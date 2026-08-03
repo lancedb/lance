@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures::Future;
 
 use crate::Result;
+use crate::deepsize::Context;
 use crate::error::CloneableError;
 
 use super::backend::{CacheBackend, CacheEntry};
@@ -171,6 +172,22 @@ impl CacheBackend for MokaCacheBackend {
         // `weighted_size()` can be stale without `run_pending_tasks()`, which
         // is async and can't be called from this synchronous context.
         self.weighted_size_bytes()
+    }
+
+    fn deep_size_of_entries(
+        &self,
+        context: &mut Context,
+        size_of_entry: &dyn Fn(&CacheEntry, &mut Context) -> Option<usize>,
+    ) -> Option<usize> {
+        Some(
+            self.cache
+                .iter()
+                .map(|(key, record)| {
+                    key_footprint(key.as_ref())
+                        + size_of_entry(&record.entry, context).unwrap_or(record.size_bytes)
+                })
+                .sum(),
+        )
     }
 }
 
