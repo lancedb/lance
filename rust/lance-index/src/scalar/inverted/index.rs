@@ -143,12 +143,59 @@ pub const FTS_FORMAT_VERSION_KEY: &str = "format_version";
 pub const POSITIONS_LAYOUT_KEY: &str = "positions_layout";
 pub const POSITIONS_CODEC_KEY: &str = "positions_codec";
 pub const POSTING_BLOCK_SIZE_KEY: &str = "posting_block_size";
+pub const LIST_DOCUMENT_MODE_KEY: &str = "list_document_mode";
 pub const POSTING_TAIL_CODEC_FIXED32_V1: &str = "fixed32_v1";
 pub const POSTING_TAIL_CODEC_VARINT_DELTA_V1: &str = "varint_delta_v1";
 pub const POSITIONS_LAYOUT_SHARED_STREAM_V2: &str = "shared_stream_v2";
 pub const POSITIONS_CODEC_VARINT_DOC_DELTA_V2: &str = "varint_doc_delta_v2";
 pub const POSITIONS_CODEC_PACKED_DELTA_V1: &str = "packed_delta_v1";
 pub const DELETED_FRAGMENTS_COL: &str = "deleted_fragments";
+
+/// How values in a string-list row are represented as indexed documents.
+///
+/// This is persisted in new inverted-index metadata so flat fallback can use
+/// the same tokenizer boundaries as the indexed portion of a dataset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListDocumentMode {
+    /// Each non-null list element is a separate document.
+    Elements,
+    /// All non-null list elements are space-joined into one row document.
+    Row,
+    /// Search both representations because the persisted index model is ambiguous.
+    Both,
+}
+
+impl ListDocumentMode {
+    pub(super) fn combine(self, other: Self) -> Self {
+        if self == other { self } else { Self::Both }
+    }
+}
+
+impl Display for ListDocumentMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Elements => write!(f, "elements"),
+            Self::Row => write!(f, "row"),
+            Self::Both => write!(f, "both"),
+        }
+    }
+}
+
+impl FromStr for ListDocumentMode {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "elements" => Ok(Self::Elements),
+            "row" => Ok(Self::Row),
+            "both" => Ok(Self::Both),
+            other => Err(Error::index(format!(
+                "unsupported list document mode {}",
+                other
+            ))),
+        }
+    }
+}
 
 // Just a heuristic when we need to pre-allocate memory for tokens
 pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
@@ -699,6 +746,7 @@ pub struct InvertedIndex {
     tokenizer: Box<dyn LanceTokenizer>,
     token_set_format: TokenSetFormat,
     format_version: InvertedListFormatVersion,
+    list_document_mode: ListDocumentMode,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
     corpus_stats: Arc<OnceCell<(u64, usize)>>,
     prewarm_state: Arc<Mutex<InvertedPrewarmState>>,
@@ -716,6 +764,7 @@ impl Debug for InvertedIndex {
             .field("params", &self.params)
             .field("token_set_format", &self.token_set_format)
             .field("format_version", &self.format_version)
+            .field("list_document_mode", &self.list_document_mode)
             .field("partitions", &self.partitions)
             .field("deleted_fragments", &self.deleted_fragments)
             .finish()
@@ -789,6 +838,7 @@ impl InvertedIndex {
                 self.deleted_fragments.clone(),
             )
             .with_format_version(self.format_version())
+            .with_list_document_mode(self.list_document_mode)
         }
     }
 
@@ -798,6 +848,11 @@ impl InvertedIndex {
 
     pub fn params(&self) -> &InvertedIndexParams {
         &self.params
+    }
+
+    /// Returns the persisted string-list document representation.
+    pub fn list_document_mode(&self) -> ListDocumentMode {
+        self.list_document_mode
     }
 
     /// Returns the number of partitions in this inverted index.
@@ -852,7 +907,13 @@ impl InvertedIndex {
             }
         }
 
-        let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
+        let list_document_mode = segments
+            .iter()
+            .map(|segment| segment.list_document_mode)
+            .fold(ListDocumentMode::Row, ListDocumentMode::combine);
+        let mut builder = InvertedIndexBuilder::new(first.params.clone())
+            .with_progress(progress)
+            .with_list_document_mode(list_document_mode);
         builder = builder
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version());
@@ -1708,6 +1769,7 @@ impl InvertedIndex {
             tokenizer,
             token_set_format: TokenSetFormat::Arrow,
             format_version: InvertedListFormatVersion::V1,
+            list_document_mode: ListDocumentMode::Elements,
             partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
@@ -1792,6 +1854,15 @@ impl InvertedIndex {
                     .transpose()?
                     .unwrap_or(TokenSetFormat::Arrow);
                 let format_version = parse_format_version_from_metadata(&reader.schema().metadata)?;
+                // Partitioned indexes written before this marker may use either
+                // released list-document model, so search both representations.
+                let list_document_mode = reader
+                    .schema()
+                    .metadata
+                    .get(LIST_DOCUMENT_MODE_KEY)
+                    .map(|value| ListDocumentMode::from_str(value))
+                    .transpose()?
+                    .unwrap_or(ListDocumentMode::Both);
 
                 // Load deleted_fragments if present (optional for backward compatibility)
                 let deleted_fragments = if reader.num_rows() > 0 {
@@ -1838,6 +1909,7 @@ impl InvertedIndex {
                     tokenizer,
                     token_set_format,
                     format_version,
+                    list_document_mode,
                     partitions,
                     corpus_stats: Arc::new(OnceCell::new()),
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
@@ -7768,8 +7840,10 @@ fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
                 continue;
             }
             let elements = doc_array.value(i);
-            let doc = materialize_string_list(elements.as_ref());
-            if has_query_token(&doc, &mut tokenizer, &query_tokens) {
+            if iter_str_array(elements.as_ref())
+                .flatten()
+                .any(|element| has_query_token(element, &mut tokenizer, &query_tokens))
+            {
                 results.push(row_id_array.value(i));
             }
         }
@@ -7803,6 +7877,7 @@ async fn tokenize_and_count(
     tokenizer: Box<dyn LanceTokenizer>,
     query_tokens: Arc<Tokens>,
     doc_col_idx: usize,
+    list_document_mode: ListDocumentMode,
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<RecordBatch> {
     let output_schema = Arc::new(Schema::new(vec![
@@ -7894,6 +7969,7 @@ async fn tokenize_and_count(
                             &mut append_counts,
                             &mut temp_query_token_counts,
                             query_tokens.len(),
+                            list_document_mode,
                         )?;
                     }
                     DataType::LargeList(_) => {
@@ -7904,6 +7980,7 @@ async fn tokenize_and_count(
                             &mut append_counts,
                             &mut temp_query_token_counts,
                             query_tokens.len(),
+                            list_document_mode,
                         )?;
                     }
                     data_type => {
@@ -7951,6 +8028,7 @@ fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
     append_counts: &mut impl FnMut(u64, u64, &[u64]),
     temp_query_token_counts: &mut Vec<u64>,
     query_tokens_len: usize,
+    list_document_mode: ListDocumentMode,
 ) -> DataFusionResult<()> {
     let doc_array = doc_col.as_list::<ListOffset>();
     match doc_array.value_type() {
@@ -7968,15 +8046,36 @@ fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
             continue;
         }
 
-        temp_query_token_counts.clear();
-        temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens_len));
-
         let elements = doc_array.value(i);
-        let doc = materialize_string_list(elements.as_ref());
-        let all_tokens = count_text(&doc, temp_query_token_counts);
+        let row_id = row_id_array.value(i);
+        let non_null_elements = iter_str_array(elements.as_ref()).flatten().count();
 
-        if all_tokens > 0 {
-            append_counts(row_id_array.value(i), all_tokens, temp_query_token_counts);
+        if matches!(
+            list_document_mode,
+            ListDocumentMode::Elements | ListDocumentMode::Both
+        ) {
+            for element in iter_str_array(elements.as_ref()).flatten() {
+                temp_query_token_counts.clear();
+                temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens_len));
+                let all_tokens = count_text(element, temp_query_token_counts);
+                if all_tokens > 0 {
+                    append_counts(row_id, all_tokens, temp_query_token_counts);
+                }
+            }
+        }
+
+        if matches!(
+            list_document_mode,
+            ListDocumentMode::Row | ListDocumentMode::Both
+        ) && (list_document_mode == ListDocumentMode::Row || non_null_elements > 1)
+        {
+            temp_query_token_counts.clear();
+            temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens_len));
+            let doc = materialize_string_list(elements.as_ref());
+            let all_tokens = count_text(&doc, temp_query_token_counts);
+            if all_tokens > 0 {
+                append_counts(row_id, all_tokens, temp_query_token_counts);
+            }
         }
     }
 
@@ -8057,10 +8156,12 @@ fn flat_bm25_score(
     query_tokens: &Tokens,
     counted_input: &RecordBatch,
     scorer: &MemBM25Scorer,
+    list_document_mode: ListDocumentMode,
     operator: Operator,
 ) -> Result<RecordBatch> {
     let mut row_ids_builder = UInt64Builder::with_capacity(counted_input.num_rows());
     let mut scores_builder = Float32Builder::with_capacity(counted_input.num_rows());
+    let mut pending_both_match = None;
     let query_groups = query_position_groups(query_tokens);
 
     let mut row_ids_iter = counted_input
@@ -8108,9 +8209,28 @@ fn flat_bm25_score(
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
         if score > 0.0 {
-            row_ids_builder.append_value(row_id);
-            scores_builder.append_value(score);
+            if list_document_mode == ListDocumentMode::Both {
+                match pending_both_match.as_mut() {
+                    Some((pending_row_id, pending_score)) if *pending_row_id == row_id => {
+                        *pending_score = f32::max(*pending_score, score);
+                    }
+                    Some((pending_row_id, pending_score)) => {
+                        row_ids_builder.append_value(*pending_row_id);
+                        scores_builder.append_value(*pending_score);
+                        *pending_row_id = row_id;
+                        *pending_score = score;
+                    }
+                    None => pending_both_match = Some((row_id, score)),
+                }
+            } else {
+                row_ids_builder.append_value(row_id);
+                scores_builder.append_value(score);
+            }
         }
+    }
+    if let Some((row_id, score)) = pending_both_match {
+        row_ids_builder.append_value(row_id);
+        scores_builder.append_value(score);
     }
 
     let row_ids = row_ids_builder.finish();
@@ -8229,6 +8349,37 @@ pub async fn flat_bm25_search_stream_with_metrics_and_operator(
     operator: Operator,
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
+    flat_bm25_search_stream_with_mode_and_operator(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        base_scorer,
+        target_batch_size,
+        ListDocumentMode::Elements,
+        operator,
+        elapsed_compute,
+    )
+    .await
+}
+
+/// Flat BM25 search with an explicit string-list document representation.
+///
+/// Scalar string columns ignore `list_document_mode`. Callers searching
+/// uncovered fragments of an indexed dataset should pass the mode loaded from
+/// that index so tokenizer boundaries and BM25 documents remain compatible.
+#[allow(clippy::too_many_arguments)]
+pub async fn flat_bm25_search_stream_with_mode_and_operator(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    base_scorer: Option<MemBM25Scorer>,
+    target_batch_size: usize,
+    list_document_mode: ListDocumentMode,
+    operator: Operator,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = tokenizer;
 
     // Pre-await synchronous work: query tokenization + chunk-stream setup.
@@ -8275,6 +8426,7 @@ pub async fn flat_bm25_search_stream_with_metrics_and_operator(
         tokenizer,
         query_tokens.clone(),
         doc_col_idx,
+        list_document_mode,
         elapsed_compute.clone(),
     )
     .await?;
@@ -8283,7 +8435,13 @@ pub async fn flat_bm25_search_stream_with_metrics_and_operator(
     // All post-await work is synchronous; time the scorer + score + slicing loop together.
     let post_await_start = std::time::Instant::now();
     let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
-    let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer, operator)?;
+    let scores = flat_bm25_score(
+        query_tokens.as_ref(),
+        &counted_input,
+        &scorer,
+        list_document_mode,
+        operator,
+    )?;
 
     // Finally we emit batches according to the target batch size
     let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
@@ -8343,6 +8501,7 @@ mod tests {
 
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
+    use rstest::rstest;
 
     use super::*;
 
@@ -8357,8 +8516,20 @@ mod tests {
         );
     }
 
+    fn raw_tokenizer() -> Box<dyn LanceTokenizer> {
+        InvertedIndexParams::default()
+            .base_tokenizer("raw".to_owned())
+            .max_token_length(None)
+            .lower_case(false)
+            .stem(false)
+            .remove_stop_words(false)
+            .ascii_folding(false)
+            .build()
+            .unwrap()
+    }
+
     #[test]
-    fn flat_full_text_search_joins_string_list_elements() {
+    fn flat_full_text_search_preserves_string_list_element_boundaries() {
         let mut docs_builder =
             GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
         docs_builder.values().append_value("a");
@@ -8375,19 +8546,12 @@ mod tests {
             vec![Arc::new(UInt64Array::from(vec![1_u64])) as ArrayRef, docs],
         )
         .unwrap();
-        let tokenizer = InvertedIndexParams::default()
-            .base_tokenizer("raw".to_owned())
-            .max_token_length(None)
-            .lower_case(false)
-            .stem(false)
-            .remove_stop_words(false)
-            .ascii_folding(false)
-            .build()
-            .unwrap();
+        let joined =
+            flat_full_text_search(&[&batch], "text", "a b", Some(raw_tokenizer())).unwrap();
+        let element = flat_full_text_search(&[&batch], "text", "a", Some(raw_tokenizer())).unwrap();
 
-        let row_ids = flat_full_text_search(&[&batch], "text", "a b", Some(tokenizer)).unwrap();
-
-        assert_eq!(row_ids, vec![1]);
+        assert!(joined.is_empty());
+        assert_eq!(element, vec![1]);
     }
 
     #[derive(Debug)]
@@ -12781,6 +12945,7 @@ mod tests {
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(updated.format_version(), format_version);
         assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V2);
+        assert_eq!(updated.list_document_mode(), ListDocumentMode::Both);
         assert_eq!(updated.partitions.len(), 2);
         for partition in &updated.partitions {
             assert_eq!(
@@ -12884,6 +13049,7 @@ mod tests {
         let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(merged.index_version(), 0);
         assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
+        assert_eq!(merged.list_document_mode(), ListDocumentMode::Both);
 
         let tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
@@ -13057,6 +13223,7 @@ mod tests {
             index.deleted_fragments().is_empty(),
             "index without deleted_fragments column should have empty bitmap"
         );
+        assert_eq!(index.list_document_mode(), ListDocumentMode::Both);
     }
 
     #[tokio::test]
@@ -13150,6 +13317,7 @@ mod tests {
             params.build().unwrap(),
             query_tokens.clone(),
             1,
+            ListDocumentMode::Elements,
             None,
         )
         .await
@@ -13224,7 +13392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flat_bm25_search_treats_string_lists_as_row_documents() {
+    async fn flat_bm25_search_both_mode_deduplicates_row() {
         let mut docs_builder =
             GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
         docs_builder.values().append_value("alpha");
@@ -13259,13 +13427,15 @@ mod tests {
             TextAnalyzer::builder(SimpleTokenizer::default()).build(),
         ));
 
-        let result_stream = flat_bm25_search_stream_with_metrics(
+        let result_stream = flat_bm25_search_stream_with_mode_and_operator(
             input,
             "text".to_string(),
             "alpha".to_string(),
             tokenizer,
             None,
             100,
+            ListDocumentMode::Both,
+            Operator::Or,
             None,
         )
         .await
@@ -13275,6 +13445,77 @@ mod tests {
         let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
 
         assert_eq!(row_ids.values(), &[0]);
+    }
+
+    #[rstest]
+    #[case::default_elements_element(None, "a", &[2])]
+    #[case::elements_joined(Some(ListDocumentMode::Elements), "a b", &[])]
+    #[case::row_element(Some(ListDocumentMode::Row), "a", &[])]
+    #[case::row_joined(Some(ListDocumentMode::Row), "a b", &[2])]
+    #[case::both_element(Some(ListDocumentMode::Both), "a", &[2])]
+    #[case::both_joined(Some(ListDocumentMode::Both), "a b", &[2])]
+    #[tokio::test]
+    async fn flat_bm25_search_honors_list_document_mode(
+        #[case] mode: Option<ListDocumentMode>,
+        #[case] query: &str,
+        #[case] expected_row_ids: &[u64],
+    ) {
+        let mut docs = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+        docs.values().append_value("a");
+        docs.values().append_value("b");
+        docs.append(true);
+
+        let docs = Arc::new(docs.finish()) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", docs.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![2_u64])) as ArrayRef, docs],
+        )
+        .unwrap();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        ));
+
+        let output = match mode {
+            Some(mode) => {
+                flat_bm25_search_stream_with_mode_and_operator(
+                    input,
+                    "text".to_owned(),
+                    query.to_owned(),
+                    raw_tokenizer(),
+                    None,
+                    100,
+                    mode,
+                    Operator::Or,
+                    None,
+                )
+                .await
+            }
+            None => {
+                flat_bm25_search_stream_with_metrics(
+                    input,
+                    "text".to_owned(),
+                    query.to_owned(),
+                    raw_tokenizer(),
+                    None,
+                    100,
+                    None,
+                )
+                .await
+            }
+        }
+        .unwrap();
+        let batches: Vec<_> = output.try_collect().await.unwrap();
+        let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+
+        assert_eq!(
+            scored[ROW_ID].as_primitive::<UInt64Type>().values(),
+            expected_row_ids
+        );
     }
 
     #[tokio::test]

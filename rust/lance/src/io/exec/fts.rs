@@ -53,8 +53,9 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, build_global_bm25_scorer, compound_search,
-    compound_search_with_base_scorer, flat_bm25_search_stream_with_metrics_and_operator,
+    FTS_SCHEMA, InvertedIndex, ListDocumentMode, MemBM25Scorer, SCORE_COL,
+    build_global_bm25_scorer, compound_search, compound_search_with_base_scorer,
+    flat_bm25_search_stream_with_mode_and_operator,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -1563,7 +1564,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 Some(segments) => Some(segments),
                 None => load_segments(&ds, &column).await?,
             };
-            let (tokenizer, base_scorer) = match segments {
+            let (tokenizer, base_scorer, list_document_mode) = match segments {
                 Some(segments) => {
                     let _details = load_segment_details(&ds, &column, &segments).await?;
                     let indices =
@@ -1574,6 +1575,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     let first_index = indices.first().ok_or(DataFusionError::Execution(
                         format!("FTS index for column {} has no segments", column),
                     ))?;
+                    let list_document_mode = indices.iter().skip(1).fold(
+                        first_index.list_document_mode(),
+                        |mode, index| {
+                            if mode == index.list_document_mode() {
+                                mode
+                            } else {
+                                ListDocumentMode::Both
+                            }
+                        },
+                    );
                     let mut tokenizer = first_index.tokenizer();
                     let base_scorer = match preset_base_scorer {
                         Some(scorer) => (*scorer).clone(),
@@ -1592,21 +1603,23 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             scorer
                         }
                     };
-                    (tokenizer, Some(base_scorer))
+                    (tokenizer, Some(base_scorer), list_document_mode)
                 }
                 None => (
                     default_text_tokenizer(),
                     preset_base_scorer.map(|s| (*s).clone()),
+                    ListDocumentMode::Elements,
                 ),
             };
 
-            flat_bm25_search_stream_with_metrics_and_operator(
+            flat_bm25_search_stream_with_mode_and_operator(
                 unindexed_input,
                 column,
                 query.terms,
                 tokenizer,
                 base_scorer,
                 target_batch_size,
+                list_document_mode,
                 query.operator,
                 Some(elapsed_compute),
             )

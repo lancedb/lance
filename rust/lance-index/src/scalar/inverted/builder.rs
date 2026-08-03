@@ -144,6 +144,7 @@ pub struct InvertedIndexBuilder {
     token_set_format: TokenSetFormat,
     format_version: InvertedListFormatVersion,
     posting_tail_codec: PostingTailCodec,
+    list_document_mode: ListDocumentMode,
     src_store: Option<Arc<dyn IndexStore>>,
     progress: Arc<dyn IndexBuildProgress>,
     deleted_fragments: RoaringBitmap,
@@ -189,6 +190,7 @@ impl InvertedIndexBuilder {
             fragment_mask,
             format_version,
             posting_tail_codec: format_version.posting_tail_codec(),
+            list_document_mode: ListDocumentMode::Row,
             progress: noop_progress(),
             deleted_fragments,
         }
@@ -215,6 +217,11 @@ impl InvertedIndexBuilder {
         self
     }
 
+    pub(super) fn with_list_document_mode(mut self, list_document_mode: ListDocumentMode) -> Self {
+        self.list_document_mode = list_document_mode;
+        self
+    }
+
     pub fn with_progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = progress;
         self
@@ -226,6 +233,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<Vec<IndexFile>> {
+        self.list_document_mode = self.list_document_mode.combine(ListDocumentMode::Row);
         validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
@@ -261,6 +269,7 @@ impl InvertedIndexBuilder {
         old_segments: &[Arc<InvertedIndex>],
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<Vec<IndexFile>> {
+        self.list_document_mode = self.list_document_mode.combine(ListDocumentMode::Row);
         validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
@@ -563,6 +572,10 @@ impl InvertedIndexBuilder {
                 POSTING_BLOCK_SIZE_KEY.to_owned(),
                 self.params.block_size.to_string(),
             ),
+            (
+                LIST_DOCUMENT_MODE_KEY.to_owned(),
+                self.list_document_mode.to_string(),
+            ),
         ]);
 
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
@@ -627,6 +640,10 @@ impl InvertedIndexBuilder {
             (
                 POSTING_BLOCK_SIZE_KEY.to_owned(),
                 self.params.block_size.to_string(),
+            ),
+            (
+                LIST_DOCUMENT_MODE_KEY.to_owned(),
+                self.list_document_mode.to_string(),
             ),
         ]);
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
@@ -2094,6 +2111,7 @@ async fn merge_metadata_files(
     let mut params = None;
     let mut token_set_format = None;
     let mut format_version = None;
+    let mut list_document_mode = None;
     let mut deleted_fragments = RoaringBitmap::new();
     progress
         .stage_start(
@@ -2135,6 +2153,16 @@ async fn merge_metadata_files(
         if format_version.is_none() {
             format_version = Some(parse_format_version_from_metadata(metadata)?);
         }
+        let part_list_document_mode = metadata
+            .get(LIST_DOCUMENT_MODE_KEY)
+            .map(|value| ListDocumentMode::from_str(value))
+            .transpose()?
+            .unwrap_or(ListDocumentMode::Both);
+        list_document_mode = Some(
+            list_document_mode
+                .map(|mode: ListDocumentMode| mode.combine(part_list_document_mode))
+                .unwrap_or(part_list_document_mode),
+        );
 
         if reader.num_rows() > 0 {
             let metadata_batch = reader.read_range(0..1, None).await?;
@@ -2200,7 +2228,8 @@ async fn merge_metadata_files(
         None,
         deleted_fragments,
     )
-    .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1));
+    .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1))
+    .with_list_document_mode(list_document_mode.unwrap_or(ListDocumentMode::Both));
     progress
         .stage_start("write_merged_metadata", Some(1), "files")
         .await?;
@@ -3181,6 +3210,13 @@ mod tests {
             "partition metadata should be written to staging"
         );
         let reader = store.open_index_file(&part_metadata_files[0]).await?;
+        let list_document_mode: ListDocumentMode = reader
+            .schema()
+            .metadata
+            .get(LIST_DOCUMENT_MODE_KEY)
+            .expect("list document mode missing from metadata")
+            .parse()?;
+        assert_eq!(list_document_mode, ListDocumentMode::Row);
         let partition_ids: Vec<u64> = serde_json::from_str(
             reader
                 .schema()

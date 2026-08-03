@@ -11,6 +11,7 @@ use crate::dataset::tests::dataset_migrations::scan_dataset;
 use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::index::vector::VectorIndexParams;
 use crate::session::Session;
+use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
@@ -2463,6 +2464,45 @@ async fn test_fts_list_flat_search_matches_index_tokenization() {
     assert_eq!(
         nested_fts_result_ids(&dataset, FullTextSearchQuery::new("c".to_owned())).await,
         Vec::<u64>::new()
+    );
+}
+
+#[tokio::test]
+async fn test_released_fts_list_index_uses_conservative_flat_fallback() {
+    let test_dir = copy_test_data_to_tmp("v8.0.0/fts_list_elements").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new(
+            "doc",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+    let mut docs = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    docs.values().append_value("a");
+    docs.values().append_value("b");
+    docs.append(true);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![2_u64])) as ArrayRef,
+            Arc::new(docs.finish()) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("a".to_owned())).await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("a b".to_owned())).await,
+        vec![2]
     );
 }
 
