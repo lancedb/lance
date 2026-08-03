@@ -49,16 +49,6 @@ pub struct FileWriterOptions {
     pub keep_original_array: Option<bool>,
 }
 
-pub(crate) fn cache_bytes_per_column(options: &FileWriterOptions, schema: &Schema) -> u64 {
-    options
-        .data_cache_bytes
-        .map(|data_cache_bytes| {
-            let num_columns = schema.fields_pre_order().count().max(1) as u64;
-            data_cache_bytes / num_columns
-        })
-        .unwrap_or(8 * 1024 * 1024)
-}
-
 /// A type-erased current-format file writer.
 ///
 /// This enum exists for callers that select a concrete file version at
@@ -170,6 +160,20 @@ impl FileWriter {
             Self::V2_1(writer) => writer.write_batch(batch).await,
             Self::V2_2(writer) => writer.write_batch(batch).await,
             Self::V2_3(writer) => writer.write_batch(batch).await,
+        }
+    }
+
+    /// Flush buffered field data into pages without finishing the file.
+    ///
+    /// This forces field encoders to emit their pending pages so the current
+    /// object-writer position reflects them. More batches may be written
+    /// afterwards.
+    pub async fn flush(&mut self) -> Result<()> {
+        match self {
+            Self::V2_0(writer) => writer.flush().await,
+            Self::V2_1(writer) => writer.flush().await,
+            Self::V2_2(writer) => writer.flush().await,
+            Self::V2_3(writer) => writer.flush().await,
         }
     }
 

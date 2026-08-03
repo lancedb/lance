@@ -148,10 +148,14 @@ impl Writer {
         self.sink.add_global_buffer(buffer).await
     }
 
+    pub(crate) async fn flush(&mut self) -> Result<()> {
+        self.encoding.flush(&mut self.sink).await
+    }
+
     /// Finish the v2.3 file and close its object writer.
     pub async fn finish(&mut self) -> Result<FileWriteSummary> {
         // The order below is the v2.3 wire contract.
-        self.encoding.flush(&mut self.sink).await?;
+        self.flush().await?;
         self.encoding.finish_encoders(&mut self.sink).await?;
 
         let descriptor = self.encoding.make_file_descriptor()?;

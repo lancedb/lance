@@ -37,7 +37,7 @@ use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::writer::{
     ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriteSummary, FileWriterOptions,
-    PAGE_BUFFER_ALIGNMENT, cache_bytes_per_column,
+    PAGE_BUFFER_ALIGNMENT,
 };
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -336,7 +336,11 @@ impl Writer {
     }
 
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
-        let cache_bytes_per_column = cache_bytes_per_column(&self.options, &schema);
+        let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
+            data_cache_bytes / schema.fields.len() as u64
+        } else {
+            8 * 1024 * 1024
+        };
 
         let max_page_bytes = self.options.max_page_bytes.unwrap_or_else(|| {
             std::env::var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES)
@@ -759,15 +763,7 @@ impl Writer {
         Ok(())
     }
 
-    /// Finishes writing the file
-    ///
-    /// This method will wait until all data has been flushed to the file.  Then it
-    /// will write the file metadata and the footer.  It will not return until all
-    /// data has been flushed and the file has been closed.
-    ///
-    /// Returns a summary of the completed file write.
-    pub async fn finish(&mut self) -> Result<FileWriteSummary> {
-        // 1. flush any remaining data and write out those pages
+    pub(crate) async fn flush(&mut self) -> Result<()> {
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self
@@ -782,7 +778,19 @@ impl Writer {
             .into_iter()
             .flatten()
             .collect::<FuturesOrdered<_>>();
-        self.write_pages(encoding_tasks).await?;
+        self.write_pages(encoding_tasks).await
+    }
+
+    /// Finishes writing the file
+    ///
+    /// This method will wait until all data has been flushed to the file.  Then it
+    /// will write the file metadata and the footer.  It will not return until all
+    /// data has been flushed and the file has been closed.
+    ///
+    /// Returns a summary of the completed file write.
+    pub async fn finish(&mut self) -> Result<FileWriteSummary> {
+        // 1. flush any remaining data and write out those pages
+        self.flush().await?;
 
         if !self.column_writers.is_empty() {
             self.finish_writers().await?;

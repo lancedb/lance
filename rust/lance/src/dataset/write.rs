@@ -62,11 +62,11 @@ use super::utils::SchemaAdapter;
 /// how far a single large input batch can overshoot `max_bytes_per_file`.
 const MAX_WRITE_BATCH_BYTES: usize = 10 * 1024 * 1024;
 
-/// Aggregate encoder buffering budget for current-format dataset writers.
+/// Smallest batch used for current-format file-size checkpoints.
 ///
-/// Keeping this below [`MAX_WRITE_BATCH_BYTES`] ensures file-size checkpoints
-/// observe encoded output even when a schema has many individually small columns.
-const MAX_WRITE_BUFFER_BYTES: usize = MAX_WRITE_BATCH_BYTES / 2;
+/// Very small byte limits remain soft limits so they do not create a file for
+/// every few rows.
+const MIN_WRITE_BATCH_BYTES: usize = 2 * 1024 * 1024;
 
 mod commit;
 pub mod delete;
@@ -292,9 +292,10 @@ pub struct WriteParams {
     /// because the limit is checked after writing each batch and the writer
     /// still needs to flush buffered data and the footer.
     ///
-    /// Current-format writes split large input batches into approximately 10 MiB
-    /// chunks before checking this limit. Legacy writes check it after each row
-    /// group, so a large `max_rows_per_group` can increase the overshoot.
+    /// Current-format writes split large input batches into chunks between 2 MiB
+    /// and 10 MiB, based on this limit, before checking the writer position.
+    /// Legacy writes check it after each row group, so a large
+    /// `max_rows_per_group` can increase the overshoot.
     ///
     /// The default is 90 GB. If you are using an object store such as S3, we
     /// currently have a hard 100 GB limit.
@@ -622,6 +623,9 @@ pub async fn do_write_fragments(
 ) -> Result<Vec<Fragment>> {
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
+    let write_batch_bytes = params
+        .max_bytes_per_file
+        .clamp(MIN_WRITE_BATCH_BYTES, MAX_WRITE_BATCH_BYTES);
 
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
         // In v1 we split the stream into row group sized batches
@@ -634,7 +638,7 @@ pub async fn do_write_fragments(
             data,
             data_schema.clone(),
             0,
-            MAX_WRITE_BATCH_BYTES,
+            write_batch_bytes,
         );
         let data = Box::pin(RecordBatchStreamAdapter::new(data_schema, data));
         break_stream(data, params.max_rows_per_file)
@@ -673,6 +677,7 @@ pub async fn do_write_fragments(
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
+    let mut input_bytes_since_flush = 0_u64;
     let mut fragments: Vec<Fragment> = Vec::new();
     let mut bytes_completed: u64 = 0;
     let mut rows_completed: u64 = 0;
@@ -702,10 +707,23 @@ pub async fn do_write_fragments(
             }
             for batch in &batch_chunk {
                 num_rows_in_current_file += batch.num_rows() as u32;
+                if storage_version != LanceFileVersion::Legacy {
+                    input_bytes_since_flush = input_bytes_since_flush
+                        .saturating_add(batch.get_array_memory_size() as u64);
+                }
+            }
+
+            let mut current_bytes = writer.as_mut().unwrap().tell().await?;
+            // Nested encoders can buffer structural state without advancing
+            // `tell()`. Periodically flush after a file limit's worth of input
+            // so that state participates in the rollover check.
+            if input_bytes_since_flush >= params.max_bytes_per_file as u64 {
+                writer.as_mut().unwrap().flush().await?;
+                input_bytes_since_flush = 0;
+                current_bytes = writer.as_mut().unwrap().tell().await?;
             }
 
             if let Some(cb) = &params.write_progress {
-                let current_bytes = writer.as_mut().unwrap().tell().await?;
                 cb.call(WriteStats {
                     bytes_written: bytes_completed + current_bytes,
                     rows_written: rows_completed + num_rows_in_current_file as u64,
@@ -714,7 +732,7 @@ pub async fn do_write_fragments(
             }
 
             if num_rows_in_current_file >= params.max_rows_per_file as u32
-                || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
+                || current_bytes >= params.max_bytes_per_file as u64
             {
                 let mut w = writer.take().unwrap();
                 flush_seed_writers(w.as_mut(), &mut seed_writers).await?;
@@ -738,6 +756,7 @@ pub async fn do_write_fragments(
                     });
                 }
                 num_rows_in_current_file = 0;
+                input_bytes_since_flush = 0;
             }
         }
         Ok(())
@@ -1476,6 +1495,10 @@ fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+    /// Flush buffered data without finishing the file.
+    async fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Get the file path and base ID for the data file being written.
     fn data_file_path(&self) -> (&str, Option<u32>);
     /// Get the current position in the file
@@ -1556,6 +1579,9 @@ impl GenericWriter for V2WriterAdapter {
             }
         }
         Ok(())
+    }
+    async fn flush(&mut self) -> Result<()> {
+        self.writer.flush().await
     }
     fn data_file_path(&self) -> (&str, Option<u32>) {
         (&self.path, self.base_id)
@@ -1713,10 +1739,7 @@ async fn open_writer_with_options(
             version,
             writer,
             schema.clone(),
-            FileWriterOptions {
-                data_cache_bytes: Some(MAX_WRITE_BUFFER_BYTES as u64),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )?;
         let preprocessor = if enable_blob_v2 {
             Some(BlobPreprocessor::new(
@@ -1914,7 +1937,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
+    use arrow_array::{
+        Array, Int32Array, RecordBatchIterator, RecordBatchReader, StructArray,
+        builder::{Int32Builder, ListBuilder},
+    };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::error::DataFusionError;
     use datafusion_physical_plan::RecordBatchStream;
@@ -2017,58 +2043,64 @@ mod tests {
         }
     }
 
+    async fn write_single_batch_with_small_file_limit(batch: RecordBatch) -> Vec<Fragment> {
+        let arrow_schema = batch.schema();
+        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter([Ok::<_, DataFusionError>(batch)]),
+        ));
+        let write_params = WriteParams {
+            max_rows_per_file: 2 * 1024 * 1024,
+            max_bytes_per_file: 2 * 1024,
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+        let (fragments, _) = write_fragments_internal(
+            None,
+            object_store,
+            &Path::from("file-size-test"),
+            schema,
+            data_stream,
+            write_params,
+            None,
+        )
+        .await
+        .unwrap();
+        fragments
+    }
+
+    fn assert_multiple_bounded_files(fragments: &[Fragment]) {
+        assert!(fragments.len() > 1, "got {} fragment(s)", fragments.len());
+        let max_file_size = fragments
+            .iter()
+            .flat_map(|fragment| &fragment.files)
+            .map(|file| {
+                file.file_size_bytes
+                    .get()
+                    .expect("written data file should have a size")
+                    .get()
+            })
+            .max()
+            .expect("at least one data file should be written");
+        assert!(
+            max_file_size < (4 * MIN_WRITE_BATCH_BYTES) as u64,
+            "largest file was {max_file_size} bytes"
+        );
+    }
+
     #[tokio::test]
     async fn test_file_size() {
-        let reader_to_frags = |data_reader: Box<dyn RecordBatchReader + Send>| {
-            let schema = data_reader.schema();
-            let data_reader =
-                data_reader.map(|rb| rb.map_err(datafusion::error::DataFusionError::from));
+        // Use one large input batch to ensure file-size enforcement does not
+        // depend on the caller's batching.
+        let batch = gen_batch()
+            .anon_col(array::rand_fsb(1024))
+            .into_batch_rows(RowCount::from(10 * 1024))
+            .unwrap();
 
-            let data_stream = Box::pin(RecordBatchStreamAdapter::new(
-                schema.clone(),
-                futures::stream::iter(data_reader),
-            ));
-
-            let write_params = WriteParams {
-                max_rows_per_file: 1024 * 1024, // Won't be limited by this
-                max_bytes_per_file: 2 * 1024,
-                mode: WriteMode::Create,
-                ..Default::default()
-            };
-
-            async move {
-                let schema = Schema::try_from(schema.as_ref()).unwrap();
-
-                let object_store = Arc::new(ObjectStore::memory());
-                write_fragments_internal(
-                    None,
-                    object_store,
-                    &Path::from("test"),
-                    schema,
-                    data_stream,
-                    write_params,
-                    None,
-                )
-                .await
-            }
-        };
-
-        // The writer will not generate a new file until enough data is *written* (not
-        // just accumulated) to justify a new file, so generate enough data to cross the
-        // encoder buffer budget. Use one input batch to ensure file-size enforcement
-        // does not depend on input batching.
-        //
-        // To avoid generating and writing millions of rows (which is a bit slow for a unit
-        // test) we can use a large data type (1KiB binary)
-        let data_reader = Box::new(
-            gen_batch()
-                .anon_col(array::rand_fsb(1024))
-                .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(1)),
-        );
-
-        let (fragments, _) = reader_to_frags(data_reader).await.unwrap();
-
-        assert_eq!(fragments.len(), 2);
+        let fragments = write_single_batch_with_small_file_limit(batch).await;
+        assert_multiple_bounded_files(&fragments);
     }
 
     #[tokio::test]
@@ -2084,41 +2116,27 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![values; num_columns]).unwrap();
         assert!(batch.get_array_memory_size() > MAX_WRITE_BATCH_BYTES);
 
-        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter([Ok::<_, DataFusionError>(batch)]),
-        ));
-        let write_params = WriteParams {
-            max_rows_per_file: 2 * 1024 * 1024,
-            max_bytes_per_file: 2 * 1024,
-            mode: WriteMode::Create,
-            ..Default::default()
-        };
-        let schema = Schema::try_from(schema.as_ref()).unwrap();
-        let object_store = Arc::new(ObjectStore::memory());
-        let (fragments, _) = write_fragments_internal(
-            None,
-            object_store,
-            &Path::from("wide-test"),
-            schema,
-            data_stream,
-            write_params,
-            None,
-        )
-        .await
-        .unwrap();
+        let fragments = write_single_batch_with_small_file_limit(batch).await;
+        assert_multiple_bounded_files(&fragments);
+    }
 
-        assert!(fragments.len() > 1, "got {} fragment(s)", fragments.len());
-        let max_file_size = fragments
-            .iter()
-            .flat_map(|fragment| &fragment.files)
-            .map(|file| file.file_size_bytes.get().unwrap().get())
-            .max()
-            .unwrap();
-        assert!(
-            max_file_size < (2 * MAX_WRITE_BATCH_BYTES) as u64,
-            "largest file was {max_file_size} bytes"
-        );
+    #[tokio::test]
+    async fn test_file_size_empty_lists_single_batch() {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for index in 0..1_000_000 {
+            builder.append(index % 2 == 0);
+        }
+        let list_array = Arc::new(builder.finish());
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            list_array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![list_array]).unwrap();
+        assert!(batch.get_array_memory_size() > MIN_WRITE_BATCH_BYTES);
+
+        let fragments = write_single_batch_with_small_file_limit(batch).await;
+        assert_multiple_bounded_files(&fragments);
     }
 
     #[tokio::test]
