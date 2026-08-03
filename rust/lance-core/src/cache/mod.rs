@@ -231,13 +231,19 @@ impl CacheState {
     where
         T: DeepSizeOf + Send + Sync + 'static,
     {
-        let mut accessors = self
+        let type_id = TypeId::of::<T>();
+        let is_registered = self
             .entry_size_accessors
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        accessors
-            .entry(TypeId::of::<T>())
-            .or_insert(cache_entry_size_with_context::<T>);
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&type_id);
+        if !is_registered {
+            self.entry_size_accessors
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(type_id)
+                .or_insert(cache_entry_size_with_context::<T>);
+        }
         cache_entry_size(value)
     }
 }
@@ -668,8 +674,13 @@ impl CacheStats {
 mod tests {
     use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
     use std::task::Poll;
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
@@ -757,6 +768,28 @@ mod tests {
 
         fn write_key(&self, builder: &mut KeyBuilder) {
             builder.write_u64(self.0);
+        }
+    }
+
+    struct ReentrantValue(LanceCache);
+
+    impl DeepSizeOf for ReentrantValue {
+        fn deep_size_of_children(&self, context: &mut Context) -> usize {
+            self.0.deep_size_of_children(context)
+        }
+    }
+
+    struct ReentrantKey;
+
+    impl CacheKey for ReentrantKey {
+        type ValueType = ReentrantValue;
+
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed("reentrant")
+        }
+
+        fn type_name() -> &'static str {
+            "test.ReentrantValue"
         }
     }
 
@@ -1159,6 +1192,29 @@ mod tests {
                 .deep_size_of_children(&mut context),
             0
         );
+    }
+
+    #[test]
+    fn sizing_can_reenter_the_same_cache() {
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let cache = LanceCache::with_capacity(4096);
+                cache
+                    .insert_with_key(&ReentrantKey, Arc::new(ReentrantValue(cache.clone())))
+                    .await;
+                done_tx.send(()).unwrap();
+            });
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cache insertion deadlocked during sizing");
+        worker.join().unwrap();
     }
 
     #[tokio::test]
