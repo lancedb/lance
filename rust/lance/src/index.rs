@@ -1727,6 +1727,10 @@ impl DatasetIndexExt for Dataset {
         validate_segment_metadata(index_name, &new_indices)?;
         validate_segment_index_details(index_name, &new_indices)?;
 
+        let incoming_type_url = new_indices[0]
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.clone());
         let mut incoming_fragments = RoaringBitmap::new();
         for segment in &new_indices {
             if segment.fields != [field.id] {
@@ -1750,9 +1754,34 @@ impl DatasetIndexExt for Dataset {
                 please specify a different name"
             )));
         }
+        let existing_different_type_url = existing_named_indices.iter().find_map(|idx| {
+            let existing_type_url = idx.index_details.as_ref()?.type_url.as_str();
+            (Some(existing_type_url) != incoming_type_url.as_deref())
+                .then(|| existing_type_url.to_owned())
+        });
+        let missing_fragments = &dataset_fragments - &incoming_fragments;
+        if let Some(existing_type_url) = &existing_different_type_url
+            && !missing_fragments.is_empty()
+        {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: cannot change index '{}' from type '{}' to type '{}' with partial fragment coverage; incoming segments are missing current fragments {:?}",
+                index_name,
+                existing_type_url,
+                incoming_type_url.as_deref().unwrap_or("<missing>"),
+                missing_fragments.iter().collect::<Vec<_>>()
+            )));
+        }
+
+        let is_index_type_change = existing_different_type_url.is_some();
         let removed_indices = existing_named_indices
             .into_iter()
             .map(|idx| -> Result<Option<IndexMetadata>> {
+                // A logical index cannot combine segment types. Full current-fragment
+                // coverage was verified above, so a type change replaces every segment.
+                if is_index_type_change {
+                    return Ok(Some(idx));
+                }
+
                 let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
                 else {
                     if incoming_fragments != dataset_fragments {
@@ -7690,6 +7719,84 @@ mod tests {
             committed.index_details.unwrap().type_url,
             replacement_type_url
         );
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_partial_index_type_change() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.path().to_str().unwrap(),
+            Some(WriteParams {
+                max_rows_per_file: 20,
+                max_rows_per_group: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let index_name = "shared_name";
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut original_segments = Vec::with_capacity(fragments.len());
+        for fragment in &fragments {
+            original_segments.push(
+                dataset
+                    .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(index_name, "id", original_segments)
+            .await
+            .unwrap();
+        let committed_version = dataset.manifest.version;
+
+        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let replacement = dataset
+            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .fragments(vec![fragments[0].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let error = dataset
+            .commit_existing_index_segments(index_name, "id", vec![replacement])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected invalid input error, got: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("cannot change index 'shared_name'")
+        );
+        assert!(error.to_string().contains("missing current fragments [1]"));
+        assert_eq!(dataset.manifest.version, committed_version);
+
+        let committed =
+            crate::index::scalar_logical::load_named_scalar_segments(&dataset, "id", index_name)
+                .await
+                .unwrap();
+        assert_eq!(committed.len(), 2);
+        assert!(committed.iter().all(|segment| {
+            segment
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url.ends_with("BTreeIndexDetails"))
+        }));
     }
 
     #[tokio::test]
