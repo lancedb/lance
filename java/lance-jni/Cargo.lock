@@ -4278,6 +4278,7 @@ name = "lance-tokenizer"
 version = "10.1.0-beta.2"
 dependencies = [
  "icu_segmenter",
+ "pagefind_stem",
  "rust-stemmers",
  "serde",
  "stop-words",
@@ -5216,6 +5217,12 @@ name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
+
+[[package]]
+name = "pagefind_stem"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8dfa810b158f3ac364e5acd43ca4a6020a6e729d40c15ce1bed1d911237a52e5"
 
 [[package]]
 name = "parking"

@@ -15,6 +15,7 @@ rust-version.workspace = true
 icu_segmenter = { workspace = true }
 jieba-rs = { workspace = true, optional = true }
 lindera = { workspace = true, optional = true }
+pagefind_stem = { version = "1.0.0", default-features = false, features = ["greek"] }
 rust-stemmers = "1.2.0"
 serde = { workspace = true, features = ["derive"] }
 stop-words = { version = "0.10.0", default-features = false, features = ["iso", "nltk"] }

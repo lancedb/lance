@@ -5147,6 +5147,7 @@ dependencies = [
  "icu_segmenter",
  "jieba-rs",
  "lindera",
+ "pagefind_stem",
  "rust-stemmers",
  "serde",
  "stop-words",
@@ -6438,6 +6439,12 @@ dependencies = [
  "libc",
  "winapi",
 ]
+
+[[package]]
+name = "pagefind_stem"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8dfa810b158f3ac364e5acd43ca4a6020a6e729d40c15ce1bed1d911237a52e5"
 
 [[package]]
 name = "parking"
