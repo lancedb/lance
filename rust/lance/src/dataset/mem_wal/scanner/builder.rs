@@ -19,6 +19,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
 use lance_core::{Error, Result, is_system_column};
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
@@ -56,9 +57,15 @@ struct LsmVectorQuery {
 /// If `filter` is a point-lookup shape on `pk_col` — `pk = lit` (either
 /// operand order) or `pk IN (lit, …)` — return the literal key values. Any
 /// other shape returns `None`, so the scanner falls through to the general
-/// scan plan. Type coercion is left to the lookup path (an exact-type literal
-/// takes the fast BTree path; a coercible one falls back internally).
-fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>> {
+/// scan plan. `IN` keys are normalized to `pk_type` only for deduplication;
+/// the first original literal is retained so the lookup path still chooses
+/// between its exact-type fast path and coercing fallback. A literal that
+/// cannot be normalized routes the expression through the general scan.
+fn extract_pk_point_keys(
+    filter: &Expr,
+    pk_col: &str,
+    pk_type: &DataType,
+) -> Option<Vec<ScalarValue>> {
     match filter {
         Expr::BinaryExpr(b) if matches!(b.op, Operator::Eq) => {
             match (b.left.as_ref(), b.right.as_ref()) {
@@ -84,7 +91,8 @@ fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>
                 let Expr::Literal(lit, _) = e else {
                     return None; // a non-literal IN element → not a point lookup
                 };
-                if seen.insert(lit) {
+                let identity = safe_coerce_scalar(lit, pk_type)?;
+                if seen.insert(identity) {
                     vals.push(lit.clone());
                 }
             }
@@ -704,7 +712,9 @@ impl LsmScanner {
             && !self.with_row_address
             && !self.projection_has_system_columns()
             && let Some(filter) = &self.filter
-            && let Some(keys) = extract_pk_point_keys(filter, &self.pk_columns[0])
+            && let Ok(pk_field) = base_schema.field_with_name(&self.pk_columns[0])
+            && let Some(keys) =
+                extract_pk_point_keys(filter, &self.pk_columns[0], pk_field.data_type())
         {
             let mut planner =
                 LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema);
@@ -935,6 +945,22 @@ mod tests {
         // so just test the type construction
         assert_eq!(pk_columns.len(), 1);
         assert!(shard_snapshots.is_empty());
+    }
+
+    #[test]
+    fn point_lookup_extraction_requires_normalizable_literals() {
+        use datafusion::prelude::{col, lit};
+
+        let filters = [
+            col("id").in_list(vec![lit(1i32), lit("not an integer")], false),
+            col("id").in_list(vec![lit(1i32), col("other")], false),
+        ];
+        for filter in filters {
+            assert!(
+                extract_pk_point_keys(&filter, "id", &DataType::Int32).is_none(),
+                "unsupported point-lookup filter must use the scan path: {filter}"
+            );
+        }
     }
 
     #[test]
@@ -1984,6 +2010,17 @@ mod tests {
         // match behind the duplicate.
         let plan = scanner()
             .filter_expr(col("id").in_list(vec![lit(1i32), lit(1i32), lit(2i32)], false))
+            .limit(Some(2), None)
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![1, 2]);
+
+        // Distinct literal types can coerce to the same primary-key value and
+        // must share one deduplication identity before the limit is applied.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(1i64), lit(2i32)], false))
             .limit(Some(2), None)
             .unwrap()
             .create_plan()
