@@ -968,6 +968,25 @@ impl CompactionPlan {
     }
 }
 
+// Blob v2 columns take two different struct shapes on the compaction path, and
+// neither is a named Rust type — each is identified by the child fields present:
+//
+//   descriptor view  struct<kind, position, size, blob_id, blob_uri>
+//                    `BLOB_V2_DESC_FIELDS`. What a scan of a written dataset
+//                    returns: where the payload lives, not the payload itself.
+//                    `position`/`size` are relative to a Lance data or pack file,
+//                    except when `kind == External`, where they are an offset and
+//                    length within the external object. See [`BlobKind`].
+//
+//   user view        struct<data, uri, position, size>
+//                    `BLOB_V2_USER_FIELDS`. What the writer accepts, carrying the
+//                    payload bytes inline. Also what a merge-insert source
+//                    supplies directly.
+//
+// Compaction reads the descriptor view and must hand the writer the user view, so
+// every blob v2 leaf in the batch has to be converted. `kind` is the field that
+// tells the two apart.
+
 /// Classification for one blob v2 row during compaction.
 ///
 /// - `Null`: NULL row.
@@ -979,7 +998,12 @@ enum RowClass {
     DataBlob,
 }
 
-/// Column views for the 5 fields in a blob v2 descriptor struct.
+/// Returns true when `struct_arr` is the descriptor view rather than the user view.
+fn is_descriptor_view(struct_arr: &StructArray) -> bool {
+    struct_arr.column_by_name("kind").is_some()
+}
+
+/// Column views for the 5 fields of the descriptor view (`BLOB_V2_DESC_FIELDS`).
 struct BlobV2Descriptor<'a> {
     kind_col: &'a arrow::array::UInt8Array,
     position_col: &'a arrow::array::UInt64Array,
@@ -1088,7 +1112,7 @@ fn classify_rows(
     })
 }
 
-/// Build a blob v2 user-view struct array from classification and descriptor.
+/// Convert the descriptor view into the user view, reading each payload back in.
 ///
 /// Reads blob data lazily using row addresses to avoid materializing all blob
 /// payloads in memory at once.
@@ -1185,8 +1209,8 @@ fn contains_blob_v2(field: &lance_core::datatypes::Field) -> bool {
 
 /// The Arrow field that [`transform_blob_v2_column`] produces for `arrow_field`.
 ///
-/// Blob v2 descriptor structs become the writer's user view; enclosing structs are
-/// rebuilt around their transformed children.
+/// Blob v2 leaves take the user-view type; enclosing structs are rebuilt around
+/// their transformed children.
 fn transformed_blob_v2_field(
     lance_field: &lance_core::datatypes::Field,
     arrow_field: &Arc<arrow_schema::Field>,
@@ -1290,10 +1314,10 @@ fn transform_blob_v2_column<'a>(
             return Ok((Arc::new(new_struct) as ArrayRef, new_field));
         }
 
-        // Merge-insert may supply a blob v2 value directly from the source.
-        // Those values are already in the writer's user view and do not refer
-        // to a row in the target dataset, unlike descriptor values from scans.
-        if struct_arr.column_by_name("kind").is_none() {
+        // Merge-insert may supply a blob v2 value directly from the source. Those
+        // values are already in the user view and, unlike descriptors read from a
+        // scan, do not refer to a row in the target dataset.
+        if !is_descriptor_view(struct_arr) {
             return Ok((array.clone(), arrow_field.clone()));
         }
 
@@ -1339,6 +1363,11 @@ pub(crate) fn transformed_blob_v2_schema(
     ))
 }
 
+/// Convert every blob v2 leaf in `batch` from the descriptor view to the user
+/// view, so the batch can be handed to the writer.
+///
+/// Requires a `_rowaddr` column, which is how each descriptor's payload is
+/// located; `keep_row_addr` controls whether it survives into the output.
 pub(crate) async fn transform_blob_v2_batch(
     dataset: &Arc<Dataset>,
     schema: &lance_core::datatypes::Schema,
