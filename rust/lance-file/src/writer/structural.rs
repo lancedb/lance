@@ -32,7 +32,10 @@ use tracing::instrument;
 use crate::{
     datatypes::FieldsWithMeta,
     format::{pb, pbfile},
-    writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriterOptions, PAGE_BUFFER_ALIGNMENT},
+    writer::{
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriterOptions, PAGE_BUFFER_ALIGNMENT,
+        cache_bytes_per_column,
+    },
 };
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -400,11 +403,7 @@ impl EncodingPipeline {
     }
 
     pub fn encoding_options(&self, schema: &Schema) -> EncodingOptions {
-        let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
-            data_cache_bytes / schema.fields.len() as u64
-        } else {
-            8 * 1024 * 1024
-        };
+        let cache_bytes_per_column = cache_bytes_per_column(&self.options, schema);
         let max_page_bytes = self.options.max_page_bytes.unwrap_or_else(|| {
             std::env::var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES)
                 .map(|value| {

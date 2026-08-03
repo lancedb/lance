@@ -62,6 +62,12 @@ use super::utils::SchemaAdapter;
 /// how far a single large input batch can overshoot `max_bytes_per_file`.
 const MAX_WRITE_BATCH_BYTES: usize = 10 * 1024 * 1024;
 
+/// Aggregate encoder buffering budget for current-format dataset writers.
+///
+/// Keeping this below [`MAX_WRITE_BATCH_BYTES`] ensures file-size checkpoints
+/// observe encoded output even when a schema has many individually small columns.
+const MAX_WRITE_BUFFER_BYTES: usize = MAX_WRITE_BATCH_BYTES / 2;
+
 mod commit;
 pub mod delete;
 mod insert;
@@ -1707,7 +1713,10 @@ async fn open_writer_with_options(
             version,
             writer,
             schema.clone(),
-            FileWriterOptions::default(),
+            FileWriterOptions {
+                data_cache_bytes: Some(MAX_WRITE_BUFFER_BYTES as u64),
+                ..Default::default()
+            },
         )?;
         let preprocessor = if enable_blob_v2 {
             Some(BlobPreprocessor::new(
@@ -2045,9 +2054,9 @@ mod tests {
         };
 
         // The writer will not generate a new file until enough data is *written* (not
-        // just accumulated) to justify a new file.  Since the default page size is 8MiB
-        // we actually need to generate quite a bit of data to trigger this. Use one
-        // input batch to ensure file-size enforcement does not depend on input batching.
+        // just accumulated) to justify a new file, so generate enough data to cross the
+        // encoder buffer budget. Use one input batch to ensure file-size enforcement
+        // does not depend on input batching.
         //
         // To avoid generating and writing millions of rows (which is a bit slow for a unit
         // test) we can use a large data type (1KiB binary)
@@ -2060,6 +2069,56 @@ mod tests {
         let (fragments, _) = reader_to_frags(data_reader).await.unwrap();
 
         assert_eq!(fragments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_file_size_wide_single_batch() {
+        let num_columns = 2000;
+        let num_rows = 16 * 1024;
+        let schema = Arc::new(ArrowSchema::new(
+            (0..num_columns)
+                .map(|index| ArrowField::new(format!("c{index}"), DataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ));
+        let values = Arc::new(Int32Array::from_iter(0..num_rows));
+        let batch = RecordBatch::try_new(schema.clone(), vec![values; num_columns]).unwrap();
+        assert!(batch.get_array_memory_size() > MAX_WRITE_BATCH_BYTES);
+
+        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter([Ok::<_, DataFusionError>(batch)]),
+        ));
+        let write_params = WriteParams {
+            max_rows_per_file: 2 * 1024 * 1024,
+            max_bytes_per_file: 2 * 1024,
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        let schema = Schema::try_from(schema.as_ref()).unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+        let (fragments, _) = write_fragments_internal(
+            None,
+            object_store,
+            &Path::from("wide-test"),
+            schema,
+            data_stream,
+            write_params,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(fragments.len() > 1, "got {} fragment(s)", fragments.len());
+        let max_file_size = fragments
+            .iter()
+            .flat_map(|fragment| &fragment.files)
+            .map(|file| file.file_size_bytes.get().unwrap().get())
+            .max()
+            .unwrap();
+        assert!(
+            max_file_size < (2 * MAX_WRITE_BATCH_BYTES) as u64,
+            "largest file was {max_file_size} bytes"
+        );
     }
 
     #[tokio::test]

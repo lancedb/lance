@@ -226,8 +226,7 @@ def test_optimize_max_bytes(tmp_path: Path):
         mode="overwrite",
     )
 
-    # In this test max_bytes_per_file is still too small but the batch size
-    # is so large we read the entire input in a single batch
+    # A large input batch must still honor max_bytes_per_file.
     metrics = dataset.optimize.compact_files(
         target_rows_per_fragment=100 * 1024,
         materialize_deletions=False,
@@ -236,12 +235,12 @@ def test_optimize_max_bytes(tmp_path: Path):
     )
 
     assert metrics.fragments_removed == 2
-    assert metrics.fragments_added == 2
+    assert metrics.fragments_added > 2
     assert metrics.files_removed == 2
-    assert metrics.files_added == 2
+    assert metrics.files_added > 2
 
     num_frags = len(dataset.get_fragments())
-    assert num_frags == 2
+    assert num_frags == metrics.fragments_added
 
 
 def create_table(min, max, nvec, ndim=8):

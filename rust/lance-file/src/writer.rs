@@ -49,6 +49,16 @@ pub struct FileWriterOptions {
     pub keep_original_array: Option<bool>,
 }
 
+pub(crate) fn cache_bytes_per_column(options: &FileWriterOptions, schema: &Schema) -> u64 {
+    options
+        .data_cache_bytes
+        .map(|data_cache_bytes| {
+            let num_columns = schema.fields_pre_order().count().max(1) as u64;
+            data_cache_bytes / num_columns
+        })
+        .unwrap_or(8 * 1024 * 1024)
+}
+
 /// A type-erased current-format file writer.
 ///
 /// This enum exists for callers that select a concrete file version at

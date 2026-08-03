@@ -37,7 +37,7 @@ use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::writer::{
     ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriteSummary, FileWriterOptions,
-    PAGE_BUFFER_ALIGNMENT,
+    PAGE_BUFFER_ALIGNMENT, cache_bytes_per_column,
 };
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -336,11 +336,7 @@ impl Writer {
     }
 
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
-        let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
-            data_cache_bytes / schema.fields.len() as u64
-        } else {
-            8 * 1024 * 1024
-        };
+        let cache_bytes_per_column = cache_bytes_per_column(&self.options, &schema);
 
         let max_page_bytes = self.options.max_page_bytes.unwrap_or_else(|| {
             std::env::var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES)
