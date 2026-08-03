@@ -4666,18 +4666,25 @@ impl PrimitiveStructuralEncoder {
         column_index: u32,
         field: Field,
         encoding_metadata: Arc<HashMap<String, String>>,
+        use_shared_dictionary_sizing: bool,
     ) -> Result<Self> {
         for page_encoding in page_encodings.iter() {
             page_encoding
                 .behavior
                 .validate_field(&field, &encoding_metadata)?;
         }
+        let accumulation_queue = AccumulationQueue::new(
+            options.cache_bytes_per_column,
+            column_index,
+            options.keep_original_array,
+        );
+        let accumulation_queue = if use_shared_dictionary_sizing {
+            accumulation_queue
+        } else {
+            accumulation_queue.with_legacy_dictionary_sizing()
+        };
         Ok(Self {
-            accumulation_queue: AccumulationQueue::new(
-                options.cache_bytes_per_column,
-                column_index,
-                options.keep_original_array,
-            ),
+            accumulation_queue,
             keep_original_array: options.keep_original_array,
             accumulated_repdefs: Vec::new(),
             column_index,

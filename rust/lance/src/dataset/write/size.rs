@@ -5,15 +5,24 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, MapArray, RecordBatch, cast::AsArray};
 use arrow_schema::DataType;
-use lance_arrow::{list::ListArrayExt, memory::batch_slice_memory_size};
+use lance_arrow::{
+    list::ListArrayExt,
+    memory::{SliceMemorySize, batch_slice_memory_size_parts},
+};
 
 /// Estimates the uncompressed values and structural levels produced by a
 /// current-format writer for one logical batch slice.
-pub(super) fn estimated_write_batch_bytes(batch: &RecordBatch) -> usize {
+pub(super) fn estimated_write_batch_size(batch: &RecordBatch) -> SliceMemorySize {
     let structural_bytes = batch.columns().iter().fold(0_u64, |bytes, array| {
         bytes.saturating_add(estimated_structural_bytes(array, 0, false, false))
     });
-    batch_slice_memory_size(batch).saturating_add(structural_bytes.min(usize::MAX as u64) as usize)
+    let memory = batch_slice_memory_size_parts(batch);
+    SliceMemorySize {
+        shared: memory.shared,
+        incremental: memory
+            .incremental
+            .saturating_add(structural_bytes.min(usize::MAX as u64) as usize),
+    }
 }
 
 fn estimated_structural_bytes(
@@ -121,7 +130,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![struct_array]).unwrap();
 
-        assert!(estimated_write_batch_bytes(&batch) >= num_rows * 2);
+        assert!(estimated_write_batch_size(&batch).total() >= num_rows * 2);
     }
 
     #[test]
@@ -135,6 +144,8 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter(0..1000))]).unwrap();
         let slice = batch.slice(100, 10);
 
-        assert!(estimated_write_batch_bytes(&slice) < estimated_write_batch_bytes(&batch));
+        assert!(
+            estimated_write_batch_size(&slice).total() < estimated_write_batch_size(&batch).total()
+        );
     }
 }

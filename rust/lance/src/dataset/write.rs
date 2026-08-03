@@ -50,7 +50,7 @@ use crate::index::DatasetIndexExt;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::session::Session;
 
-use self::size::estimated_write_batch_bytes;
+use self::size::estimated_write_batch_size;
 use super::DATA_DIR;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
@@ -636,12 +636,12 @@ pub async fn do_write_fragments(
         // Current writers do not use row groups, but they need bounded batches
         // so a single large input batch cannot bypass file-size checkpoints.
         let data_schema = data.schema();
-        let data = lance_arrow::stream::rechunk_stream_by_size_with_estimator(
+        let data = lance_arrow::stream::rechunk_stream_by_size_with_shared_estimator(
             data,
             data_schema.clone(),
             0,
             write_batch_bytes,
-            estimated_write_batch_bytes,
+            estimated_write_batch_size,
         );
         let data = Box::pin(RecordBatchStreamAdapter::new(data_schema, data));
         break_stream(data, params.max_rows_per_file)

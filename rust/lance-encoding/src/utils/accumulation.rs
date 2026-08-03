@@ -6,16 +6,160 @@
 use std::sync::{Arc, Weak};
 
 use arrow_array::{Array, ArrayRef, cast::AsArray, make_array};
+use arrow_data::ArrayData;
+use arrow_schema::DataType;
 use lance_arrow::deepcopy::deep_copy_array_sliced;
-use lance_arrow::memory::array_slice_memory_size;
+use lance_arrow::memory::{array_slice_memory_size, array_slice_memory_size_parts};
 use log::{debug, trace};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArrayDataIdentity {
+    data_type: DataType,
+    len: usize,
+    offset: usize,
+    buffers: Vec<(usize, usize)>,
+    nulls: Option<(usize, usize, usize, usize)>,
+    children: Vec<Self>,
+}
+
+impl ArrayDataIdentity {
+    fn new(data: &ArrayData) -> Self {
+        let buffers = data
+            .buffers()
+            .iter()
+            .map(|buffer| (buffer.as_ptr() as usize, buffer.len()))
+            .collect();
+        let nulls = data.nulls().map(|nulls| {
+            let values = nulls.inner();
+            (
+                values.inner().as_ptr() as usize,
+                values.inner().len(),
+                values.offset(),
+                values.len(),
+            )
+        });
+        let children = data.child_data().iter().map(Self::new).collect();
+        Self {
+            data_type: data.data_type().clone(),
+            len: data.len(),
+            offset: data.offset(),
+            buffers,
+            nulls,
+            children,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedDictionaryValues {
+    source: Weak<dyn Array>,
+    identity: ArrayDataIdentity,
+    values: ArrayRef,
+}
+
+impl CachedDictionaryValues {
+    fn matches(&mut self, source: &ArrayRef, identity: &ArrayDataIdentity) -> bool {
+        if self.identity != *identity {
+            return false;
+        }
+
+        if self.source.upgrade().is_some() {
+            // The allocation represented by `identity` is still live, so its
+            // buffer addresses cannot have been reused for unrelated data.
+            return true;
+        }
+
+        // A raw address may be reused after the original wrapper and buffers
+        // are gone. Validate against the detached logical values before
+        // adopting a new wrapper with the same buffer fingerprint.
+        if source.to_data() == self.values.to_data() {
+            self.source = Arc::downgrade(source);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DictionaryKeySlice {
+    allocation: (usize, usize),
+    start: usize,
+    end: usize,
+}
+
+impl DictionaryKeySlice {
+    fn new(keys: &dyn Array) -> Option<Self> {
+        let data = keys.to_data();
+        let buffer = data.buffers().first()?;
+        let start = buffer.ptr_offset();
+        let end = start.checked_add(buffer.len())?;
+        Some(Self {
+            allocation: (buffer.data_ptr().as_ptr() as usize, buffer.capacity()),
+            start,
+            end,
+        })
+    }
+
+    fn has_unreferenced_values(&self) -> bool {
+        self.allocation.1 > 0 && self.end < self.allocation.1
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DictionaryRun {
+    values: ArrayDataIdentity,
+    key_allocation: (usize, usize),
+    next_key_offset: usize,
+}
+
+impl DictionaryRun {
+    fn new(values: ArrayDataIdentity, keys: &DictionaryKeySlice) -> Self {
+        Self {
+            values,
+            key_allocation: keys.allocation,
+            next_key_offset: keys.end,
+        }
+    }
+
+    fn continues(&self, values: &ArrayDataIdentity, keys: &DictionaryKeySlice) -> bool {
+        self.values == *values
+            && self.key_allocation == keys.allocation
+            && self.next_key_offset == keys.start
+    }
+}
+
+struct DictionaryArrayInfo {
+    values: ArrayRef,
+    values_identity: ArrayDataIdentity,
+    keys: Option<DictionaryKeySlice>,
+    shared_bytes: u64,
+    incremental_bytes: u64,
+}
+
+impl DictionaryArrayInfo {
+    fn new(array: &ArrayRef) -> Option<Self> {
+        let dictionary = array.as_any_dictionary_opt()?;
+        let values = dictionary.values().clone();
+        let size = array_slice_memory_size_parts(array.as_ref());
+        Some(Self {
+            values_identity: ArrayDataIdentity::new(&values.to_data()),
+            keys: DictionaryKeySlice::new(dictionary.keys()),
+            values,
+            shared_bytes: size.shared as u64,
+            incremental_bytes: size.incremental as u64,
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct AccumulationQueue {
     cache_bytes: u64,
     keep_original_array: bool,
+    use_shared_dictionary_sizing: bool,
     buffered_arrays: Vec<ArrayRef>,
-    detached_dictionary_values: Vec<(Weak<dyn Array>, ArrayRef)>,
+    dictionary_values: Vec<CachedDictionaryValues>,
+    dictionary_run: Option<DictionaryRun>,
     current_bytes: u64,
     // Row number of the first item in buffered_arrays, reset on flush
     row_number: u64,
@@ -30,13 +174,21 @@ impl AccumulationQueue {
         Self {
             cache_bytes,
             buffered_arrays: Vec::new(),
-            detached_dictionary_values: Vec::new(),
+            dictionary_values: Vec::new(),
+            dictionary_run: None,
             current_bytes: 0,
             column_index,
             keep_original_array,
+            use_shared_dictionary_sizing: true,
             row_number: u64::MAX,
             num_rows: 0,
         }
+    }
+
+    /// Retain the historical accounting used by stable writer entry points.
+    pub(crate) fn with_legacy_dictionary_sizing(mut self) -> Self {
+        self.use_shared_dictionary_sizing = false;
+        self
     }
 
     /// Adds an array to the queue, if there is enough data then the queue is flushed
@@ -51,8 +203,46 @@ impl AccumulationQueue {
             self.row_number = row_number;
         }
         self.num_rows += num_rows;
-        self.current_bytes += array_slice_memory_size(array.as_ref()) as u64;
-        if self.current_bytes > self.cache_bytes {
+        let dictionary = DictionaryArrayInfo::new(&array);
+        let cached_values = dictionary.as_ref().and_then(|dictionary| {
+            self.find_dictionary_values(&dictionary.values, &dictionary.values_identity)
+        });
+        let inserted_bytes = if self.use_shared_dictionary_sizing {
+            dictionary.as_ref().map_or_else(
+                || array_slice_memory_size(array.as_ref()) as u64,
+                |dictionary| {
+                    dictionary.incremental_bytes
+                        + if cached_values.is_some() {
+                            0
+                        } else {
+                            dictionary.shared_bytes
+                        }
+                },
+            )
+        } else {
+            array_slice_memory_size(array.as_ref()) as u64
+        };
+        self.current_bytes = self.current_bytes.saturating_add(inserted_bytes);
+
+        let continues_dictionary_run = dictionary
+            .as_ref()
+            .and_then(|dictionary| {
+                dictionary.keys.as_ref().map(|keys| {
+                    self.dictionary_run
+                        .as_ref()
+                        .is_some_and(|run| run.continues(&dictionary.values_identity, keys))
+                })
+            })
+            .unwrap_or(false);
+        let starts_sliced_dictionary_run = self.buffered_arrays.is_empty()
+            && dictionary
+                .as_ref()
+                .and_then(|dictionary| dictionary.keys.as_ref())
+                .is_some_and(DictionaryKeySlice::has_unreferenced_values);
+        let defer_dictionary_flush = self.use_shared_dictionary_sizing
+            && (continues_dictionary_run || starts_sliced_dictionary_run);
+
+        if self.current_bytes > self.cache_bytes && !defer_dictionary_flush {
             debug!(
                 "Flushing column {} page of size {} bytes (unencoded)",
                 self.column_index, self.current_bytes
@@ -60,13 +250,11 @@ impl AccumulationQueue {
             // Dictionary slices already in the queue use detached values. Reuse
             // those values for the final slice so concatenation still recognizes
             // one shared dictionary. Other arrays need no copy before a flush.
-            let array = if !self.keep_original_array
-                && !self.buffered_arrays.is_empty()
-                && array.as_any_dictionary_opt().is_some()
-            {
-                self.deep_copy_array_sliced(array)
-            } else {
-                array
+            let array = match (dictionary.as_ref(), cached_values) {
+                (Some(_), Some(index)) if !self.keep_original_array => {
+                    self.copy_dictionary_array(&array, index, false)
+                }
+                _ => array,
             };
             self.buffered_arrays.push(array);
             self.current_bytes = 0;
@@ -81,9 +269,19 @@ impl AccumulationQueue {
                 self.column_index, self.current_bytes
             );
             if self.keep_original_array {
-                self.buffered_arrays.push(array);
+                if let Some(dictionary) = dictionary.as_ref() {
+                    self.cache_dictionary_values(dictionary, cached_values);
+                }
+                self.record_dictionary_run(dictionary.as_ref());
+                self.buffered_arrays.push(array)
             } else {
-                let array = self.deep_copy_array_sliced(array);
+                let array = if let Some(dictionary) = dictionary.as_ref() {
+                    let index = self.cache_dictionary_values(dictionary, cached_values);
+                    self.copy_dictionary_array(&array, index, defer_dictionary_flush)
+                } else {
+                    deep_copy_array_sliced(array.as_ref())
+                };
+                self.record_dictionary_run(dictionary.as_ref());
                 self.buffered_arrays.push(array)
             }
             None
@@ -116,54 +314,101 @@ impl AccumulationQueue {
         self.current_bytes
     }
 
-    fn deep_copy_array_sliced(&mut self, array: ArrayRef) -> ArrayRef {
-        let Some(dictionary) = array.as_any_dictionary_opt() else {
-            return deep_copy_array_sliced(array.as_ref());
-        };
+    fn find_dictionary_values(
+        &mut self,
+        values: &ArrayRef,
+        identity: &ArrayDataIdentity,
+    ) -> Option<usize> {
+        self.dictionary_values
+            .iter_mut()
+            .position(|cached| cached.matches(values, identity))
+    }
 
-        let source_values = dictionary.values();
-        let detached_values = self
-            .detached_dictionary_values
-            .iter()
-            .find_map(|(source, detached)| {
-                source
-                    .upgrade()
-                    .filter(|source| Arc::ptr_eq(source, source_values))
-                    .map(|_| detached.clone())
-            })
-            .unwrap_or_else(|| {
-                let detached = deep_copy_array_sliced(source_values.as_ref());
-                self.detached_dictionary_values
-                    .push((Arc::downgrade(source_values), detached.clone()));
-                detached
+    fn cache_dictionary_values(
+        &mut self,
+        dictionary: &DictionaryArrayInfo,
+        cached_values: Option<usize>,
+    ) -> usize {
+        cached_values.unwrap_or_else(|| {
+            let values = if self.keep_original_array {
+                dictionary.values.clone()
+            } else {
+                deep_copy_array_sliced(dictionary.values.as_ref())
+            };
+            let index = self.dictionary_values.len();
+            self.dictionary_values.push(CachedDictionaryValues {
+                source: Arc::downgrade(&dictionary.values),
+                identity: dictionary.values_identity.clone(),
+                values,
             });
+            index
+        })
+    }
 
-        let keys = deep_copy_array_sliced(dictionary.keys()).to_data();
+    fn copy_dictionary_array(
+        &self,
+        array: &ArrayRef,
+        dictionary_values: usize,
+        keep_source_keys: bool,
+    ) -> ArrayRef {
+        let dictionary = array.as_any_dictionary();
+        let keys = if keep_source_keys {
+            dictionary.keys().to_data()
+        } else {
+            deep_copy_array_sliced(dictionary.keys()).to_data()
+        };
+        let values = self.dictionary_values[dictionary_values].values.to_data();
         // SAFETY: `keys` is a value-identical logical copy of this dictionary's
-        // primitive keys. `detached_values` is a value-identical copy of the same
+        // primitive keys. `values` is a value-identical copy of the same
         // source values array, so the original key bounds and dictionary types
         // remain valid when the two are combined.
         let data = unsafe {
             keys.into_builder()
                 .data_type(array.data_type().clone())
-                .child_data(vec![detached_values.to_data()])
+                .child_data(vec![values])
                 .build_unchecked()
         };
         make_array(data)
     }
 
+    fn record_dictionary_run(&mut self, dictionary: Option<&DictionaryArrayInfo>) {
+        let Some(dictionary) = dictionary else {
+            self.dictionary_run = None;
+            return;
+        };
+        let Some(keys) = dictionary.keys.as_ref() else {
+            self.dictionary_run = None;
+            return;
+        };
+
+        if self.buffered_arrays.is_empty() {
+            self.dictionary_run =
+                Some(DictionaryRun::new(dictionary.values_identity.clone(), keys));
+        } else if let Some(run) = self.dictionary_run.as_mut() {
+            if run.continues(&dictionary.values_identity, keys) {
+                run.next_key_offset = keys.end;
+            } else {
+                self.dictionary_run = None;
+            }
+        }
+    }
+
     fn take_buffered_arrays(&mut self) -> Vec<ArrayRef> {
-        self.detached_dictionary_values.clear();
+        self.dictionary_values.clear();
+        self.dictionary_run = None;
         std::mem::take(&mut self.buffered_arrays)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array, DictionaryArray, Int8Array, StringArray, types::Int8Type};
-    use rstest::rstest;
-
     use super::*;
+    use arrow_array::{
+        Array, DictionaryArray, Int8Array, Int32Array, RecordBatch, StringArray,
+        types::{Int8Type, Int32Type},
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::{StreamExt, stream};
 
     #[test]
     fn sliced_utf8_cache_does_not_copy_the_full_parent() {
@@ -204,35 +449,114 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[case::final_flush(false)]
-    #[case::threshold_flush(true)]
-    fn copied_dictionary_slices_reuse_shared_values(#[case] is_threshold_flush: bool) {
+    #[test]
+    fn copied_dictionary_slices_reuse_shared_values() {
         let values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
         let keys = Int8Array::from((0..100).map(|index| (index % 2) as i8).collect::<Vec<_>>());
         let dictionary =
             Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef;
 
         let slice_bytes = array_slice_memory_size(dictionary.slice(0, 10).as_ref()) as u64;
-        let cache_bytes = if is_threshold_flush {
-            slice_bytes * 4
-        } else {
-            8 * 1024 * 1024
-        };
-        let mut queue = AccumulationQueue::new(cache_bytes, 0, false);
-        let mut flushed = None;
+        let mut queue = AccumulationQueue::new(slice_bytes * 2, 0, false);
+        let slice_size = array_slice_memory_size_parts(dictionary.slice(0, 10).as_ref());
         for offset in (0..50).step_by(10) {
-            flushed = queue.insert(dictionary.slice(offset, 10), offset as u64, 10);
+            assert!(
+                queue
+                    .insert(dictionary.slice(offset, 10), offset as u64, 10)
+                    .is_none()
+            );
         }
-        let (arrays, _, num_rows) = if is_threshold_flush {
-            flushed.unwrap()
-        } else {
-            assert!(flushed.is_none());
-            queue.flush().unwrap()
-        };
+        assert_eq!(
+            queue.pending_bytes(),
+            (slice_size.shared + 5 * slice_size.incremental) as u64
+        );
+        let (arrays, _, num_rows) = queue.flush().unwrap();
         let data = crate::data::DataBlock::from_arrays(&arrays, num_rows);
         let dictionary = data.as_dictionary().unwrap();
 
         assert_eq!(dictionary.dictionary.num_values(), 2);
+    }
+
+    #[test]
+    fn copied_dictionary_wrappers_sharing_buffers_reuse_values() {
+        let source_values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        let arrays = (0..5)
+            .map(|_| {
+                let values = make_array(source_values.to_data());
+                let keys =
+                    Int8Array::from((0..10).map(|index| (index % 2) as i8).collect::<Vec<_>>());
+                Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef
+            })
+            .collect::<Vec<_>>();
+
+        let baseline = crate::data::DataBlock::from_arrays(&arrays, 50);
+        assert_eq!(baseline.as_dictionary().unwrap().dictionary.num_values(), 2);
+
+        let mut queue = AccumulationQueue::new(8 * 1024 * 1024, 0, false);
+        for (row_number, array) in arrays.into_iter().enumerate() {
+            assert!(queue.insert(array, (row_number * 10) as u64, 10).is_none());
+        }
+        let array_size = array_slice_memory_size_parts(queue.buffered_arrays[0].as_ref());
+        assert_eq!(
+            queue.pending_bytes(),
+            (array_size.shared + 5 * array_size.incremental) as u64
+        );
+        let (arrays, _, num_rows) = queue.flush().unwrap();
+        let copied = crate::data::DataBlock::from_arrays(&arrays, num_rows);
+
+        assert_eq!(copied.as_dictionary().unwrap().dictionary.num_values(), 2);
+    }
+
+    #[tokio::test]
+    async fn large_dictionary_is_not_repeated_across_checkpoint_slices() {
+        const MIB: usize = 1024 * 1024;
+        let value = "x".repeat(5 * MIB);
+        let values = Arc::new(StringArray::from(vec![value.as_str(), value.as_str()])) as ArrayRef;
+        let keys = Int32Array::from(
+            (0..10 * MIB)
+                .map(|index| (index % 2) as i32)
+                .collect::<Vec<_>>(),
+        );
+        let dictionary =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "item",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![dictionary]).unwrap();
+
+        let slices = lance_arrow::stream::rechunk_stream_by_size_with_shared_estimator(
+            stream::iter([Ok::<_, arrow_schema::ArrowError>(batch)]),
+            schema,
+            0,
+            10 * MIB,
+            lance_arrow::memory::batch_slice_memory_size_parts,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+        let mut queue = AccumulationQueue::new(8 * MIB as u64, 0, false);
+        let mut encoded_dictionary_values = 0;
+        for (row_number, slice) in slices.iter().enumerate() {
+            if let Some((arrays, _, num_rows)) = queue.insert(
+                slice.column(0).clone(),
+                row_number as u64,
+                slice.num_rows() as u64,
+            ) {
+                let data = crate::data::DataBlock::from_arrays(&arrays, num_rows);
+                encoded_dictionary_values += data.as_dictionary().unwrap().dictionary.num_values();
+            }
+        }
+        if let Some((arrays, _, num_rows)) = queue.flush() {
+            let data = crate::data::DataBlock::from_arrays(&arrays, num_rows);
+            encoded_dictionary_values += data.as_dictionary().unwrap().dictionary.num_values();
+        }
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(encoded_dictionary_values, 2);
     }
 }

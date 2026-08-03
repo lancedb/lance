@@ -26,6 +26,7 @@ use super::{ColumnIndexSequence, FieldEncoder, FieldEncodingContext};
 #[derive(Debug, Clone)]
 pub struct PrimitiveFieldEncoding {
     page_encodings: Arc<[PrimitivePageEncoding]>,
+    use_shared_dictionary_sizing: bool,
 }
 
 impl PrimitiveFieldEncoding {
@@ -33,7 +34,15 @@ impl PrimitiveFieldEncoding {
     pub fn new(page_encodings: impl IntoIterator<Item = PrimitivePageEncoding>) -> Self {
         Self {
             page_encodings: page_encodings.into_iter().collect(),
+            use_shared_dictionary_sizing: false,
         }
+    }
+
+    /// Preserve shared dictionaries across logical checkpoint slices.
+    #[doc(hidden)]
+    pub fn with_shared_dictionary_sizing(mut self) -> Self {
+        self.use_shared_dictionary_sizing = true;
+        self
     }
 
     fn is_primitive_type(data_type: &DataType) -> bool {
@@ -84,6 +93,7 @@ impl PrimitiveFieldEncoding {
             column_index,
             field,
             Arc::new(context.root_field_metadata.clone()),
+            self.use_shared_dictionary_sizing,
         )?))
     }
 

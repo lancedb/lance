@@ -424,12 +424,18 @@ impl PrimitiveFieldEncoder {
         field: Field,
         use_logical_page_sizing: bool,
     ) -> Result<Self> {
+        let accumulation_queue = AccumulationQueue::new(
+            options.cache_bytes_per_column,
+            column_index,
+            options.keep_original_array,
+        );
+        let accumulation_queue = if use_logical_page_sizing {
+            accumulation_queue
+        } else {
+            accumulation_queue.with_legacy_dictionary_sizing()
+        };
         Ok(Self {
-            accumulation_queue: AccumulationQueue::new(
-                options.cache_bytes_per_column,
-                column_index,
-                options.keep_original_array,
-            ),
+            accumulation_queue,
             column_index,
             max_page_bytes: options.max_page_bytes,
             array_encoding_strategy,

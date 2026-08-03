@@ -9,6 +9,7 @@ use futures::stream::{self, Stream, StreamExt};
 use std::{collections::VecDeque, pin::Pin, sync::Arc};
 
 use crate::deepcopy::deep_copy_batch_sliced;
+use crate::memory::SliceMemorySize;
 
 /// Rechunks a stream of [`RecordBatch`] so that each output batch has
 /// approximately `target_bytes` of array data.
@@ -33,7 +34,7 @@ where
         min_bytes,
         max_bytes,
         false,
-        Arc::new(RecordBatch::get_array_memory_size),
+        Arc::new(|batch| SliceMemorySize::incremental(batch.get_array_memory_size())),
     )
 }
 
@@ -53,6 +54,33 @@ where
     S: Stream<Item = Result<RecordBatch, E>>,
     E: From<ArrowError>,
     F: Fn(&RecordBatch) -> usize + Send + Sync + 'static,
+{
+    rechunk_stream_by_size_inner(
+        input,
+        input_schema,
+        min_bytes,
+        max_bytes,
+        false,
+        Arc::new(move |batch| SliceMemorySize::incremental(estimate_bytes(batch))),
+    )
+}
+
+/// Rechunks a stream using an estimator that distinguishes shared bytes.
+///
+/// Shared bytes, such as dictionary values, are not assumed to shrink when a
+/// batch is sliced. If the shared portion already reaches `max_bytes`, the
+/// batch is left intact because row slicing cannot bring it below the target.
+pub fn rechunk_stream_by_size_with_shared_estimator<S, E, F>(
+    input: S,
+    input_schema: SchemaRef,
+    min_bytes: usize,
+    max_bytes: usize,
+    estimate_bytes: F,
+) -> impl Stream<Item = Result<RecordBatch, E>>
+where
+    S: Stream<Item = Result<RecordBatch, E>>,
+    E: From<ArrowError>,
+    F: Fn(&RecordBatch) -> SliceMemorySize + Send + Sync + 'static,
 {
     rechunk_stream_by_size_inner(
         input,
@@ -95,7 +123,7 @@ where
         min_bytes,
         max_bytes,
         true,
-        Arc::new(RecordBatch::get_array_memory_size),
+        Arc::new(|batch| SliceMemorySize::incremental(batch.get_array_memory_size())),
     )
 }
 
@@ -105,7 +133,7 @@ fn rechunk_stream_by_size_inner<S, E>(
     min_bytes: usize,
     max_bytes: usize,
     deep_copy: bool,
-    estimate_bytes: Arc<dyn Fn(&RecordBatch) -> usize + Send + Sync>,
+    estimate_bytes: Arc<dyn Fn(&RecordBatch) -> SliceMemorySize + Send + Sync>,
 ) -> impl Stream<Item = Result<RecordBatch, E>>
 where
     S: Stream<Item = Result<RecordBatch, E>>,
@@ -139,7 +167,9 @@ where
             {
                 match state.input.next().await {
                     Some(Ok(batch)) => {
-                        state.acc_bytes += (state.estimate_bytes)(&batch);
+                        state.acc_bytes = state
+                            .acc_bytes
+                            .saturating_add((state.estimate_bytes)(&batch).total());
                         state.accumulated.push(batch);
                     }
                     Some(Err(e)) => return Err(e),
@@ -157,10 +187,12 @@ where
             // byte threshold, deliver it directly instead of concatenating
             // everything together (which would just get sliced back apart).
             if state.accumulated.len() > 1
-                && (state.estimate_bytes)(&state.accumulated[0]) >= state.min_bytes
+                && (state.estimate_bytes)(&state.accumulated[0]).total() >= state.min_bytes
             {
                 let b = state.accumulated.remove(0);
-                state.acc_bytes -= (state.estimate_bytes)(&b);
+                state.acc_bytes = state
+                    .acc_bytes
+                    .saturating_sub((state.estimate_bytes)(&b).total());
                 return Ok(Some((b, state)));
             }
 
@@ -207,28 +239,36 @@ fn slice_batch(
     max_bytes: usize,
     deep_copy: bool,
 ) -> Result<Vec<RecordBatch>, ArrowError> {
-    slice_batch_with_estimator(
-        batch,
-        max_bytes,
-        deep_copy,
-        &RecordBatch::get_array_memory_size,
-    )
+    slice_batch_with_estimator(batch, max_bytes, deep_copy, &|batch| {
+        SliceMemorySize::incremental(batch.get_array_memory_size())
+    })
 }
 
 fn slice_batch_with_estimator(
     batch: RecordBatch,
     max_bytes: usize,
     deep_copy: bool,
-    estimate_bytes: &dyn Fn(&RecordBatch) -> usize,
+    estimate_bytes: &dyn Fn(&RecordBatch) -> SliceMemorySize,
 ) -> Result<Vec<RecordBatch>, ArrowError> {
-    let batch_bytes = estimate_bytes(&batch);
+    let batch_size = estimate_bytes(&batch);
+    let batch_bytes = batch_size.total();
     let num_rows = batch.num_rows();
 
     if batch_bytes <= max_bytes || num_rows <= 1 {
         return Ok(vec![batch]);
     }
 
-    let rows_per_chunk = (max_bytes as u64 * num_rows as u64 / batch_bytes as u64).max(1) as usize;
+    // Shared bytes are repeated unchanged in every zero-copy slice. If they
+    // fill the target by themselves, slicing only multiplies that fixed cost.
+    if batch_size.shared >= max_bytes || batch_size.incremental == 0 {
+        return Ok(vec![batch]);
+    }
+
+    let incremental_target = max_bytes - batch_size.shared;
+    let rows_per_chunk = ((incremental_target as u128 * num_rows as u128)
+        / batch_size.incremental as u128)
+        .max(1)
+        .min(usize::MAX as u128) as usize;
 
     let mut result = Vec::new();
     let mut offset = 0;
@@ -267,7 +307,7 @@ struct RechunkState<S> {
     min_bytes: usize,
     max_bytes: usize,
     deep_copy: bool,
-    estimate_bytes: Arc<dyn Fn(&RecordBatch) -> usize + Send + Sync>,
+    estimate_bytes: Arc<dyn Fn(&RecordBatch) -> SliceMemorySize + Send + Sync>,
 }
 
 #[cfg(test)]
@@ -457,6 +497,44 @@ mod tests {
         let result = collect_rechunked(vec![batch], 0, bytes / 4);
         assert_eq!(total_rows(&result), 1000);
         assert_eq!(result.len(), expected_batches);
+    }
+
+    #[test]
+    fn test_shared_estimator_only_slices_incremental_bytes() {
+        let input = stream::iter([Ok::<_, ArrowError>(make_batch(100))]);
+        let rechunked =
+            rechunk_stream_by_size_with_shared_estimator(input, test_schema(), 0, 100, |batch| {
+                SliceMemorySize {
+                    shared: 60,
+                    incremental: batch.num_rows() * std::mem::size_of::<i32>(),
+                }
+            });
+        let batches = block_on(rechunked.collect::<Vec<_>>())
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(batches.len(), 10);
+        assert!(batches.iter().all(|batch| batch.num_rows() == 10));
+    }
+
+    #[test]
+    fn test_shared_estimator_does_not_repeat_oversized_shared_bytes() {
+        let input = stream::iter([Ok::<_, ArrowError>(make_batch(100))]);
+        let rechunked =
+            rechunk_stream_by_size_with_shared_estimator(input, test_schema(), 0, 100, |batch| {
+                SliceMemorySize {
+                    shared: 100,
+                    incremental: batch.num_rows() * std::mem::size_of::<i32>(),
+                }
+            });
+        let batches = block_on(rechunked.collect::<Vec<_>>())
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 100);
     }
 
     /// Build a batch with one variable-length string column.

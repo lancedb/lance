@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-use super::encoding_strategy;
+use super::{encoding_strategy, encoding_strategy_with_shared_dictionary_sizing};
 
 /// A writer for the Lance v2.1 file grammar.
 ///
@@ -33,6 +33,7 @@ pub struct Writer {
     sink: StructuralFileSink,
     encoding: EncodingPipeline,
     compression: CompressionParams,
+    use_shared_dictionary_sizing: bool,
 }
 
 impl Writer {
@@ -57,6 +58,17 @@ impl Writer {
         Ok(writer)
     }
 
+    pub(crate) fn try_new_with_shared_dictionary_sizing(
+        object_writer: Box<dyn ObjectWriter>,
+        schema: Schema,
+        options: FileWriterOptions,
+    ) -> Result<Self> {
+        let mut writer =
+            Self::new_lazy_with_policy(object_writer, options, Default::default(), true);
+        writer.initialize(schema)?;
+        Ok(writer)
+    }
+
     /// Create a v2.1 writer whose schema is inferred from the first batch.
     pub fn new_lazy(object_writer: Box<dyn ObjectWriter>, options: FileWriterOptions) -> Self {
         Self::new_lazy_with_compression(object_writer, options, Default::default())
@@ -68,17 +80,31 @@ impl Writer {
         options: FileWriterOptions,
         compression: CompressionParams,
     ) -> Self {
+        Self::new_lazy_with_policy(object_writer, options, compression, false)
+    }
+
+    fn new_lazy_with_policy(
+        object_writer: Box<dyn ObjectWriter>,
+        options: FileWriterOptions,
+        compression: CompressionParams,
+        use_shared_dictionary_sizing: bool,
+    ) -> Self {
         Self {
             sink: StructuralFileSink::new(object_writer),
             encoding: EncodingPipeline::new(options),
             compression,
+            use_shared_dictionary_sizing,
         }
     }
 
     fn initialize(&mut self, schema: Schema) -> Result<()> {
         let encoding_options = self.encoding.encoding_options(&schema);
         schema.validate()?;
-        let strategy = encoding_strategy(self.compression.clone());
+        let strategy = if self.use_shared_dictionary_sizing {
+            encoding_strategy_with_shared_dictionary_sizing(self.compression.clone())
+        } else {
+            encoding_strategy(self.compression.clone())
+        };
         let encoder = BatchEncoder::try_new(&schema, strategy.as_ref(), &encoding_options)?;
         self.encoding.initialize(schema, encoder, &mut self.sink);
         Ok(())

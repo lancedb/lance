@@ -48,10 +48,10 @@ pub fn create_writer(
     }
 }
 
-/// Create a writer that sizes V2.0 pages from logical array slices.
+/// Create a writer that preserves logical sizing across rechunked slices.
 ///
-/// This runtime policy is used for input that has already been rechunked into
-/// bounded zero-copy slices. Other versions use their standard writer.
+/// V2.0 sizes pages from logical array slices. All current versions preserve
+/// shared dictionaries across slices from the same input batch.
 #[doc(hidden)]
 pub fn create_writer_with_logical_page_sizing(
     version: ConcreteFileVersion,
@@ -64,7 +64,19 @@ pub fn create_writer_with_logical_page_sizing(
             v2_0::create_writer_with_logical_page_sizing(object_writer, schema, options)
                 .map(Into::into)
         }
-        _ => create_writer(version, object_writer, schema, options),
+        ConcreteFileVersion::V2_1 => {
+            v2_1::create_writer_with_shared_dictionary_sizing(object_writer, schema, options)
+                .map(Into::into)
+        }
+        ConcreteFileVersion::V2_2 => {
+            v2_2::create_writer_with_shared_dictionary_sizing(object_writer, schema, options)
+                .map(Into::into)
+        }
+        ConcreteFileVersion::V2_3 => {
+            v2_3::create_writer_with_shared_dictionary_sizing(object_writer, schema, options)
+                .map(Into::into)
+        }
+        ConcreteFileVersion::V1 => create_writer(version, object_writer, schema, options),
     }
 }
 

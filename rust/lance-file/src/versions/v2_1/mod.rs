@@ -93,13 +93,30 @@ impl FieldEncodingStrategy for FieldStrategy {
 
 /// Compose the v2.1 field encoding mechanisms.
 pub fn encoding_strategy(params: CompressionParams) -> Arc<dyn FieldEncodingStrategy> {
+    encoding_strategy_with_policy(params, false)
+}
+
+pub(crate) fn encoding_strategy_with_shared_dictionary_sizing(
+    params: CompressionParams,
+) -> Arc<dyn FieldEncodingStrategy> {
+    encoding_strategy_with_policy(params, true)
+}
+
+fn encoding_strategy_with_policy(
+    params: CompressionParams,
+    use_shared_dictionary_sizing: bool,
+) -> Arc<dyn FieldEncodingStrategy> {
     let compression = Arc::new(compression::Strategy::new(params));
-    Arc::new(FieldStrategy {
-        primitive: PrimitiveFieldEncoding::new([
-            PrimitivePageEncoding::reject_sparse(),
-            PrimitivePageEncoding::dense_u16(compression),
-        ]),
-    })
+    let primitive = PrimitiveFieldEncoding::new([
+        PrimitivePageEncoding::reject_sparse(),
+        PrimitivePageEncoding::dense_u16(compression),
+    ]);
+    let primitive = if use_shared_dictionary_sizing {
+        primitive.with_shared_dictionary_sizing()
+    } else {
+        primitive
+    };
+    Arc::new(FieldStrategy { primitive })
 }
 
 /// Create a v2.1 writer with an explicit schema.
@@ -109,6 +126,14 @@ pub fn create_writer(
     options: FileWriterOptions,
 ) -> Result<Writer> {
     Writer::try_new(object_writer, schema, options)
+}
+
+pub(crate) fn create_writer_with_shared_dictionary_sizing(
+    object_writer: Box<dyn ObjectWriter>,
+    schema: Schema,
+    options: FileWriterOptions,
+) -> Result<Writer> {
+    Writer::try_new_with_shared_dictionary_sizing(object_writer, schema, options)
 }
 
 /// Create a v2.1 writer with explicit compression tuning.
