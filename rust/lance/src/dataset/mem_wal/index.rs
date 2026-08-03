@@ -199,9 +199,18 @@ pub fn validate_index_configs(
         // A config whose `field_id` identifies a *different* column would be bound
         // under the wrong identity (e.g. reused as the single-column PK index), so
         // reject any `field_id` that does not name the resolved column.
+        //
+        // The Lance lookup can still miss when the Arrow and Lance schemas
+        // diverge; a fallible API must report that, not panic on it.
         let resolved_field_id = lance_schema
             .field(column)
-            .expect("column resolved in the Arrow schema is present in the Lance schema")
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "index '{}' is configured on column '{}', which is not in the Lance schema",
+                    config.name(),
+                    column,
+                ))
+            })?
             .id;
         if resolved_field_id != config.field_id() {
             return Err(Error::invalid_input(format!(
@@ -1739,6 +1748,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The Arrow and Lance schemas normally derive from the same source, but a
+    /// diverged pair — the column resolves in the Arrow schema yet has no Lance
+    /// field — must yield a descriptive error, not a panic (#8194).
+    #[test]
+    fn test_validate_index_configs_column_missing_from_lance_schema() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("extra", DataType::Int32, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(&ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+
+        let config = MemIndexConfig::BTree(BTreeIndexConfig {
+            name: "idx".into(),
+            field_id: 1,
+            column: "extra".into(),
+        });
+        let err = validate_index_configs(&[config], &schema, &lance_schema, &[])
+            .expect_err("a column absent from the Lance schema must be rejected, not panic");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected invalid-input error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("extra"),
+            "error must name the missing column, got {err}"
+        );
     }
 
     /// A composite PK builds an order-preserving encoded key, so its columns must
