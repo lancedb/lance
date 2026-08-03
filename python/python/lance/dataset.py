@@ -7240,7 +7240,7 @@ class Tags:
         """
         return self._ds.tags()
 
-    def get_version(self, tag: str) -> Optional[int]:
+    def get_version(self, tag: str) -> int:
         """
         Get the version of a specific tag by name.
 
@@ -7251,8 +7251,13 @@ class Tags:
 
         Returns
         -------
-        int or None
-            The version number of the tag if it exists, otherwise None.
+        int
+            The version number of the tag.
+
+        Raises
+        ------
+        ValueError
+            If the tag does not exist. Use :meth:`list` to check for presence.
         """
         return self._ds.get_version(tag)
 

@@ -683,8 +683,9 @@ impl HnswBuilder {
         let len = storage.len();
         let max_level = params.max_level;
 
+        let initial_level_count = usize::from(!storage.is_empty());
         let level_count = (0..max_level)
-            .map(|_| AtomicUsize::new(0))
+            .map(|_| AtomicUsize::new(initial_level_count))
             .collect::<Vec<_>>();
 
         let visited_generator_queue = Arc::new(ArrayQueue::new(get_num_compute_intensive_cpus()));
@@ -941,12 +942,12 @@ enum LevelLookup {
     /// `__vector_id` column.
     ///
     /// We do *not* assume the column is sorted or that the slice is aligned
-    /// to a true level boundary: `level_offsets`/`level_count` omit the
-    /// entry-point node (it is written at every level by `to_batch` but only
-    /// counted at level 0), so upper-level slices can be off-by-one and
-    /// non-monotonic. Keying by the `__vector_id` value -- exactly what the
-    /// old per-node `load` did -- preserves behavior bit-for-bit. Upper
-    /// levels shrink geometrically, so this map stays tiny.
+    /// to a true level boundary. Indices written before issue #5156 was fixed
+    /// omitted the entry point from every upper-level count, so their slices
+    /// start progressively earlier than the true boundaries. Keying by the
+    /// `__vector_id` value -- exactly what the old per-node `load` did --
+    /// preserves their behavior bit-for-bit. Upper levels shrink
+    /// geometrically, so this map stays tiny.
     Sparse(HashMap<u32, u32>),
 }
 
@@ -1376,7 +1377,6 @@ impl IvfSubIndex for HNSW {
         }
 
         let len = storage.len();
-        builder.level_count[0].fetch_add(1, Ordering::Relaxed);
         (1..len).into_par_iter().for_each_init(
             || VisitedGenerator::new(len),
             |visited_generator, node| {
@@ -1495,7 +1495,7 @@ mod tests {
     use object_store::path::Path;
     use rstest::rstest;
 
-    use super::{HnswGraph, ImmutableHnswBottomView, ImmutableHnswLevelView};
+    use super::{HNSW_METADATA_KEY, HnswGraph, ImmutableHnswBottomView, ImmutableHnswLevelView};
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
@@ -1503,10 +1503,20 @@ mod tests {
         flat::storage::{FlatBinStorage, FlatFloatStorage},
         graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
-            HNSW, VECTOR_ID_FIELD,
+            HNSW, HnswMetadata, VECTOR_ID_FIELD,
             builder::{HnswBuildParams, HnswQueryParams},
         },
     };
+
+    fn with_hnsw_metadata(batch: &RecordBatch, hnsw_metadata: HnswMetadata) -> RecordBatch {
+        let mut metadata = batch.schema_ref().metadata().clone();
+        metadata.insert(
+            HNSW_METADATA_KEY.to_string(),
+            serde_json::to_string(&hnsw_metadata).unwrap(),
+        );
+        let schema = batch.schema().as_ref().clone().with_metadata(metadata);
+        RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap()
+    }
 
     #[tokio::test]
     async fn test_builder_write_load() {
@@ -2063,17 +2073,10 @@ mod tests {
         assert_eq!(got, expected);
     }
 
-    /// Regression guard for the `level_offsets` misalignment (issue #6746).
-    /// `to_batch` writes the entry-point node at *every* level, but
-    /// `level_count` only counts it at level 0, so the serialized batch has
-    /// strictly more rows than `sum(level_count)` and the upper-level
-    /// `level_offsets` slices are off-by-one / non-monotonic. The Arrow-backed
-    /// loaded graph must still search bit-identically to the in-memory build:
-    /// it keys upper levels by `__vector_id` value via the `Sparse` map
-    /// (last-write-wins), never `row == id`. A naive `row == id`
-    /// reimplementation would pass the small cases but break here.
-    #[tokio::test]
-    async fn test_loaded_level_offsets_misalignment_invariant() {
+    /// Every fresh `level_offsets` range must exactly delimit the rows emitted
+    /// for that HNSW level (issue #5156).
+    #[test]
+    fn test_level_offsets_match_serialized_levels() {
         use arrow::array::AsArray;
         use arrow::datatypes::UInt32Type;
 
@@ -2082,7 +2085,7 @@ mod tests {
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
-        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
             HnswBuildParams::default().num_edges(20).ef_construction(50),
@@ -2097,38 +2100,66 @@ mod tests {
         );
 
         let batch = builder.to_batch().unwrap();
-        let md = builder.metadata();
-        let total_counted = *md.level_offsets.last().unwrap();
-
-        // The exact misalignment: more serialized rows than `level_count` sums
-        // to, because the entry-point node is written at every level yet
-        // counted only at level 0.
-        assert!(
-            batch.num_rows() > total_counted,
-            "expected serialized rows ({}) to exceed sum(level_count) ({}) -- \
-             entry point should be written at every level",
+        let metadata = builder.metadata();
+        assert_eq!(
+            *metadata.level_offsets.last().unwrap(),
             batch.num_rows(),
-            total_counted,
+            "level offsets must cover every serialized row",
         );
 
-        // Level-0 slice must still be exactly `[0, N)` with
-        // `__vector_id == row` -- the precondition for `LevelLookup::Dense`.
-        let n = md.level_offsets[1];
-        assert_eq!(n, TOTAL);
-        let level0 = batch.slice(0, n);
-        let ids = level0.column(0).as_primitive::<UInt32Type>();
-        assert!(
-            ids.values()
+        let nodes = builder.nodes().unwrap();
+        for level in 0..builder.max_level() as usize {
+            let start = metadata.level_offsets[level];
+            let end = metadata.level_offsets[level + 1];
+            let level_batch = batch.slice(start, end - start);
+            let ids = level_batch.column(0).as_primitive::<UInt32Type>();
+            let expected_ids = nodes
                 .iter()
                 .enumerate()
-                .all(|(row, id)| *id == row as u32),
-            "level-0 __vector_id must equal the row index",
-        );
+                .filter_map(|(id, node)| (level < node.level_neighbors.len()).then_some(id as u32))
+                .collect::<Vec<_>>();
 
-        // Despite the surplus rows and off-by-one upper slices, the loaded
-        // graph searches bit-identically to the in-memory build (old `load`
-        // semantics preserved via the `Sparse` last-write-wins map).
-        let loaded = HNSW::load(batch).unwrap();
+            assert_eq!(
+                ids.values().as_ref(),
+                expected_ids.as_slice(),
+                "serialized ids do not match level {level}",
+            );
+            assert_eq!(builder.num_nodes(level), expected_ids.len());
+        }
+    }
+
+    /// Indices written before issue #5156 was fixed omitted the entry point
+    /// from every upper-level count. Loading those misaligned slices must keep
+    /// the previous id-keyed, last-write-wins behavior.
+    #[test]
+    fn test_load_legacy_misaligned_level_offsets() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        assert!(builder.max_level() >= 2);
+
+        let batch = builder.to_batch().unwrap();
+        let mut metadata = builder.metadata();
+        let mut legacy_offsets = Vec::with_capacity(metadata.level_offsets.len());
+        legacy_offsets.push(0);
+        for level in 0..builder.max_level() as usize {
+            let level_count = metadata.level_offsets[level + 1] - metadata.level_offsets[level];
+            let legacy_level_count = level_count - usize::from(level > 0);
+            legacy_offsets.push(legacy_offsets.last().unwrap() + legacy_level_count);
+        }
+        metadata.level_offsets = legacy_offsets;
+        assert!(*metadata.level_offsets.last().unwrap() < batch.num_rows());
+
+        let legacy_batch = with_hnsw_metadata(&batch, metadata);
+        let loaded = HNSW::load(legacy_batch).unwrap();
         assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
         let params = HnswQueryParams {
             ef: 50,
@@ -2194,8 +2225,6 @@ mod tests {
     /// time.
     #[tokio::test]
     async fn test_load_rejects_out_of_range_entry_point() {
-        use super::{HNSW_METADATA_KEY, HnswMetadata};
-
         const DIM: usize = 16;
         const TOTAL: usize = 256;
         let fsl =
@@ -2209,21 +2238,18 @@ mod tests {
         .unwrap();
 
         let batch = builder.to_batch().unwrap();
-        let mut metadata = batch.schema_ref().metadata().clone();
-        let mut md: HnswMetadata =
-            serde_json::from_str(metadata.get(HNSW_METADATA_KEY).unwrap()).unwrap();
+        let mut md: HnswMetadata = serde_json::from_str(
+            batch
+                .schema_ref()
+                .metadata()
+                .get(HNSW_METADATA_KEY)
+                .unwrap(),
+        )
+        .unwrap();
         // Valid entry points are `[0, N)`; `level_offsets[1]` == N is one past.
         let n = md.level_offsets[1];
         md.entry_point = n as u32;
-        metadata.insert(
-            HNSW_METADATA_KEY.to_string(),
-            serde_json::to_string(&md).unwrap(),
-        );
-        // Rebuild the batch under the rewritten metadata. `with_schema` would
-        // reject this: it requires the new metadata to be a superset, but we
-        // are changing an existing key's value, not adding one.
-        let schema = batch.schema().as_ref().clone().with_metadata(metadata);
-        let corrupted = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap();
+        let corrupted = with_hnsw_metadata(&batch, md);
 
         assert!(
             HNSW::load(corrupted).is_err(),
