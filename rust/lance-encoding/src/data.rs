@@ -233,6 +233,27 @@ impl<T: OffsetSizeTrait> VariableWidthDataBlockBuilder<T> {
             bytes: Vec::with_capacity(estimated_size_bytes as usize),
         }
     }
+
+    fn invalid_offsets(
+        block: &VariableWidthBlock,
+        selection: &Range<u64>,
+        detail: impl std::fmt::Display,
+    ) -> Error {
+        Error::corrupt_file_named(
+            "variable width data block",
+            format!(
+                "cannot append offsets for selection {}..{}: {} (num_values: {}, \
+                 bits_per_offset: {}, offsets buffer size: {} bytes, data buffer size: {} bytes)",
+                selection.start,
+                selection.end,
+                detail,
+                block.num_values,
+                block.bits_per_offset,
+                block.offsets.len(),
+                block.data.len(),
+            ),
+        )
+    }
 }
 
 impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<T> {
@@ -258,6 +279,138 @@ impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthD
                     T::from_usize(previous_len).unwrap()
                 }),
         );
+    }
+
+    fn try_append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        let block = data_block.as_variable_width_ref().unwrap();
+        let expected_bits_per_offset = T::get_byte_width() as u8 * 8;
+        if block.bits_per_offset != expected_bits_per_offset {
+            return Err(Self::invalid_offsets(
+                block,
+                &selection,
+                format!(
+                    "expected {}-bit offsets but found {}-bit offsets",
+                    expected_bits_per_offset, block.bits_per_offset
+                ),
+            ));
+        }
+        let offset_size = std::mem::size_of::<T>();
+        if !block.offsets.len().is_multiple_of(offset_size) {
+            return Err(Self::invalid_offsets(
+                block,
+                &selection,
+                format!(
+                    "offsets buffer length {} is not a multiple of the {}-byte offset width",
+                    block.offsets.len(),
+                    offset_size
+                ),
+            ));
+        }
+        if selection.start > selection.end || selection.end > block.num_values {
+            return Err(Self::invalid_offsets(
+                block,
+                &selection,
+                "selection is outside the block's value range",
+            ));
+        }
+        let selection_start = usize::try_from(selection.start).map_err(|_| {
+            Self::invalid_offsets(block, &selection, "selection start does not fit in usize")
+        })?;
+        let selection_end = usize::try_from(selection.end).map_err(|_| {
+            Self::invalid_offsets(block, &selection, "selection end does not fit in usize")
+        })?;
+        let offsets = block.offsets.borrow_to_typed_view::<T>();
+        if selection_end >= offsets.len() {
+            return Err(Self::invalid_offsets(
+                block,
+                &selection,
+                format!(
+                    "selection requires offset {} but the buffer holds {} offsets",
+                    selection_end,
+                    offsets.len()
+                ),
+            ));
+        }
+        let selected_offsets = &offsets[selection_start..=selection_end];
+        let start_offset = selected_offsets[0].to_usize().ok_or_else(|| {
+            Self::invalid_offsets(
+                block,
+                &selection,
+                format!(
+                    "offset at position {} is negative: {:?}",
+                    selection_start, selected_offsets[0]
+                ),
+            )
+        })?;
+        if start_offset > block.data.len() {
+            return Err(Self::invalid_offsets(
+                block,
+                &selection,
+                format!(
+                    "offset at position {} is out of bounds: {} > {}",
+                    selection_start,
+                    start_offset,
+                    block.data.len()
+                ),
+            ));
+        }
+
+        let mut previous_offset = start_offset;
+        for (relative_position, &offset) in selected_offsets[1..].iter().enumerate() {
+            let position = selection_start + relative_position + 1;
+            let offset = offset.to_usize().ok_or_else(|| {
+                Self::invalid_offsets(
+                    block,
+                    &selection,
+                    format!("offset at position {} is negative: {:?}", position, offset),
+                )
+            })?;
+            if offset < previous_offset {
+                return Err(Self::invalid_offsets(
+                    block,
+                    &selection,
+                    format!(
+                        "offset at position {} decreases: {} < {}",
+                        position, offset, previous_offset
+                    ),
+                ));
+            }
+            if offset > block.data.len() {
+                return Err(Self::invalid_offsets(
+                    block,
+                    &selection,
+                    format!(
+                        "offset at position {} is out of bounds: {} > {}",
+                        position,
+                        offset,
+                        block.data.len()
+                    ),
+                ));
+            }
+            previous_offset = offset;
+        }
+
+        let selected_data_len = previous_offset - start_offset;
+        let new_data_len = self
+            .bytes
+            .len()
+            .checked_add(selected_data_len)
+            .ok_or_else(|| {
+                Self::invalid_offsets(block, &selection, "combined data length overflows usize")
+            })?;
+        if T::from_usize(new_data_len).is_none() {
+            return Err(Self::invalid_offsets(
+                block,
+                &selection,
+                format!(
+                    "combined data length {} exceeds the capacity of {}-bit offsets",
+                    new_data_len, expected_bits_per_offset
+                ),
+            ));
+        }
+
+        self.append(data_block, selection);
+        Ok(())
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
@@ -362,6 +515,14 @@ impl DataBlockBuilderImpl for StructDataBlockBuilder {
         for i in 0..self.children.len() {
             self.children[i].append(&data_block.children[i], selection.clone());
         }
+    }
+
+    fn try_append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        let data_block = data_block.as_struct_ref().unwrap();
+        for i in 0..self.children.len() {
+            self.children[i].try_append(&data_block.children[i], selection.clone())?;
+        }
+        Ok(())
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
@@ -509,6 +670,12 @@ impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
         self.inner.append(fsl.child.as_ref(), selection);
     }
 
+    fn try_append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        let selection = selection.start * self.dimension..selection.end * self.dimension;
+        let fsl = data_block.as_fixed_size_list_ref().unwrap();
+        self.inner.try_append(fsl.child.as_ref(), selection)
+    }
+
     fn finish(self: Box<Self>) -> DataBlock {
         let inner_block = self.inner.finish();
         DataBlock::FixedSizeList(FixedSizeListBlock {
@@ -543,6 +710,19 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
         );
         self.validity.append_buffer(&bool_buf);
         self.inner.append(nullable.data.as_ref(), selection);
+    }
+
+    fn try_append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        let nullable = data_block.as_nullable_ref().unwrap();
+        self.inner
+            .try_append(nullable.data.as_ref(), selection.clone())?;
+        let bool_buf = BooleanBuffer::new(
+            nullable.nulls.clone().into_buffer(),
+            selection.start as usize,
+            (selection.end - selection.start) as usize,
+        );
+        self.validity.append_buffer(&bool_buf);
+        Ok(())
     }
 
     fn finish(mut self: Box<Self>) -> DataBlock {
@@ -959,9 +1139,7 @@ impl DictionaryDataBlock {
         indices
             .iter()
             .map(|idx| idx.to_usize().unwrap() as u64)
-            .for_each(|idx| {
-                data_builder.append(&self.dictionary, idx..idx + 1);
-            });
+            .try_for_each(|idx| data_builder.try_append(&self.dictionary, idx..idx + 1))?;
 
         Ok(data_builder.finish())
     }
@@ -1842,6 +2020,10 @@ impl From<ArrayRef> for DataBlock {
 
 pub trait DataBlockBuilderImpl: std::fmt::Debug {
     fn append(&mut self, data_block: &DataBlock, selection: Range<u64>);
+    fn try_append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        self.append(data_block, selection);
+        Ok(())
+    }
     fn finish(self: Box<Self>) -> DataBlock;
 }
 
@@ -1868,6 +2050,13 @@ impl DataBlockBuilder {
 
     pub fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         self.get_builder(data_block).append(data_block, selection);
+    }
+
+    /// Appends a selection while validating any variable-width offsets that may
+    /// have originated in an untrusted file.
+    pub fn try_append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        self.get_builder(data_block)
+            .try_append(data_block, selection)
     }
 
     pub fn finish(self) -> DataBlock {
@@ -1897,8 +2086,8 @@ mod tests {
     use crate::buffer::LanceBuffer;
 
     use super::{
-        AllNullDataBlock, BlockInfo, DataBlock, DictionaryDataBlock, FixedWidthDataBlock,
-        VariableWidthBlock,
+        AllNullDataBlock, BlockInfo, DataBlock, DataBlockBuilder, DictionaryDataBlock,
+        FixedWidthDataBlock, VariableWidthBlock,
     };
 
     use arrow_array::Array;
@@ -2336,6 +2525,53 @@ mod tests {
         assert!(
             message.contains("100000") && message.contains("data buffer size: 14 bytes"),
             "error must report the offending offset and the data buffer size: {message}"
+        );
+    }
+
+    #[rstest]
+    #[case::i32_decreasing(
+        LanceBuffer::reinterpret_vec(vec![0_i32, 5, 2]),
+        32,
+        2,
+        "decreases"
+    )]
+    #[case::i64_decreasing(
+        LanceBuffer::reinterpret_vec(vec![0_i64, 5, 2]),
+        64,
+        2,
+        "decreases"
+    )]
+    #[case::i32_out_of_bounds(
+        LanceBuffer::reinterpret_vec(vec![0_i32, 6]),
+        32,
+        1,
+        "out of bounds"
+    )]
+    fn variable_width_builder_rejects_malformed_offsets(
+        #[case] offsets: LanceBuffer,
+        #[case] bits_per_offset: u8,
+        #[case] num_values: u64,
+        #[case] expected_message: &str,
+    ) {
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::copy_slice(b"abcde"),
+            offsets,
+            bits_per_offset,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        let mut builder = DataBlockBuilder::with_capacity_estimate(5);
+
+        let error = builder
+            .try_append(&block, 0..num_values)
+            .expect_err("malformed offsets must fail concatenation");
+        assert!(
+            matches!(error, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected message: {error}"
         );
     }
 
