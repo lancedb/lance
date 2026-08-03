@@ -115,7 +115,7 @@ impl AccumulationQueue {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, StringArray};
+    use arrow_array::{Array, DictionaryArray, Int8Array, StringArray, types::Int8Type};
 
     use super::*;
 
@@ -133,6 +133,28 @@ mod tests {
         assert!(
             retained_bytes < 3 * 1024 * 1024,
             "a 2 MiB logical slice retained {retained_bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn sliced_dictionary_values_do_not_retain_the_full_parent() {
+        let value = "x".repeat(1024 * 1024);
+        let parent_values = Arc::new(StringArray::from(vec![value.as_str(); 16])) as ArrayRef;
+        let values = parent_values.slice(0, 2);
+        let keys = Int8Array::from(vec![0_i8, 1_i8]);
+        let dictionary =
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef;
+        assert!(array_slice_memory_size(dictionary.as_ref()) < 3 * 1024 * 1024);
+        let expected = dictionary.to_data();
+
+        let mut queue = AccumulationQueue::new(8 * 1024 * 1024, 0, false);
+        assert!(queue.insert(dictionary, 0, 2).is_none());
+        assert_eq!(queue.buffered_arrays[0].to_data(), expected);
+        let retained_bytes = queue.buffered_arrays[0].get_buffer_memory_size();
+
+        assert!(
+            retained_bytes < 3 * 1024 * 1024,
+            "a 2 MiB dictionary retained {retained_bytes} bytes"
         );
     }
 }

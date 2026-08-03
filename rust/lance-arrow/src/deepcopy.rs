@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder, transform::MutableArrayData};
+use arrow_schema::DataType;
 
 pub fn deep_copy_buffer(buffer: &Buffer) -> Buffer {
     Buffer::from(buffer.as_slice())
@@ -91,7 +92,26 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     // MutableArrayData indexes relative to the logical source array and applies
     // ArrayData::offset internally for types such as Boolean.
     mutable.extend(0, 0, data.len());
-    mutable.freeze()
+    let copied = mutable.freeze();
+
+    if matches!(copied.data_type(), DataType::Dictionary(_, _)) {
+        let child_data = copied
+            .child_data()
+            .iter()
+            .map(deep_copy_array_data_sliced)
+            .collect();
+        // SAFETY: `copied` is valid ArrayData produced by MutableArrayData. Its
+        // dictionary child is replaced by a value-identical deep copy with the
+        // same data type and length, preserving all dictionary key invariants.
+        unsafe {
+            copied
+                .into_builder()
+                .child_data(child_data)
+                .build_unchecked()
+        }
+    } else {
+        copied
+    }
 }
 
 /// Deep copy an array, extracting only the sliced portion using MutableArrayData
