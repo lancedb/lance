@@ -4,8 +4,13 @@
 """Unit tests for merge_insert CI datagen readiness checks.
 
 These live under ``python/tests`` (not ``ci_benchmarks/``) so PR CI can collect
-them without putting the source tree on ``sys.path`` ahead of the installed
-wheel. Import ``lance`` first, then expose ``ci_benchmarks`` for the helpers.
+them without putting the source tree on ``sys.path`` for the whole suite.
+
+``ci_benchmarks`` is not installed with the wheel, so we temporarily expose the
+source tree only while importing the helpers, then restore ``sys.path``. Leaving
+the path in place breaks later tests that use ``multiprocessing`` spawn: the
+child inherits ``sys.path`` and resolves pure-Python ``lance`` without the
+native extension.
 """
 
 from __future__ import annotations
@@ -13,23 +18,29 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Load the installed native extension before adding the source tree for
-# ``ci_benchmarks``. Otherwise ``import lance`` resolves to pure-Python sources
-# without ``lance.lance`` and collection fails with BlobDescriptor ImportError.
+# Load the installed native extension before temporarily adding the source tree
+# for ``ci_benchmarks``.
 import lance  # noqa: F401
 import numpy as np
 
-_PYTHON_SRC = Path(__file__).resolve().parents[1]
-if str(_PYTHON_SRC) not in sys.path:
-    sys.path.insert(0, str(_PYTHON_SRC))
-
-from ci_benchmarks.datagen.merge_insert import (  # noqa: E402
-    BASE_TAG,
-    NARROW_SCHEMA,
-    _already_generated,
-    _tag_base,
-    narrow_batch,
-)
+_PYTHON_SRC = str(Path(__file__).resolve().parents[1])
+_path_added = _PYTHON_SRC not in sys.path
+if _path_added:
+    sys.path.insert(0, _PYTHON_SRC)
+try:
+    from ci_benchmarks.datagen.merge_insert import (  # noqa: E402
+        BASE_TAG,
+        NARROW_SCHEMA,
+        _already_generated,
+        _tag_base,
+        narrow_batch,
+    )
+finally:
+    if _path_added:
+        try:
+            sys.path.remove(_PYTHON_SRC)
+        except ValueError:
+            pass
 
 
 def test_already_generated_missing_dataset(tmp_path):
