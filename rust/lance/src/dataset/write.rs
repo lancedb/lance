@@ -1683,6 +1683,7 @@ pub(super) async fn open_update_writer(
 struct WriterOptions {
     add_data_dir: bool,
     base_id: Option<u32>,
+    use_logical_page_sizing: bool,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
     external_blob_mode: ExternalBlobMode,
@@ -1701,6 +1702,7 @@ async fn open_writer_with_options(
     let WriterOptions {
         add_data_dir,
         base_id,
+        use_logical_page_sizing,
         external_base_resolver,
         allow_external_blob_outside_bases,
         external_blob_mode,
@@ -1736,12 +1738,21 @@ async fn open_writer_with_options(
         let writer = object_store.create(&full_path).await?;
         let enable_blob_v2 = storage_version >= LanceFileVersion::V2_2;
         let version = ConcreteFileVersion::from(storage_version);
-        let file_writer = lance_file::versions::create_writer(
-            version,
-            writer,
-            schema.clone(),
-            FileWriterOptions::default(),
-        )?;
+        let file_writer = if use_logical_page_sizing {
+            lance_file::versions::create_writer_with_logical_page_sizing(
+                version,
+                writer,
+                schema.clone(),
+                FileWriterOptions::default(),
+            )?
+        } else {
+            lance_file::versions::create_writer(
+                version,
+                writer,
+                schema.clone(),
+                FileWriterOptions::default(),
+            )?
+        };
         let preprocessor = if enable_blob_v2 {
             Some(BlobPreprocessor::new(
                 object_store.clone(),
@@ -1865,6 +1876,7 @@ impl WriterGenerator {
                 self.storage_version,
                 WriterOptions {
                     add_data_dir: base_info.is_dataset_root,
+                    use_logical_page_sizing: true,
                     // Primary-storage slots stamp no base id, like a write
                     // without target bases.
                     base_id: (base_info.base_id != PRIMARY_BASE_ID).then_some(base_info.base_id),
@@ -1886,6 +1898,7 @@ impl WriterGenerator {
                 WriterOptions {
                     add_data_dir: true,
                     base_id: None,
+                    use_logical_page_sizing: true,
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
                     external_blob_mode: self.external_blob_mode,

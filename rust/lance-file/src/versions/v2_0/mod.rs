@@ -30,6 +30,14 @@ pub fn create_writer(
     Writer::try_new(object_writer, schema, options)
 }
 
+pub(crate) fn create_writer_with_logical_page_sizing(
+    object_writer: Box<dyn ObjectWriter>,
+    schema: Schema,
+    options: FileWriterOptions,
+) -> Result<Writer> {
+    Writer::try_new_with_logical_page_sizing(object_writer, schema, options)
+}
+
 /// Create a v2.0 writer whose schema is inferred from the first batch.
 pub fn create_lazy_writer(
     object_writer: Box<dyn ObjectWriter>,

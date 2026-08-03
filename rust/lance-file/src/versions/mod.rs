@@ -48,6 +48,26 @@ pub fn create_writer(
     }
 }
 
+/// Create a writer that sizes V2.0 pages from logical array slices.
+///
+/// This runtime policy is used for input that has already been rechunked into
+/// bounded zero-copy slices. Other versions use their standard writer.
+#[doc(hidden)]
+pub fn create_writer_with_logical_page_sizing(
+    version: ConcreteFileVersion,
+    object_writer: Box<dyn Writer>,
+    schema: Schema,
+    options: FileWriterOptions,
+) -> Result<FileWriter> {
+    match version {
+        ConcreteFileVersion::V2_0 => {
+            v2_0::create_writer_with_logical_page_sizing(object_writer, schema, options)
+                .map(Into::into)
+        }
+        _ => create_writer(version, object_writer, schema, options),
+    }
+}
+
 /// Create a lazy current-format writer for an exact file version.
 pub fn create_lazy_writer(
     version: ConcreteFileVersion,

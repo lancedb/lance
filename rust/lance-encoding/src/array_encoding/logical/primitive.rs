@@ -400,18 +400,29 @@ pub struct PrimitiveFieldEncoder {
     column_index: u32,
     field: Field,
     max_page_bytes: u64,
+    use_logical_page_sizing: bool,
 }
 
-fn num_page_parts(array: &dyn Array, max_page_bytes: usize) -> usize {
-    bit_util::ceil(array_slice_memory_size(array), max_page_bytes).min(array.len())
+fn num_page_parts(
+    array: &dyn Array,
+    max_page_bytes: usize,
+    use_logical_page_sizing: bool,
+) -> usize {
+    let size_bytes = if use_logical_page_sizing {
+        array_slice_memory_size(array)
+    } else {
+        array.get_buffer_memory_size()
+    };
+    bit_util::ceil(size_bytes, max_page_bytes).min(array.len())
 }
 
 impl PrimitiveFieldEncoder {
-    pub fn try_new(
+    pub(crate) fn try_new(
         options: &EncodingOptions,
         array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
         column_index: u32,
         field: Field,
+        use_logical_page_sizing: bool,
     ) -> Result<Self> {
         Ok(Self {
             accumulation_queue: AccumulationQueue::new(
@@ -423,6 +434,7 @@ impl PrimitiveFieldEncoder {
             max_page_bytes: options.max_page_bytes,
             array_encoding_strategy,
             field,
+            use_logical_page_sizing,
         })
     }
 
@@ -463,7 +475,11 @@ impl PrimitiveFieldEncoder {
         if arrays.len() == 1 {
             let array = arrays.into_iter().next().unwrap();
             // Can't slice it finer than 1 page per row.
-            let num_parts = num_page_parts(array.as_ref(), self.max_page_bytes as usize);
+            let num_parts = num_page_parts(
+                array.as_ref(),
+                self.max_page_bytes as usize,
+                self.use_logical_page_sizing,
+            );
             if num_parts <= 1 {
                 // One part and it fits in a page
                 Ok(vec![self.create_encode_task(vec![array])?])
@@ -555,9 +571,23 @@ mod tests {
             num_page_parts(
                 slice.as_ref(),
                 EncodingOptions::default().max_page_bytes as usize,
+                true,
             ),
             1,
             "a 10 MiB logical slice fits in one 32 MiB page"
+        );
+    }
+
+    #[test]
+    fn test_v2_0_multi_page_split_preserves_parent_size() {
+        let parent = Arc::new(Int32Array::from(vec![0_i32; 4096])) as ArrayRef;
+        let slice = parent.slice(0, 257);
+
+        assert_eq!(array_slice_memory_size(slice.as_ref()), 1028);
+        assert_eq!(
+            num_page_parts(slice.as_ref(), 1024, false),
+            16,
+            "released V2.0 page boundaries use the parent size for multi-page slices"
         );
     }
 }

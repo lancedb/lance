@@ -189,7 +189,34 @@ impl Writer {
         schema: LanceSchema,
         options: FileWriterOptions,
     ) -> Result<Self> {
-        let mut writer = Self::new_lazy(object_writer, options);
+        Self::try_new_with_strategy(
+            object_writer,
+            schema,
+            options,
+            Box::new(ArrayFieldEncodingStrategy::new()),
+        )
+    }
+
+    pub(crate) fn try_new_with_logical_page_sizing(
+        object_writer: Box<dyn ObjectWriter>,
+        schema: LanceSchema,
+        options: FileWriterOptions,
+    ) -> Result<Self> {
+        Self::try_new_with_strategy(
+            object_writer,
+            schema,
+            options,
+            Box::new(ArrayFieldEncodingStrategy::new().with_logical_page_sizing()),
+        )
+    }
+
+    fn try_new_with_strategy(
+        object_writer: Box<dyn ObjectWriter>,
+        schema: LanceSchema,
+        options: FileWriterOptions,
+        encoding_strategy: Box<dyn FieldEncodingStrategy>,
+    ) -> Result<Self> {
+        let mut writer = Self::new_lazy_with_strategy(object_writer, options, encoding_strategy);
         writer.initialize(schema)?;
         Ok(writer)
     }
@@ -199,6 +226,18 @@ impl Writer {
     /// The output schema will be set based on the first batch of data to arrive.
     /// If no data arrives and the writer is finished then the write will fail.
     pub fn new_lazy(object_writer: Box<dyn ObjectWriter>, options: FileWriterOptions) -> Self {
+        Self::new_lazy_with_strategy(
+            object_writer,
+            options,
+            Box::new(ArrayFieldEncodingStrategy::new()),
+        )
+    }
+
+    fn new_lazy_with_strategy(
+        object_writer: Box<dyn ObjectWriter>,
+        options: FileWriterOptions,
+        encoding_strategy: Box<dyn FieldEncodingStrategy>,
+    ) -> Self {
         Self {
             writer: object_writer,
             schema: None,
@@ -211,7 +250,7 @@ impl Writer {
             global_buffers: Vec::new(),
             schema_metadata: HashMap::new(),
             page_spill: None,
-            encoding_strategy: Box::new(ArrayFieldEncodingStrategy::new()),
+            encoding_strategy,
             options,
         }
     }

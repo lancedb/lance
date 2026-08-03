@@ -48,6 +48,7 @@ use lance_core::{Error, Result};
 #[derive(Debug)]
 pub struct ArrayFieldEncodingStrategy {
     array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
+    use_logical_page_sizing: bool,
 }
 
 impl ArrayFieldEncodingStrategy {
@@ -61,7 +62,16 @@ impl ArrayFieldEncodingStrategy {
     pub fn new() -> Self {
         Self {
             array_encoding_strategy: Arc::new(ArrayStrategy),
+            use_logical_page_sizing: false,
         }
+    }
+
+    /// Size V2.0 pages by the logical array slice instead of its retained
+    /// parent allocation.
+    #[doc(hidden)]
+    pub fn with_logical_page_sizing(mut self) -> Self {
+        self.use_logical_page_sizing = true;
+        self
     }
 
     fn is_primitive_type(data_type: &DataType) -> bool {
@@ -126,6 +136,7 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                     self.array_encoding_strategy.clone(),
                     column_index,
                     desc_field,
+                    self.use_logical_page_sizing,
                 )?);
                 Ok(Box::new(BlobFieldEncoder::new(desc_encoder)))
             } else {
@@ -134,6 +145,7 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                     self.array_encoding_strategy.clone(),
                     column_index,
                     field.clone(),
+                    self.use_logical_page_sizing,
                 )?))
             }
         } else {
@@ -167,6 +179,7 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                             self.array_encoding_strategy.clone(),
                             column_index.next_column_index(field.id as u32),
                             field.clone(),
+                            self.use_logical_page_sizing,
                         )?))
                     } else {
                         let header_idx = column_index.next_column_index(field.id as u32);
@@ -193,6 +206,7 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                             self.array_encoding_strategy.clone(),
                             column_index.next_column_index(field.id as u32),
                             field.clone(),
+                            self.use_logical_page_sizing,
                         )?))
                     } else {
                         // A dictionary of logical is, itself, logical and we don't support that today
