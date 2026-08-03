@@ -42,7 +42,7 @@ use tracing::{info, instrument};
 use crate::Dataset;
 use crate::blob::normalize_prepared_blob_schema;
 use crate::dataset::blob::{
-    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
+    BLOB_SIDECAR_STATS_META_KEY, BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata, preprocess_blob_batches,
 };
@@ -1545,6 +1545,10 @@ impl GenericWriter for V2WriterAdapter {
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
         if let Some(pre) = self.preprocessor.as_mut() {
             pre.finish().await?;
+            if let Some(sidecar_stats) = pre.sidecar_stats_metadata()? {
+                self.writer
+                    .add_schema_metadata(BLOB_SIDECAR_STATS_META_KEY, sidecar_stats);
+            }
         }
         let field_ids = self
             .writer

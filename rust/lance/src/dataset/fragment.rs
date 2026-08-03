@@ -59,6 +59,7 @@ use roaring::RoaringBitmap;
 
 use self::write::FragmentCreateBuilder;
 
+use super::blob::{BLOB_SIDECAR_STATS_META_KEY, parse_blob_sidecar_stats_metadata};
 use super::hash_joiner::HashJoiner;
 use super::rowids::load_row_id_sequence;
 use super::scanner::Scanner;
@@ -90,6 +91,12 @@ pub struct FileFragment {
     dataset: Arc<Dataset>,
 
     pub(super) metadata: Fragment,
+}
+
+pub(crate) struct FragmentStorageStats {
+    pub fragment_id: u32,
+    pub fields: Vec<(u32, u64)>,
+    pub persisted_blob_fields: HashSet<u32>,
 }
 
 const DEFAULT_BATCH_READ_SIZE: u32 = 1024;
@@ -142,6 +149,11 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
 
     /// Get storage statistics for this file (ignored by v1 reader)
     fn storage_stats(&self) -> Result<Vec<(u32, u64)>>;
+
+    /// Get persisted blob sidecar statistics for this file, if present.
+    fn blob_sidecar_stats(&self) -> Result<Option<Vec<(u32, u64)>>> {
+        Ok(None)
+    }
 
     // Helper functions to fallback to the legacy implementation while we
     // slowly migrate functionality over to the generic reader
@@ -518,6 +530,15 @@ mod v2_adapter {
             Ok(stats)
         }
 
+        fn blob_sidecar_stats(&self) -> Result<Option<Vec<(u32, u64)>>> {
+            self.reader
+                .schema()
+                .metadata
+                .get(BLOB_SIDECAR_STATS_META_KEY)
+                .map(|value| parse_blob_sidecar_stats_metadata(value))
+                .transpose()
+        }
+
         fn projection(&self) -> &Arc<Schema> {
             &self.projection
         }
@@ -847,13 +868,15 @@ impl FileFragment {
         }
     }
 
-    /// Returns storage stats as `(field_id, bytes_on_disk)` pairs for this fragment.
+    /// Returns data-file and persisted sidecar storage statistics for this fragment.
     pub(crate) async fn storage_stats(
         &self,
         dataset_schema: &Schema,
         scan_scheduler: Arc<ScanScheduler>,
-    ) -> Result<Vec<(u32, u64)>> {
+    ) -> Result<FragmentStorageStats> {
         let mut stats = Vec::new();
+        let mut persisted_blob_fields = HashSet::new();
+        let mut unpersisted_blob_fields = HashSet::new();
         for reader in self
             .open_readers_with_full_metadata(
                 dataset_schema,
@@ -862,8 +885,25 @@ impl FileFragment {
             .await?
         {
             stats.extend(reader.storage_stats()?);
+            let reader_blob_fields = reader
+                .projection()
+                .fields_pre_order()
+                .filter(|field| field.is_blob_v2())
+                .map(|field| field.id as u32)
+                .collect::<Vec<_>>();
+            if let Some(sidecar_stats) = reader.blob_sidecar_stats()? {
+                persisted_blob_fields.extend(sidecar_stats.iter().map(|(field_id, _)| *field_id));
+                stats.extend(sidecar_stats);
+            } else {
+                unpersisted_blob_fields.extend(reader_blob_fields);
+            }
         }
-        Ok(stats)
+        persisted_blob_fields.retain(|field_id| !unpersisted_blob_fields.contains(field_id));
+        Ok(FragmentStorageStats {
+            fragment_id: self.id() as u32,
+            fields: stats,
+            persisted_blob_fields,
+        })
     }
 
     pub fn dataset(&self) -> &Dataset {

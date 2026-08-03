@@ -49,6 +49,25 @@ const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
 
+pub(super) const BLOB_SIDECAR_STATS_META_KEY: &str = "lance:blob-sidecar-stats:v1";
+
+pub(super) fn parse_blob_sidecar_stats_metadata(value: &str) -> Result<Vec<(u32, u64)>> {
+    let stats: Vec<(u32, u64)> = serde_json::from_str(value).map_err(|error| {
+        Error::internal(format!(
+            "Invalid blob sidecar statistics metadata {BLOB_SIDECAR_STATS_META_KEY:?}: {error}"
+        ))
+    })?;
+    let mut field_ids = BTreeMap::new();
+    for (field_id, bytes) in &stats {
+        if field_ids.insert(*field_id, *bytes).is_some() {
+            return Err(Error::internal(format!(
+                "Blob sidecar statistics metadata contains duplicate field id {field_id}"
+            )));
+        }
+    }
+    Ok(stats)
+}
+
 pub(super) fn blob_inline_threshold_from_metadata(
     metadata: &HashMap<String, String>,
     field_name: &str,
@@ -290,6 +309,8 @@ pub struct BlobPreprocessor {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    sidecar_bytes: BTreeMap<u32, u64>,
+    can_persist_sidecar_bytes: bool,
 }
 
 /// A logical slice of an external blob that can be materialized or streamed into Lance-managed
@@ -312,31 +333,40 @@ enum BlobWriteSource<'a> {
 #[derive(Clone, Debug)]
 struct BlobPreprocessField {
     kind: BlobPreprocessFieldKind,
+    has_untracked_blob_v2: bool,
 }
 
 #[derive(Clone, Debug)]
 enum BlobPreprocessFieldKind {
-    BlobV2 {
-        inline_threshold: usize,
-        dedicated_threshold: usize,
-        pack_file_threshold: usize,
-        writer_metadata: HashMap<String, String>,
-    },
-    Struct {
-        children: Vec<BlobPreprocessField>,
-    },
-    List {
-        child: Box<BlobPreprocessField>,
-    },
+    BlobV2(BlobV2PreprocessOptions),
+    Struct { children: Vec<BlobPreprocessField> },
+    List { child: Box<BlobPreprocessField> },
     Passthrough,
 }
 
+#[derive(Clone, Debug)]
+struct BlobV2PreprocessOptions {
+    field_id: u32,
+    inline_threshold: usize,
+    dedicated_threshold: usize,
+    pack_file_threshold: usize,
+    writer_metadata: HashMap<String, String>,
+}
+
 impl BlobPreprocessField {
-    fn new(field: &ArrowField) -> Result<Self> {
+    fn new(field: &ArrowField, lance_field: &LanceField) -> Result<Self> {
+        if field.name() != &lance_field.name {
+            return Err(Error::internal(format!(
+                "Blob preprocessor field name mismatch: Arrow field '{}', Lance field '{}'",
+                field.name(),
+                lance_field.name
+            )));
+        }
         if field.is_blob_v2() {
             if is_prepared_blob_v2_field(field) {
                 return Ok(Self {
                     kind: BlobPreprocessFieldKind::Passthrough,
+                    has_untracked_blob_v2: true,
                 });
             }
             if !is_logical_blob_v2_field(field) {
@@ -348,8 +378,15 @@ impl BlobPreprocessField {
                     field.name()
                 )));
             }
+            let field_id = u32::try_from(lance_field.id).map_err(|_| {
+                Error::internal(format!(
+                    "Blob v2 field '{}' has invalid field id {}",
+                    lance_field.name, lance_field.id
+                ))
+            })?;
             return Ok(Self {
-                kind: BlobPreprocessFieldKind::BlobV2 {
+                kind: BlobPreprocessFieldKind::BlobV2(BlobV2PreprocessOptions {
+                    field_id,
                     inline_threshold: blob_inline_threshold_from_metadata(
                         field.metadata(),
                         field.name(),
@@ -363,40 +400,83 @@ impl BlobPreprocessField {
                         field.name(),
                     )?,
                     writer_metadata: field.metadata().clone(),
-                },
+                }),
+                has_untracked_blob_v2: false,
             });
         }
 
         if let ArrowDataType::Struct(children) = field.data_type() {
+            if children.len() != lance_field.children.len() {
+                return Err(Error::internal(format!(
+                    "Blob struct field '{}' has {} Arrow children but {} Lance children",
+                    field.name(),
+                    children.len(),
+                    lance_field.children.len()
+                )));
+            }
             let children = children
                 .iter()
-                .map(|child| Self::new(child.as_ref()))
+                .zip(&lance_field.children)
+                .map(|(child, lance_child)| Self::new(child.as_ref(), lance_child))
                 .collect::<Result<Vec<_>>>()?;
-            if children.iter().any(|child| child.requires_preprocessing()) {
+            if children
+                .iter()
+                .any(|child| child.requires_preprocessing() || child.has_untracked_blob_v2)
+            {
+                let has_untracked_blob_v2 =
+                    children.iter().any(|child| child.has_untracked_blob_v2);
                 return Ok(Self {
                     kind: BlobPreprocessFieldKind::Struct { children },
+                    has_untracked_blob_v2,
                 });
             }
         }
 
         if let ArrowDataType::List(child) | ArrowDataType::LargeList(child) = field.data_type() {
-            let child = Self::new(child.as_ref())?;
-            if child.requires_preprocessing() {
+            let [lance_child] = lance_field.children.as_slice() else {
+                return Err(Error::internal(format!(
+                    "Blob list field '{}' must have exactly one Lance child, got {}",
+                    field.name(),
+                    lance_field.children.len()
+                )));
+            };
+            let child = Self::new(child.as_ref(), lance_child)?;
+            if child.requires_preprocessing() || child.has_untracked_blob_v2 {
+                let has_untracked_blob_v2 = child.has_untracked_blob_v2;
                 return Ok(Self {
                     kind: BlobPreprocessFieldKind::List {
                         child: Box::new(child),
                     },
+                    has_untracked_blob_v2,
                 });
             }
         }
 
         Ok(Self {
             kind: BlobPreprocessFieldKind::Passthrough,
+            has_untracked_blob_v2: false,
         })
     }
 
     fn requires_preprocessing(&self) -> bool {
         !matches!(self.kind, BlobPreprocessFieldKind::Passthrough)
+    }
+
+    fn initialize_sidecar_bytes(&self, sidecar_bytes: &mut BTreeMap<u32, u64>) {
+        match &self.kind {
+            BlobPreprocessFieldKind::BlobV2(options) => {
+                sidecar_bytes.insert(options.field_id, 0);
+            }
+            BlobPreprocessFieldKind::Struct { children } => {
+                for child in children {
+                    child.initialize_sidecar_bytes(sidecar_bytes);
+                }
+            }
+            BlobPreprocessFieldKind::List { child } => {
+                child.initialize_sidecar_bytes(sidecar_bytes);
+            }
+            BlobPreprocessFieldKind::Passthrough => {}
+        }
     }
 }
 
@@ -465,11 +545,26 @@ impl BlobPreprocessor {
     ) -> Result<Self> {
         let pack_writer = RollingPackedBlobWriter::new();
         let arrow_schema = arrow_schema::Schema::from(schema);
+        if arrow_schema.fields().len() != schema.fields.len() {
+            return Err(Error::internal(format!(
+                "Blob preprocessor schema has {} Arrow fields but {} Lance fields",
+                arrow_schema.fields().len(),
+                schema.fields.len()
+            )));
+        }
         let field_processors = arrow_schema
             .fields()
             .iter()
-            .map(|field| BlobPreprocessField::new(field.as_ref()))
+            .zip(&schema.fields)
+            .map(|(field, lance_field)| BlobPreprocessField::new(field.as_ref(), lance_field))
             .collect::<Result<Vec<_>>>()?;
+        let can_persist_sidecar_bytes = !field_processors
+            .iter()
+            .any(|field| field.has_untracked_blob_v2);
+        let mut sidecar_bytes = BTreeMap::new();
+        for field in &field_processors {
+            field.initialize_sidecar_bytes(&mut sidecar_bytes);
+        }
         Ok(Self {
             object_store,
             data_dir,
@@ -483,6 +578,8 @@ impl BlobPreprocessor {
             external_blob_mode,
             source_store_registry,
             source_store_params,
+            sidecar_bytes,
+            can_persist_sidecar_bytes,
         })
     }
 
@@ -495,17 +592,30 @@ impl BlobPreprocessor {
     }
 
     async fn write_dedicated(
-        object_store: ObjectStore,
-        data_dir: Path,
-        data_file_key: String,
-        blob_id_allocator: BlobIdAllocator,
+        &mut self,
+        field_id: u32,
         source: BlobWriteSource<'_>,
     ) -> Result<BlobDescriptor> {
-        let blob_id = blob_id_allocator.next()?;
-        let data_file_path = data_dir.join(format!("{data_file_key}.lance"));
-        let mut writer =
-            crate::blob::DedicatedBlobWriter::try_new(object_store, data_file_path, blob_id)
-                .await?;
+        let size = match &source {
+            BlobWriteSource::Bytes(data) => u64::try_from(data.len()).map_err(|_| {
+                Error::internal(format!(
+                    "Blob v2 sidecar size {} does not fit into u64 for field id {field_id}",
+                    data.len()
+                ))
+            })?,
+            BlobWriteSource::External(source) => source.size(),
+        };
+        let blob_id = self.blob_id_allocator.next()?;
+        let data_file_path = self
+            .data_dir
+            .clone()
+            .join(format!("{}.lance", self.data_file_key));
+        let mut writer = crate::blob::DedicatedBlobWriter::try_new(
+            self.object_store.clone(),
+            data_file_path,
+            blob_id,
+        )
+        .await?;
         match source {
             BlobWriteSource::Bytes(data) => writer.write(data).await?,
             BlobWriteSource::External(source) => {
@@ -514,18 +624,29 @@ impl BlobPreprocessor {
                     .await?;
             }
         }
-        writer.finish().await
+        let descriptor = writer.finish().await?;
+        self.record_sidecar_bytes(field_id, size)?;
+        Ok(descriptor)
     }
 
     async fn write_packed(
         &mut self,
+        field_id: u32,
         field_pack_file_threshold: usize,
         source: BlobWriteSource<'_>,
     ) -> Result<BlobDescriptor> {
+        let source_size = source.size();
+        let size = u64::try_from(source_size).map_err(|_| {
+            Error::internal(format!(
+                "Blob v2 sidecar size {} does not fit into u64 for field id {field_id}",
+                source_size
+            ))
+        })?;
         let max_pack_size = self
             .pack_file_size_override
             .unwrap_or(field_pack_file_threshold);
-        self.pack_writer
+        let descriptor = self
+            .pack_writer
             .write(
                 self.object_store.clone(),
                 self.data_dir.clone(),
@@ -534,7 +655,23 @@ impl BlobPreprocessor {
                 max_pack_size,
                 source,
             )
-            .await
+            .await?;
+        self.record_sidecar_bytes(field_id, size)?;
+        Ok(descriptor)
+    }
+
+    fn record_sidecar_bytes(&mut self, field_id: u32, bytes: u64) -> Result<()> {
+        let field_bytes = self.sidecar_bytes.get_mut(&field_id).ok_or_else(|| {
+            Error::internal(format!(
+                "Blob v2 sidecar statistics referenced untracked field id {field_id}"
+            ))
+        })?;
+        *field_bytes = field_bytes.checked_add(bytes).ok_or_else(|| {
+            Error::internal(format!(
+                "Blob v2 sidecar byte count overflowed u64 for field id {field_id}"
+            ))
+        })?;
+        Ok(())
     }
 
     async fn resolve_external_reference(&mut self, uri: &str) -> Result<(u32, String)> {
@@ -650,26 +787,15 @@ impl BlobPreprocessor {
         async move {
             if is_prepared_blob_v2_field(field.as_ref()) {
                 validate_prepared_blob_array(field.as_ref(), &array)?;
+                self.can_persist_sidecar_bytes = false;
                 return Ok((array, field.clone()));
             }
 
             match &processor.kind {
                 BlobPreprocessFieldKind::Passthrough => Ok((array, field.clone())),
-                BlobPreprocessFieldKind::BlobV2 {
-                    inline_threshold,
-                    dedicated_threshold,
-                    pack_file_threshold,
-                    writer_metadata,
-                } => {
-                    self.preprocess_blob_array(
-                        array,
-                        field.as_ref(),
-                        *inline_threshold,
-                        *dedicated_threshold,
-                        *pack_file_threshold,
-                        writer_metadata,
-                    )
-                    .await
+                BlobPreprocessFieldKind::BlobV2(options) => {
+                    self.preprocess_blob_array(array, field.as_ref(), options)
+                        .await
                 }
                 BlobPreprocessFieldKind::Struct { children } => {
                     self.preprocess_struct_array(array, field.as_ref(), children)
@@ -821,10 +947,7 @@ impl BlobPreprocessor {
         &mut self,
         array: ArrayRef,
         field: &ArrowField,
-        inline_threshold: usize,
-        dedicated_threshold: usize,
-        pack_file_threshold: usize,
-        writer_metadata: &HashMap<String, String>,
+        options: &BlobV2PreprocessOptions,
     ) -> Result<(ArrayRef, Arc<ArrowField>)> {
         let struct_arr = array
             .as_any()
@@ -846,7 +969,8 @@ impl BlobPreprocessor {
             .column_by_name("size")
             .map(|col| col.as_primitive::<UInt64Type>());
 
-        let mut blob_writer = self.blob_writer_with_metadata(field, writer_metadata.clone());
+        let mut blob_writer =
+            self.blob_writer_with_metadata(field, options.writer_metadata.clone());
 
         for i in 0..struct_arr.len() {
             if struct_arr.is_null(i) {
@@ -866,23 +990,19 @@ impl BlobPreprocessor {
                 .unwrap_or(false);
             let data_len = if has_data { data_col.value(i).len() } else { 0 };
 
-            if has_data && data_len > dedicated_threshold {
-                let value = Self::write_dedicated(
-                    self.object_store.clone(),
-                    self.data_dir.clone(),
-                    self.data_file_key.clone(),
-                    self.blob_id_allocator.clone(),
-                    BlobWriteSource::Bytes(data_col.value(i)),
-                )
-                .await?;
+            if has_data && data_len > options.dedicated_threshold {
+                let value = self
+                    .write_dedicated(options.field_id, BlobWriteSource::Bytes(data_col.value(i)))
+                    .await?;
                 blob_writer.push(value)?;
                 continue;
             }
 
-            if has_data && data_len > inline_threshold {
+            if has_data && data_len > options.inline_threshold {
                 let value = self
                     .write_packed(
-                        pack_file_threshold,
+                        options.field_id,
+                        options.pack_file_threshold,
                         BlobWriteSource::Bytes(data_col.value(i)),
                     )
                     .await?;
@@ -911,22 +1031,21 @@ impl BlobPreprocessor {
                     let source = self.open_external_source(uri_val, position, size).await?;
                     let data_len = source.size();
 
-                    if data_len > dedicated_threshold as u64 {
-                        let value = Self::write_dedicated(
-                            self.object_store.clone(),
-                            self.data_dir.clone(),
-                            self.data_file_key.clone(),
-                            self.blob_id_allocator.clone(),
-                            BlobWriteSource::External(&source),
-                        )
-                        .await?;
+                    if data_len > options.dedicated_threshold as u64 {
+                        let value = self
+                            .write_dedicated(options.field_id, BlobWriteSource::External(&source))
+                            .await?;
                         blob_writer.push(value)?;
                         continue;
                     }
 
-                    if data_len > inline_threshold as u64 {
+                    if data_len > options.inline_threshold as u64 {
                         let value = self
-                            .write_packed(pack_file_threshold, BlobWriteSource::External(&source))
+                            .write_packed(
+                                options.field_id,
+                                options.pack_file_threshold,
+                                BlobWriteSource::External(&source),
+                            )
                             .await?;
                         blob_writer.push(value)?;
                         continue;
@@ -973,6 +1092,22 @@ impl BlobPreprocessor {
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
         self.pack_writer.finish().await
+    }
+
+    pub(crate) fn sidecar_stats_metadata(&self) -> Result<Option<String>> {
+        if !self.can_persist_sidecar_bytes || self.sidecar_bytes.is_empty() {
+            return Ok(None);
+        }
+        let stats = self
+            .sidecar_bytes
+            .iter()
+            .map(|(field_id, bytes)| (*field_id, *bytes))
+            .collect::<Vec<_>>();
+        serde_json::to_string(&stats).map(Some).map_err(|error| {
+            Error::internal(format!(
+                "Failed to serialize blob sidecar statistics metadata: {error}"
+            ))
+        })
     }
 }
 
