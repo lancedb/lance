@@ -8,7 +8,7 @@ use std::{
     fmt::Debug,
     iter,
     ops::Range,
-    sync::Arc,
+    sync::{Arc, Weak},
     vec,
 };
 
@@ -4581,11 +4581,18 @@ pub struct PrimitiveStructuralEncoder {
     accumulation_queue: AccumulationQueue,
 
     keep_original_array: bool,
+    use_shared_dictionary_sizing: bool,
+    normalized_dictionary_values: Vec<CachedNormalizedDictionaryValues>,
     accumulated_repdefs: Vec<RepDefBuilder>,
     page_encodings: Arc<[PrimitivePageEncoding]>,
     column_index: u32,
     field: Field,
     encoding_metadata: Arc<HashMap<String, String>>,
+}
+
+struct CachedNormalizedDictionaryValues {
+    source: Weak<dyn Array>,
+    normalized: ArrayRef,
 }
 
 struct CompressedLevelsChunk {
@@ -4686,6 +4693,8 @@ impl PrimitiveStructuralEncoder {
         Ok(Self {
             accumulation_queue,
             keep_original_array: options.keep_original_array,
+            use_shared_dictionary_sizing,
+            normalized_dictionary_values: Vec::new(),
             accumulated_repdefs: Vec::new(),
             column_index,
             page_encodings,
@@ -6615,6 +6624,7 @@ impl PrimitiveStructuralEncoder {
     }
 
     fn extract_validity(
+        &mut self,
         mut array: Arc<dyn Array>,
         repdef: &mut RepDefBuilder,
         keep_original_array: bool,
@@ -6625,7 +6635,30 @@ impl PrimitiveStructuralEncoder {
                 Ok(array)
             }
             DataType::Dictionary(_, _) => {
-                array = dict::normalize_dict_nulls(array)?;
+                if self.use_shared_dictionary_sizing {
+                    let source_values = array.as_any_dictionary().values().clone();
+                    self.normalized_dictionary_values
+                        .retain(|cached| cached.source.upgrade().is_some());
+                    let normalized_values =
+                        self.normalized_dictionary_values.iter().find_map(|cached| {
+                            cached
+                                .source
+                                .upgrade()
+                                .filter(|source| Arc::ptr_eq(source, &source_values))
+                                .map(|_| cached.normalized.clone())
+                        });
+                    array =
+                        dict::normalize_dict_nulls_with_values(array, normalized_values.clone())?;
+                    if normalized_values.is_none() && source_values.null_count() > 0 {
+                        self.normalized_dictionary_values
+                            .push(CachedNormalizedDictionaryValues {
+                                source: Arc::downgrade(&source_values),
+                                normalized: array.as_any_dictionary().values().clone(),
+                            });
+                    }
+                } else {
+                    array = dict::normalize_dict_nulls(array)?;
+                }
                 Self::extract_validity_buf(array, repdef, keep_original_array)
             }
             // Extract our validity buf but NOT any child validity bufs. (they will be encoded in
@@ -6936,7 +6969,7 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        let array = Self::extract_validity(array, &mut repdef, self.keep_original_array)?;
+        let array = self.extract_validity(array, &mut repdef, self.keep_original_array)?;
         self.accumulated_repdefs.push(repdef);
 
         if let Some((arrays, row_number, num_rows)) =
@@ -7010,7 +7043,7 @@ mod tests {
     use crate::repdef::build_control_word_iterator;
     use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_array::{ArrayRef, DictionaryArray, Int8Array, StringArray, types::Int8Type};
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
@@ -7034,6 +7067,30 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    #[test]
+    fn nullable_dictionary_values_are_reused_across_slices() {
+        let values = Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])) as ArrayRef;
+        let keys = Int8Array::from(
+            (0..50)
+                .map(|index| if index % 2 == 0 { 0_i8 } else { 2_i8 })
+                .collect::<Vec<_>>(),
+        );
+        let dictionary =
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef;
+
+        let mut queue =
+            crate::utils::accumulation::AccumulationQueue::new(8 * 1024 * 1024, 0, false);
+        for offset in (0..50).step_by(10) {
+            let normalized =
+                super::dict::normalize_dict_nulls(dictionary.slice(offset, 10)).unwrap();
+            assert!(queue.insert(normalized, offset as u64, 10).is_none());
+        }
+
+        let (arrays, _, num_rows) = queue.flush().unwrap();
+        let data = DataBlock::from_arrays(&arrays, num_rows);
+        assert_eq!(data.as_dictionary().unwrap().dictionary.num_values(), 2);
     }
 
     #[test]

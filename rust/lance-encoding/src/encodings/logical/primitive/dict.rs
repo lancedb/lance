@@ -30,6 +30,7 @@ use crate::{
 // Helper function for normalize_dict_nulls
 fn normalize_dict_nulls_impl<K: ArrowDictionaryKeyType>(
     array: Arc<dyn Array>,
+    normalized_values: Option<Arc<dyn Array>>,
 ) -> Result<Arc<dyn Array>> {
     // TODO: Fast path when there is only one null index? (common case)
 
@@ -41,12 +42,16 @@ fn normalize_dict_nulls_impl<K: ArrowDictionaryKeyType>(
 
     let mut mapping = vec![None; dict_array.values().len()];
     let mut skipped = 0;
-    let mut valid_indices = Vec::with_capacity(dict_array.values().len());
+    let mut valid_indices = normalized_values
+        .is_none()
+        .then(|| Vec::with_capacity(dict_array.values().len()));
     for (old_idx, is_valid) in dict_array.values().nulls().expect_ok()?.iter().enumerate() {
         if is_valid {
             // Should be safe since we are only decreasing K values (e.g. won't overflow u8 keys into u16)
             mapping[old_idx] = Some(K::Native::from_usize(old_idx - skipped).expect_ok()?);
-            valid_indices.push(old_idx as u64);
+            if let Some(valid_indices) = valid_indices.as_mut() {
+                valid_indices.push(old_idx as u64);
+            }
         } else {
             skipped += 1;
             mapping[old_idx] = None;
@@ -70,14 +75,18 @@ fn normalize_dict_nulls_impl<K: ArrowDictionaryKeyType>(
     }
     let keys = keys_builder.finish();
 
-    let valid_indices = UInt64Array::from(valid_indices);
-    let values = arrow_select::take::take(
-        dict_array.values(),
-        &valid_indices,
-        Some(TakeOptions {
-            check_bounds: false,
-        }),
-    )?;
+    let values = if let Some(normalized_values) = normalized_values {
+        normalized_values
+    } else {
+        let valid_indices = UInt64Array::from(valid_indices.unwrap());
+        arrow_select::take::take(
+            dict_array.values(),
+            &valid_indices,
+            Some(TakeOptions {
+                check_bounds: false,
+            }),
+        )?
+    };
 
     Ok(Arc::new(DictionaryArray::new(keys, values)) as Arc<dyn Array>)
 }
@@ -89,16 +98,24 @@ fn normalize_dict_nulls_impl<K: ArrowDictionaryKeyType>(
 /// We want to normalize this so that all nulls are in the keys.  This way we can store
 /// the nulls with the keys as rep-def values the same as any other array.
 pub fn normalize_dict_nulls(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+    normalize_dict_nulls_with_values(array, None)
+}
+
+/// Normalizes dictionary keys while reusing values normalized from the same source.
+pub(super) fn normalize_dict_nulls_with_values(
+    array: Arc<dyn Array>,
+    normalized_values: Option<Arc<dyn Array>>,
+) -> Result<Arc<dyn Array>> {
     match array.data_type() {
         DataType::Dictionary(key_type, _) => match key_type.as_ref() {
-            DataType::UInt8 => normalize_dict_nulls_impl::<UInt8Type>(array),
-            DataType::UInt16 => normalize_dict_nulls_impl::<UInt16Type>(array),
-            DataType::UInt32 => normalize_dict_nulls_impl::<UInt32Type>(array),
-            DataType::UInt64 => normalize_dict_nulls_impl::<UInt64Type>(array),
-            DataType::Int8 => normalize_dict_nulls_impl::<Int8Type>(array),
-            DataType::Int16 => normalize_dict_nulls_impl::<Int16Type>(array),
-            DataType::Int32 => normalize_dict_nulls_impl::<Int32Type>(array),
-            DataType::Int64 => normalize_dict_nulls_impl::<Int64Type>(array),
+            DataType::UInt8 => normalize_dict_nulls_impl::<UInt8Type>(array, normalized_values),
+            DataType::UInt16 => normalize_dict_nulls_impl::<UInt16Type>(array, normalized_values),
+            DataType::UInt32 => normalize_dict_nulls_impl::<UInt32Type>(array, normalized_values),
+            DataType::UInt64 => normalize_dict_nulls_impl::<UInt64Type>(array, normalized_values),
+            DataType::Int8 => normalize_dict_nulls_impl::<Int8Type>(array, normalized_values),
+            DataType::Int16 => normalize_dict_nulls_impl::<Int16Type>(array, normalized_values),
+            DataType::Int32 => normalize_dict_nulls_impl::<Int32Type>(array, normalized_values),
+            DataType::Int64 => normalize_dict_nulls_impl::<Int64Type>(array, normalized_values),
             _ => Err(Error::not_supported_source(
                 format!("Unsupported dictionary key type: {}", key_type).into(),
             )),
@@ -374,8 +391,29 @@ mod tests {
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
     };
-    use arrow_array::{Array, StringArray};
+    use arrow_array::{Array, ArrayRef, DictionaryArray, Int8Array, StringArray, types::Int8Type};
     use std::sync::Arc;
+
+    #[test]
+    fn normalize_dict_nulls_reuses_normalized_values() {
+        let values = Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])) as ArrayRef;
+        let keys = Int8Array::from(vec![0_i8, 2, 0, 2]);
+        let dictionary =
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef;
+
+        let first = normalize_dict_nulls(dictionary.slice(0, 2)).unwrap();
+        let normalized_values = first.as_any_dictionary().values().clone();
+        let second = normalize_dict_nulls_with_values(
+            dictionary.slice(2, 2),
+            Some(normalized_values.clone()),
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(
+            second.as_any_dictionary().values(),
+            &normalized_values
+        ));
+    }
 
     #[test]
     fn test_dictionary_encode_abort_fixed_width() {

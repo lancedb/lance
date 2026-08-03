@@ -58,8 +58,21 @@ struct CachedDictionaryValues {
 }
 
 impl CachedDictionaryValues {
-    fn matches(&mut self, source: &ArrayRef, identity: &ArrayDataIdentity) -> bool {
+    fn matches(
+        &mut self,
+        source: &ArrayRef,
+        identity: &ArrayDataIdentity,
+        allow_equivalent_values: bool,
+    ) -> bool {
         if self.identity != *identity {
+            // Normalizing nullable dictionary values creates fresh buffers for
+            // every input slice. Reuse the detached child when those buffers
+            // still contain the same logical values.
+            if allow_equivalent_values && source.to_data() == self.values.to_data() {
+                self.source = Arc::downgrade(source);
+                self.identity = identity.clone();
+                return true;
+            }
             return false;
         }
 
@@ -108,24 +121,31 @@ impl DictionaryKeySlice {
 
 #[derive(Clone, Debug)]
 struct DictionaryRun {
-    values: ArrayDataIdentity,
+    values: usize,
     key_allocation: (usize, usize),
     next_key_offset: usize,
+    has_oversized_shared_values: bool,
 }
 
 impl DictionaryRun {
-    fn new(values: ArrayDataIdentity, keys: &DictionaryKeySlice) -> Self {
+    fn new(values: usize, keys: &DictionaryKeySlice, has_oversized_shared_values: bool) -> Self {
         Self {
             values,
             key_allocation: keys.allocation,
             next_key_offset: keys.end,
+            has_oversized_shared_values,
         }
     }
 
-    fn continues(&self, values: &ArrayDataIdentity, keys: &DictionaryKeySlice) -> bool {
-        self.values == *values
-            && self.key_allocation == keys.allocation
-            && self.next_key_offset == keys.start
+    fn continues(
+        &self,
+        values: usize,
+        keys: &DictionaryKeySlice,
+        has_oversized_shared_values: bool,
+    ) -> bool {
+        self.values == values
+            && ((self.has_oversized_shared_values && has_oversized_shared_values)
+                || (self.key_allocation == keys.allocation && self.next_key_offset == keys.start))
     }
 }
 
@@ -207,6 +227,7 @@ impl AccumulationQueue {
         let cached_values = dictionary.as_ref().and_then(|dictionary| {
             self.find_dictionary_values(&dictionary.values, &dictionary.values_identity)
         });
+        let dictionary_values = cached_values.unwrap_or(self.dictionary_values.len());
         let inserted_bytes = if self.use_shared_dictionary_sizing {
             dictionary.as_ref().map_or_else(
                 || array_slice_memory_size(array.as_ref()) as u64,
@@ -228,17 +249,24 @@ impl AccumulationQueue {
             .as_ref()
             .and_then(|dictionary| {
                 dictionary.keys.as_ref().map(|keys| {
-                    self.dictionary_run
-                        .as_ref()
-                        .is_some_and(|run| run.continues(&dictionary.values_identity, keys))
+                    self.dictionary_run.as_ref().is_some_and(|run| {
+                        run.continues(
+                            dictionary_values,
+                            keys,
+                            dictionary.shared_bytes > self.cache_bytes,
+                        )
+                    })
                 })
             })
             .unwrap_or(false);
         let starts_sliced_dictionary_run = self.buffered_arrays.is_empty()
-            && dictionary
-                .as_ref()
-                .and_then(|dictionary| dictionary.keys.as_ref())
-                .is_some_and(DictionaryKeySlice::has_unreferenced_values);
+            && dictionary.as_ref().is_some_and(|dictionary| {
+                dictionary
+                    .keys
+                    .as_ref()
+                    .is_some_and(DictionaryKeySlice::has_unreferenced_values)
+                    || dictionary.shared_bytes > self.cache_bytes
+            });
         let defer_dictionary_flush = self.use_shared_dictionary_sizing
             && (continues_dictionary_run || starts_sliced_dictionary_run);
 
@@ -268,22 +296,18 @@ impl AccumulationQueue {
                 "Accumulating data for column {}.  Now at {} bytes",
                 self.column_index, self.current_bytes
             );
-            if self.keep_original_array {
-                if let Some(dictionary) = dictionary.as_ref() {
-                    self.cache_dictionary_values(dictionary, cached_values);
-                }
-                self.record_dictionary_run(dictionary.as_ref());
-                self.buffered_arrays.push(array)
+            let cached_values = dictionary
+                .as_ref()
+                .map(|dictionary| self.cache_dictionary_values(dictionary, cached_values));
+            let array = if self.keep_original_array {
+                array
+            } else if let Some(index) = cached_values {
+                self.copy_dictionary_array(&array, index, defer_dictionary_flush)
             } else {
-                let array = if let Some(dictionary) = dictionary.as_ref() {
-                    let index = self.cache_dictionary_values(dictionary, cached_values);
-                    self.copy_dictionary_array(&array, index, defer_dictionary_flush)
-                } else {
-                    deep_copy_array_sliced(array.as_ref())
-                };
-                self.record_dictionary_run(dictionary.as_ref());
-                self.buffered_arrays.push(array)
-            }
+                deep_copy_array_sliced(array.as_ref())
+            };
+            self.record_dictionary_run(dictionary.as_ref(), cached_values);
+            self.buffered_arrays.push(array);
             None
         }
     }
@@ -319,9 +343,10 @@ impl AccumulationQueue {
         values: &ArrayRef,
         identity: &ArrayDataIdentity,
     ) -> Option<usize> {
+        let allow_equivalent_values = self.use_shared_dictionary_sizing;
         self.dictionary_values
             .iter_mut()
-            .position(|cached| cached.matches(values, identity))
+            .position(|cached| cached.matches(values, identity, allow_equivalent_values))
     }
 
     fn cache_dictionary_values(
@@ -371,8 +396,12 @@ impl AccumulationQueue {
         make_array(data)
     }
 
-    fn record_dictionary_run(&mut self, dictionary: Option<&DictionaryArrayInfo>) {
-        let Some(dictionary) = dictionary else {
+    fn record_dictionary_run(
+        &mut self,
+        dictionary: Option<&DictionaryArrayInfo>,
+        dictionary_values: Option<usize>,
+    ) {
+        let (Some(dictionary), Some(dictionary_values)) = (dictionary, dictionary_values) else {
             self.dictionary_run = None;
             return;
         };
@@ -382,10 +411,17 @@ impl AccumulationQueue {
         };
 
         if self.buffered_arrays.is_empty() {
-            self.dictionary_run =
-                Some(DictionaryRun::new(dictionary.values_identity.clone(), keys));
+            self.dictionary_run = Some(DictionaryRun::new(
+                dictionary_values,
+                keys,
+                dictionary.shared_bytes > self.cache_bytes,
+            ));
         } else if let Some(run) = self.dictionary_run.as_mut() {
-            if run.continues(&dictionary.values_identity, keys) {
+            if run.continues(
+                dictionary_values,
+                keys,
+                dictionary.shared_bytes > self.cache_bytes,
+            ) {
                 run.next_key_offset = keys.end;
             } else {
                 self.dictionary_run = None;
@@ -501,6 +537,27 @@ mod tests {
             queue.pending_bytes(),
             (array_size.shared + 5 * array_size.incremental) as u64
         );
+        let (arrays, _, num_rows) = queue.flush().unwrap();
+        let copied = crate::data::DataBlock::from_arrays(&arrays, num_rows);
+
+        assert_eq!(copied.as_dictionary().unwrap().dictionary.num_values(), 2);
+    }
+
+    #[test]
+    fn equivalent_oversized_dictionary_values_are_reused() {
+        let arrays = (0..5)
+            .map(|_| {
+                let values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+                let keys =
+                    Int8Array::from((0..10).map(|index| (index % 2) as i8).collect::<Vec<_>>());
+                Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef
+            })
+            .collect::<Vec<_>>();
+
+        let mut queue = AccumulationQueue::new(1, 0, false);
+        for (row_number, array) in arrays.into_iter().enumerate() {
+            assert!(queue.insert(array, (row_number * 10) as u64, 10).is_none());
+        }
         let (arrays, _, num_rows) = queue.flush().unwrap();
         let copied = crate::data::DataBlock::from_arrays(&arrays, num_rows);
 
