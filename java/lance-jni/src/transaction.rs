@@ -3,7 +3,7 @@
 
 use crate::Error;
 use crate::JNIEnvExt;
-use crate::RT;
+use crate::block_on;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
 use crate::error::Result;
 use crate::traits::{
@@ -429,7 +429,7 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified,
-            merged_generations: _,
+            compacted_sstables: _,
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter: _,
@@ -1243,7 +1243,7 @@ fn convert_to_rust_operation(
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                merged_generations: vec![],
+                compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter: None,
@@ -1574,7 +1574,7 @@ fn inner_commit_to_uri<'local>(
         builder = builder.with_commit_handler(commit_handler);
     }
 
-    let dataset = RT.block_on(builder.execute(transaction))?;
+    let dataset = block_on(builder.execute(transaction))?;
     let blocking_ds = BlockingDataset { inner: dataset };
     blocking_ds.into_java(env)
 }

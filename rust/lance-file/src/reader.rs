@@ -32,7 +32,7 @@ use prost::{Message, Name};
 
 use lance_core::{
     Error, Result,
-    cache::{CacheKey, LanceCache},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     datatypes::{Field, Schema},
 };
 use lance_encoding::format::pb as pbenc;
@@ -47,6 +47,7 @@ use crate::{
     datatypes::{Fields, FieldsWithMeta},
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION, pb, pbfile},
     io::LanceEncodingsIo,
+    version::ConcreteFileVersion,
     writer::PAGE_BUFFER_ALIGNMENT,
 };
 
@@ -225,6 +226,14 @@ impl CacheKey for ColumnMetadataCacheKey {
 
     fn type_name() -> &'static str {
         "ColumnMetadata"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.file.column-metadata-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.column_index);
     }
 }
 
@@ -534,6 +543,30 @@ fn field_column_shape(field: &Field, is_structural: bool) -> (bool, bool) {
     let contributes = !is_structural || field.children.is_empty();
     let recurse = !field.children.is_empty();
     (contributes, recurse)
+}
+
+// Count the V2.1 physical columns required to reconstruct a projected field.
+// This is the same DFS shape consumed by `ColumnInfoIter`: ordinary structural
+// nodes are transparent and leaves contribute columns. Indexed metadata loading
+// can therefore compact any ordinary structural projection into 0..N while
+// preserving this order.
+//
+// Blob and packed-struct fields remain unsupported by indexed projection. Their
+// opaque decode semantics are handled by the existing full-metadata reader.
+fn indexed_projection_column_count(field: &Field) -> Option<usize> {
+    if field.is_blob() || field.is_packed_struct() {
+        return None;
+    }
+
+    let (contributes, recurse) = field_column_shape(field, true);
+    let initial = usize::from(contributes);
+    if !recurse {
+        return Some(initial);
+    }
+
+    field.children.iter().try_fold(initial, |count, child| {
+        count.checked_add(indexed_projection_column_count(child)?)
+    })
 }
 
 // Whether a field's children each cover the same rows as the field itself. Struct
@@ -919,11 +952,17 @@ impl FileReader {
         let mut global_bufs_cursor = Cursor::new(gbo_bytes);
 
         let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
-        for _ in 0..footer.num_global_buffers {
+        for buffer_index in 0..footer.num_global_buffers {
             let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()?;
-            assert!(
-                version < LanceFileVersion::V2_1 || buf_pos % PAGE_BUFFER_ALIGNMENT as u64 == 0
-            );
+            if version >= LanceFileVersion::V2_1 && buf_pos % PAGE_BUFFER_ALIGNMENT as u64 != 0 {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Global buffer {} position {} is not aligned to {} bytes",
+                        buffer_index, buf_pos, PAGE_BUFFER_ALIGNMENT
+                    )
+                    .into(),
+                ));
+            }
             let buf_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
             global_buffers.push(BufferDescriptor {
                 position: buf_pos,
@@ -984,10 +1023,9 @@ impl FileReader {
         let tail_offset = file_len - tail_bytes.len() as u64;
         let footer = Self::decode_footer(&tail_bytes)?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
+        let file_version: LanceFileVersion =
+            ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
+                .into();
 
         let gbo_table =
             Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
@@ -1021,7 +1059,7 @@ impl FileReader {
         let num_data_bytes = footer.column_meta_start - num_global_buffer_bytes;
         let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
 
-        let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version);
+        let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version)?;
 
         // The tail read above already pulled in any global buffer that lives within
         // the captured window. Copy those user buffers (index >= 1; the schema at 0
@@ -1056,10 +1094,9 @@ impl FileReader {
         let tail_offset = file_len - tail_bytes.len() as u64;
         let footer = Self::decode_footer(&tail_bytes)?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
+        let file_version: LanceFileVersion =
+            ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
+                .into();
 
         let gbo_table =
             Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
@@ -1129,74 +1166,139 @@ impl FileReader {
         Self::read_metadata_index_with_known_schema(scheduler, Some((file_schema, num_rows))).await
     }
 
-    fn fetch_encoding<M: Default + Name + Sized>(encoding: &pbfile::Encoding) -> M {
+    fn fetch_encoding<M: Default + Name + Sized>(encoding: &pbfile::Encoding) -> Result<M> {
         match &encoding.location {
-            Some(pbfile::encoding::Location::Indirect(_)) => todo!(),
+            Some(pbfile::encoding::Location::Indirect(_)) => Err(Error::invalid_input_source(
+                "Indirect file encodings are not supported".into(),
+            )),
             Some(pbfile::encoding::Location::Direct(encoding)) => {
                 let encoding_buf = Bytes::from(encoding.encoding.clone());
-                let encoding_any = prost_types::Any::decode(encoding_buf).unwrap();
-                encoding_any.to_msg::<M>().unwrap()
+                let encoding_any = prost_types::Any::decode(encoding_buf).map_err(|error| {
+                    Error::invalid_input_source(
+                        format!("Invalid direct {} encoding envelope: {error}", M::NAME).into(),
+                    )
+                })?;
+                encoding_any.to_msg::<M>().map_err(|error| {
+                    Error::invalid_input_source(
+                        format!("Invalid direct {} encoding: {error}", M::NAME).into(),
+                    )
+                })
             }
-            Some(pbfile::encoding::Location::None(_)) => panic!(),
-            None => panic!(),
+            Some(pbfile::encoding::Location::None(_)) => Err(Error::invalid_input_source(
+                format!("Missing {} encoding description", M::NAME).into(),
+            )),
+            None => Err(Error::invalid_input_source(
+                format!("Missing {} encoding location", M::NAME).into(),
+            )),
         }
     }
 
     fn meta_to_col_infos(
         column_metadatas: &[pbfile::ColumnMetadata],
         file_version: LanceFileVersion,
-    ) -> Vec<Arc<ColumnInfo>> {
+    ) -> Result<Vec<Arc<ColumnInfo>>> {
         column_metadatas
             .iter()
             .enumerate()
             .map(|(col_idx, col_meta)| {
-                Self::meta_to_col_info(col_idx as u32, col_meta, file_version)
+                let col_idx = u32::try_from(col_idx).map_err(|_| {
+                    Error::invalid_input_source("File has more than u32::MAX columns".into())
+                })?;
+                Self::meta_to_col_info(col_idx, col_meta, file_version)
             })
-            .collect::<Vec<_>>()
+            .collect()
     }
 
     fn meta_to_col_info(
         col_idx: u32,
         col_meta: &pbfile::ColumnMetadata,
         file_version: LanceFileVersion,
-    ) -> Arc<ColumnInfo> {
+    ) -> Result<Arc<ColumnInfo>> {
         let page_infos = col_meta
             .pages
             .iter()
-            .map(|page| {
+            .enumerate()
+            .map(|(page_idx, page)| {
                 let num_rows = page.length;
                 let encoding = match file_version {
                     LanceFileVersion::V2_0 => {
                         PageEncoding::Legacy(Self::fetch_encoding::<pbenc::ArrayEncoding>(
-                            page.encoding.as_ref().unwrap(),
-                        ))
+                            page.encoding.as_ref().ok_or_else(|| {
+                                Error::invalid_input_source(
+                                    format!(
+                                        "Column {} page {} is missing its encoding",
+                                        col_idx, page_idx
+                                    )
+                                    .into(),
+                                )
+                            })?,
+                        )?)
                     }
-                    _ => PageEncoding::Structural(Self::fetch_encoding::<pbenc21::PageLayout>(
-                        page.encoding.as_ref().unwrap(),
-                    )),
+                    _ => {
+                        PageEncoding::Structural(Self::fetch_encoding::<pbenc21::PageLayout>(
+                            page.encoding.as_ref().ok_or_else(|| {
+                                Error::invalid_input_source(
+                                    format!(
+                                        "Column {} page {} is missing its encoding",
+                                        col_idx, page_idx
+                                    )
+                                    .into(),
+                                )
+                            })?,
+                        )?)
+                    }
                 };
+                if page.buffer_offsets.len() != page.buffer_sizes.len() {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Column {} page {} has {} buffer offsets but {} buffer sizes",
+                            col_idx,
+                            page_idx,
+                            page.buffer_offsets.len(),
+                            page.buffer_sizes.len()
+                        )
+                        .into(),
+                    ));
+                }
                 let buffer_offsets_and_sizes = Arc::from(
                     page.buffer_offsets
                         .iter()
                         .zip(page.buffer_sizes.iter())
-                        .map(|(offset, size)| {
-                            // Starting with version 2.1 we can assert that page buffers are aligned
-                            assert!(
-                                file_version < LanceFileVersion::V2_1
-                                    || offset % PAGE_BUFFER_ALIGNMENT as u64 == 0
-                            );
-                            (*offset, *size)
+                        .map(|(offset, size)| -> Result<_> {
+                            if file_version >= LanceFileVersion::V2_1
+                                && offset % PAGE_BUFFER_ALIGNMENT as u64 != 0
+                            {
+                                return Err(Error::invalid_input_source(
+                                    format!(
+                                        "Column {} page {} buffer offset {} is not aligned to {} bytes",
+                                        col_idx, page_idx, offset, PAGE_BUFFER_ALIGNMENT
+                                    )
+                                    .into(),
+                                ));
+                            }
+                            Ok((*offset, *size))
                         })
-                        .collect::<Vec<_>>(),
+                        .collect::<Result<Vec<_>>>()?,
                 );
-                PageInfo {
+                Ok(PageInfo {
                     buffer_offsets_and_sizes,
                     encoding,
                     num_rows,
                     priority: page.priority,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
+        if col_meta.buffer_offsets.len() != col_meta.buffer_sizes.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Column {} has {} buffer offsets but {} buffer sizes",
+                    col_idx,
+                    col_meta.buffer_offsets.len(),
+                    col_meta.buffer_sizes.len()
+                )
+                .into(),
+            ));
+        }
         let buffer_offsets_and_sizes = Arc::from(
             col_meta
                 .buffer_offsets
@@ -1205,12 +1307,16 @@ impl FileReader {
                 .map(|(offset, size)| (*offset, *size))
                 .collect::<Vec<_>>(),
         );
-        Arc::new(ColumnInfo {
+        Ok(Arc::new(ColumnInfo {
             index: col_idx,
             page_infos: Arc::from(page_infos),
             buffer_offsets_and_sizes,
-            encoding: Self::fetch_encoding(col_meta.encoding.as_ref().unwrap()),
-        })
+            encoding: Self::fetch_encoding(col_meta.encoding.as_ref().ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!("Column {} is missing its encoding", col_idx).into(),
+                )
+            })?)?,
+        }))
     }
 
     fn validate_projection(
@@ -1836,12 +1942,18 @@ impl FileMetadataProvider {
         projection: &ReaderProjection,
         version: LanceFileVersion,
     ) -> bool {
-        version >= LanceFileVersion::V2_1
-            && !projection.schema.fields.is_empty()
-            && projection.schema.fields.len() == projection.column_indices.len()
-            && projection.schema.fields.iter().all(|field| {
-                field.children.is_empty() && !field.is_blob() && !field.is_packed_struct()
+        if version < LanceFileVersion::V2_1 || projection.schema.fields.is_empty() {
+            return false;
+        }
+
+        projection
+            .schema
+            .fields
+            .iter()
+            .try_fold(0usize, |count, field| {
+                count.checked_add(indexed_projection_column_count(field)?)
             })
+            == Some(projection.column_indices.len())
     }
 
     fn validate_indexed_projection(
@@ -1871,7 +1983,7 @@ impl FileMetadataProvider {
         }
         if !Self::supports_indexed_projection(projection, metadata_index.version) {
             return Err(Error::not_supported(format!(
-                "lazy column metadata loading only supports direct V2.1+ top-level physical column projections; got file version {:?}, {} schema fields, and {} column indices",
+                "lazy column metadata loading requires a V2.1+ ordinary structural projection without blob or packed-struct fields whose physical-column count matches the projection; got file version {:?}, {} schema fields, and {} column indices",
                 metadata_index.version,
                 projection.schema.fields.len(),
                 projection.column_indices.len()
@@ -1946,7 +2058,7 @@ impl FileMetadataProvider {
                     column_index,
                     &column_metadata,
                     metadata_index.version,
-                );
+                )?;
                 let cached = Arc::new(CachedColumnMetadata {
                     column_metadata,
                     column_info: column_info.clone(),
@@ -2108,7 +2220,32 @@ impl FileReadCore {
                     column_infos.len()
                 ))
             })?;
-            Ok(info.page_infos.iter().map(|page| page.num_rows).sum())
+            info.page_infos.iter().try_fold(0_u64, |rows, page| {
+                let page_rows = match &page.encoding {
+                    PageEncoding::Structural(layout) => match &layout.layout {
+                        Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => sparse
+                            .structural_layers
+                            .first()
+                            .and_then(|layer| layer.layer.as_ref())
+                            .map_or(page.num_rows, |layer| match layer {
+                                pbenc21::sparse_structural_layer::Layer::Validity(layer) => {
+                                    layer.num_slots
+                                }
+                                pbenc21::sparse_structural_layer::Layer::List(layer) => {
+                                    layer.num_slots
+                                }
+                                pbenc21::sparse_structural_layer::Layer::FixedSizeList(layer) => {
+                                    layer.num_slots
+                                }
+                            }),
+                        _ => page.num_rows,
+                    },
+                    _ => page.num_rows,
+                };
+                rows.checked_add(page_rows).ok_or_else(|| {
+                    Error::invalid_input_source("Column row count overflows u64".into())
+                })
+            })
         };
         let column_indices = &prepared.decoder_projection.column_indices;
         let fields = &prepared.decoder_projection.schema.fields;
@@ -2507,12 +2644,11 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let column_metadatas =
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
+        let file_version: LanceFileVersion =
+            ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
+                .into();
 
-        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
+        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version)?;
 
         Ok(Self {
             data: bytes,
@@ -2531,10 +2667,9 @@ impl EncodedBatchReaderExt for EncodedBatch {
         Self: Sized,
     {
         let footer = FileReader::decode_footer(&bytes)?;
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
+        let file_version: LanceFileVersion =
+            ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
+                .into();
 
         let gbo_table = FileReader::do_decode_gbo_table(
             &bytes.slice(footer.global_buff_offsets_start as usize..),
@@ -2561,7 +2696,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let column_metadatas =
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
+        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version)?;
 
         Ok(Self {
             data: bytes,
@@ -2585,20 +2720,24 @@ mod tests {
     };
 
     use arrow_array::{
-        RecordBatch, UInt32Array,
+        Int32Array, ListArray, RecordBatch, RecordBatchIterator, UInt32Array,
         types::{Float64Type, Int32Type},
     };
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use bytes::Bytes;
     use futures::{StreamExt, prelude::stream::TryStreamExt};
     use lance_arrow::{BLOB_META_KEY, RecordBatchExt};
     use lance_core::{ArrowResult, datatypes::Schema};
-    use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::{
+        constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE},
         decoder::{
-            DecodeBatchScheduler, DecoderPlugins, FilterExpression, ReadBatchTask, decode_batch,
+            DecodeBatchScheduler, DecoderPlugins, EncodedBatchLayout, FilterExpression,
+            PageEncoding, ReadBatchTask, decode_batch,
         },
-        encoder::{EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch},
+        encoder::{EncodedBatch, EncodingOptions, encode_batch},
+        format::pb21,
         version::LanceFileVersion,
     };
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
@@ -2611,8 +2750,145 @@ mod tests {
         ReaderProjection, validate_field_length, verify_uniform_lengths,
     };
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
-    use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
+    use crate::version::ConcreteFileVersion;
+    use crate::versions;
+    use crate::writer::FileWriterOptions;
     use lance_encoding::decoder::DecoderConfig;
+
+    fn footer_version(bytes: &[u8]) -> (u16, u16) {
+        let version_start = bytes.len() - 8;
+        (
+            u16::from_le_bytes([bytes[version_start], bytes[version_start + 1]]),
+            u16::from_le_bytes([bytes[version_start + 2], bytes[version_start + 3]]),
+        )
+    }
+
+    #[tokio::test]
+    async fn sparse_file_writer_reader_scan_range_and_take_roundtrip() {
+        let fs = FsFixture::default();
+        let sparse_metadata = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        )]);
+        let value_field =
+            Field::new("values", DataType::Int32, true).with_metadata(sparse_metadata.clone());
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_field = Field::new("items", DataType::List(item_field.clone()), true)
+            .with_metadata(sparse_metadata);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![value_field, list_field]));
+        let list = ListArray::try_new(
+            item_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 2, 2, 3, 3, 5])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                Some(4),
+                Some(5),
+            ])),
+            Some(NullBuffer::from(vec![true, false, true, true, true, true])),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    None,
+                    Some(30),
+                    Some(40),
+                    None,
+                    Some(60),
+                ])),
+                Arc::new(list),
+            ],
+        )
+        .unwrap();
+        let input = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema);
+        write_lance_file(
+            input,
+            &fs,
+            ConcreteFileVersion::V2_3,
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(file_reader.metadata.column_infos.len(), 2);
+        assert!(
+            file_reader
+                .metadata
+                .column_infos
+                .iter()
+                .flat_map(|column| column.page_infos.iter())
+                .all(|page| {
+                    matches!(
+                        &page.encoding,
+                        PageEncoding::Structural(layout)
+                            if matches!(
+                                layout.layout,
+                                Some(pb21::page_layout::Layout::SparseLayout(_))
+                            )
+                    )
+                })
+        );
+
+        let scan = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(scan, vec![batch.clone()]);
+
+        let range = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Range(1..5),
+                1024,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(range, vec![batch.slice(1, 4)]);
+
+        let indices = UInt32Array::from(vec![0, 3, 5]);
+        let take = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Indices(indices.clone()),
+                1024,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(take, vec![batch.take(&indices).unwrap()]);
+    }
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
@@ -2634,10 +2910,8 @@ mod tests {
         write_lance_file(
             reader,
             fs,
-            FileWriterOptions {
-                format_version: Some(version),
-                ..Default::default()
-            },
+            ConcreteFileVersion::from(version),
+            FileWriterOptions::default(),
         )
         .await
     }
@@ -2652,10 +2926,58 @@ mod tests {
         write_lance_file(
             reader,
             fs,
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_1),
-                ..Default::default()
-            },
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
+        )
+        .await
+    }
+
+    async fn create_wide_fixed_size_list_file(fs: &FsFixture, num_columns: usize) -> WrittenFile {
+        let data_type =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4);
+        let mut reader = gen_batch();
+        for column_idx in 0..num_columns {
+            reader = reader.col(
+                format!("c{column_idx}"),
+                array::rand_type(&data_type).with_random_nulls(0.1),
+            );
+        }
+        let reader = reader.into_reader_rows(RowCount::from(64), BatchCount::from(4));
+
+        write_lance_file(
+            reader,
+            fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
+        )
+        .await
+    }
+
+    async fn create_wide_structural_file(fs: &FsFixture, num_groups: usize) -> WrittenFile {
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ]));
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let mut reader = gen_batch();
+        for group_idx in 0..num_groups {
+            reader = reader
+                .col(
+                    format!("s{group_idx}"),
+                    array::rand_type(&struct_type).with_random_nulls(0.5),
+                )
+                .col(
+                    format!("l{group_idx}"),
+                    array::rand_type(&list_type).with_random_nulls(0.5),
+                );
+        }
+        let reader = reader.into_reader_rows(RowCount::from(64), BatchCount::from(4));
+
+        write_lance_file(
+            reader,
+            fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
         )
         .await
     }
@@ -2724,11 +3046,200 @@ mod tests {
             .unwrap()
     }
 
+    /// Writes `batch` to a fresh file, overwrites `patch` bytes at `patch_offset`
+    /// into the single occurrence of `pattern`, and reads the file back with the
+    /// default reader configuration.
+    async fn read_file_with_mutated_bytes(
+        version: LanceFileVersion,
+        batch: RecordBatch,
+        pattern: &[u8],
+        patch_offset: usize,
+        patch: &[u8],
+    ) -> lance_core::Result<Vec<RecordBatch>> {
+        let fs = FsFixture::default();
+        let schema = batch.schema();
+        write_lance_file(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &fs,
+            ConcreteFileVersion::from(version),
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let mut bytes = fs
+            .object_store
+            .read_one_all(&fs.tmp_path)
+            .await
+            .unwrap()
+            .to_vec();
+        let matches = bytes
+            .windows(pattern.len())
+            .enumerate()
+            .filter_map(|(position, window)| (window == pattern).then_some(position))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected the byte pattern to appear exactly once in the file"
+        );
+        let patch_start = matches[0] + patch_offset;
+        bytes[patch_start..patch_start + patch.len()].copy_from_slice(patch);
+        fs.object_store.put(&fs.tmp_path, &bytes).await.unwrap();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await
+    }
+
+    /// A corrupt file whose variable-width offsets point outside the value bytes
+    /// must fail with a typed error under the default reader configuration
+    /// (`validate_on_decode` disabled) instead of materializing values outside
+    /// the data buffer.
+    ///
+    /// Uses a dictionary-encoded string column because its values page stores
+    /// the offsets verbatim, so flipping the tail offset in the file reaches the
+    /// Arrow conversion boundary without being rejected by an intermediate
+    /// decompressor.
+    #[rstest]
+    #[tokio::test]
+    async fn test_default_reader_rejects_out_of_bounds_variable_width_offsets(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+    ) {
+        use arrow_array::{Array, DictionaryArray, Int32Array, StringArray};
+
+        let values = StringArray::from(vec!["alpha", "beta", "gamma"]);
+        let indices = Int32Array::from((0..300).map(|i| i % 3).collect::<Vec<i32>>());
+        let dictionary = DictionaryArray::new(indices, Arc::new(values));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "category",
+            dictionary.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(dictionary)]).unwrap();
+
+        // The dictionary values page stores the value offsets as plain
+        // little-endian i32s ending with [5, 9, 14] (2.1 also stores the leading
+        // zero, 2.2+ omits it).  If a future encoding change stops storing these
+        // offsets verbatim this lookup fails loudly and the test needs a new
+        // byte pattern.  The patch rewrites the tail offset so it points far
+        // beyond the value bytes.
+        let offsets_tail_pattern = [5_i32, 9, 14]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let error = read_file_with_mutated_bytes(
+            version,
+            batch,
+            &offsets_tail_pattern,
+            8,
+            &100_000_i32.to_le_bytes(),
+        )
+        .await
+        .expect_err("out-of-bounds offsets must fail the read");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("out of bounds"),
+            "unexpected message: {error}"
+        );
+    }
+
+    /// Same contract as the test above, but for a plain (non-dictionary) string
+    /// column: the mini-block chunk stores chunk-relative value offsets that are
+    /// used to slice the chunk, so a corrupt tail offset must surface as a typed
+    /// error from the chunk decompressor instead of a panic in the decode task.
+    #[rstest]
+    #[tokio::test]
+    async fn test_default_reader_rejects_out_of_bounds_miniblock_offsets(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+    ) {
+        use arrow_array::StringArray;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "strings",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"]))],
+        )
+        .unwrap();
+
+        // For ["alpha", "beta", "gamma"] the chunk stores LE i32 offsets
+        // [16, 21, 25, 30] (chunk-relative: a 16-byte offsets region precedes
+        // the value bytes).  The patch rewrites the tail offset to point far
+        // past the chunk.
+        let chunk_offsets_pattern = [16_i32, 21, 25, 30]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let error = read_file_with_mutated_bytes(
+            version,
+            batch,
+            &chunk_offsets_pattern,
+            12,
+            &100_000_i32.to_le_bytes(),
+        )
+        .await
+        .expect_err("an out-of-bounds chunk offset must fail the read");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("out of bounds"),
+            "unexpected message: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_round_trip() {
         let fs = FsFixture::default();
 
         let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
+
+        let file_size = fs.object_store.size(&fs.tmp_path).await.unwrap() as usize;
+        let footer = fs
+            .object_store
+            .open(&fs.tmp_path)
+            .await
+            .unwrap()
+            .get_range(file_size - 8..file_size)
+            .await
+            .unwrap();
+        assert_eq!(footer_version(&footer), (0, 3));
+        assert_eq!(
+            crate::determine_file_version(&fs.object_store, &fs.tmp_path, Some(file_size))
+                .await
+                .unwrap(),
+            LanceFileVersion::V2_0
+        );
 
         for read_size in [32, 1024, 1024 * 1024] {
             let file_scheduler = fs
@@ -2782,10 +3293,9 @@ mod tests {
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
             buffer_alignment: 64,
-            version,
         };
 
-        let encoding_strategy = default_encoding_strategy(version);
+        let encoding_strategy = crate::versions::v2_0::encoding_strategy();
 
         let encoded_batch = encode_batch(
             &data,
@@ -2797,7 +3307,12 @@ mod tests {
         .unwrap();
 
         // Test self described
-        let bytes = encoded_batch.try_to_self_described_lance(version).unwrap();
+        let bytes = versions::encode_self_described_batch(
+            ConcreteFileVersion::from(version),
+            &encoded_batch,
+        )
+        .unwrap();
+        assert_eq!(footer_version(&bytes), (2, 0));
 
         let decoded_batch = EncodedBatch::try_from_self_described_lance(bytes).unwrap();
 
@@ -2806,7 +3321,7 @@ mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
-            version,
+            EncodedBatchLayout::Array,
             None,
         )
         .await
@@ -2815,7 +3330,9 @@ mod tests {
         assert_eq!(data, decoded);
 
         // Test mini
-        let bytes = encoded_batch.try_to_mini_lance(version).unwrap();
+        let bytes = versions::encode_mini_batch(ConcreteFileVersion::from(version), &encoded_batch)
+            .unwrap();
+        assert_eq!(footer_version(&bytes), (2, 0));
         let decoded_batch =
             EncodedBatch::try_from_mini_lance(bytes, lance_schema.as_ref(), LanceFileVersion::V2_0)
                 .unwrap();
@@ -2824,7 +3341,7 @@ mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
-            version,
+            EncodedBatchLayout::Array,
             None,
         )
         .await
@@ -3157,6 +3674,170 @@ mod tests {
         );
     }
 
+    async fn assert_lazy_projection_matches_eager_and_reads_metadata_subset(
+        fs: &FsFixture,
+        projection: ReaderProjection,
+        shape: &str,
+    ) -> Vec<RecordBatch> {
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let eager_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let expected = eager_reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::RangeFull,
+                127,
+                16,
+                projection.clone(),
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let cache = test_cache();
+        let lazy_reader = ProjectedFileReader::try_open(
+            file_scheduler,
+            Some(projection.clone()),
+            Arc::<DecoderPlugins>::default(),
+            &cache,
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let metadata_index = lazy_reader.metadata_index().unwrap();
+        let requested_metadata_bytes = projection
+            .column_indices
+            .iter()
+            .map(|column_index| metadata_index.column_metadata_offsets[*column_index as usize].1)
+            .sum::<u64>();
+        let total_metadata_bytes = metadata_index
+            .column_metadata_offsets
+            .iter()
+            .map(|(_, length)| *length)
+            .sum::<u64>();
+        assert!(total_metadata_bytes > requested_metadata_bytes * 8);
+
+        fs.object_store.io_stats_incremental();
+        let tasks = lazy_reader
+            .read_tasks(
+                lance_io::ReadBatchParams::Range(0..0),
+                127,
+                None,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        assert!(collect_read_tasks(tasks, 1).await.is_empty());
+        let metadata_stats = fs.object_store.io_stats_incremental();
+        assert!(
+            metadata_stats.read_bytes < total_metadata_bytes / 2,
+            "lazy {shape} read fetched too much metadata: read {} bytes, requested column metadata is {} bytes, total column metadata is {} bytes",
+            metadata_stats.read_bytes,
+            requested_metadata_bytes,
+            total_metadata_bytes
+        );
+
+        let tasks = lazy_reader
+            .read_tasks(
+                lance_io::ReadBatchParams::RangeFull,
+                127,
+                None,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let actual = collect_read_tasks(tasks, 16).await;
+        assert_eq!(expected, actual);
+        actual
+    }
+
+    #[tokio::test]
+    async fn test_lazy_reader_fixed_size_list_projection_matches_eager_reader() {
+        let fs = FsFixture::default();
+        let written_file = create_wide_fixed_size_list_file(&fs, 512).await;
+        let projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_1,
+            &written_file.schema,
+            &["c17", "c509"],
+        )
+        .unwrap();
+        assert!(ProjectedFileReader::supports_projection(
+            &projection,
+            LanceFileVersion::V2_1
+        ));
+        assert!(!ProjectedFileReader::supports_projection(
+            &projection,
+            LanceFileVersion::V2_0
+        ));
+        assert_lazy_projection_matches_eager_and_reads_metadata_subset(
+            &fs,
+            projection,
+            "fixed-size-list",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_lazy_reader_nested_projection_compacts_physical_columns() {
+        let fs = FsFixture::default();
+        let written_file = create_wide_structural_file(&fs, 128).await;
+        let projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_1,
+            &written_file.schema,
+            &["s97.y", "l4", "s3"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            projection
+                .schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s97", "l4", "s3"]
+        );
+        assert_eq!(projection.schema.fields[0].children.len(), 1);
+        assert_eq!(projection.schema.fields[0].children[0].name, "y");
+        assert_eq!(projection.schema.fields[2].children.len(), 2);
+        assert_eq!(projection.column_indices.len(), 4);
+        assert!(
+            projection
+                .column_indices
+                .windows(2)
+                .any(|indices| indices[0] > indices[1]),
+            "the projection must reorder physical columns to exercise compact remapping"
+        );
+        assert!(ProjectedFileReader::supports_projection(
+            &projection,
+            LanceFileVersion::V2_1
+        ));
+        let actual = assert_lazy_projection_matches_eager_and_reads_metadata_subset(
+            &fs, projection, "nested",
+        )
+        .await;
+        assert!(
+            actual
+                .iter()
+                .flat_map(|batch| batch.columns())
+                .any(|column| column.null_count() > 0),
+            "the structural projection must exercise nullable arrays"
+        );
+    }
+
     #[rstest]
     #[case::before_metadata_region(90, 5)]
     #[case::after_metadata_region(190, 20)]
@@ -3185,19 +3866,23 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::blob(BLOB_META_KEY)]
+    #[case::packed_struct("lance-encoding:packed")]
     #[tokio::test]
-    async fn test_lazy_reader_rejects_unsupported_projection() {
+    async fn test_lazy_reader_rejects_opaque_projection(#[case] metadata_key: &str) {
         let fs = FsFixture::default();
         let written_file = create_some_file(&fs, LanceFileVersion::V2_1).await;
 
-        let projection = ReaderProjection::from_column_names(
+        let ordinary_projection = ReaderProjection::from_column_names(
             LanceFileVersion::V2_1,
             &written_file.schema,
-            &["location"],
+            &["location.x"],
         )
         .unwrap();
-        assert!(!ProjectedFileReader::supports_projection(
-            &projection,
+        assert_eq!(ordinary_projection.schema.fields[0].children.len(), 1);
+        assert!(ProjectedFileReader::supports_projection(
+            &ordinary_projection,
             LanceFileVersion::V2_1
         ));
 
@@ -3220,6 +3905,15 @@ mod tests {
             "expected InvalidInput, got {err:?}"
         );
 
+        let mut projection = ordinary_projection;
+        Arc::make_mut(&mut projection.schema).fields[0]
+            .metadata
+            .insert(metadata_key.to_string(), "true".to_string());
+        assert!(!ProjectedFileReader::supports_projection(
+            &projection,
+            LanceFileVersion::V2_1
+        ));
+
         let err = ProjectedFileReader::try_open(
             file_scheduler,
             Some(projection),
@@ -3231,7 +3925,7 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, lance_core::Error::NotSupported { .. }),
-            "expected NotSupported, got {err:?}"
+            "expected NotSupported for {metadata_key}, got {err:?}"
         );
     }
 
@@ -3253,14 +3947,11 @@ mod tests {
         let lance_schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
         let fs = FsFixture::default();
-        let options = FileWriterOptions {
-            format_version: Some(LanceFileVersion::V2_1),
-            ..Default::default()
-        };
-        let mut writer = FileWriter::try_new(
+        let mut writer = versions::create_writer(
+            ConcreteFileVersion::V2_1,
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
-            options,
+            FileWriterOptions::default(),
         )
         .unwrap();
         // "a" has 5 rows, "c" has 1 -- an unequal-length file.
@@ -3651,7 +4342,8 @@ mod tests {
             )]))
             .unwrap();
 
-        let mut file_writer = FileWriter::try_new(
+        let mut file_writer = versions::create_writer(
+            ConcreteFileVersion::V2_1,
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
             lance_schema,
             FileWriterOptions::default(),

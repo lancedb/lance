@@ -4,37 +4,17 @@ Lance is a modern columnar data format optimized for ML workflows and datasets, 
 
 Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](python/AGENTS.md) | [java/](java/AGENTS.md) | [protos/](protos/AGENTS.md) | [docs/src/format/](docs/src/format/AGENTS.md)
 
-## Architecture
-
-Rust workspace with Python and Java bindings:
-
-- `rust/lance/` - Main library implementing the columnar format
-- `rust/lance-core/` - Core types, traits, and utilities
-- `rust/lance-arrow/` - Apache Arrow integration layer
-- `rust/lance-encoding/` - Data encoding and compression algorithms
-- `rust/lance-file/` - File format reading/writing
-- `rust/lance-index/` - Vector and scalar indexing
-- `rust/lance-io/` - I/O operations and object store integration
-- `rust/lance-linalg/` - Linear algebra for vector search
-- `rust/lance-table/` - Table format and operations
-- `rust/lance-geo/` - Geospatial data support
-- `rust/lance-datagen/` - Data generation for tests and benchmarks
-- `rust/lance-namespace/` / `rust/lance-namespace-impls/` - Namespace/catalog interfaces
-- `rust/lance-test-macros/` / `rust/lance-testing/` - Test infrastructure
-- `rust/lance-tools/` - CLI and developer tooling
-- `rust/examples/` - Sample binaries and demonstrations
-- `rust/compression/bitpacking/` / `rust/compression/fsst/` - Compression codecs
-- `rust/lance-datafusion/` - DataFusion integration (built separately)
-- `python/` - Python bindings (PyO3/maturin)
-- `java/` - Java bindings (JNI)
-
-Key technical traits: async-first (tokio), Arrow-native, versioned writes with manifest tracking, custom ML-optimized encodings, unified object store interface (local/S3/Azure/GCS).
-
 ## File Format Stability and Compatibility
 
 - Treat every file format marked stable as a durable compatibility contract. All changes to a stable format must preserve both backward and forward compatibility.
 - Treat every file format marked unstable as disposable. It may change freely; do not add compatibility code, migrations, fallbacks, or tests for files written by earlier unstable revisions.
 - Evaluate compatibility against the latest released stable version while continuing to honor all stable format contracts. Changes that exist only on the current branch or `main` are not compatibility constraints; do not compromise a cleaner or more complete design to preserve those intermediate states.
+
+### Legacy Compatibility Boundaries
+
+- Treat formats and code paths that current writers no longer emit as frozen compatibility surfaces. Preserve their existing read behavior, but exclude them from new feature design unless legacy support is explicitly required.
+- Implement new features in the current format and write paths. Do not extend legacy writers, retrofit new capabilities into legacy readers, or reuse legacy implementations as the foundation for new code.
+- Avoid refactoring or otherwise modifying legacy code during feature work. If a shared boundary makes a legacy change unavoidable, isolate the change, preserve existing behavior, and add targeted regression coverage using released historical fixtures.
 
 ## Development Commands
 

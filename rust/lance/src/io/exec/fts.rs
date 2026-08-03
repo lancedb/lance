@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{AsArray, BooleanBuilder};
@@ -13,7 +14,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricsSet};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
@@ -21,7 +22,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::future::try_join_all;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -45,17 +46,18 @@ use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
-    BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery, Tokens, collect_query_tokens,
-    has_query_token,
+    BoostQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, Tokens,
+    collect_query_tokens, has_query_token,
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, build_global_bm25_scorer,
-    flat_bm25_search_stream_with_metrics,
+    FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, build_global_bm25_scorer, compound_search,
+    compound_search_with_base_scorer, flat_bm25_search_stream_with_metrics_and_operator,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
+use uuid::Uuid;
 
 /// Open one FTS segment as an [`InvertedIndex`].
 async fn open_fts_segment(
@@ -152,11 +154,419 @@ async fn search_segments(
         .unzip())
 }
 
+fn compare_scored_rows(
+    (left_row_id, left_score): &(u64, f32),
+    (right_row_id, right_score): &(u64, f32),
+) -> Ordering {
+    right_score
+        .total_cmp(left_score)
+        .then_with(|| left_row_id.cmp(right_row_id))
+}
+
+fn count_fts_leaves(query: &FtsQuery) -> usize {
+    match query {
+        FtsQuery::Match(_) | FtsQuery::Phrase(_) => 1,
+        FtsQuery::Boost(query) => {
+            count_fts_leaves(&query.positive) + count_fts_leaves(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => query.match_queries.len(),
+        FtsQuery::Boolean(query) => query
+            .should
+            .iter()
+            .chain(&query.must)
+            .chain(&query.must_not)
+            .map(count_fts_leaves)
+            .sum(),
+    }
+}
+
+/// One DataFusion boundary around a posting-backed compound scorer tree.
+#[derive(Debug)]
+pub struct CompoundQueryExec {
+    dataset: Arc<Dataset>,
+    query: FtsQuery,
+    params: FtsSearchParams,
+    prefilter_source: PreFilterSource,
+    /// When set, leaf scorers use this instead of building one from the
+    /// searched segments — see [`MatchQueryExec::with_base_scorer`].
+    base_scorer: Option<Arc<MemBM25Scorer>>,
+    segment_selection: FtsSegmentSelection,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl CompoundQueryExec {
+    pub fn new_with_segments(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segments: Vec<IndexMetadata>,
+    ) -> Self {
+        Self::new_inner(
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+        )
+    }
+
+    pub fn new_with_segment_uuids(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segment_uuids: Vec<Uuid>,
+    ) -> Self {
+        Self::new_inner(
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            FtsSegmentSelection::exact_uuids(segment_uuids),
+        )
+    }
+
+    fn new_inner(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segment_selection: FtsSegmentSelection,
+    ) -> Self {
+        Self {
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            base_scorer: None,
+            segment_selection,
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(FTS_SCHEMA.clone()),
+                Partitioning::RoundRobinBatch(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            )),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// Override locally computed BM25 statistics with a corpus-wide scorer.
+    ///
+    /// The scorer must cover every token in every query leaf, including fuzzy
+    /// expansions. Execution returns an error when any required token is absent.
+    pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn query(&self) -> &FtsQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
+
+    pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
+        self.base_scorer.as_ref()
+    }
+
+    /// See [`MatchQueryExec::explicit_segment_uuids`].
+    pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
+        self.segment_selection.explicit_segment_uuids()
+    }
+}
+
+impl DisplayAs for CompoundQueryExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "CompoundFtsScorer: query={}", self.query)
+            }
+            DisplayFormatType::TreeRender => write!(f, "CompoundFtsScorer\nquery={}", self.query),
+        }
+    }
+}
+
+impl ExecutionPlan for CompoundQueryExec {
+    fn name(&self) -> &str {
+        "CompoundQueryExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        match &self.prefilter_source {
+            PreFilterSource::None => vec![],
+            PreFilterSource::FilteredRowIds(source) | PreFilterSource::ScalarIndexQuery(source) => {
+                vec![source]
+            }
+        }
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let prefilter_source = match children.len() {
+            0 if matches!(self.prefilter_source, PreFilterSource::None) => PreFilterSource::None,
+            1 => {
+                let Some(source) = children.pop() else {
+                    return Err(DataFusionError::Internal(
+                        "compound FTS lost its prefilter child".to_string(),
+                    ));
+                };
+                match &self.prefilter_source {
+                    PreFilterSource::FilteredRowIds(_) => PreFilterSource::FilteredRowIds(source),
+                    PreFilterSource::ScalarIndexQuery(_) => {
+                        PreFilterSource::ScalarIndexQuery(source)
+                    }
+                    PreFilterSource::None => {
+                        return Err(DataFusionError::Internal(
+                            "compound FTS received an unexpected prefilter child".to_string(),
+                        ));
+                    }
+                }
+            }
+            count => {
+                return Err(DataFusionError::Internal(format!(
+                    "compound FTS expected at most one prefilter child, got {count}"
+                )));
+            }
+        };
+        Ok(Arc::new(Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            params: self.params.clone(),
+            prefilter_source,
+            base_scorer: self.base_scorer.clone(),
+            segment_selection: self.segment_selection.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    #[instrument(name = "compound_fts_scorer_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let dataset = self.dataset.clone();
+        let query = self.query.clone();
+        let params = self.params.clone();
+        let prefilter_source = self.prefilter_source.clone();
+        let base_scorer = self.base_scorer.clone();
+        let segment_selection = self.segment_selection.clone();
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+
+        let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let columns = query.columns();
+            let column = columns.iter().next().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "compound FTS query does not reference an indexed column".to_string(),
+                )
+            })?;
+            if columns.len() != 1 {
+                return Err(DataFusionError::Execution(
+                    "posting-backed compound FTS requires exactly one column".to_string(),
+                ));
+            }
+            let segments = segment_selection
+                .resolve(&dataset, column, &metrics.segment_bind_duration)
+                .await?;
+            let _details = load_segment_details(&dataset, column, &segments).await?;
+            let indices =
+                open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
+            let mut prefilter =
+                build_prefilter(context, partition, &prefilter_source, dataset, &segments)?;
+            let deleted_fragments =
+                indices
+                    .iter()
+                    .fold(roaring::RoaringBitmap::new(), |mut deleted, index| {
+                        deleted |= index.deleted_fragments().clone();
+                        deleted
+                    });
+            if !deleted_fragments.is_empty() {
+                let prefilter = Arc::get_mut(&mut prefilter).ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "compound FTS prefilter was unexpectedly shared before initialization"
+                            .to_string(),
+                    )
+                })?;
+                prefilter.set_deleted_fragments(deleted_fragments);
+            }
+            metrics.record_parts_searched(
+                indices
+                    .iter()
+                    .map(|index| index.partition_count())
+                    .sum::<usize>()
+                    .saturating_mul(count_fts_leaves(&query)),
+            );
+            let (row_ids, scores) = match base_scorer {
+                Some(base_scorer) => {
+                    compound_search_with_base_scorer(
+                        &indices,
+                        &query,
+                        &params,
+                        prefilter,
+                        metrics.clone(),
+                        base_scorer,
+                    )
+                    .await?
+                }
+                None => {
+                    compound_search(&indices, &query, &params, prefilter, metrics.clone()).await?
+                }
+            };
+            metrics.baseline_metrics.record_output(row_ids.len());
+            Ok::<_, DataFusionError>(RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(row_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+}
+
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
 fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
     Box::new(TextTokenizer::new(
         TextAnalyzer::builder(SimpleTokenizer::default()).build(),
     ))
+}
+
+/// Time spent resolving an exact ordered UUID selection to committed FTS segments.
+pub const FTS_SEGMENT_BIND_DURATION_METRIC: &str = "fts_segment_bind_duration";
+
+#[derive(Debug, Clone)]
+enum FtsSegmentSelection {
+    AllCommitted,
+    ExactResolved(Arc<[IndexMetadata]>),
+    ExactUuids(Arc<[Uuid]>),
+}
+
+impl FtsSegmentSelection {
+    fn exact_uuids(mut uuids: Vec<Uuid>) -> Self {
+        let mut seen = HashSet::with_capacity(uuids.len());
+        uuids.retain(|uuid| seen.insert(*uuid));
+        Self::ExactUuids(Arc::from(uuids))
+    }
+
+    fn preset_segments(&self) -> Option<&[IndexMetadata]> {
+        match self {
+            Self::ExactResolved(segments) => Some(segments),
+            Self::AllCommitted | Self::ExactUuids(_) => None,
+        }
+    }
+
+    fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
+        match self {
+            Self::AllCommitted => None,
+            Self::ExactResolved(segments) => {
+                Some(segments.iter().map(|segment| segment.uuid).collect())
+            }
+            Self::ExactUuids(uuids) => Some(uuids.to_vec()),
+        }
+    }
+
+    async fn resolve(
+        &self,
+        dataset: &Dataset,
+        column: &str,
+        segment_bind_duration: &Time,
+    ) -> DataFusionResult<Arc<[IndexMetadata]>> {
+        match self {
+            Self::AllCommitted => load_segments(dataset, column)
+                .await?
+                .map(Arc::from)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "No Inverted index found for column {}",
+                        column,
+                    ))
+                }),
+            Self::ExactResolved(segments) => Ok(segments.clone()),
+            Self::ExactUuids(uuids) => {
+                let _timer = segment_bind_duration.timer();
+                let dataset_version = dataset.version_id();
+                if uuids.is_empty() {
+                    return Err(DataFusionError::Execution(format!(
+                        "Exact FTS segment selection for column {} at dataset version {} \
+                         requires at least one segment UUID",
+                        column, dataset_version
+                    )));
+                }
+
+                let committed_segments =
+                    load_segments(dataset, column).await?.ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Cannot resolve exact FTS segment selection for column {} at dataset \
+                             version {}: no Inverted index found",
+                            column, dataset_version
+                        ))
+                    })?;
+                let mut segments_by_uuid = HashMap::with_capacity(committed_segments.len());
+                for segment in committed_segments {
+                    let uuid = segment.uuid;
+                    if segments_by_uuid.insert(uuid, segment).is_some() {
+                        return Err(DataFusionError::Execution(format!(
+                            "FTS metadata for column {} at dataset version {} contains duplicate \
+                             segment UUID {}",
+                            column, dataset_version, uuid
+                        )));
+                    }
+                }
+
+                let mut resolved = Vec::with_capacity(uuids.len());
+                for uuid in uuids.iter() {
+                    let segment = segments_by_uuid.get(uuid).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Requested FTS segment UUID {} for column {} is not committed in \
+                             dataset version {}",
+                            uuid, column, dataset_version
+                        ))
+                    })?;
+                    resolved.push(segment.clone());
+                }
+                Ok(Arc::from(resolved))
+            }
+        }
+    }
 }
 
 pub struct FtsIndexMetrics {
@@ -166,6 +576,10 @@ pub struct FtsIndexMetrics {
     and_candidates_pruned_before_return: Count,
     and_full_scores: Count,
     freqs_collected: Count,
+    /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
+    /// fallback; zero when a preset base scorer was injected.
+    scorer_build_ms: Gauge,
+    segment_bind_duration: Time,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -179,12 +593,18 @@ impl FtsIndexMetrics {
                 .new_count(AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, partition),
             and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
             freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
+            scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
+            segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 
     pub fn record_parts_searched(&self, num_parts: usize) {
         self.partitions_searched.add(num_parts);
+    }
+
+    pub fn record_scorer_build(&self, elapsed: std::time::Duration) {
+        self.scorer_build_ms.set(elapsed.as_millis() as usize);
     }
 }
 
@@ -199,6 +619,14 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_metrics.record_comparisons(num_comparisons);
+    }
+
+    fn record_index_cache_hits(&self, num_hits: usize) {
+        self.index_metrics.record_index_cache_hits(num_hits);
+    }
+
+    fn record_index_cache_misses(&self, num_misses: usize) {
+        self.index_metrics.record_index_cache_misses(num_misses);
     }
 
     fn record_and_candidates_seen(&self, num_candidates: usize) {
@@ -227,9 +655,7 @@ pub struct MatchQueryExec {
     /// When set, `execute()` skips `build_global_bm25_scorer` and threads this
     /// scorer down to `InvertedIndex::bm25_search`.
     base_scorer: Option<Arc<MemBM25Scorer>>,
-    /// When set, `execute()` skips `load_segments` and searches exactly these
-    /// segments.
-    preset_segments: Option<Vec<IndexMetadata>>,
+    segment_selection: FtsSegmentSelection,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -241,7 +667,7 @@ impl DisplayAs for MatchQueryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "MatchQuery: column={}, query={}",
+                    "MatchQuery: column={}, query=[{}]",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
                 )
@@ -287,7 +713,7 @@ impl MatchQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
-            preset_segments: None,
+            segment_selection: FtsSegmentSelection::AllCommitted,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -322,7 +748,40 @@ impl MatchQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
-            preset_segments: Some(segments),
+            segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// Construct a `MatchQueryExec` bound to an exact ordered set of committed
+    /// FTS segment UUIDs.
+    ///
+    /// The UUIDs are resolved from this exec's dataset snapshot when the output
+    /// stream is polled. Duplicate UUIDs are removed while preserving their
+    /// first-occurrence order. Resolution fails if the list is empty or any UUID
+    /// is not committed for the query column.
+    pub fn new_with_segment_uuids(
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segment_uuids: Vec<Uuid>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        let params = Self::effective_params(&query, params);
+        Self {
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            base_scorer: None,
+            segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -366,17 +825,22 @@ impl MatchQueryExec {
     }
 
     pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
-        self.preset_segments.as_deref()
+        self.segment_selection.preset_segments()
+    }
+
+    /// Return the ordered segment UUIDs for an explicit selection.
+    ///
+    /// Returns `None` when this exec searches all committed segments. UUID-based
+    /// selections omit duplicates while preserving first-occurrence order.
+    /// Pre-resolved selections preserve the supplied metadata order.
+    pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
+        self.segment_selection.explicit_segment_uuids()
     }
 }
 
 impl ExecutionPlan for MatchQueryExec {
     fn name(&self) -> &str {
         "MatchQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -413,7 +877,7 @@ impl ExecutionPlan for MatchQueryExec {
                     params: self.params.clone(),
                     prefilter_source: PreFilterSource::None,
                     base_scorer: self.base_scorer.clone(),
-                    preset_segments: self.preset_segments.clone(),
+                    segment_selection: self.segment_selection.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -440,7 +904,7 @@ impl ExecutionPlan for MatchQueryExec {
                     params: self.params.clone(),
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
-                    preset_segments: self.preset_segments.clone(),
+                    segment_selection: self.segment_selection.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -465,7 +929,7 @@ impl ExecutionPlan for MatchQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
-        let preset_segments = self.preset_segments.clone();
+        let segment_selection = self.segment_selection.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -473,15 +937,9 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let segments = match preset_segments {
-                Some(segments) => segments,
-                None => load_segments(&ds, &column)
-                    .await?
-                    .ok_or(DataFusionError::Execution(format!(
-                        "No Inverted index found for column {}",
-                        column,
-                    )))?,
-            };
+            let segments = segment_selection
+                .resolve(&ds, &column, &metrics.segment_bind_duration)
+                .await?;
             let _details = load_segment_details(&ds, &column, &segments).await?;
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
@@ -525,11 +983,21 @@ impl ExecutionPlan for MatchQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(
-                    build_global_bm25_scorer(&indices, &tokens, &params)
+                None => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_global_bm25_scorer(
+                            &indices,
+                            &tokens,
+                            &params,
+                            Some(metrics.as_ref()),
+                        )
                         .boxed()
                         .await?,
-                ),
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
             };
 
             pre_filter.wait_for_ready().await?;
@@ -795,10 +1263,6 @@ impl ExecutionPlan for FlatMatchFilterExec {
         "FlatMatchFilterExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -850,7 +1314,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -991,10 +1455,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
         "FlatMatchQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.unindexed_input]
     }
@@ -1078,13 +1538,17 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         Some(scorer) => (*scorer).clone(),
                         None => {
                             let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-                            build_global_bm25_scorer(
+                            let scorer_start = std::time::Instant::now();
+                            let scorer = build_global_bm25_scorer(
                                 &indices,
                                 &query_tokens,
                                 &FtsSearchParams::new(),
+                                Some(metrics.as_ref()),
                             )
                             .boxed()
-                            .await?
+                            .await?;
+                            metrics.record_scorer_build(scorer_start.elapsed());
+                            scorer
                         }
                     };
                     (tokenizer, Some(base_scorer))
@@ -1095,13 +1559,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 ),
             };
 
-            flat_bm25_search_stream_with_metrics(
+            flat_bm25_search_stream_with_metrics_and_operator(
                 unindexed_input,
                 column,
                 query.terms,
                 tokenizer,
                 base_scorer,
                 target_batch_size,
+                query.operator,
                 Some(elapsed_compute),
             )
             .await
@@ -1147,9 +1612,7 @@ pub struct PhraseQueryExec {
     /// Optional override for the BM25 scorer normally built locally inside
     /// `execute()`. See [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
-    /// Optional pre-resolved segment list. See
-    /// [`MatchQueryExec::new_with_segments`].
-    preset_segments: Option<Vec<IndexMetadata>>,
+    segment_selection: FtsSegmentSelection,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1198,7 +1661,7 @@ impl PhraseQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
-            preset_segments: None,
+            segment_selection: FtsSegmentSelection::AllCommitted,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1226,7 +1689,41 @@ impl PhraseQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
-            preset_segments: Some(segments),
+            segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// Construct a `PhraseQueryExec` bound to an exact ordered set of committed
+    /// FTS segment UUIDs.
+    ///
+    /// The UUIDs are resolved from this exec's dataset snapshot when the output
+    /// stream is polled. Duplicate UUIDs are removed while preserving their
+    /// first-occurrence order. Resolution fails if the list is empty or any UUID
+    /// is not committed for the query column.
+    pub fn new_with_segment_uuids(
+        dataset: Arc<Dataset>,
+        query: PhraseQuery,
+        mut params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segment_uuids: Vec<Uuid>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        params = params.with_phrase_slop(Some(query.slop));
+
+        Self {
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            base_scorer: None,
+            segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1259,17 +1756,22 @@ impl PhraseQueryExec {
     }
 
     pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
-        self.preset_segments.as_deref()
+        self.segment_selection.preset_segments()
+    }
+
+    /// Return the ordered segment UUIDs for an explicit selection.
+    ///
+    /// Returns `None` when this exec searches all committed segments. UUID-based
+    /// selections omit duplicates while preserving first-occurrence order.
+    /// Pre-resolved selections preserve the supplied metadata order.
+    pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
+        self.segment_selection.explicit_segment_uuids()
     }
 }
 
 impl ExecutionPlan for PhraseQueryExec {
     fn name(&self) -> &str {
         "PhraseQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1299,7 +1801,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 params: self.params.clone(),
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
-                preset_segments: self.preset_segments.clone(),
+                segment_selection: self.segment_selection.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -1324,7 +1826,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     params: self.params.clone(),
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
-                    preset_segments: self.preset_segments.clone(),
+                    segment_selection: self.segment_selection.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1349,7 +1851,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
-        let preset_segments = self.preset_segments.clone();
+        let segment_selection = self.segment_selection.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -1357,15 +1859,9 @@ impl ExecutionPlan for PhraseQueryExec {
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
-            let segments = match preset_segments {
-                Some(segments) => segments,
-                None => load_segments(&ds, &column)
-                    .await?
-                    .ok_or(DataFusionError::Execution(format!(
-                        "No Inverted index found for column {}",
-                        column,
-                    )))?,
-            };
+            let segments = segment_selection
+                .resolve(&ds, &column, &metrics.segment_bind_duration)
+                .await?;
             let _details = load_segment_details(&ds, &column, &segments).await?;
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
@@ -1395,11 +1891,21 @@ impl ExecutionPlan for PhraseQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(
-                    build_global_bm25_scorer(&indices, &tokens, &params)
+                None => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_global_bm25_scorer(
+                            &indices,
+                            &tokens,
+                            &params,
+                            Some(metrics.as_ref()),
+                        )
                         .boxed()
                         .await?,
-                ),
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
             };
 
             pre_filter.wait_for_ready().await?;
@@ -1521,10 +2027,6 @@ impl ExecutionPlan for BoostQueryExec {
         "BoostQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.positive, &self.negative]
     }
@@ -1598,7 +2100,7 @@ impl ExecutionPlan for BoostQueryExec {
 
             let (doc_ids, scores): (Vec<_>, Vec<_>) = res
                 .into_iter()
-                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .sorted_unstable_by(compare_scored_rows)
                 .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
             metrics.baseline_metrics.record_output(doc_ids.len());
@@ -1789,10 +2291,6 @@ impl ExecutionPlan for BooleanQueryExec {
         "BooleanQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.must {
             Some(must) => vec![&self.should, &self.must_not, must],
@@ -1938,7 +2436,7 @@ impl ExecutionPlan for BooleanQueryExec {
             let _timer = elapsed_time.timer();
             let (row_ids, scores): (Vec<_>, Vec<_>) = res
                 .into_iter()
-                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .sorted_unstable_by(compare_scored_rows)
                 .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
             metrics.baseline_metrics.record_output(row_ids.len());
@@ -1976,10 +2474,11 @@ mod tests {
         UInt64Array,
     };
     use arrow_schema::DataType;
+    use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use futures::TryStreamExt;
-    use lance_core::ROW_ID;
+    use lance_core::{ROW_ID, utils::address::RowAddress};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
@@ -1995,6 +2494,7 @@ mod tests {
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
     use lance_table::format::IndexMetadata;
+    use uuid::Uuid;
 
     use crate::{
         Dataset,
@@ -2006,8 +2506,9 @@ mod tests {
     };
 
     use super::{
-        BoolSlot, BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
-        PhraseQueryExec, build_boolean_query_children, open_fts_segments,
+        BoolSlot, BoostQueryExec, CompoundQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC,
+        FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+        build_boolean_query_children, open_fts_segments,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -2031,6 +2532,128 @@ mod tests {
         fn consume(self) -> ExecutionSummaryCounts {
             self.collected_stats.lock().unwrap().take().unwrap()
         }
+    }
+
+    async fn create_segment_selection_fixture() -> (Arc<Dataset>, Vec<IndexMetadata>, Vec<u32>) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["quick brown fox"]),
+            )
+            .col(
+                "other",
+                lance_datagen::array::cycle_utf8_literals(&["not indexed"]),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids.len(), 3);
+
+        let params = InvertedIndexParams::default().with_position(true);
+        let mut segments = Vec::with_capacity(fragment_ids.len());
+        for fragment_id in &fragment_ids {
+            let mut builder = dataset
+                .create_index_builder(&["text"], IndexType::Inverted, &params)
+                .name("segment_selection_fts".to_string())
+                .fragments(vec![*fragment_id]);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+        dataset
+            .commit_existing_index_segments("segment_selection_fts", "text", segments.clone())
+            .await
+            .unwrap();
+
+        let committed = crate::index::scalar::inverted::load_segments(&dataset, "text")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.len(), fragment_ids.len());
+        (Arc::new(dataset), committed, fragment_ids)
+    }
+
+    fn segment_uuid_for_fragment(segments: &[IndexMetadata], fragment_id: u32) -> Uuid {
+        segments
+            .iter()
+            .find(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|fragments| fragments.contains(fragment_id))
+            })
+            .map(|segment| segment.uuid)
+            .unwrap()
+    }
+
+    fn expected_row_ids(fragment_ids: &[u32]) -> Vec<u64> {
+        let mut row_ids = fragment_ids
+            .iter()
+            .flat_map(|fragment_id| {
+                (0..2).map(|offset| u64::from(RowAddress::new_from_parts(*fragment_id, offset)))
+            })
+            .collect::<Vec<_>>();
+        row_ids.sort_unstable();
+        row_ids
+    }
+
+    async fn execute_results(plan: &dyn ExecutionPlan) -> DataFusionResult<Vec<(u64, f32)>> {
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, Arc::new(TaskContext::default()))?
+            .try_collect()
+            .await?;
+        let mut results = Vec::new();
+        for batch in batches {
+            let row_ids = batch[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            let scores = batch[SCORE_COL]
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            results.extend(
+                row_ids
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(scores.values().iter().copied()),
+            );
+        }
+        results.sort_by_key(|(row_id, _)| *row_id);
+        Ok(results)
+    }
+
+    async fn execute_row_ids(plan: &dyn ExecutionPlan) -> DataFusionResult<Vec<u64>> {
+        Ok(execute_results(plan)
+            .await?
+            .into_iter()
+            .map(|(row_id, _)| row_id)
+            .collect())
+    }
+
+    fn metric_value(plan: &dyn ExecutionPlan, name: &str) -> usize {
+        plan.metrics()
+            .unwrap()
+            .iter()
+            .find(|metric| metric.value().name() == name)
+            .unwrap()
+            .value()
+            .as_usize()
+    }
+
+    fn assert_execution_error(error: DataFusionError, expected_message: &str) {
+        assert!(
+            matches!(&error, DataFusionError::Execution(_)),
+            "expected execution error, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(expected_message),
+            "expected error containing {expected_message:?}, got {error}"
+        );
     }
 
     #[test]
@@ -2318,13 +2941,348 @@ mod tests {
             .full_text_search(FullTextSearchQuery::new_query(query.into()))
             .unwrap();
         let analysis = scanner.analyze_plan().await.unwrap();
-        let boolean_line = analysis
+        let compound_line = analysis
             .lines()
-            .find(|line| line.contains("BooleanQuery"))
+            .find(|line| line.contains("CompoundFtsScorer"))
             .unwrap();
         assert!(
-            boolean_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
-            "BooleanQuery metrics missing partitions_searched: {boolean_line}"
+            compound_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
+            "compound FTS scorer metrics missing partitions_searched: {compound_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_match_query_exec_segment_selection() {
+        let (dataset, segments, fragment_ids) = create_segment_selection_fixture().await;
+        let query = MatchQuery::new("quick".to_string()).with_column(Some("text".to_string()));
+        let params = FtsSearchParams::default().with_limit(Some(20));
+        let committed_uuids = segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+
+        let all_committed = MatchQueryExec::new(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+        );
+        assert!(all_committed.preset_segments().is_none());
+        assert!(all_committed.explicit_segment_uuids().is_none());
+        let all_results = execute_results(&all_committed).await.unwrap();
+        assert_eq!(
+            all_results
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect::<Vec<_>>(),
+            expected_row_ids(&fragment_ids)
+        );
+        assert_eq!(
+            metric_value(&all_committed, FTS_SEGMENT_BIND_DURATION_METRIC),
+            0
+        );
+
+        let exact_resolved = MatchQueryExec::new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        );
+        assert_eq!(exact_resolved.preset_segments(), Some(segments.as_slice()));
+        assert_eq!(
+            exact_resolved.explicit_segment_uuids(),
+            Some(committed_uuids.clone())
+        );
+        assert_eq!(execute_results(&exact_resolved).await.unwrap(), all_results);
+        assert_eq!(
+            metric_value(&exact_resolved, FTS_SEGMENT_BIND_DURATION_METRIC),
+            0
+        );
+
+        let selected_fragment = fragment_ids[1];
+        let selected_uuid = segment_uuid_for_fragment(&segments, selected_fragment);
+        let unpolled = MatchQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            vec![selected_uuid],
+        );
+        drop(
+            unpolled
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap(),
+        );
+        assert_eq!(
+            metric_value(&unpolled, FTS_SEGMENT_BIND_DURATION_METRIC),
+            0,
+            "UUID binding should not start until the output stream is polled"
+        );
+
+        let exact_uuids = MatchQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            vec![selected_uuid],
+        );
+        assert!(exact_uuids.preset_segments().is_none());
+        assert_eq!(
+            exact_uuids.explicit_segment_uuids(),
+            Some(vec![selected_uuid])
+        );
+        assert_eq!(
+            execute_row_ids(&exact_uuids).await.unwrap(),
+            expected_row_ids(&[selected_fragment])
+        );
+        assert!(
+            metric_value(&exact_uuids, FTS_SEGMENT_BIND_DURATION_METRIC) > 0,
+            "successful UUID binding should record a duration"
+        );
+
+        let input_uuids = vec![
+            segment_uuid_for_fragment(&segments, fragment_ids[2]),
+            segment_uuid_for_fragment(&segments, fragment_ids[0]),
+            segment_uuid_for_fragment(&segments, fragment_ids[2]),
+        ];
+        let deduplicated_uuids = input_uuids[..2].to_vec();
+        let ordered_plan = Arc::new(MatchQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            input_uuids,
+        ))
+        .with_new_children(vec![])
+        .unwrap();
+        let rewritten = ordered_plan.downcast_ref::<MatchQueryExec>().unwrap();
+        assert_eq!(
+            rewritten.explicit_segment_uuids(),
+            Some(deduplicated_uuids.clone())
+        );
+        assert_eq!(
+            execute_row_ids(rewritten).await.unwrap(),
+            expected_row_ids(&[fragment_ids[2], fragment_ids[0]])
+        );
+        let resolver_metrics_set = ExecutionPlanMetricsSet::new();
+        let resolver_metrics = super::FtsIndexMetrics::new(&resolver_metrics_set, 0);
+        let resolved = rewritten
+            .segment_selection
+            .resolve(&dataset, "text", &resolver_metrics.segment_bind_duration)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<Vec<_>>(),
+            deduplicated_uuids
+        );
+
+        let empty = MatchQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            vec![],
+        );
+        assert_execution_error(
+            execute_row_ids(&empty).await.unwrap_err(),
+            "requires at least one segment UUID",
+        );
+
+        let missing_uuid = Uuid::new_v4();
+        let missing = MatchQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query,
+            params.clone(),
+            PreFilterSource::None,
+            vec![missing_uuid],
+        );
+        assert_execution_error(
+            execute_row_ids(&missing).await.unwrap_err(),
+            &missing_uuid.to_string(),
+        );
+
+        let wrong_column = MatchQueryExec::new_with_segment_uuids(
+            dataset,
+            MatchQuery::new("quick".to_string()).with_column(Some("other".to_string())),
+            params,
+            PreFilterSource::None,
+            vec![selected_uuid],
+        );
+        assert_execution_error(
+            execute_row_ids(&wrong_column).await.unwrap_err(),
+            "no Inverted index found",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phrase_query_exec_segment_selection() {
+        let (dataset, segments, fragment_ids) = create_segment_selection_fixture().await;
+        let query =
+            PhraseQuery::new("quick brown".to_string()).with_column(Some("text".to_string()));
+        let params = FtsSearchParams::default().with_limit(Some(20));
+        let committed_uuids = segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+
+        let all_committed = PhraseQueryExec::new(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+        );
+        assert!(all_committed.preset_segments().is_none());
+        assert!(all_committed.explicit_segment_uuids().is_none());
+        let all_results = execute_results(&all_committed).await.unwrap();
+        assert_eq!(
+            all_results
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect::<Vec<_>>(),
+            expected_row_ids(&fragment_ids)
+        );
+        assert_eq!(
+            metric_value(&all_committed, FTS_SEGMENT_BIND_DURATION_METRIC),
+            0
+        );
+
+        let exact_resolved = PhraseQueryExec::new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        );
+        assert_eq!(exact_resolved.preset_segments(), Some(segments.as_slice()));
+        assert_eq!(
+            exact_resolved.explicit_segment_uuids(),
+            Some(committed_uuids)
+        );
+        assert_eq!(execute_results(&exact_resolved).await.unwrap(), all_results);
+        assert_eq!(
+            metric_value(&exact_resolved, FTS_SEGMENT_BIND_DURATION_METRIC),
+            0
+        );
+
+        let selected_fragment = fragment_ids[1];
+        let selected_uuid = segment_uuid_for_fragment(&segments, selected_fragment);
+        let unpolled = PhraseQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            vec![selected_uuid],
+        );
+        drop(
+            unpolled
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap(),
+        );
+        assert_eq!(
+            metric_value(&unpolled, FTS_SEGMENT_BIND_DURATION_METRIC),
+            0,
+            "UUID binding should not start until the output stream is polled"
+        );
+
+        let exact_uuids = PhraseQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            vec![selected_uuid],
+        );
+        assert!(exact_uuids.preset_segments().is_none());
+        assert_eq!(
+            exact_uuids.explicit_segment_uuids(),
+            Some(vec![selected_uuid])
+        );
+        assert_eq!(
+            execute_row_ids(&exact_uuids).await.unwrap(),
+            expected_row_ids(&[selected_fragment])
+        );
+        assert!(
+            metric_value(&exact_uuids, FTS_SEGMENT_BIND_DURATION_METRIC) > 0,
+            "successful UUID binding should record a duration"
+        );
+
+        let input_uuids = vec![
+            segment_uuid_for_fragment(&segments, fragment_ids[2]),
+            segment_uuid_for_fragment(&segments, fragment_ids[0]),
+            segment_uuid_for_fragment(&segments, fragment_ids[2]),
+        ];
+        let deduplicated_uuids = input_uuids[..2].to_vec();
+        let ordered_plan = Arc::new(PhraseQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            input_uuids,
+        ))
+        .with_new_children(vec![])
+        .unwrap();
+        let rewritten = ordered_plan.downcast_ref::<PhraseQueryExec>().unwrap();
+        assert_eq!(
+            rewritten.explicit_segment_uuids(),
+            Some(deduplicated_uuids.clone())
+        );
+        assert_eq!(
+            execute_row_ids(rewritten).await.unwrap(),
+            expected_row_ids(&[fragment_ids[2], fragment_ids[0]])
+        );
+        let resolver_metrics_set = ExecutionPlanMetricsSet::new();
+        let resolver_metrics = super::FtsIndexMetrics::new(&resolver_metrics_set, 0);
+        let resolved = rewritten
+            .segment_selection
+            .resolve(&dataset, "text", &resolver_metrics.segment_bind_duration)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<Vec<_>>(),
+            deduplicated_uuids
+        );
+
+        let empty = PhraseQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            vec![],
+        );
+        assert_execution_error(
+            execute_row_ids(&empty).await.unwrap_err(),
+            "requires at least one segment UUID",
+        );
+
+        let missing_uuid = Uuid::new_v4();
+        let missing = PhraseQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query,
+            params.clone(),
+            PreFilterSource::None,
+            vec![missing_uuid],
+        );
+        assert_execution_error(
+            execute_row_ids(&missing).await.unwrap_err(),
+            &missing_uuid.to_string(),
+        );
+
+        let wrong_column = PhraseQueryExec::new_with_segment_uuids(
+            dataset,
+            PhraseQuery::new("quick brown".to_string()).with_column(Some("other".to_string())),
+            params,
+            PreFilterSource::None,
+            vec![selected_uuid],
+        );
+        assert_execution_error(
+            execute_row_ids(&wrong_column).await.unwrap_err(),
+            "no Inverted index found",
         );
     }
 
@@ -2452,7 +3410,7 @@ mod tests {
         let mut tokenizer = indices[0].tokenizer();
         let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
         let global_scorer = Arc::new(
-            build_global_bm25_scorer(&indices, &tokens, &search_params)
+            build_global_bm25_scorer(&indices, &tokens, &search_params, None)
                 .await
                 .unwrap(),
         );
@@ -2532,6 +3490,124 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_compound_query_exec_validates_base_scorer() {
+        let (dataset, segments, _) = create_segment_selection_fixture().await;
+        let search_params = FtsSearchParams::default().with_limit(Some(10));
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = IndexMetrics::new(&metrics_set, 0);
+        let indices = open_fts_segments(&dataset, "text", &segments, &metrics)
+            .await
+            .unwrap();
+
+        let query: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("quick".to_string())
+                    .with_column(Some("text".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Should,
+                MatchQuery::new("brown".to_string())
+                    .with_column(Some("text".to_string()))
+                    .into(),
+            ),
+        ])
+        .into();
+
+        let baseline = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        );
+        let baseline_results = execute_results(&baseline).await.unwrap();
+
+        let mut tokenizer = indices[0].tokenizer();
+        let complete_tokens = collect_query_tokens("quick brown", &mut tokenizer);
+        let complete_scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &complete_tokens, &search_params, None)
+                .await
+                .unwrap(),
+        );
+        let complete_override = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        )
+        .with_base_scorer(complete_scorer);
+        assert_eq!(
+            execute_results(&complete_override).await.unwrap(),
+            baseline_results
+        );
+
+        let mut tokenizer = indices[0].tokenizer();
+        let incomplete_tokens = collect_query_tokens("quick", &mut tokenizer);
+        let incomplete_scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &incomplete_tokens, &search_params, None)
+                .await
+                .unwrap(),
+        );
+        let incomplete_override = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            query,
+            search_params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        )
+        .with_base_scorer(incomplete_scorer);
+
+        let error = execute_results(&incomplete_override).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected BM25 scorer is missing compound FTS token 'brown'"),
+            "unexpected incomplete-scorer error: {error}"
+        );
+
+        let mut tokenizer = indices[0].tokenizer();
+        let brown_tokens = collect_query_tokens("brown", &mut tokenizer);
+        let scorer_without_fuzzy_expansion = Arc::new(
+            build_global_bm25_scorer(&indices, &brown_tokens, &search_params, None)
+                .await
+                .unwrap(),
+        );
+        let fuzzy_query = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("quik".to_string())
+                    .with_column(Some("text".to_string()))
+                    .with_fuzziness(Some(1))
+                    .into(),
+            ),
+            (
+                Occur::Should,
+                MatchQuery::new("brown".to_string())
+                    .with_column(Some("text".to_string()))
+                    .into(),
+            ),
+        ]);
+        let fuzzy_override = CompoundQueryExec::new_with_segments(
+            dataset,
+            fuzzy_query.into(),
+            search_params,
+            PreFilterSource::None,
+            segments,
+        )
+        .with_base_scorer(scorer_without_fuzzy_expansion);
+        let error = execute_results(&fuzzy_override).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected BM25 scorer is missing compound FTS token 'quick'"),
+            "unexpected fuzzy-scorer error: {error}"
+        );
+    }
+
     fn empty_fts_child() -> Arc<dyn ExecutionPlan> {
         Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
     }
@@ -2542,7 +3618,7 @@ mod tests {
             .unwrap()
             .expect("Should slot always returns Some");
         assert!(
-            plan.as_any().downcast_ref::<EmptyExec>().is_some(),
+            plan.downcast_ref::<EmptyExec>().is_some(),
             "expected EmptyExec for empty Should slot, got {plan:?}"
         );
     }
@@ -2570,12 +3646,10 @@ mod tests {
         .unwrap()
         .expect("Should slot always returns Some");
         let repartition = plan
-            .as_any()
             .downcast_ref::<RepartitionExec>()
             .expect("multi-child Should should be wrapped in RepartitionExec");
         let inner = repartition
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
@@ -2614,7 +3688,7 @@ mod tests {
         // there are N-1 joins.
         let mut joins = 0usize;
         let mut current: Arc<dyn ExecutionPlan> = plan;
-        while let Some(join) = current.clone().as_any().downcast_ref::<HashJoinExec>() {
+        while let Some(join) = current.clone().downcast_ref::<HashJoinExec>() {
             joins += 1;
             current = join.children()[0].clone();
         }
@@ -2630,12 +3704,10 @@ mod tests {
         .unwrap()
         .expect("MustNot slot always returns Some");
         let repartition = plan
-            .as_any()
             .downcast_ref::<RepartitionExec>()
             .expect("multi-child MustNot should be wrapped in RepartitionExec");
         let inner = repartition
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);

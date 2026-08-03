@@ -3,7 +3,6 @@
 
 #[cfg(test)]
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use std::any::Any;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -60,6 +59,8 @@ use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
 use uuid::Uuid;
+
+use lance_select::RowAddrMask;
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
@@ -829,10 +830,6 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         "KNNVectorDistanceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Flat KNN inherits the schema from input node, and add one distance column.
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.output_schema.clone()
@@ -948,7 +945,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         let inner_stats = self.input.partition_statistics(partition)?;
         let input_schema = self.input.schema();
         let input_stats_by_name = inner_stats
@@ -985,11 +982,11 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 }
             })
             .collect::<Vec<_>>();
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1104,11 +1101,14 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+/// Create a new ANN execution node. `overlay_block`, when `Some`, excludes rows whose index
+/// entries may be stale due to a newer data overlay (see [`ANNIvfSubIndexExec::with_overlay_block`]).
 pub fn new_knn_exec(
     dataset: Arc<Dataset>,
     indices: &[IndexMetadata],
     query: &Query,
     prefilter_source: PreFilterSource,
+    overlay_block: Option<RowAddrMask>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
@@ -1116,13 +1116,16 @@ pub fn new_knn_exec(
         query.clone(),
     )?;
 
-    let sub_index = ANNIvfSubIndexExec::try_new(
+    let mut sub_index = ANNIvfSubIndexExec::try_new(
         Arc::new(ivf_node),
         dataset,
         indices.to_vec(),
         query.clone(),
         prefilter_source,
     )?;
+    if let Some(overlay_block) = overlay_block {
+        sub_index = sub_index.with_overlay_block(overlay_block);
+    }
 
     Ok(Arc::new(sub_index))
 }
@@ -1225,10 +1228,6 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         "ANNIVFPartitionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         KNN_PARTITION_SCHEMA.clone()
     }
@@ -1237,11 +1236,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         &self.properties
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.minimum_nprobes),
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1386,6 +1385,10 @@ pub struct ANNIvfSubIndexExec {
     /// Prefiltering input
     prefilter_source: PreFilterSource,
 
+    /// Row addresses whose index entries are stale due to a newer data overlay. Blocked from
+    /// index results at execution time via [`DatasetPreFilter::with_overlay_block`].
+    overlay_block: Option<RowAddrMask>,
+
     /// Datafusion Plan Properties
     properties: Arc<PlanProperties>,
 
@@ -1418,9 +1421,16 @@ impl ANNIvfSubIndexExec {
             indices,
             query,
             prefilter_source,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Block stale row addresses (see the `overlay_block` field) from index results.
+    pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
+        self
     }
 
     /// Returns a reference to the vector query.
@@ -1843,10 +1853,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         "ANNSubIndexExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         KNN_INDEX_SCHEMA.clone()
     }
@@ -1893,6 +1899,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 indices: self.indices.clone(),
                 query: self.query.clone(),
                 prefilter_source,
+                overlay_block: self.overlay_block.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
@@ -1973,11 +1980,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             PreFilterSource::None => None,
         };
 
-        let pre_filter = Arc::new(DatasetPreFilter::new(
-            ds.clone(),
-            &indices,
-            prefilter_loader,
-        ));
+        let pre_filter = {
+            let mut pf = DatasetPreFilter::new(ds.clone(), &indices, prefilter_loader);
+            if let Some(block) = self.overlay_block.clone() {
+                pf = pf.with_overlay_block(block);
+            }
+            Arc::new(pf)
+        };
 
         let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));
 
@@ -2043,8 +2052,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
+    ) -> DataFusionResult<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
@@ -2056,7 +2065,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         .unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -2137,10 +2146,6 @@ impl DisplayAs for MultivectorScoringExec {
 impl ExecutionPlan for MultivectorScoringExec {
     fn name(&self) -> &str {
         "MultivectorScoringExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
@@ -2289,6 +2294,8 @@ impl ExecutionPlan for MultivectorScoringExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::any::Any;
 
     use crate::index::DatasetIndexExt;
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};

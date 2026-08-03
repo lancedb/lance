@@ -5,18 +5,18 @@
 //!
 //! The MemWAL Index stores:
 //! - Configuration (sharding_specs, maintained_indexes)
-//! - Merge progress (merged_generations per shard)
+//! - SSTable compaction progress
 //! - Shard state snapshots (eventually consistent)
 //!
 //! Writers no longer update the index on every write. Instead, they update
 //! shard manifests directly. This module provides functions to:
 //! - Load the MemWAL index
-//! - Update merged generations (called during merge-insert commits)
+//! - Update compacted SSTables (called during merge-insert commits)
 
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails, MergedGeneration};
+use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails};
 use lance_table::format::{IndexMetadata, pb};
 use uuid::Uuid;
 
@@ -45,15 +45,16 @@ pub(crate) fn open_mem_wal_index(index: IndexMetadata) -> Result<Arc<MemWalIndex
     )?)))
 }
 
-/// Update merged_generations in the MemWAL index.
+/// Update `compacted_sstables` in the MemWAL index.
+///
 /// This is called during merge-insert commits to atomically record which
-/// generations have been merged to the base table.
-pub(crate) fn update_mem_wal_index_merged_generations(
+/// SSTables have been compacted into the base table.
+pub(crate) fn update_mem_wal_index_compacted_sstables(
     indices: &mut Vec<IndexMetadata>,
     dataset_version: u64,
-    new_merged_generations: Vec<MergedGeneration>,
+    new_compacted_sstables: Vec<CompactedSsTable>,
 ) -> Result<()> {
-    if new_merged_generations.is_empty() {
+    if new_compacted_sstables.is_empty() {
         return Ok(());
     }
 
@@ -65,26 +66,26 @@ pub(crate) fn update_mem_wal_index_merged_generations(
         let current_meta = indices.remove(pos);
         let mut details = load_mem_wal_index_details(current_meta)?;
 
-        // Update merged_generations - for each shard, keep the higher generation
-        for new_mg in new_merged_generations {
+        // Update compacted_sstables - for each shard, keep the higher generation
+        for new_sstable in new_compacted_sstables {
             if let Some(existing) = details
-                .merged_generations
+                .compacted_sstables
                 .iter_mut()
-                .find(|mg| mg.shard_id == new_mg.shard_id)
+                .find(|sstable| sstable.shard_id == new_sstable.shard_id)
             {
-                if new_mg.generation > existing.generation {
-                    existing.generation = new_mg.generation;
+                if new_sstable.generation > existing.generation {
+                    existing.generation = new_sstable.generation;
                 }
             } else {
-                details.merged_generations.push(new_mg);
+                details.compacted_sstables.push(new_sstable);
             }
         }
 
         new_mem_wal_index_meta(dataset_version, details)?
     } else {
-        // Create new MemWAL index with just the merged generations
+        // Create a MemWAL index containing only compaction progress.
         let details = MemWalIndexDetails {
-            merged_generations: new_merged_generations,
+            compacted_sstables: new_compacted_sstables,
             ..Default::default()
         };
         new_mem_wal_index_meta(dataset_version, details)?
@@ -163,7 +164,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -177,7 +178,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -200,7 +201,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -213,7 +214,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -237,7 +238,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -251,7 +252,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -275,7 +276,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard1, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
             },
             None,
         );
@@ -289,7 +290,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard2, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
             },
             None,
         );
@@ -312,11 +313,11 @@ mod tests {
             .unwrap()
             .clone();
         let details = load_mem_wal_index_details(mem_wal_idx).unwrap();
-        assert_eq!(details.merged_generations.len(), 2);
+        assert_eq!(details.compacted_sstables.len(), 2);
     }
 
     /// Test that CreateIndex of MemWalIndex can be rebased against UpdateMemWalState.
-    /// The merged_generations from UpdateMemWalState should be merged into CreateIndex.
+    /// The compacted_sstables from UpdateMemWalState should be included in CreateIndex.
     #[tokio::test]
     async fn test_create_index_rebase_against_update_mem_wal_state() {
         let dataset = test_dataset().await;
@@ -326,7 +327,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -336,7 +337,7 @@ mod tests {
             .unwrap();
 
         // CreateIndex of MemWalIndex based on old version (before UpdateMemWalState)
-        // This should succeed and merge the generations
+        // This should succeed and combine the compaction progress.
         let details = MemWalIndexDetails {
             num_shards: 1,
             ..Default::default()
@@ -359,7 +360,7 @@ mod tests {
             result
         );
 
-        // Verify the merged_generations from UpdateMemWalState were merged into CreateIndex
+        // Verify the compacted_sstables from UpdateMemWalState were included in CreateIndex
         let dataset = result.unwrap();
         let mem_wal_idx = dataset
             .load_indices()
@@ -370,9 +371,9 @@ mod tests {
             .unwrap()
             .clone();
         let details = load_mem_wal_index_details(mem_wal_idx).unwrap();
-        assert_eq!(details.merged_generations.len(), 1);
-        assert_eq!(details.merged_generations[0].shard_id, shard);
-        assert_eq!(details.merged_generations[0].generation, 10);
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(details.compacted_sstables[0].shard_id, shard);
+        assert_eq!(details.compacted_sstables[0].generation, 10);
         assert_eq!(details.num_shards, 1); // Config from CreateIndex preserved
     }
 
@@ -382,9 +383,9 @@ mod tests {
         let dataset = test_dataset().await;
         let shard = Uuid::new_v4();
 
-        // First commit CreateIndex of MemWalIndex with merged_generations
+        // First commit CreateIndex of MemWalIndex with compacted_sstables
         let details = MemWalIndexDetails {
-            merged_generations: vec![MergedGeneration::new(shard, 10)],
+            compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             ..Default::default()
         };
         let mem_wal_index = new_mem_wal_index_meta(dataset.manifest.version, details).unwrap();
@@ -406,7 +407,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -420,73 +421,73 @@ mod tests {
     }
 
     #[test]
-    fn test_update_merged_generations() {
+    fn test_update_compacted_sstables() {
         let mut indices = Vec::new();
         let shard1 = Uuid::new_v4();
         let shard2 = Uuid::new_v4();
 
         // First update - creates new index
-        update_mem_wal_index_merged_generations(
+        update_mem_wal_index_compacted_sstables(
             &mut indices,
             1,
-            vec![MergedGeneration::new(shard1, 5)],
+            vec![CompactedSsTable::new(shard1, 5)],
         )
         .unwrap();
 
         assert_eq!(indices.len(), 1);
         let details = load_mem_wal_index_details(indices[0].clone()).unwrap();
-        assert_eq!(details.merged_generations.len(), 1);
-        assert_eq!(details.merged_generations[0].shard_id, shard1);
-        assert_eq!(details.merged_generations[0].generation, 5);
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(details.compacted_sstables[0].shard_id, shard1);
+        assert_eq!(details.compacted_sstables[0].generation, 5);
 
         // Second update - updates existing shard
-        update_mem_wal_index_merged_generations(
+        update_mem_wal_index_compacted_sstables(
             &mut indices,
             2,
-            vec![MergedGeneration::new(shard1, 10)],
+            vec![CompactedSsTable::new(shard1, 10)],
         )
         .unwrap();
 
         assert_eq!(indices.len(), 1);
         let details = load_mem_wal_index_details(indices[0].clone()).unwrap();
-        assert_eq!(details.merged_generations.len(), 1);
-        assert_eq!(details.merged_generations[0].generation, 10);
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(details.compacted_sstables[0].generation, 10);
 
         // Third update - adds new shard
-        update_mem_wal_index_merged_generations(
+        update_mem_wal_index_compacted_sstables(
             &mut indices,
             3,
-            vec![MergedGeneration::new(shard2, 3)],
+            vec![CompactedSsTable::new(shard2, 3)],
         )
         .unwrap();
 
         assert_eq!(indices.len(), 1);
         let details = load_mem_wal_index_details(indices[0].clone()).unwrap();
-        assert_eq!(details.merged_generations.len(), 2);
+        assert_eq!(details.compacted_sstables.len(), 2);
 
         // Fourth update - lower generation should not update
-        update_mem_wal_index_merged_generations(
+        update_mem_wal_index_compacted_sstables(
             &mut indices,
             4,
-            vec![MergedGeneration::new(shard1, 8)], // lower than 10
+            vec![CompactedSsTable::new(shard1, 8)], // lower than 10
         )
         .unwrap();
 
         let details = load_mem_wal_index_details(indices[0].clone()).unwrap();
-        let r1_mg = details
-            .merged_generations
+        let shard1_sstable = details
+            .compacted_sstables
             .iter()
-            .find(|mg| mg.shard_id == shard1)
+            .find(|sstable| sstable.shard_id == shard1)
             .unwrap();
-        assert_eq!(r1_mg.generation, 10); // Should still be 10
+        assert_eq!(shard1_sstable.generation, 10); // Should still be 10
     }
 
     #[test]
-    fn test_empty_merged_generations_noop() {
+    fn test_empty_compacted_sstables_noop() {
         let mut indices = Vec::new();
 
         // Empty update should be a no-op
-        update_mem_wal_index_merged_generations(&mut indices, 1, vec![]).unwrap();
+        update_mem_wal_index_compacted_sstables(&mut indices, 1, vec![]).unwrap();
 
         assert!(indices.is_empty());
     }
@@ -520,7 +521,7 @@ mod tests {
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 1)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 1)],
             },
             None,
         );

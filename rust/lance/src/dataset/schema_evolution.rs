@@ -424,7 +424,7 @@ pub(super) async fn add_columns(
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
 ) -> Result<()> {
-    let (fragments, schema, fragments_to_cleanup) = add_columns_to_fragments(
+    let (fragments, schema, _fragments_to_cleanup) = add_columns_to_fragments(
         dataset,
         transforms,
         read_columns,
@@ -435,16 +435,13 @@ pub(super) async fn add_columns(
 
     let operation = Operation::Merge { fragments, schema };
     let transaction = Transaction::new(dataset.manifest.version, operation, None);
-    match dataset
+    // Once the manifest commit has been attempted, an error does not prove
+    // that the new files are unreferenced: the commit may have landed and only
+    // its response (or a post-commit callback) may have failed. Leave files
+    // from failed attempts for dataset GC instead of risking live-data loss.
+    dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await
-    {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            cleanup_new_column_data_files(&dataset.get_fragments(), &fragments_to_cleanup).await;
-            Err(e)
-        }
-    }
 }
 
 async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
@@ -967,7 +964,7 @@ mod test {
     use super::*;
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_table::format::{BasePath, DataFile};
     use rstest::rstest;
 
@@ -1096,6 +1093,69 @@ mod test {
         ]);
         assert_eq!(data.schema().as_ref(), &expected_schema);
         assert_eq!(data.num_rows(), num_rows);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_preserves_files_when_commit_status_is_unknown() -> Result<()> {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let num_rows = 5;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let files_before = data_file_paths_in(test_uri);
+
+        handler.fail_next(AmbiguousFailure::LandAndError);
+        handler
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("double_id".into(), "2 * id".into())]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("unverifiable commit outcome must be reported");
+        assert!(
+            error.is_commit_status_unknown(),
+            "expected CommitStatusUnknown, got: {error:?}"
+        );
+        assert!(data_file_paths_in(test_uri).len() > files_before.len());
+
+        handler
+            .fail_resolve
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let reopened = Dataset::open(test_uri).await?;
+        let data = reopened.scan().try_into_batch().await?;
+        let double_id = data
+            .column_by_name("double_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(double_id, &Int32Array::from(vec![0, 2, 4, 6, 8]));
 
         Ok(())
     }
@@ -1295,8 +1355,7 @@ mod test {
             "checkpointed.lance",
             vec![dataset.manifest.max_field_id() + 1],
             vec![0],
-            2,
-            2,
+            ConcreteFileVersion::V2_2,
             NonZero::new(17),
             None,
         ));

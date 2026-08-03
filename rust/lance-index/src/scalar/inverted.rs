@@ -3,12 +3,13 @@
 
 pub mod builder;
 mod cache_codec;
+mod compound;
+mod documents;
 mod encoding;
 mod impact;
 mod index;
 mod iter;
 pub mod json;
-mod lazy_docset;
 pub mod parser;
 pub mod query;
 mod scorer;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
+pub use compound::{compound_search, compound_search_with_base_scorer};
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
@@ -74,6 +76,11 @@ fn scorer_terms(
 /// statistics rather than per-segment statistics. Computes the union of
 /// fuzzy-expanded terms when `params.fuzziness` is set.
 ///
+/// `metrics`, when provided, is forwarded to the per-token metadata cache
+/// boundary on each segment so callers running under an `ExecutionPlan`
+/// (e.g. `MatchQueryExec`) see the reads triggered here in their per-query
+/// `index_cache_hits`/`index_cache_misses` counters.
+///
 /// Public as the canonical producer paired with the `with_base_scorer`
 /// consumer on FTS exec types: callers holding `Arc<InvertedIndex>` segment
 /// handles locally can construct an injectable scorer without reimplementing
@@ -84,13 +91,14 @@ pub async fn build_global_bm25_scorer(
     indices: &[Arc<InvertedIndex>],
     query_tokens: &Tokens,
     params: &FtsSearchParams,
+    metrics: Option<&dyn crate::scalar::MetricsCollector>,
 ) -> Result<MemBM25Scorer> {
     let terms = scorer_terms(indices, query_tokens, params)?;
     let first_index = indices.first().ok_or_else(|| {
         lance_core::Error::invalid_input("FTS index requires at least one segment")
     })?;
     let (mut total_tokens, mut num_docs, first_token_docs) =
-        first_index.bm25_stats_for_terms(&terms).await?;
+        first_index.bm25_stats_for_terms(&terms, metrics).await?;
     let mut token_docs = HashMap::with_capacity(terms.len());
     for (term, count) in terms.iter().cloned().zip(first_token_docs) {
         token_docs.insert(term, count);
@@ -98,7 +106,7 @@ pub async fn build_global_bm25_scorer(
 
     for index in indices.iter().skip(1) {
         let (segment_total_tokens, segment_num_docs, segment_token_docs) =
-            index.bm25_stats_for_terms(&terms).await?;
+            index.bm25_stats_for_terms(&terms, metrics).await?;
         total_tokens += segment_total_tokens;
         num_docs += segment_num_docs;
         for (term, count) in terms.iter().zip(segment_token_docs) {
@@ -268,7 +276,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        max_supported_fts_format_version().index_version()
+        INVERTED_INDEX_VERSION_V3
     }
 
     fn new_query_parser(
@@ -320,12 +328,9 @@ mod tests {
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     #[test]
-    fn test_plugin_version_tracks_max_supported_format() {
+    fn test_plugin_version_tracks_v3_capability_gate() {
         let plugin = InvertedIndexPlugin;
-        assert_eq!(
-            plugin.version(),
-            max_supported_fts_format_version().index_version()
-        );
+        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V3);
     }
 
     #[test]
