@@ -12,7 +12,7 @@ use crate::{
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
     },
 };
-use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -46,7 +46,7 @@ use lance_select::{
     RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use tracing::{debug_span, instrument};
 
 #[async_trait]
@@ -326,7 +326,8 @@ impl IndexLookup {
 /// row addresses where every column's value is present in its respective
 /// index — that is, the AND of the per-column index probes. This lets a
 /// composite-key join trim the candidate row set with every available
-/// scalar index before the downstream take.
+/// scalar index before the downstream take. A row address reached by more
+/// than one input batch is emitted only once.
 #[derive(Debug)]
 pub struct MapIndexExec {
     dataset: Arc<Dataset>,
@@ -452,6 +453,22 @@ impl MapIndexExec {
                 let _t = elapsed_compute.timer();
                 Self::map_batch(lookups, dataset, deletion_mask, batch, metrics).await
             }
+        });
+        let mut emitted_row_addrs = RoaringTreemap::new();
+        let stream = stream.and_then(move |batch| {
+            // Each batch's index result is already a set. Retain first
+            // occurrences here to make the complete candidate stream a set too.
+            let row_addrs = batch.column(0).as_primitive::<UInt64Type>();
+            let unseen: UInt64Array = row_addrs
+                .values()
+                .iter()
+                .copied()
+                .filter(|row_addr| emitted_row_addrs.insert(*row_addr))
+                .collect();
+            futures::future::ready(
+                RecordBatch::try_new(INDEX_LOOKUP_SCHEMA.clone(), vec![Arc::new(unseen)])
+                    .map_err(datafusion::error::DataFusionError::from),
+            )
         });
         let stream = stream.map(move |batch| {
             let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
