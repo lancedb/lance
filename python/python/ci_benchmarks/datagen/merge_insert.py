@@ -257,14 +257,18 @@ def _already_generated(uri: str, expected_rows: int) -> bool:
 
     A previous benchmark run may have left extra versions behind, so the row
     count is checked at the tagged version rather than at the latest one.
+
+    Incomplete generations (dataset written, tag never created) and missing
+    tags both return False so the caller can overwrite and retag.
     """
     try:
         ds = lance.dataset(uri)
     except ValueError:
         return False
-    base_version = ds.tags.get_version(BASE_TAG)
-    if base_version is None:
+    tags = ds.tags.list()
+    if BASE_TAG not in tags:
         return False
+    base_version = tags[BASE_TAG]["version"]
     return ds.checkout_version(base_version).count_rows() == expected_rows
 
 
