@@ -332,6 +332,9 @@ impl DistinctRowAddrs {
 
     fn retain_unseen(&mut self, row_addrs: &UInt64Array) -> datafusion::error::Result<UInt64Array> {
         let initial_reservation_size = self.reservation.size();
+        // The first batch also has to account for the empty map's inline size,
+        // which is not part of the initially empty reservation.
+        let retained_size = initial_reservation_size.max(std::mem::size_of::<RowAddrTreeMap>());
         let unaccounted_candidates = row_addrs
             .values()
             .iter()
@@ -339,7 +342,7 @@ impl DistinctRowAddrs {
             .count();
         let provisional_size = unaccounted_candidates
             .checked_mul(ROW_ADDR_INSERT_RESERVATION_BYTES)
-            .and_then(|additional| initial_reservation_size.checked_add(additional))
+            .and_then(|additional| retained_size.checked_add(additional))
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::ResourcesExhausted(format!(
                     "Candidate memory reservation overflowed for {MAP_INDEX_CANDIDATES_MEMORY_CONSUMER}"
@@ -1063,6 +1066,19 @@ mod tests {
             dataset: Arc::new(dataset),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    #[test]
+    fn test_map_index_candidates_accept_empty_first_batch() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER).register(&pool);
+        let mut candidates = DistinctRowAddrs::new(reservation);
+
+        let empty = candidates
+            .retain_unseen(&UInt64Array::from(Vec::<u64>::new()))
+            .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(pool.reserved(), RowAddrTreeMap::new().deep_size_of());
     }
 
     #[test]
