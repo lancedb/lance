@@ -263,11 +263,13 @@ fn slice_batch_with_estimator(
         return Ok(vec![batch]);
     }
 
-    // Shared bytes are repeated unchanged in every zero-copy slice. Once that
-    // unavoidable fixed cost fills the target, continue bounding the
-    // row-proportional portion with the full target as a separate budget.
+    // Keep a practical incremental floor so shared bytes just below the target
+    // cannot create one eager RecordBatch wrapper per row. Three quarters of
+    // the target limits amplification near that boundary while keeping the
+    // unavoidable shared-plus-incremental soft overshoot below twice the target.
+    let minimum_incremental_target = max_bytes.saturating_sub(max_bytes / 4).max(1);
     let incremental_target = if batch_size.shared < max_bytes {
-        max_bytes - batch_size.shared
+        (max_bytes - batch_size.shared).max(minimum_incremental_target)
     } else {
         max_bytes.max(1)
     };
@@ -520,8 +522,12 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(batches.len(), 10);
-        assert!(batches.iter().all(|batch| batch.num_rows() == 10));
+        assert!(batches.len() > 1);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() * std::mem::size_of::<i32>() <= 75)
+        );
     }
 
     #[test]
@@ -548,6 +554,28 @@ mod tests {
                 .iter()
                 .all(|batch| batch.num_rows() * std::mem::size_of::<i32>() <= 100)
         );
+    }
+
+    #[test]
+    fn shared_boundary_avoids_row_scale_slice_counts() {
+        fn slice_count(shared: usize) -> usize {
+            let input = stream::iter([Ok::<_, ArrowError>(make_batch(10_000))]);
+            let output = rechunk_stream_by_size_with_shared_estimator(
+                input,
+                test_schema(),
+                0,
+                100,
+                move |batch| SliceMemorySize {
+                    shared,
+                    incremental: batch.num_rows() * std::mem::size_of::<i32>(),
+                },
+            );
+            block_on(output.collect::<Vec<_>>()).len()
+        }
+
+        let just_below = slice_count(99);
+        let at_target = slice_count(100);
+        assert!(just_below <= at_target * 2);
     }
 
     /// Build a batch with one variable-length string column.

@@ -4583,11 +4583,31 @@ pub struct PrimitiveStructuralEncoder {
     keep_original_array: bool,
     use_shared_dictionary_sizing: bool,
     normalized_dictionary_values: Vec<CachedNormalizedDictionaryValues>,
-    accumulated_repdefs: Vec<RepDefBuilder>,
+    accumulated_repdefs: AccumulatedRepDefs,
     page_encodings: Arc<[PrimitivePageEncoding]>,
     column_index: u32,
     field: Field,
     encoding_metadata: Arc<HashMap<String, String>>,
+}
+
+#[derive(Default)]
+struct AccumulatedRepDefs {
+    builders: Vec<RepDefBuilder>,
+    estimated_bytes: u64,
+}
+
+impl AccumulatedRepDefs {
+    fn push(&mut self, builder: RepDefBuilder) {
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(builder.estimated_serialized_bytes());
+        self.builders.push(builder);
+    }
+
+    fn take(&mut self) -> Vec<RepDefBuilder> {
+        self.estimated_bytes = 0;
+        std::mem::take(&mut self.builders)
+    }
 }
 
 struct CachedNormalizedDictionaryValues {
@@ -4695,7 +4715,7 @@ impl PrimitiveStructuralEncoder {
             keep_original_array: options.keep_original_array,
             use_shared_dictionary_sizing,
             normalized_dictionary_values: Vec::new(),
-            accumulated_repdefs: Vec::new(),
+            accumulated_repdefs: AccumulatedRepDefs::default(),
             column_index,
             page_encodings,
             field,
@@ -6971,18 +6991,16 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
     ) -> Result<Vec<EncodeTask>> {
         let array = self.extract_validity(array, &mut repdef, self.keep_original_array)?;
         self.accumulated_repdefs.push(repdef);
-        let pending_repdef_bytes = self
-            .accumulated_repdefs
-            .iter()
-            .fold(0_u64, |bytes, repdef| {
-                bytes.saturating_add(repdef.estimated_serialized_bytes())
-            });
 
-        if let Some((arrays, row_number, num_rows)) = self
-            .accumulation_queue
-            .insert_with_additional_bytes(array, row_number, num_rows, pending_repdef_bytes)
+        if let Some((arrays, row_number, num_rows)) =
+            self.accumulation_queue.insert_with_additional_bytes(
+                array,
+                row_number,
+                num_rows,
+                self.accumulated_repdefs.estimated_bytes,
+            )
         {
-            let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
+            let accumulated_repdefs = self.accumulated_repdefs.take();
             Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
         } else {
             Ok(vec![])
@@ -6992,7 +7010,7 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self, _external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         if let Some((arrays, row_number, num_rows)) = self.accumulation_queue.flush() {
-            let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
+            let accumulated_repdefs = self.accumulated_repdefs.take();
             Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
         } else {
             Ok(vec![])
@@ -7000,11 +7018,9 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
     }
 
     fn pending_bytes(&self) -> u64 {
-        self.accumulated_repdefs
-            .iter()
-            .fold(self.accumulation_queue.pending_bytes(), |bytes, repdef| {
-                bytes.saturating_add(repdef.estimated_serialized_bytes())
-            })
+        self.accumulation_queue
+            .pending_bytes()
+            .saturating_add(self.accumulated_repdefs.estimated_bytes)
     }
 
     fn num_columns(&self) -> u32 {
@@ -7023,13 +7039,13 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::{
-        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FixedWidthDictionaryEncoding, FullZipCacheableState,
-        FullZipDecodeDetails, FullZipReadSource, FullZipRepIndexDetails, FullZipScheduler,
-        LazyLevels, LevelCodec, LevelCursor, LevelPlan, MiniBlockChunk, MiniBlockChunkIndex,
-        MiniBlockCompressed, MiniblockChunkSize, PerValueDecompressor, PreambleAction,
-        RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler, VariableFullZipDecoder,
-        dense_levels_from_block, validate_complex_all_null_levels,
+        AccumulatedRepDefs, ChunkInstructions, DataBlock, DecodeMiniBlockTask,
+        FixedPerValueDecompressor, FixedWidthDataBlock, FixedWidthDictionaryEncoding,
+        FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource, FullZipRepIndexDetails,
+        FullZipScheduler, LazyLevels, LevelCodec, LevelCursor, LevelPlan, MiniBlockChunk,
+        MiniBlockChunkIndex, MiniBlockCompressed, MiniblockChunkSize, PerValueDecompressor,
+        PreambleAction, RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler,
+        VariableFullZipDecoder, dense_levels_from_block, validate_complex_all_null_levels,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::{BlockCompressor, DefaultDecompressionStrategy};
@@ -7047,7 +7063,7 @@ mod tests {
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
-    use crate::repdef::build_control_word_iterator;
+    use crate::repdef::{RepDefBuilder, build_control_word_iterator};
     use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use arrow_array::{ArrayRef, DictionaryArray, Int8Array, StringArray, types::Int8Type};
@@ -7055,6 +7071,31 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
+
+    #[test]
+    fn accumulated_repdefs_track_and_reset_estimated_bytes() {
+        let mut first = RepDefBuilder::default();
+        first.add_validity_bitmap(arrow_buffer::NullBuffer::new(
+            arrow_buffer::BooleanBuffer::from(vec![true, false, true]),
+        ));
+        let mut second = RepDefBuilder::default();
+        second.add_validity_bitmap(arrow_buffer::NullBuffer::new(
+            arrow_buffer::BooleanBuffer::from(vec![false, true, true, false, true]),
+        ));
+        let expected_bytes = first
+            .estimated_serialized_bytes()
+            .saturating_add(second.estimated_serialized_bytes());
+        assert!(expected_bytes > 0);
+
+        let mut accumulated = AccumulatedRepDefs::default();
+        accumulated.push(first);
+        accumulated.push(second);
+        assert_eq!(accumulated.estimated_bytes, expected_bytes);
+
+        let builders = accumulated.take();
+        assert_eq!(builders.len(), 2);
+        assert_eq!(accumulated.estimated_bytes, 0);
+    }
 
     #[test]
     fn test_is_narrow() {
