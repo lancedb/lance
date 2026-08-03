@@ -19,6 +19,7 @@ lance-io.workspace = true
 arrow-arith.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
+arrow-cast.workspace = true
 arrow-data.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
@@ -43,6 +44,7 @@ criterion.workspace = true
 rstest.workspace = true
 proptest.workspace = true
 pretty_assertions.workspace = true
+rand.workspace = true
 test-log.workspace = true
 libc.workspace = true
 

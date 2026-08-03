@@ -340,8 +340,13 @@ impl HNSW {
         L: BorrowingGraph,
         B: BorrowingGraph,
     {
+        // Greedy descent stops at level 1 (HNSW paper, Algorithm 2): level 0
+        // is searched only by the ef-bounded beam below. Greedily descending
+        // into level 0 first collapses the entry point into a deep local
+        // minimum, which costs extra distance computations and measurably
+        // hurts recall at low ef (https://github.com/lance-format/lance/issues/5208).
         let mut ep = ep;
-        for level in (0..self.max_level()).rev() {
+        for level in (1..self.max_level()).rev() {
             let cur_level = make_level(level);
             ep = greedy_search_borrowed(
                 &cur_level,
@@ -508,8 +513,10 @@ impl HNSW {
         L: BorrowingGraph,
         B: BorrowingGraph,
     {
+        // Same level descent as [Self::run_search]: greedy stops at level 1
+        // (see the comment there); level 0 is left to the beam below.
         let mut ep = ep;
-        for level in (0..self.max_level()).rev() {
+        for level in (1..self.max_level()).rev() {
             let cur_level = make_level(level);
             ep = greedy_search_borrowed(
                 &cur_level,
@@ -1263,6 +1270,15 @@ impl IvfSubIndex for HNSW {
         .into()
     }
 
+    // `schema()` governs the on-disk index file, and readers older than v8.0.0
+    // index the distance column there unconditionally, panicking when it is
+    // absent, so it cannot be dropped from what we write. Skipping it on read
+    // costs nothing in compatibility and keeps most of the graph bytes off the
+    // wire.
+    fn read_columns() -> Option<&'static [&'static str]> {
+        Some(&[VECTOR_ID_COL, NEIGHBORS_COL])
+    }
+
     #[instrument(level = "debug", skip(self, query, storage, prefilter, _metrics))]
     fn search(
         &self,
@@ -1461,16 +1477,15 @@ impl IvfSubIndex for HNSW {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array};
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::deepsize::DeepSizeOf;
-    use lance_file::previous::{
-        reader::FileReader as PreviousFileReader,
-        writer::{
-            FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
-        },
+    use lance_file::versions::v1::{
+        reader::FileReader as V1FileReader,
+        writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     };
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::DistanceType;
@@ -1480,12 +1495,13 @@ mod tests {
     use object_store::path::Path;
     use rstest::rstest;
 
-    use super::HnswGraph;
+    use super::{HnswGraph, ImmutableHnswBottomView, ImmutableHnswLevelView};
+    use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
         flat::storage::{FlatBinStorage, FlatFloatStorage},
-        graph::{DISTS_FIELD, NEIGHBORS_FIELD, VisitedGenerator},
+        graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, VECTOR_ID_FIELD,
             builder::{HnswBuildParams, HnswQueryParams},
@@ -1517,10 +1533,10 @@ mod tests {
             DISTS_FIELD.clone(),
         ]);
         let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
-        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
+        let mut writer = V1FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             schema,
-            &PreviousFileWriterOptions::default(),
+            &V1FileWriterOptions::default(),
         )
         .unwrap();
         let batch = builder.to_batch().unwrap();
@@ -1528,7 +1544,7 @@ mod tests {
         writer.write(&[batch]).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+        let reader = V1FileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         let batch = reader
@@ -1579,10 +1595,10 @@ mod tests {
             DISTS_FIELD.clone(),
         ]);
         let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
-        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
+        let mut writer = V1FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             schema,
-            &PreviousFileWriterOptions::default(),
+            &V1FileWriterOptions::default(),
         )
         .unwrap();
         let batch = builder.to_batch().unwrap();
@@ -1590,7 +1606,7 @@ mod tests {
         writer.write(&[batch]).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+        let reader = V1FileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         let batch = reader
@@ -1685,6 +1701,143 @@ mod tests {
             .count();
         let recall = hits as f32 / k as f32;
         assert!(recall >= 0.5, "recall {recall} below 0.5 (k={k})");
+    }
+
+    /// A [`DistCalculator`] over fixed per-node distances that counts how
+    /// many distances it computes, so a test can assert exactly which search
+    /// phases ran.
+    struct CountingDistCalculator<'a> {
+        distances: &'a [f32],
+        calls: &'a AtomicUsize,
+    }
+
+    impl DistCalculator for CountingDistCalculator<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.distances[id as usize]
+        }
+
+        fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+            self.distances.to_vec()
+        }
+    }
+
+    /// Regression test for <https://github.com/lance-format/lance/issues/5208>:
+    /// the query-time greedy descent must stop at level 1 (HNSW paper,
+    /// Algorithm 2); level 0 must be searched only by the ef-bounded beam.
+    ///
+    /// Drives [`HNSW::run_search`] / [`HNSW::run_search_acorn`] directly over
+    /// a hand-built graph: node 0 is the entry point and the only node at
+    /// level 1 (with no level-1 neighbors), so the greedy descent over
+    /// levels >= 1 computes no distances, and with ef == N the bottom beam
+    /// visits every level-0 node exactly once. A greedy step at level 0
+    /// would show up as 10 extra distance computations: the level-0 degrees
+    /// along the path are 1,2,2,2,2,1 and the strictly decreasing distances
+    /// make greedy walk it end to end.
+    #[test]
+    fn test_greedy_descent_stops_before_level_0() {
+        const N: usize = 6;
+        // Strictly decreasing along the path; the true top-3 is nodes 5,4,3.
+        let distances: Vec<f32> = (0..N).map(|id| (N - id) as f32).collect();
+
+        // Level 0 is the path 0-1-...-5, mirrored into both the bottom view
+        // and the level-0 view (only the bottom view may be used at query
+        // time, which is what this test asserts).
+        let mut nodes: Vec<GraphBuilderNode> = (0..N as u32)
+            .map(|id| GraphBuilderNode::new(id, 2))
+            .collect();
+        for (id, node) in nodes.iter_mut().enumerate() {
+            let mut adjacency = Vec::new();
+            if id > 0 {
+                adjacency.push(id as u32 - 1);
+            }
+            if id + 1 < N {
+                adjacency.push(id as u32 + 1);
+            }
+            let adjacency = Arc::new(adjacency);
+            node.bottom_neighbors = adjacency.clone();
+            node.level_neighbors[0] = adjacency;
+        }
+
+        let build_params = HnswBuildParams {
+            max_level: 2,
+            m: 4,
+            ef_construction: 10,
+            prefetch_distance: None,
+        };
+        let hnsw = HNSW::from_parts(build_params, nodes.clone(), vec![N, 1], 0);
+        let query_params = HnswQueryParams {
+            ef: N,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+
+        let calls = AtomicUsize::new(0);
+        let dist_calc = CountingDistCalculator {
+            distances: &distances,
+            calls: &calls,
+        };
+        // The entry-point distance (1 call) mirrors `search_inner`.
+        let ep = OrderedNode::new(0, dist_calc.distance(0).into());
+        let mut visited_generator = VisitedGenerator::new(N);
+
+        let results = hnsw.run_search(
+            ep.clone(),
+            3,
+            &query_params,
+            None,
+            &mut visited_generator,
+            N,
+            None,
+            &dist_calc,
+            |level| ImmutableHnswLevelView::new(level, &nodes),
+            ImmutableHnswBottomView::new(&nodes),
+        );
+        assert_eq!(
+            results.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![5, 4, 3]
+        );
+        // Exactly 1 entry-point distance + 5 beam visits (one per remaining
+        // node); the pre-fix level-0 greedy step brought this to 16.
+        assert_eq!(calls.load(Ordering::Relaxed), N);
+
+        // The ACORN traversal shares the descent. Its beam additionally seeds
+        // mask-passing nodes with distance computations, so only bound the
+        // total: a level-0 greedy step would push it past one call per node.
+        let mut mask_generator = VisitedGenerator::new(N);
+        let mut mask = mask_generator.generate(N);
+        for id in 0..N as u32 {
+            mask.insert(id);
+        }
+        let mut expanded_generator = VisitedGenerator::new(N);
+        calls.store(0, Ordering::Relaxed);
+        let results = hnsw.run_search_acorn(
+            ep,
+            &query_params,
+            &mask,
+            &mut visited_generator,
+            &mut expanded_generator,
+            N,
+            None,
+            &dist_calc,
+            |level| ImmutableHnswLevelView::new(level, &nodes),
+            ImmutableHnswBottomView::new(&nodes),
+        );
+        assert_eq!(
+            results
+                .iter()
+                .take(3)
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            vec![5, 4, 3]
+        );
+        assert!(
+            calls.load(Ordering::Relaxed) <= N,
+            "level-0 greedy descent adds distance computations beyond the \
+             beam's one per node"
+        );
     }
 
     /// Brute-force top-`k` restricted to mask-passing ids.

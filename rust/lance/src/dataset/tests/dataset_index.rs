@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::vec;
 
 use crate::dataset::ROW_ID;
@@ -31,14 +31,20 @@ use arrow_schema::{
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
+use lance_index::metrics::{
+    COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
+    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
-    InvertedListFormatVersion,
-    query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
+    InvertedListFormatVersion, SCORE_COL,
+    query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
@@ -861,6 +867,362 @@ async fn test_fts_on_multiple_columns() {
         .await
         .unwrap();
     assert_eq!(results.num_rows(), 1);
+}
+
+async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str, with_position: bool) {
+    create_fragmented_fts_index_with_order(dataset, column, with_position, false).await;
+}
+
+async fn create_fragmented_fts_index_with_order(
+    dataset: &mut Dataset,
+    column: &str,
+    with_position: bool,
+    reverse_segments: bool,
+) {
+    let index_name = format!("{column}_idx");
+    let columns = [column];
+    let params = InvertedIndexParams::default().with_position(with_position);
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in &fragment_ids {
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::Inverted, &params)
+            .name(index_name.clone())
+            .fragments(vec![*fragment_id]);
+        segments.push(builder.execute_uncommitted().await.unwrap());
+    }
+    if reverse_segments {
+        segments.reverse();
+    }
+    dataset
+        .commit_existing_index_segments(&index_name, column, segments)
+        .await
+        .unwrap();
+
+    let segments = crate::index::scalar::inverted::load_segments(dataset, column)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(segments.len(), fragment_ids.len());
+}
+
+fn compound_multimatch_query() -> FtsQuery {
+    MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![10.0, 1.0])
+    .unwrap()
+    .into()
+}
+
+fn compound_match_query(term: &str, column: &str, boost: f32) -> FtsQuery {
+    MatchQuery::new(term.to_owned())
+        .with_column(Some(column.to_owned()))
+        .with_boost(boost)
+        .into()
+}
+
+async fn compound_fts_results(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
+async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
+    let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
+    assert!(
+        exhaustive.len() > limit,
+        "the exhaustive result must contain candidates beyond k"
+    );
+    let limited = compound_fts_results(dataset, query, Some(limit as i64)).await;
+    assert_eq!(limited, exhaustive[..limit]);
+}
+
+#[tokio::test]
+async fn test_nested_multimatch_limit_propagation() {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "common",
+                "common filler filler filler filler filler filler filler",
+                "irrelevant",
+                "common tie",
+                "common tie",
+                "irrelevant"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "penalty",
+                "special",
+                "common",
+                "neutral",
+                "neutral",
+                "common filler filler filler penalty"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+
+    let must_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    let must_results = compound_fts_results(&dataset, must_query.clone(), None).await;
+    assert!(
+        must_results
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "the exhaustive result should include a deterministic score tie"
+    );
+    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+
+    let should_query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, should_query.clone(), 2).await;
+    let mut fallback_scanner = dataset.scan();
+    fallback_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(should_query))
+        .unwrap();
+    fallback_scanner.limit(Some(2), None).unwrap();
+    let fallback_plan = fallback_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        fallback_plan.contains("BooleanQuery"),
+        "cross-column compound FTS should retain its exact fallback:\n{fallback_plan}"
+    );
+    assert!(
+        !fallback_plan.contains("CompoundFtsScorer"),
+        "cross-column compound FTS is not yet supported by the scorer tree:\n{fallback_plan}"
+    );
+
+    let boost_query: FtsQuery = BoostQuery::new(
+        compound_multimatch_query(),
+        compound_match_query("penalty", "body", 100.0),
+        Some(1.0),
+    )
+    .into();
+    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+
+    assert_compound_fts_top_k(&dataset, compound_multimatch_query(), 1).await;
+}
+
+#[tokio::test]
+async fn test_same_column_compound_scorer_is_exact_and_bounded() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "common",
+            "common filler filler filler",
+            "irrelevant",
+            "common tie",
+            "common tie",
+            "common filler"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let match_query = |term: &str| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("common")),
+        (
+            Occur::Should,
+            BoostQuery::new(match_query("tie"), match_query("filler"), Some(0.5)).into(),
+        ),
+        (
+            Occur::Should,
+            PhraseQuery::new("common tie".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("irrelevant")),
+    ])
+    .into();
+
+    assert_compound_fts_top_k(&dataset, query.clone(), 2).await;
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column compound FTS should use the scorer tree:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "same-column compound FTS should not materialize intermediate joins:\n{plan}"
+    );
+
+    let same_column_multimatch: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![1.0, 0.5])
+    .unwrap()
+    .into();
+    assert_compound_fts_top_k(&dataset, same_column_multimatch.clone(), 2).await;
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(same_column_multimatch))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_tie_uses_resolved_row_id() {
+    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; 384])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 256,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(1), None).unwrap();
+    let limited = scanner.try_into_batch().await.unwrap();
+    let limited_row_id = limited[ROW_ID].as_primitive::<UInt64Type>().value(0);
+
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(limited_row_id, exhaustive[0].0);
+    assert_eq!(exhaustive.len(), 384);
+
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_ADDRESSES_RESOLVED_METRIC),
+        Some(&384)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC),
+        Some(&1)
+    );
+
+    let mut analyze_scanner = dataset.scan();
+    analyze_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    analyze_scanner.limit(Some(1), None).unwrap();
+    let analysis = analyze_scanner.analyze_plan().await.unwrap();
+    let compound_line = analysis
+        .lines()
+        .find(|line| line.contains("CompoundFtsScorer"))
+        .unwrap();
+    assert!(
+        compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
+        "compound FTS metrics missing the bounded candidate peak: {compound_line}"
+    );
+    assert!(
+        compound_line.contains(&format!(
+            "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
+        )),
+        "compound FTS metrics missing the bounded resolution batch: {compound_line}"
+    );
 }
 
 fn nested_fts_batch(
@@ -2472,124 +2834,6 @@ async fn test_prewarm_index_with_position_validation() {
     );
 }
 
-/// Cache backend that exercises the serialization codec on every insert and
-/// returns deserialized entries on every get. Items without a codec fall
-/// through to an in-memory passthrough so that non-FTS cache traffic still
-/// works during the test.
-///
-/// Mirrors the helper in `rust/lance/src/index/vector/ivf/v2.rs` tests; if a
-/// third user appears, lift this into a shared test utility.
-mod fts_serializing_backend {
-    use std::collections::HashMap;
-    use std::pin::Pin;
-
-    use futures::Future;
-    use lance_core::Result;
-    use lance_core::cache::{
-        CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend,
-    };
-
-    type SerializedEntry = (bytes::Bytes, CacheCodec, usize);
-
-    #[derive(Debug)]
-    pub struct SerializingBackend {
-        serialized: tokio::sync::Mutex<HashMap<InternalCacheKey, SerializedEntry>>,
-        passthrough: MokaCacheBackend,
-    }
-
-    impl SerializingBackend {
-        pub fn new() -> Self {
-            Self {
-                serialized: tokio::sync::Mutex::new(HashMap::new()),
-                passthrough: MokaCacheBackend::with_capacity(256 * 1024 * 1024),
-            }
-        }
-
-        pub async fn serialized_entry_count(&self) -> usize {
-            self.serialized.lock().await.len()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl CacheBackend for SerializingBackend {
-        async fn get(
-            &self,
-            key: &InternalCacheKey,
-            codec: Option<CacheCodec>,
-        ) -> Option<CacheEntry> {
-            let guard = self.serialized.lock().await;
-            if let Some((bytes, stored_codec, _)) = guard.get(key) {
-                return stored_codec.deserialize(&bytes.clone()).hit();
-            }
-            drop(guard);
-            self.passthrough.get(key, codec).await
-        }
-
-        async fn insert(
-            &self,
-            key: &InternalCacheKey,
-            entry: CacheEntry,
-            size_bytes: usize,
-            codec: Option<CacheCodec>,
-        ) {
-            if let Some(codec) = codec {
-                let mut bytes = Vec::new();
-                codec
-                    .serialize(&entry, &mut bytes)
-                    .expect("serialization should succeed");
-                self.serialized
-                    .lock()
-                    .await
-                    .insert(key.clone(), (bytes::Bytes::from(bytes), codec, size_bytes));
-            } else {
-                self.passthrough.insert(key, entry, size_bytes, None).await;
-            }
-        }
-
-        async fn get_or_insert<'a>(
-            &self,
-            key: &InternalCacheKey,
-            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
-            codec: Option<CacheCodec>,
-        ) -> Result<(CacheEntry, bool)> {
-            if let Some(entry) = self.get(key, codec).await {
-                return Ok((entry, true));
-            }
-            let (entry, size) = loader.await?;
-            self.insert(key, entry.clone(), size, codec).await;
-            Ok((entry, false))
-        }
-
-        async fn invalidate_prefix(&self, prefix: &str) {
-            self.serialized
-                .lock()
-                .await
-                .retain(|k, _| !k.starts_with(prefix));
-            self.passthrough.invalidate_prefix(prefix).await;
-        }
-
-        async fn clear(&self) {
-            self.serialized.lock().await.clear();
-            self.passthrough.clear().await;
-        }
-
-        async fn num_entries(&self) -> usize {
-            self.serialized.lock().await.len() + self.passthrough.num_entries().await
-        }
-
-        async fn size_bytes(&self) -> usize {
-            let serialized: usize = self
-                .serialized
-                .lock()
-                .await
-                .values()
-                .map(|(_, _, s)| *s)
-                .sum();
-            serialized + self.passthrough.size_bytes().await
-        }
-    }
-}
-
 /// Validates the OSS-741 contract: after FTS prewarm through a serializing
 /// cache backend, FTS queries serve results without any further IO. The
 /// serializing backend forces every cache hit through the new
@@ -2600,7 +2844,7 @@ mod fts_serializing_backend {
 async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2639,7 +2883,7 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     // Re-open the dataset on a session whose cache backend serializes every
     // entry through its codec. Set a generous capacity so nothing is evicted
     // before we query.
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -2718,7 +2962,7 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
 async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2754,7 +2998,7 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
 
     // Re-open on a session whose cache backend serializes every entry through
     // its codec, with a generous capacity so nothing is evicted before we query.
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -2781,9 +3025,32 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
          but the serializing store was empty"
     );
 
-    // After prewarm, an indexed-filter query must reconstruct the index and
-    // every page it touches from the cache, deserializing via the codec, with
-    // no disk IO. Project only `_rowid` so the scan does not read a data column.
+    drop(dataset);
+    let backend = Arc::new(backend.restart());
+    assert_eq!(
+        backend.l1_entry_count().await,
+        0,
+        "restarting must discard the in-memory L1"
+    );
+    assert_eq!(
+        backend.serialized_entry_count().await,
+        serialized_after_prewarm,
+        "restarting must retain only the serialized entries"
+    );
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend,
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // After recreating the backend, an indexed-filter query must reconstruct
+    // the index and every page it touches from serialized bytes, with no disk
+    // IO. Project only `_rowid` so the scan does not read a data column.
     dataset.object_store.as_ref().io_stats_incremental();
 
     let result = dataset
@@ -2821,7 +3088,7 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
 async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2855,7 +3122,7 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
         .await
         .unwrap();
 
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -3001,7 +3268,7 @@ async fn test_label_list_index_types(#[case] large_list: bool) {
 async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -3045,7 +3312,7 @@ async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_i
         "test dataset must contain at least one row whose labels include 3"
     );
 
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,

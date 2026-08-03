@@ -3,12 +3,13 @@
 
 pub mod builder;
 mod cache_codec;
+mod compound;
+mod documents;
 mod encoding;
 mod impact;
 mod index;
 mod iter;
 pub mod json;
-mod lazy_docset;
 pub mod parser;
 pub mod query;
 mod scorer;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
+pub use compound::{compound_search, compound_search_with_base_scorer};
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};

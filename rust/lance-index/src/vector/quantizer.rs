@@ -15,7 +15,7 @@ use bytes::Bytes;
 use lance_arrow::RecordBatchExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
@@ -223,7 +223,7 @@ pub trait QuantizerMetadata:
         Ok(None)
     }
 
-    async fn load(reader: &PreviousFileReader) -> Result<Self>;
+    async fn load(reader: &V1FileReader) -> Result<Self>;
 }
 
 #[async_trait::async_trait]
@@ -277,7 +277,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
     }
 
     async fn load_partition(
-        reader: &PreviousFileReader,
+        reader: &V1FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
@@ -287,7 +287,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
 
 /// Loader to load partitioned [VectorStore] from disk.
 pub struct IvfQuantizationStorage<Q: Quantization> {
-    reader: PreviousFileReader,
+    reader: V1FileReader,
 
     distance_type: DistanceType,
     quantizer: Quantizer,
@@ -322,7 +322,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ///
     ///
     pub async fn open(reader: Arc<dyn Reader>) -> Result<Self> {
-        let reader = PreviousFileReader::try_new_self_described_from_reader(reader, None).await?;
+        let reader = V1FileReader::try_new_self_described_from_reader(reader, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema

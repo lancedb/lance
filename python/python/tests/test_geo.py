@@ -273,11 +273,12 @@ def test_staged_rtree_after_rewrite_columns(tmp_path: Path):
     )
 
     assert _query_point_ids(updated, "POINT (10 10)") == [0]
-    committed = updated.commit_existing_index_segments(
+    committed = dataset.commit_existing_index_segments(
         "point_rtree",
         "point",
         [segment],
     )
+    assert committed.describe_indices()[0].segments[0].fragment_ids == set()
     assert _query_point_ids(committed, "POINT (10 10)") == [0]
 
 
