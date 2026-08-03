@@ -15,6 +15,7 @@ use super::backend::{CacheBackend, CacheEntry};
 use super::moka::key_footprint;
 use super::{CacheCodec, InternalCacheKey};
 use crate::Result;
+use crate::deepsize::Context;
 
 #[derive(Clone)]
 struct QuickEntry {
@@ -148,6 +149,22 @@ impl CacheBackend for QuickCacheBackend {
 
     fn approx_size_bytes(&self) -> usize {
         self.cache.weight() as usize
+    }
+
+    fn deep_size_of_entries(
+        &self,
+        context: &mut Context,
+        size_of_entry: &dyn Fn(&CacheEntry, &mut Context) -> Option<usize>,
+    ) -> Option<usize> {
+        Some(
+            self.cache
+                .iter()
+                .map(|(key, record)| {
+                    key_footprint(&key)
+                        + size_of_entry(&record.entry, context).unwrap_or(record.size_bytes)
+                })
+                .sum(),
+        )
     }
 }
 

@@ -65,9 +65,11 @@ pub use moka::MokaCacheBackend;
 pub use quick::{QuickCacheBackend, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};
 
+use std::any::TypeId;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::{
-    Arc, Weak,
+    Arc, RwLock, Weak,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -189,11 +191,30 @@ fn cache_entry_size<T: DeepSizeOf + ?Sized>(value: &T) -> usize {
     value.deep_size_of() + std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2
 }
 
+type CacheEntrySizeAccessor = fn(&CacheEntry, &mut Context) -> Option<usize>;
+
+fn cache_entry_size_with_context<T>(entry: &CacheEntry, context: &mut Context) -> Option<usize>
+where
+    T: DeepSizeOf + Send + Sync + 'static,
+{
+    let value = entry.downcast_ref::<T>()?;
+    let entry_ptr = Arc::as_ptr(entry) as *const () as usize;
+    if !context.mark_seen(entry_ptr) {
+        return Some(0);
+    }
+    Some(
+        std::mem::size_of_val(value)
+            + value.deep_size_of_children(context)
+            + std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2,
+    )
+}
+
 #[derive(Debug)]
 struct CacheState {
     backend: Arc<dyn CacheBackend>,
     hits: AtomicU64,
     misses: AtomicU64,
+    entry_size_accessors: RwLock<HashMap<TypeId, CacheEntrySizeAccessor>>,
 }
 
 impl CacheState {
@@ -202,7 +223,22 @@ impl CacheState {
             backend,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            entry_size_accessors: RwLock::new(HashMap::new()),
         }
+    }
+
+    fn entry_size<T>(&self, value: &T) -> usize
+    where
+        T: DeepSizeOf + Send + Sync + 'static,
+    {
+        let mut accessors = self
+            .entry_size_accessors
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        accessors
+            .entry(TypeId::of::<T>())
+            .or_insert(cache_entry_size_with_context::<T>);
+        cache_entry_size(value)
     }
 }
 
@@ -229,8 +265,26 @@ impl std::fmt::Debug for LanceCache {
 }
 
 impl DeepSizeOf for LanceCache {
-    fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        self.state.backend.approx_size_bytes()
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        let state_ptr = Arc::as_ptr(&self.state) as usize;
+        if !context.mark_seen(state_ptr) {
+            return 0;
+        }
+
+        let accessors = self
+            .state
+            .entry_size_accessors
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.state
+            .backend
+            .deep_size_of_entries(context, &|entry, context| {
+                accessors
+                    .get(&entry.as_ref().type_id())
+                    .and_then(|size_of_entry| size_of_entry(entry, context))
+            })
+            .unwrap_or_else(|| self.state.backend.approx_size_bytes())
     }
 }
 
@@ -299,7 +353,7 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        let size = cache_entry_size(metadata.as_ref());
+        let size = self.state.entry_size(metadata.as_ref());
         let key = self.sized_key(cache_key);
         self.state
             .backend
@@ -379,9 +433,10 @@ impl LanceCache {
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
         let key = self.sized_key(&cache_key);
+        let state = self.state.clone();
         let typed_loader = Box::pin(async move {
             let value = Arc::new(loader().await?);
-            let size = cache_entry_size(value.as_ref());
+            let size = state.entry_size(value.as_ref());
             Ok((value as CacheEntry, size))
         });
 
@@ -411,7 +466,7 @@ impl LanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let metadata = Arc::new(metadata);
-        let size = cache_entry_size(metadata.as_ref());
+        let size = self.state.entry_size(metadata.as_ref());
         let key = self.unsized_key(cache_key);
         self.state.backend.insert(&key, metadata, size, None).await;
     }
@@ -670,6 +725,55 @@ mod tests {
 
         fn write_key(&self, builder: &mut KeyBuilder) {
             builder.write_u64(self.id);
+        }
+    }
+
+    struct SharedTestValue {
+        data: Arc<Vec<u8>>,
+    }
+
+    impl DeepSizeOf for SharedTestValue {
+        fn deep_size_of_children(&self, context: &mut Context) -> usize {
+            self.data.deep_size_of_children(context)
+        }
+    }
+
+    struct SharedTestKey(u64);
+
+    impl CacheKey for SharedTestKey {
+        type ValueType = SharedTestValue;
+
+        fn key(&self) -> Cow<'_, str> {
+            self.0.to_string().into()
+        }
+
+        fn type_name() -> &'static str {
+            "test.SharedValue"
+        }
+
+        fn schema() -> CacheKeySchema {
+            CacheKeySchema::new("test.shared-value-key", 1)
+        }
+
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            builder.write_u64(self.0);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TestBackendKind {
+        Moka,
+        Quick,
+    }
+
+    impl TestBackendKind {
+        fn cache(self, capacity: usize) -> LanceCache {
+            match self {
+                Self::Moka => LanceCache::with_capacity(capacity),
+                Self::Quick => {
+                    LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(capacity)))
+                }
+            }
         }
     }
 
@@ -1012,6 +1116,49 @@ mod tests {
         let cache = LanceCache::with_capacity(expected * 2);
         cache.insert_with_key(&TestKey::new(1), value).await;
         assert_eq!(cache.size_bytes().await, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::moka(TestBackendKind::Moka)]
+    #[case::quick(TestBackendKind::Quick)]
+    #[tokio::test]
+    async fn deep_size_deduplicates_shared_entry_allocations(
+        #[case] backend_kind: TestBackendKind,
+    ) {
+        let cache = backend_kind.cache(1 << 20);
+        let shared_data = Arc::new(vec![0_u8; 1024]);
+
+        for id in 0..2 {
+            let data = shared_data.clone();
+            cache
+                .get_or_insert_with_key(SharedTestKey(id), || async move {
+                    Ok(SharedTestValue { data })
+                })
+                .await
+                .unwrap();
+        }
+
+        let arc_overhead = std::mem::size_of::<AtomicUsize>() * 2;
+        let shared_allocation = std::mem::size_of::<Vec<u8>>() + shared_data.capacity();
+        let expected_entries = 2 * std::mem::size_of::<InternalCacheKey>()
+            + 2 * (std::mem::size_of::<SharedTestValue>() + arc_overhead)
+            + shared_allocation;
+
+        let weighted_size = cache.size_bytes().await;
+        assert_eq!(weighted_size, expected_entries + shared_allocation);
+        assert_eq!(
+            cache.deep_size_of(),
+            std::mem::size_of::<LanceCache>() + expected_entries
+        );
+
+        let mut context = Context::new();
+        assert_eq!(cache.deep_size_of_children(&mut context), expected_entries);
+        assert_eq!(
+            cache
+                .with_key_prefix("another-handle")
+                .deep_size_of_children(&mut context),
+            0
+        );
     }
 
     #[tokio::test]
