@@ -40,7 +40,9 @@ use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
-    FREQS_COLLECTED_METRIC, MetricsCollector,
+    COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
+    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -576,6 +578,11 @@ pub struct FtsIndexMetrics {
     and_candidates_pruned_before_return: Count,
     and_full_scores: Count,
     freqs_collected: Count,
+    compound_addresses_resolved: Count,
+    compound_address_resolution_batches: Count,
+    compound_peak_address_resolution_batch_size: Gauge,
+    compound_score_floor_overflows: Count,
+    compound_peak_buffered_candidates: Gauge,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -593,6 +600,18 @@ impl FtsIndexMetrics {
                 .new_count(AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, partition),
             and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
             freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
+            compound_addresses_resolved: metrics
+                .new_count(COMPOUND_ADDRESSES_RESOLVED_METRIC, partition),
+            compound_address_resolution_batches: metrics
+                .new_count(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, partition),
+            compound_peak_address_resolution_batch_size: metrics.new_gauge(
+                COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC,
+                partition,
+            ),
+            compound_score_floor_overflows: metrics
+                .new_count(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, partition),
+            compound_peak_buffered_candidates: metrics
+                .new_gauge(COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -643,6 +662,28 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_freqs_collected(&self, num_collections: usize) {
         self.freqs_collected.add(num_collections);
+    }
+
+    fn record_compound_addresses_resolved(&self, num_addresses: usize) {
+        self.compound_addresses_resolved.add(num_addresses);
+    }
+
+    fn record_compound_address_resolution_batches(&self, num_batches: usize) {
+        self.compound_address_resolution_batches.add(num_batches);
+    }
+
+    fn record_compound_peak_address_resolution_batch_size(&self, num_addresses: usize) {
+        self.compound_peak_address_resolution_batch_size
+            .set_max(num_addresses);
+    }
+
+    fn record_compound_score_floor_overflows(&self, num_overflows: usize) {
+        self.compound_score_floor_overflows.add(num_overflows);
+    }
+
+    fn record_compound_peak_buffered_candidates(&self, num_candidates: usize) {
+        self.compound_peak_buffered_candidates
+            .set_max(num_candidates);
     }
 }
 

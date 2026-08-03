@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::vec;
 
 use crate::dataset::ROW_ID;
@@ -31,9 +31,15 @@ use arrow_schema::{
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
+use lance_index::metrics::{
+    COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
+    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
@@ -1142,15 +1148,13 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
 
 #[tokio::test]
 async fn test_compound_tie_uses_resolved_row_id() {
-    let batch =
-        arrow_array::record_batch!(("text", Utf8, ["common", "common", "common", "common"]))
-            .unwrap();
+    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; 384])).unwrap();
     let schema = batch.schema();
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
         "memory://",
         Some(WriteParams {
-            max_rows_per_file: 1,
+            max_rows_per_file: 256,
             ..Default::default()
         }),
     )
@@ -1164,7 +1168,61 @@ async fn test_compound_tie_uses_resolved_row_id() {
     )
     .unwrap()
     .into();
-    assert_compound_fts_top_k(&dataset, query, 1).await;
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(1), None).unwrap();
+    let limited = scanner.try_into_batch().await.unwrap();
+    let limited_row_id = limited[ROW_ID].as_primitive::<UInt64Type>().value(0);
+
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(limited_row_id, exhaustive[0].0);
+    assert_eq!(exhaustive.len(), 384);
+
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_ADDRESSES_RESOLVED_METRIC),
+        Some(&384)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC),
+        Some(&1)
+    );
+
+    let mut analyze_scanner = dataset.scan();
+    analyze_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    analyze_scanner.limit(Some(1), None).unwrap();
+    let analysis = analyze_scanner.analyze_plan().await.unwrap();
+    let compound_line = analysis
+        .lines()
+        .find(|line| line.contains("CompoundFtsScorer"))
+        .unwrap();
+    assert!(
+        compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
+        "compound FTS metrics missing the bounded candidate peak: {compound_line}"
+    );
+    assert!(
+        compound_line.contains(&format!(
+            "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
+        )),
+        "compound FTS metrics missing the bounded resolution batch: {compound_line}"
+    );
 }
 
 fn nested_fts_batch(
