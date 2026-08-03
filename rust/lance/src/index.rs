@@ -1757,10 +1757,10 @@ impl DatasetIndexExt for Dataset {
         let existing_different_type_url = existing_named_indices.iter().find_map(|idx| {
             // Legacy metadata may omit index details. Its type cannot be proven
             // compatible, so only a full replacement is safe.
-            let existing_type_url = idx
-                .index_details
-                .as_ref()
-                .map_or("<unknown>", |details| details.type_url.as_str());
+            let Some(existing_details) = idx.index_details.as_ref() else {
+                return Some("<unknown>".to_owned());
+            };
+            let existing_type_url = existing_details.type_url.as_str();
             (Some(existing_type_url) != incoming_type_url.as_deref())
                 .then(|| existing_type_url.to_owned())
         });
@@ -7881,6 +7881,38 @@ mod tests {
         );
         assert!(error.to_string().contains("from type '<unknown>'"));
         assert!(error.to_string().contains("partial fragment coverage"));
+        assert!(error.to_string().contains("missing current fragments [0]"));
+        assert_eq!(dataset.manifest.version, version_before);
+
+        let committed = dataset.load_indices_by_name(index_name).await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].uuid, original_uuid);
+        assert!(committed[0].index_details.is_none());
+        assert_eq!(committed[0].index_version, 0);
+
+        let field_id = dataset.schema().field("id").unwrap().id;
+        let sentinel_segment = IndexSegment::new(
+            Uuid::new_v4(),
+            [fragments[1].id() as u32],
+            [field_id],
+            Arc::new(prost_types::Any {
+                type_url: "<unknown>".to_string(),
+                value: Vec::new(),
+            }),
+            0,
+            dataset.manifest.version,
+        );
+        let error = dataset
+            .commit_existing_index_segments(index_name, "id", vec![sentinel_segment])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected invalid input error, got: {error}"
+        );
+        assert!(error.to_string().contains("from type '<unknown>'"));
+        assert!(error.to_string().contains("to type '<unknown>'"));
         assert!(error.to_string().contains("missing current fragments [0]"));
         assert_eq!(dataset.manifest.version, version_before);
 
