@@ -33,7 +33,9 @@ build: ## Build the local Rust extension with maturin
 	$(UV_RUN) maturin develop --uv
 
 test: ## Run Python tests except recurring tests
-	pytest $(PYTEST_ARGS) python/tests
+	# Include ci_benchmarks/datagen unit tests so PR CI catches datagen
+	# regressions before main-only bench_regress hits shared GCS state.
+	pytest $(PYTEST_ARGS) python/tests python/ci_benchmarks/datagen
 
 integtest: ## Start LocalStack and run integration tests
 	@if [ "$(KEEP_COMPOSE)" = "1" ]; then \

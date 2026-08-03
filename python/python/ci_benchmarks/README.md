@@ -19,6 +19,19 @@ ci_benchmarks/
 └── datasets.py          # Dataset URI resolver (local vs GCS)
 ```
 
+## Datagen unit tests
+
+Logic under `datagen/` (for example dataset readiness checks) has unit tests in
+`datagen/test_*.py`. These run as part of the normal Python test suite
+(`make test` / PR CI) and again before dataset generation in
+`ci-benchmarks.yml`, so pure-Python regressions fail before main-only GCS
+generation.
+
+```bash
+# from python/
+pytest python/ci_benchmarks/datagen
+```
+
 ## Running Benchmarks Locally
 
 ### 1. Generate test datasets

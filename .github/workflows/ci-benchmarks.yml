@@ -53,6 +53,12 @@ jobs:
         run: |
           source venv/bin/activate
           make -C ../memtest build-release
+      # Unit tests first: gen_all touches shared GCS and is expensive to debug
+      # when a pure-Python readiness check is wrong.
+      - name: Run datagen unit tests
+        run: |
+          source venv/bin/activate
+          pytest python/ci_benchmarks/datagen -q
       - name: Generate datasets
         run: |
           source venv/bin/activate
