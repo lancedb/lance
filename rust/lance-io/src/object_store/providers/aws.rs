@@ -15,7 +15,9 @@ use opendal::{Operator, services::S3};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::ecs::EcsCredentialsProvider;
+use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
+use aws_config::Region;
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
@@ -356,7 +358,11 @@ pub async fn build_aws_credential(
                 ))
             }
             AwsProviderScheme::Irsa => {
-                let provider = WebIdentityTokenCredentialsProvider::builder().build();
+                let conf = ProviderConfig::default()
+                    .with_region(Some(Region::new(region.clone())));
+                let provider = WebIdentityTokenCredentialsProvider::builder()
+                    .configure(&conf)
+                    .build();
                 Ok((
                     Arc::new(AwsCredentialAdapter::new(
                         Arc::new(provider),
@@ -1283,13 +1289,14 @@ mod tests {
         assert!(result.is_ok(), "ECS provider should build without error");
     }
 
-    // Test that aws_provider_scheme=irsa builds a provider without error.
-    // The IRSA provider reads env vars lazily; construction always succeeds.
+    // Test that aws_provider_scheme=irsa builds a provider and attempts credential
+    // retrieval (which fails with a provider error, not a config error like
+    // "Missing Region" — confirming the region is wired through to the STS client).
     #[tokio::test]
     async fn test_provider_scheme_irsa() {
         let opts: HashMap<AmazonS3ConfigKey, String> = HashMap::new();
 
-        let result = build_aws_credential(
+        let (provider, _) = build_aws_credential(
             Duration::from_secs(300),
             None,
             Some(&opts),
@@ -1297,8 +1304,16 @@ mod tests {
             None,
             Some(AwsProviderScheme::Irsa),
         )
-        .await;
-        assert!(result.is_ok(), "IRSA provider should build without error");
+        .await
+        .unwrap();
+
+        // Credential retrieval must fail with a provider error (missing env vars or
+        // network), NOT a configuration error like "Invalid Configuration: Missing Region".
+        let err = provider.get_credential().await.unwrap_err();
+        assert!(
+            !err.to_string().contains("Missing Region"),
+            "should not fail with Missing Region; region was provided. got: {err}"
+        );
     }
 
     // Test that an invalid aws_provider_scheme value produces a clear error.
