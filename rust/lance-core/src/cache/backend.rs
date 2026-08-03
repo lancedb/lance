@@ -38,6 +38,7 @@ use async_trait::async_trait;
 use futures::Future;
 
 use crate::Result;
+use crate::deepsize::Context;
 
 use super::{CacheCodec, InternalCacheKey};
 
@@ -106,12 +107,31 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     }
 
     /// Approximate weighted size in bytes, callable from synchronous contexts.
-    /// Used by `DeepSizeOf` to report cache memory usage.
+    /// Used as a `DeepSizeOf` fallback when exact entry traversal is unavailable.
     /// Backends that cannot provide this cheaply should return 0.
     ///
     /// Assumes entries do not share underlying buffers; if they do, the
     /// returned total may overcount.
     fn approx_size_bytes(&self) -> usize {
         0
+    }
+
+    /// Computes the size of the entries currently held in memory.
+    ///
+    /// `size_of_entry` threads a shared [`Context`] through each value so
+    /// allocations shared by multiple entries are counted once. It returns
+    /// `None` when the value's concrete type was not registered by
+    /// [`LanceCache`](super::LanceCache); implementations should use the
+    /// entry's declared eviction size as a fallback in that case.
+    ///
+    /// Backends that can enumerate their in-memory entries should include the
+    /// physical key footprint in the returned total. The default returns
+    /// `None`, causing `LanceCache` to use [`approx_size_bytes`](Self::approx_size_bytes).
+    fn deep_size_of_entries(
+        &self,
+        _context: &mut Context,
+        _size_of_entry: &dyn Fn(&CacheEntry, &mut Context) -> Option<usize>,
+    ) -> Option<usize> {
+        None
     }
 }
