@@ -14,6 +14,10 @@ use byteorder::{ByteOrder, LittleEndian};
 use core::panic;
 use snafu::location;
 
+fn corrupt_file_named(name: &str, message: impl Into<String>) -> Error {
+    Error::corrupt_file(name.into(), message, location!())
+}
+
 use crate::compression::{
     BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
 };
@@ -254,7 +258,7 @@ fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: u
     for (position, &offset) in offsets.iter().enumerate().skip(1) {
         let offset: u64 = offset.into();
         if offset < previous {
-            return Error::corrupt_file_named(
+            return corrupt_file_named(
                 "binary mini-block",
                 format!(
                     "value offset at position {position} decreases: {offset} < {previous} \
@@ -264,7 +268,7 @@ fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: u
         }
         previous = offset;
     }
-    Error::corrupt_file_named(
+    corrupt_file_named(
         "binary mini-block",
         format!("value offset {previous} is out of bounds for a chunk of {chunk_len} bytes"),
     )
@@ -286,8 +290,8 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
         let data = data.into_iter().next().unwrap();
 
         let bytes_per_offset = self.bits_per_offset as usize / 8;
-        if !data.len().is_multiple_of(bytes_per_offset) {
-            return Err(Error::corrupt_file_named(
+        if data.len() % bytes_per_offset != 0 {
+            return Err(corrupt_file_named(
                 "binary mini-block",
                 format!(
                     "chunk size {} is not a multiple of the {}-byte offset width",
@@ -297,13 +301,13 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             ));
         }
         let num_offsets = (num_values as usize).checked_add(1).ok_or_else(|| {
-            Error::corrupt_file_named(
+            corrupt_file_named(
                 "binary mini-block",
                 format!("cannot decode {num_values} values from a single chunk"),
             )
         })?;
         if data.len() / bytes_per_offset < num_offsets {
-            return Err(Error::corrupt_file_named(
+            return Err(corrupt_file_named(
                 "binary mini-block",
                 format!(
                     "chunk of {} bytes holds {} offsets but decoding {} values requires {}",
@@ -321,7 +325,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
         // unrequested offsets between the requested prefix and the values.
         let min_value_region_start = num_offsets * bytes_per_offset;
         let value_region_overlap_error = |first: u64| {
-            Error::corrupt_file_named(
+            corrupt_file_named(
                 "binary mini-block",
                 format!(
                     "value region starts at offset {first} which overlaps the {num_offsets} \
@@ -518,7 +522,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
         // validation in `VariableWidthBlock::into_arrow`, so they are not rescanned
         // here.
         if data.len() < 4 {
-            return Err(Error::corrupt_file_named(
+            return Err(corrupt_file_named(
                 "variable-width block",
                 format!(
                     "block of {} bytes is too small to hold a header",
@@ -530,7 +534,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 
         let ensure_header = |header_len: usize| {
             if data.len() < header_len {
-                return Err(Error::corrupt_file_named(
+                return Err(corrupt_file_named(
                     "variable-width block",
                     format!(
                         "block of {} bytes is too small for a {} byte header",
@@ -593,13 +597,13 @@ impl BlockDecompressor for BinaryBlockDecompressor {
             .checked_add(1)
             .and_then(|num_offsets| num_offsets.checked_mul(bits_per_offset as u64 / 8))
             .ok_or_else(|| {
-                Error::corrupt_file_named(
+                corrupt_file_named(
                     "variable-width block",
                     format!("offsets region size overflows for {num_values} values"),
                 )
             })?;
         if bytes_start_offset < offset_start || bytes_start_offset > data.len() as u64 {
-            return Err(Error::corrupt_file_named(
+            return Err(corrupt_file_named(
                 "variable-width block",
                 format!(
                     "bytes start offset {} is outside the block (header: {} bytes, block: {} bytes)",
@@ -610,7 +614,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
             ));
         }
         if bytes_start_offset - offset_start != expected_offsets_bytes {
-            return Err(Error::corrupt_file_named(
+            return Err(corrupt_file_named(
                 "variable-width block",
                 format!(
                     "expected {} offset bytes for {} values but found {}",
@@ -631,7 +635,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
             _ => LittleEndian::read_u64(&offsets[0..8]),
         };
         if first_offset != 0 {
-            return Err(Error::corrupt_file_named(
+            return Err(corrupt_file_named(
                 "variable-width block",
                 format!("first offset must be 0 but found {first_offset}"),
             ));

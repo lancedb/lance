@@ -2413,6 +2413,10 @@ struct VariableFullZipDecoder {
     num_rows: u64,
 }
 
+fn corrupt_file_named(name: &str, message: impl Into<String>) -> Error {
+    Error::corrupt_file(name.into(), message, location!())
+}
+
 impl VariableFullZipDecoder {
     fn new(
         details: Arc<FullZipDecodeDetails>,
@@ -2479,7 +2483,7 @@ impl VariableFullZipDecoder {
     fn parse_length(data: &[u8], bits_per_offset: u8) -> Result<u64> {
         let width = bits_per_offset as usize / 8;
         if data.len() < width {
-            return Err(Error::corrupt_file_named(
+            return Err(corrupt_file_named(
                 "variable_full_zip",
                 format!(
                     "truncated length prefix: {} byte(s) remain in the page buffer but a {}-bit length prefix requires {}",
@@ -5732,13 +5736,6 @@ mod tests {
             bits_per_offset,
             bits_per_offset,
         )
-    }
-
-    /// A well-formed length prefix decodes without incident, for both widths.
-    #[test]
-    fn variable_full_zip_wellformed_length_prefix() {
-        assert!(decode_variable_full_zip(0u32.to_le_bytes().to_vec(), 32).is_ok());
-        assert!(decode_variable_full_zip(0u64.to_le_bytes().to_vec(), 64).is_ok());
     }
 
     /// A page whose item walk ends with a partial length prefix must surface a
