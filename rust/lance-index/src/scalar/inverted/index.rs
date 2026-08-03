@@ -926,6 +926,55 @@ impl InvertedIndex {
             .await?)
     }
 
+    /// Remaps row ids using the indexed column type supplied by the dataset layer.
+    ///
+    /// Unmarked string-list indexes infer their historical document model while
+    /// remapping. Other column types always use row documents, avoiding inference
+    /// work whose result cannot affect their semantics.
+    #[doc(hidden)]
+    pub async fn remap_with_document_type(
+        &self,
+        mapping: &RowAddrRemap,
+        dest_store: &dyn IndexStore,
+        document_type: &DataType,
+    ) -> Result<CreatedIndex> {
+        self.remap_with_mode_inference(
+            mapping,
+            dest_store,
+            ListDocumentMode::applies_to(document_type),
+        )
+        .await
+    }
+
+    async fn remap_with_mode_inference(
+        &self,
+        mapping: &RowAddrRemap,
+        dest_store: &dyn IndexStore,
+        infer_unmarked_list_document_mode: bool,
+    ) -> Result<CreatedIndex> {
+        let list_document_mode = self.list_document_mode.get().copied();
+        let unresolved_mode = if infer_unmarked_list_document_mode {
+            ListDocumentMode::Ambiguous
+        } else {
+            ListDocumentMode::Row
+        };
+        let mut builder = self.to_builder(list_document_mode.unwrap_or(unresolved_mode));
+        if list_document_mode.is_none() && infer_unmarked_list_document_mode {
+            builder = builder.with_list_document_mode_inference_on_remap();
+        }
+        let files = builder
+            .remap(mapping, self.store.clone(), dest_store)
+            .await?;
+
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: self.index_version(),
+            files,
+        })
+    }
+
     /// Returns the number of partitions in this inverted index.
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
@@ -2384,23 +2433,8 @@ impl ScalarIndex for InvertedIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let list_document_mode = self.list_document_mode.get().copied();
-        let mut builder =
-            self.to_builder(list_document_mode.unwrap_or(ListDocumentMode::Ambiguous));
-        if list_document_mode.is_none() {
-            builder = builder.with_list_document_mode_inference_on_remap();
-        }
-        let files = builder
-            .remap(mapping, self.store.clone(), dest_store)
-            .await?;
-
-        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: self.index_version(),
-            files,
-        })
+        self.remap_with_mode_inference(mapping, dest_store, true)
+            .await
     }
 
     async fn update(
@@ -13409,13 +13443,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unresolved_elements(&[100, 100], false, ListDocumentMode::Elements)]
-    #[case::already_resolved_elements(&[100, 100], true, ListDocumentMode::Elements)]
-    #[case::unresolved_ambiguous(&[100], false, ListDocumentMode::Ambiguous)]
+    #[case::unresolved_elements(&[100, 100], false, true, ListDocumentMode::Elements)]
+    #[case::already_resolved_elements(&[100, 100], true, true, ListDocumentMode::Elements)]
+    #[case::unresolved_ambiguous(&[100], false, true, ListDocumentMode::Ambiguous)]
+    #[case::generic_unresolved_elements(&[100, 100], false, false, ListDocumentMode::Elements)]
     #[tokio::test]
     async fn test_remap_preserves_unmarked_document_mode(
         #[case] row_ids: &[u64],
         #[case] resolve_before_remap: bool,
+        #[case] use_document_type: bool,
         #[case] expected_mode: ListDocumentMode,
     ) {
         let src_dir = TempObjDir::default();
@@ -13447,13 +13483,24 @@ mod tests {
         }
         let rows_read_before_remap = counter.rows_read();
 
-        index
-            .remap(
-                &RowAddrRemap::direct(HashMap::from([(100, Some(101))])),
-                dest_store.as_ref(),
-            )
-            .await
-            .unwrap();
+        if use_document_type {
+            index
+                .remap_with_document_type(
+                    &RowAddrRemap::direct(HashMap::from([(100, Some(101))])),
+                    dest_store.as_ref(),
+                    &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                )
+                .await
+                .unwrap();
+        } else {
+            index
+                .remap(
+                    &RowAddrRemap::direct(HashMap::from([(100, Some(101))])),
+                    dest_store.as_ref(),
+                )
+                .await
+                .unwrap();
+        }
         assert_eq!(
             counter.rows_read() - rows_read_before_remap,
             row_ids.len(),
@@ -13469,6 +13516,46 @@ mod tests {
             "remap must persist the inferred historical document mode"
         );
         assert_eq!(remapped.list_document_mode().await.unwrap(), expected_mode);
+    }
+
+    #[tokio::test]
+    async fn test_scalar_remap_skips_unmarked_list_document_mode_inference() {
+        let src_dir = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let index = load_unmarked_index_with_row_ids(src_store, &[100, 100]).await;
+        assert!(index.list_document_mode.get().is_none());
+
+        index
+            .remap_with_document_type(
+                &RowAddrRemap::direct(HashMap::from([(100, Some(101))])),
+                dest_store.as_ref(),
+                &DataType::Utf8,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            index.list_document_mode.get().is_none(),
+            "scalar remap must not initialize list-document inference"
+        );
+        let remapped = InvertedIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(
+            remapped.list_document_mode.get(),
+            Some(&ListDocumentMode::Row),
+            "duplicate row IDs are a sentinel for accidental list-mode inference"
+        );
     }
 
     #[tokio::test]

@@ -985,7 +985,19 @@ pub(crate) async fn remap_index(
                         )
                         .await?
                     } else {
-                        scalar_index.remap(row_id_map, &new_store).await?
+                        let document_type = dataset
+                            .schema()
+                            .field_by_id(*field_id)
+                            .ok_or_else(|| {
+                                Error::index(format!(
+                                    "Index {} refers to missing field id {}",
+                                    index_id, field_id
+                                ))
+                            })?
+                            .data_type();
+                        inverted_index
+                            .remap_with_document_type(row_id_map, &new_store, &document_type)
+                            .await?
                     }
                 }
                 _ => scalar_index.remap(row_id_map, &new_store).await?,
