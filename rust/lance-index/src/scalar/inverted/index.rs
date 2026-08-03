@@ -98,9 +98,11 @@ use std::str::FromStr;
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
 // Version 3: Version 2 layout with configurable posting blocks and analyzer metadata.
+// Version 4: Version 3 capabilities plus Snowball 3 Greek vocabulary semantics.
 pub const INVERTED_INDEX_VERSION_V1: u32 = 1;
 pub const INVERTED_INDEX_VERSION_V2: u32 = 2;
 pub const INVERTED_INDEX_VERSION_V3: u32 = 3;
+pub const INVERTED_INDEX_VERSION_V4: u32 = 4;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -166,6 +168,20 @@ pub fn resolve_fts_format_version(
     match value {
         Some(value) => value.parse(),
         None => Ok(default_fts_format_version()),
+    }
+}
+
+/// Return the manifest capability version required by an inverted-index
+/// analyzer and its physical posting-list format.
+#[doc(hidden)]
+pub fn index_version_for_params(
+    params: &InvertedIndexParams,
+    format_version: InvertedListFormatVersion,
+) -> u32 {
+    if params.uses_snowball3_greek() {
+        INVERTED_INDEX_VERSION_V4
+    } else {
+        format_version.index_version()
     }
 }
 
@@ -734,6 +750,9 @@ impl InvertedIndex {
     }
 
     fn index_version(&self) -> u32 {
+        if self.params.uses_snowball3_greek() {
+            return INVERTED_INDEX_VERSION_V4;
+        }
         match (self.token_set_format, self.format_version()) {
             (
                 TokenSetFormat::Arrow,
@@ -8334,7 +8353,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::scalar::inverted::tokenizer::GreekStemmerVersion;
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
 
@@ -8578,7 +8596,7 @@ mod tests {
             .expect("inverted index params should serialize to an object")
             .remove("greek_stemmer");
         let legacy_params: InvertedIndexParams = serde_json::from_value(legacy_json)?;
-        assert_eq!(legacy_params.greek_stemmer, GreekStemmerVersion::Legacy);
+        assert_eq!(legacy_params.greek_stemmer, None);
 
         // rust-stemmers 1.2.0 produced an empty term for this word. The
         // manually written term and missing version field model a persisted
@@ -8586,7 +8604,7 @@ mod tests {
         let index =
             write_single_partition_index(src_store, legacy_params, TokenSetFormat::Fst, "", 100)
                 .await?;
-        assert_eq!(index.params.greek_stemmer, GreekStemmerVersion::Legacy);
+        assert_eq!(index.params.greek_stemmer, None);
 
         let matches = index.do_search("ίσα").await?;
         let row_ids = matches[ROW_ID].as_primitive::<UInt64Type>();
@@ -8605,7 +8623,7 @@ mod tests {
             .await?;
 
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(updated.params.greek_stemmer, GreekStemmerVersion::Legacy);
+        assert_eq!(updated.params.greek_stemmer, None);
         let matches = updated.do_search("ίσα").await?;
         let mut row_ids = matches[ROW_ID]
             .as_primitive::<UInt64Type>()

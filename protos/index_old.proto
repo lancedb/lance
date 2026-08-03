@@ -93,7 +93,8 @@ message InvertedIndexDetails {
   // code-specific configuration to apply.
   CodeTokenizerConfig code_config = 13;
   // Greek stemming semantics used to build this index. An absent value means
-  // the legacy rust-stemmers 1.2.0 implementation; new indexes record the
-  // corrected Snowball 3 implementation.
+  // the legacy rust-stemmers 1.2.0 implementation. The Snowball 3 value is
+  // present only when Greek stemming is active and requires inverted-index
+  // capability version 4 so older readers reject the segment.
   optional GreekStemmer greek_stemmer = 14;
 }

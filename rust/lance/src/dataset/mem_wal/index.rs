@@ -35,7 +35,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::pbold;
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::InvertedListFormatVersion;
+use lance_index::scalar::inverted::{INVERTED_INDEX_VERSION_V4, InvertedListFormatVersion};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
@@ -388,8 +388,11 @@ impl MemIndexConfig {
             0 | 1 => Ok(InvertedListFormatVersion::V1),
             2 => Ok(InvertedListFormatVersion::V2),
             3 => Ok(InvertedListFormatVersion::V3),
+            version if version == INVERTED_INDEX_VERSION_V4 as i32 => {
+                Ok(InvertedListFormatVersion::V3)
+            }
             version => Err(Error::invalid_input(format!(
-                "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, or 3",
+                "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, 3, or 4",
                 index_meta.name, version
             ))),
         }
@@ -1568,6 +1571,7 @@ mod tests {
             (1, InvertedListFormatVersion::V1),
             (2, InvertedListFormatVersion::V2),
             (3, InvertedListFormatVersion::V3),
+            (4, InvertedListFormatVersion::V3),
         ] {
             let config =
                 MemIndexConfig::fts_from_metadata(&fts_index_metadata(index_version), &schema)
@@ -1590,9 +1594,9 @@ mod tests {
         let arrow_schema = create_test_schema();
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(4), &schema).unwrap_err();
+        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(5), &schema).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported index_version 4"),
+            err.to_string().contains("unsupported index_version 5"),
             "{err}"
         );
     }

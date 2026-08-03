@@ -157,6 +157,7 @@ impl InvertedIndexPlugin {
 
         params.validate_format_version()?;
         let format_version = params.resolved_format_version();
+        let index_version = index::index_version_for_params(&params, format_version);
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
@@ -164,7 +165,7 @@ impl InvertedIndexPlugin {
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: format_version.index_version(),
+            index_version,
             files,
         })
     }
@@ -276,7 +277,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        INVERTED_INDEX_VERSION_V3
+        INVERTED_INDEX_VERSION_V4
     }
 
     fn new_query_parser(
@@ -328,9 +329,34 @@ mod tests {
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     #[test]
-    fn test_plugin_version_tracks_v3_capability_gate() {
+    fn test_plugin_version_tracks_v4_capability_gate() {
         let plugin = InvertedIndexPlugin;
-        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V3);
+        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V4);
+    }
+
+    #[test]
+    fn test_snowball_greek_uses_v4_capability_gate() {
+        let current = InvertedIndexParams::new("raw".to_string(), Language::Greek);
+        assert_eq!(
+            index::index_version_for_params(&current, InvertedListFormatVersion::V2),
+            INVERTED_INDEX_VERSION_V4
+        );
+
+        let mut legacy_json = serde_json::to_value(&current).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("greek_stemmer");
+        let legacy: InvertedIndexParams = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            index::index_version_for_params(&legacy, InvertedListFormatVersion::V2),
+            INVERTED_INDEX_VERSION_V2
+        );
+
+        assert_eq!(
+            index::index_version_for_params(
+                &InvertedIndexParams::default(),
+                InvertedListFormatVersion::V2,
+            ),
+            INVERTED_INDEX_VERSION_V2
+        );
     }
 
     #[test]
