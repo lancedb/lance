@@ -886,20 +886,6 @@ fn index_matches_type(idx: &IndexMetadata, index_type: IndexType) -> bool {
     }
 }
 
-fn is_btree_scalar_params(params: &dyn IndexParams) -> bool {
-    params
-        .as_any()
-        .downcast_ref::<ScalarIndexParams>()
-        .is_some_and(|p| p.index_type.eq_ignore_ascii_case("btree"))
-}
-
-fn is_ngram_scalar_params(params: &dyn IndexParams) -> bool {
-    params
-        .as_any()
-        .downcast_ref::<ScalarIndexParams>()
-        .is_some_and(|params| params.index_type.eq_ignore_ascii_case("ngram"))
-}
-
 fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> bool {
     params.index_name() == LANCE_VECTOR_INDEX
         && matches!(
