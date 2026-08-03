@@ -199,6 +199,14 @@ impl ProjectionPlan {
         fields.push(Arc::new(
             (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
         ));
+        // Search operators add these columns after projection planning.  Their types must be
+        // available here so expressions that reference them are coerced before physical planning.
+        fields.push(Arc::new(ArrowField::new(
+            "_distance",
+            DataType::Float32,
+            true,
+        )));
+        fields.push(Arc::new(ArrowField::new("_score", DataType::Float32, true)));
         ArrowSchema::new(fields)
     }
 
@@ -459,8 +467,41 @@ impl ProjectionPlan {
 mod tests {
     use super::*;
 
-    use arrow_array::Int64Array;
+    use arrow_array::{ArrayRef, Float32Array, Int64Array};
     use lance_arrow::json::{is_json_field, json_field};
+
+    #[test]
+    fn test_scoring_column_expression() {
+        let base = Arc::new(Schema::default());
+
+        for scoring_column in ["_distance", "_score"] {
+            let expression = format!("1 - {scoring_column}");
+            let plan = ProjectionPlan::from_expressions(
+                base.clone(),
+                &[("inverted", expression.as_str())],
+            )
+            .unwrap();
+            let batch = RecordBatch::try_from_iter([(
+                scoring_column,
+                Arc::new(Float32Array::from(vec![0.25, 0.75])) as ArrayRef,
+            )])
+            .unwrap();
+
+            let physical_exprs = plan.to_physical_exprs(batch.schema().as_ref()).unwrap();
+            let values = physical_exprs[0]
+                .0
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+
+            assert_eq!(
+                values.as_ref(),
+                &Float32Array::from(vec![0.75, 0.25]),
+                "unexpected result for {scoring_column}",
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_coalesce_in_column_map() {
