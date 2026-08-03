@@ -139,12 +139,9 @@ jobs:
       # Need up-to-date compilers for kernels
       CC: clang
       CXX: clang++
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Rust
-        run: |
-          rustup update stable
-          rustup override set stable
       # Remote cargo.lock to force a fresh build
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
