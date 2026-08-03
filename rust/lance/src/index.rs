@@ -3008,7 +3008,7 @@ impl DatasetIndexInternalExt for Dataset {
                 ))
             })?;
 
-        let mut field_names = Vec::new();
+        let mut field_paths = Vec::with_capacity(source_index.fields.len());
         for field_id in source_index.fields.iter() {
             let source_field = source_dataset
                 .schema()
@@ -3019,33 +3019,35 @@ impl DatasetIndexInternalExt for Dataset {
                         field_id
                     ))
                 })?;
+            let source_field_path = source_dataset.schema().field_path(*field_id)?;
 
-            let target_field = self.schema().field(&source_field.name).ok_or_else(|| {
+            let target_field = self.schema().field(&source_field_path).ok_or_else(|| {
                 Error::index(format!(
                     "Field '{}' required by index '{}' not found in target dataset",
-                    source_field.name, index_name
+                    source_field_path, index_name
                 ))
             })?;
 
             if source_field.data_type() != target_field.data_type() {
                 return Err(Error::index(format!(
                     "Field '{}' has different types in source ({:?}) and target ({:?}) datasets",
-                    source_field.name,
+                    source_field_path,
                     source_field.data_type(),
                     target_field.data_type()
                 )));
             }
 
-            field_names.push(source_field.name.as_str());
+            field_paths.push(source_field_path);
         }
 
-        if field_names.is_empty() {
+        if field_paths.is_empty() {
             return Err(Error::index(format!(
                 "Index '{}' has no fields",
                 index_name
             )));
         }
 
+        let field_names = field_paths.iter().map(String::as_str).collect::<Vec<_>>();
         if let Some(index_details) = &source_index.index_details {
             let index_details_wrapper = IndexDetails(index_details.clone());
 
@@ -6532,6 +6534,68 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("not found in source dataset")
+        );
+    }
+
+    #[rstest]
+    #[case::simple("value", "data.value")]
+    #[case::quoted("value.with.dot", "data.`value.with.dot`")]
+    #[tokio::test]
+    async fn test_initialize_index_on_nested_field(
+        #[case] nested_field_name: &str,
+        #[case] nested_field_path: &str,
+    ) {
+        let nested_field = Arc::new(Field::new(nested_field_name, DataType::Int32, false));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::Struct(vec![nested_field.clone()].into()),
+            false,
+        )]));
+        let nested_values = arrow_array::StructArray::from(vec![(
+            nested_field,
+            Arc::new(Int32Array::from_iter_values(0..10)) as Arc<dyn arrow_array::Array>,
+        )]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested_values)]).unwrap();
+
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir);
+        let target_uri = format!("{}/target", test_dir);
+
+        let source_reader =
+            RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+        source_dataset
+            .create_index(
+                &[nested_field_path],
+                IndexType::BTree,
+                Some("nested_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+
+        let target_reader =
+            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+        target_dataset
+            .initialize_index(&source_dataset, "nested_idx")
+            .await
+            .unwrap();
+
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 1);
+        assert_eq!(
+            target_dataset
+                .schema()
+                .field_path(target_indices[0].fields[0])
+                .unwrap(),
+            nested_field_path
         );
     }
 
