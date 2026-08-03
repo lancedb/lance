@@ -5,9 +5,16 @@
 
 use std::{collections::HashMap, future::Future, sync::Arc};
 
+use arrow_array::{
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray, UInt8Array, UInt64Array,
+};
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{Error, Result};
+use lance_arrow::list::ListArrayExt;
+use lance_core::{
+    Error, Result,
+    datatypes::{BlobHandling, BlobKind, Field},
+};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::zonemap::ZoneMapIndex;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -15,6 +22,162 @@ use roaring::RoaringBitmap;
 
 use super::{Dataset, fragment::FileFragment};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+
+fn has_blob_v2(field: &Field) -> bool {
+    field.is_blob_v2() || field.children.iter().any(has_blob_v2)
+}
+
+fn managed_blob_bytes(array: &dyn Array) -> Result<u64> {
+    let descriptors = array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "Blob v2 descriptor must be Struct, got {}",
+                array.data_type()
+            ))
+        })?;
+    let fields = descriptors.fields();
+    if fields.len() != 5
+        || fields[0].name() != "kind"
+        || fields[1].name() != "position"
+        || fields[2].name() != "size"
+        || fields[3].name() != "blob_id"
+        || fields[4].name() != "blob_uri"
+    {
+        return Err(Error::internal(format!(
+            "Unexpected blob v2 descriptor fields: {:?}",
+            fields.iter().map(|field| field.name()).collect::<Vec<_>>()
+        )));
+    }
+    let kinds = descriptors
+        .column_by_name("kind")
+        .and_then(|column| column.as_any().downcast_ref::<UInt8Array>())
+        .ok_or_else(|| Error::internal("Blob v2 descriptor 'kind' must be UInt8".to_string()))?;
+    let sizes = descriptors
+        .column_by_name("size")
+        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| Error::internal("Blob v2 descriptor 'size' must be UInt64".to_string()))?;
+
+    let mut total = 0_u64;
+    for row in 0..descriptors.len() {
+        if descriptors.is_null(row) || kinds.is_null(row) || sizes.is_null(row) {
+            continue;
+        }
+        if matches!(
+            BlobKind::try_from(kinds.value(row))?,
+            BlobKind::Packed | BlobKind::Dedicated
+        ) {
+            total = total.checked_add(sizes.value(row)).ok_or_else(|| {
+                Error::internal("Blob v2 managed sidecar byte count overflowed u64".to_string())
+            })?;
+        }
+    }
+    Ok(total)
+}
+
+fn collect_list_blob_stats<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    field: &Field,
+    stats: &mut HashMap<u32, u64>,
+) -> Result<()> {
+    let [child] = field.children.as_slice() else {
+        return Err(Error::internal(format!(
+            "Blob list field '{}' must have exactly one child, got {}",
+            field.name,
+            field.children.len()
+        )));
+    };
+    collect_blob_v2_sidecar_stats(list.trimmed_values(), child, stats)
+}
+
+fn collect_blob_v2_sidecar_stats(
+    array: ArrayRef,
+    field: &Field,
+    stats: &mut HashMap<u32, u64>,
+) -> Result<()> {
+    if field.is_blob_v2() {
+        let bytes = managed_blob_bytes(array.as_ref())?;
+        let field_bytes = stats.entry(field.id as u32).or_insert(0_u64);
+        *field_bytes = field_bytes.checked_add(bytes).ok_or_else(|| {
+            Error::internal(format!(
+                "Blob v2 managed sidecar byte count overflowed u64 for field '{}'",
+                field.name
+            ))
+        })?;
+        return Ok(());
+    }
+
+    if let Some(structure) = array.as_any().downcast_ref::<StructArray>() {
+        if structure.num_columns() != field.children.len() {
+            return Err(Error::internal(format!(
+                "Struct field '{}' has {} arrays but {} schema children",
+                field.name,
+                structure.num_columns(),
+                field.children.len()
+            )));
+        }
+        for (child_array, child_field) in structure.columns().iter().zip(&field.children) {
+            if has_blob_v2(child_field) {
+                collect_blob_v2_sidecar_stats(child_array.clone(), child_field, stats)?;
+            }
+        }
+        return Ok(());
+    }
+    if let Some(list) = array.as_any().downcast_ref::<GenericListArray<i32>>() {
+        return collect_list_blob_stats(list, field, stats);
+    }
+    if let Some(list) = array.as_any().downcast_ref::<GenericListArray<i64>>() {
+        return collect_list_blob_stats(list, field, stats);
+    }
+    Err(Error::internal(format!(
+        "Blob-containing field '{}' has unsupported type {}",
+        field.name,
+        array.data_type()
+    )))
+}
+
+async fn calculate_blob_v2_sidecar_stats(dataset: &Arc<Dataset>) -> Result<HashMap<u32, u64>> {
+    let blob_roots = dataset
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| has_blob_v2(field))
+        .map(|field| {
+            Ok((
+                field.clone(),
+                dataset.schema().field_path_minimal(field.id)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if blob_roots.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let paths = blob_roots
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .collect::<Vec<_>>();
+    let mut scanner = dataset.scan();
+    scanner.project(&paths)?;
+    scanner.blob_handling(BlobHandling::BlobsDescriptions);
+    // Storage statistics cover physical data, including rows hidden by deletion vectors.
+    // The scanner requires row ids in order to expose those deleted rows.
+    scanner.with_row_id().include_deleted_rows();
+    let mut stream = scanner.try_into_stream().await?;
+    let mut stats = HashMap::with_capacity(blob_roots.len());
+    while let Some(batch) = stream.try_next().await? {
+        for (field, path) in &blob_roots {
+            let array = batch.column_by_name(path).ok_or_else(|| {
+                Error::internal(format!(
+                    "Projected blob-containing field '{path}' was missing from the statistics scan"
+                ))
+            })?;
+            collect_blob_v2_sidecar_stats(array.clone(), field, &mut stats)?;
+        }
+    }
+    Ok(stats)
+}
 
 /// Statistics about a single field in the dataset
 pub struct FieldStatistics {
@@ -77,6 +240,19 @@ impl DatasetStatisticsExt for Dataset {
                     futures::future::ready(Ok(()))
                 })
                 .await?;
+
+            for (field_id, bytes) in calculate_blob_v2_sidecar_stats(self).await? {
+                let stats = field_stats.get_mut(&field_id).ok_or_else(|| {
+                    Error::internal(format!(
+                        "Blob v2 statistics referenced unknown field id {field_id}"
+                    ))
+                })?;
+                stats.bytes_on_disk = stats.bytes_on_disk.checked_add(bytes).ok_or_else(|| {
+                    Error::internal(format!(
+                        "Data statistics byte count overflowed u64 for field id {field_id}"
+                    ))
+                })?;
+            }
         }
         let field_stats = field_ids
             .into_iter()
@@ -182,14 +358,18 @@ impl<'a> DatasetStatistics<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{num::NonZeroUsize, sync::Arc};
 
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{ArrayRef, Int32Array, ListArray, RecordBatch, RecordBatchIterator};
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
 
-    use crate::dataset::WriteParams;
+    use crate::{
+        blob::{BlobArrayBuilder, BlobFieldOptions, blob_field_with_options},
+        dataset::WriteParams,
+    };
 
     use super::*;
 
@@ -243,5 +423,81 @@ mod tests {
             stats.fields[0].bytes_on_disk > 0,
             "bytes_on_disk should include the remaining column after drop_columns"
         );
+    }
+
+    #[tokio::test]
+    async fn test_calculate_data_stats_includes_blob_v2_sidecars() {
+        let payloads = [vec![1_u8; 4 * 1024], vec![2_u8; 8 * 1024]];
+        let payload_bytes = payloads.iter().map(Vec::len).sum::<usize>() as u64;
+        let mut blob_builder = BlobArrayBuilder::new(payloads.len());
+        for payload in &payloads {
+            blob_builder.push_bytes(payload).unwrap();
+        }
+
+        let list_payloads = [vec![3_u8; 2 * 1024], vec![4_u8; 3 * 1024]];
+        let list_payload_bytes = list_payloads.iter().map(Vec::len).sum::<usize>() as u64;
+        let mut list_blob_builder = BlobArrayBuilder::new(list_payloads.len());
+        for payload in &list_payloads {
+            list_blob_builder.push_bytes(payload).unwrap();
+        }
+
+        let options = BlobFieldOptions::default()
+            .with_inline_size_threshold(1)
+            .with_dedicated_size_threshold(NonZeroUsize::new(1024).unwrap());
+        let blob_field = blob_field_with_options("blob", false, options.clone());
+        let list_item = Arc::new(blob_field_with_options("item", false, options));
+        let list_array = Arc::new(
+            ListArray::try_new(
+                list_item.clone(),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 2])),
+                list_blob_builder.finish().unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field,
+            ArrowField::new("blob_list", DataType::List(list_item), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![blob_builder.finish().unwrap(), list_array],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 1,
+                    max_rows_per_group: 1,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let blob_field_id = dataset.schema().field("blob").unwrap().id as u32;
+        let list_blob_field_id = dataset.schema().field("blob_list").unwrap().children[0].id as u32;
+        let stats = dataset.calculate_data_stats().await.unwrap();
+        for (field_id, expected_bytes) in [
+            (blob_field_id, payload_bytes),
+            (list_blob_field_id, list_payload_bytes),
+        ] {
+            let blob_stats = stats
+                .fields
+                .iter()
+                .find(|stats| stats.id == field_id)
+                .unwrap();
+            assert!(
+                blob_stats.bytes_on_disk >= expected_bytes,
+                "blob field {field_id} bytes_on_disk={} should include {expected_bytes} sidecar bytes",
+                blob_stats.bytes_on_disk
+            );
+        }
     }
 }
