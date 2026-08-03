@@ -14,6 +14,7 @@ use crate::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
 use crate::encoder::ArrayEncodingStrategy;
 use crate::utils::accumulation::AccumulationQueue;
 use crate::{array_encoding::physical::decoder_from_array_encoding, data::DataBlock};
+use lance_arrow::memory::array_slice_memory_size;
 use lance_core::{Error, Result, datatypes::Field};
 
 use crate::{
@@ -401,6 +402,10 @@ pub struct PrimitiveFieldEncoder {
     max_page_bytes: u64,
 }
 
+fn num_page_parts(array: &dyn Array, max_page_bytes: usize) -> usize {
+    bit_util::ceil(array_slice_memory_size(array), max_page_bytes).min(array.len())
+}
+
 impl PrimitiveFieldEncoder {
     pub fn try_new(
         options: &EncodingOptions,
@@ -457,10 +462,8 @@ impl PrimitiveFieldEncoder {
     fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<Vec<EncodeTask>> {
         if arrays.len() == 1 {
             let array = arrays.into_iter().next().unwrap();
-            let size_bytes = array.get_buffer_memory_size();
-            let num_parts = bit_util::ceil(size_bytes, self.max_page_bytes as usize);
-            // Can't slice it finer than 1 page per row
-            let num_parts = num_parts.min(array.len());
+            // Can't slice it finer than 1 page per row.
+            let num_parts = num_page_parts(array.as_ref(), self.max_page_bytes as usize);
             if num_parts <= 1 {
                 // One part and it fits in a page
                 Ok(vec![self.create_encode_task(vec![array])?])
@@ -533,5 +536,28 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         _external_buffers: &mut OutOfLineBuffers,
     ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
         std::future::ready(Ok(vec![EncodedColumn::default()])).boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Int32Array;
+
+    use super::*;
+
+    #[test]
+    fn test_v2_0_page_split_uses_slice_size() {
+        let parent = Arc::new(Int32Array::from(vec![0_i32; 16 * 1024 * 1024])) as ArrayRef;
+        let slice = parent.slice(0, 10 * 1024 * 1024 / std::mem::size_of::<i32>());
+
+        assert_eq!(array_slice_memory_size(slice.as_ref()), 10 * 1024 * 1024);
+        assert_eq!(
+            num_page_parts(
+                slice.as_ref(),
+                EncodingOptions::default().max_page_bytes as usize,
+            ),
+            1,
+            "a 10 MiB logical slice fits in one 32 MiB page"
+        );
     }
 }
