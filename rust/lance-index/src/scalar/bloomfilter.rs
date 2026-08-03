@@ -56,7 +56,6 @@ const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
 /// bookkeeping (offset and validity buffers) cannot push a batch over the edge.
 const MAX_BLOOMFILTER_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024;
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
-pub const MAX_BINARY_VALUE_BUFFER_LEN: u64 = i32::MAX as u64;
 
 #[derive(Debug, Clone)]
 struct BloomFilterStatistics {
@@ -612,19 +611,6 @@ fn remap_zone(
     zones
 }
 
-fn checked_merged_payload_size(current: u64, additional: usize) -> Result<u64> {
-    let total = current
-        .checked_add(additional as u64)
-        .ok_or_else(|| Error::invalid_input("merged BloomFilter payload size overflowed u64"))?;
-    if total > MAX_BINARY_VALUE_BUFFER_LEN {
-        return Err(Error::invalid_input(format!(
-            "merged BloomFilter payload is {total} bytes, exceeding the Arrow BinaryArray limit \
-             of {MAX_BINARY_VALUE_BUFFER_LEN} bytes; merge fewer segments at a time"
-        )));
-    }
-    Ok(total)
-}
-
 /// Merge caller-selected BloomFilter segments into one self-contained segment.
 pub async fn merge_bloomfilter_indices(
     source_indices: &[(&BloomFilterIndex, &RoaringBitmap)],
@@ -645,7 +631,6 @@ pub async fn merge_bloomfilter_indices(
     let mut blocks = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut has_missing_null_bitmap = false;
-    let mut serialized_bytes = 0u64;
     for (source, fragment_filter) in source_indices {
         if fragment_filter.is_empty() {
             continue;
@@ -668,14 +653,10 @@ pub async fn merge_bloomfilter_indices(
                 |remapper| remap_zone(block, remapper),
             )
         });
-        for block in source_zones.filter(|block| {
+        blocks.extend(source_zones.filter(|block| {
             u32::try_from(block.bound.fragment_id)
                 .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
-        }) {
-            serialized_bytes =
-                checked_merged_payload_size(serialized_bytes, block.bloom_filter.to_bytes().len())?;
-            blocks.push(block);
-        }
+        }));
         match &source.null_rows {
             Some(null_rows) => {
                 let mut filtered = source.frag_reuse_index.as_deref().map_or_else(
@@ -1522,7 +1503,7 @@ mod tests {
         BloomFilterQuery, IndexStore, ScalarIndex, SearchResult,
         bloomfilter::{
             BloomFilterIndex, BloomFilterIndexBuilder, BloomFilterIndexBuilderParams,
-            MAX_BINARY_VALUE_BUFFER_LEN, checked_merged_payload_size, merge_bloomfilter_indices,
+            merge_bloomfilter_indices,
         },
         lance_format::LanceIndexStore,
     };
@@ -1531,16 +1512,6 @@ mod tests {
     use crate::Index; // Import Index trait to access calculate_included_frags
     use crate::metrics::NoOpMetricsCollector;
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
-
-    #[test]
-    fn test_checked_merged_payload_size_rejects_binary_overflow() {
-        assert_eq!(
-            checked_merged_payload_size(MAX_BINARY_VALUE_BUFFER_LEN - 1, 1).unwrap(),
-            MAX_BINARY_VALUE_BUFFER_LEN
-        );
-        let err = checked_merged_payload_size(MAX_BINARY_VALUE_BUFFER_LEN, 1).unwrap_err();
-        assert!(err.to_string().contains("Arrow BinaryArray limit"));
-    }
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
