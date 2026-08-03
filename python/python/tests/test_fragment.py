@@ -121,7 +121,7 @@ def test_fragment_session(tmp_path: Path):
 
 
 def test_write_fragments(tmp_path: Path):
-    # Should result in two files since each batch is 8MB and max_bytes_per_file is small
+    # Large input batches are split before enforcing max_bytes_per_file.
     batches = pa.RecordBatchReader.from_batches(
         pa.schema([pa.field("a", pa.string())]),
         [
@@ -138,11 +138,11 @@ def test_write_fragments(tmp_path: Path):
         max_bytes_per_file=1024,
         progress=progress,
     )
-    assert len(fragments) == 2
+    assert len(fragments) > 2
     assert all(isinstance(f, FragmentMetadata) for f in fragments)
     # progress hook was called for each fragment
-    assert progress.begin_called == 2
-    assert progress.complete_called == 2
+    assert progress.begin_called == len(fragments)
+    assert progress.complete_called == len(fragments)
 
 
 def test_write_fragments_schema_holes(tmp_path: Path):

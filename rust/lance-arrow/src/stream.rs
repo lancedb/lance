@@ -6,7 +6,7 @@
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
 use futures::stream::{self, Stream, StreamExt};
-use std::pin::Pin;
+use std::{collections::VecDeque, pin::Pin};
 
 use crate::deepcopy::deep_copy_batch_sliced;
 
@@ -73,6 +73,7 @@ where
         RechunkState {
             input: Box::pin(input),
             accumulated: Vec::new(),
+            pending_slices: VecDeque::new(),
             acc_bytes: 0,
             done: false,
             input_schema,
@@ -81,6 +82,10 @@ where
             deep_copy,
         },
         |mut state| async move {
+            if let Some(batch) = state.pending_slices.pop_front() {
+                return Ok(Some((batch, state)));
+            }
+
             if state.done && state.accumulated.is_empty() {
                 return Ok(None);
             }
@@ -128,22 +133,10 @@ where
             state.acc_bytes = 0;
 
             // Slice the batch into ~max_bytes pieces assuming uniform row sizes.
-            let mut slices =
-                slice_batch(batch, state.max_bytes, state.deep_copy).map_err(E::from)?;
-
-            if slices.len() == 1 {
-                Ok(Some((slices.pop().unwrap(), state)))
-            } else {
-                let first = slices.remove(0);
-
-                // Stash leftover slices for subsequent iterations.
-                for a in &slices {
-                    state.acc_bytes += a.get_array_memory_size();
-                }
-                state.accumulated = slices;
-
-                Ok(Some((first, state)))
-            }
+            let slices = slice_batch(batch, state.max_bytes, state.deep_copy).map_err(E::from)?;
+            state.pending_slices = slices.into();
+            let first = state.pending_slices.pop_front().unwrap();
+            Ok(Some((first, state)))
         },
     )
 }
@@ -198,6 +191,7 @@ fn slice_batch(
 struct RechunkState<S> {
     input: Pin<Box<S>>,
     accumulated: Vec<RecordBatch>,
+    pending_slices: VecDeque<RecordBatch>,
     acc_bytes: usize,
     done: bool,
     input_schema: SchemaRef,
@@ -389,13 +383,10 @@ mod tests {
         // min_bytes=0 with a small max_bytes should still slice large batches.
         let batch = make_batch(1000);
         let bytes = batch.get_array_memory_size();
+        let expected_batches = slice_batch(batch.clone(), bytes / 4, false).unwrap().len();
         let result = collect_rechunked(vec![batch], 0, bytes / 4);
         assert_eq!(total_rows(&result), 1000);
-        assert!(
-            result.len() >= 4,
-            "expected at least 4 slices, got {}",
-            result.len()
-        );
+        assert_eq!(result.len(), expected_batches);
     }
 
     /// Build a batch with one variable-length string column.
