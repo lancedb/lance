@@ -4,7 +4,7 @@
 //! An accumulation queue accumulates arrays until we have enough data to flush.
 
 use arrow_array::ArrayRef;
-use lance_arrow::deepcopy::deep_copy_array;
+use lance_arrow::deepcopy::deep_copy_array_sliced;
 use lance_arrow::memory::array_slice_memory_size;
 use log::{debug, trace};
 
@@ -73,7 +73,8 @@ impl AccumulationQueue {
             if self.keep_original_array {
                 self.buffered_arrays.push(array);
             } else {
-                self.buffered_arrays.push(deep_copy_array(array.as_ref()))
+                self.buffered_arrays
+                    .push(deep_copy_array_sliced(array.as_ref()))
             }
             None
         }
@@ -107,5 +108,31 @@ impl AccumulationQueue {
     /// Estimated bytes retained by arrays that have not been emitted yet.
     pub fn pending_bytes(&self) -> u64 {
         self.current_bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, StringArray};
+
+    use super::*;
+
+    #[test]
+    fn sliced_utf8_cache_does_not_copy_the_full_parent() {
+        let value = "x".repeat(1024 * 1024);
+        let parent = Arc::new(StringArray::from(vec![value.as_str(); 16])) as ArrayRef;
+        let slice = parent.slice(0, 2);
+        assert!(array_slice_memory_size(slice.as_ref()) < 3 * 1024 * 1024);
+
+        let mut queue = AccumulationQueue::new(8 * 1024 * 1024, 0, false);
+        assert!(queue.insert(slice, 0, 2).is_none());
+        let retained_bytes = queue.buffered_arrays[0].get_buffer_memory_size();
+
+        assert!(
+            retained_bytes < 3 * 1024 * 1024,
+            "a 2 MiB logical slice retained {retained_bytes} bytes"
+        );
     }
 }
