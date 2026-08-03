@@ -1312,11 +1312,36 @@ impl MergeInsertJob {
                 )?;
 
                 let updated_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-                if Some(updated_rows) == metadata.physical_rows {
-                    // All rows have been updated and there are no deletions. So we
-                    // don't need to merge in existing values.
-                    // Also, because we already sorted by row address, the rows
-                    // will be in the correct order.
+
+                // This function is here to help rustc with lifetimes.
+                fn get_row_addr_iter(
+                    batches: &[RecordBatch],
+                ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send {
+                    batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
+                        // The index in source batches will be one more.
+                        let batch_idx = batch_idx + 1;
+                        let row_addrs = batch
+                            .column_by_name(ROW_ADDR)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap();
+                        row_addrs
+                            .values()
+                            .iter()
+                            .enumerate()
+                            .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
+                    })
+                }
+
+                let has_full_fragment_coverage = metadata.deletion_file.is_none()
+                    && Some(updated_rows) == metadata.physical_rows
+                    && get_row_addr_iter(&batches)
+                        .map(|(row_addr, _)| row_addr)
+                        .eq(RowAddress::address_range(metadata.id as u32).take(updated_rows));
+                if has_full_fragment_coverage {
+                    // Exact, deletion-free coverage can be written directly because the
+                    // batches are sorted by row address.
 
                     let data_storage_version = dataset
                         .manifest()
@@ -1419,27 +1444,6 @@ impl MergeInsertJob {
                         source_batches.push(convert_json_columns(&dropped).map_err(Error::from)?);
                     }
 
-                    // This function is here to help rustc with lifetimes.
-                    fn get_row_addr_iter(
-                        batches: &[RecordBatch],
-                    ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send
-                    {
-                        batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
-                            // The index in source batches will be one more.
-                            let batch_idx = batch_idx + 1;
-                            let row_addrs = batch
-                                .column_by_name(ROW_ADDR)
-                                .unwrap()
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .unwrap();
-                            row_addrs
-                                .values()
-                                .iter()
-                                .enumerate()
-                                .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
-                        })
-                    }
                     let mut updated_rows =
                         UpdatedRowAddrReconciler::new(get_row_addr_iter(&batches));
 
@@ -3164,6 +3168,40 @@ mod tests {
         assert!(matches!(error, Error::Internal { .. }));
         let message = error.to_string();
         assert!(message.contains("update row address (7, 2) is missing"));
+        assert!(message.contains("no target rows remain"));
+    }
+
+    #[tokio::test]
+    async fn test_updated_row_addr_missing_in_full_fragment_update() {
+        let initial = record_batch!(("value", Int32, [10, 20])).unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+        let row_addr = |offset| u64::from(RowAddress::new_from_parts(fragment_id, offset));
+        let updates = record_batch!(
+            (ROW_ADDR, UInt64, [row_addr(0), row_addr(2)]),
+            ("value", Int32, [100, 200])
+        )
+        .unwrap();
+        let update_stream =
+            RecordBatchStreamAdapter::new(updates.schema(), futures::stream::iter([Ok(updates)]));
+
+        let error = MergeInsertJob::update_fragments(
+            dataset.clone(),
+            Box::pin(update_stream),
+            dataset.manifest().version + 1,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        let message = error.to_string();
+        assert!(message.contains("update row address (0, 2) is missing"));
         assert!(message.contains("no target rows remain"));
     }
 
