@@ -18,24 +18,25 @@ pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
-    // Virtual path to prevent collisions in the cache.
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
-        Some(RowIdMeta::Inline(data)) => {
+        Some(row_id_meta @ RowIdMeta::Inline(data)) => {
             let data = data.clone();
             let key = RowIdSequenceKey {
                 fragment_id: fragment.id,
+                row_id_meta,
             };
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
                 .await
         }
-        Some(RowIdMeta::External(file_slice)) => {
+        Some(row_id_meta @ RowIdMeta::External(file_slice)) => {
             let file_slice = file_slice.clone();
             let dataset_clone = dataset.clone();
             let key = RowIdSequenceKey {
                 fragment_id: fragment.id,
+                row_id_meta,
             };
             dataset
                 .metadata_cache
@@ -286,6 +287,7 @@ mod test {
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
+    use crate::session::Session;
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
@@ -495,9 +497,13 @@ mod test {
         let num_rows = 10u64;
         let batch = sequence_batch(0..num_rows as i32);
 
+        // The session is shared across both writes so the metadata cache stays
+        // warm across the overwrite.
+        let session = Arc::new(Session::default());
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_stable_row_ids: true,
+            session: Some(session.clone()),
             ..Default::default()
         };
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -508,9 +514,26 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
 
+        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            sequence.iter().collect::<Vec<_>>(),
+            (0..num_rows).collect::<Vec<_>>()
+        );
+
+        // Loading the same fragment again must be served from the cache: the key
+        // discriminates on the row id metadata, which has not changed.
+        let hits_before = session.metadata_cache_stats().await.hits;
+        load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(session.metadata_cache_stats().await.hits, hits_before + 1);
+
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             mode: WriteMode::Overwrite,
+            session: Some(session.clone()),
             ..Default::default()
         };
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
@@ -526,6 +549,82 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
         assert!(index.get(num_rows).is_some());
+
+        // The new fragment holds the row ids the overwrite wrote, not the ones
+        // cached for the generation it replaced.
+        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            sequence.iter().collect::<Vec<_>>(),
+            (num_rows..(2 * num_rows)).collect::<Vec<_>>()
+        );
+
+        // Neither generation displaces the other: the version written before the
+        // overwrite still reads its own sequence out of the same cache.
+        let previous = dataset.checkout_version(1).await.unwrap();
+        let sequence = load_row_id_sequence(&previous, &previous.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            sequence.iter().collect::<Vec<_>>(),
+            (0..num_rows).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_after_overwrite() {
+        // Compaction rechunks the row id sequences of the fragments it merges.
+        // If a sequence cached before the overwrite were served for one of them,
+        // the rechunk would hand out ids the fragments do not hold.
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let session = Arc::new(Session::default());
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+
+        let write = |rows: Range<i32>, mode: WriteMode| {
+            let batch = sequence_batch(rows);
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let params = WriteParams {
+                mode,
+                ..params.clone()
+            };
+            async move {
+                Dataset::write(reader, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let dataset = write(0..100, WriteMode::Create).await;
+        load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+
+        // The overwrite replaces those 100 rows with 60 holding row ids 100..160.
+        write(0..60, WriteMode::Overwrite).await;
+        // A second fragment, so compaction has something to merge.
+        let mut dataset = write(0..100, WriteMode::Append).await;
+
+        compact(&mut dataset, 1024).await;
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 160);
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let batch = scan.try_into_batch().await.unwrap();
+        let row_ids = batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        // 100..160 from the overwrite, 160..260 from the append. A stale
+        // sequence would put 0..100 back into circulation.
+        assert_eq!(row_ids, (100..260).collect::<HashSet<_>>());
     }
 
     #[tokio::test]

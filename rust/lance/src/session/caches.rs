@@ -19,7 +19,7 @@ use lance_core::{
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DeletionFile, DeletionFileType, Manifest},
+    format::{DeletionFile, DeletionFileType, Manifest, RowIdMeta},
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -221,12 +221,26 @@ impl CacheKey for RowIdIndexKey {
 }
 
 #[derive(Debug)]
-pub struct RowIdSequenceKey {
+pub struct RowIdSequenceKey<'a> {
     pub fragment_id: u64,
+    /// Where the sequence is stored, which identifies which generation of the
+    /// fragment it belongs to. A fragment id alone is not enough: this cache is
+    /// namespaced by dataset URI only (see [`GlobalMetadataCache::for_dataset`])
+    /// and fragment ids restart at 0 both for an overwrite and for a dataset
+    /// dropped and recreated at the same URI, so a reused id would otherwise be
+    /// served the earlier generation's sequence. Rewriting a fragment always
+    /// rewrites its `row_id_meta`, while operations that leave row ids alone
+    /// (deletes, added columns) keep hitting the cache.
+    ///
+    /// Inline metadata is the fragment's run-encoded sequence, so for those the
+    /// key hashes the value's own bytes. That is the point — identity *is* the
+    /// content — and the encoded form is a handful of bytes per run.
+    pub row_id_meta: &'a RowIdMeta,
 }
 
-impl CacheKey for RowIdSequenceKey {
+impl CacheKey for RowIdSequenceKey<'_> {
     type ValueType = RowIdSequence;
+    // Only the legacy display form. Identity comes from `write_key` below.
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
     }
@@ -235,11 +249,23 @@ impl CacheKey for RowIdSequenceKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 1)
+        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.fragment_id);
+        match self.row_id_meta {
+            RowIdMeta::Inline(data) => {
+                builder.write_variant(0);
+                builder.write_bytes(data);
+            }
+            RowIdMeta::External(file) => {
+                builder.write_variant(1);
+                builder.write_str(&file.path);
+                builder.write_u64(file.offset);
+                builder.write_u64(file.size);
+            }
+        }
     }
 }
 
@@ -254,6 +280,9 @@ impl DSMetadataCache {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use lance_table::format::ExternalFile;
+    use lance_table::rowids::write_row_ids;
 
     use super::*;
 
@@ -286,6 +315,80 @@ mod tests {
                 .get_with_key(&DeletionFileKey {
                     fragment_id: 2,
                     deletion_file: &deletion_file_on_other_base,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_sequence_key_separates_fragment_generations() {
+        // An overwrite, or a dataset dropped and recreated at the same URI,
+        // restarts fragment ids, so the same id must not resolve to the earlier
+        // generation's sequence.
+        let cache = LanceCache::with_capacity(4096);
+        let first_generation = RowIdMeta::Inline(write_row_ids(&(0..100).into()));
+        let key = RowIdSequenceKey {
+            fragment_id: 0,
+            row_id_meta: &first_generation,
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowIdSequence::from(0..100)))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        let second_generation = RowIdMeta::Inline(write_row_ids(&(100..160).into()));
+        assert!(
+            cache
+                .get_with_key(&RowIdSequenceKey {
+                    fragment_id: 0,
+                    row_id_meta: &second_generation,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_sequence_key_separates_external_slices() {
+        // External metadata is a read-only legacy shape, but the same slice of
+        // the same file is the only thing that may share a cache entry.
+        let cache = LanceCache::with_capacity(4096);
+        let external = |offset| {
+            RowIdMeta::External(ExternalFile {
+                path: "_row_ids/1.rowids".into(),
+                offset,
+                size: 16,
+            })
+        };
+        let first_slice = external(0);
+        cache
+            .insert_with_key(
+                &RowIdSequenceKey {
+                    fragment_id: 0,
+                    row_id_meta: &first_slice,
+                },
+                Arc::new(RowIdSequence::from(0..100)),
+            )
+            .await;
+
+        let second_slice = external(16);
+        assert!(
+            cache
+                .get_with_key(&RowIdSequenceKey {
+                    fragment_id: 0,
+                    row_id_meta: &second_slice,
+                })
+                .await
+                .is_none()
+        );
+        // An inline sequence never aliases an external one.
+        let inline = RowIdMeta::Inline(write_row_ids(&(0..100).into()));
+        assert!(
+            cache
+                .get_with_key(&RowIdSequenceKey {
+                    fragment_id: 0,
+                    row_id_meta: &inline,
                 })
                 .await
                 .is_none()
