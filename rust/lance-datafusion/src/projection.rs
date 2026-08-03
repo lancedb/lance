@@ -219,6 +219,14 @@ impl ProjectionPlan {
         fields.push(Arc::new(
             (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
         ));
+        // Scoring fields are needed for initial parsing of schema-dependent functions. Stored
+        // fields keep their own types here; scoring expressions are replanned against the final
+        // physical schema before execution.
+        for name in ["_distance", "_score"] {
+            if schema.field_with_name(name).is_err() {
+                fields.push(Arc::new(ArrowField::new(name, DataType::Float32, true)));
+            }
+        }
         ArrowSchema::new(fields)
     }
 
@@ -552,6 +560,32 @@ mod tests {
             );
 
             ProjectionPlan::from_expressions(base, &[("incremented", "id + 1")]).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_scoring_column_function_expression() {
+        for scoring_column in ["_distance", "_score"] {
+            let expression = format!("coalesce(1 - {scoring_column}, 0)");
+            let plan = ProjectionPlan::from_expressions(
+                Arc::new(Schema::default()),
+                &[("normalized", expression.as_str())],
+            )
+            .unwrap();
+            let batch = RecordBatch::try_from_iter([(
+                scoring_column,
+                Arc::new(Float32Array::from(vec![Some(0.25), None])) as ArrayRef,
+            )])
+            .unwrap();
+
+            let physical_exprs = plan.to_physical_exprs(batch.schema().as_ref()).unwrap();
+            let values = physical_exprs[0]
+                .0
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(values.as_ref(), &Float32Array::from(vec![0.75, 0.0]));
         }
     }
 
