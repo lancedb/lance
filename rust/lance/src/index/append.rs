@@ -1972,6 +1972,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_append_legacy_greek_fts_preserves_canonical_details() {
+        use lance_index::pbold::InvertedIndexDetails;
+        use lance_index::scalar::FullTextSearchQuery;
+        use lance_index::scalar::inverted::{InvertedIndexParams, Language};
+        use prost::Message;
+
+        const INDEX_NAME: &str = "body_idx";
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
+        let initial_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["ίσα"]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone()),
+            test_dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let current_params = InvertedIndexParams::new("raw".to_string(), Language::Greek)
+            .max_token_length(None)
+            .remove_stop_words(false)
+            .ascii_folding(false);
+        let mut legacy_json = serde_json::to_value(current_params).unwrap();
+        legacy_json
+            .as_object_mut()
+            .expect("inverted index params should serialize to an object")
+            .remove("greek_stemmer");
+        let legacy_params: InvertedIndexParams = serde_json::from_value(legacy_json).unwrap();
+
+        let fragment_ids = dataset
+            .get_fragments()
+            .into_iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect();
+        let mut legacy_segment =
+            CreateIndexBuilder::new(&mut dataset, &["body"], IndexType::Inverted, &legacy_params)
+                .name(INDEX_NAME.to_string())
+                .fragments(fragment_ids)
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+        // Model the manifest details written before the Greek stemmer
+        // discriminator existed. The index files still select legacy stemming.
+        let details_any = legacy_segment
+            .index_details
+            .as_ref()
+            .expect("inverted segment should include index details");
+        let mut details = InvertedIndexDetails::decode(details_any.value.as_slice()).unwrap();
+        details.greek_stemmer = None;
+        legacy_segment.index_details = Some(Arc::new(
+            prost_types::Any::from_msg(&details).expect("details should encode"),
+        ));
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "body", vec![legacy_segment])
+            .await
+            .unwrap();
+
+        let appended_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["ίσα"]))],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended_batch)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(segments.len(), 2);
+        for segment in segments {
+            let details_any = segment
+                .index_details
+                .expect("inverted segment should include index details");
+            let details = InvertedIndexDetails::decode(details_any.value.as_slice()).unwrap();
+            assert_eq!(details.greek_stemmer, None);
+        }
+
+        let result = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("ίσα".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+    }
+
+    #[tokio::test]
     async fn test_append_index() {
         const DIM: usize = 64;
         const IVF_PARTITIONS: usize = 2;

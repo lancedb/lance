@@ -67,12 +67,12 @@ impl GreekStemmerVersion {
         }
     }
 
-    fn to_proto(self) -> i32 {
+    fn to_proto(self) -> Option<i32> {
         use pbold::inverted_index_details::GreekStemmer;
 
         match self {
-            Self::Legacy => GreekStemmer::Legacy as i32,
-            Self::Snowball3 => GreekStemmer::Snowball3 as i32,
+            Self::Legacy => None,
+            Self::Snowball3 => Some(GreekStemmer::Snowball3 as i32),
         }
     }
 }
@@ -402,7 +402,7 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             ),
             greek_stemmer: params
                 .active_greek_stemmer()
-                .map(GreekStemmerVersion::to_proto),
+                .and_then(GreekStemmerVersion::to_proto),
         })
     }
 }
@@ -1579,6 +1579,11 @@ mod tests {
         assert_eq!(
             legacy_training.greek_stemmer,
             Some(GreekStemmerVersion::Legacy)
+        );
+        assert_eq!(
+            pbold::InvertedIndexDetails::try_from(&legacy_training).unwrap(),
+            legacy_details,
+            "the internal legacy training hint should retain absent canonical metadata"
         );
 
         let current_training =
