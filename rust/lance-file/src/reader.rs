@@ -3113,6 +3113,69 @@ mod tests {
             .await
     }
 
+    #[tokio::test]
+    async fn test_reader_rejects_excess_miniblock_row_counts() {
+        let batch =
+            arrow_array::record_batch!(("id", UInt64, (0..2048_u64).collect::<Vec<_>>())).unwrap();
+        let fs = FsFixture::default();
+        write_lance_file(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            &fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let mut bytes = fs
+            .object_store
+            .read_one_all(&fs.tmp_path)
+            .await
+            .unwrap()
+            .to_vec();
+        // V2.1 places this column's first mini-block metadata word at byte zero.
+        // The issue's mutation makes its non-final item count exceed the page total.
+        bytes[0] ^= 0xf7;
+        fs.object_store.put(&fs.tmp_path, &bytes).await.unwrap();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let result = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await;
+        let error = match result {
+            Ok(stream) => stream
+                .try_collect::<Vec<_>>()
+                .await
+                .expect_err("excess mini-block row counts must fail the read"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("exceeding items_in_page"),
+            "unexpected message: {error}"
+        );
+    }
+
     /// A corrupt file whose variable-width offsets point outside the value bytes
     /// must fail with a typed error under the default reader configuration
     /// (`validate_on_decode` disabled) instead of materializing values outside

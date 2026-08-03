@@ -4429,6 +4429,60 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::all_valid_first(false)]
+    #[case::nullable_first(true)]
+    #[tokio::test]
+    async fn test_write_blob_batches_with_mixed_nullability(#[case] nulls_first: bool) {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+        ]));
+        let batch = |values: Vec<Option<&[u8]>>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeBinaryArray::from(values))],
+            )
+            .unwrap()
+        };
+
+        // Definition-level semantics come from each batch's validity bitmap. Both
+        // transitions must start a new descriptor page so nulls remain distinct
+        // from valid empty blobs.
+        let all_valid = batch(vec![Some(b"a".as_slice()), Some(b"".as_slice())]);
+        let with_null = batch(vec![Some(b"c".as_slice()), None]);
+        let (batches, expected) = if nulls_first {
+            (
+                vec![with_null, all_valid],
+                vec![Some(b"c".as_slice()), None, Some(b"a"), Some(b"")],
+            )
+        } else {
+            (
+                vec![all_valid, with_null],
+                vec![Some(b"a".as_slice()), Some(b""), Some(b"c"), None],
+            )
+        };
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let dataset = Arc::new(Dataset::write(reader, &test_dir, None).await.unwrap());
+
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1, 2, 3], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), expected.len());
+        for (row_idx, (blob, expected)) in blobs.into_iter().zip(expected).enumerate() {
+            let actual = match blob {
+                Some(blob) => Some(blob.read().await.unwrap()),
+                None => None,
+            };
+            assert_eq!(actual.as_deref(), expected, "row {row_idx}");
+        }
+    }
+
     #[tokio::test]
     pub async fn test_take_blob_id_not_exist() {
         let fixture = BlobTestFixture::new().await;
