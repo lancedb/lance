@@ -6336,7 +6336,7 @@ mod test {
             let values_bytes = (*wide.value_offsets().last().unwrap()
                 - *wide.value_offsets().first().unwrap()) as usize;
             let logical_bytes = batch.num_rows() * std::mem::size_of::<i64>()
-                + wide.value_offsets().len() * std::mem::size_of::<i32>()
+                + std::mem::size_of_val(wide.value_offsets())
                 + values_bytes;
             assert!(
                 logical_bytes <= target_bytes as usize,
