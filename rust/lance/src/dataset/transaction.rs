@@ -2708,6 +2708,16 @@ impl Transaction {
             .collect::<HashSet<_>>();
 
         for index in indices.iter_mut() {
+            // A pure rewrite preserves row ids, so a row-id-domain index's entries remain
+            // valid for the rows it moved. An address-domain index's do not: the addresses
+            // it stores name the fragment the rewrite replaced, and it has no entries at
+            // all for the new one. Claiming coverage would make the scanner skip the
+            // rewritten rows, so leave the new fragments uncovered and let them fall back
+            // to a full scan.
+            if index_results_are_row_addrs(index) {
+                continue;
+            }
+
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
                 value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
             });

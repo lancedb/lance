@@ -1353,6 +1353,94 @@ mod tests {
         assert_eq!(updated.num_rows(), 3);
     }
 
+    /// Regression test for https://github.com/lance-format/lance/issues/8202
+    ///
+    /// An update that leaves the indexed column alone still moves the rows it matched
+    /// into a new fragment. Under stable row ids that is a pure rewrite, so a
+    /// row-id-domain index keeps covering those rows (see
+    /// `test_update_affects_index_fragment_bitmap`). An address-domain index cannot: its
+    /// entries name the fragment the rewrite replaced, so claiming the new fragment made
+    /// the scanner skip the moved rows and drop them from the answer.
+    #[rstest]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter)]
+    #[tokio::test]
+    async fn test_addr_domain_index_after_update_of_other_column(
+        #[case] builtin: BuiltinIndexType,
+        #[case] index_type: IndexType,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col("other", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                index_type,
+                Some("i_idx".to_string()),
+                &ScalarIndexParams::for_builtin(builtin),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Moves one row out of each fragment into a new one, without touching `i`. Both
+        // original fragments survive with a deletion vector.
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i = 1 OR i = 4")
+            .unwrap()
+            .set("other", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let index = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.name == "i_idx")
+            .expect("index must survive the update")
+            .clone();
+        assert_eq!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "an update must not point an address-domain index at the fragment it wrote"
+        );
+
+        // The moved rows are only found if the new fragment falls back to a full scan.
+        for value in [1, 4] {
+            let matched = dataset
+                .scan()
+                .filter(&format!("i = {value}"))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(matched.num_rows(), 1, "row i = {value} was dropped");
+        }
+    }
+
     #[tokio::test]
     async fn test_update_mixed_indexed_unindexed_fragments() {
         let mut dataset = lance_datagen::gen_batch()
