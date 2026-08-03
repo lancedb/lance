@@ -16,7 +16,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    opendal_retry::store_with_retry,
+    opendal_retry::{FinalizationRetry, store_with_retry},
     throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
 };
 use lance_core::error::{Error, Result};
@@ -51,7 +51,10 @@ impl GcsStoreProvider {
         let operator = Operator::from_iter::<Gcs>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create GCS operator: {:?}", e)))?;
 
-        Ok(Arc::new(store_with_retry(operator)) as Arc<dyn OSObjectStore>)
+        Ok(
+            Arc::new(store_with_retry(operator, FinalizationRetry::Retry))
+                as Arc<dyn OSObjectStore>,
+        )
     }
 
     async fn build_google_cloud_store(

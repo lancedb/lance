@@ -9,7 +9,8 @@ use url::Url;
 
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions, opendal_retry::store_with_retry,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    opendal_retry::{FinalizationRetry, store_with_retry},
 };
 use lance_core::error::{Error, Result};
 
@@ -175,7 +176,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         })?;
 
         // Wrap as object_store::ObjectStore via OpendalStore bridge
-        let opendal_store = Arc::new(store_with_retry(operator));
+        let opendal_store = Arc::new(store_with_retry(operator, FinalizationRetry::OneShot));
 
         Ok(ObjectStore {
             scheme: "goosefs".to_string(),

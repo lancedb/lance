@@ -9,7 +9,8 @@ use url::Url;
 
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions, opendal_retry::store_with_retry,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    opendal_retry::{FinalizationRetry, store_with_retry},
 };
 use lance_core::error::{Error, Result};
 
@@ -81,7 +82,7 @@ impl ObjectStoreProvider for TencentStoreProvider {
         let operator = Operator::from_iter::<Cos>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create COS operator: {:?}", e)))?;
 
-        let opendal_store = Arc::new(store_with_retry(operator));
+        let opendal_store = Arc::new(store_with_retry(operator, FinalizationRetry::Retry));
 
         let mut url = base_path;
         if !url.path().ends_with('/') {

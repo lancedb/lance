@@ -21,7 +21,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    opendal_retry::store_with_retry,
+    opendal_retry::{FinalizationRetry, store_with_retry},
     throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
 };
 use lance_core::error::{Error, Result};
@@ -154,7 +154,10 @@ impl AzureBlobStoreProvider {
         storage_options: &StorageOptions,
     ) -> Result<Arc<dyn OSObjectStore>> {
         let operator = Self::build_opendal_operator(base_path, storage_options)?;
-        Ok(Arc::new(store_with_retry(operator)))
+        Ok(Arc::new(store_with_retry(
+            operator,
+            FinalizationRetry::Retry,
+        )))
     }
 
     async fn build_microsoft_azure_store(

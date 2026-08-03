@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use object_store_opendal::OpendalStore;
 use opendal::raw::{
-    Layer, OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
-    RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo, Servicer, oio,
+    BoxedFuture, Layer, OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat,
+    OpWrite, RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo, Servicer, oio,
 };
 use opendal::{Buffer, Capability, Metadata, OperationContext, Operator, Result};
 use rand::Rng;
@@ -22,19 +22,32 @@ fn max_retries() -> usize {
     })
 }
 
-async fn retry_write<W>(writer: &mut W, body: Buffer) -> Result<()>
+#[derive(Clone, Copy, Debug)]
+pub enum FinalizationRetry {
+    /// The writer preserves failed finalization work so `close` can be re-entered.
+    Retry,
+    /// The writer consumes or deletes staged state during `close`, even on failure.
+    OneShot,
+}
+
+async fn retry_replay_safe_operation<T, W>(
+    writer: &mut W,
+    operation_name: &str,
+    mut operation: impl for<'a> FnMut(&'a mut W) -> BoxedFuture<'a, Result<T>>,
+) -> Result<T>
 where
     W: oio::Write,
 {
     let mut retries = 0;
     loop {
-        match writer.write(body.clone()).await {
-            Ok(()) => return Ok(()),
+        match operation(writer).await {
+            Ok(value) => return Ok(value),
             Err(error) if error.is_temporary() && retries < max_retries() => {
                 retries += 1;
                 let delay = Duration::from_millis(rand::rng().random_range(2_000..8_000));
                 log::warn!(
-                    "Retrying OpenDAL write after temporary error (attempt {}): {:?}",
+                    "Retrying OpenDAL {} after temporary error (attempt {}): {:?}",
+                    operation_name,
                     retries,
                     error
                 );
@@ -48,17 +61,27 @@ where
 #[derive(Debug)]
 struct RetryWriter<W> {
     inner: W,
+    finalization_retry: FinalizationRetry,
 }
 
 impl<W: oio::Write> oio::Write for RetryWriter<W> {
     async fn write(&mut self, body: Buffer) -> Result<()> {
-        retry_write(&mut self.inner, body).await
+        retry_replay_safe_operation(&mut self.inner, "write", move |writer| {
+            Box::pin(writer.write(body.clone()))
+        })
+        .await
     }
 
     async fn close(&mut self) -> Result<Metadata> {
-        // Finalization can consume staged state before returning an error, so it is not
-        // replay-safe.
-        self.inner.close().await
+        match self.finalization_retry {
+            FinalizationRetry::Retry => {
+                retry_replay_safe_operation(&mut self.inner, "close", |writer| {
+                    Box::pin(writer.close())
+                })
+                .await
+            }
+            FinalizationRetry::OneShot => self.inner.close().await,
+        }
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -70,6 +93,7 @@ impl<W: oio::Write> oio::Write for RetryWriter<W> {
 #[derive(Clone, Debug)]
 struct WriterRetryService {
     inner: Servicer,
+    finalization_retry: FinalizationRetry,
 }
 
 impl Service for WriterRetryService {
@@ -107,6 +131,7 @@ impl Service for WriterRetryService {
     fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
         Ok(RetryWriter {
             inner: self.inner.write(ctx, path, args)?,
+            finalization_retry: self.finalization_retry,
         })
     }
 
@@ -150,19 +175,24 @@ impl Service for WriterRetryService {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct WriterRetryLayer;
+struct WriterRetryLayer {
+    finalization_retry: FinalizationRetry,
+}
 
 impl Layer for WriterRetryLayer {
     fn apply_service(&self, inner: Servicer) -> Servicer {
-        Arc::new(WriterRetryService { inner })
+        Arc::new(WriterRetryService {
+            inner,
+            finalization_retry: self.finalization_retry,
+        })
     }
 }
 
-/// Install write retries beneath OpenDAL's writer so a retry reuses the same
-/// writer state and buffer instead of allocating another cloud multipart part.
-/// Other operations remain unwrapped so they report throttle feedback to AIMD.
-pub fn store_with_retry(operator: Operator) -> OpendalStore {
-    OpendalStore::new(operator.layer(WriterRetryLayer))
+/// Install retries beneath OpenDAL's writer so a retry reuses provider state
+/// instead of allocating another cloud multipart part. Other operations remain
+/// unwrapped so they report throttle feedback to AIMD.
+pub fn store_with_retry(operator: Operator, finalization_retry: FinalizationRetry) -> OpendalStore {
+    OpendalStore::new(operator.layer(WriterRetryLayer { finalization_retry }))
 }
 
 #[cfg(test)]
@@ -347,6 +377,51 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DeferredPartWriter {
+        attempts: Arc<AtomicUsize>,
+        part_numbers: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl oio::MultipartWrite for DeferredPartWriter {
+        async fn write_once(&self, _: u64, _: Buffer) -> Result<Metadata> {
+            Ok(Metadata::new(EntryMode::FILE))
+        }
+
+        async fn initiate_part(&self) -> Result<String> {
+            Ok("upload".to_string())
+        }
+
+        async fn write_part(
+            &self,
+            _: &str,
+            part_number: usize,
+            _: u64,
+            _: Buffer,
+        ) -> Result<oio::MultipartPart> {
+            self.part_numbers.lock().unwrap().push(part_number);
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(
+                    Error::new(ErrorKind::Unexpected, "connection reset by peer").set_temporary(),
+                );
+            }
+            Ok(oio::MultipartPart {
+                part_number,
+                etag: format!("part-{part_number}"),
+                checksum: None,
+                size: None,
+            })
+        }
+
+        async fn complete_part(&self, _: &str, _: &[oio::MultipartPart]) -> Result<Metadata> {
+            Ok(Metadata::new(EntryMode::FILE))
+        }
+
+        async fn abort_part(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_retry_reuses_opendal_writer_and_body() {
         let builder = TransientWriteBuilder::default();
@@ -354,7 +429,7 @@ mod tests {
         let writers_created = Arc::clone(&builder.writers_created);
         let bodies = Arc::clone(&builder.bodies);
         let operator = Operator::new(builder).unwrap();
-        let store = store_with_retry(operator);
+        let store = store_with_retry(operator, FinalizationRetry::Retry);
 
         let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
         upload
@@ -379,7 +454,7 @@ mod tests {
         let builder = TransientWriteBuilder::default();
         let stat_attempts = Arc::clone(&builder.stat_attempts);
         let operator = Operator::new(builder).unwrap();
-        let store = store_with_retry(operator);
+        let store = store_with_retry(operator, FinalizationRetry::Retry);
 
         let error = store.head(&Path::from("object")).await.unwrap_err();
 
@@ -398,6 +473,7 @@ mod tests {
                 abort_attempts: Arc::new(AtomicUsize::new(0)),
                 published_size: Arc::clone(&published_size),
             },
+            finalization_retry: FinalizationRetry::OneShot,
         };
         writer.write(Buffer::from("payload")).await.unwrap();
 
@@ -419,6 +495,7 @@ mod tests {
                 abort_attempts: Arc::clone(&abort_attempts),
                 published_size: Arc::new(AtomicUsize::new(usize::MAX)),
             },
+            finalization_retry: FinalizationRetry::OneShot,
         };
 
         let error = writer.abort().await.unwrap_err();
@@ -426,5 +503,32 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Unexpected);
         assert!(error.to_string().contains("transport closed"));
         assert_eq!(abort_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_close_retries_preserved_multipart_task() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let part_numbers = Arc::new(Mutex::new(Vec::new()));
+        let inner = oio::MultipartWriter::new(
+            opendal::Executor::default(),
+            DeferredPartWriter {
+                attempts: Arc::clone(&attempts),
+                part_numbers: Arc::clone(&part_numbers),
+            },
+            8,
+        );
+        let mut writer = RetryWriter {
+            inner,
+            finalization_retry: FinalizationRetry::Retry,
+        };
+
+        writer.write(Buffer::from("part-0")).await.unwrap();
+        writer.write(Buffer::from("part-1")).await.unwrap();
+        writer.close().await.unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let mut observed_part_numbers = part_numbers.lock().unwrap().clone();
+        observed_part_numbers.sort_unstable();
+        assert_eq!(observed_part_numbers, [0, 0, 1]);
     }
 }

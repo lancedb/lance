@@ -10,7 +10,7 @@ use opendal::{Operator, services::Oss};
 use url::Url;
 
 use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
-use crate::object_store::opendal_retry::store_with_retry;
+use crate::object_store::opendal_retry::{FinalizationRetry, store_with_retry};
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -98,7 +98,7 @@ impl OssStoreProvider {
         let operator = Operator::from_iter::<Oss>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create OSS operator: {:?}", e)))?;
 
-        Ok(store_with_retry(operator))
+        Ok(store_with_retry(operator, FinalizationRetry::Retry))
     }
 }
 
