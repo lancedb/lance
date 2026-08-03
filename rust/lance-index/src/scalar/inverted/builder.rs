@@ -591,12 +591,10 @@ impl InvertedIndexBuilder {
                 self.params.block_size.to_string(),
             ),
         ]);
-        if let Some(list_document_mode) = self.list_document_mode.persisted_value() {
-            metadata.insert(
-                LIST_DOCUMENT_MODE_KEY.to_owned(),
-                list_document_mode.to_owned(),
-            );
-        }
+        metadata.insert(
+            LIST_DOCUMENT_MODE_KEY.to_owned(),
+            self.list_document_mode.persisted_value().to_owned(),
+        );
 
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
             metadata.insert(
@@ -662,12 +660,10 @@ impl InvertedIndexBuilder {
                 self.params.block_size.to_string(),
             ),
         ]);
-        if let Some(list_document_mode) = self.list_document_mode.persisted_value() {
-            metadata.insert(
-                LIST_DOCUMENT_MODE_KEY.to_owned(),
-                list_document_mode.to_owned(),
-            );
-        }
+        metadata.insert(
+            LIST_DOCUMENT_MODE_KEY.to_owned(),
+            self.list_document_mode.persisted_value().to_owned(),
+        );
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
             metadata.insert(
                 POSITIONS_LAYOUT_KEY.to_owned(),

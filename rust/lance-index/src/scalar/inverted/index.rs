@@ -188,11 +188,11 @@ impl ListDocumentMode {
         if self == other { self } else { Self::Ambiguous }
     }
 
-    pub(super) fn persisted_value(self) -> Option<&'static str> {
+    pub(super) fn persisted_value(self) -> &'static str {
         match self {
-            Self::Elements => Some("elements"),
-            Self::Row => Some("row"),
-            Self::Ambiguous => None,
+            Self::Elements => "elements",
+            Self::Row => "row",
+            Self::Ambiguous => "ambiguous",
         }
     }
 }
@@ -214,8 +214,9 @@ impl FromStr for ListDocumentMode {
         match value {
             "elements" => Ok(Self::Elements),
             "row" => Ok(Self::Row),
+            "ambiguous" => Ok(Self::Ambiguous),
             other => Err(Error::index(format!(
-                "unsupported list document mode {other:?}; expected \"elements\" or \"row\""
+                "unsupported list document mode {other:?}; expected \"elements\", \"row\", or \"ambiguous\""
             ))),
         }
     }
@@ -876,13 +877,6 @@ impl InvertedIndex {
 
     pub fn params(&self) -> &InvertedIndexParams {
         &self.params
-    }
-
-    fn known_list_document_mode(&self) -> ListDocumentMode {
-        self.list_document_mode
-            .get()
-            .copied()
-            .unwrap_or(ListDocumentMode::Ambiguous)
     }
 
     /// Returns the resolved string-list document representation.
@@ -2376,8 +2370,9 @@ impl ScalarIndex for InvertedIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
+        let list_document_mode = self.list_document_mode().await?;
         let files = self
-            .to_builder(self.known_list_document_mode())
+            .to_builder(list_document_mode)
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
@@ -8842,9 +8837,20 @@ mod tests {
         store: Arc<LanceIndexStore>,
         row_ids: &[u64],
     ) -> Arc<InvertedIndex> {
-        let mut partition = InnerBuilder::new(0, false, TokenSetFormat::default());
+        let format_version = InvertedListFormatVersion::V1;
+        let mut partition = InnerBuilder::new_with_format_version(
+            0,
+            false,
+            TokenSetFormat::default(),
+            format_version,
+        );
         partition.tokens.add("test".to_owned());
-        partition.posting_lists.push(PostingListBuilder::new(false));
+        partition
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                false,
+                format_version.posting_tail_codec(),
+            ));
         for (doc_id, row_id) in row_ids.iter().copied().enumerate() {
             partition.posting_lists[0]
                 .add(u32::try_from(doc_id).unwrap(), PositionRecorder::Count(1));
@@ -8858,7 +8864,12 @@ mod tests {
             false,
         )
         .await;
-        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        write_test_metadata(
+            &store,
+            vec![0],
+            InvertedIndexParams::default().format_version(format_version),
+        )
+        .await;
 
         InvertedIndex::load(store, None, &LanceCache::no_cache())
             .await
@@ -13369,6 +13380,53 @@ mod tests {
             index.list_document_mode().await.unwrap(),
             ListDocumentMode::Elements
         );
+    }
+
+    #[rstest]
+    #[case::unresolved_elements(&[100, 100], false, ListDocumentMode::Elements)]
+    #[case::already_resolved_elements(&[100, 100], true, ListDocumentMode::Elements)]
+    #[case::unresolved_ambiguous(&[100], false, ListDocumentMode::Ambiguous)]
+    #[tokio::test]
+    async fn test_remap_preserves_unmarked_document_mode(
+        #[case] row_ids: &[u64],
+        #[case] resolve_before_remap: bool,
+        #[case] expected_mode: ListDocumentMode,
+    ) {
+        let src_dir = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let index = load_unmarked_index_with_row_ids(src_store, row_ids).await;
+        assert!(index.list_document_mode.get().is_none());
+        if resolve_before_remap {
+            assert_eq!(index.list_document_mode().await.unwrap(), expected_mode);
+        }
+
+        index
+            .remap(
+                &RowAddrRemap::direct(HashMap::from([(100, Some(101))])),
+                dest_store.as_ref(),
+            )
+            .await
+            .unwrap();
+
+        let remapped = InvertedIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(
+            remapped.list_document_mode.get(),
+            Some(&expected_mode),
+            "remap must persist the inferred historical document mode"
+        );
+        assert_eq!(remapped.list_document_mode().await.unwrap(), expected_mode);
     }
 
     #[tokio::test]
