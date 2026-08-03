@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::Schema;
@@ -264,6 +267,7 @@ pub struct FullSchemaMergeInsertExec {
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
+    source_skipped_duplicates: Arc<AtomicU64>,
     /// Whether the ON columns match the schema's unenforced primary key.
     /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
     is_primary_key: bool,
@@ -274,6 +278,7 @@ impl FullSchemaMergeInsertExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
+        source_skipped_duplicates: Arc<AtomicU64>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -307,6 +312,7 @@ impl FullSchemaMergeInsertExec {
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
             inserted_rows_filter: Arc::new(Mutex::new(None)),
+            source_skipped_duplicates,
             is_primary_key,
         })
     }
@@ -877,6 +883,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
             inserted_rows_filter: self.inserted_rows_filter.clone(),
+            source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             is_primary_key: self.is_primary_key,
         }))
     }
@@ -974,6 +981,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
+        let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -1102,7 +1110,15 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .add(total_files_written);
 
                 // Get the final stats from the shared state
-                let stats = MergeStats::from(&merge_state.metrics);
+                let mut stats = MergeStats::from(&merge_state.metrics);
+                stats.num_skipped_duplicates = stats
+                    .num_skipped_duplicates
+                    .checked_add(source_skipped_duplicates.load(Ordering::Relaxed))
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "merge insert skipped duplicate count overflowed u64".to_string(),
+                        )
+                    })?;
 
                 if let Ok(mut transaction_guard) = transaction_holder.lock() {
                     transaction_guard.replace(transaction);

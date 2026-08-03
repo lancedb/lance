@@ -35,7 +35,6 @@ const MERGE_ACTION_COLUMN: &str = "__action";
 // to determine which side each row came from.  The sentinel is stripped by
 // `prepare_stream_schema` and never written to the dataset.
 pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
-const MERGE_SOURCE_ORDER_COLUMN: &str = "__merge_source_order";
 
 pub mod inserted_rows;
 
@@ -139,7 +138,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -788,29 +787,36 @@ fn one_shot_provider(stream: SendableRecordBatchStream) -> Result<Arc<dyn TableP
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
 }
 
-/// Scans source partitions sequentially and adds a dense row ordinal.
+/// Scans source partitions sequentially and removes duplicate non-null keys.
 ///
-/// DataFusion joins do not preserve input order. The ordinal lets the v2 merge
-/// restore source order before applying `FirstSeen` deduplication without
-/// buffering the source in memory.
+/// Deduplicating before the join fixes the `FirstSeen` winner at the source
+/// boundary, before DataFusion can reorder rows. The tracker retains only keys,
+/// so this stays streaming without buffering source batches.
 #[derive(Debug)]
-struct OrderedSourcePartitionStream {
+struct DeduplicatingSourcePartitionStream {
     input: Arc<dyn ExecutionPlan>,
     schema: Arc<Schema>,
+    on_columns: Vec<String>,
+    skipped_duplicates: Arc<AtomicU64>,
 }
 
-impl OrderedSourcePartitionStream {
-    fn try_new(input: Arc<dyn ExecutionPlan>) -> datafusion::common::Result<Self> {
-        let schema = Arc::new(input.schema().as_ref().try_with_column(Field::new(
-            MERGE_SOURCE_ORDER_COLUMN,
-            DataType::UInt64,
-            false,
-        ))?);
-        Ok(Self { input, schema })
+impl DeduplicatingSourcePartitionStream {
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        on_columns: Vec<String>,
+        skipped_duplicates: Arc<AtomicU64>,
+    ) -> Self {
+        let schema = input.schema();
+        Self {
+            input,
+            schema,
+            on_columns,
+            skipped_duplicates,
+        }
     }
 }
 
-impl PartitionStream for OrderedSourcePartitionStream {
+impl PartitionStream for DeduplicatingSourcePartitionStream {
     fn schema(&self) -> &Arc<Schema> {
         &self.schema
     }
@@ -825,31 +831,49 @@ impl PartitionStream for OrderedSourcePartitionStream {
             .map(move |partition| input.execute(partition, context.clone()))
             .try_flatten();
 
-        let mut next_row = 0_u64;
-        let source_order_field = Field::new(MERGE_SOURCE_ORDER_COLUMN, DataType::UInt64, false);
-        let ordered = partition_streams.map(move |batch| {
+        let mut tracker = InsertedKeyTracker::default();
+        let on_columns = self.on_columns.clone();
+        let skipped_duplicates = self.skipped_duplicates.clone();
+        skipped_duplicates.store(0, Ordering::Relaxed);
+        let deduplicated = partition_streams.map(move |batch| {
             let batch = batch?;
-            let num_rows = u64::try_from(batch.num_rows()).map_err(|_| {
-                DataFusionError::Execution(format!(
-                    "source batch row count {} does not fit in u64",
-                    batch.num_rows()
-                ))
-            })?;
-            let end_row = next_row.checked_add(num_rows).ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "source row ordinal overflow at row {} with batch size {}",
-                    next_row,
-                    batch.num_rows()
-                ))
-            })?;
-            let source_order = UInt64Array::from((next_row..end_row).collect::<Vec<_>>());
-            next_row = end_row;
-            batch
-                .try_with_column(source_order_field.clone(), Arc::new(source_order))
-                .map_err(DataFusionError::from)
+            let mut keep = Vec::with_capacity(batch.num_rows());
+            let mut num_skipped = 0_u64;
+            for row_idx in 0..batch.num_rows() {
+                let is_first = tracker.insert(&batch, row_idx, &on_columns)?;
+                keep.push(is_first);
+                if !is_first {
+                    num_skipped = num_skipped.checked_add(1).ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "source duplicate count overflowed u64".to_string(),
+                        )
+                    })?;
+                }
+            }
+
+            skipped_duplicates
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(num_skipped)
+                })
+                .map_err(|current| {
+                    DataFusionError::Execution(format!(
+                        "source duplicate count overflow at {} with batch count {}",
+                        current, num_skipped
+                    ))
+                })?;
+
+            if num_skipped == 0 {
+                Ok(batch)
+            } else {
+                arrow::compute::filter_record_batch(&batch, &BooleanArray::from(keep))
+                    .map_err(DataFusionError::from)
+            }
         });
 
-        Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), ordered))
+        Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            deduplicated,
+        ))
     }
 }
 
@@ -1964,19 +1988,24 @@ impl MergeInsertJob {
             .collect::<Vec<_>>();
         let on_cols_refs = on_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         // FirstSeen must observe the caller's source order even though the join can
-        // reorder batches. Scan source partitions sequentially and attach a row
-        // ordinal that is sorted after the join. Other modes plan directly against
-        // the provider so its statistics reach the optimizer.
-        let preserve_source_order =
+        // reorder batches. Deduplicating source partitions sequentially before
+        // the join fixes the winner at that contract boundary. Other modes plan
+        // directly against the provider so its statistics reach the optimizer.
+        let deduplicate_source =
             self.params.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen;
-        let source_df = if preserve_source_order {
+        let source_skipped_duplicates = Arc::new(AtomicU64::new(0));
+        let source_df = if deduplicate_source {
             let source_plan = provider.scan(&session_ctx.state(), None, &[], None).await?;
-            let ordered_partition = Arc::new(OrderedSourcePartitionStream::try_new(source_plan)?);
-            let ordered_provider = Arc::new(StreamingTable::try_new(
-                ordered_partition.schema().clone(),
-                vec![ordered_partition],
+            let deduplicated_partition = Arc::new(DeduplicatingSourcePartitionStream::new(
+                source_plan,
+                self.params.on.clone(),
+                source_skipped_duplicates.clone(),
+            ));
+            let deduplicated_provider = Arc::new(StreamingTable::try_new(
+                deduplicated_partition.schema().clone(),
+                vec![deduplicated_partition],
             )?);
-            session_ctx.read_table(ordered_provider)?
+            session_ctx.read_table(deduplicated_provider)?
         } else {
             session_ctx.read_table(provider)?
         };
@@ -2033,18 +2062,13 @@ impl MergeInsertJob {
             }
         }
 
-        if preserve_source_order {
-            df = df.sort(vec![
-                logical_expr::col(MERGE_SOURCE_ORDER_COLUMN).sort(true, false),
-            ])?;
-        }
-
         let (session_state, logical_plan) = df.into_parts();
 
         let write_node = logical_plan::MergeInsertWriteNode::new(
             logical_plan,
             self.dataset.clone(),
             self.params.clone(),
+            source_skipped_duplicates,
         );
         let logical_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(write_node),
