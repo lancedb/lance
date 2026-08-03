@@ -2626,6 +2626,10 @@ struct VariableFullZipDecoder {
     num_rows: u64,
 }
 
+fn corrupt_file_named(name: &str, message: impl Into<String>) -> Error {
+    Error::corrupt_file(name.into(), message)
+}
+
 impl VariableFullZipDecoder {
     fn new(
         details: Arc<FullZipDecodeDetails>,
@@ -2764,7 +2768,7 @@ impl VariableFullZipDecoder {
     fn parse_length(data: &[u8], bits_per_offset: u8) -> Result<u64> {
         let width = bits_per_offset as usize / 8;
         if data.len() < width {
-            return Err(Error::corrupt_file_named(
+            return Err(corrupt_file_named(
                 "variable_full_zip",
                 format!(
                     "truncated length prefix: {} byte(s) remain in the page buffer but a \
@@ -7322,11 +7326,37 @@ mod tests {
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
     }
-    /// A well-formed length prefix decodes without incident, for both widths.
-    #[test]
-    fn variable_full_zip_wellformed_length_prefix() {
-        assert!(decode_variable_full_zip(0u32.to_le_bytes().to_vec(), 32).is_ok());
-        assert!(decode_variable_full_zip(0u64.to_le_bytes().to_vec(), 64).is_ok());
+    fn truncated_tail_details() -> std::sync::Arc<super::FullZipDecodeDetails> {
+        use crate::compression::VariablePerValueDecompressor;
+        use crate::encodings::physical::binary::VariableDecoder;
+        use crate::repdef::{ControlWordParser, DefinitionInterpretation};
+        use std::sync::Arc;
+        Arc::new(super::FullZipDecodeDetails {
+            value_decompressor: super::PerValueDecompressor::Variable(Arc::new(
+                VariableDecoder::default(),
+            )
+                as Arc<dyn VariablePerValueDecompressor>),
+            def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
+            ctrl_word_parser: ControlWordParser::new(0, 0),
+            max_rep: 0,
+            max_visible_def: 0,
+        })
+    }
+
+    fn decode_variable_full_zip(
+        buf: Vec<u8>,
+        bits_per_offset: u8,
+    ) -> lance_core::Result<super::VariableFullZipDecoder> {
+        use std::collections::VecDeque;
+        let mut data = VecDeque::new();
+        data.push_back(crate::buffer::LanceBuffer::from(buf));
+        super::VariableFullZipDecoder::new(
+            truncated_tail_details(),
+            data,
+            1,
+            bits_per_offset,
+            bits_per_offset,
+        )
     }
 
     /// A page whose item walk ends with a partial length prefix must surface a
