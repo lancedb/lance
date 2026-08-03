@@ -451,7 +451,8 @@ pub struct FileReaderOptions {
     /// Default: 8MB (DEFAULT_READ_CHUNK_SIZE)
     pub read_chunk_size: u64,
     /// If set, the reader will produce batches whose total size in bytes
-    /// is approximately this value, overriding the row-based `batch_size`.
+    /// is approximately this value. The row-based `batch_size` remains an
+    /// independent upper bound, and the limit reached first determines the batch size.
     ///
     /// This can be set at the dataset level (via `ReadParams::file_reader_options`)
     /// to provide a default for all scans, or at the scanner level (via

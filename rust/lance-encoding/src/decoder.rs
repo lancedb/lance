@@ -1850,7 +1850,8 @@ pub struct StructuralBatchDecodeStream {
     // - false: run `into_batch` inline, which avoids Tokio scheduling overhead and is
     //   typically better for point lookups / small takes.
     spawn_batch_decode_tasks: bool,
-    /// If set, target this many bytes per batch instead of `rows_per_batch` rows.
+    /// If set, target this many bytes per batch while retaining `rows_per_batch`
+    /// as an independent upper bound.
     batch_size_bytes: Option<u64>,
     /// Schema-based estimate of bytes per row, computed once at construction.
     /// Only meaningful when `batch_size_bytes` is `Some`.
@@ -1938,6 +1939,7 @@ impl StructuralBatchDecodeStream {
             return Ok(None);
         }
 
+        let row_limit = self.rows_remaining.min(self.rows_per_batch as u64);
         let mut to_take = if let Some(batch_size_bytes) = self.batch_size_bytes {
             let feedback = self.bytes_per_row_feedback.load(Ordering::Relaxed);
             let bpr = if feedback > 0 {
@@ -1946,9 +1948,9 @@ impl StructuralBatchDecodeStream {
                 self.schema_bytes_per_row
             };
             let rows = (batch_size_bytes as f64 / bpr) as u64;
-            self.rows_remaining.min(rows.max(1))
+            row_limit.min(rows.max(1))
         } else {
-            self.rows_remaining.min(self.rows_per_batch as u64)
+            row_limit
         };
         self.rows_remaining -= to_take;
 
@@ -2112,7 +2114,8 @@ pub struct SchedulerDecoderConfig {
     pub cache: Arc<LanceCache>,
     /// Decoder configuration
     pub decoder_config: DecoderConfig,
-    /// If set, target this many bytes per batch instead of using `batch_size` rows.
+    /// If set, target this many bytes per batch while retaining `batch_size` as
+    /// an independent row-count upper bound.
     ///
     /// Only supported for v2.1+ (structural) files. For v2.0 files this
     /// option is ignored and a warning is logged.
@@ -3397,6 +3400,29 @@ mod tests {
                 batch.num_rows()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_byte_sized_batches_respect_row_limit() {
+        use arrow_array::Int32Array;
+
+        let num_rows: i32 = 1000;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let input_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+
+        // The byte limit can hold every row, so the 100-row limit must win.
+        let batches =
+            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 100, Some(10_000)).await;
+        assert_eq!(batches.len(), 10);
+        assert!(batches.iter().all(|batch| batch.num_rows() == 100));
     }
 
     #[tokio::test]
