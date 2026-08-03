@@ -311,6 +311,11 @@ pub struct IndexLookup {
 
 const MAP_INDEX_CANDIDATES_MEMORY_CONSUMER: &str = "MapIndexExecCandidates";
 
+/// Conservative upper bound on the [`DeepSizeOf`] growth from inserting one
+/// address: a new B-tree entry, Roaring container metadata, and its payload.
+/// The reservation is shrunk to the measured size after each input batch.
+const ROW_ADDR_INSERT_RESERVATION_BYTES: usize = 256;
+
 #[derive(Debug)]
 struct DistinctRowAddrs {
     emitted: RowAddrTreeMap,
@@ -326,19 +331,53 @@ impl DistinctRowAddrs {
     }
 
     fn retain_unseen(&mut self, row_addrs: &UInt64Array) -> datafusion::error::Result<UInt64Array> {
-        let unseen: UInt64Array = row_addrs
+        let initial_reservation_size = self.reservation.size();
+        let unaccounted_candidates = row_addrs
             .values()
             .iter()
-            .copied()
-            .filter(|row_addr| self.emitted.insert(*row_addr))
-            .collect();
-        if let Err(error) = self.reservation.try_resize(self.emitted.deep_size_of()) {
-            for row_addr in unseen.values() {
-                self.emitted.remove(*row_addr);
+            .filter(|row_addr| !self.emitted.contains(**row_addr))
+            .count();
+        let provisional_size = unaccounted_candidates
+            .checked_mul(ROW_ADDR_INSERT_RESERVATION_BYTES)
+            .and_then(|additional| initial_reservation_size.checked_add(additional))
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::ResourcesExhausted(format!(
+                    "Candidate memory reservation overflowed for {MAP_INDEX_CANDIDATES_MEMORY_CONSUMER}"
+                ))
+            })?;
+        self.reservation.try_resize(provisional_size)?;
+
+        // Allocate output storage only after the complete retained-state
+        // reservation succeeds.
+        let mut unseen = Vec::with_capacity(unaccounted_candidates);
+        for row_addr in row_addrs.values() {
+            if self.emitted.insert(*row_addr) {
+                unseen.push(*row_addr);
             }
-            return Err(error);
         }
-        Ok(unseen)
+
+        let measured_size = self.emitted.deep_size_of();
+        if measured_size > provisional_size {
+            self.rollback_batch(&unseen, initial_reservation_size);
+            return Err(datafusion::error::DataFusionError::ResourcesExhausted(
+                format!(
+                    "MapIndexExecCandidates batch exceeded its {ROW_ADDR_INSERT_RESERVATION_BYTES}-byte per-candidate reservation"
+                ),
+            ));
+        }
+        self.reservation.resize(measured_size);
+        Ok(UInt64Array::from(unseen))
+    }
+
+    fn rollback_batch(&mut self, unseen: &[u64], reservation_size: usize) {
+        for row_addr in unseen {
+            let is_removed = self.emitted.remove(*row_addr);
+            debug_assert!(
+                is_removed,
+                "a newly inserted MapIndexExec candidate must be removable"
+            );
+        }
+        self.reservation.resize(reservation_size);
     }
 }
 
@@ -964,7 +1003,10 @@ mod tests {
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
-    use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
+    use lance_core::{
+        deepsize::DeepSizeOf,
+        utils::{address::RowAddress, tempfile::TempStrDir},
+    };
     use lance_datagen::gen_batch;
     use lance_index::{
         IndexType,
@@ -973,7 +1015,7 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
-    use lance_select::{RowAddrTreeMap, result::IndexExprResultWireFormat};
+    use lance_select::{RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat};
 
     use crate::{
         Dataset,
@@ -983,7 +1025,8 @@ mod tests {
     };
 
     use super::{
-        DistinctRowAddrs, MAP_INDEX_CANDIDATES_MEMORY_CONSUMER, MapIndexExec, ScalarIndexExec,
+        DistinctRowAddrs, MAP_INDEX_CANDIDATES_MEMORY_CONSUMER, MapIndexExec,
+        ROW_ADDR_INSERT_RESERVATION_BYTES, ScalarIndexExec,
     };
 
     struct TestFixture {
@@ -1024,20 +1067,48 @@ mod tests {
 
     #[test]
     fn test_map_index_candidates_respect_memory_pool() {
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+        let mut first_candidate = RowAddrTreeMap::new();
+        first_candidate.insert(1);
+        let first_candidate_size = first_candidate.deep_size_of();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(
+            ROW_ADDR_INSERT_RESERVATION_BYTES + first_candidate_size,
+        ));
         let reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER).register(&pool);
         let mut candidates = DistinctRowAddrs::new(reservation);
 
-        let error = candidates
+        let first = candidates
             .retain_unseen(&UInt64Array::from(vec![1]))
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(first.values(), &[1]);
+        assert_eq!(pool.reserved(), first_candidate_size);
 
+        let second = candidates
+            .retain_unseen(&UInt64Array::from(vec![2]))
+            .unwrap();
+        assert_eq!(second.values(), &[2]);
+        let retained_size = pool.reserved();
+        assert!(retained_size > first_candidate_size);
+
+        let error = candidates
+            .retain_unseen(&UInt64Array::from(vec![3]))
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
         assert!(
             error
                 .to_string()
                 .contains(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
         );
+        assert!(candidates.emitted.contains(1));
+        assert!(candidates.emitted.contains(2));
+        assert!(!candidates.emitted.contains(3));
+        assert_eq!(pool.reserved(), retained_size);
+
+        let duplicate = candidates
+            .retain_unseen(&UInt64Array::from(vec![1, 2]))
+            .unwrap();
+        assert!(duplicate.values().is_empty());
+
+        drop(candidates);
         assert_eq!(pool.reserved(), 0);
     }
 
