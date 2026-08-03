@@ -18,7 +18,6 @@ use rayon::prelude::*;
 use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
-use std::iter;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -128,7 +127,7 @@ impl HnswBuildParams {
         self
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.max_level == 0 {
             return Err(Error::invalid_input(format!(
                 "HnswBuildParams::max_level must be greater than 0, got {}",
@@ -216,7 +215,10 @@ impl DeepSizeOf for HnswCore {
 
 impl HnswCore {
     fn max_level(&self) -> u16 {
-        self.level_count.len() as u16
+        self.level_count
+            .iter()
+            .rposition(|count| *count != 0)
+            .map_or(0, |level| level + 1) as u16
     }
 
     fn num_nodes(&self, level: usize) -> usize {
@@ -644,19 +646,18 @@ impl HNSW {
 
     /// Returns the metadata of this [`HNSW`].
     pub fn metadata(&self) -> HnswMetadata {
-        // calculate the offsets of each level,
-        // start from 0
-        let level_offsets = self
-            .inner
-            .level_count
-            .iter()
-            .chain(iter::once(&0))
-            .scan(0, |state, x| {
-                let start = *state;
-                *state += *x;
-                Some(start)
-            })
-            .collect();
+        // Version-1 readers use params.max_level as the number of level
+        // batches and index them directly. Preserve that configured shape,
+        // padding levels above the sampled graph height with empty ranges.
+        let configured_levels = self.inner.params.max_level as usize;
+        let mut level_offsets = Vec::with_capacity(configured_levels + 1);
+        let mut offset = 0;
+        level_offsets.push(0);
+        for level in 0..configured_levels {
+            let level_count = self.inner.level_count.get(level).copied().unwrap_or(0);
+            offset += level_count;
+            level_offsets.push(offset);
+        }
 
         HnswMetadata {
             entry_point: self.inner.entry_point,
@@ -2291,6 +2292,37 @@ mod tests {
                 "serialized ids do not match level {level}",
             );
             assert_eq!(builder.num_nodes(level), expected_ids.len());
+        }
+    }
+
+    /// Version-1 readers use the configured max level to index serialized
+    /// level batches directly. Empty trailing ranges keep that persisted
+    /// shape while current readers use only the sampled, non-empty height.
+    #[test]
+    fn test_metadata_preserves_configured_empty_levels() {
+        const CONFIGURED_LEVELS: usize = 7;
+        let params = HnswBuildParams::default().max_level(CONFIGURED_LEVELS as u16);
+        let hnsw = HNSW::from_parts(params, vec![GraphBuilderNode::new(0, 1)], vec![1], 0);
+
+        assert_eq!(hnsw.max_level(), 1);
+        let metadata = hnsw.metadata();
+        assert_eq!(metadata.level_offsets.len(), CONFIGURED_LEVELS + 1);
+        assert_eq!(metadata.level_offsets[0], 0);
+        assert!(
+            metadata.level_offsets[1..]
+                .iter()
+                .all(|offset| *offset == 1)
+        );
+
+        let loaded = HNSW::load(hnsw.to_batch().unwrap()).unwrap();
+        assert_eq!(loaded.max_level(), 1);
+        match &loaded.inner.graph {
+            HnswGraph::Loaded(graph) => {
+                assert_eq!(graph.level_neighbors.len(), CONFIGURED_LEVELS);
+                assert_eq!(graph.level_count[0], 1);
+                assert!(graph.level_count[1..].iter().all(|count| *count == 0));
+            }
+            HnswGraph::Built(_) => panic!("expected an Arrow-backed loaded graph"),
         }
     }
 

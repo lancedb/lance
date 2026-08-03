@@ -18,7 +18,7 @@
 //!
 //! # Lifecycle
 //!
-//! 1. `OnlineHnswBuilder::with_capacity(...)` pre-allocates fixed-size node
+//! 1. `OnlineHnswBuilder::try_with_capacity(...)` pre-allocates fixed-size node
 //!    arrays. Each slot has its target level pre-assigned so concurrent
 //!    inserts don't need to allocate.
 //! 2. Writer calls `insert(id, storage)` for `id` in `0..capacity`. The vector
@@ -46,6 +46,7 @@ use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, beam_search, greedy_search,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
+use lance_core::Result;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 
 /// A node in the online HNSW graph.
@@ -141,13 +142,42 @@ pub struct OnlineHnswBuilder {
 }
 
 impl OnlineHnswBuilder {
-    /// Create a new builder with the given capacity. Each node's target level
-    /// is pre-assigned at random.
+    /// Create a new builder with validated parameters.
+    ///
+    /// Each node's target level is pre-assigned at random.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::vector::hnsw::{OnlineHnswBuilder, builder::HnswBuildParams};
+    ///
+    /// let builder = OnlineHnswBuilder::try_with_capacity(
+    ///     1_024,
+    ///     HnswBuildParams::default(),
+    /// )?;
+    /// assert_eq!(builder.capacity(), 1_024);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn try_with_capacity(capacity: usize, params: HnswBuildParams) -> Result<Self> {
+        params.validate()?;
+        Ok(Self::new(capacity, params))
+    }
+
+    /// Create a new builder with the given capacity.
+    ///
+    /// Use [`Self::try_with_capacity`] to handle invalid parameters without
+    /// panicking.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `params` violates an HNSW construction precondition.
+    #[deprecated(note = "use OnlineHnswBuilder::try_with_capacity")]
     pub fn with_capacity(capacity: usize, params: HnswBuildParams) -> Self {
-        assert!(
-            params.max_level > 0,
-            "HnswBuildParams::max_level must be > 0"
-        );
+        Self::try_with_capacity(capacity, params)
+            .unwrap_or_else(|error| panic!("invalid HNSW build parameters: {error}"))
+    }
+
+    fn new(capacity: usize, params: HnswBuildParams) -> Self {
         let max_level = params.max_level;
         let level_count = (0..max_level).map(|_| AtomicUsize::new(0)).collect();
 
@@ -536,6 +566,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array;
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn build_storage(n: usize, dim: usize) -> (Arc<FlatFloatStorage>, FixedSizeListArray) {
@@ -543,6 +574,43 @@ mod tests {
         let fsl = FixedSizeListArray::try_new_from_values(data, dim as i32).unwrap();
         let storage = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         (storage, fsl)
+    }
+
+    #[rstest]
+    #[case::zero_max_level(
+        HnswBuildParams::default().max_level(0),
+        "max_level must be greater than 0"
+    )]
+    #[case::zero_m(
+        HnswBuildParams::default().num_edges(0),
+        "m must be greater than 1"
+    )]
+    #[case::one_m(
+        HnswBuildParams::default().num_edges(1),
+        "m must be greater than 1"
+    )]
+    #[case::small_ef(
+        HnswBuildParams::default().num_edges(20).ef_construction(19),
+        "ef_construction must be at least m (20)"
+    )]
+    #[case::overflowing_level_zero_limit(
+        HnswBuildParams::default()
+            .num_edges(usize::MAX)
+            .ef_construction(usize::MAX),
+        "level-0 reciprocal limit can be represented"
+    )]
+    fn test_try_with_capacity_rejects_invalid_params(
+        #[case] params: HnswBuildParams,
+        #[case] expected_message: &str,
+    ) {
+        let Err(error) = OnlineHnswBuilder::try_with_capacity(2, params) else {
+            panic!("expected invalid HNSW parameters to be rejected");
+        };
+        assert!(matches!(&error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -554,7 +622,7 @@ mod tests {
         let params = HnswBuildParams::default()
             .num_edges(16)
             .ef_construction(100);
-        let builder = OnlineHnswBuilder::with_capacity(N, params);
+        let builder = OnlineHnswBuilder::try_with_capacity(N, params).unwrap();
 
         for i in 0..N {
             builder.insert(i as u32, storage.as_ref());
@@ -610,7 +678,7 @@ mod tests {
         let params = HnswBuildParams::default()
             .num_edges(16)
             .ef_construction(100);
-        let builder = OnlineHnswBuilder::with_capacity(N, params);
+        let builder = OnlineHnswBuilder::try_with_capacity(N, params).unwrap();
         for i in 0..N {
             builder.insert(i as u32, storage.as_ref());
         }
@@ -655,7 +723,7 @@ mod tests {
     #[test]
     fn test_online_hnsw_empty_search() {
         let params = HnswBuildParams::default();
-        let builder = OnlineHnswBuilder::with_capacity(16, params);
+        let builder = OnlineHnswBuilder::try_with_capacity(16, params).unwrap();
         let (storage, fsl) = build_storage(1, 8);
         let results = builder.search(fsl.value(0), 10, 32, storage.as_ref());
         assert!(results.is_empty());
@@ -678,7 +746,7 @@ mod tests {
             .max_level(1)
             .num_edges(2)
             .ef_construction(5);
-        let builder = OnlineHnswBuilder::with_capacity(5, params);
+        let builder = OnlineHnswBuilder::try_with_capacity(5, params).unwrap();
 
         for id in 0..5 {
             builder.insert(id, &storage);
@@ -701,7 +769,7 @@ mod tests {
         const TOTAL: usize = 128;
         let (storage, _) = build_storage(TOTAL, 4);
         let params = HnswBuildParams::default();
-        let builder = OnlineHnswBuilder::with_capacity(TOTAL, params.clone());
+        let builder = OnlineHnswBuilder::try_with_capacity(TOTAL, params.clone()).unwrap();
 
         let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
         let expected_levels = (0..TOTAL)
