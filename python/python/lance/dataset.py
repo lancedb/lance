@@ -1252,6 +1252,8 @@ class LanceDataset(pa.dataset.Dataset):
             If set, the scanner will produce batches whose total size in bytes
             is approximately this value. If ``batch_size`` is also set, both
             limits apply and the one reached first determines the batch size.
+            This cannot be combined with ``strict_batch_size=True`` because
+            strict row batching can merge batches beyond the byte limit.
             This can also be configured at the dataset level via
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
@@ -1329,6 +1331,10 @@ class LanceDataset(pa.dataset.Dataset):
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
             re-raised.
+        strict_batch_size: bool, default False
+            If True, all batches except the last batch will have exactly
+            ``batch_size`` rows. This cannot be combined with a byte limit,
+            including one configured through ``FileReaderOptions``.
         include_deleted_rows: bool, default False
             If True, then rows that have been deleted, but are still present in the
             fragment, will be returned.  These rows will have the _rowid column set
@@ -6751,6 +6757,9 @@ class ScannerBuilder:
         If this is true then small batches will need to be merged together
         which will require a data copy and incur a (typically very small)
         performance penalty.
+
+        This cannot be combined with ``batch_size_bytes`` because merging
+        batches to the strict row count can exceed the byte limit.
         """
         self._strict_batch_size = strict_batch_size
         return self

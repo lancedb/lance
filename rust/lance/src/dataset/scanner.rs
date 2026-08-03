@@ -1461,6 +1461,8 @@ impl Scanner {
     /// When set, the scanner will produce batches whose total size in bytes
     /// is approximately this value. When a row-based `batch_size` is also set,
     /// both limits apply and the one reached first determines the batch size.
+    /// This cannot be combined with [`Self::strict_batch_size`] because strict
+    /// row batching can merge batches beyond the byte limit.
     ///
     /// This can also be configured at the dataset level via
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  A scanner-level setting takes
@@ -1568,6 +1570,10 @@ impl Scanner {
     /// By default, this is False and output batches are allowed to have fewer than `batch_size` rows
     /// Setting this to True will require us to merge batches, incurring a data copy, for a minor performance
     /// penalty.
+    ///
+    /// This cannot be enabled when a byte limit is configured through
+    /// [`Self::batch_size_bytes`] or
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.strict_batch_size = strict_batch_size;
         self
@@ -2540,6 +2546,19 @@ impl Scanner {
         if self.batch_readahead == 0 {
             return Err(Error::invalid_input_source(
                 "batch_readahead must be greater than 0, got 0".into(),
+            ));
+        }
+
+        if self.strict_batch_size
+            && let Some(batch_size_bytes) = self
+                .resolved_file_reader_options()
+                .and_then(|options| options.batch_size_bytes)
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}; strict row batching can merge batches beyond the byte limit"
+                )
+                .into(),
             ));
         }
 
@@ -6357,6 +6376,24 @@ mod test {
             .await
             .unwrap();
         assert!(batches.iter().all(|batch| batch.num_rows() <= 10));
+
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size(200)
+            .batch_size_bytes(target_bytes)
+            .strict_batch_size(true);
+        let error = scan
+            .try_into_stream()
+            .await
+            .err()
+            .expect("strict row and byte batch limits should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("strict_batch_size=true cannot be combined with batch_size_bytes=8192"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
