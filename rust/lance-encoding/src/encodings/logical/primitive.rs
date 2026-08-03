@@ -2220,7 +2220,7 @@ impl FullZipScheduler {
                     num_rows,
                     bits_per_offset,
                     bits_per_offset,
-                )))
+                )?))
             }
         }
     }
@@ -2626,6 +2626,10 @@ struct VariableFullZipDecoder {
     num_rows: u64,
 }
 
+fn corrupt_file_named(name: &str, message: impl Into<String>) -> Error {
+    Error::corrupt_file(name.into(), message)
+}
+
 impl VariableFullZipDecoder {
     fn new(
         details: Arc<FullZipDecodeDetails>,
@@ -2633,7 +2637,7 @@ impl VariableFullZipDecoder {
         num_rows: u64,
         in_bits_per_length: u8,
         out_bits_per_offset: u8,
-    ) -> Self {
+    ) -> Result<Self> {
         let decompressor = match details.value_decompressor {
             PerValueDecompressor::Variable(ref d) => d.clone(),
             _ => unreachable!(),
@@ -2678,9 +2682,9 @@ impl VariableFullZipDecoder {
         //   - We could force each decode task to do a full unzip of all the data.  Each decode task now
         //     has to do more work but the work is all fused.
         //   - We could just try doing this work on the decode thread and see if it is a problem.
-        decoder.unzip(data, in_bits_per_length, out_bits_per_offset, num_rows);
+        decoder.unzip(data, in_bits_per_length, out_bits_per_offset, num_rows)?;
 
-        decoder
+        Ok(decoder)
     }
 
     fn slice_batch_data_and_rebase_offsets_typed<T>(
@@ -2755,28 +2759,33 @@ impl VariableFullZipDecoder {
         }
     }
 
-    unsafe fn parse_length(data: &[u8], bits_per_offset: u8) -> u64 {
-        match bits_per_offset {
-            8 => *data.get_unchecked(0) as u64,
-            16 => u16::from_le_bytes([*data.get_unchecked(0), *data.get_unchecked(1)]) as u64,
-            32 => u32::from_le_bytes([
-                *data.get_unchecked(0),
-                *data.get_unchecked(1),
-                *data.get_unchecked(2),
-                *data.get_unchecked(3),
-            ]) as u64,
-            64 => u64::from_le_bytes([
-                *data.get_unchecked(0),
-                *data.get_unchecked(1),
-                *data.get_unchecked(2),
-                *data.get_unchecked(3),
-                *data.get_unchecked(4),
-                *data.get_unchecked(5),
-                *data.get_unchecked(6),
-                *data.get_unchecked(7),
-            ]),
-            _ => unreachable!(),
+    /// Reads a single length prefix from the front of `data`.
+    ///
+    /// The bytes come from the file. A page whose item walk ends with a partial
+    /// trailing item leaves fewer than `bits_per_offset / 8` bytes here, so this
+    /// is bounds checked and reports a corrupt file rather than reading past the
+    /// end of the buffer.
+    fn parse_length(data: &[u8], bits_per_offset: u8) -> Result<u64> {
+        let width = bits_per_offset as usize / 8;
+        if data.len() < width {
+            return Err(corrupt_file_named(
+                "variable_full_zip",
+                format!(
+                    "truncated length prefix: {} byte(s) remain in the page buffer but a \
+                     {}-bit length prefix requires {}",
+                    data.len(),
+                    bits_per_offset,
+                    width
+                ),
+            ));
         }
+        Ok(match bits_per_offset {
+            8 => data[0] as u64,
+            16 => u16::from_le_bytes(data[..2].try_into().unwrap()) as u64,
+            32 => u32::from_le_bytes(data[..4].try_into().unwrap()) as u64,
+            64 => u64::from_le_bytes(data[..8].try_into().unwrap()),
+            _ => unreachable!(),
+        })
     }
 
     fn unzip(
@@ -2785,7 +2794,7 @@ impl VariableFullZipDecoder {
         in_bits_per_length: u8,
         out_bits_per_offset: u8,
         num_rows: u64,
-    ) {
+    ) -> Result<()> {
         // This undercounts if there are lists but, at this point, we don't really know how many items we have
         let mut rep = Vec::with_capacity(num_rows as usize);
         let mut def = Vec::with_capacity(num_rows as usize);
@@ -2836,9 +2845,7 @@ impl VariableFullZipDecoder {
                 if ctrl_desc.is_visible {
                     visible_item_count += 1;
                     if ctrl_desc.is_valid_item {
-                        // Safety: Data should have at least bytes_per_length bytes remaining
-                        debug_assert!(databuf.len() >= bytes_per_length);
-                        let length = unsafe { Self::parse_length(databuf, in_bits_per_length) };
+                        let length = Self::parse_length(databuf, in_bits_per_length)?;
                         match out_bits_per_offset {
                             32 => offsets_data
                                 .extend_from_slice(&(current_offset as u32).to_le_bytes()),
@@ -2874,6 +2881,7 @@ impl VariableFullZipDecoder {
         self.def = ScalarBuffer::from(def);
         self.data = LanceBuffer::from(unzipped_data);
         self.offsets = LanceBuffer::from(offsets_data);
+        Ok(())
     }
 }
 
@@ -7417,5 +7425,67 @@ mod tests {
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
+    }
+    fn truncated_tail_details() -> std::sync::Arc<super::FullZipDecodeDetails> {
+        use crate::compression::VariablePerValueDecompressor;
+        use crate::encodings::physical::binary::VariableDecoder;
+        use crate::repdef::{ControlWordParser, DefinitionInterpretation};
+        use std::sync::Arc;
+        Arc::new(super::FullZipDecodeDetails {
+            value_decompressor: super::PerValueDecompressor::Variable(Arc::new(
+                VariableDecoder::default(),
+            )
+                as Arc<dyn VariablePerValueDecompressor>),
+            def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
+            ctrl_word_parser: ControlWordParser::new(0, 0),
+            max_rep: 0,
+            max_visible_def: 0,
+        })
+    }
+
+    fn decode_variable_full_zip(
+        buf: Vec<u8>,
+        bits_per_offset: u8,
+    ) -> lance_core::Result<super::VariableFullZipDecoder> {
+        use std::collections::VecDeque;
+        let mut data = VecDeque::new();
+        data.push_back(crate::buffer::LanceBuffer::from(buf));
+        super::VariableFullZipDecoder::new(
+            truncated_tail_details(),
+            data,
+            1,
+            bits_per_offset,
+            bits_per_offset,
+        )
+    }
+
+    /// A page whose item walk ends with a partial length prefix must surface a
+    /// corrupt-file error rather than read past the end of the buffer.
+    ///
+    /// This asserts the error variant and message rather than merely expecting a
+    /// panic: before the length prefix was bounds checked, the read was
+    /// `get_unchecked` behind a `debug_assert!`, so a debug build panicked here
+    /// (which a `#[should_panic]` test would have accepted as a pass) while a
+    /// release build read up to 8 bytes out of a 4 byte allocation.
+    #[test]
+    fn variable_full_zip_truncated_length_prefix_is_corrupt_file() {
+        use lance_core::Error;
+
+        for (bits, buf_len) in [(32u8, 3usize), (64u8, 4usize)] {
+            let err = decode_variable_full_zip(vec![0xAA; buf_len], bits)
+                .expect_err("a truncated length prefix must not decode");
+            assert!(
+                matches!(err, Error::CorruptFile { .. }),
+                "expected CorruptFile for a {}-bit prefix with {} byte(s), got: {:?}",
+                bits,
+                buf_len,
+                err
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("truncated length prefix"),
+                "error should say what is wrong, got: {msg}"
+            );
+        }
     }
 }
