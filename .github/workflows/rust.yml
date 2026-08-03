@@ -139,6 +139,7 @@ jobs:
       # Need up-to-date compilers for kernels
       CC: clang
       CXX: clang++
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust
