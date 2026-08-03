@@ -33,9 +33,6 @@ build: ## Build the local Rust extension with maturin
 	$(UV_RUN) maturin develop --uv
 
 test: ## Run Python tests except recurring tests
-	# Datagen readiness checks live under python/tests (e.g.
-	# test_merge_insert_datagen.py) so PR CI covers them without collecting
-	# ci_benchmarks/ as a path (which would shadow the installed wheel).
 	pytest $(PYTEST_ARGS) python/tests
 
 integtest: ## Start LocalStack and run integration tests
