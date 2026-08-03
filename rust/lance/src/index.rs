@@ -1727,10 +1727,6 @@ impl DatasetIndexExt for Dataset {
         validate_segment_metadata(index_name, &new_indices)?;
         validate_segment_index_details(index_name, &new_indices)?;
 
-        let incoming_type_url = new_indices[0]
-            .index_details
-            .as_ref()
-            .map(|details| details.type_url.clone());
         let mut incoming_fragments = RoaringBitmap::new();
         for segment in &new_indices {
             if segment.fields != [field.id] {
@@ -1756,12 +1752,6 @@ impl DatasetIndexExt for Dataset {
         }
         let removed_indices = existing_named_indices
             .into_iter()
-            .filter(|idx| {
-                idx.index_details
-                    .as_ref()
-                    .zip(incoming_type_url.as_deref())
-                    .is_none_or(|(details, expected)| details.type_url == expected)
-            })
             .map(|idx| -> Result<Option<IndexMetadata>> {
                 let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
                 else {
@@ -7648,6 +7638,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("would orphan fragments"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_replaces_different_index_type() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let index_name = "shared_name";
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let original = dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("staged_btree".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(index_name, "id", vec![original])
+            .await
+            .unwrap();
+
+        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let replacement = dataset
+            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .name("staged_bitmap".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let replacement_uuid = replacement.uuid;
+        let replacement_type_url = replacement.index_details.as_ref().unwrap().type_url.clone();
+
+        dataset
+            .commit_existing_index_segments(index_name, "id", vec![replacement])
+            .await
+            .unwrap();
+
+        let committed = dataset
+            .load_index_by_name(index_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.uuid, replacement_uuid);
+        assert_eq!(
+            committed.index_details.unwrap().type_url,
+            replacement_type_url
+        );
     }
 
     #[tokio::test]
