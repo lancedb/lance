@@ -197,6 +197,41 @@ impl ListDocumentMode {
     }
 }
 
+#[derive(Default)]
+pub(super) struct UnmarkedListDocumentModeInference {
+    has_row_document_layout: bool,
+    seen_row_ids: RoaringTreemap,
+    has_element_documents: bool,
+}
+
+impl UnmarkedListDocumentModeInference {
+    pub(super) fn observe_row_document_layout(&mut self, has_row_document_layout: bool) {
+        self.has_row_document_layout |= has_row_document_layout;
+    }
+
+    pub(super) fn observe_row_ids(&mut self, mut row_ids: impl Iterator<Item = u64>) {
+        if self.has_element_documents {
+            return;
+        }
+        self.has_element_documents = row_ids.any(|row_id| !self.seen_row_ids.insert(row_id));
+    }
+
+    fn has_element_documents(&self) -> bool {
+        self.has_element_documents
+    }
+
+    pub(super) fn finish(self) -> ListDocumentMode {
+        match (self.has_element_documents, self.has_row_document_layout) {
+            (true, false) => ListDocumentMode::Elements,
+            (false, true) => ListDocumentMode::Row,
+            // Conflicting evidence identifies a mixed index. No evidence is
+            // insufficient because an element index containing only singleton
+            // lists is indistinguishable from a row-document index.
+            (true, true) | (false, false) => ListDocumentMode::Ambiguous,
+        }
+    }
+}
+
 impl Display for ListDocumentMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1863,51 +1898,30 @@ impl InvertedIndex {
     }
 
     async fn infer_unmarked_list_document_mode(&self) -> Result<ListDocumentMode> {
-        let mut has_row_document_layout = false;
+        let mut inference = UnmarkedListDocumentModeInference::default();
         for partition in &self.partitions {
-            let documents = partition.docs.modern().ok_or_else(|| {
-                Error::internal(
-                    "partitioned FTS index unexpectedly uses the legacy document store".to_owned(),
-                )
-            })?;
-            has_row_document_layout |= documents.has_row_document_layout();
+            let documents = partition.modern_documents()?;
+            inference.observe_row_document_layout(documents.has_row_document_layout());
         }
 
         // A row-document index stores each row id once. Repetition anywhere in
         // the index is positive evidence for historical element documents. Read
         // one partition at a time so inference does not retain every row-ID
         // array simultaneously.
-        let mut seen = RoaringTreemap::new();
-        let mut has_element_documents = false;
         for partition in &self.partitions {
-            let documents = partition.docs.modern().ok_or_else(|| {
-                Error::internal(
-                    "partitioned FTS index unexpectedly uses the legacy document store".to_owned(),
-                )
-            })?;
+            let documents = partition.modern_documents()?;
             let row_ids = documents.row_ids_column().await?;
-            let (next_seen, has_repeated_row_id) = spawn_cpu(move || {
-                let mut seen = seen;
-                let has_repeated_row_id =
-                    row_ids.values().iter().any(|row_id| !seen.insert(*row_id));
-                Ok::<_, Error>((seen, has_repeated_row_id))
+            inference = spawn_cpu(move || {
+                inference.observe_row_ids(row_ids.values().iter().copied());
+                Ok::<_, Error>(inference)
             })
             .await?;
-            seen = next_seen;
-            if has_repeated_row_id {
-                has_element_documents = true;
+            if inference.has_element_documents() {
                 break;
             }
         }
 
-        Ok(match (has_element_documents, has_row_document_layout) {
-            (true, false) => ListDocumentMode::Elements,
-            (false, true) => ListDocumentMode::Row,
-            // Conflicting evidence identifies a mixed index. No evidence is
-            // insufficient because an element index containing only singleton
-            // lists is indistinguishable from a row-document index.
-            (true, true) | (false, false) => ListDocumentMode::Ambiguous,
-        })
+        Ok(inference.finish())
     }
 
     pub async fn load(
@@ -2370,9 +2384,13 @@ impl ScalarIndex for InvertedIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let list_document_mode = self.list_document_mode().await?;
-        let files = self
-            .to_builder(list_document_mode)
+        let list_document_mode = self.list_document_mode.get().copied();
+        let mut builder =
+            self.to_builder(list_document_mode.unwrap_or(ListDocumentMode::Ambiguous));
+        if list_document_mode.is_none() {
+            builder = builder.with_list_document_mode_inference_on_remap();
+        }
+        let files = builder
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
@@ -2475,6 +2493,14 @@ impl InvertedPartition {
 
     pub fn is_legacy(&self) -> bool {
         self.inverted_list.is_legacy_layout()
+    }
+
+    pub(super) fn modern_documents(&self) -> Result<&PartitionDocuments> {
+        self.docs.modern().map(Arc::as_ref).ok_or_else(|| {
+            Error::internal(
+                "partitioned FTS index unexpectedly uses the legacy document store".to_owned(),
+            )
+        })
     }
 
     pub async fn load(
@@ -13404,11 +13430,22 @@ mod tests {
             dest_dir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-        let index = load_unmarked_index_with_row_ids(src_store, row_ids).await;
+        drop(load_unmarked_index_with_row_ids(src_store.clone(), row_ids).await);
+        let counter = Arc::new(PostingMetadataCounter::default());
+        let counting_store: Arc<dyn IndexStore> = Arc::new(CountingStore {
+            inner: src_store,
+            posting_file: doc_file_path(0),
+            counter: counter.clone(),
+        });
+        let index = InvertedIndex::load(counting_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
         assert!(index.list_document_mode.get().is_none());
+        assert_eq!(counter.rows_read(), 0);
         if resolve_before_remap {
             assert_eq!(index.list_document_mode().await.unwrap(), expected_mode);
         }
+        let rows_read_before_remap = counter.rows_read();
 
         index
             .remap(
@@ -13417,6 +13454,11 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            counter.rows_read() - rows_read_before_remap,
+            row_ids.len(),
+            "remap should infer the document mode from its existing document rewrite read"
+        );
 
         let remapped = InvertedIndex::load(dest_store, None, &LanceCache::no_cache())
             .await

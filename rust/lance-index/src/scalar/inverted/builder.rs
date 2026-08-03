@@ -145,6 +145,7 @@ pub struct InvertedIndexBuilder {
     format_version: InvertedListFormatVersion,
     posting_tail_codec: PostingTailCodec,
     list_document_mode: ListDocumentMode,
+    infer_list_document_mode_on_remap: bool,
     src_store: Option<Arc<dyn IndexStore>>,
     progress: Arc<dyn IndexBuildProgress>,
     deleted_fragments: RoaringBitmap,
@@ -191,6 +192,7 @@ impl InvertedIndexBuilder {
             format_version,
             posting_tail_codec: format_version.posting_tail_codec(),
             list_document_mode: ListDocumentMode::Row,
+            infer_list_document_mode_on_remap: false,
             progress: noop_progress(),
             deleted_fragments,
         }
@@ -219,6 +221,11 @@ impl InvertedIndexBuilder {
 
     pub(super) fn with_list_document_mode(mut self, list_document_mode: ListDocumentMode) -> Self {
         self.list_document_mode = list_document_mode;
+        self
+    }
+
+    pub(super) fn with_list_document_mode_inference_on_remap(mut self) -> Self {
+        self.infer_list_document_mode_on_remap = true;
         self
     }
 
@@ -532,6 +539,9 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
         let mut files = Vec::new();
+        let mut list_document_mode_inference = self
+            .infer_list_document_mode_on_remap
+            .then(UnmarkedListDocumentModeInference::default);
         for part in self.partitions.iter() {
             let part = InvertedPartition::load(
                 src_store.clone(),
@@ -541,13 +551,30 @@ impl InvertedIndexBuilder {
                 self.token_set_format,
             )
             .await?;
+            if let Some(inference) = list_document_mode_inference.as_mut() {
+                let documents = part.modern_documents()?;
+                inference.observe_row_document_layout(documents.has_row_document_layout());
+            }
             let mut builder = part.into_builder().await?;
+            if let Some(mut inference) = list_document_mode_inference.take() {
+                let docs = std::mem::take(&mut builder.docs);
+                let (inference, docs) = spawn_cpu(move || {
+                    inference.observe_row_ids(docs.iter().map(|(row_id, _)| *row_id));
+                    Ok::<_, Error>((inference, docs))
+                })
+                .await?;
+                list_document_mode_inference = Some(inference);
+                builder.docs = docs;
+            }
             builder.remap(mapping).await?;
             files.extend(
                 builder
                     .write_to(dest_store, self.partition_write_target())
                     .await?,
             );
+        }
+        if let Some(inference) = list_document_mode_inference {
+            self.list_document_mode = inference.finish();
         }
         if self.fragment_mask.is_none() {
             files.push(self.write_metadata(dest_store, &self.partitions).await?);
