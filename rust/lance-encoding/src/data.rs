@@ -597,6 +597,10 @@ pub struct VariableWidthBlock {
 /// caller-controlled flag.
 struct ValidVariableWidthLayout;
 
+fn corrupt_file_named(name: &str, message: impl Into<String>) -> Error {
+    Error::corrupt_file(name.into(), message)
+}
+
 impl VariableWidthBlock {
     // The offsets buffer comes straight from file bytes, so an unchecked build would
     // let a corrupt file smuggle out-of-bounds offsets into an Arrow array whose
@@ -657,7 +661,7 @@ impl VariableWidthBlock {
         offsets_size: usize,
         data_size: usize,
     ) -> Error {
-        Error::corrupt_file_named(
+        corrupt_file_named(
             "variable width data block",
             format!(
                 "invalid variable-width layout for {}: {} (num_values: {}, bits_per_offset: {}, \
@@ -1863,9 +1867,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array, make_array,
-        new_null_array,
+        ArrayRef, BinaryArray, DictionaryArray, Int8Array, LargeBinaryArray, LargeStringArray,
+        StringArray, UInt8Array, UInt16Array, make_array, new_null_array,
         types::{Int8Type, Int32Type},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
