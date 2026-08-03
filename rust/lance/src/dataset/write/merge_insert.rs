@@ -35,6 +35,7 @@ const MERGE_ACTION_COLUMN: &str = "__action";
 // to determine which side each row came from.  The sentinel is stripped by
 // `prepare_stream_schema` and never written to the dataset.
 pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
+const MERGE_SOURCE_ORDER_COLUMN: &str = "__merge_source_order";
 
 pub mod inserted_rows;
 
@@ -93,6 +94,7 @@ use datafusion::{
         repartition::RepartitionExec,
         sorts::sort::SortExec,
         stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream,
         union::UnionExec,
     },
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
@@ -784,6 +786,71 @@ fn one_shot_provider(stream: SendableRecordBatchStream) -> Result<Arc<dyn TableP
     let schema = stream.schema();
     let partition = Arc::new(OneShotPartitionStream::new(stream));
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
+}
+
+/// Scans source partitions sequentially and adds a dense row ordinal.
+///
+/// DataFusion joins do not preserve input order. The ordinal lets the v2 merge
+/// restore source order before applying `FirstSeen` deduplication without
+/// buffering the source in memory.
+#[derive(Debug)]
+struct OrderedSourcePartitionStream {
+    input: Arc<dyn ExecutionPlan>,
+    schema: Arc<Schema>,
+}
+
+impl OrderedSourcePartitionStream {
+    fn try_new(input: Arc<dyn ExecutionPlan>) -> datafusion::common::Result<Self> {
+        let schema = Arc::new(input.schema().as_ref().try_with_column(Field::new(
+            MERGE_SOURCE_ORDER_COLUMN,
+            DataType::UInt64,
+            false,
+        ))?);
+        Ok(Self { input, schema })
+    }
+}
+
+impl PartitionStream for OrderedSourcePartitionStream {
+    fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
+    fn execute(
+        &self,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> SendableRecordBatchStream {
+        let input = self.input.clone();
+        let partition_count = input.properties().output_partitioning().partition_count();
+        let partition_streams = stream::iter(0..partition_count)
+            .map(move |partition| input.execute(partition, context.clone()))
+            .try_flatten();
+
+        let mut next_row = 0_u64;
+        let source_order_field = Field::new(MERGE_SOURCE_ORDER_COLUMN, DataType::UInt64, false);
+        let ordered = partition_streams.map(move |batch| {
+            let batch = batch?;
+            let num_rows = u64::try_from(batch.num_rows()).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "source batch row count {} does not fit in u64",
+                    batch.num_rows()
+                ))
+            })?;
+            let end_row = next_row.checked_add(num_rows).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "source row ordinal overflow at row {} with batch size {}",
+                    next_row,
+                    batch.num_rows()
+                ))
+            })?;
+            let source_order = UInt64Array::from((next_row..end_row).collect::<Vec<_>>());
+            next_row = end_row;
+            batch
+                .try_with_column(source_order_field.clone(), Arc::new(source_order))
+                .map_err(DataFusionError::from)
+        });
+
+        Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), ordered))
+    }
 }
 
 impl MergeInsertJob {
@@ -1763,10 +1830,13 @@ impl MergeInsertJob {
             .first()
             .map(|batch| batch.schema())
             .unwrap_or_else(|| Arc::new(Schema::from(self.dataset.schema())));
-        // Spread batches across partitions so the source can be scanned in parallel
-        // and reports per-partition statistics. A single inner Vec would be one
-        // partition with no parallelism.
-        let partitions = Self::batches_into_partitions(batches);
+        // FirstSeen needs a defined encounter order. Keep materialized batches in
+        // their caller-provided order; other modes retain parallel source scans.
+        let partitions = if self.params.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen {
+            vec![batches]
+        } else {
+            Self::batches_into_partitions(batches)
+        };
         Ok(Arc::new(MemTable::try_new(schema, partitions)?))
     }
 
@@ -1893,11 +1963,23 @@ impl MergeInsertJob {
             .map(|name| format!("\"{}\"", name))
             .collect::<Vec<_>>();
         let on_cols_refs = on_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-        // Plan against the provider directly so its statistics reach the optimizer.
-        // The merge write node requires a single-partition input, so the optimizer
-        // coalesces a multi-partition provider for us (see
-        // `FullSchemaMergeInsertExec::required_input_distribution`).
-        let source_df = session_ctx.read_table(provider)?;
+        // FirstSeen must observe the caller's source order even though the join can
+        // reorder batches. Scan source partitions sequentially and attach a row
+        // ordinal that is sorted after the join. Other modes plan directly against
+        // the provider so its statistics reach the optimizer.
+        let preserve_source_order =
+            self.params.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen;
+        let source_df = if preserve_source_order {
+            let source_plan = provider.scan(&session_ctx.state(), None, &[], None).await?;
+            let ordered_partition = Arc::new(OrderedSourcePartitionStream::try_new(source_plan)?);
+            let ordered_provider = Arc::new(StreamingTable::try_new(
+                ordered_partition.schema().clone(),
+                vec![ordered_partition],
+            )?);
+            session_ctx.read_table(ordered_provider)?
+        } else {
+            session_ctx.read_table(provider)?
+        };
         // Capture the source field names *before* aliasing / joining so we
         // can tell which dataset columns are missing from the source and
         // need to be filled from the target side of the join below.
@@ -1949,6 +2031,12 @@ impl MergeInsertJob {
                     logical_expr::col(format!("target.\"{}\"", field.name())),
                 )?;
             }
+        }
+
+        if preserve_source_order {
+            df = df.sort(vec![
+                logical_expr::col(MERGE_SOURCE_ORDER_COLUMN).sort(true, false),
+            ])?;
         }
 
         let (session_state, logical_plan) = df.into_parts();
@@ -8906,24 +8994,25 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .unwrap();
         }
 
-        // Repeat the same duplicate pair across batches so the retained value is
-        // deterministic even if independent batches are scheduled in either order.
-        // On the v2 path, also verify that NULL keys remain distinct under SQL
-        // equality across batches.
-        let (source, expected_inserted) = if with_index {
+        // Split distinct duplicate values across batches to verify that FirstSeen
+        // preserves source order across the entire stream. On the v2 path, also
+        // verify that NULL keys remain distinct under SQL equality.
+        let (first, second, expected_inserted) = if with_index {
             (
-                record_batch!(
-                    ("id", Int32, [Some(108), Some(108)]),
-                    ("value", Int32, [Some(1), Some(2)])
-                )
-                .unwrap(),
+                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(1)])).unwrap(),
+                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(2)])).unwrap(),
                 1,
             )
         } else {
             (
                 record_batch!(
-                    ("id", Int32, [Some(108), Some(108), None]),
-                    ("value", Int32, [Some(1), Some(2), Some(3)])
+                    ("id", Int32, [Some(108), None]),
+                    ("value", Int32, [Some(1), Some(3)])
+                )
+                .unwrap(),
+                record_batch!(
+                    ("id", Int32, [Some(108), None]),
+                    ("value", Int32, [Some(2), Some(4)])
                 )
                 .unwrap(),
                 3,
@@ -8939,15 +9028,15 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .try_build()
                 .unwrap()
                 .execute_reader(Box::new(RecordBatchIterator::new(
-                    [Ok(source.clone()), Ok(source.clone())],
-                    source.schema(),
+                    [Ok(first.clone()), Ok(second)],
+                    first.schema(),
                 )))
                 .await
                 .unwrap();
 
         assert_eq!(stats.num_inserted_rows, expected_inserted);
         assert_eq!(stats.num_updated_rows, 0);
-        assert_eq!(stats.num_skipped_duplicates, 3);
+        assert_eq!(stats.num_skipped_duplicates, 1);
 
         let inserted = dataset
             .scan()
