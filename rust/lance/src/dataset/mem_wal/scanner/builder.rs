@@ -3,8 +3,8 @@
 
 //! LSM Scanner builder.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
@@ -79,11 +79,14 @@ fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>
                 return None;
             }
             let mut vals = Vec::with_capacity(in_list.list.len());
+            let mut seen = HashSet::with_capacity(in_list.list.len());
             for e in &in_list.list {
                 let Expr::Literal(lit, _) = e else {
                     return None; // a non-literal IN element → not a point lookup
                 };
-                vals.push(lit.clone());
+                if seen.insert(lit) {
+                    vals.push(lit.clone());
+                }
             }
             (!vals.is_empty()).then_some(vals)
         }
@@ -1975,6 +1978,37 @@ mod tests {
             "pk IN (..) must route"
         );
         assert_eq!(count(plan).await, 2);
+
+        // Duplicate literals retain predicate semantics: each matching row is
+        // emitted once, including when a limit would otherwise hide a distinct
+        // match behind the duplicate.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(1i32), lit(2i32)], false))
+            .limit(Some(2), None)
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![1, 2]);
+
+        // Coercible literals use the per-key fallback and must have the same
+        // set semantics as exact-type keys.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i64), lit(1i64), lit(3i64)], false))
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![1, 3]);
+
+        // NULL literals cannot match, and duplicate NULLs must not affect the
+        // non-NULL matches.
+        let null = lit(ScalarValue::Int32(None));
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![null.clone(), lit(2i32), null], false))
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![2]);
 
         // A range filter is NOT a point lookup → falls through to the scan path.
         let plan = scanner()
