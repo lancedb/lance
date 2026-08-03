@@ -1246,12 +1246,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
-            smaller than this size.  Note: this can be overridden by
-            ``batch_size_bytes`` or by a dataset-level ``batch_size_bytes``
-            configured via ``FileReaderOptions``.
+            smaller than this size. If a byte limit is also configured, both
+            limits apply and the one reached first determines the batch size.
         batch_size_bytes: int, default None
             If set, the scanner will produce batches whose total size in bytes
-            is approximately this value, overriding the row-based ``batch_size``.
+            is approximately this value. If ``batch_size`` is also set, both
+            limits apply and the one reached first determines the batch size.
             This can also be configured at the dataset level via
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
@@ -6361,9 +6361,8 @@ class ScannerBuilder:
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set the maximum number of rows per batch.
 
-        Note: this can be overridden by ``batch_size_bytes`` or by a
-        dataset-level ``batch_size_bytes`` configured via
-        ``FileReaderOptions``.
+        If a byte limit is also configured, both limits apply and the one
+        reached first determines the batch size.
         """
         self._batch_size = batch_size
         return self
@@ -6372,7 +6371,8 @@ class ScannerBuilder:
         """Set the target batch size in bytes.
 
         When set, the scanner will produce batches whose total size in bytes
-        is approximately this value, overriding the row-based ``batch_size``.
+        is approximately this value. If ``batch_size`` is also set, both
+        limits apply and the one reached first determines the batch size.
 
         This can also be configured at the dataset level via
         ``FileReaderOptions``.  A scanner-level setting takes precedence
