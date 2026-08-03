@@ -1224,12 +1224,25 @@ impl FileScheduler {
             priority,
             self.bypass_backpressure,
         );
+        let file_path = self.reader.path().clone();
 
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
 
         async move {
             let bytes_vec = bytes_vec_fut.await?;
+
+            for (range, bytes) in updated_requests.iter().zip(&bytes_vec) {
+                let expected_len = range.end - range.start;
+                if bytes.len() as u64 != expected_len {
+                    return Err(Error::io(format!(
+                        "I/O request for file {file_path} and range {}..{} returned {} bytes, expected {expected_len} bytes",
+                        range.start,
+                        range.end,
+                        bytes.len()
+                    )));
+                }
+            }
 
             let mut orig_index = 0;
             while (updated_index < updated_requests.len()) && (orig_index < request.len()) {
@@ -1521,6 +1534,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes[0], some_data);
+    }
+
+    #[derive(Debug)]
+    struct ShortReader {
+        path: Path,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for ShortReader {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for ShortReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn get_range(
+            &self,
+            _range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::new()) })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_short_read_returns_io_error() {
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::memory()),
+            SchedulerConfig::default_for_testing(),
+        );
+        let reader = Arc::new(ShortReader {
+            path: Path::parse("short-file").unwrap(),
+        });
+        let file_scheduler = scheduler.open_reader(reader);
+
+        let error = file_scheduler
+            .submit_request(vec![0..8], 0)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "I/O request for file short-file and range 0..8 returned 0 bytes, expected 8 bytes"
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]
