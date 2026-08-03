@@ -119,11 +119,23 @@ impl ProjectionBuilder {
         }
 
         for col in Planner::column_names_in_expr(&expr) {
-            if self.physical_cols_set.contains(&col) {
+            // Discovery can bind an exact provisional scoring field beside a mixed-case stored
+            // field. Load the stored field too so final-schema replanning can select the stored
+            // or search-generated field from the physical input.
+            let physical_col = if canonical_scoring_column(&col).is_some() {
+                self.base
+                    .schema()
+                    .field_case_insensitive(&col)
+                    .map(|field| field.name.clone())
+                    .unwrap_or(col)
+            } else {
+                col
+            };
+            if self.physical_cols_set.contains(&physical_col) {
                 continue;
             }
-            self.physical_cols.push(col.clone());
-            self.physical_cols_set.insert(col);
+            self.physical_cols.push(physical_col.clone());
+            self.physical_cols_set.insert(physical_col);
         }
         self.output.insert(output_name.to_string(), expr.clone());
 
@@ -227,15 +239,11 @@ impl ProjectionPlan {
         fields.push(Arc::new(
             (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
         ));
-        // Scoring fields are needed for initial parsing of schema-dependent functions. Stored
-        // fields keep their own types here; scoring expressions are replanned against the final
-        // physical schema before execution.
+        // Exact scoring fields are needed for initial parsing of schema-dependent functions, even
+        // beside a mixed-case stored field. The stored field is carried into the physical
+        // projection separately, and scoring expressions are replanned against the final schema.
         for name in SCORING_COLUMNS {
-            let has_stored_column = schema
-                .fields()
-                .iter()
-                .any(|field| canonical_scoring_column(field.name()) == Some(name));
-            if !has_stored_column {
+            if schema.field_with_name(name).is_err() {
                 fields.push(Arc::new(ArrowField::new(name, DataType::Float32, true)));
             }
         }
@@ -607,6 +615,38 @@ mod tests {
                     .unwrap(),
                 DataType::Float32,
             );
+        }
+    }
+
+    #[test]
+    fn test_generated_scoring_function_with_mixed_case_stored_column() {
+        for (stored_name, generated_name) in [("_Distance", "_distance"), ("_Score", "_score")] {
+            let base = Arc::new(
+                Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                    stored_name,
+                    DataType::Float64,
+                    true,
+                )]))
+                .unwrap(),
+            );
+            let expression = format!("coalesce(1 - {generated_name}, 0)");
+            let plan =
+                ProjectionPlan::from_expressions(base, &[("normalized", expression.as_str())])
+                    .unwrap();
+            let batch = RecordBatch::try_from_iter([(
+                generated_name,
+                Arc::new(Float32Array::from(vec![Some(0.25), None])) as ArrayRef,
+            )])
+            .unwrap();
+
+            let physical_exprs = plan.to_physical_exprs(batch.schema().as_ref()).unwrap();
+            let values = physical_exprs[0]
+                .0
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(values.as_ref(), &Float32Array::from(vec![0.75, 0.0]));
         }
     }
 
