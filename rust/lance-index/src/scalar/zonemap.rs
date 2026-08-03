@@ -1115,10 +1115,8 @@ impl ZoneProcessor for ZoneMapProcessor {
         // For nested types, only null_count is meaningful; store null min/max.
         if self.data_type.is_nested() {
             return Ok(ZoneMapStatistics {
-                min: ScalarValue::try_from(&self.data_type)
-                    .map_err(|e| Error::invalid_input(format!("{e}")))?,
-                max: ScalarValue::try_from(&self.data_type)
-                    .map_err(|e| Error::invalid_input(format!("{e}")))?,
+                min: ScalarValue::try_new_null(&self.data_type)?,
+                max: ScalarValue::try_new_null(&self.data_type)?,
                 null_count,
                 nan_count: 0,
                 bound,

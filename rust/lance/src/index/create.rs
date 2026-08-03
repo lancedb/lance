@@ -268,7 +268,10 @@ impl<'a> CreateIndexBuilder<'a> {
         let index_name = if let Some(name) = self.name.take() {
             name
         } else {
-            // Generate default name with collision handling
+            // Generate default name with collision handling.
+            // A name is available when there is no existing index with:
+            //   - the same name AND different fields, OR
+            //   - the same name AND same field BUT a different index kind
             let column_path = resolved_fts_field
                 .as_ref()
                 .map(|resolved| {
@@ -282,11 +285,11 @@ impl<'a> CreateIndexBuilder<'a> {
             let base_name = format!("{column_path}_idx");
             let mut candidate = base_name.clone();
             let mut counter = 2; // Start with no suffix, then use _2, _3, ...
-            // Find unique name by appending numeric suffix if needed
-            while indices
-                .iter()
-                .any(|idx| idx.name == candidate && idx.fields != [field.id])
-            {
+            while indices.iter().any(|idx| {
+                idx.name == candidate
+                    && (idx.fields != [field.id]
+                        || !index_matches_type(idx, self.index_type))
+            }) {
                 candidate = format!("{base_name}_{counter}");
                 counter += 1;
             }
@@ -841,8 +844,6 @@ impl<'a> CreateIndexBuilder<'a> {
             build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
                 .await?;
 
-        // Collect all same-name indices for removal when replace is set,
-        // matching the standard execute() path behavior.
         let removed_indices = if self.replace {
             existing_named_indices
                 .into_iter()
@@ -874,6 +875,29 @@ impl<'a> CreateIndexBuilder<'a> {
             ))
         })
     }
+}
+
+/// Returns true if an existing `IndexMetadata` matches the given type
+fn index_matches_type(idx: &IndexMetadata, index_type: IndexType) -> bool {
+    match &idx.index_details {
+        Some(d) => index_type.matches_details(d),
+        // Fallback for legacy indexes, assume we are not trying to change the type
+        None => true,
+    }
+}
+
+fn is_btree_scalar_params(params: &dyn IndexParams) -> bool {
+    params
+        .as_any()
+        .downcast_ref::<ScalarIndexParams>()
+        .is_some_and(|p| p.index_type.eq_ignore_ascii_case("btree"))
+}
+
+fn is_ngram_scalar_params(params: &dyn IndexParams) -> bool {
+    params
+        .as_any()
+        .downcast_ref::<ScalarIndexParams>()
+        .is_some_and(|params| params.index_type.eq_ignore_ascii_case("ngram"))
 }
 
 fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> bool {
