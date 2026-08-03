@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use object_store_opendal::OpendalStore;
 use opendal::raw::{
-    BoxedFuture, Layer, OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat,
-    OpWrite, RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo, Servicer, oio,
+    Layer, OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
+    RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo, Servicer, oio,
 };
 use opendal::{Buffer, Capability, Metadata, OperationContext, Operator, Result};
 use rand::Rng;
@@ -22,22 +22,19 @@ fn max_retries() -> usize {
     })
 }
 
-async fn retry_writer_operation<T, W>(
-    writer: &mut W,
-    mut operation: impl for<'a> FnMut(&'a mut W) -> BoxedFuture<'a, Result<T>>,
-) -> Result<T>
+async fn retry_write<W>(writer: &mut W, body: Buffer) -> Result<()>
 where
     W: oio::Write,
 {
     let mut retries = 0;
     loop {
-        match operation(writer).await {
-            Ok(value) => return Ok(value),
+        match writer.write(body.clone()).await {
+            Ok(()) => return Ok(()),
             Err(error) if error.is_temporary() && retries < max_retries() => {
                 retries += 1;
                 let delay = Duration::from_millis(rand::rng().random_range(2_000..8_000));
                 log::warn!(
-                    "Retrying OpenDAL writer operation after temporary error (attempt {}): {:?}",
+                    "Retrying OpenDAL write after temporary error (attempt {}): {:?}",
                     retries,
                     error
                 );
@@ -55,18 +52,18 @@ struct RetryWriter<W> {
 
 impl<W: oio::Write> oio::Write for RetryWriter<W> {
     async fn write(&mut self, body: Buffer) -> Result<()> {
-        retry_writer_operation(&mut self.inner, move |writer| {
-            Box::pin(writer.write(body.clone()))
-        })
-        .await
+        retry_write(&mut self.inner, body).await
     }
 
     async fn close(&mut self) -> Result<Metadata> {
-        retry_writer_operation(&mut self.inner, |writer| Box::pin(writer.close())).await
+        // Finalization can consume staged state before returning an error, so it is not
+        // replay-safe.
+        self.inner.close().await
     }
 
     async fn abort(&mut self) -> Result<()> {
-        retry_writer_operation(&mut self.inner, |writer| Box::pin(writer.abort())).await
+        // Cleanup can delete staged state before returning an error, so it is not replay-safe.
+        self.inner.abort().await
     }
 }
 
@@ -161,9 +158,9 @@ impl Layer for WriterRetryLayer {
     }
 }
 
-/// Install retries beneath OpenDAL's writer so a retry reuses the same writer
-/// state and buffer instead of allocating another cloud multipart part. Other
-/// operations remain unwrapped so they report throttle feedback to AIMD.
+/// Install write retries beneath OpenDAL's writer so a retry reuses the same
+/// writer state and buffer instead of allocating another cloud multipart part.
+/// Other operations remain unwrapped so they report throttle feedback to AIMD.
 pub fn store_with_retry(operator: Operator) -> OpendalStore {
     OpendalStore::new(operator.layer(WriterRetryLayer))
 }
@@ -176,7 +173,7 @@ mod tests {
     use bytes::Bytes;
     use object_store::path::Path;
     use object_store::{ObjectStoreExt, PutPayload};
-    use opendal::raw::oio;
+    use opendal::raw::oio::{self, Write};
     use opendal::{
         Buffer, Builder, Capability, EntryMode, Error, ErrorKind, Metadata, OperationContext,
         Result,
@@ -317,6 +314,39 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DestructiveFinalizeWriter {
+        buffered_size: usize,
+        close_attempts: Arc<AtomicUsize>,
+        abort_attempts: Arc<AtomicUsize>,
+        published_size: Arc<AtomicUsize>,
+    }
+
+    impl oio::Write for DestructiveFinalizeWriter {
+        async fn write(&mut self, body: Buffer) -> Result<()> {
+            self.buffered_size += body.len();
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<Metadata> {
+            let buffered_size = std::mem::take(&mut self.buffered_size);
+            if self.close_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Error::new(ErrorKind::Unexpected, "transport closed").set_temporary())
+            } else {
+                self.published_size.store(buffered_size, Ordering::SeqCst);
+                Ok(Metadata::new(EntryMode::FILE))
+            }
+        }
+
+        async fn abort(&mut self) -> Result<()> {
+            if self.abort_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Error::new(ErrorKind::Unexpected, "transport closed").set_temporary())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_retry_reuses_opendal_writer_and_body() {
         let builder = TransientWriteBuilder::default();
@@ -355,5 +385,46 @@ mod tests {
 
         assert!(error.to_string().contains("429 Too Many Requests"));
         assert_eq!(stat_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_close_is_not_retried_after_destructive_error() {
+        let close_attempts = Arc::new(AtomicUsize::new(0));
+        let published_size = Arc::new(AtomicUsize::new(usize::MAX));
+        let mut writer = RetryWriter {
+            inner: DestructiveFinalizeWriter {
+                buffered_size: 0,
+                close_attempts: Arc::clone(&close_attempts),
+                abort_attempts: Arc::new(AtomicUsize::new(0)),
+                published_size: Arc::clone(&published_size),
+            },
+        };
+        writer.write(Buffer::from("payload")).await.unwrap();
+
+        let error = writer.close().await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(error.to_string().contains("transport closed"));
+        assert_eq!(close_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(published_size.load(Ordering::SeqCst), usize::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_abort_is_not_retried_after_destructive_error() {
+        let abort_attempts = Arc::new(AtomicUsize::new(0));
+        let mut writer = RetryWriter {
+            inner: DestructiveFinalizeWriter {
+                buffered_size: 0,
+                close_attempts: Arc::new(AtomicUsize::new(0)),
+                abort_attempts: Arc::clone(&abort_attempts),
+                published_size: Arc::new(AtomicUsize::new(usize::MAX)),
+            },
+        };
+
+        let error = writer.abort().await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(error.to_string().contains("transport closed"));
+        assert_eq!(abort_attempts.load(Ordering::SeqCst), 1);
     }
 }
