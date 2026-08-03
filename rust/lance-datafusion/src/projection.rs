@@ -29,6 +29,7 @@ struct ProjectionBuilder {
     planner: Planner,
     output: HashMap<String, Expr>,
     output_cols: Vec<OutputColumn>,
+    scoring_exprs: HashMap<String, String>,
     physical_cols_set: HashSet<String>,
     physical_cols: Vec<String>,
     needs_row_id: bool,
@@ -50,6 +51,7 @@ impl ProjectionBuilder {
             planner,
             output: HashMap::default(),
             output_cols: Vec::default(),
+            scoring_exprs: HashMap::default(),
             physical_cols_set: HashSet::default(),
             physical_cols: Vec::default(),
             needs_row_id: false,
@@ -75,10 +77,18 @@ impl ProjectionBuilder {
         self.check_duplicate_column(output_name)?;
 
         let expr = self.planner.parse_expr(raw_expr)?;
-        // Run simplification + coercion so that expressions like `coalesce(...)`
-        // (which DataFusion's physical evaluator expects to have been rewritten
-        // into a `CASE` expression by the simplifier) work correctly.
-        let expr = self.planner.optimize_expr(expr)?;
+        let expr = if Self::references_scoring_column(&expr) {
+            // A scoring name can refer to either a stored column or a search-generated
+            // Float32 column. Reparse and coerce once the physical input schema disambiguates it.
+            self.scoring_exprs
+                .insert(output_name.to_string(), raw_expr.to_string());
+            expr
+        } else {
+            // Run simplification + coercion so that expressions like `coalesce(...)`
+            // (which DataFusion's physical evaluator expects to have been rewritten
+            // into a `CASE` expression by the simplifier) work correctly.
+            self.planner.optimize_expr(expr)?
+        };
 
         // If the expression is a bare column reference to a system column, mark that we need it
         if let Expr::Column(Column {
@@ -115,6 +125,12 @@ impl ProjectionBuilder {
         });
 
         Ok(())
+    }
+
+    fn references_scoring_column(expr: &Expr) -> bool {
+        Planner::column_names_in_expr(expr)
+            .iter()
+            .any(|name| matches!(name.as_str(), "_distance" | "_score"))
     }
 
     fn add_columns(&mut self, columns: &[(impl AsRef<str>, impl AsRef<str>)]) -> Result<()> {
@@ -159,6 +175,7 @@ impl ProjectionBuilder {
             physical_projection,
             must_add_row_offset: self.must_add_row_offset,
             requested_output_expr: self.output_cols,
+            scoring_exprs: self.scoring_exprs,
         })
     }
 }
@@ -181,6 +198,9 @@ pub struct ProjectionPlan {
 
     /// The desired output columns
     pub requested_output_expr: Vec<OutputColumn>,
+
+    /// Original SQL for scoring expressions that must be replanned against the physical schema.
+    scoring_exprs: HashMap<String, String>,
 }
 
 impl ProjectionPlan {
@@ -199,14 +219,6 @@ impl ProjectionPlan {
         fields.push(Arc::new(
             (*lance_core::ROW_CREATED_AT_VERSION_FIELD).clone(),
         ));
-        // Search operators add these columns after projection planning.  Their types must be
-        // available here so expressions that reference them are coerced before physical planning.
-        fields.push(Arc::new(ArrowField::new(
-            "_distance",
-            DataType::Float32,
-            true,
-        )));
-        fields.push(Arc::new(ArrowField::new("_score", DataType::Float32, true)));
         ArrowSchema::new(fields)
     }
 
@@ -320,6 +332,7 @@ impl ProjectionPlan {
             physical_projection,
             requested_output_expr: exprs,
             must_add_row_offset,
+            scoring_exprs: HashMap::default(),
         })
     }
 
@@ -346,6 +359,7 @@ impl ProjectionPlan {
             physical_projection,
             must_add_row_offset: false,
             requested_output_expr,
+            scoring_exprs: HashMap::default(),
         })
     }
 
@@ -360,9 +374,16 @@ impl ProjectionPlan {
         self.requested_output_expr
             .iter()
             .map(|output_column| {
+                let expr = if let Some(raw_expr) = self.scoring_exprs.get(&output_column.name) {
+                    let planner = Planner::new(Arc::new(current_schema.clone()));
+                    let expr = planner.parse_expr(raw_expr)?;
+                    planner.optimize_expr(expr)?
+                } else {
+                    output_column.expr.clone()
+                };
                 Ok((
                     datafusion::physical_expr::create_physical_expr(
-                        &output_column.expr,
+                        &expr,
                         physical_df_schema.as_ref(),
                         &Default::default(),
                     )?,
@@ -472,34 +493,65 @@ mod tests {
 
     #[test]
     fn test_scoring_column_expression() {
-        let base = Arc::new(Schema::default());
-
         for scoring_column in ["_distance", "_score"] {
-            let expression = format!("1 - {scoring_column}");
-            let plan = ProjectionPlan::from_expressions(
-                base.clone(),
-                &[("inverted", expression.as_str())],
-            )
-            .unwrap();
-            let batch = RecordBatch::try_from_iter([(
-                scoring_column,
-                Arc::new(Float32Array::from(vec![0.25, 0.75])) as ArrayRef,
-            )])
-            .unwrap();
+            for has_stored_column in [false, true] {
+                let base = if has_stored_column {
+                    Arc::new(
+                        Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                            scoring_column,
+                            DataType::Float64,
+                            true,
+                        )]))
+                        .unwrap(),
+                    )
+                } else {
+                    Arc::new(Schema::default())
+                };
+                let expression = format!("1 - {scoring_column}");
+                let plan =
+                    ProjectionPlan::from_expressions(base, &[("inverted", expression.as_str())])
+                        .unwrap();
 
-            let physical_exprs = plan.to_physical_exprs(batch.schema().as_ref()).unwrap();
-            let values = physical_exprs[0]
-                .0
-                .evaluate(&batch)
-                .unwrap()
-                .into_array(batch.num_rows())
+                if has_stored_column {
+                    let stored_output = plan.output_schema().unwrap();
+                    assert_eq!(stored_output.field(0).data_type(), &DataType::Float64);
+                }
+
+                let batch = RecordBatch::try_from_iter([(
+                    scoring_column,
+                    Arc::new(Float32Array::from(vec![0.25, 0.75])) as ArrayRef,
+                )])
                 .unwrap();
 
-            assert_eq!(
-                values.as_ref(),
-                &Float32Array::from(vec![0.75, 0.25]),
-                "unexpected result for {scoring_column}",
+                let physical_exprs = plan.to_physical_exprs(batch.schema().as_ref()).unwrap();
+                let values = physical_exprs[0]
+                    .0
+                    .evaluate(&batch)
+                    .unwrap()
+                    .into_array(batch.num_rows())
+                    .unwrap();
+
+                assert_eq!(
+                    values.as_ref(),
+                    &Float32Array::from(vec![0.75, 0.25]),
+                    "unexpected result for {scoring_column}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_stored_scoring_column_does_not_break_other_expressions() {
+        for scoring_column in ["_distance", "_score"] {
+            let base = Arc::new(
+                Schema::try_from(&ArrowSchema::new(vec![
+                    ArrowField::new("id", DataType::Int64, false),
+                    ArrowField::new(scoring_column, DataType::Float64, true),
+                ]))
+                .unwrap(),
             );
+
+            ProjectionPlan::from_expressions(base, &[("incremented", "id + 1")]).unwrap();
         }
     }
 
