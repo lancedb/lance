@@ -311,9 +311,10 @@ pub struct IndexLookup {
 
 const MAP_INDEX_CANDIDATES_MEMORY_CONSUMER: &str = "MapIndexExecCandidates";
 
-/// Conservative upper bound on the [`DeepSizeOf`] growth from inserting one
-/// address: a new B-tree entry, Roaring container metadata, and its payload.
-/// The reservation is shrunk to the measured size after each input batch.
+/// Per-address allowance for cooperative pool accounting of the retained map.
+/// This conservatively bounds its approximate [`DeepSizeOf`] growth, but is not
+/// an allocator-level peak-memory bound. The reservation is shrunk to the
+/// measured retained-map size after each input batch.
 const ROW_ADDR_INSERT_RESERVATION_BYTES: usize = 256;
 
 #[derive(Debug)]
