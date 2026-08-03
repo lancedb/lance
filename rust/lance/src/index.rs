@@ -1755,7 +1755,12 @@ impl DatasetIndexExt for Dataset {
             )));
         }
         let existing_different_type_url = existing_named_indices.iter().find_map(|idx| {
-            let existing_type_url = idx.index_details.as_ref()?.type_url.as_str();
+            // Legacy metadata may omit index details. Its type cannot be proven
+            // compatible, so only a full replacement is safe.
+            let existing_type_url = idx
+                .index_details
+                .as_ref()
+                .map_or("<unknown>", |details| details.type_url.as_str());
             (Some(existing_type_url) != incoming_type_url.as_deref())
                 .then(|| existing_type_url.to_owned())
         });
@@ -7797,6 +7802,93 @@ mod tests {
                 .as_ref()
                 .is_some_and(|details| details.type_url.ends_with("BTreeIndexDetails"))
         }));
+    }
+
+    #[tokio::test]
+    async fn test_partial_type_change_with_legacy_missing_details_is_rejected() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let index_name = "shared_name";
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let original = dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(index_name, "id", vec![original])
+            .await
+            .unwrap();
+
+        let current = dataset.load_indices_by_name(index_name).await.unwrap();
+        assert_eq!(current.len(), 1);
+        let original_uuid = current[0].uuid;
+        let mut legacy = current.clone();
+        legacy[0].index_details = None;
+        legacy[0].index_version = 0;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: legacy,
+                removed_indices: current,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let append_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            append_reader,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+
+        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let replacement = dataset
+            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .fragments(vec![fragments[1].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let version_before = dataset.manifest.version;
+        let error = dataset
+            .commit_existing_index_segments(index_name, "id", vec![replacement])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected invalid input error, got: {error}"
+        );
+        assert!(error.to_string().contains("from type '<unknown>'"));
+        assert!(error.to_string().contains("partial fragment coverage"));
+        assert!(error.to_string().contains("missing current fragments [0]"));
+        assert_eq!(dataset.manifest.version, version_before);
+
+        let committed = dataset.load_indices_by_name(index_name).await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].uuid, original_uuid);
+        assert!(committed[0].index_details.is_none());
+        assert_eq!(committed[0].index_version, 0);
     }
 
     #[tokio::test]
