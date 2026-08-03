@@ -82,7 +82,7 @@
 //! they can be committed in any order.
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
@@ -2235,11 +2235,13 @@ pub async fn commit_compaction(
         .flat_map(|g| g.new_fragments.iter().cloned())
         .collect();
 
-    // Collect the index ids for the same reason, before they move into the
-    // transaction. `RemapResult::Keep` reports an index it did not rewrite as
-    // `new_id == old_id`; that directory belongs to the committed manifest, so
-    // only differing ids are ours to delete.
-    let new_index_ids: Vec<uuid::Uuid> = rewritten_indices
+    // Same for the index ids, before they move into the transaction. An index that
+    // was not rewritten comes back as `new_id == old_id` and is still referenced by
+    // the snapshot the remapper planned against, so only differing ids are ours to
+    // delete. That snapshot can be older than the current manifest, since a
+    // concurrent reindex leaves a kept id live in a present-but-not-latest version,
+    // so `cleanup_index_dirs` does not subsume this filter.
+    let minted_index_ids: Vec<uuid::Uuid> = rewritten_indices
         .iter()
         .filter(|rewritten| rewritten.new_id != rewritten.old_id)
         .map(|rewritten| rewritten.new_id)
@@ -2275,7 +2277,7 @@ pub async fn commit_compaction(
             &all_new_fragments,
         )
         .await;
-        cleanup_index_dirs(dataset, &new_index_ids).await;
+        cleanup_index_dirs(dataset, &minted_index_ids).await;
         return Err(e);
     }
 
@@ -2284,17 +2286,28 @@ pub async fn commit_compaction(
 
 /// Removes index directories left behind by a transaction that failed to commit.
 ///
-/// Callers must only pass ids no manifest references. That holds for ids minted
-/// by the failed transaction, since they are only discoverable through the
-/// manifest it never published — with the same caveat as
-/// [`cleanup_data_fragments`](super::cleanup_data_fragments): a commit handler
-/// can fail after the manifest reached its final path, so `Err` is strong but
-/// not absolute evidence.
+/// Ids the current manifest references are skipped, since [`IndexRemapper`] is
+/// public and a caller-supplied one can report an already-committed uuid. Ids
+/// minted by the failed transaction carry the same caveat as
+/// [`cleanup_data_fragments`]: a commit handler can fail after the manifest
+/// reached its final path, and this handle still holds the pre-commit manifest,
+/// so `Err` is strong but not absolute evidence that nothing references them.
 ///
-/// Errors are logged, not returned: the commit error is what the caller needs,
-/// and a directory left behind only costs space until the next cleanup.
+/// Errors are logged, not returned, so they cannot mask the commit error. A
+/// failure to read the index list skips deletion rather than risk a live
+/// directory.
 async fn cleanup_index_dirs(dataset: &Dataset, index_ids: &[uuid::Uuid]) {
+    let committed_index_ids: HashSet<uuid::Uuid> = match dataset.load_indices().await {
+        Ok(indices) => indices.iter().map(|index| index.uuid).collect(),
+        Err(err) => {
+            warn!("Skipping index cleanup, could not read the index list: {err}");
+            return;
+        }
+    };
     for id in index_ids {
+        if committed_index_ids.contains(id) {
+            continue;
+        }
         let dir = dataset.indices_dir().join(id.to_string());
         match dataset.object_store.remove_dir_all(dir.clone()).await {
             Ok(()) => {
@@ -2304,7 +2317,7 @@ async fn cleanup_index_dirs(dataset: &Dataset, index_ids: &[uuid::Uuid]) {
             // directory, so a missing one is expected rather than a problem.
             Err(err) if err.is_not_found() => {}
             Err(err) => {
-                log::warn!("Failed to clean up orphaned index directory {dir}: {err}");
+                warn!("Failed to clean up orphaned index directory {dir}: {err}");
             }
         }
     }
@@ -2465,27 +2478,27 @@ mod tests {
     /// Reports a fixed remap result for any row map, for tests that care about
     /// the returned ids rather than the address mapping.
     #[derive(Debug, Clone)]
-    struct FixedRemap {
+    struct FixedRemapper {
         answer: Vec<RemappedIndex>,
     }
 
     #[async_trait]
-    impl IndexRemapper for FixedRemap {
+    impl IndexRemapper for FixedRemapper {
         async fn remap_indices(&self, _: RowAddrRemap, _: &[u64]) -> Result<Vec<RemappedIndex>> {
             Ok(self.answer.clone())
         }
     }
 
     #[async_trait]
-    impl IndexRemapperOptions for FixedRemap {
+    impl IndexRemapperOptions for FixedRemapper {
         async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
             Ok(Some(Box::new(self.clone())))
         }
     }
 
-    /// Only `old_id`/`new_id` are read by the cleanup path, and the failing
-    /// commit never serializes the rest.
-    fn mock_remapped_index(old_id: Uuid, new_id: Uuid) -> RemappedIndex {
+    /// A `RemappedIndex` with placeholder details; only `old_id`/`new_id` reach
+    /// the cleanup path.
+    fn remapped_index(old_id: Uuid, new_id: Uuid) -> RemappedIndex {
         RemappedIndex {
             old_id,
             new_id,
@@ -7171,8 +7184,7 @@ mod tests {
         count_all_files_in(&data_dir).unwrap_or(0)
     }
 
-    /// Names of the `_indices/{uuid}/` directories on disk. A set rather than a
-    /// count, so deleting the wrong directory cannot pass.
+    /// Names of the `_indices/{uuid}/` directories on disk.
     fn index_dirs_in(base_dir: &str) -> HashSet<String> {
         let indices_dir = std::path::Path::new(base_dir).join("_indices");
         let Ok(entries) = std::fs::read_dir(&indices_dir) else {
@@ -7266,9 +7278,8 @@ mod tests {
     }
 
     /// A failed commit must also reclaim the `_indices/{uuid}/` directory
-    /// `remap_indices` wrote. Needs address-style row ids and an existing index,
-    /// otherwise `needs_remapping` is false and no directory is written — the
-    /// data-file test above takes that shortcut deliberately.
+    /// `remap_indices` wrote. Requires address-style row ids and an existing
+    /// index; otherwise `needs_remapping` is false and no directory is written.
     #[tokio::test]
     async fn test_commit_compaction_cleans_up_indices_on_commit_failure() {
         use crate::dataset::builder::DatasetBuilder;
@@ -7301,7 +7312,6 @@ mod tests {
         // transaction, which would consume the injected failure counter.
         create_scalar_index(&mut dataset, "a", false).await;
         let index_dirs_before = index_dirs_in(test_uri);
-        // Guards the assertion below against passing on an empty directory.
         assert_eq!(
             index_dirs_before.len(),
             1,
@@ -7337,8 +7347,7 @@ mod tests {
         let err = compact_files(&mut dataset, options, None)
             .await
             .expect_err("Compaction should fail when transaction commit fails");
-        // Pin the failure to the injected error: failing earlier than
-        // `apply_commit` would leave this test green but vacuous.
+        // A failure before `apply_commit` would make this test vacuous.
         assert!(
             err.to_string().contains("injected commit failure"),
             "expected the injected commit failure, got {err}"
@@ -7350,8 +7359,7 @@ mod tests {
             "Only the index directory written by the failed commit should be removed"
         );
 
-        // Deleting the live directory instead of the orphan keeps the set size
-        // right but breaks every query that scans the index.
+        // The surviving directory must still serve queries, not just exist.
         let dataset = DatasetBuilder::from_uri(&routed_uri).load().await.unwrap();
         dataset
             .scan()
@@ -7364,11 +7372,9 @@ mod tests {
             .expect("index should still be usable after the failed compaction");
     }
 
-    /// An index reported as `RemapResult::Keep` comes back with
-    /// `new_id == old_id` and points at the directory the committed manifest
-    /// still uses, so the `new_id != old_id` filter must exclude it. Reaching
-    /// that arm for real needs a fully-deleted fragment bitmap; a stub remapper
-    /// reports both shapes directly.
+    /// An index left alone comes back as `new_id == old_id` and still belongs to
+    /// the committed manifest, so the `new_id != old_id` filter must exclude it.
+    /// A stub remapper reports both cases without a fully-deleted fragment bitmap.
     #[tokio::test]
     async fn test_commit_compaction_keeps_index_dirs_it_did_not_write() {
         use crate::dataset::builder::DatasetBuilder;
@@ -7395,12 +7401,9 @@ mod tests {
         .unwrap();
 
         // Compaction only reaches a remapper when an index exists. Neither stub
-        // entry reports this index, so its directory also checks that cleanup
-        // touches only reported ids.
+        // entry reports it, so its directory must survive too.
         create_scalar_index(&mut dataset, "a", false).await;
 
-        // `kept_id` mimics an index left alone; `rewritten_id` one that was
-        // rewritten.
         let kept_id = Uuid::new_v4();
         let rewritten_old_id = Uuid::new_v4();
         let rewritten_id = Uuid::new_v4();
@@ -7413,12 +7416,10 @@ mod tests {
                 .unwrap();
         }
 
-        // `MockIndexRemapper` asserts on the exact row map, which is irrelevant
-        // here.
-        let mock_remapper = Arc::new(FixedRemap {
+        let mock_remapper = Arc::new(FixedRemapper {
             answer: vec![
-                mock_remapped_index(kept_id, kept_id),
-                mock_remapped_index(rewritten_old_id, rewritten_id),
+                remapped_index(kept_id, kept_id),
+                remapped_index(rewritten_old_id, rewritten_id),
             ],
         });
 
@@ -7468,8 +7469,7 @@ mod tests {
 
     /// The fragment-reuse arm: under `defer_index_remap`, details larger than the
     /// inline threshold get their own `_indices/{uuid}/` directory before the
-    /// commit. These are the orphans #7207 reports from deferred-remap
-    /// deployments.
+    /// commit.
     #[tokio::test]
     async fn test_commit_compaction_cleans_up_frag_reuse_index_on_commit_failure() {
         use crate::dataset::builder::DatasetBuilder;
