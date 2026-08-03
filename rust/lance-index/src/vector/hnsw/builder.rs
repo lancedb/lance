@@ -61,7 +61,7 @@ pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
-    /// max level ofm
+    /// Maximum number of levels in the graph.
     pub max_level: u16,
 
     /// number of connections to establish while inserting new element
@@ -97,14 +97,14 @@ impl Default for HnswBuildParams {
 
 impl HnswBuildParams {
     /// The maximum level of the graph.
-    /// The default value is `8`.
+    /// The default value is `7`.
     pub fn max_level(mut self, max_level: u16) -> Self {
         self.max_level = max_level;
         self
     }
 
     /// The number of connections to establish while inserting new element
-    /// The default value is `30`.
+    /// The default value is `20`.
     pub fn num_edges(mut self, m: usize) -> Self {
         self.m = m;
         self
@@ -113,10 +113,39 @@ impl HnswBuildParams {
     /// Number of candidates to be considered when searching for the nearest neighbors
     /// during the construction of the graph.
     ///
-    /// The default value is `100`.
+    /// The default value is `150`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
         self
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.max_level == 0 {
+            return Err(Error::invalid_input(format!(
+                "HnswBuildParams::max_level must be greater than 0, got {}",
+                self.max_level
+            )));
+        }
+        if self.m <= 1 {
+            return Err(Error::invalid_input(format!(
+                "HnswBuildParams::m must be greater than 1, got {}",
+                self.m
+            )));
+        }
+        if self.m > usize::MAX / 2 {
+            return Err(Error::invalid_input(format!(
+                "HnswBuildParams::m must be at most {} so the level-0 reciprocal limit can be represented, got {}",
+                usize::MAX / 2,
+                self.m
+            )));
+        }
+        if self.ef_construction < self.m {
+            return Err(Error::invalid_input(format!(
+                "HnswBuildParams::ef_construction must be at least m ({}), got {}",
+                self.m, self.ef_construction
+            )));
+        }
+        Ok(())
     }
 
     /// Build the HNSW index from the given data.
@@ -708,6 +737,10 @@ impl HnswBuilder {
         let mut nodes = Vec::with_capacity(len);
         {
             if len > 0 {
+                // The offline builder inserts the remaining nodes in parallel, so
+                // node 0 is a fixed full-height anchor instead of a dynamically
+                // promoted entry point. This intentional construction variant lets
+                // every worker traverse every configured level from a valid node.
                 nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
             }
             let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
@@ -773,7 +806,9 @@ impl HnswBuilder {
                 for neighbor in &neighbors {
                     current_node.add_neighbor(neighbor.id, neighbor.dist, level);
                 }
-                self.prune(storage, &mut current_node, level);
+                // Algorithm 1 selects M neighbors for the new node. Mmax0 is
+                // reserved for reciprocal edges on existing level-0 nodes.
+                self.prune(storage, &mut current_node, level, self.params.m);
                 pruned_neighbors_per_level[level as usize]
                     .clone_from(&current_node.level_neighbors_ranked[level as usize]);
 
@@ -781,22 +816,19 @@ impl HnswBuilder {
             }
         }
         for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
-            for unpruned_edge in pruned_neighbors {
-                let level = level as u16;
-                let m_max = match level {
-                    0 => self.params.m * 2,
-                    _ => self.params.m,
-                };
-                if unpruned_edge.dist
-                    < nodes[unpruned_edge.id as usize]
-                        .read()
-                        .unwrap()
-                        .cutoff(level, m_max)
-                {
-                    let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
-                    chosen_node.add_neighbor(node, unpruned_edge.dist, level);
-                    self.prune(storage, &mut chosen_node, level);
-                }
+            let level = level as u16;
+            let reciprocal_limit = if level == 0 {
+                self.params.m * 2
+            } else {
+                self.params.m
+            };
+            for selected_edge in pruned_neighbors {
+                // Algorithm 1 adds the reciprocal candidate before applying
+                // SELECT-NEIGHBORS. A distance-only cutoff would incorrectly
+                // discard farther candidates that improve directional diversity.
+                let mut chosen_node = nodes[selected_edge.id as usize].write().unwrap();
+                chosen_node.add_neighbor(node, selected_edge.dist, level);
+                self.prune(storage, &mut chosen_node, level, reciprocal_limit);
             }
         }
     }
@@ -828,20 +860,22 @@ impl HnswBuilder {
         )
     }
 
-    fn prune(&self, storage: &impl VectorStore, builder_node: &mut GraphBuilderNode, level: u16) {
-        let m_max = match level {
-            0 => self.params.m * 2,
-            _ => self.params.m,
-        };
-
+    fn prune(
+        &self,
+        storage: &impl VectorStore,
+        builder_node: &mut GraphBuilderNode,
+        level: u16,
+        max_connections: usize,
+    ) {
         let neighbors_ranked = &mut builder_node.level_neighbors_ranked[level as usize];
-        if neighbors_ranked.len() <= m_max {
+        if neighbors_ranked.len() <= max_connections {
             builder_node.update_from_ranked_neighbors(level);
             return;
         }
 
         let level_neighbors = std::mem::take(neighbors_ranked);
-        *neighbors_ranked = select_neighbors_heuristic_owned(storage, level_neighbors, m_max);
+        *neighbors_ranked =
+            select_neighbors_heuristic_owned(storage, level_neighbors, max_connections);
         builder_node.update_from_ranked_neighbors(level);
     }
 }
@@ -941,12 +975,12 @@ enum LevelLookup {
     /// `__vector_id` column.
     ///
     /// We do *not* assume the column is sorted or that the slice is aligned
-    /// to a true level boundary: `level_offsets`/`level_count` omit the
-    /// entry-point node (it is written at every level by `to_batch` but only
-    /// counted at level 0), so upper-level slices can be off-by-one and
-    /// non-monotonic. Keying by the `__vector_id` value -- exactly what the
-    /// old per-node `load` did -- preserves behavior bit-for-bit. Upper
-    /// levels shrink geometrically, so this map stays tiny.
+    /// to a true level boundary. Writers before the level-count fix omitted
+    /// the full-height entry point from upper-level counts, so their slices
+    /// can be misaligned and non-monotonic. Keying by the `__vector_id` value
+    /// -- exactly what the old per-node `load` did -- preserves that legacy
+    /// read behavior. Upper levels shrink geometrically, so this map stays
+    /// tiny.
     Sparse(HashMap<u32, u32>),
 }
 
@@ -1360,6 +1394,7 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
+        params.validate()?;
         let builder = HnswBuilder::with_params(params, storage);
 
         log::debug!(
@@ -1376,7 +1411,11 @@ impl IvfSubIndex for HNSW {
         }
 
         let len = storage.len();
-        builder.level_count[0].fetch_add(1, Ordering::Relaxed);
+        // The fixed entry point is emitted at every configured level, so its
+        // contribution must be present in every persisted level boundary.
+        for count in &builder.level_count {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
         (1..len).into_par_iter().for_each_init(
             || VisitedGenerator::new(len),
             |visited_generator, node| {
@@ -1479,10 +1518,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+    };
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::deepsize::DeepSizeOf;
+    use lance_core::{Error, deepsize::DeepSizeOf};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader,
         writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
@@ -1495,7 +1536,7 @@ mod tests {
     use object_store::path::Path;
     use rstest::rstest;
 
-    use super::{HnswGraph, ImmutableHnswBottomView, ImmutableHnswLevelView};
+    use super::{HnswBuilder, HnswGraph, ImmutableHnswBottomView, ImmutableHnswLevelView};
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
@@ -1641,6 +1682,83 @@ mod tests {
             .collect();
         all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         all.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    #[rstest]
+    #[case::zero_max_level(
+        HnswBuildParams::default().max_level(0),
+        "max_level must be greater than 0"
+    )]
+    #[case::zero_m(
+        HnswBuildParams::default().num_edges(0),
+        "m must be greater than 1"
+    )]
+    #[case::one_m(
+        HnswBuildParams::default().num_edges(1),
+        "m must be greater than 1"
+    )]
+    #[case::small_ef(
+        HnswBuildParams::default().num_edges(20).ef_construction(19),
+        "ef_construction must be at least m (20)"
+    )]
+    #[case::overflowing_level_zero_limit(
+        HnswBuildParams::default()
+            .num_edges(usize::MAX)
+            .ef_construction(usize::MAX),
+        "level-0 reciprocal limit can be represented"
+    )]
+    fn test_rejects_invalid_build_params(
+        #[case] params: HnswBuildParams,
+        #[case] expected_message: &str,
+    ) {
+        let fsl =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, 0.0]), 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+
+        let error = HNSW::index_vectors(&store, params).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Algorithm 1 limits a newly inserted node to M connections even on
+    /// level 0. The larger Mmax0 limit only applies when old nodes receive
+    /// reciprocal connections.
+    #[test]
+    fn test_new_node_uses_m_connections() {
+        // Four equidistant, mutually diverse points around the final point.
+        // With the old shared Mmax0 limit, node 4 retained all four.
+        let values = Float32Array::from(vec![
+            1.0, 0.0, // east
+            0.0, 1.0, // north
+            -1.0, 0.0, // west
+            0.0, -1.0, // south
+            0.0, 0.0, // final node
+        ]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .max_level(1)
+            .num_edges(2)
+            .ef_construction(5);
+        let builder = HnswBuilder::with_params(params, &store);
+        let mut visited_generator = VisitedGenerator::new(store.len());
+
+        for node in 1..store.len() as u32 {
+            builder.insert(node, &mut visited_generator, &store);
+        }
+
+        let final_node = builder.nodes[4].read().unwrap();
+        assert_eq!(final_node.level_neighbors_ranked[0].len(), 2);
+        assert!(
+            builder
+                .nodes
+                .iter()
+                .all(|node| node.read().unwrap().level_neighbors_ranked[0].len() <= 4),
+            "existing level-0 nodes must remain bounded by Mmax0"
+        );
     }
 
     /// The Arrow-backed loaded graph must search bit-identically to the
@@ -2063,17 +2181,13 @@ mod tests {
         assert_eq!(got, expected);
     }
 
-    /// Regression guard for the `level_offsets` misalignment (issue #6746).
-    /// `to_batch` writes the entry-point node at *every* level, but
-    /// `level_count` only counts it at level 0, so the serialized batch has
-    /// strictly more rows than `sum(level_count)` and the upper-level
-    /// `level_offsets` slices are off-by-one / non-monotonic. The Arrow-backed
-    /// loaded graph must still search bit-identically to the in-memory build:
-    /// it keys upper levels by `__vector_id` value via the `Sparse` map
-    /// (last-write-wins), never `row == id`. A naive `row == id`
-    /// reimplementation would pass the small cases but break here.
+    /// Regression guard for the `level_offsets` misalignment in #5156.
+    /// Every serialized row must belong to exactly one level slice, and the
+    /// corrected slices must preserve built-versus-loaded search parity for
+    /// non-entry-point queries. Legacy files retain their old metadata and
+    /// continue to use the sparse `__vector_id` lookup above.
     #[tokio::test]
-    async fn test_loaded_level_offsets_misalignment_invariant() {
+    async fn test_level_offsets_match_serialized_rows() {
         use arrow::array::AsArray;
         use arrow::datatypes::UInt32Type;
 
@@ -2100,16 +2214,7 @@ mod tests {
         let md = builder.metadata();
         let total_counted = *md.level_offsets.last().unwrap();
 
-        // The exact misalignment: more serialized rows than `level_count` sums
-        // to, because the entry-point node is written at every level yet
-        // counted only at level 0.
-        assert!(
-            batch.num_rows() > total_counted,
-            "expected serialized rows ({}) to exceed sum(level_count) ({}) -- \
-             entry point should be written at every level",
-            batch.num_rows(),
-            total_counted,
-        );
+        assert_eq!(batch.num_rows(), total_counted);
 
         // Level-0 slice must still be exactly `[0, N)` with
         // `__vector_id == row` -- the precondition for `LevelLookup::Dense`.
@@ -2125,9 +2230,7 @@ mod tests {
             "level-0 __vector_id must equal the row index",
         );
 
-        // Despite the surplus rows and off-by-one upper slices, the loaded
-        // graph searches bit-identically to the in-memory build (old `load`
-        // semantics preserved via the `Sparse` last-write-wins map).
+        // Correct upper-level slices search identically before and after load.
         let loaded = HNSW::load(batch).unwrap();
         assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
         let params = HnswQueryParams {
@@ -2137,14 +2240,16 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let query = fsl.value(0);
-        let builder_results = builder
-            .search_basic(query.clone(), 10, &params, None, store.as_ref())
-            .unwrap();
-        let loaded_results = loaded
-            .search_basic(query, 10, &params, None, store.as_ref())
-            .unwrap();
-        assert_eq!(builder_results, loaded_results);
+        for query_index in [1, TOTAL / 3, TOTAL - 1] {
+            let query = fsl.value(query_index);
+            let builder_results = builder
+                .search_basic(query.clone(), 10, &params, None, store.as_ref())
+                .unwrap();
+            let loaded_results = loaded
+                .search_basic(query, 10, &params, None, store.as_ref())
+                .unwrap();
+            assert_eq!(builder_results, loaded_results);
+        }
     }
 
     /// `load()` must reject a batch whose level-0 `__vector_id` no longer

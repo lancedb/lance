@@ -97,22 +97,6 @@ impl OnlineGraphBuilderNode {
         ranked[level as usize].push(OrderedNode { dist, id: v });
     }
 
-    fn cutoff(&self, level: u16, max_size: usize) -> OrderedFloat {
-        if !self.has_level(level) {
-            return OrderedFloat(f32::NEG_INFINITY);
-        }
-        let ranked = self
-            .level_neighbors_ranked
-            .lock()
-            .expect("level_neighbors_ranked mutex poisoned");
-        let neighbors = &ranked[level as usize];
-        if neighbors.len() < max_size {
-            OrderedFloat(f32::INFINITY)
-        } else {
-            neighbors.last().unwrap().dist
-        }
-    }
-
     /// Rebuild `level_neighbors[level]` from the current ranked list and
     /// publish it via `ArcSwap`. Also updates `bottom_neighbors` for level 0.
     fn publish_from_ranked(&self, level: u16) {
@@ -284,7 +268,9 @@ impl OnlineHnswBuilder {
                 }
                 current_node.add_neighbor(neighbor.id, neighbor.dist, level);
             }
-            self.prune(storage, current_node, level);
+            // New nodes select M connections at every level. The larger
+            // level-0 limit applies only to reciprocal edges on old nodes.
+            self.prune(storage, current_node, level, self.params.m);
             // Snapshot the pruned ranked list before publishing.
             let snapshot = {
                 let ranked = current_node
@@ -310,18 +296,16 @@ impl OnlineHnswBuilder {
         // Add reverse edges to chosen neighbors, prune them too.
         for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
             let level = level as u16;
-            let m_max = if level == 0 {
+            let reciprocal_limit = if level == 0 {
                 self.params.m * 2
             } else {
                 self.params.m
             };
-            for unpruned_edge in pruned_neighbors {
-                let chosen = &nodes[unpruned_edge.id as usize];
-                if unpruned_edge.dist < chosen.cutoff(level, m_max) {
-                    chosen.add_neighbor(id, unpruned_edge.dist, level);
-                    self.prune(storage, chosen, level);
-                    chosen.publish_from_ranked(level);
-                }
+            for selected_edge in pruned_neighbors {
+                let chosen = &nodes[selected_edge.id as usize];
+                chosen.add_neighbor(id, selected_edge.dist, level);
+                self.prune(storage, chosen, level, reciprocal_limit);
+                chosen.publish_from_ranked(level);
             }
         }
 
@@ -368,22 +352,23 @@ impl OnlineHnswBuilder {
         )
     }
 
-    fn prune(&self, storage: &impl VectorStore, node: &OnlineGraphBuilderNode, level: u16) {
-        let m_max = if level == 0 {
-            self.params.m * 2
-        } else {
-            self.params.m
-        };
-
+    fn prune(
+        &self,
+        storage: &impl VectorStore,
+        node: &OnlineGraphBuilderNode,
+        level: u16,
+        max_connections: usize,
+    ) {
         let mut ranked = node
             .level_neighbors_ranked
             .lock()
             .expect("level_neighbors_ranked mutex poisoned");
         let level_neighbors = ranked[level as usize].clone();
-        if level_neighbors.len() <= m_max {
+        if level_neighbors.len() <= max_connections {
             return;
         }
-        ranked[level as usize] = select_neighbors_heuristic(storage, &level_neighbors, m_max);
+        ranked[level as usize] =
+            select_neighbors_heuristic(storage, &level_neighbors, max_connections);
     }
 
     /// Search the graph for the k nearest neighbors of `query`.
@@ -568,7 +553,7 @@ impl Graph for OnlineHnswBottomView<'_> {
 mod tests {
     use super::*;
     use crate::vector::flat::storage::FlatFloatStorage;
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{FixedSizeListArray, Float32Array};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array;
@@ -695,5 +680,40 @@ mod tests {
         let (storage, fsl) = build_storage(1, 8);
         let results = builder.search(fsl.value(0), 10, 32, storage.as_ref());
         assert!(results.is_empty());
+    }
+
+    /// Online construction uses the same Algorithm 1 distinction as the
+    /// offline builder: M for a new node and Mmax0 for reciprocal edges.
+    #[test]
+    fn test_online_new_node_uses_m_connections() {
+        let values = Float32Array::from(vec![
+            1.0, 0.0, // east
+            0.0, 1.0, // north
+            -1.0, 0.0, // west
+            0.0, -1.0, // south
+            0.0, 0.0, // final node
+        ]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let storage = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .max_level(1)
+            .num_edges(2)
+            .ef_construction(5);
+        let builder = OnlineHnswBuilder::with_capacity(5, params);
+
+        for id in 0..5 {
+            builder.insert(id, &storage);
+        }
+
+        let final_node = builder.nodes[4].level_neighbors_ranked.lock().unwrap();
+        assert_eq!(final_node[0].len(), 2);
+        drop(final_node);
+        assert!(
+            builder
+                .nodes
+                .iter()
+                .all(|node| { node.level_neighbors_ranked.lock().unwrap()[0].len() <= 4 }),
+            "existing level-0 nodes must remain bounded by Mmax0"
+        );
     }
 }

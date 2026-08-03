@@ -321,6 +321,10 @@ macro_rules! beam_search_loop {
                 }
                 $visited.insert(neighbor);
                 let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
+                // Algorithm 2 refreshes the furthest result after every
+                // update to W, including updates made by an earlier neighbor
+                // of this same expanded node.
+                let furthest = furthest_distance(&$results);
                 if dist <= furthest || $results.len() < $k {
                     if $accepts_result(neighbor, dist) {
                         push_result(&mut $results, (dist, neighbor).into(), $k);
