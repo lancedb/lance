@@ -369,11 +369,14 @@ impl JsonTrainingRequest {
         // for unordered input instead and let `train_index` sort the extracted value
         // stream itself, once, right before handing it to the target trainer.
         //
-        // This is safe for `Addresses` too: `scan_training_data` only special-cases
-        // `Values` (it calls `order_by` only then); an `Addresses` or `None` criteria
-        // both fall through to the same unordered-scan behavior, since the scan already
+        // Preserve `Addresses` so callers must still provide the ordering required by
+        // target trainers such as ZoneMap, even though the dataset scanner currently
         // returns rows in row-address order by default.
-        let mut criteria = TrainingCriteria::new(TrainingOrdering::None);
+        let ordering = match target_criteria.ordering {
+            TrainingOrdering::Values => TrainingOrdering::None,
+            ordering => ordering,
+        };
+        let mut criteria = TrainingCriteria::new(ordering);
         criteria.needs_row_ids = target_criteria.needs_row_ids;
         criteria.needs_row_addrs = target_criteria.needs_row_addrs;
         Self {
@@ -1063,6 +1066,7 @@ mod tests {
     async fn train_and_load_json_index(
         store: Arc<dyn IndexStore>,
         target_index_type: &str,
+        expected_ordering: TrainingOrdering,
         path: &str,
         json_docs: &[&str],
     ) -> Arc<dyn ScalarIndex> {
@@ -1081,11 +1085,7 @@ mod tests {
             )
             .unwrap();
 
-        // The scanner must be asked for unordered input: only this plugin knows the
-        // order of the extracted value, so sorting on the raw JSON column would be
-        // wasted work that either goes unused (non-`Values` targets) or still leaves
-        // the extracted stream unsorted (`Values` targets, see below).
-        assert_eq!(request.criteria().ordering, TrainingOrdering::None);
+        assert_eq!(request.criteria().ordering, expected_ordering);
 
         let jsonb: Vec<Vec<u8>> = json_docs
             .iter()
@@ -1149,14 +1149,18 @@ mod tests {
 
     /// Regression test for https://github.com/lance-format/lance/issues/7859.
     #[rstest]
-    #[case::zonemap("zonemap")]
-    #[case::fm("fm")]
+    #[case::zonemap("zonemap", TrainingOrdering::Addresses)]
+    #[case::fm("fm", TrainingOrdering::None)]
     #[tokio::test]
-    async fn test_json_index_preserves_row_addresses(#[case] target_index_type: &str) {
+    async fn test_json_index_preserves_row_addresses(
+        #[case] target_index_type: &str,
+        #[case] expected_ordering: TrainingOrdering,
+    ) {
         let (store, _tmpdir) = local_json_index_store();
         let index = train_and_load_json_index(
             store,
             target_index_type,
+            expected_ordering,
             "value",
             &[
                 r#"{"value": "alpha"}"#,
@@ -1226,6 +1230,7 @@ mod tests {
         let index = train_and_load_json_index(
             store,
             "btree",
+            TrainingOrdering::None,
             "latitude",
             &[
                 r#"{"latitude": 10.5}"#,
@@ -1273,6 +1278,7 @@ mod tests {
         let index = train_and_load_json_index(
             store,
             "btree",
+            TrainingOrdering::None,
             "v",
             &[
                 r#"{"v": 40.1}"#,  // row 0
@@ -1345,6 +1351,7 @@ mod tests {
         let index = train_and_load_json_index(
             store,
             "ngram",
+            TrainingOrdering::None,
             "tag",
             &[
                 r#"{"tag": "unique-charlie"}"#,
