@@ -1975,13 +1975,21 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(request.uri().to_string());
-                let should_fail = self
-                    .state
-                    .failures_remaining
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok();
+                let mut remaining = self.state.failures_remaining.load(Ordering::SeqCst);
+                let should_fail = loop {
+                    let Some(next) = remaining.checked_sub(1) else {
+                        break false;
+                    };
+                    match self.state.failures_remaining.compare_exchange_weak(
+                        remaining,
+                        next,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break true,
+                        Err(actual) => remaining = actual,
+                    }
+                };
                 if should_fail {
                     (
                         ::http::StatusCode::SERVICE_UNAVAILABLE,

@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use object_store_opendal::OpendalStore;
-use opendal::Operator;
-use opendal::layers::RetryLayer;
+use opendal::raw::{
+    BoxedFuture, Layer, OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat,
+    OpWrite, RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo, Servicer, oio,
+};
+use opendal::{Buffer, Capability, Metadata, OperationContext, Operator, Result};
+use rand::Rng;
 
 fn max_retries() -> usize {
     static MAX_RETRIES: OnceLock<usize> = OnceLock::new();
@@ -18,15 +22,150 @@ fn max_retries() -> usize {
     })
 }
 
+async fn retry_writer_operation<T, W>(
+    writer: &mut W,
+    mut operation: impl for<'a> FnMut(&'a mut W) -> BoxedFuture<'a, Result<T>>,
+) -> Result<T>
+where
+    W: oio::Write,
+{
+    let mut retries = 0;
+    loop {
+        match operation(writer).await {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_temporary() && retries < max_retries() => {
+                retries += 1;
+                let delay = Duration::from_millis(rand::rng().random_range(2_000..8_000));
+                log::warn!(
+                    "Retrying OpenDAL writer operation after temporary error (attempt {}): {:?}",
+                    retries,
+                    error
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error.set_persistent()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RetryWriter<W> {
+    inner: W,
+}
+
+impl<W: oio::Write> oio::Write for RetryWriter<W> {
+    async fn write(&mut self, body: Buffer) -> Result<()> {
+        retry_writer_operation(&mut self.inner, move |writer| {
+            Box::pin(writer.write(body.clone()))
+        })
+        .await
+    }
+
+    async fn close(&mut self) -> Result<Metadata> {
+        retry_writer_operation(&mut self.inner, |writer| Box::pin(writer.close())).await
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        retry_writer_operation(&mut self.inner, |writer| Box::pin(writer.abort())).await
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WriterRetryService {
+    inner: Servicer,
+}
+
+impl Service for WriterRetryService {
+    type Reader = oio::Reader;
+    type Writer = RetryWriter<oio::Writer>;
+    type Lister = oio::Lister;
+    type Deleter = oio::Deleter;
+    type Copier = oio::Copier;
+
+    fn info(&self) -> ServiceInfo {
+        self.inner.info()
+    }
+
+    fn capability(&self) -> Capability {
+        self.inner.capability()
+    }
+
+    async fn create_dir(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpCreateDir,
+    ) -> Result<RpCreateDir> {
+        self.inner.create_dir(ctx, path, args).await
+    }
+
+    async fn stat(&self, ctx: &OperationContext, path: &str, args: OpStat) -> Result<RpStat> {
+        self.inner.stat(ctx, path, args).await
+    }
+
+    fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
+        self.inner.read(ctx, path, args)
+    }
+
+    fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
+        Ok(RetryWriter {
+            inner: self.inner.write(ctx, path, args)?,
+        })
+    }
+
+    fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
+        self.inner.delete(ctx)
+    }
+
+    fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+        self.inner.list(ctx, path, args)
+    }
+
+    fn copy(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpCopy,
+        opts: OpCopier,
+    ) -> Result<Self::Copier> {
+        self.inner.copy(ctx, from, to, args, opts)
+    }
+
+    async fn rename(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpRename,
+    ) -> Result<RpRename> {
+        self.inner.rename(ctx, from, to, args).await
+    }
+
+    async fn presign(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpPresign,
+    ) -> Result<RpPresign> {
+        self.inner.presign(ctx, path, args).await
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WriterRetryLayer;
+
+impl Layer for WriterRetryLayer {
+    fn apply_service(&self, inner: Servicer) -> Servicer {
+        Arc::new(WriterRetryService { inner })
+    }
+}
+
 /// Install retries beneath OpenDAL's writer so a retry reuses the same writer
-/// state and buffer instead of allocating another cloud multipart part.
-pub(crate) fn store_with_retry(operator: Operator) -> OpendalStore {
-    let retry_layer = RetryLayer::default()
-        .with_min_delay(Duration::from_secs(2))
-        .with_max_delay(Duration::from_secs(8))
-        .with_max_times(max_retries())
-        .with_jitter();
-    OpendalStore::new(operator.layer(retry_layer))
+/// state and buffer instead of allocating another cloud multipart part. Other
+/// operations remain unwrapped so they report throttle feedback to AIMD.
+pub fn store_with_retry(operator: Operator) -> OpendalStore {
+    OpendalStore::new(operator.layer(WriterRetryLayer))
 }
 
 #[cfg(test)]
@@ -38,7 +177,6 @@ mod tests {
     use object_store::path::Path;
     use object_store::{ObjectStoreExt, PutPayload};
     use opendal::raw::oio;
-    use opendal::raw::*;
     use opendal::{
         Buffer, Builder, Capability, EntryMode, Error, ErrorKind, Metadata, OperationContext,
         Result,
@@ -48,7 +186,9 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct TransientWriteBuilder {
-        attempts: Arc<AtomicUsize>,
+        write_attempts: Arc<AtomicUsize>,
+        writers_created: Arc<AtomicUsize>,
+        stat_attempts: Arc<AtomicUsize>,
         bodies: Arc<Mutex<Vec<Bytes>>>,
     }
 
@@ -57,7 +197,9 @@ mod tests {
 
         fn build(self) -> Result<impl Service> {
             Ok(TransientWriteService {
-                attempts: self.attempts,
+                write_attempts: self.write_attempts,
+                writers_created: self.writers_created,
+                stat_attempts: self.stat_attempts,
                 bodies: self.bodies,
             })
         }
@@ -65,7 +207,9 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct TransientWriteService {
-        attempts: Arc<AtomicUsize>,
+        write_attempts: Arc<AtomicUsize>,
+        writers_created: Arc<AtomicUsize>,
+        stat_attempts: Arc<AtomicUsize>,
         bodies: Arc<Mutex<Vec<Bytes>>>,
     }
 
@@ -98,7 +242,8 @@ mod tests {
         }
 
         async fn stat(&self, _: &OperationContext, _: &str, _: OpStat) -> Result<RpStat> {
-            Err(Error::new(ErrorKind::Unsupported, "stat is unsupported"))
+            self.stat_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(Error::new(ErrorKind::Unexpected, "429 Too Many Requests").set_temporary())
         }
 
         fn read(&self, _: &OperationContext, _: &str, _: OpRead) -> Result<Self::Reader> {
@@ -106,8 +251,9 @@ mod tests {
         }
 
         fn write(&self, _: &OperationContext, _: &str, _: OpWrite) -> Result<Self::Writer> {
+            self.writers_created.fetch_add(1, Ordering::SeqCst);
             Ok(TransientWriter {
-                attempts: Arc::clone(&self.attempts),
+                attempts: Arc::clone(&self.write_attempts),
                 bodies: Arc::clone(&self.bodies),
             })
         }
@@ -174,7 +320,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_retry_reuses_opendal_writer_and_body() {
         let builder = TransientWriteBuilder::default();
-        let attempts = Arc::clone(&builder.attempts);
+        let write_attempts = Arc::clone(&builder.write_attempts);
+        let writers_created = Arc::clone(&builder.writers_created);
         let bodies = Arc::clone(&builder.bodies);
         let operator = Operator::new(builder).unwrap();
         let store = store_with_retry(operator);
@@ -186,7 +333,8 @@ mod tests {
             .unwrap();
         upload.complete().await.unwrap();
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(writers_created.load(Ordering::SeqCst), 1);
+        assert_eq!(write_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             bodies.lock().unwrap().as_slice(),
             &[
@@ -194,5 +342,18 @@ mod tests {
                 Bytes::from_static(b"payload")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_retry_does_not_wrap_non_writer_operations() {
+        let builder = TransientWriteBuilder::default();
+        let stat_attempts = Arc::clone(&builder.stat_attempts);
+        let operator = Operator::new(builder).unwrap();
+        let store = store_with_retry(operator);
+
+        let error = store.head(&Path::from("object")).await.unwrap_err();
+
+        assert!(error.to_string().contains("429 Too Many Requests"));
+        assert_eq!(stat_attempts.load(Ordering::SeqCst), 1);
     }
 }
