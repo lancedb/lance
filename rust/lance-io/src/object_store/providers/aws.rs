@@ -22,6 +22,9 @@ use object_store::{
         AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
         AwsCredentialProvider,
     },
+    client::{
+        HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService,
+    },
 };
 use tokio::sync::RwLock;
 use url::Url;
@@ -37,6 +40,67 @@ use lance_core::error::{Error, Result};
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
 
+// Opt-in because reqwest does not strip every supported credential source on a
+// cross-authority redirect. The guarded mode accepts only static AWS credentials
+// without custom headers and rejects sensitive GET headers before dispatch.
+const CREDENTIAL_SAFE_REDIRECTS_OPTION: &str = "s3_allow_credential_safe_redirects";
+
+#[derive(Debug)]
+struct CredentialSafeRedirectConnector<C> {
+    inner: C,
+}
+
+impl<C> CredentialSafeRedirectConnector<C> {
+    fn new(inner: C) -> Self {
+        Self { inner }
+    }
+}
+
+impl<C: HttpConnector> HttpConnector for CredentialSafeRedirectConnector<C> {
+    fn connect(&self, options: &ClientOptions) -> ObjectStoreResult<HttpClient> {
+        Ok(HttpClient::new(CredentialSafeRedirectService {
+            inner: self.inner.connect(options)?,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct CredentialSafeRedirectService {
+    inner: HttpClient,
+}
+
+#[async_trait::async_trait]
+impl HttpService for CredentialSafeRedirectService {
+    async fn call(&self, mut request: HttpRequest) -> std::result::Result<HttpResponse, HttpError> {
+        if request.method() != http::Method::GET {
+            return self.inner.execute(request).await;
+        }
+        if let Some(header) = request.headers().keys().find(|header| {
+            matches!(
+                header.as_str(),
+                "x-amz-security-token" | "x-amz-s3session-token"
+            ) || header
+                .as_str()
+                .contains("server-side-encryption-customer-key")
+        }) {
+            return Err(HttpError::new(
+                HttpErrorKind::Unknown,
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "S3 credential-safe redirects do not allow sensitive header '{header}'"
+                    ),
+                ),
+            ));
+        }
+        // object_store 0.13 signs Host by inserting it into the outgoing GET.
+        // Let the HTTP client derive Host from each URL so a cross-authority
+        // redirect cannot retain the gateway authority.
+        request.headers_mut().remove(http::header::HOST);
+        self.inner.execute(request).await
+    }
+}
+
 impl AwsStoreProvider {
     async fn build_amazon_s3_store(
         &self,
@@ -46,6 +110,25 @@ impl AwsStoreProvider {
         is_s3_express: bool,
         throttle_state: Option<&AimdThrottleState>,
     ) -> Result<Arc<dyn OSObjectStore>> {
+        let allow_credential_safe_redirects = storage_options
+            .get(CREDENTIAL_SAFE_REDIRECTS_OPTION)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        if allow_credential_safe_redirects && is_s3_express {
+            return Err(Error::invalid_input(
+                "S3 credential-safe redirects do not support S3 Express session credentials",
+            ));
+        }
+        if allow_credential_safe_redirects
+            && let Some(header) = storage_options
+                .0
+                .keys()
+                .find_map(|key| key.strip_prefix("headers."))
+        {
+            return Err(Error::invalid_input(format!(
+                "S3 credential-safe redirects do not support custom header '{header}'"
+            )));
+        }
+
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -95,7 +178,12 @@ impl AwsStoreProvider {
             .with_retry(retry_config)
             .with_region(region);
 
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
+        let connector = cloud_http_connector(throttle_state, store_prefix);
+        if allow_credential_safe_redirects {
+            builder = builder.with_http_connector(CredentialSafeRedirectConnector::new(connector));
+        } else {
+            builder = builder.with_http_connector(connector);
+        }
 
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
     }
@@ -484,10 +572,182 @@ mod tests {
     use crate::object_store::ObjectStoreRegistry;
     use crate::object_store::StorageOptionsProvider;
     use mock_instant::thread_local::MockClock;
+    use object_store::ObjectStoreExt;
     use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "connection closed before request headers");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn redirect_storage_options(endpoint: String) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "aws_access_key_id".to_string(),
+                "test-access-key".to_string(),
+            ),
+            (
+                "aws_secret_access_key".to_string(),
+                "test-secret-key".to_string(),
+            ),
+            ("aws_endpoint".to_string(), endpoint),
+            ("aws_region".to_string(), "us-east-1".to_string()),
+            ("allow_http".to_string(), "true".to_string()),
+            (
+                CREDENTIAL_SAFE_REDIRECTS_OPTION.to_string(),
+                "true".to_string(),
+            ),
+        ])
+    }
+
+    #[rstest::rstest]
+    #[case::s3_express("s3_express", "true", "do not support S3 Express session credentials")]
+    #[case::custom_gateway_credential(
+        "headers.x-api-key",
+        "gateway-api-secret",
+        "do not support custom header 'x-api-key'"
+    )]
+    #[tokio::test]
+    async fn test_redirect_option_rejects_unproven_credential_sources(
+        #[case] option_key: &str,
+        #[case] option_value: &str,
+        #[case] expected_message: &str,
+    ) {
+        let mut options = redirect_storage_options("http://127.0.0.1:1".to_string());
+        options.insert(option_key.to_string(), option_value.to_string());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+
+        let error = AwsStoreProvider
+            .new_store(Url::parse("s3://test-bucket").unwrap(), &params)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_storage_option_follows_credential_safe_range_redirect() {
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_addr = destination.local_addr().unwrap();
+        let destination_task = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 7-7/8\r\nConnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+            request
+        });
+
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        let gateway_task = tokio::spawn(async move {
+            let (mut stream, _) = gateway.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{destination_addr}/object\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                redirect_storage_options(format!("http://{gateway_addr}")),
+            ))),
+            ..Default::default()
+        };
+        let store = AwsStoreProvider
+            .new_store(Url::parse("s3://test-bucket").unwrap(), &params)
+            .await
+            .unwrap();
+        let bytes = store
+            .inner
+            .get_range(&Path::from("object"), 7..8)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"x");
+
+        let gateway_request = gateway_task.await.unwrap().to_ascii_lowercase();
+        assert!(gateway_request.contains(&format!("host: {gateway_addr}").to_ascii_lowercase()));
+        assert!(gateway_request.contains("authorization: aws4-hmac-sha256 credential="));
+        assert!(gateway_request.contains("range: bytes=7-7"));
+
+        let destination_request = destination_task.await.unwrap().to_ascii_lowercase();
+        assert!(
+            destination_request.contains(&format!("host: {destination_addr}").to_ascii_lowercase())
+        );
+        assert!(destination_request.contains("range: bytes=7-7"));
+        assert!(!destination_request.contains("authorization:"));
+        assert!(!destination_request.contains("x-amz-security-token:"));
+    }
+
+    #[rstest::rstest]
+    #[case::session_token(
+        "aws_session_token",
+        "temporary-session-secret",
+        "x-amz-security-token"
+    )]
+    #[case::sse_customer_key(
+        "aws_sse_customer_key_base64",
+        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+        "x-amz-server-side-encryption-customer-key"
+    )]
+    #[tokio::test]
+    async fn test_storage_option_rejects_credentials_reqwest_would_forward(
+        #[case] option_key: &str,
+        #[case] option_value: &str,
+        #[case] expected_header: &str,
+    ) {
+        let mut options = redirect_storage_options("http://127.0.0.1:1".to_string());
+        options.insert(option_key.to_string(), option_value.to_string());
+        if option_key == "aws_sse_customer_key_base64" {
+            options.insert(
+                "aws_server_side_encryption".to_string(),
+                "sse-c".to_string(),
+            );
+        }
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        let store = AwsStoreProvider
+            .new_store(Url::parse("s3://test-bucket").unwrap(), &params)
+            .await
+            .unwrap();
+
+        let error = store
+            .inner
+            .get_range(&Path::from("object"), 7..8)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, object_store::Error::Generic { .. }));
+        assert!(
+            error.to_string().contains(expected_header),
+            "unexpected error: {error}"
+        );
+    }
 
     #[derive(Debug, Default)]
     struct MockAwsCredentialsProvider {
