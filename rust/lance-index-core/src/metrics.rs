@@ -7,6 +7,12 @@ pub const AND_CANDIDATES_SEEN_METRIC: &str = "and_candidates_seen";
 pub const AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC: &str = "and_candidates_pruned_before_return";
 pub const AND_FULL_SCORES_METRIC: &str = "and_full_scores";
 pub const FREQS_COLLECTED_METRIC: &str = "freqs_collected";
+pub const COMPOUND_ADDRESSES_RESOLVED_METRIC: &str = "compound_addresses_resolved";
+pub const COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC: &str = "compound_address_resolution_batches";
+pub const COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC: &str =
+    "compound_peak_address_resolution_batch_size";
+pub const COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "compound_score_floor_overflows";
+pub const COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "compound_peak_buffered_candidates";
 
 /// A trait used by the index to report metrics
 ///
@@ -84,6 +90,21 @@ pub trait MetricsCollector: Send + Sync {
     fn record_and_full_scores(&self, _num_scores: usize) {}
 
     fn record_freqs_collected(&self, _num_collections: usize) {}
+
+    /// Record compound FTS document addresses resolved for final row-ID ties.
+    fn record_compound_addresses_resolved(&self, _num_addresses: usize) {}
+
+    /// Record bounded compound FTS address-resolution batches.
+    fn record_compound_address_resolution_batches(&self, _num_batches: usize) {}
+
+    /// Record the largest compound FTS address-resolution batch.
+    fn record_compound_peak_address_resolution_batch_size(&self, _num_addresses: usize) {}
+
+    /// Record unresolved score floors that required a resolved-key retry.
+    fn record_compound_score_floor_overflows(&self, _num_overflows: usize) {}
+
+    /// Record a candidate-buffer high-water mark for compound FTS.
+    fn record_compound_peak_buffered_candidates(&self, _num_candidates: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
