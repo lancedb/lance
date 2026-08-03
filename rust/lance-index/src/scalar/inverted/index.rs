@@ -169,6 +169,21 @@ pub enum ListDocumentMode {
 }
 
 impl ListDocumentMode {
+    /// Returns whether document boundaries for `data_type` are controlled by
+    /// this mode.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field};
+    /// # use lance_index::scalar::inverted::ListDocumentMode;
+    /// let strings = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+    /// assert!(ListDocumentMode::applies_to(&strings));
+    /// assert!(!ListDocumentMode::applies_to(&DataType::Utf8));
+    /// ```
+    pub fn applies_to(data_type: &DataType) -> bool {
+        matches!(data_type, DataType::List(_) | DataType::LargeList(_))
+    }
+
     pub(super) fn combine(self, other: Self) -> Self {
         if self == other { self } else { Self::Ambiguous }
     }
@@ -755,7 +770,7 @@ pub struct InvertedIndex {
     tokenizer: Box<dyn LanceTokenizer>,
     token_set_format: TokenSetFormat,
     format_version: InvertedListFormatVersion,
-    list_document_mode: ListDocumentMode,
+    list_document_mode: Arc<OnceCell<ListDocumentMode>>,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
     corpus_stats: Arc<OnceCell<(u64, usize)>>,
     prewarm_state: Arc<Mutex<InvertedPrewarmState>>,
@@ -773,7 +788,7 @@ impl Debug for InvertedIndex {
             .field("params", &self.params)
             .field("token_set_format", &self.token_set_format)
             .field("format_version", &self.format_version)
-            .field("list_document_mode", &self.list_document_mode)
+            .field("list_document_mode", &self.list_document_mode.get())
             .field("partitions", &self.partitions)
             .field("deleted_fragments", &self.deleted_fragments)
             .finish()
@@ -808,11 +823,15 @@ impl InvertedIndex {
             .unwrap_or_default()
     }
 
-    fn to_builder(&self) -> InvertedIndexBuilder {
-        self.to_builder_with_offset(None)
+    fn to_builder(&self, list_document_mode: ListDocumentMode) -> InvertedIndexBuilder {
+        self.to_builder_with_offset(None, list_document_mode)
     }
 
-    fn to_builder_with_offset(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
+    fn to_builder_with_offset(
+        &self,
+        fragment_mask: Option<u64>,
+        list_document_mode: ListDocumentMode,
+    ) -> InvertedIndexBuilder {
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
             InvertedIndexBuilder::from_existing_index(
@@ -847,7 +866,7 @@ impl InvertedIndex {
                 self.deleted_fragments.clone(),
             )
             .with_format_version(self.format_version())
-            .with_list_document_mode(self.list_document_mode)
+            .with_list_document_mode(list_document_mode)
         }
     }
 
@@ -859,9 +878,23 @@ impl InvertedIndex {
         &self.params
     }
 
-    /// Returns the resolved string-list document representation.
-    pub fn list_document_mode(&self) -> ListDocumentMode {
+    fn known_list_document_mode(&self) -> ListDocumentMode {
         self.list_document_mode
+            .get()
+            .copied()
+            .unwrap_or(ListDocumentMode::Ambiguous)
+    }
+
+    /// Returns the resolved string-list document representation.
+    ///
+    /// Unmarked historical indexes resolve the mode lazily from their document
+    /// layout and row IDs. Indexed-only and scalar operations do not need to
+    /// call this method.
+    pub async fn list_document_mode(&self) -> Result<ListDocumentMode> {
+        Ok(*self
+            .list_document_mode
+            .get_or_try_init(|| self.infer_unmarked_list_document_mode())
+            .await?)
     }
 
     /// Returns the number of partitions in this inverted index.
@@ -916,12 +949,16 @@ impl InvertedIndex {
             }
         }
 
-        let list_document_mode = segments
-            .iter()
-            .skip(1)
-            .fold(first.list_document_mode, |mode, segment| {
-                mode.combine(segment.list_document_mode)
-            });
+        let list_document_mode =
+            if ListDocumentMode::applies_to(new_data.schema().field(0).data_type()) {
+                let mut mode = first.list_document_mode().await?;
+                for segment in segments.iter().skip(1) {
+                    mode = mode.combine(segment.list_document_mode().await?);
+                }
+                mode
+            } else {
+                ListDocumentMode::Row
+            };
         let mut builder = InvertedIndexBuilder::new(first.params.clone())
             .with_progress(progress)
             .with_list_document_mode(list_document_mode);
@@ -1780,7 +1817,7 @@ impl InvertedIndex {
             tokenizer,
             token_set_format: TokenSetFormat::Arrow,
             format_version: InvertedListFormatVersion::V1,
-            list_document_mode: ListDocumentMode::Elements,
+            list_document_mode: Arc::new(OnceCell::from(ListDocumentMode::Elements)),
             partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
@@ -1831,33 +1868,43 @@ impl InvertedIndex {
         }
     }
 
-    async fn infer_unmarked_list_document_mode(
-        partitions: &[Arc<InvertedPartition>],
-    ) -> Result<ListDocumentMode> {
+    async fn infer_unmarked_list_document_mode(&self) -> Result<ListDocumentMode> {
         let mut has_row_document_layout = false;
-        let mut row_id_columns = Vec::with_capacity(partitions.len());
-
-        for partition in partitions {
+        for partition in &self.partitions {
             let documents = partition.docs.modern().ok_or_else(|| {
                 Error::internal(
                     "partitioned FTS index unexpectedly uses the legacy document store".to_owned(),
                 )
             })?;
             has_row_document_layout |= documents.has_row_document_layout();
-            row_id_columns.push(documents.row_ids_column().await?);
         }
 
         // A row-document index stores each row id once. Repetition anywhere in
-        // the index is positive evidence for historical element documents.
-        let has_element_documents = spawn_cpu(move || {
-            let mut seen = RoaringTreemap::new();
-            Ok::<bool, Error>(
-                row_id_columns
-                    .iter()
-                    .any(|row_ids| row_ids.values().iter().any(|row_id| !seen.insert(*row_id))),
-            )
-        })
-        .await?;
+        // the index is positive evidence for historical element documents. Read
+        // one partition at a time so inference does not retain every row-ID
+        // array simultaneously.
+        let mut seen = RoaringTreemap::new();
+        let mut has_element_documents = false;
+        for partition in &self.partitions {
+            let documents = partition.docs.modern().ok_or_else(|| {
+                Error::internal(
+                    "partitioned FTS index unexpectedly uses the legacy document store".to_owned(),
+                )
+            })?;
+            let row_ids = documents.row_ids_column().await?;
+            let (next_seen, has_repeated_row_id) = spawn_cpu(move || {
+                let mut seen = seen;
+                let has_repeated_row_id =
+                    row_ids.values().iter().any(|row_id| !seen.insert(*row_id));
+                Ok::<_, Error>((seen, has_repeated_row_id))
+            })
+            .await?;
+            seen = next_seen;
+            if has_repeated_row_id {
+                has_element_documents = true;
+                break;
+            }
+        }
 
         Ok(match (has_element_documents, has_row_document_layout) {
             (true, false) => ListDocumentMode::Elements,
@@ -1950,11 +1997,6 @@ impl InvertedIndex {
                     .buffer_unordered(store.io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
-                let list_document_mode = match list_document_mode {
-                    Some(list_document_mode) => list_document_mode,
-                    None => Self::infer_unmarked_list_document_mode(&partitions).await?,
-                };
-
                 let tokenizer = params.build()?;
                 Ok(Arc::new(Self {
                     params,
@@ -1962,7 +2004,7 @@ impl InvertedIndex {
                     tokenizer,
                     token_set_format,
                     format_version,
-                    list_document_mode,
+                    list_document_mode: Arc::new(OnceCell::new_with(list_document_mode)),
                     partitions,
                     corpus_stats: Arc::new(OnceCell::new()),
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
@@ -2335,7 +2377,7 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let files = self
-            .to_builder()
+            .to_builder(self.known_list_document_mode())
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
@@ -2354,8 +2396,14 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
+        let list_document_mode =
+            if ListDocumentMode::applies_to(new_data.schema().field(0).data_type()) {
+                self.list_document_mode().await?
+            } else {
+                ListDocumentMode::Row
+            };
         let files = self
-            .to_builder()
+            .to_builder(list_document_mode)
             .update(new_data, dest_store, old_data_filter)
             .await?;
 
@@ -13006,7 +13054,7 @@ mod tests {
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(updated.format_version(), format_version);
         assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V2);
-        assert_eq!(updated.list_document_mode(), ListDocumentMode::Row);
+        assert_eq!(updated.list_document_mode().await?, ListDocumentMode::Row);
         assert_eq!(updated.partitions.len(), 2);
         for partition in &updated.partitions {
             assert_eq!(
@@ -13110,7 +13158,7 @@ mod tests {
         let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(merged.index_version(), 0);
         assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
-        assert_eq!(merged.list_document_mode(), ListDocumentMode::Row);
+        assert_eq!(merged.list_document_mode().await?, ListDocumentMode::Row);
 
         let tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
@@ -13277,14 +13325,33 @@ mod tests {
             .unwrap();
         writer.finish_with_metadata(metadata).await.unwrap();
 
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+        let counter = Arc::new(PostingMetadataCounter::default());
+        let counting_store: Arc<dyn IndexStore> = Arc::new(CountingStore {
+            inner: store,
+            posting_file: doc_file_path(0),
+            counter: counter.clone(),
+        });
+        let index = InvertedIndex::load(counting_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert!(
             index.deleted_fragments().is_empty(),
             "index without deleted_fragments column should have empty bitmap"
         );
-        assert_eq!(index.list_document_mode(), ListDocumentMode::Row);
+        assert_eq!(
+            counter.rows_read(),
+            0,
+            "opening an unmarked scalar index must not scan document row IDs"
+        );
+        assert_eq!(
+            index.list_document_mode().await.unwrap(),
+            ListDocumentMode::Row
+        );
+        assert_eq!(
+            counter.rows_read(),
+            1,
+            "resolving an unmarked list mode should scan document row IDs lazily"
+        );
     }
 
     #[tokio::test]
@@ -13298,7 +13365,10 @@ mod tests {
 
         let index = load_unmarked_index_with_row_ids(store, &[100, 100]).await;
 
-        assert_eq!(index.list_document_mode(), ListDocumentMode::Elements);
+        assert_eq!(
+            index.list_document_mode().await.unwrap(),
+            ListDocumentMode::Elements
+        );
     }
 
     #[tokio::test]
@@ -13316,7 +13386,10 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
         let index = load_unmarked_index_with_row_ids(src_store, &[100]).await;
-        assert_eq!(index.list_document_mode(), ListDocumentMode::Ambiguous);
+        assert_eq!(
+            index.list_document_mode().await.unwrap(),
+            ListDocumentMode::Ambiguous
+        );
 
         let mut docs = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
         docs.values().append_value("test");

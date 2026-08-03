@@ -1556,8 +1556,12 @@ impl ExecutionPlan for FlatMatchQueryExec {
             "column not set for MatchQuery {}",
             query.terms
         )))?;
-        let unindexed_input =
-            document_input(self.unindexed_input.execute(partition, context)?, &column)?;
+        let unindexed_input = self.unindexed_input.execute(partition, context)?;
+        let unindexed_schema = unindexed_input.schema();
+        let unindexed_doc_idx = unindexed_schema.index_of(&column)?;
+        let is_list_document =
+            ListDocumentMode::applies_to(unindexed_schema.field(unindexed_doc_idx).data_type());
+        let unindexed_input = document_input(unindexed_input, &column)?;
 
         let stream = stream::once(async move {
             let segments = match preset_segments {
@@ -1575,16 +1579,18 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     let first_index = indices.first().ok_or(DataFusionError::Execution(
                         format!("FTS index for column {} has no segments", column),
                     ))?;
-                    let list_document_mode = indices.iter().skip(1).fold(
-                        first_index.list_document_mode(),
-                        |mode, index| {
-                            if mode == index.list_document_mode() {
-                                mode
-                            } else {
-                                ListDocumentMode::Ambiguous
+                    let list_document_mode = if is_list_document {
+                        let mut mode = first_index.list_document_mode().await?;
+                        for index in indices.iter().skip(1) {
+                            if mode != index.list_document_mode().await? {
+                                mode = ListDocumentMode::Ambiguous;
+                                break;
                             }
-                        },
-                    );
+                        }
+                        mode
+                    } else {
+                        ListDocumentMode::Row
+                    };
                     let mut tokenizer = first_index.tokenizer();
                     let base_scorer = match preset_base_scorer {
                         Some(scorer) => (*scorer).clone(),

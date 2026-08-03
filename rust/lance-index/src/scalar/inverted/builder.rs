@@ -297,7 +297,7 @@ impl InvertedIndexBuilder {
     }
 
     fn resolve_list_document_mode(&mut self, data_type: &DataType) -> Result<()> {
-        if matches!(data_type, DataType::List(_) | DataType::LargeList(_)) {
+        if ListDocumentMode::applies_to(data_type) {
             if self.list_document_mode == ListDocumentMode::Ambiguous {
                 return Err(Error::index(
                     "cannot update a string-list inverted index whose historical document model is ambiguous; rebuild the index before indexing additional rows"
