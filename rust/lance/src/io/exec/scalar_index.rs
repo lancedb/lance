@@ -17,6 +17,7 @@ use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
+    execution::memory_pool::{MemoryConsumer, MemoryReservation},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
@@ -27,7 +28,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
-use lance_core::{Error, ROW_ID_FIELD, Result, utils::address::RowAddress};
+use lance_core::{Error, ROW_ID_FIELD, Result, deepsize::DeepSizeOf, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
     utils::{
@@ -46,7 +47,7 @@ use lance_select::{
     RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
-use roaring::{RoaringBitmap, RoaringTreemap};
+use roaring::RoaringBitmap;
 use tracing::{debug_span, instrument};
 
 #[async_trait]
@@ -308,6 +309,39 @@ pub struct IndexLookup {
     pub index_name: String,
 }
 
+const MAP_INDEX_CANDIDATES_MEMORY_CONSUMER: &str = "MapIndexExecCandidates";
+
+#[derive(Debug)]
+struct DistinctRowAddrs {
+    emitted: RowAddrTreeMap,
+    reservation: MemoryReservation,
+}
+
+impl DistinctRowAddrs {
+    fn new(reservation: MemoryReservation) -> Self {
+        Self {
+            emitted: RowAddrTreeMap::new(),
+            reservation,
+        }
+    }
+
+    fn retain_unseen(&mut self, row_addrs: &UInt64Array) -> datafusion::error::Result<UInt64Array> {
+        let unseen: UInt64Array = row_addrs
+            .values()
+            .iter()
+            .copied()
+            .filter(|row_addr| self.emitted.insert(*row_addr))
+            .collect();
+        if let Err(error) = self.reservation.try_resize(self.emitted.deep_size_of()) {
+            for row_addr in unseen.values() {
+                self.emitted.remove(*row_addr);
+            }
+            return Err(error);
+        }
+        Ok(unseen)
+    }
+}
+
 impl IndexLookup {
     pub fn new(column: impl Into<String>, index_name: impl Into<String>) -> Self {
         Self {
@@ -408,6 +442,7 @@ impl MapIndexExec {
         lookups: Vec<IndexLookup>,
         index_metrics: Arc<IndexMetrics>,
         metrics_set: ExecutionPlanMetricsSet,
+        candidate_reservation: MemoryReservation,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         // A row can be found by the composite probe only if it lives in a
         // fragment covered by *every* index in `lookups`; restrict the
@@ -454,21 +489,18 @@ impl MapIndexExec {
                 Self::map_batch(lookups, dataset, deletion_mask, batch, metrics).await
             }
         });
-        let mut emitted_row_addrs = RoaringTreemap::new();
+        let mut distinct_row_addrs = DistinctRowAddrs::new(candidate_reservation);
         let stream = stream.and_then(move |batch| {
             // Each batch's index result is already a set. Retain first
             // occurrences here to make the complete candidate stream a set too.
             let row_addrs = batch.column(0).as_primitive::<UInt64Type>();
-            let unseen: UInt64Array = row_addrs
-                .values()
-                .iter()
-                .copied()
-                .filter(|row_addr| emitted_row_addrs.insert(*row_addr))
-                .collect();
-            futures::future::ready(
-                RecordBatch::try_new(INDEX_LOOKUP_SCHEMA.clone(), vec![Arc::new(unseen)])
-                    .map_err(datafusion::error::DataFusionError::from),
-            )
+            let result = distinct_row_addrs
+                .retain_unseen(row_addrs)
+                .and_then(|unseen| {
+                    RecordBatch::try_new(INDEX_LOOKUP_SCHEMA.clone(), vec![Arc::new(unseen)])
+                        .map_err(datafusion::error::DataFusionError::from)
+                });
+            futures::future::ready(result)
         });
         let stream = stream.map(move |batch| {
             let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
@@ -577,6 +609,8 @@ impl ExecutionPlan for MapIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
+            .register(context.memory_pool());
         let input = self.input.execute(partition, context)?;
         let stream_fut = Self::build_stream(
             input,
@@ -585,6 +619,7 @@ impl ExecutionPlan for MapIndexExec {
             self.lookups.clone(),
             Arc::new(IndexMetrics::new(&self.metrics, partition)),
             self.metrics.clone(),
+            candidate_reservation,
         );
         let stream = futures::stream::once(stream_fut).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -916,10 +951,16 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
     use arrow::record_batch::RecordBatchIterator;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::Schema;
     use datafusion::{
-        execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
+        error::DataFusionError,
+        execution::{
+            TaskContext,
+            memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool},
+        },
+        physical_plan::ExecutionPlan,
+        prelude::SessionConfig,
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
@@ -941,7 +982,9 @@ mod tests {
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
 
-    use super::{MapIndexExec, ScalarIndexExec};
+    use super::{
+        DistinctRowAddrs, MAP_INDEX_CANDIDATES_MEMORY_CONSUMER, MapIndexExec, ScalarIndexExec,
+    };
 
     struct TestFixture {
         dataset: Arc<Dataset>,
@@ -977,6 +1020,25 @@ mod tests {
             dataset: Arc::new(dataset),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    #[test]
+    fn test_map_index_candidates_respect_memory_pool() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+        let reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER).register(&pool);
+        let mut candidates = DistinctRowAddrs::new(reservation);
+
+        let error = candidates
+            .retain_unseen(&UInt64Array::from(vec![1]))
+            .unwrap_err();
+
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+        assert!(
+            error
+                .to_string()
+                .contains(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
+        );
+        assert_eq!(pool.reserved(), 0);
     }
 
     #[tokio::test]
