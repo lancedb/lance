@@ -4,7 +4,7 @@
 use arrow_array::RecordBatch;
 use bytes::Bytes;
 use chrono::TimeDelta;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
@@ -55,6 +55,12 @@ use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
+
+/// Maximum uncompressed batch size passed to current-format file writers.
+///
+/// File-size limits are checked after each batch, so bounding batches limits
+/// how far a single large input batch can overshoot `max_bytes_per_file`.
+const MAX_WRITE_BATCH_BYTES: usize = 10 * 1024 * 1024;
 
 mod commit;
 pub mod delete;
@@ -277,11 +283,12 @@ pub struct WriteParams {
     /// Max file size in bytes.
     ///
     /// This is a soft limit. The actual file size may be larger than this value
-    /// by a few megabytes, since once we detect we hit this limit, we still
-    /// need to flush the footer.
+    /// because the limit is checked after writing each batch and the writer
+    /// still needs to flush buffered data and the footer.
     ///
-    /// This limit is checked after writing each group, so if max_rows_per_group
-    /// is set to a large value, this limit may be exceeded by a large amount.
+    /// Current-format writes split large input batches into approximately 10 MiB
+    /// chunks before checking this limit. Legacy writes check it after each row
+    /// group, so a large `max_rows_per_group` can increase the overshoot.
     ///
     /// The default is 90 GB. If you are using an object store such as S3, we
     /// currently have a hard 100 GB limit.
@@ -614,8 +621,16 @@ pub async fn do_write_fragments(
         // In v1 we split the stream into row group sized batches
         chunk_stream(data, params.max_rows_per_group)
     } else {
-        // In v2 we don't care about group size but we do want to break
-        // the stream on file boundaries
+        // Current writers do not use row groups, but they need bounded batches
+        // so a single large input batch cannot bypass file-size checkpoints.
+        let data_schema = data.schema();
+        let data = lance_arrow::stream::rechunk_stream_by_size(
+            data,
+            data_schema.clone(),
+            0,
+            MAX_WRITE_BATCH_BYTES,
+        );
+        let data = Box::pin(RecordBatchStreamAdapter::new(data_schema, data));
         break_stream(data, params.max_rows_per_file)
             .map_ok(|batch| vec![batch])
             .boxed()
@@ -1892,7 +1907,7 @@ mod tests {
 
     use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
-    use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
+    use datafusion::error::DataFusionError;
     use datafusion_physical_plan::RecordBatchStream;
     use futures::TryStreamExt;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
@@ -2029,16 +2044,17 @@ mod tests {
             }
         };
 
-        // The writer will not generate a new file until at enough data is *written* (not
+        // The writer will not generate a new file until enough data is *written* (not
         // just accumulated) to justify a new file.  Since the default page size is 8MiB
-        // we actually need to generate quite a bit of data to trigger this.
+        // we actually need to generate quite a bit of data to trigger this. Use one
+        // input batch to ensure file-size enforcement does not depend on input batching.
         //
         // To avoid generating and writing millions of rows (which is a bit slow for a unit
         // test) we can use a large data type (1KiB binary)
         let data_reader = Box::new(
             gen_batch()
                 .anon_col(array::rand_fsb(1024))
-                .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
+                .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(1)),
         );
 
         let (fragments, _) = reader_to_frags(data_reader).await.unwrap();
