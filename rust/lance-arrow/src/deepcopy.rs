@@ -85,16 +85,12 @@ pub fn deep_copy_batch(batch: &RecordBatch) -> crate::Result<RecordBatch> {
     RecordBatch::try_new(batch.schema(), arrays)
 }
 
-/// Deep copy array data, extracting only the sliced portion using MutableArrayData
-/// This is the most efficient and correct way to copy just the sliced data
+/// Deep copy array data, extracting only the sliced portion using `MutableArrayData`.
 pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
-    // Use MutableArrayData to efficiently copy just the slice
     let mut mutable = MutableArrayData::new(vec![data], false, data.len());
-
-    // Copy from offset to offset+len (the visible slice)
-    mutable.extend(0, data.offset(), data.offset() + data.len());
-
-    // Freeze into immutable ArrayData
+    // MutableArrayData indexes relative to the logical source array and applies
+    // ArrayData::offset internally for types such as Boolean.
+    mutable.extend(0, 0, data.len());
     mutable.freeze()
 }
 
@@ -119,7 +115,7 @@ pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch>
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
@@ -234,5 +230,28 @@ mod tests {
         assert!(copied_int.is_valid(1)); // Some(3)
         assert!(!copied_int.is_valid(2)); // None
         assert_eq!(copied_int.value(1), 3);
+    }
+
+    #[test]
+    fn test_deep_copy_nested_boolean_slice() {
+        let array = StructArray::from(vec![(
+            Arc::new(Field::new("flag", DataType::Boolean, true)),
+            Arc::new(BooleanArray::from(vec![
+                Some(false),
+                Some(true),
+                None,
+                Some(false),
+                Some(true),
+            ])) as Arc<dyn Array>,
+        )]);
+        let sliced = array.slice(1, 3);
+
+        let copied = super::deep_copy_array_sliced(sliced.column(0).as_ref());
+        let copied = copied.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+        assert_eq!(
+            copied,
+            &BooleanArray::from(vec![Some(true), None, Some(false)])
+        );
     }
 }
