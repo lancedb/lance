@@ -105,16 +105,12 @@ impl IOTracker {
     /// Label the metrics published through [`Self::begin_io`] with the prefix of
     /// the store this tracker belongs to, so IO that bypasses the `object_store`
     /// layer carries the same `base` label as the store's metered operations.
+    ///
+    /// Only `meter_store` should call this, so that labelling the tracker and
+    /// wrapping the store stay inseparable — see the rationale there.
     #[cfg(feature = "metrics")]
-    pub fn with_metrics_base(mut self, base: &str) -> Self {
+    pub(crate) fn set_metrics_base(&mut self, base: &str) {
         self.metrics_base = Some(base.into());
-        self
-    }
-
-    /// Without the `metrics` feature there is nothing to label.
-    #[cfg(not(feature = "metrics"))]
-    pub fn with_metrics_base(self, _base: &str) -> Self {
-        self
     }
 
     /// Begin an operation that talks to storage without going through the

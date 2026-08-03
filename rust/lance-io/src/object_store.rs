@@ -489,18 +489,14 @@ impl ObjectStore {
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
 
-            #[cfg(feature = "metrics")]
-            {
-                use crate::object_store::metrics::ObjectStoreMetricsExt;
-                inner = inner.metered(store_prefix.clone());
-            }
+            let mut io_tracker = IOTracker::default();
+            meter_store(&mut inner, &mut io_tracker, &store_prefix);
 
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
             }
 
             // Always wrap with IO tracking
-            let io_tracker = IOTracker::default();
             let tracked_store = io_tracker.wrap("", inner);
 
             let store = Self {
@@ -650,16 +646,6 @@ impl ObjectStore {
         self.io_tracker.incremental_stats()
     }
 
-    /// A handle on this store's IO tracker for the readers, writers and
-    /// shortcuts that talk to the filesystem directly instead of going through
-    /// [`Self::inner`]. It carries the store prefix so the metrics they publish
-    /// land under the same `base` label as the store's metered operations.
-    fn local_io_tracker(&self) -> IOTracker {
-        self.io_tracker
-            .clone()
-            .with_metrics_base(&self.store_prefix)
-    }
-
     /// Open a file for path.
     ///
     /// Parameters
@@ -671,7 +657,7 @@ impl ObjectStore {
                     path,
                     self.block_size,
                     None,
-                    Arc::new(self.local_io_tracker()),
+                    Arc::new(self.io_tracker.clone()),
                 )
                 .await
             }
@@ -687,7 +673,7 @@ impl ObjectStore {
                         path,
                         self.block_size,
                         None,
-                        Arc::new(self.local_io_tracker()),
+                        Arc::new(self.io_tracker.clone()),
                     )
                     .await
                 } else {
@@ -695,7 +681,7 @@ impl ObjectStore {
                         path,
                         self.block_size,
                         None,
-                        Arc::new(self.local_io_tracker()),
+                        Arc::new(self.io_tracker.clone()),
                     )
                     .await
                 }
@@ -733,7 +719,7 @@ impl ObjectStore {
                     path,
                     self.block_size,
                     Some(known_size),
-                    Arc::new(self.local_io_tracker()),
+                    Arc::new(self.io_tracker.clone()),
                 )
                 .await
             }
@@ -749,7 +735,7 @@ impl ObjectStore {
                         path,
                         self.block_size,
                         Some(known_size),
-                        Arc::new(self.local_io_tracker()),
+                        Arc::new(self.io_tracker.clone()),
                     )
                     .await
                 } else {
@@ -757,7 +743,7 @@ impl ObjectStore {
                         path,
                         self.block_size,
                         Some(known_size),
-                        Arc::new(self.local_io_tracker()),
+                        Arc::new(self.io_tracker.clone()),
                     )
                     .await
                 }
@@ -811,7 +797,7 @@ impl ObjectStore {
                     file,
                     path.clone(),
                     temp_path,
-                    Arc::new(self.local_io_tracker()),
+                    Arc::new(self.io_tracker.clone()),
                 )))
             }
             _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
@@ -864,7 +850,7 @@ impl ObjectStore {
     ) -> Result<()> {
         if self.is_local() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
-            let metrics = self.local_io_tracker().begin_io("copy");
+            let metrics = self.io_tracker.begin_io("copy");
             let result = super::local::copy_file(from, to);
             metrics.record(&result, 0);
             return result;
@@ -933,7 +919,7 @@ impl ObjectStore {
             // The local file system provider needs to delete both files and directories.
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
-            let metrics = self.local_io_tracker().begin_io("delete");
+            let metrics = self.io_tracker.begin_io("delete");
             let result = super::local::remove_dir_all(&path);
             metrics.record(&result, 0);
             return result;
@@ -1134,7 +1120,7 @@ static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
 impl ObjectStore {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store: Arc<DynObjectStore>,
+        mut store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -1159,13 +1145,15 @@ impl ObjectStore {
                 store_prefix
             }
         };
+        let mut io_tracker = IOTracker::default();
+        meter_store(&mut store, &mut io_tracker, &store_prefix);
+
         let store = match wrapper {
             Some(wrapper) => wrapper.wrap(&store_prefix, store),
             None => store,
         };
 
         // Always wrap with IO tracking
-        let io_tracker = IOTracker::default();
         let tracked_store = io_tracker.wrap("", store);
 
         Self {
@@ -1181,6 +1169,29 @@ impl ObjectStore {
             store_prefix,
         }
     }
+}
+
+/// Wrap `inner` so its operations publish metrics labelled by `store_prefix`,
+/// and label `io_tracker` with the same prefix so the local reads and writes
+/// that bypass `inner` publish under it too.
+///
+/// The two go together on purpose: a store metered on one path but not the other
+/// would report a partial picture that reads like a complete one. Every
+/// constructor that hands an [`ObjectStore`] to a caller must route its `inner`
+/// through here, or through nothing at all.
+#[cfg(feature = "metrics")]
+fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, store_prefix: &str) {
+    use crate::object_store::metrics::ObjectStoreMetricsExt;
+    io_tracker.set_metrics_base(store_prefix);
+    *inner = inner.clone().metered(store_prefix.to_owned());
+}
+
+#[cfg(not(feature = "metrics"))]
+fn meter_store(
+    _inner: &mut Arc<dyn OSObjectStore>,
+    _io_tracker: &mut IOTracker,
+    _store_prefix: &str,
+) {
 }
 
 fn infer_block_size(scheme: &str) -> usize {

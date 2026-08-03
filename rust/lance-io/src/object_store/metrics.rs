@@ -26,6 +26,12 @@
 //! shortcuts), which go straight to the filesystem. Those publish the same
 //! request-level metrics themselves through
 //! [`IOTracker::begin_io`](crate::utils::tracking_store::IOTracker::begin_io).
+//! The two are installed together, so a store either publishes for all of its
+//! IO or for none of it. A store built by calling a provider's `new_store`
+//! directly, bypassing both `ObjectStore` constructors — as
+//! [`ObjectStore::local`](crate::object_store::ObjectStore::local) and
+//! [`ObjectStore::memory`](crate::object_store::ObjectStore::memory) do — is in
+//! the "none of it" case.
 //!
 //! [`LocalObjectReader`]: crate::local::LocalObjectReader
 //! [`LocalWriter`]: crate::object_writer::LocalWriter
@@ -1518,8 +1524,9 @@ mod tests {
     fn test_local_read_error_is_counted() {
         let tmp = TempStdDir::default();
         let recorded = capture_metrics(|| async {
-            let store = LanceObjectStore::local();
-            let path = Path::from_absolute_path(tmp.join("a.bin")).unwrap();
+            let (store, path) = LanceObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
+                .await
+                .unwrap();
             store.put(&path, b"hello").await.unwrap();
 
             let reader = store.open(&path).await.unwrap();
@@ -1548,8 +1555,9 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let store = LanceObjectStore::local();
-                let path = Path::from_absolute_path(tmp.join("a.bin")).unwrap();
+                let (store, path) = LanceObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
+                    .await
+                    .unwrap();
                 let mut writer = store.create(&path).await.unwrap();
                 writer.write_all(b"hello").await.unwrap();
 
@@ -1596,6 +1604,45 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// `ObjectStore::new` is how `DatasetBuilder` wraps a caller-supplied store,
+    /// so it must meter both halves of the store: the operations that go through
+    /// `inner`, and the local ones that bypass it. Metering only one half would
+    /// report a partial picture that reads like a complete one.
+    #[test]
+    fn test_store_built_from_new_is_metered() {
+        let tmp = TempStdDir::default();
+        let recorded = capture_metrics(|| async {
+            let store = LanceObjectStore::new(
+                Arc::new(object_store::local::LocalFileSystem::new()),
+                Url::parse("file:///").unwrap(),
+                None,
+                None,
+                false,
+                false,
+                1,
+                3,
+                None,
+            );
+            let path = Path::from_absolute_path(tmp.join("a.bin")).unwrap();
+            // put and open bypass `inner` and publish for themselves.
+            store.put(&path, b"hello").await.unwrap();
+            let reader = store.open(&path).await.unwrap();
+            assert_eq!(reader.get_all().await.unwrap().len(), 5);
+            // delete goes through `inner`, so only MeteredObjectStore can count it.
+            store.delete(&path).await.unwrap();
+        });
+
+        for (operation, bytes) in [("put", 5), ("get", 5), ("delete", 0)] {
+            let labels = [("operation", operation), ("base", "file")];
+            assert_eq!(
+                counter_value(&recorded, METRIC_REQUESTS, &labels),
+                1,
+                "expected one {operation} request"
+            );
+            assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), bytes);
+        }
     }
 
     /// A store whose stream-producing operations always yield an error, used to
