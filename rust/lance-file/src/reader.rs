@@ -1651,7 +1651,7 @@ mod tests {
     use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 
     use arrow_array::{
-        RecordBatch, UInt32Array,
+        RecordBatch, RecordBatchIterator, UInt32Array,
         types::{Float64Type, Int32Type},
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -1770,8 +1770,10 @@ mod tests {
         write_lance_file(
             RecordBatchIterator::new(vec![Ok(batch)], schema),
             &fs,
-            ConcreteFileVersion::from(version),
-            FileWriterOptions::default(),
+            FileWriterOptions {
+                format_version: Some(version),
+                ..Default::default()
+            },
         )
         .await;
 
@@ -1867,13 +1869,14 @@ mod tests {
         )
         .await
         .expect_err("out-of-bounds offsets must fail the read");
+        let error_message = error.to_string();
         assert!(
-            matches!(error, lance_core::Error::CorruptFile { .. }),
-            "expected CorruptFile, got: {error}"
+            error_message.contains("corrupt file"),
+            "expected a corruption error, got: {error_message}"
         );
         assert!(
-            error.to_string().contains("out of bounds"),
-            "unexpected message: {error}"
+            error_message.contains("out of bounds"),
+            "unexpected message: {error_message}"
         );
     }
 
@@ -1917,13 +1920,14 @@ mod tests {
         )
         .await
         .expect_err("an out-of-bounds chunk offset must fail the read");
+        let error_message = error.to_string();
         assert!(
-            matches!(error, lance_core::Error::CorruptFile { .. }),
-            "expected CorruptFile, got: {error}"
+            error_message.contains("corrupt file"),
+            "expected a corruption error, got: {error_message}"
         );
         assert!(
-            error.to_string().contains("out of bounds"),
-            "unexpected message: {error}"
+            error_message.contains("out of bounds"),
+            "unexpected message: {error_message}"
         );
     }
 
