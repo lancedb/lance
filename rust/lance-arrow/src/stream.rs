@@ -68,8 +68,9 @@ where
 /// Rechunks a stream using an estimator that distinguishes shared bytes.
 ///
 /// Shared bytes, such as dictionary values, are not assumed to shrink when a
-/// batch is sliced. If the shared portion already reaches `max_bytes`, the
-/// batch is left intact because row slicing cannot bring it below the target.
+/// batch is sliced. If the shared portion already reaches `max_bytes`, it is
+/// treated as an unavoidable fixed cost while row-proportional bytes are still
+/// sliced to an independent `max_bytes` budget.
 pub fn rechunk_stream_by_size_with_shared_estimator<S, E, F>(
     input: S,
     input_schema: SchemaRef,
@@ -258,13 +259,18 @@ fn slice_batch_with_estimator(
         return Ok(vec![batch]);
     }
 
-    // Shared bytes are repeated unchanged in every zero-copy slice. If they
-    // fill the target by themselves, slicing only multiplies that fixed cost.
-    if batch_size.shared >= max_bytes || batch_size.incremental == 0 {
+    if batch_size.incremental == 0 {
         return Ok(vec![batch]);
     }
 
-    let incremental_target = max_bytes - batch_size.shared;
+    // Shared bytes are repeated unchanged in every zero-copy slice. Once that
+    // unavoidable fixed cost fills the target, continue bounding the
+    // row-proportional portion with the full target as a separate budget.
+    let incremental_target = if batch_size.shared < max_bytes {
+        max_bytes - batch_size.shared
+    } else {
+        max_bytes.max(1)
+    };
     let rows_per_chunk = ((incremental_target as u128 * num_rows as u128)
         / batch_size.incremental as u128)
         .max(1)
@@ -519,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_estimator_does_not_repeat_oversized_shared_bytes() {
+    fn shared_estimator_still_bounds_incremental_bytes_when_shared_exceeds_target() {
         let input = stream::iter([Ok::<_, ArrowError>(make_batch(100))]);
         let rechunked =
             rechunk_stream_by_size_with_shared_estimator(input, test_schema(), 0, 100, |batch| {
@@ -533,8 +539,15 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 100);
+        assert!(
+            batches.len() > 1,
+            "incremental bytes were left in one batch"
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() * std::mem::size_of::<i32>() <= 100)
+        );
     }
 
     /// Build a batch with one variable-length string column.

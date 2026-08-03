@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_dictionary_is_not_repeated_across_checkpoint_slices() {
+    async fn large_dictionary_keys_are_bounded_across_checkpoint_slices() {
         const MIB: usize = 1024 * 1024;
         let value = "x".repeat(5 * MIB);
         let values = Arc::new(StringArray::from(vec![value.as_str(), value.as_str()])) as ArrayRef;
@@ -646,6 +646,7 @@ mod tests {
 
         let mut queue = AccumulationQueue::new(8 * MIB as u64, 0, false);
         let mut encoded_dictionary_values = 0;
+        let mut encoded_pages = 0;
         for (row_number, slice) in slices.iter().enumerate() {
             if let Some((arrays, _, num_rows)) = queue.insert(
                 slice.column(0).clone(),
@@ -654,14 +655,20 @@ mod tests {
             ) {
                 let data = crate::data::DataBlock::from_arrays(&arrays, num_rows);
                 encoded_dictionary_values += data.as_dictionary().unwrap().dictionary.num_values();
+                encoded_pages += 1;
             }
         }
         if let Some((arrays, _, num_rows)) = queue.flush() {
             let data = crate::data::DataBlock::from_arrays(&arrays, num_rows);
             encoded_dictionary_values += data.as_dictionary().unwrap().dictionary.num_values();
+            encoded_pages += 1;
         }
 
-        assert_eq!(slices.len(), 1);
-        assert_eq!(encoded_dictionary_values, 2);
+        assert!(slices.len() > 1);
+        assert!(slices.iter().all(|slice| {
+            lance_arrow::memory::batch_slice_memory_size_parts(slice).incremental <= 10 * MIB
+        }));
+        assert!(encoded_pages > 1);
+        assert_eq!(encoded_dictionary_values, 2 * encoded_pages);
     }
 }
