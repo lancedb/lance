@@ -24,6 +24,14 @@ use crate::{
     planner::Planner,
 };
 
+const SCORING_COLUMNS: [&str; 2] = ["_distance", "_score"];
+
+fn canonical_scoring_column(name: &str) -> Option<&'static str> {
+    SCORING_COLUMNS
+        .into_iter()
+        .find(|scoring_column| name.eq_ignore_ascii_case(scoring_column))
+}
+
 struct ProjectionBuilder {
     base: Arc<dyn Projectable>,
     planner: Planner,
@@ -130,7 +138,7 @@ impl ProjectionBuilder {
     fn references_scoring_column(expr: &Expr) -> bool {
         Planner::column_names_in_expr(expr)
             .iter()
-            .any(|name| matches!(name.as_str(), "_distance" | "_score"))
+            .any(|name| canonical_scoring_column(name).is_some())
     }
 
     fn add_columns(&mut self, columns: &[(impl AsRef<str>, impl AsRef<str>)]) -> Result<()> {
@@ -222,8 +230,12 @@ impl ProjectionPlan {
         // Scoring fields are needed for initial parsing of schema-dependent functions. Stored
         // fields keep their own types here; scoring expressions are replanned against the final
         // physical schema before execution.
-        for name in ["_distance", "_score"] {
-            if schema.field_with_name(name).is_err() {
+        for name in SCORING_COLUMNS {
+            let has_stored_column = schema
+                .fields()
+                .iter()
+                .any(|field| canonical_scoring_column(field.name()) == Some(name));
+            if !has_stored_column {
                 fields.push(Arc::new(ArrowField::new(name, DataType::Float32, true)));
             }
         }
@@ -560,6 +572,41 @@ mod tests {
             );
 
             ProjectionPlan::from_expressions(base, &[("incremented", "id + 1")]).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_stored_scoring_column_is_case_insensitive() {
+        for (stored_name, requested_name) in [("_Distance", "_distance"), ("_Score", "_score")] {
+            let base = Arc::new(
+                Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                    stored_name,
+                    DataType::Float64,
+                    true,
+                )]))
+                .unwrap(),
+            );
+            let plan =
+                ProjectionPlan::from_expressions(base, &[("stored", requested_name)]).unwrap();
+
+            assert_eq!(
+                plan.output_schema().unwrap().field(0).data_type(),
+                &DataType::Float64,
+            );
+
+            let batch = RecordBatch::try_from_iter([(
+                requested_name,
+                Arc::new(Float32Array::from(vec![0.25, 0.75])) as ArrayRef,
+            )])
+            .unwrap();
+            let physical_exprs = plan.to_physical_exprs(batch.schema().as_ref()).unwrap();
+            assert_eq!(
+                physical_exprs[0]
+                    .0
+                    .data_type(batch.schema().as_ref())
+                    .unwrap(),
+                DataType::Float32,
+            );
         }
     }
 
