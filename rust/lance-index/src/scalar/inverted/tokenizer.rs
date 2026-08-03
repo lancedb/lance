@@ -1065,6 +1065,15 @@ impl InvertedIndexParams {
         self.active_greek_stemmer() == Some(GreekStemmerVersion::Snowball3)
     }
 
+    /// Normalize historical field-absent physical metadata to the explicit
+    /// internal hint used when rebuilding or merging legacy Greek segments.
+    pub(crate) fn normalize_loaded_greek_stemmer(mut self) -> Self {
+        if self.language == Language::Greek && self.stem && self.greek_stemmer.is_none() {
+            self.greek_stemmer = Some(GreekStemmerVersion::Legacy);
+        }
+        self
+    }
+
     fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         match self.base_tokenizer.as_str() {
             "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),

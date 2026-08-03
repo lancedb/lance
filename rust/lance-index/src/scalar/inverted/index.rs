@@ -1756,7 +1756,8 @@ impl InvertedIndex {
                     .metadata
                     .get("params")
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
-                Ok(serde_json::from_str::<InvertedIndexParams>(params)?)
+                Ok(serde_json::from_str::<InvertedIndexParams>(params)?
+                    .normalize_loaded_greek_stemmer())
             }
             Err(metadata_error) => {
                 // Legacy format: params live in the tokens file (see
@@ -1772,7 +1773,8 @@ impl InvertedIndex {
                     .get("tokenizer")
                     .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
                     .transpose()?
-                    .unwrap_or_default())
+                    .unwrap_or_default()
+                    .normalize_loaded_greek_stemmer())
             }
         }
     }
@@ -1796,7 +1798,8 @@ impl InvertedIndex {
                     .metadata
                     .get("params")
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
-                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
+                let params = serde_json::from_str::<InvertedIndexParams>(params)?
+                    .normalize_loaded_greek_stemmer();
                 let partitions = reader
                     .schema()
                     .metadata
@@ -8353,6 +8356,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use crate::scalar::inverted::tokenizer::GreekStemmerVersion;
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
 
@@ -8604,7 +8608,10 @@ mod tests {
         let index =
             write_single_partition_index(src_store, legacy_params, TokenSetFormat::Fst, "", 100)
                 .await?;
-        assert_eq!(index.params.greek_stemmer, None);
+        assert_eq!(
+            index.params.greek_stemmer,
+            Some(GreekStemmerVersion::Legacy)
+        );
 
         let matches = index.do_search("ίσα").await?;
         let row_ids = matches[ROW_ID].as_primitive::<UInt64Type>();
@@ -8623,7 +8630,10 @@ mod tests {
             .await?;
 
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(updated.params.greek_stemmer, None);
+        assert_eq!(
+            updated.params.greek_stemmer,
+            Some(GreekStemmerVersion::Legacy)
+        );
         let matches = updated.do_search("ίσα").await?;
         let mut row_ids = matches[ROW_ID]
             .as_primitive::<UInt64Type>()
