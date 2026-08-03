@@ -1651,7 +1651,7 @@ mod tests {
     use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 
     use arrow_array::{
-        RecordBatch, UInt32Array,
+        RecordBatch, RecordBatchIterator, UInt32Array,
         types::{Float64Type, Int32Type},
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -1753,6 +1753,182 @@ mod tests {
             }
         }
         assert_eq!(remaining, 0);
+    }
+
+    /// Writes `batch` to a fresh file, overwrites `patch` bytes at `patch_offset`
+    /// into the single occurrence of `pattern`, and reads the file back with the
+    /// default reader configuration.
+    async fn read_file_with_mutated_bytes(
+        version: LanceFileVersion,
+        batch: RecordBatch,
+        pattern: &[u8],
+        patch_offset: usize,
+        patch: &[u8],
+    ) -> lance_core::Result<Vec<RecordBatch>> {
+        let fs = FsFixture::default();
+        let schema = batch.schema();
+        write_lance_file(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &fs,
+            FileWriterOptions {
+                format_version: Some(version),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let mut bytes = fs
+            .object_store
+            .read_one_all(&fs.tmp_path)
+            .await
+            .unwrap()
+            .to_vec();
+        let matches = bytes
+            .windows(pattern.len())
+            .enumerate()
+            .filter_map(|(position, window)| (window == pattern).then_some(position))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected the byte pattern to appear exactly once in the file"
+        );
+        let patch_start = matches[0] + patch_offset;
+        bytes[patch_start..patch_start + patch.len()].copy_from_slice(patch);
+        fs.object_store.put(&fs.tmp_path, &bytes).await.unwrap();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await
+    }
+
+    /// A corrupt file whose variable-width offsets point outside the value bytes
+    /// must fail with a typed error under the default reader configuration
+    /// (`validate_on_decode` disabled) instead of materializing values outside
+    /// the data buffer.
+    ///
+    /// Uses a dictionary-encoded string column because its values page stores
+    /// the offsets verbatim, so flipping the tail offset in the file reaches the
+    /// Arrow conversion boundary without being rejected by an intermediate
+    /// decompressor.
+    #[rstest]
+    #[tokio::test]
+    async fn test_default_reader_rejects_out_of_bounds_variable_width_offsets(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+    ) {
+        use arrow_array::{Array, DictionaryArray, Int32Array, StringArray};
+
+        let values = StringArray::from(vec!["alpha", "beta", "gamma"]);
+        let indices = Int32Array::from((0..300).map(|i| i % 3).collect::<Vec<i32>>());
+        let dictionary = DictionaryArray::new(indices, Arc::new(values));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "category",
+            dictionary.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(dictionary)]).unwrap();
+
+        // The dictionary values page stores the value offsets as plain
+        // little-endian i32s ending with [5, 9, 14] (2.1 also stores the leading
+        // zero, 2.2+ omits it).  If a future encoding change stops storing these
+        // offsets verbatim this lookup fails loudly and the test needs a new
+        // byte pattern.  The patch rewrites the tail offset so it points far
+        // beyond the value bytes.
+        let offsets_tail_pattern = [5_i32, 9, 14]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let error = read_file_with_mutated_bytes(
+            version,
+            batch,
+            &offsets_tail_pattern,
+            8,
+            &100_000_i32.to_le_bytes(),
+        )
+        .await
+        .expect_err("out-of-bounds offsets must fail the read");
+        let error_message = error.to_string();
+        assert!(
+            error_message.contains("corrupt file"),
+            "expected a corruption error, got: {error_message}"
+        );
+        assert!(
+            error_message.contains("out of bounds"),
+            "unexpected message: {error_message}"
+        );
+    }
+
+    /// Same contract as the test above, but for a plain (non-dictionary) string
+    /// column: the mini-block chunk stores chunk-relative value offsets that are
+    /// used to slice the chunk, so a corrupt tail offset must surface as a typed
+    /// error from the chunk decompressor instead of a panic in the decode task.
+    #[rstest]
+    #[tokio::test]
+    async fn test_default_reader_rejects_out_of_bounds_miniblock_offsets(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+    ) {
+        use arrow_array::StringArray;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "strings",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"]))],
+        )
+        .unwrap();
+
+        // For ["alpha", "beta", "gamma"] the chunk stores LE i32 offsets
+        // [16, 21, 25, 30] (chunk-relative: a 16-byte offsets region precedes
+        // the value bytes).  The patch rewrites the tail offset to point far
+        // past the chunk.
+        let chunk_offsets_pattern = [16_i32, 21, 25, 30]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let error = read_file_with_mutated_bytes(
+            version,
+            batch,
+            &chunk_offsets_pattern,
+            12,
+            &100_000_i32.to_le_bytes(),
+        )
+        .await
+        .expect_err("an out-of-bounds chunk offset must fail the read");
+        let error_message = error.to_string();
+        assert!(
+            error_message.contains("corrupt file"),
+            "expected a corruption error, got: {error_message}"
+        );
+        assert!(
+            error_message.contains("out of bounds"),
+            "unexpected message: {error_message}"
+        );
     }
 
     #[tokio::test]
