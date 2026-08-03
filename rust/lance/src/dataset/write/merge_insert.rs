@@ -257,10 +257,11 @@ impl InsertedKeyTracker {
                     column_name
                 ))
             })?;
-            if column.is_null(row_idx) {
+            let value = ScalarValue::try_from_array(column, row_idx)?;
+            if value.is_null() {
                 return Ok(true);
             }
-            key.push(ScalarValue::try_from_array(column, row_idx)?);
+            key.push(value);
         }
         Ok(self.keys.insert(key))
     }
@@ -3124,7 +3125,7 @@ mod tests {
     use arrow_array::types::Float32Type;
     use arrow_array::{
         Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, ListArray,
-        RecordBatchIterator, RecordBatchReader, StringArray, StructArray, UInt32Array,
+        NullArray, RecordBatchIterator, RecordBatchReader, StringArray, StructArray, UInt32Array,
         types::{Int32Type, UInt32Type},
     };
     use arrow_array::{RecordBatch, record_batch};
@@ -3151,6 +3152,20 @@ mod tests {
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    #[test]
+    fn test_inserted_key_tracker_preserves_logical_nulls() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Null, true)])),
+            vec![Arc::new(NullArray::new(2))],
+        )
+        .unwrap();
+        let mut tracker = InsertedKeyTracker::default();
+        let on_columns = ["id".to_string()];
+
+        assert!(tracker.insert(&batch, 0, &on_columns).unwrap());
+        assert!(tracker.insert(&batch, 1, &on_columns).unwrap());
     }
 
     // An update-style merge_insert leaves the source and new fragments with
@@ -8891,25 +8906,24 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .unwrap();
         }
 
-        // The duplicate non-null key is split across batches to verify that
-        // FirstSeen state spans the entire source stream. On the v2 path,
-        // also verify that NULL keys remain distinct under SQL equality.
-        let (first, second, expected_inserted) = if with_index {
+        // Repeat the same duplicate pair across batches so the retained value is
+        // deterministic even if independent batches are scheduled in either order.
+        // On the v2 path, also verify that NULL keys remain distinct under SQL
+        // equality across batches.
+        let (source, expected_inserted) = if with_index {
             (
-                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(1)])).unwrap(),
-                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(2)])).unwrap(),
+                record_batch!(
+                    ("id", Int32, [Some(108), Some(108)]),
+                    ("value", Int32, [Some(1), Some(2)])
+                )
+                .unwrap(),
                 1,
             )
         } else {
             (
                 record_batch!(
-                    ("id", Int32, [Some(108), None]),
-                    ("value", Int32, [Some(1), Some(3)])
-                )
-                .unwrap(),
-                record_batch!(
-                    ("id", Int32, [Some(108), None]),
-                    ("value", Int32, [Some(2), Some(4)])
+                    ("id", Int32, [Some(108), Some(108), None]),
+                    ("value", Int32, [Some(1), Some(2), Some(3)])
                 )
                 .unwrap(),
                 3,
@@ -8925,15 +8939,15 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .try_build()
                 .unwrap()
                 .execute_reader(Box::new(RecordBatchIterator::new(
-                    [Ok(first.clone()), Ok(second)],
-                    first.schema(),
+                    [Ok(source.clone()), Ok(source.clone())],
+                    source.schema(),
                 )))
                 .await
                 .unwrap();
 
         assert_eq!(stats.num_inserted_rows, expected_inserted);
         assert_eq!(stats.num_updated_rows, 0);
-        assert_eq!(stats.num_skipped_duplicates, 1);
+        assert_eq!(stats.num_skipped_duplicates, 3);
 
         let inserted = dataset
             .scan()
