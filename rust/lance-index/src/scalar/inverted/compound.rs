@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
@@ -15,7 +15,7 @@ use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use super::{
     InvertedIndex, build_global_bm25_scorer,
     document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
-    documents::{DocId, DocLengths, DocVisibility},
+    documents::{DocId, DocLengths, DocVisibility, PartitionDocuments, ResidentAddressProjection},
     index::{DocSet, InvertedPartition},
     query::{
         FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
@@ -30,6 +30,7 @@ use super::{
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 
 const DEFAULT_BLOCK_SIZE: usize = 128;
+const SCORE_FLOOR_RESOLUTION_BATCH_SIZE: usize = DEFAULT_BLOCK_SIZE;
 
 /// One exact FTS result in a compound collector's candidate domain.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -625,16 +626,29 @@ fn compare_scored_rows<K: Ord>(left: &ScoredRow<K>, right: &ScoredRow<K>) -> Ord
         .then_with(|| left.row_id.cmp(&right.row_id))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CollectionStatus {
+    Complete,
+    ScoreFloorOverflow,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TieHandling {
+    ResolveByKey,
+    RetainScoreFloor { max_buffered: usize },
+}
+
 /// The sole owner of top-k state for a compound scorer tree.
 ///
-/// The heap retains every candidate tied at the kth score. Some document keys
-/// are only resolvable to row ids asynchronously, so equal-score candidates
-/// cannot be trimmed by their temporary keys without changing the final
-/// row-id tie-break.
+/// Resolved document keys use the normal `(score DESC, row_id ASC)` ordering
+/// and keep exactly `limit` rows. An unresolved partition temporarily retains
+/// its kth-score floor, but stops once the bounded resolution buffer fills.
 pub(super) struct TopKCollector<K = u64> {
     limit: usize,
     heap: BinaryHeap<HeapRow<K>>,
     competitive_score: Arc<CompetitiveScore>,
+    tie_handling: TieHandling,
+    peak_buffered: usize,
 }
 
 impl<K: Copy + Ord> TopKCollector<K> {
@@ -646,35 +660,89 @@ impl<K: Copy + Ord> TopKCollector<K> {
         limit: usize,
         competitive_score: Arc<CompetitiveScore>,
     ) -> Self {
+        Self::with_tie_handling(limit, competitive_score, TieHandling::ResolveByKey)
+    }
+
+    fn retaining_score_floor(
+        limit: usize,
+        competitive_score: Arc<CompetitiveScore>,
+        max_buffered: usize,
+    ) -> Self {
+        debug_assert!(max_buffered >= limit);
+        Self::with_tie_handling(
+            limit,
+            competitive_score,
+            TieHandling::RetainScoreFloor { max_buffered },
+        )
+    }
+
+    fn with_tie_handling(
+        limit: usize,
+        competitive_score: Arc<CompetitiveScore>,
+        tie_handling: TieHandling,
+    ) -> Self {
         Self {
             limit,
             heap: BinaryHeap::with_capacity(limit.min(DEFAULT_BLOCK_SIZE)),
             competitive_score,
+            tie_handling,
+            peak_buffered: 0,
         }
     }
 
-    fn insert(&mut self, row: ScoredRow<K>) {
+    fn insert(&mut self, row: ScoredRow<K>) -> CollectionStatus {
         if self.limit == 0 {
-            return;
+            return CollectionStatus::Complete;
         }
         if self.heap.len() < self.limit {
             self.heap.push(HeapRow(row));
         } else {
-            let floor = self
-                .heap
-                .peek()
-                .expect("a full top-k heap is non-empty")
-                .0
-                .score;
-            match row.score.total_cmp(&floor) {
+            let worst = self.heap.peek().expect("a full top-k heap is non-empty").0;
+            match row.score.total_cmp(&worst.score) {
                 Ordering::Less => {}
-                Ordering::Equal => self.heap.push(HeapRow(row)),
+                Ordering::Equal => match self.tie_handling {
+                    TieHandling::ResolveByKey => {
+                        if row.row_id < worst.row_id {
+                            self.heap.pop();
+                            self.heap.push(HeapRow(row));
+                        }
+                    }
+                    TieHandling::RetainScoreFloor { max_buffered } => {
+                        if self.heap.len() >= max_buffered {
+                            self.raise_competitive_score();
+                            return CollectionStatus::ScoreFloorOverflow;
+                        }
+                        self.heap.push(HeapRow(row));
+                    }
+                },
                 Ordering::Greater => {
-                    self.heap.push(HeapRow(row));
-                    self.prune_obsolete_score_floors();
+                    match self.tie_handling {
+                        TieHandling::ResolveByKey => {
+                            self.heap.pop();
+                            self.heap.push(HeapRow(row));
+                        }
+                        TieHandling::RetainScoreFloor { max_buffered } => {
+                            self.heap.push(HeapRow(row));
+                            self.prune_obsolete_score_floors();
+                            if self.heap.len() > max_buffered {
+                                // This collector is discarded and the partition is
+                                // retried with resolved keys. Keep its observable
+                                // working set within the advertised bound meanwhile.
+                                self.heap.pop();
+                                self.raise_competitive_score();
+                                return CollectionStatus::ScoreFloorOverflow;
+                            }
+                        }
+                    }
                 }
             }
         }
+        self.peak_buffered = self.peak_buffered.max(self.heap.len());
+        self.raise_competitive_score();
+        CollectionStatus::Complete
+    }
+
+    fn raise_competitive_score(&self) {
         if self.heap.len() >= self.limit
             && let Some(worst) = self.heap.peek()
         {
@@ -707,11 +775,15 @@ impl<K: Copy + Ord> TopKCollector<K> {
         &mut self,
         scorer: &mut dyn ComposableScorer,
         mut map_document: impl FnMut(u64) -> Result<K>,
-    ) -> Result<()> {
+    ) -> Result<CollectionStatus> {
         if self.limit == 0 {
-            return Ok(());
+            return Ok(CollectionStatus::Complete);
         }
-        let expected = scorer.cost().min(self.limit);
+        let capacity_limit = match self.tie_handling {
+            TieHandling::ResolveByKey => self.limit,
+            TieHandling::RetainScoreFloor { max_buffered } => max_buffered,
+        };
+        let expected = scorer.cost().min(capacity_limit);
         self.heap
             .reserve(expected.saturating_sub(self.heap.capacity()));
 
@@ -748,28 +820,30 @@ impl<K: Copy + Ord> TopKCollector<K> {
                             "compound FTS scorer did not expose its current document key",
                         )
                     })?;
-                    self.insert(ScoredRow {
+                    let status = self.insert(ScoredRow {
                         row_id: map_document(document_key)?,
                         score,
                     });
+                    if status == CollectionStatus::ScoreFloorOverflow {
+                        return Ok(status);
+                    }
                 }
             }
             doc = scorer.next()?;
         }
 
-        Ok(())
+        Ok(CollectionStatus::Complete)
     }
 
-    fn into_score_floor_rows(self) -> Vec<ScoredRow<K>> {
+    fn into_candidates(self) -> Vec<ScoredRow<K>> {
         let mut rows = self.heap.into_iter().map(|row| row.0).collect::<Vec<_>>();
         rows.sort_unstable_by(compare_scored_rows);
         rows
     }
 
-    #[cfg(test)]
     fn into_rows(self) -> Vec<ScoredRow<K>> {
         let limit = self.limit;
-        let mut rows = self.into_score_floor_rows();
+        let mut rows = self.into_candidates();
         rows.truncate(limit);
         rows
     }
@@ -1723,14 +1797,17 @@ struct LoadedLeaf {
 enum LoadedDocuments {
     Legacy(Arc<DocSet>),
     Modern {
+        documents: Arc<PartitionDocuments>,
         lengths: Arc<DocLengths>,
         visibility: DocVisibility,
+        projection: Option<ResidentAddressProjection>,
     },
 }
 
 struct LoadedPartition {
     segment_ordinal: usize,
     partition_ordinal: usize,
+    partition: Arc<InvertedPartition>,
     documents: LoadedDocuments,
     leaves: Vec<LoadedLeaf>,
 }
@@ -1802,38 +1879,59 @@ async fn load_compound_partition(
             Some(lengths) => lengths,
             None => documents.lengths().await?,
         };
+        let projection = documents.resident_address_projection();
         LoadedDocuments::Modern {
+            documents,
             lengths,
             visibility,
+            projection,
         }
     };
 
     Ok(Some(LoadedPartition {
         segment_ordinal,
         partition_ordinal,
+        partition,
         documents,
         leaves,
     }))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum CompoundDocument {
-    Legacy(u64),
-    Modern {
-        segment_ordinal: u32,
-        partition_ordinal: u32,
-        doc_id: u32,
-    },
+struct DeferredCompoundRows {
+    documents: Arc<PartitionDocuments>,
+    rows: Vec<ScoredRow<DocId>>,
 }
 
-fn collect_partition_with_documents<D: WandDocuments + Sync>(
+struct OverflowedCompoundPartition {
+    segment_ordinal: usize,
+    partition_ordinal: usize,
+    partition: Arc<InvertedPartition>,
+    documents: Arc<PartitionDocuments>,
+}
+
+enum PartitionCollectionBoundary {
+    Deferred(DeferredCompoundRows),
+    Overflow(OverflowedCompoundPartition),
+}
+
+struct CollectedPartitions {
+    collector: TopKCollector<u64>,
+    remaining: Vec<LoadedPartition>,
+    boundary: Option<PartitionCollectionBoundary>,
+}
+
+fn collect_partition_with_documents<D, K>(
     documents: &D,
     leaves: Vec<LoadedLeaf>,
     plan: &CompoundScorerPlan,
     metrics: &dyn MetricsCollector,
-    collector: &mut TopKCollector<CompoundDocument>,
-    mut map_document: impl FnMut(u64) -> Result<CompoundDocument>,
-) -> Result<()> {
+    collector: &mut TopKCollector<K>,
+    mut map_document: impl FnMut(u64) -> Result<K>,
+) -> Result<CollectionStatus>
+where
+    D: WandDocuments + Sync,
+    K: Copy + Ord,
+{
     let mut leaf_scorers = leaves
         .into_iter()
         .map(|leaf| {
@@ -1866,127 +1964,196 @@ fn collect_loaded_partitions(
     plan: &CompoundScorerPlan,
     mask: &RowAddrMask,
     metrics: &dyn MetricsCollector,
-    mut collector: TopKCollector<CompoundDocument>,
-) -> Result<TopKCollector<CompoundDocument>> {
-    for partition in partitions {
-        match partition.documents {
+    mut collector: TopKCollector<u64>,
+) -> Result<CollectedPartitions> {
+    let mut partitions = partitions.into_iter();
+    while let Some(partition) = partitions.next() {
+        let LoadedPartition {
+            segment_ordinal,
+            partition_ordinal,
+            partition: source,
+            documents,
+            leaves,
+        } = partition;
+        match documents {
             LoadedDocuments::Legacy(docs) => {
                 let documents = LegacyWandDocuments::new(docs.as_ref(), mask);
-                collect_partition_with_documents(
+                let status = collect_partition_with_documents(
                     &documents,
-                    partition.leaves,
+                    leaves,
                     plan,
                     metrics,
                     &mut collector,
-                    |row_id| Ok(CompoundDocument::Legacy(row_id)),
+                    Ok,
                 )?;
+                debug_assert_eq!(status, CollectionStatus::Complete);
             }
             LoadedDocuments::Modern {
+                documents: partition_documents,
                 lengths,
                 visibility,
+                projection,
             } => {
-                let segment_ordinal = u32::try_from(partition.segment_ordinal).map_err(|_| {
-                    Error::index(format!(
-                        "FTS segment ordinal {} exceeds u32::MAX",
-                        partition.segment_ordinal
-                    ))
-                })?;
-                let partition_ordinal =
-                    u32::try_from(partition.partition_ordinal).map_err(|_| {
-                        Error::index(format!(
-                            "FTS partition ordinal {} exceeds u32::MAX",
-                            partition.partition_ordinal
-                        ))
-                    })?;
                 let documents = ModernWandDocuments::filtered(lengths.as_ref(), &visibility);
-                collect_partition_with_documents(
-                    &documents,
-                    partition.leaves,
-                    plan,
-                    metrics,
-                    &mut collector,
-                    |doc_id| {
-                        Ok(CompoundDocument::Modern {
-                            segment_ordinal,
-                            partition_ordinal,
-                            doc_id: u32::try_from(doc_id).map_err(|_| {
+                if let Some(projection) = projection {
+                    let mut addresses_resolved = 0;
+                    let status = collect_partition_with_documents(
+                        &documents,
+                        leaves,
+                        plan,
+                        metrics,
+                        &mut collector,
+                        |doc_id| {
+                            let doc_id = DocId::new(u32::try_from(doc_id).map_err(|_| {
                                 Error::index(format!(
                                     "FTS DocId {doc_id} exceeds the modern u32 domain"
                                 ))
-                            })?,
-                        })
-                    },
-                )?;
+                            })?);
+                            let row_id = projection.address(doc_id).ok_or_else(|| {
+                                Error::internal(format!(
+                                    "compound FTS scorer returned non-visible DocId {} in segment {segment_ordinal}, partition {partition_ordinal}",
+                                    doc_id.get()
+                                ))
+                            })?;
+                            addresses_resolved += 1;
+                            Ok(row_id)
+                        },
+                    )?;
+                    debug_assert_eq!(status, CollectionStatus::Complete);
+                    metrics.record_compound_addresses_resolved(addresses_resolved);
+                } else {
+                    let max_buffered = collector
+                        .limit
+                        .saturating_add(SCORE_FLOOR_RESOLUTION_BATCH_SIZE);
+                    let mut local_collector = TopKCollector::retaining_score_floor(
+                        collector.limit,
+                        collector.competitive_score.clone(),
+                        max_buffered,
+                    );
+                    let status = collect_partition_with_documents(
+                        &documents,
+                        leaves,
+                        plan,
+                        metrics,
+                        &mut local_collector,
+                        |doc_id| {
+                            Ok(DocId::new(u32::try_from(doc_id).map_err(|_| {
+                                Error::index(format!(
+                                    "FTS DocId {doc_id} exceeds the modern u32 domain"
+                                ))
+                            })?))
+                        },
+                    )?;
+                    metrics.record_compound_peak_buffered_candidates(local_collector.peak_buffered);
+                    let boundary = match status {
+                        CollectionStatus::Complete => {
+                            PartitionCollectionBoundary::Deferred(DeferredCompoundRows {
+                                documents: partition_documents,
+                                rows: local_collector.into_candidates(),
+                            })
+                        }
+                        CollectionStatus::ScoreFloorOverflow => {
+                            metrics.record_compound_score_floor_overflows(1);
+                            PartitionCollectionBoundary::Overflow(OverflowedCompoundPartition {
+                                segment_ordinal,
+                                partition_ordinal,
+                                partition: source,
+                                documents: partition_documents,
+                            })
+                        }
+                    };
+                    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
+                    return Ok(CollectedPartitions {
+                        collector,
+                        remaining: partitions.collect(),
+                        boundary: Some(boundary),
+                    });
+                }
             }
         }
     }
-    Ok(collector)
+    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
+    Ok(CollectedPartitions {
+        collector,
+        remaining: Vec::new(),
+        boundary: None,
+    })
 }
 
-async fn resolve_compound_rows(
-    indices: &[Arc<InvertedIndex>],
-    rows: Vec<ScoredRow<CompoundDocument>>,
-    limit: usize,
-) -> Result<Vec<ScoredRow>> {
-    let mut resolved = vec![None; rows.len()];
-    let mut modern = BTreeMap::<(usize, usize), Vec<(usize, DocId)>>::new();
-    for (rank, row) in rows.iter().enumerate() {
-        match row.row_id {
-            CompoundDocument::Legacy(row_id) => resolved[rank] = Some(row_id),
-            CompoundDocument::Modern {
-                segment_ordinal,
-                partition_ordinal,
-                doc_id,
-            } => modern
-                .entry((segment_ordinal as usize, partition_ordinal as usize))
-                .or_default()
-                .push((rank, DocId::new(doc_id))),
+async fn merge_resolved_compound_rows(
+    collector: &mut TopKCollector<u64>,
+    deferred: DeferredCompoundRows,
+    metrics: &dyn MetricsCollector,
+) -> Result<()> {
+    for rows in deferred.rows.chunks(SCORE_FLOOR_RESOLUTION_BATCH_SIZE) {
+        let doc_ids = rows.iter().map(|row| row.row_id).collect::<Vec<_>>();
+        let addresses = deferred.documents.resolve_addresses(&doc_ids).await?;
+        if addresses.len() != rows.len() {
+            return Err(Error::internal(format!(
+                "compound FTS resolved {} addresses for {} DocIds",
+                addresses.len(),
+                rows.len()
+            )));
         }
-    }
-    for ((segment_ordinal, partition_ordinal), entries) in modern {
-        let documents = indices
-            .get(segment_ordinal)
-            .and_then(|index| index.partitions.get(partition_ordinal))
-            .and_then(|partition| partition.docs.modern())
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "missing modern FTS documents for segment {segment_ordinal}, partition {partition_ordinal}"
-                ))
-            })?;
-        let doc_ids = entries
-            .iter()
-            .map(|(_, doc_id)| *doc_id)
-            .collect::<Vec<_>>();
-        let addresses = documents.resolve_addresses(&doc_ids).await?;
-        for ((rank, _), address) in entries.into_iter().zip(addresses) {
-            resolved[rank] = Some(address);
-        }
-    }
-
-    let mut rows = rows
-        .into_iter()
-        .zip(resolved)
-        .map(|(row, row_id)| {
-            Ok(ScoredRow {
-                row_id: row_id.ok_or_else(|| {
-                    Error::internal("compound FTS candidate address was not resolved")
-                })?,
+        metrics.record_compound_address_resolution_batches(1);
+        metrics.record_compound_peak_address_resolution_batch_size(rows.len());
+        metrics.record_compound_addresses_resolved(addresses.len());
+        for (row, row_id) in rows.iter().zip(addresses) {
+            let status = collector.insert(ScoredRow {
+                row_id,
                 score: row.score,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    rows.sort_unstable_by(compare_scored_rows);
-    rows.truncate(limit);
-    Ok(rows)
+            });
+            debug_assert_eq!(status, CollectionStatus::Complete);
+        }
+    }
+    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
+    Ok(())
+}
+
+async fn reload_compound_partition_with_projection(
+    overflow: OverflowedCompoundPartition,
+    leaves: &[PreparedLeaf],
+    mask: Arc<RowAddrMask>,
+    metrics: Arc<dyn MetricsCollector>,
+) -> Result<LoadedPartition> {
+    let projection = overflow.documents.address_projection().await?;
+    let mut loaded = load_compound_partition(
+        overflow.segment_ordinal,
+        overflow.partition_ordinal,
+        overflow.partition,
+        leaves,
+        mask,
+        metrics,
+    )
+    .await?
+    .ok_or_else(|| {
+        Error::internal(format!(
+            "compound FTS retry lost visible documents in segment {}, partition {}",
+            overflow.segment_ordinal, overflow.partition_ordinal
+        ))
+    })?;
+    match &mut loaded.documents {
+        LoadedDocuments::Modern {
+            projection: loaded_projection,
+            ..
+        } => *loaded_projection = Some(projection),
+        LoadedDocuments::Legacy(_) => {
+            return Err(Error::internal(format!(
+                "compound FTS retry changed segment {}, partition {} from modern to legacy documents",
+                overflow.segment_ordinal, overflow.partition_ordinal
+            )));
+        }
+    }
+    Ok(loaded)
 }
 
 /// Search one-column compound FTS directly over posting-backed scorers.
 ///
 /// The caller must provide all committed index segments for the column and a
 /// ready prefilter. One collector owns the global top-k heap and propagates its
-/// score floor through every partition-local scorer tree. Its score-bounded
-/// candidates, including every kth-score tie, are resolved to row addresses
-/// before the final row-id tie-break is applied.
+/// score floor through every partition-local scorer tree. Modern partitions
+/// resolve candidates in bounded batches; an oversized kth-score tie is retried
+/// against a resident row-address projection so final row-id ordering stays exact.
 pub async fn compound_search(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
@@ -2056,29 +2223,50 @@ async fn compound_search_impl(
                         metrics.clone(),
                     )
                 });
-        let partitions = stream::iter(loads)
+        let mut partitions = stream::iter(loads)
             .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 32))
             .try_collect::<Vec<_>>()
             .await?
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        let plan = plan.clone();
-        let mask = mask.clone();
-        let metrics = metrics.clone();
-        collector = spawn_cpu(move || {
-            collect_loaded_partitions(
-                partitions,
-                &plan,
-                mask.as_ref(),
-                metrics.as_ref(),
-                collector,
-            )
-        })
-        .await?;
+        while !partitions.is_empty() {
+            let cpu_plan = plan.clone();
+            let cpu_mask = mask.clone();
+            let cpu_metrics = metrics.clone();
+            let collected = spawn_cpu(move || {
+                collect_loaded_partitions(
+                    partitions,
+                    &cpu_plan,
+                    cpu_mask.as_ref(),
+                    cpu_metrics.as_ref(),
+                    collector,
+                )
+            })
+            .await?;
+            collector = collected.collector;
+            partitions = collected.remaining;
+            match collected.boundary {
+                Some(PartitionCollectionBoundary::Deferred(deferred)) => {
+                    merge_resolved_compound_rows(&mut collector, deferred, metrics.as_ref())
+                        .await?;
+                }
+                Some(PartitionCollectionBoundary::Overflow(overflow)) => {
+                    let retry = reload_compound_partition_with_projection(
+                        overflow,
+                        &leaves,
+                        mask.clone(),
+                        metrics.clone(),
+                    )
+                    .await?;
+                    partitions.insert(0, retry);
+                }
+                None => debug_assert!(partitions.is_empty()),
+            }
+        }
     }
 
-    let rows = resolve_compound_rows(indices, collector.into_score_floor_rows(), limit).await?;
+    let rows = collector.into_rows();
     Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
 }
 
@@ -2152,6 +2340,54 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn collector_bounds_equal_score_candidates() {
+        let limit = 1;
+        let num_candidates = DEFAULT_BLOCK_SIZE * 4;
+        let values = (0..num_candidates)
+            .map(|row_id| (row_id as u64, 1.0))
+            .collect::<Vec<_>>();
+        let mut scorer = MaterializedScorer::try_new(rows(&values)).unwrap();
+        let max_buffered = limit + SCORE_FLOOR_RESOLUTION_BATCH_SIZE;
+        let mut collector = TopKCollector::retaining_score_floor(
+            limit,
+            Arc::new(CompetitiveScore::default()),
+            max_buffered,
+        );
+
+        let status = collector.collect_mapped(&mut scorer, Ok).unwrap();
+
+        assert_eq!(status, CollectionStatus::ScoreFloorOverflow);
+        assert_eq!(collector.heap.len(), max_buffered);
+    }
+
+    #[test]
+    fn collector_reclaims_obsolete_score_floor_before_overflowing() {
+        let limit = 2;
+        let max_buffered = 4;
+        let values = [
+            (0, 1.0),
+            (1, 1.0),
+            (2, 1.0),
+            (3, 2.0),
+            (4, 2.0),
+            (5, 2.0),
+            (6, 2.0),
+            (7, 2.0),
+        ];
+        let mut scorer = MaterializedScorer::try_new(rows(&values)).unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        let mut collector =
+            TopKCollector::retaining_score_floor(limit, competitive_score.clone(), max_buffered);
+
+        let status = collector.collect_mapped(&mut scorer, Ok).unwrap();
+
+        assert_eq!(status, CollectionStatus::ScoreFloorOverflow);
+        assert_eq!(collector.heap.len(), max_buffered);
+        assert!(collector.heap.iter().all(|row| row.0.score == 2.0));
+        assert_eq!(competitive_score.get(), 2.0);
     }
 
     struct TwoPhaseScorer {
