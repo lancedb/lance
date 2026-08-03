@@ -2379,6 +2379,94 @@ async fn test_fts_list_index_uses_row_level_documents() {
 }
 
 #[tokio::test]
+async fn test_fts_list_flat_search_matches_index_tokenization() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new(
+            "doc",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+    let list_batch = |ids: Vec<u64>, rows: Vec<Option<Vec<Option<&str>>>>| {
+        let mut docs = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+        for row in rows {
+            let Some(elements) = row else {
+                docs.append(false);
+                continue;
+            };
+            for element in elements {
+                match element {
+                    Some(value) => docs.values().append_value(value),
+                    None => docs.values().append_null(),
+                }
+            }
+            docs.append(true);
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(ids)) as ArrayRef,
+                Arc::new(docs.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let indexed = list_batch(
+        vec![1, 3, 4, 5],
+        vec![
+            Some(vec![Some("a"), None, Some("b")]),
+            Some(vec![None]),
+            Some(vec![]),
+            None,
+        ],
+    );
+    let reader = RecordBatchIterator::new([Ok(indexed)], schema.clone());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("raw".to_owned())
+        .max_token_length(None)
+        .lower_case(false)
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(false);
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let unindexed = list_batch(
+        vec![2, 6, 7, 8],
+        vec![
+            Some(vec![Some("c"), None, Some("d")]),
+            Some(vec![None]),
+            Some(vec![]),
+            None,
+        ],
+    );
+    let reader = RecordBatchIterator::new([Ok(unindexed)], schema);
+    dataset.append(reader, None).await.unwrap();
+
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("a b".to_owned())).await,
+        vec![1]
+    );
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("a".to_owned())).await,
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("c d".to_owned())).await,
+        vec![2]
+    );
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("c".to_owned())).await,
+        Vec::<u64>::new()
+    );
+}
+
+#[tokio::test]
 async fn test_fts_list_phrase_query_can_cross_elements() {
     assert_fts_list_phrase_query_can_cross_elements::<i32>().await;
 }

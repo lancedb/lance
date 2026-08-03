@@ -1426,17 +1426,6 @@ impl IndexWorker {
         })
     }
 
-    fn materialize_string_list(elements: &dyn Array) -> String {
-        let mut doc = String::new();
-        for element in iter_str_array(elements).flatten() {
-            if !doc.is_empty() {
-                doc.push(' ');
-            }
-            doc.push_str(element);
-        }
-        doc
-    }
-
     async fn process_document(&mut self, row_id: u64, document: DocumentSource<'_>) -> Result<()> {
         let with_position = self.has_position();
         let builder_was_empty = self.builder.docs.is_empty();
@@ -1505,7 +1494,7 @@ impl IndexWorker {
                         process_text(doc)?;
                     }
                     DocumentSource::StringList(elements) => {
-                        let doc = Self::materialize_string_list(elements);
+                        let doc = materialize_string_list(elements);
                         process_text(&doc)?;
                     }
                 }
@@ -1534,7 +1523,7 @@ impl IndexWorker {
                 match document {
                     DocumentSource::Text(doc) => process_text(doc),
                     DocumentSource::StringList(elements) => {
-                        let doc = Self::materialize_string_list(elements);
+                        let doc = materialize_string_list(elements);
                         process_text(&doc);
                     }
                 }

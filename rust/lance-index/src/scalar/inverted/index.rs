@@ -7669,6 +7669,17 @@ impl DocSet {
     }
 }
 
+pub(super) fn materialize_string_list(elements: &dyn Array) -> String {
+    let mut doc = String::new();
+    for element in iter_str_array(elements).flatten() {
+        if !doc.is_empty() {
+            doc.push(' ');
+        }
+        doc.push_str(element);
+    }
+    doc
+}
+
 pub fn flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
@@ -7757,10 +7768,8 @@ fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
                 continue;
             }
             let elements = doc_array.value(i);
-            if iter_str_array(elements.as_ref())
-                .flatten()
-                .any(|element| has_query_token(element, &mut tokenizer, &query_tokens))
-            {
+            let doc = materialize_string_list(elements.as_ref());
+            if has_query_token(&doc, &mut tokenizer, &query_tokens) {
                 results.push(row_id_array.value(i));
             }
         }
@@ -7963,10 +7972,8 @@ fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
         temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens_len));
 
         let elements = doc_array.value(i);
-        let mut all_tokens = 0;
-        for element in iter_str_array(elements.as_ref()).flatten() {
-            all_tokens += count_text(element, temp_query_token_counts);
-        }
+        let doc = materialize_string_list(elements.as_ref());
+        let all_tokens = count_text(&doc, temp_query_token_counts);
 
         if all_tokens > 0 {
             append_counts(row_id_array.value(i), all_tokens, temp_query_token_counts);
@@ -8348,6 +8355,39 @@ mod tests {
             address_read_concurrency(64, 2 * MAX_CONCURRENT_ADDRESS_READ_BYTES),
             1
         );
+    }
+
+    #[test]
+    fn flat_full_text_search_joins_string_list_elements() {
+        let mut docs_builder =
+            GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+        docs_builder.values().append_value("a");
+        docs_builder.values().append_null();
+        docs_builder.values().append_value("b");
+        docs_builder.append(true);
+
+        let docs = Arc::new(docs_builder.finish()) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                ROW_ID_FIELD.clone(),
+                Field::new("text", docs.data_type().clone(), true),
+            ])),
+            vec![Arc::new(UInt64Array::from(vec![1_u64])) as ArrayRef, docs],
+        )
+        .unwrap();
+        let tokenizer = InvertedIndexParams::default()
+            .base_tokenizer("raw".to_owned())
+            .max_token_length(None)
+            .lower_case(false)
+            .stem(false)
+            .remove_stop_words(false)
+            .ascii_folding(false)
+            .build()
+            .unwrap();
+
+        let row_ids = flat_full_text_search(&[&batch], "text", "a b", Some(tokenizer)).unwrap();
+
+        assert_eq!(row_ids, vec![1]);
     }
 
     #[derive(Debug)]
