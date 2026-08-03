@@ -2415,18 +2415,50 @@ struct FlatValueCounts {
     last_chunk_values: u64,
 }
 
-fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
+fn analyze_value_counts(words: &Words, items_in_page: u64) -> Result<FlatValueCounts> {
     let num_chunks = words.len();
     let logs = words.iter().map(|w| (w & 0x0F) as u8).collect::<Vec<_>>();
     let mut counted = 0u64;
-    for &log in logs.iter().take(num_chunks.saturating_sub(1)) {
-        // Non-last chunks always encode a positive log value count.
-        debug_assert!(log > 0);
-        counted += 1u64 << log;
+    for (chunk_index, &log) in logs.iter().take(num_chunks.saturating_sub(1)).enumerate() {
+        if log == 0 {
+            return Err(Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "non-final chunk {chunk_index} of {num_chunks} has invalid log_num_values=0"
+                ),
+            ));
+        }
+        counted = counted.checked_add(1u64 << log).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "value count overflow at chunk {chunk_index}: counted_values={counted}, \
+                     log_num_values={log}, items_in_page={items_in_page}"
+                ),
+            )
+        })?;
     }
-    let last_chunk_values = items_in_page - counted;
-    if let Some(&last_log) = logs.last() {
-        debug_assert!(last_log == 0 || (1u64 << last_log) == last_chunk_values);
+    let last_chunk_values = items_in_page.checked_sub(counted).ok_or_else(|| {
+        Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "non-final chunks account for counted_values={counted}, exceeding \
+                 items_in_page={items_in_page}"
+            ),
+        )
+    })?;
+    if let Some(&last_log) = logs.last()
+        && last_log != 0
+        && (1u64 << last_log) != last_chunk_values
+    {
+        return Err(Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "final chunk log_num_values={last_log} does not match \
+                 last_chunk_values={last_chunk_values}: counted_values={counted}, \
+                 items_in_page={items_in_page}"
+            ),
+        ));
     }
     let uniform = num_chunks <= 1 || logs[..num_chunks - 1].iter().all(|&log| log == logs[0]);
     // A single-chunk page has no "non-last" chunk to derive a stride from; use the
@@ -2436,27 +2468,24 @@ fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
     } else {
         1u64 << logs[0]
     };
-    FlatValueCounts {
+    Ok(FlatValueCounts {
         logs,
         uniform,
         values_per_chunk,
         last_chunk_values,
-    }
+    })
 }
 
 /// Iterator over per-chunk value counts for a non-uniform flat page.  Non-last
-/// chunks yield `1 << log`; the last yields the remaining items in the page.
-fn flat_value_counts_iter(logs: &[u8], items_in_page: u64) -> impl Iterator<Item = u64> + '_ {
+/// chunks yield `1 << log`; the last yields the validated remaining item count.
+fn flat_value_counts_iter(logs: &[u8], last_chunk_values: u64) -> impl Iterator<Item = u64> + '_ {
     let num_chunks = logs.len();
-    let mut counted = 0u64;
     (0..num_chunks).map(move |i| {
-        let count = if i + 1 < num_chunks {
+        if i + 1 < num_chunks {
             1u64 << logs[i]
         } else {
-            items_in_page - counted
-        };
-        counted += count;
-        count
+            last_chunk_values
+        }
     })
 }
 
@@ -2471,8 +2500,12 @@ fn build_chunk_index(
     data_buf_size: u64,
     rep_index_bytes: Option<&[u8]>,
     repetition_index_depth: u16,
-) -> MiniBlockChunkIndex {
+) -> Result<MiniBlockChunkIndex> {
     let num_chunks = words.len();
+    // Validate item counts before byte sizes because both share a metadata word,
+    // and an invalid count must not reach the final-chunk subtraction.
+    let value_counts = analyze_value_counts(words, items_in_page)?;
+
     // Each chunk stores `(divided_bytes + 1) * MINIBLOCK_ALIGNMENT` bytes, so the
     // deltas are the chunk sizes and their grand total is the data buffer size.
     let byte_starts = PrefixSums::from_deltas(
@@ -2489,7 +2522,6 @@ fn build_chunk_index(
         assert!(rep_index_data.len() % 8 == 0);
         let stride = repetition_index_depth as usize + 1;
         let (row_starts, has_trailer) = parse_nested_rep(rep_index_data, stride);
-        let value_counts = analyze_value_counts(words, items_in_page);
         let item_counts = if value_counts.uniform {
             ItemCounts::Uniform {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -2507,7 +2539,6 @@ fn build_chunk_index(
             item_counts,
         }
     } else {
-        let value_counts = analyze_value_counts(words, items_in_page);
         if value_counts.uniform {
             RowMapping::UniformFlat {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -2516,7 +2547,7 @@ fn build_chunk_index(
             }
         } else {
             let value_starts = PrefixSums::from_deltas(
-                flat_value_counts_iter(&value_counts.logs, items_in_page),
+                flat_value_counts_iter(&value_counts.logs, value_counts.last_chunk_values),
                 num_chunks,
                 items_in_page,
             );
@@ -2524,7 +2555,7 @@ fn build_chunk_index(
         }
     };
 
-    MiniBlockChunkIndex::new(base, byte_starts, rows)
+    Ok(MiniBlockChunkIndex::new(base, byte_starts, rows))
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
@@ -2574,7 +2605,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 data_buf_size,
                 rep_index_bytes.as_deref(),
                 self.repetition_index_depth,
-            );
+            )?;
 
             // decode dictionary
             let dictionary = if let Some(ref mut dictionary) = self.dictionary {
@@ -7788,7 +7819,7 @@ mod tests {
     ) {
         let base = 100u64;
         let (words, data_buf_size) = words_from(entries);
-        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0);
+        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0).unwrap();
 
         assert_eq!(index.row_mapping_debug(), expected_kind);
         assert_eq!(index.num_chunks(), entries.len());
@@ -7819,7 +7850,7 @@ mod tests {
 
         // Uniform leaf chunking: value counts 4, 4, 2.
         let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1);
+        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1).unwrap();
         assert_eq!(index.row_mapping_debug(), "nested");
         assert_eq!(index.num_chunks(), 3);
         // Rows come from the repetition index, not the value counts.
@@ -7836,7 +7867,7 @@ mod tests {
 
         // Non-uniform leaf chunking: value counts 8, 2, 5.
         let (words_nu, dbs_nu) = words_from(&[(3, 8), (1, 8), (0, 8)]);
-        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1);
+        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1).unwrap();
         assert_eq!(index_nu.row_mapping_debug(), "nested");
         assert_eq!(index_nu.items_in_chunk(0), 8);
         assert_eq!(index_nu.items_in_chunk(1), 2);
@@ -7849,7 +7880,7 @@ mod tests {
     fn test_uniform_flat_matches_prefix_sum_flat() {
         // Distribution: 4 chunks of 4 values, last chunk 3 (15 items total).
         let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (2, 8), (0, 8)]);
-        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0);
+        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
 
         // The same distribution expressed as a non-uniform Flat prefix-sum index.
@@ -7900,12 +7931,12 @@ mod tests {
         let heap = |index: &MiniBlockChunkIndex| index.deep_size_of_children(&mut Context::new());
 
         let (uniform_words, uniform_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0);
+        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
         assert!(heap(&uniform) < LEGACY_PER_CHUNK * num_chunks);
 
         let (flat_words, flat_dbs) = words_from(&[(3, 8), (1, 8), (0, 8)]);
-        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0);
+        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0).unwrap();
         assert_eq!(flat.row_mapping_debug(), "flat");
         assert!(heap(&flat) < LEGACY_PER_CHUNK * num_chunks);
         // Flat carries a value-starts array that UniformFlat derives arithmetically.
@@ -7913,7 +7944,7 @@ mod tests {
 
         let rep = rep_bytes_from(&[4, 0, 3, 0, 3, 0]);
         let (nested_words, nested_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1);
+        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1).unwrap();
         assert_eq!(nested.row_mapping_debug(), "nested");
         assert!(heap(&nested) < LEGACY_PER_CHUNK * num_chunks);
     }

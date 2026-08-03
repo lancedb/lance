@@ -473,7 +473,7 @@ impl ResidentAddressProjection {
         }
     }
 
-    fn address(&self, doc_id: DocId) -> Option<u64> {
+    pub(super) fn address(&self, doc_id: DocId) -> Option<u64> {
         if self
             .projection
             .live_docs
@@ -866,7 +866,7 @@ impl PartitionDocuments {
         self.lengths.get().cloned()
     }
 
-    fn resident_address_projection(&self) -> Option<ResidentAddressProjection> {
+    pub(super) fn resident_address_projection(&self) -> Option<ResidentAddressProjection> {
         let projection = self.projection.get()?.clone();
         let shared_addresses = match &projection.addresses {
             AddressValues::Shared { .. } => self.shared_addresses.load().upgrade(),
