@@ -60,10 +60,9 @@ impl Default for HnswMetadata {
 /// Algorithm 4 in the HNSW paper.
 ///
 /// This uses the paper's `extendCandidates = false` and
-/// `keepPrunedConnections = false` configuration. Candidate extension can
-/// substantially increase construction work on clustered data, so it is not
-/// enabled implicitly; callers supply the complete candidate set that should
-/// participate in this selection.
+/// `keepPrunedConnections = false` configuration, matching hnswlib's
+/// `getNeighborsByHeuristic2`. Callers supply the complete candidate set that
+/// should participate in this selection.
 ///
 /// # NOTE
 /// The results are not ordered.

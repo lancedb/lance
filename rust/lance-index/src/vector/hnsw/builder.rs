@@ -58,6 +58,15 @@ pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 /// ([`super::online::OnlineHnswBuilder`]) builders so both produce comparable graphs.
 pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
 
+/// Draw a node level using the distribution from Algorithm 1.
+pub(crate) fn random_level_with<R: Rng + ?Sized>(params: &HnswBuildParams, rng: &mut R) -> u16 {
+    let ml = 1.0 / (params.m as f32).ln();
+    min(
+        (-rng.random::<f32>().ln() * ml) as u16,
+        params.max_level - 1,
+    )
+}
+
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
@@ -207,7 +216,7 @@ impl DeepSizeOf for HnswCore {
 
 impl HnswCore {
     fn max_level(&self) -> u16 {
-        self.params.max_level
+        self.level_count.len() as u16
     }
 
     fn num_nodes(&self, level: usize) -> usize {
@@ -679,7 +688,7 @@ impl DeepSizeOf for HnswBuilder {
 
 impl HnswBuilder {
     fn finish(self) -> HNSW {
-        let nodes = match Arc::try_unwrap(self.nodes) {
+        let nodes: Vec<GraphBuilderNode> = match Arc::try_unwrap(self.nodes) {
             Ok(nodes) => nodes
                 .into_iter()
                 .map(|node| node.into_inner().expect("builder lock poisoned"))
@@ -690,9 +699,14 @@ impl HnswBuilder {
                 .collect(),
         };
 
+        let actual_levels = nodes
+            .get(self.entry_point as usize)
+            .map(|node| node.level_neighbors.len())
+            .unwrap_or(0);
         let level_count = self
             .level_count
             .into_iter()
+            .take(actual_levels)
             .map(|count| count.load(Ordering::Relaxed))
             .collect();
 
@@ -735,36 +749,22 @@ impl HnswBuilder {
         }
 
         let mut nodes = Vec::with_capacity(len);
-        {
-            if len > 0 {
-                // The offline builder inserts the remaining nodes in parallel, so
-                // node 0 is a fixed full-height anchor instead of a dynamically
-                // promoted entry point. This intentional construction variant lets
-                // every worker traverse every configured level from a valid node.
-                nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
+        let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
+        let mut highest_level = 0;
+        for i in 0..len {
+            let target_level = random_level_with(&builder.params, &mut level_rng);
+            if target_level > highest_level {
+                highest_level = target_level;
+                builder.entry_point = i as u32;
             }
-            let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
-            for i in 1..len {
-                nodes.push(RwLock::new(GraphBuilderNode::new(
-                    i as u32,
-                    builder.random_level(&mut level_rng) as usize + 1,
-                )));
-            }
+            nodes.push(RwLock::new(GraphBuilderNode::new(
+                i as u32,
+                target_level as usize + 1,
+            )));
         }
         builder.nodes = Arc::new(nodes);
 
         builder
-    }
-
-    /// New node's level
-    ///
-    /// See paper `Algorithm 1`
-    fn random_level<R: Rng + ?Sized>(&self, rng: &mut R) -> u16 {
-        let ml = 1.0 / (self.params.m as f32).ln();
-        min(
-            (-rng.random::<f32>().ln() * ml) as u16,
-            self.params.max_level - 1,
-        )
     }
 
     /// Insert one node.
@@ -776,6 +776,12 @@ impl HnswBuilder {
     ) {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
+        let entry_level = nodes[self.entry_point as usize]
+            .read()
+            .unwrap()
+            .level_neighbors
+            .len() as u16
+            - 1;
         let dist_calc = storage.dist_calculator_from_id(node);
         let mut ep = OrderedNode::new(
             self.entry_point,
@@ -790,7 +796,7 @@ impl HnswBuilder {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
-        for level in (target_level + 1..self.params.max_level).rev() {
+        for level in (target_level + 1..=entry_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
         }
@@ -1411,17 +1417,23 @@ impl IvfSubIndex for HNSW {
         }
 
         let len = storage.len();
-        // The fixed entry point is emitted at every configured level, so its
-        // contribution must be present in every persisted level boundary.
-        for count in &builder.level_count {
+        let entry_levels = builder.nodes[builder.entry_point as usize]
+            .read()
+            .unwrap()
+            .level_neighbors
+            .len();
+        for count in builder.level_count.iter().take(entry_levels) {
             count.fetch_add(1, Ordering::Relaxed);
         }
-        (1..len).into_par_iter().for_each_init(
-            || VisitedGenerator::new(len),
-            |visited_generator, node| {
-                builder.insert(node as u32, visited_generator, storage);
-            },
-        );
+        (0..len)
+            .into_par_iter()
+            .filter(|node| *node as u32 != builder.entry_point)
+            .for_each_init(
+                || VisitedGenerator::new(len),
+                |visited_generator, node| {
+                    builder.insert(node as u32, visited_generator, storage);
+                },
+            );
 
         assert_eq!(builder.level_count[0].load(Ordering::Relaxed), len);
         Ok(builder.finish())
@@ -1534,9 +1546,13 @@ mod tests {
     use lance_table::io::manifest::ManifestDescribing;
     use lance_testing::datagen::generate_random_array;
     use object_store::path::Path;
+    use rand::{SeedableRng, rngs::SmallRng};
     use rstest::rstest;
 
-    use super::{HnswBuilder, HnswGraph, ImmutableHnswBottomView, ImmutableHnswLevelView};
+    use super::{
+        HNSW_LEVEL_RNG_SEED, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
+        ImmutableHnswLevelView, random_level_with,
+    };
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
@@ -1759,6 +1775,38 @@ mod tests {
                 .all(|node| node.read().unwrap().level_neighbors_ranked[0].len() <= 4),
             "existing level-0 nodes must remain bounded by Mmax0"
         );
+    }
+
+    /// Offline construction pre-assigns the same random node heights as the
+    /// online builder and uses the first globally highest node as the anchor
+    /// for parallel insertion. This matches the final entry point produced by
+    /// sequential dynamic promotion without forcing node 0 to full height.
+    #[test]
+    fn test_offline_entry_point_uses_random_node_levels() {
+        const TOTAL: usize = 2048;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * 2), 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default();
+        let builder = HnswBuilder::with_params(params.clone(), &store);
+
+        let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
+        let expected_levels = (0..TOTAL)
+            .map(|_| random_level_with(&params, &mut level_rng))
+            .collect::<Vec<_>>();
+        let highest_level = *expected_levels.iter().max().unwrap();
+        let expected_entry = expected_levels
+            .iter()
+            .position(|level| *level == highest_level)
+            .unwrap() as u32;
+
+        for (node, expected_level) in builder.nodes.iter().zip(expected_levels) {
+            assert_eq!(
+                node.read().unwrap().level_neighbors.len(),
+                expected_level as usize + 1
+            );
+        }
+        assert_eq!(builder.entry_point, expected_entry);
     }
 
     /// The Arrow-backed loaded graph must search bit-identically to the
@@ -2240,7 +2288,14 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        for query_index in [1, TOTAL / 3, TOTAL - 1] {
+        let entry_point = builder.inner.entry_point as usize;
+        let query_indices = [0, 1, TOTAL / 3, TOTAL - 1]
+            .into_iter()
+            .filter(|query_index| *query_index != entry_point)
+            .take(3)
+            .collect::<Vec<_>>();
+        assert_eq!(query_indices.len(), 3);
+        for query_index in query_indices {
             let query = fsl.value(query_index);
             let builder_results = builder
                 .search_basic(query.clone(), 10, &params, None, store.as_ref())
