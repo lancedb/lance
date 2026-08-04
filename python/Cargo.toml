@@ -25,7 +25,7 @@ arrow-cast = "58.0.0"
 arrow-data = "58.0.0"
 arrow-schema = "58.0.0"
 object_store = "0.13.2"
-datafusion = { version = "54.0.0", default-features = false }
+datafusion = { version = "54.0.0", default-features = false, features = ["recursive_protection"] }
 datafusion-ffi = "54.0.0"
 datafusion-common = "54.0.0"
 # Keep the Python FFI build on the working Brotli allocator resolution until
@@ -84,6 +84,10 @@ tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.17"
 tracing = { version = "0.1" }
 bytes = "1.11.1"
+
+# Remove after a DataFusion release includes https://github.com/apache/datafusion/pull/23058.
+[patch.crates-io]
+datafusion-sql = { path = "../rust/vendor/datafusion-sql" }
 
 [features]
 default = []

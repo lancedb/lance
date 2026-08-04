@@ -27,7 +27,7 @@ members = [
     "rust/arrow-scalar",
     "rust/arrow-stats",
 ]
-exclude = ["python", "java/lance-jni"]
+exclude = ["python", "java/lance-jni", "rust/vendor/datafusion-sql"]
 # Python package needs to be built by maturin.
 resolver = "3"
 
@@ -134,6 +134,7 @@ datafusion = { version = "54.0.0", default-features = false, features = [
     "datetime_expressions",
     "encoding_expressions",
     "nested_expressions",
+    "recursive_protection",
     "regex_expressions",
     "sql",
     "string_expressions",
@@ -141,7 +142,7 @@ datafusion = { version = "54.0.0", default-features = false, features = [
 ] }
 datafusion-common = "54.0.0"
 datafusion-functions = { version = "54.0.0", default-features = false, features = ["regex_expressions"] }
-datafusion-sql = "54.0.0"
+datafusion-sql = { version = "54.0.0", features = ["recursive_protection"] }
 datafusion-expr = "54.0.0"
 datafusion-ffi = "54.0.0"
 datafusion-physical-expr = "54.0.0"
@@ -218,6 +219,10 @@ url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 wiremock = "0.6"
 pretty_assertions = "1.4.0"
+
+# Remove after a DataFusion release includes https://github.com/apache/datafusion/pull/23058.
+[patch.crates-io]
+datafusion-sql = { path = "rust/vendor/datafusion-sql" }
 
 [profile.bench]
 opt-level = 3
