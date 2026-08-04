@@ -21,7 +21,9 @@ use crate::{
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::{IndexParams, IndexType, registry::plugin_name_from_details_url, scalar::CreatedIndex};
+use lance_index::{
+    IndexParams, IndexType, registry::plugin_name_from_details_url, scalar::CreatedIndex,
+};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{
@@ -892,12 +894,13 @@ fn index_matches_type(
     // for type_url lookup: lowercase the last path segment and strip "indexdetails".
     // Compare directly instead of going through IndexType so this path stays valid
     // as we move away from the IndexType enum.
-    if index_type == IndexType::Scalar {
-        if let Some(scalar_params) = params.as_any().downcast_ref::<ScalarIndexParams>() {
-            return scalar_params.index_type.to_lowercase()
-                == plugin_name_from_details_url(&d.type_url);
-        }
+    if index_type == IndexType::Scalar
+        && let Some(scalar_params) = params.as_any().downcast_ref::<ScalarIndexParams>()
+    {
+        return scalar_params.index_type.to_lowercase()
+            == plugin_name_from_details_url(&d.type_url);
     }
+
     index_type.matches_details(d)
 }
 
