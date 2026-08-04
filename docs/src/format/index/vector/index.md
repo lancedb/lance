@@ -167,17 +167,17 @@ No quantization applied - stores original vectors in their full precision:
 
 | Column   | Type                     | Nullable | Description                                           |
 | -------- | ------------------------ | -------- | ----------------------------------------------------- |
-| `_rowid` | uint64                   | false    | Row identifier                                        |
-| `flat`   | list<float32>[dimension] | false    | Original vector values (list_size = vector dimension) |
+| `_rowid` | uint64                   | true     | Row identifier                                        |
+| `flat`   | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
 
 ##### PQ
 
 Compresses vectors using product quantization for significant memory savings:
 
-| Column      | Type           | Nullable | Description                                 |
-| ----------- | -------------- | -------- | ------------------------------------------- |
-| `_rowid`    | uint64         | false    | Row identifier                              |
-| `__pq_code` | list<uint8>[m] | false    | PQ codes (list_size = number of subvectors) |
+| Column      | Type                                            | Nullable | Description                                   |
+| ----------- | ----------------------------------------------- | -------- | --------------------------------------------- |
+| `_rowid`    | uint64                                          | true     | Row identifier                                |
+| `__pq_code` | list<uint8>[num_sub_vectors * num_bits / 8]     | true     | PQ codes, packed to `num_bits` per subvector  |
 
 ##### SQ
 
@@ -185,23 +185,23 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 | Column      | Type                   | Nullable | Description                             |
 | ----------- | ---------------------- | -------- | --------------------------------------- |
-| `_rowid`    | uint64                 | false    | Row identifier                          |
-| `__sq_code` | list<uint8>[dimension] | false    | SQ codes (list_size = vector dimension) |
+| `_rowid`    | uint64                 | true     | Row identifier                          |
+| `__sq_code` | list<uint8>[dimension] | true     | SQ codes (list_size = vector dimension) |
 
 ##### RQ
 
 Compresses vectors using RabitQ with random rotation and binary quantization for extreme compression:
 
-| Column               | Type                                             | Nullable                 | Description                                                     |
-| -------------------- | ------------------------------------------------ | ------------------------ | --------------------------------------------------------------- |
-| `_rowid`             | uint64                                           | false                    | Row identifier                                                  |
-| `_rabit_codes`       | list<uint8>[dimension / 8]                       | false                    | Binary quantized codes (1 bit per dimension, packed into bytes) |
-| `__add_factors`      | float32                                          | false                    | Additive correction factors for distance computation            |
-| `__scale_factors`    | float32                                          | false                    | Scale correction factors for distance computation               |
-| `__error_factors`    | float32                                          | false for `raw_query`    | Error factors for raw-query lower-bound pruning                 |
-| `__blocked_ex_codes` | list<uint8>[next_multiple_of(dimension, 64) * (num_bits - 1) / 8] | false for `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ, in the blocked layout   |
-| `__add_factors_ex`   | float32                                          | false for `num_bits > 1` | Additive correction factors for ex-code distance computation    |
-| `__scale_factors_ex` | float32                                          | false for `num_bits > 1` | Scale correction factors for ex-code distance computation       |
+| Column               | Type                                             | Nullable | Present when                | Description                                                     |
+| -------------------- | ------------------------------------------------ | -------- | --------------------------- | --------------------------------------------------------------- |
+| `_rowid`             | uint64                                           | true     | always                      | Row identifier                                                  |
+| `_rabit_codes`       | list<uint8>[ceil(code_dim / 8)]                  | true     | always                      | Binary quantized codes (1 bit per dimension, packed into bytes) |
+| `__add_factors`      | float32                                          | true     | always                      | Additive correction factors for distance computation            |
+| `__scale_factors`    | float32                                          | true     | always                      | Scale correction factors for distance computation               |
+| `__error_factors`    | float32                                          | true     | `raw_query` estimator       | Error factors for raw-query lower-bound pruning                 |
+| `__blocked_ex_codes` | list<uint8>[next_multiple_of(code_dim, 64) * (num_bits - 1) / 8] | true | `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ, in the blocked layout  |
+| `__add_factors_ex`   | float32                                          | true     | `num_bits > 1`              | Additive correction factors for ex-code distance computation    |
+| `__scale_factors_ex` | float32                                          | true     | `num_bits > 1`              | Scale correction factors for ex-code distance computation       |
 
 !!! note
     Indexes written before the blocked ex-code layout store the same bits in
@@ -324,7 +324,7 @@ PQ uses 16 num_sub_vectors (m=16) with 8 num_bits per subvector, and distance ty
 ```python
 pa.schema([
     pa.field("_rowid", pa.uint64()),
-    pa.field("__pq_code", pa.list_(pa.uint8(), list_size=16)), # m subvector codes
+    pa.field("__pq_code", pa.list_(pa.uint8(), list_size=16)), # num_sub_vectors * num_bits / 8 = 16 * 8 / 8
 ])
 ```
 
@@ -361,7 +361,7 @@ auxiliary schema also includes `__blocked_ex_codes`, `__add_factors_ex`, and `__
 ```python
 pa.schema([
     pa.field("_rowid", pa.uint64()),
-    pa.field("_rabit_codes", pa.list_(pa.uint8(), list_size=16)), # dimension/8 = 128/8 = 16 bytes
+    pa.field("_rabit_codes", pa.list_(pa.uint8(), list_size=16)), # ceil(code_dim / 8) = ceil(128 / 8)
     pa.field("__add_factors", pa.float32()),
     pa.field("__scale_factors", pa.float32()),
     pa.field("__error_factors", pa.float32()),
