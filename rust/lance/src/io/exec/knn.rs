@@ -62,7 +62,7 @@ use uuid::Uuid;
 
 use lance_select::RowAddrMask;
 
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder};
 use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
@@ -1389,6 +1389,10 @@ pub struct ANNIvfSubIndexExec {
     /// index results at execution time via [`DatasetPreFilter::with_overlay_block`].
     overlay_block: Option<RowAddrMask>,
 
+    /// Output schema: `[_distance, _rowid]` plus any included/covering columns
+    /// the index emits.
+    output_schema: SchemaRef,
+
     /// Datafusion Plan Properties
     properties: Arc<PlanProperties>,
 
@@ -1409,8 +1413,45 @@ impl ANNIvfSubIndexExec {
                 PART_ID_COLUMN
             )));
         }
+        // Declare any included/covering columns recorded in the index manifest
+        // (`IndexMetadata.included_fields`, by field id); the per-partition search
+        // emits them so a covered projection lets TakeExec skip the base-table
+        // fetch. Empty for ordinary indexes. Resolve id -> name -> arrow field so
+        // the declared schema matches the columns stored at build time exactly.
+        let mut fields = KNN_INDEX_SCHEMA.fields().to_vec();
+        let included_ids = indices
+            .first()
+            .map(|idx| idx.included_fields.clone())
+            .unwrap_or_default();
+        if !included_ids.is_empty() {
+            let lance_schema = dataset.schema();
+            for id in &included_ids {
+                // The manifest is authoritative: a declared covering field that cannot
+                // be resolved means the index metadata and schema disagree. Silently
+                // dropping it would leave the declared output schema missing a column a
+                // covered projection expects -- TakeExec would then wrongly elide the
+                // base-table fetch for a column that is never emitted. Fail loudly
+                // instead (a covered column cannot be dropped while its index exists).
+                let lance_field = lance_schema
+                    .fields
+                    .iter()
+                    .find(|field| field.id == *id)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "ANNIvfSubIndexExec: index declares covering field id {id}, which is \
+                             not present as a top-level field in the current dataset schema; \
+                             index metadata and schema are inconsistent"
+                        ))
+                    })?;
+                // Convert just this field. `ArrowSchema::from(&lance_schema)` would give the
+                // same result -- it is exactly this conversion mapped over every field -- but
+                // it walks the whole table (including nested structs) on every covered plan.
+                fields.push(Arc::new(arrow_schema::Field::from(lance_field)));
+            }
+        }
+        let output_schema = Arc::new(arrow_schema::Schema::new(fields));
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -1422,6 +1463,7 @@ impl ANNIvfSubIndexExec {
             query,
             prefilter_source,
             overlay_block: None,
+            output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -1493,6 +1535,12 @@ struct ANNIvfEarlySearchResults {
     deltas_remaining: AtomicUsize,
     all_deltas_done: Notify,
     took_no_rows_shortcut: AtomicBool,
+    /// Set when a covered delta's late search reaches the no-rows shortcut. The
+    /// exec-level covered recovery emits ONLY when this is armed, so covered result
+    /// sets stay identical to non-covered ones: when every partition was already
+    /// searched (`maximum_nprobes <= minimum_nprobes`) the non-covered path returns
+    /// nothing for prefilter rows without index entries, and covered must match.
+    covered_recovery_armed: AtomicBool,
 }
 
 impl ANNIvfEarlySearchResults {
@@ -1504,6 +1552,7 @@ impl ANNIvfEarlySearchResults {
             deltas_remaining: AtomicUsize::new(deltas_remaining),
             all_deltas_done: Notify::new(),
             took_no_rows_shortcut: AtomicBool::new(false),
+            covered_recovery_armed: AtomicBool::new(false),
         }
     }
 
@@ -1634,6 +1683,7 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
+        has_covered: bool,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -1667,6 +1717,21 @@ impl ANNIvfSubIndexExec {
             {
                 // In this case there are fewer than k results matching the prefilter so
                 // just return the prefilter ids and don't bother searching any further
+
+                // The shortcut batch emits only [_distance, _rowid]; a covering
+                // index's declared schema carries more columns, and their values
+                // cannot be fabricated here. Emit nothing instead: the
+                // end-of-stream covered recovery (`covered_not_found_batch`)
+                // returns every unemitted prefilter row with INFINITY distance
+                // and its covering columns via a take bounded by the prefilter
+                // size -- mirroring the non-covered shortcut's semantics without
+                // searching (a prefilter row with no index entry, e.g. a null
+                // vector, could otherwise never be found and would drive the
+                // search through every partition).
+                if has_covered {
+                    state.covered_recovery_armed.store(true, Ordering::Relaxed);
+                    return futures::stream::empty().boxed();
+                }
 
                 // This next if check should be true, because we wouldn't get max_results otherwise
                 if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
@@ -1849,6 +1914,81 @@ impl ANNIvfSubIndexExec {
             .buffered(query_parallelism)
             .boxed()
     }
+
+    /// Recover rows that match a bounded, selective prefilter but have no index entry
+    /// (their vector is null or an empty multivector), which the covered search never
+    /// returns. The non-covered path recovers them via its not-found shortcut with
+    /// `INFINITY` distance; a covered index must do the same but also supply the covering
+    /// columns, which it fetches from the base table for these few missing rows. Returns
+    /// `None` when there is nothing to recover (non-covered, unbounded/non-selective
+    /// prefilter, or every prefilter row was already emitted).
+    async fn covered_not_found_batch(
+        has_covered: bool,
+        prefilter: Arc<DatasetPreFilter>,
+        dataset: Arc<Dataset>,
+        output_schema: SchemaRef,
+        k: usize,
+        emitted: Arc<std::sync::Mutex<roaring::RoaringTreemap>>,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        if !has_covered {
+            return Ok(None);
+        }
+        prefilter
+            .wait_for_ready()
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("prefilter not ready: {e}")))?;
+        let mask = prefilter.mask();
+        // Only a bounded, selective prefilter (at most k allowed rows) guarantees every
+        // matching row belongs in the result; an unbounded prefilter has no not-found set.
+        let Some(max_len) = mask.max_len() else {
+            return Ok(None);
+        };
+        if max_len as usize > k {
+            return Ok(None);
+        }
+        let Some(addrs) = mask.iter_addrs() else {
+            return Ok(None);
+        };
+        let not_found: Vec<u64> = {
+            let emitted = emitted.lock().unwrap();
+            addrs
+                .map(u64::from)
+                .filter(|addr| !emitted.contains(*addr))
+                .collect()
+        };
+        if not_found.is_empty() {
+            return Ok(None);
+        }
+
+        // Fetch the covering columns (the fields after `[_distance, _rowid]`) from the
+        // base table for the missing rows; the take is bounded by `not_found.len()`.
+        let covered_names: Vec<String> = output_schema
+            .fields()
+            .iter()
+            .skip(2)
+            .map(|field| field.name().clone())
+            .collect();
+        let projection = ProjectionRequest::from_columns(covered_names, dataset.schema());
+        // `not_found` holds row ids (the `_rowid` space): stable logical ids on a
+        // stable-row-id dataset, physical addresses otherwise. `try_new_from_ids`
+        // resolves them through the row-id index when one exists and falls back to
+        // identity (id == address) when it does not, so it is correct in both cases --
+        // unlike `try_new_from_addresses`, which would misread a stable id as
+        // `frag = id >> 32, offset = id` and take the wrong physical row (or error).
+        let covered = TakeBuilder::try_new_from_ids(dataset, not_found.clone(), projection)?
+            .execute()
+            .await?;
+
+        let n = not_found.len();
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Float32Array::from_value(f32::INFINITY, n)),
+            Arc::new(UInt64Array::from(not_found)),
+        ];
+        columns.extend(covered.columns().iter().cloned());
+        let batch = RecordBatch::try_new(output_schema, columns)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        Ok(Some(batch))
+    }
 }
 
 impl ExecutionPlan for ANNIvfSubIndexExec {
@@ -1857,7 +1997,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        KNN_INDEX_SCHEMA.clone()
+        self.output_schema.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1903,6 +2043,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 query: self.query.clone(),
                 prefilter_source,
                 overlay_block: self.overlay_block.clone(),
+                output_schema: self.output_schema.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
@@ -1921,6 +2062,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
         let schema = self.schema();
+        // When the index emits covering columns, the output schema is wider than
+        // [_distance, _rowid]; the late-search no-rows shortcut emits only those
+        // two columns, so disable it here and let the full search emit covering.
+        let has_covered = schema.fields().len() > KNN_INDEX_SCHEMA.fields().len();
         let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
@@ -1993,6 +2138,22 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 
         let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));
 
+        // Covered null-vector recovery: track which row ids the search emits, then after
+        // it finishes emit any prefilter-matched rows that had no index entry, with their
+        // covering columns taken from the base table (see `covered_not_found_batch`).
+        // Tracking is skipped when recovery provably cannot emit anything: without a
+        // prefilter source there is no allow-list, so `covered_not_found_batch` always
+        // returns `None` -- the per-batch lock and inserts would be pure overhead on
+        // the covered hot path.
+        let track_emitted = has_covered && !matches!(self.prefilter_source, PreFilterSource::None);
+        let emitted_row_ids = Arc::new(std::sync::Mutex::new(roaring::RoaringTreemap::new()));
+        let emitted_for_inspect = emitted_row_ids.clone();
+        let recon_prefilter = pre_filter.clone();
+        let recon_state = state.clone();
+        let recon_ds = ds.clone();
+        let recon_schema = schema.clone();
+        let recon_k = query.k;
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             per_index_stream
@@ -2030,6 +2191,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             metrics,
                             state,
                             target_partitions,
+                            has_covered,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
@@ -2038,6 +2200,36 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 // Each delta stream is split into an early and late search.  The late search
                 // will not start until the early search is complete across all deltas.
                 .try_flatten_unordered(None)
+                .inspect_ok(move |batch| {
+                    // Record emitted row ids so the reconciliation below can find the
+                    // prefilter rows the search never returned (no index entry).
+                    if track_emitted && let Some(col) = batch.column_by_name(ROW_ID) {
+                        emitted_for_inspect
+                            .lock()
+                            .unwrap()
+                            .extend(col.as_primitive::<UInt64Type>().values().iter().copied());
+                    }
+                })
+                .chain(
+                    stream::once(async move {
+                        // Only recover when a covered late search actually took the
+                        // no-rows shortcut; otherwise the non-covered path would not
+                        // have emitted these rows either, and covered must match.
+                        if !recon_state.covered_recovery_armed.load(Ordering::Relaxed) {
+                            return Ok(None);
+                        }
+                        Self::covered_not_found_batch(
+                            has_covered,
+                            recon_prefilter,
+                            recon_ds,
+                            recon_schema,
+                            recon_k,
+                            emitted_row_ids,
+                        )
+                        .await
+                    })
+                    .try_filter_map(|opt| future::ready(Ok(opt))),
+                )
                 .finally(move || {
                     // Publish the exact index-file I/O measured for this query
                     // (cache misses only) to the iops/requests/bytes_read gauges.
@@ -2113,13 +2305,24 @@ pub struct MultivectorScoringExec {
     // the inputs are sorted ANN search results
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     query: Query,
+    /// Output schema: `[_distance, _rowid]` plus any covering columns the ANN children
+    /// emit. The covered payload is per source row (replicated across its sub-vectors),
+    /// so it is carried through the per-row-id reduction below.
+    output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
 
 impl MultivectorScoringExec {
     pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>, query: Query) -> Result<Self> {
+        // Inherit the children's schema so covering columns flow through scoring instead
+        // of being dropped (a covered multivector query would otherwise still take from
+        // the base table).
+        let output_schema = inputs
+            .first()
+            .map(|input| input.schema())
+            .unwrap_or_else(|| KNN_INDEX_SCHEMA.clone());
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -2128,6 +2331,7 @@ impl MultivectorScoringExec {
         Ok(Self {
             inputs,
             query,
+            output_schema,
             properties,
         })
     }
@@ -2152,7 +2356,7 @@ impl ExecutionPlan for MultivectorScoringExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        KNN_INDEX_SCHEMA.clone()
+        self.output_schema.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -2187,11 +2391,18 @@ impl ExecutionPlan for MultivectorScoringExec {
             .map(|input| input.execute(partition, context.clone()))
             .collect::<DataFusionResult<Vec<_>>>()?;
 
+        // Covering columns (if any) follow `[_distance, _rowid]` in the child schema.
+        // They are per source row -- identical across a row's sub-vectors -- so we carry
+        // them through the per-row-id reduction and re-attach one copy per output row.
+        let output_schema = self.output_schema.clone();
+        let n_covered = output_schema.fields().len().saturating_sub(2);
+
         // collect the top k results from each stream,
         // and max-reduce for each query,
         // records the minimum distance for each query as estimation.
         let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
-            stream.map(|batch| {
+            let output_schema = output_schema.clone();
+            stream.map(move |batch| {
                 let batch = batch?;
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
@@ -2205,9 +2416,15 @@ impl ExecutionPlan for MultivectorScoringExec {
                     .unwrap_or_default();
                 let mut new_row_ids = Vec::with_capacity(row_ids.len());
                 let mut new_sims = Vec::with_capacity(row_ids.len());
+                let mut keep_indices: Vec<u32> = Vec::with_capacity(row_ids.len());
                 let mut visited_row_ids = HashSet::with_capacity(row_ids.len());
 
-                for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
+                for (i, (row_id, dist)) in row_ids
+                    .values()
+                    .iter()
+                    .zip(dists.values().iter())
+                    .enumerate()
+                {
                     // the results are sorted by distance, so we can skip if we have seen this row id before
                     if visited_row_ids.contains(row_id) {
                         continue;
@@ -2216,14 +2433,20 @@ impl ExecutionPlan for MultivectorScoringExec {
                     new_row_ids.push(*row_id);
                     // it's cosine distance, so we need to convert it to similarity
                     new_sims.push(1.0 - *dist);
+                    keep_indices.push(i as u32);
                 }
-                let new_row_ids = UInt64Array::from(new_row_ids);
-                let new_dists = Float32Array::from(new_sims);
 
-                let batch = RecordBatch::try_new(
-                    KNN_INDEX_SCHEMA.clone(),
-                    vec![Arc::new(new_dists), Arc::new(new_row_ids)],
-                )?;
+                let mut columns: Vec<ArrayRef> = vec![
+                    Arc::new(Float32Array::from(new_sims)),
+                    Arc::new(UInt64Array::from(new_row_ids)),
+                ];
+                if n_covered > 0 {
+                    let keep = arrow_array::UInt32Array::from(keep_indices);
+                    for covered_col in batch.columns().iter().skip(2) {
+                        columns.push(arrow::compute::take(covered_col, &keep, None)?);
+                    }
+                }
+                let batch = RecordBatch::try_new(output_schema.clone(), columns)?;
 
                 Ok::<_, DataFusionError>((min_sim, batch))
             })
@@ -2235,10 +2458,27 @@ impl ExecutionPlan for MultivectorScoringExec {
         let stream = stream::once(async move {
             // at most, we will have k * refine_factor results for each query
             let mut results = HashMap::with_capacity(k * refactor);
+            // row id -> its covering-column cells (recorded once, first seen).
+            let mut payloads: HashMap<u64, Vec<datafusion::scalar::ScalarValue>> = HashMap::new();
             let mut missed_sim_sum = 0.0;
             while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let sims = batch[DIST_COL].as_primitive::<Float32Type>();
+
+                if n_covered > 0 {
+                    for (i, row_id) in row_ids.values().iter().enumerate() {
+                        if !payloads.contains_key(row_id) {
+                            let mut cells = Vec::with_capacity(n_covered);
+                            for covered_col in batch.columns().iter().skip(2) {
+                                cells.push(datafusion::scalar::ScalarValue::try_from_array(
+                                    covered_col,
+                                    i,
+                                )?);
+                            }
+                            payloads.insert(*row_id, cells);
+                        }
+                    }
+                }
 
                 let query_results = row_ids
                     .values()
@@ -2265,18 +2505,32 @@ impl ExecutionPlan for MultivectorScoringExec {
                 missed_sim_sum += min_sim;
             }
 
-            let (row_ids, sims): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+            let (row_ids, sims): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
             let dists = sims
-                .into_iter()
+                .iter()
                 // it's similarity, so we need to convert it back to distance
                 .map(|sim| num_queries - sim)
                 .collect::<Vec<_>>();
-            let row_ids = UInt64Array::from(row_ids);
-            let dists = Float32Array::from(dists);
-            let batch = RecordBatch::try_new(
-                KNN_INDEX_SCHEMA.clone(),
-                vec![Arc::new(dists), Arc::new(row_ids)],
-            )?;
+            let mut columns: Vec<ArrayRef> = vec![
+                Arc::new(Float32Array::from(dists)),
+                Arc::new(UInt64Array::from(row_ids.clone())),
+            ];
+            for covered_pos in 0..n_covered {
+                let field = output_schema.field(2 + covered_pos);
+                let array = if row_ids.is_empty() {
+                    arrow::array::new_empty_array(field.data_type())
+                } else {
+                    let cells = row_ids.iter().map(|row_id| {
+                        payloads
+                            .get(row_id)
+                            .map(|cells| cells[covered_pos].clone())
+                            .unwrap_or(datafusion::scalar::ScalarValue::Null)
+                    });
+                    datafusion::scalar::ScalarValue::iter_to_array(cells)?
+                };
+                columns.push(array);
+            }
+            let batch = RecordBatch::try_new(output_schema.clone(), columns)?;
             Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -2351,6 +2605,68 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
         }
+    }
+
+    /// The read path is manifest-authoritative: if an index declares a covering field id
+    /// the current schema cannot resolve, `ANNIvfSubIndexExec::try_new` must fail loudly
+    /// rather than silently produce an output schema missing that column -- which would
+    /// let `TakeExec` wrongly elide the base-table fetch for a column never emitted.
+    #[tokio::test]
+    async fn test_ann_sub_index_rejects_unresolvable_covering_field() {
+        use lance_datafusion::exec::OneShotExec;
+
+        // Minimal input plan carrying the required PART_ID_COLUMN schema.
+        let input = Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(
+            KNN_PARTITION_SCHEMA.clone(),
+        )));
+
+        // A dataset whose schema has no field with id 9999.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                "memory://d2-unresolvable-covering",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![],
+            name: "vector_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            included_fields: vec![9999],
+        };
+
+        let result = ANNIvfSubIndexExec::try_new(
+            input,
+            dataset,
+            vec![index],
+            base_query(),
+            PreFilterSource::None,
+        );
+        let err = result.expect_err("unresolvable covering field id must be rejected");
+        assert!(
+            err.to_string().contains("covering field id 9999"),
+            "expected a manifest/schema inconsistency error, got: {err}"
+        );
     }
 
     #[test]
@@ -2578,7 +2894,12 @@ mod tests {
         }
 
         fn find_partitions(&self, _query: &Query) -> Result<(UInt32Array, Float32Array)> {
-            unimplemented!()
+            // No additional partitions to reveal; the covered re-rank in
+            // late_search treats an empty result as "nothing more to search".
+            Ok((
+                UInt32Array::from(Vec::<u32>::new()),
+                Float32Array::from(Vec::<f32>::new()),
+            ))
         }
 
         fn total_partitions(&self) -> usize {
@@ -2835,6 +3156,69 @@ mod tests {
         prefilter
     }
 
+    /// A `FilterLoader` that yields a fixed allow-list of row addresses, so the
+    /// resulting prefilter mask is a bounded `AllowList` (`max_len()` is `Some`).
+    struct StaticAllowList(Vec<u64>);
+
+    #[async_trait]
+    impl FilterLoader for StaticAllowList {
+        async fn load(self: Box<Self>) -> lance_core::Result<lance_select::RowAddrMask> {
+            Ok(lance_select::RowAddrMask::from_allowed(
+                lance_select::RowAddrTreeMap::from_iter(self.0.iter().copied()),
+            ))
+        }
+    }
+
+    /// Like `empty_prefilter`, but the prefilter mask is a bounded allow-list of
+    /// the given row addresses, which drives the late-search no-rows shortcut.
+    async fn bounded_prefilter(allow: Vec<u64>) -> Arc<DatasetPreFilter> {
+        static NEXT_PREFILTER_DATASET_ID: AtomicUsize = AtomicUsize::new(100_000);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let uri = format!(
+            "memory://bounded-prefilter-{}",
+            NEXT_PREFILTER_DATASET_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                &uri,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut indexed_fragments = RoaringBitmap::new();
+        for fragment in dataset.manifest.fragments.iter() {
+            indexed_fragments.insert(fragment.id as u32);
+        }
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![],
+            name: "test".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(indexed_fragments),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            included_fields: Vec::new(),
+        };
+        let loader: Box<dyn FilterLoader> = Box::new(StaticAllowList(allow));
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], Some(loader)));
+        prefilter.wait_for_ready().await.unwrap();
+        prefilter
+    }
+
     fn prepared_metrics() -> Arc<AnnIndexMetrics> {
         Arc::new(AnnIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
     }
@@ -3037,6 +3421,7 @@ mod tests {
             prepared_metrics(),
             state.clone(),
             usize::MAX,
+            false,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -3046,6 +3431,70 @@ mod tests {
         assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
         assert_eq!(*searched_partitions.lock().unwrap(), vec![0]);
         assert_eq!(state.num_results_found.load(Ordering::Relaxed), 2);
+    }
+
+    /// With a bounded selective prefilter, the late-search no-rows shortcut must fire
+    /// for covered indexes too -- but emit nothing: the shortcut's `[_distance, _rowid]`
+    /// batch would drop the covering columns, so the end-of-stream covered recovery
+    /// (`covered_not_found_batch`) emits the missing rows instead, with a take bounded
+    /// by the prefilter size. Searching instead of shortcutting is the failure mode this
+    /// pins down: a prefilter-matched row with no index entry (null vector) can never be
+    /// found, so the search degenerates to scoring every partition on every query.
+    #[tokio::test]
+    async fn test_late_search_covered_skips_search_on_selective_prefilter() {
+        // Bounded prefilter (one allowed row) + k=2 => max_results=1 <= k, and an
+        // empty initial state => found_so_far=0 < max_results: shortcut criteria.
+        async fn run_late_search(has_covered: bool) -> (Vec<RecordBatch>, Vec<usize>) {
+            let (index, _prepared, searched_partitions, _threads) =
+                prepared_index(vec![21, 22, 23]);
+            let mut query = base_query();
+            query.k = 2;
+            query.minimum_nprobes = 0;
+            query.maximum_nprobes = Some(3);
+            let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+
+            let batches = ANNIvfSubIndexExec::late_search(
+                index,
+                query,
+                Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
+                bounded_prefilter(vec![0]).await,
+                prepared_metrics(),
+                state,
+                usize::MAX,
+                has_covered,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            let searched = searched_partitions.lock().unwrap().clone();
+            (batches, searched)
+        }
+
+        // Control: a non-covered index takes the shortcut, so no partition is
+        // searched and the only batch is the [_distance, _rowid] not-found batch.
+        let (batches, searched) = run_late_search(false).await;
+        assert!(
+            searched.is_empty(),
+            "non-covered query should take the shortcut and skip the search, searched={searched:?}"
+        );
+        assert!(
+            batches.iter().all(|b| b.num_columns() == 2),
+            "the shortcut emits only [_distance, _rowid]"
+        );
+
+        // Covered: the shortcut fires too (no partition searched), but emits nothing --
+        // the end-of-stream covered recovery supplies the not-found rows with their
+        // covering columns.
+        let (batches, searched) = run_late_search(true).await;
+        assert!(
+            searched.is_empty(),
+            "covered query must take the shortcut and skip the search, searched={searched:?}"
+        );
+        assert!(
+            batches.is_empty(),
+            "the covered shortcut emits nothing; recovery happens at end of stream"
+        );
     }
 
     #[tokio::test]
@@ -3066,6 +3515,7 @@ mod tests {
             prepared_metrics(),
             state.clone(),
             usize::MAX,
+            false,
         )
         .try_collect::<Vec<_>>();
 
@@ -3083,6 +3533,7 @@ mod tests {
             prepared_metrics(),
             state,
             usize::MAX,
+            false,
         )
         .try_collect::<Vec<_>>();
 

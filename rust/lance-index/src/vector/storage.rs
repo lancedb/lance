@@ -372,6 +372,25 @@ impl DeepSizeOf for QueryScratchPool {
 ///
 /// It abstracts away the logic to compute the distance between vectors.
 ///
+/// Indices of the covering ("included") columns in a vector-storage schema: every
+/// field whose name is not one of `internal`. Each storage lists its own non-covering
+/// column names (the row id, its quantization code columns, and any legacy bookkeeping
+/// column it carries) and shares this filter, so covering detection stays a per-storage
+/// data decision rather than duplicated iteration logic. See
+/// [`VectorStore::covering_field_indices`] for why the set cannot be inferred generically.
+pub(crate) fn covering_field_indices_excluding(
+    schema: &arrow_schema::Schema,
+    internal: &[&str],
+) -> Vec<usize> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !internal.contains(&f.name().as_str()))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// TODO: should we rename this to "VectorDistance"?;
 ///
 /// <section class="warning">
@@ -408,6 +427,45 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     /// Append Raw [RecordBatch] into the Storage.
     /// The storage implement will perform quantization if necessary.
     fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
+
+    /// Field indices of the "included"/covering columns: the extra columns
+    /// stored alongside the row id and quantization code so a covered query can
+    /// skip the take from the base table.
+    ///
+    /// The default is empty (no covering). A storage that supports covering must
+    /// override this, since only it knows which of its columns are quantization
+    /// code columns versus included columns — inferring that generically by name
+    /// is unsafe (e.g. it would mistake RaBitQ's code columns for covering ones).
+    fn covering_field_indices(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// `[_rowid, <included cols...>]` for the whole storage. Captured while a
+    /// partition is loaded during search so covering columns can be emitted with
+    /// the result without a separate take. Returns `None` if there are no
+    /// included columns (ordinary index — nothing to cover).
+    fn covering_batch(&self) -> Result<Option<RecordBatch>> {
+        let included = self.covering_field_indices();
+        if included.is_empty() {
+            return Ok(None);
+        }
+        let schema = self.schema().clone();
+        let row_id_idx = schema.index_of(ROW_ID)?;
+        let mut indices = Vec::with_capacity(included.len() + 1);
+        indices.push(row_id_idx);
+        indices.extend(included);
+        // Project each batch BEFORE concatenating. Concatenating the full partition first
+        // would copy every quantization-code column only to discard it on the next line --
+        // and those columns dominate the partition (HNSW partitions target 1 << 20 rows), so
+        // on a multi-probe query that copy is hundreds of MB of pure waste on the ANN hot
+        // path. Only `[_rowid, <included...>]` is ever read from the result.
+        let projected: Vec<RecordBatch> = self
+            .to_batches()?
+            .map(|batch| batch.project(&indices))
+            .collect::<std::result::Result<_, _>>()?;
+        let projected_schema = Arc::new(schema.project(&indices)?);
+        Ok(Some(concat_batches(&projected_schema, projected.iter())?))
+    }
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
@@ -467,7 +525,43 @@ impl<Q: Quantization> StorageBuilder<Q> {
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
-        let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+        // Batches can come from different sources (existing partitions loaded
+        // from disk vs freshly shuffled/split/reassigned data) that carry the
+        // same columns in a different order -- notably when the index has
+        // included/covering columns. `concat_batches` matches columns by
+        // position, so align every batch to the first batch's column order (by
+        // name). No-op when all batches already share a schema.
+        let schema = batches[0].schema();
+        let aligned: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| {
+                if b.schema() == schema {
+                    return Ok(b.clone());
+                }
+                // `project_by_schema` reorders by name and errors on a missing
+                // column, but it cannot see extras -- and a batch with MORE
+                // columns must error rather than have them silently dropped
+                // (e.g. covering columns the index metadata still advertises).
+                // Equal count + every expected column present = same set.
+                if b.num_columns() != schema.fields().len() {
+                    let names = |s: &arrow_schema::Schema| {
+                        s.fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    return Err(Error::index(format!(
+                        "mismatched columns while merging vector storage batches: \
+                         expected [{}], got [{}]",
+                        names(&schema),
+                        names(&b.schema()),
+                    )));
+                }
+                Ok(b.project_by_schema(schema.as_ref())?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut batch = concat_batches(&schema, aligned.iter())?;
 
         if batch.column_by_name(self.quantizer.column()).is_none() {
             let vectors = batch
@@ -505,6 +599,11 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
     ivf: IvfModel,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    /// Lazily-computed covering schema (see [`Self::covering_schema`]). The schema is
+    /// fixed for the storage's lifetime, and computing it constructs an empty
+    /// `Q::Storage` (for PQ this decodes the whole codebook), so it must not be
+    /// recomputed per query.
+    covering_schema: std::sync::OnceLock<Option<SchemaRef>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -566,6 +665,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
+            covering_schema: std::sync::OnceLock::new(),
         })
     }
 
@@ -584,6 +684,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
+            covering_schema: std::sync::OnceLock::new(),
         }
     }
 
@@ -618,6 +719,28 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     pub fn schema(&self) -> SchemaRef {
         Arc::new(self.reader.schema().as_ref().into())
+    }
+
+    /// The `[_rowid, <included cols...>]` schema for this index's covering
+    /// columns, or `None` if the index has no covering columns. Derived from an
+    /// empty storage instance (no I/O) so callers can emit the correct covered
+    /// output schema even when zero partitions are searched. Computed once and
+    /// cached: it is queried per search, and constructing the empty storage is
+    /// not free (PQ decodes its codebook from metadata).
+    pub fn covering_schema(&self) -> Result<Option<SchemaRef>> {
+        if let Some(cached) = self.covering_schema.get() {
+            return Ok(cached.clone());
+        }
+        let arrow_schema = arrow_schema::Schema::from(self.reader.schema().as_ref());
+        let empty = RecordBatch::new_empty(Arc::new(arrow_schema));
+        let storage = Q::Storage::try_from_batch(
+            empty,
+            self.metadata(),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+        )?;
+        let computed = storage.covering_batch()?.map(|b| b.schema());
+        Ok(self.covering_schema.get_or_init(|| computed).clone())
     }
 
     /// Get the number of partitions in the storage.

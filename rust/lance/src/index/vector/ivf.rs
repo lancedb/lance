@@ -602,6 +602,9 @@ pub(crate) async fn optimize_vector_indices(
     vector_column: &str,
     logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
+    // Covering ("included") column names to preserve through the merge. Empty
+    // for ordinary indexes. Only the v2 path supports covering columns.
+    included_columns: &[String],
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
@@ -616,8 +619,15 @@ pub(crate) async fn optimize_vector_indices(
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
         let sources = existing_index_sources(&dataset, logical_index);
-        return optimize_vector_indices_v2(&dataset, unindexed, vector_column, &sources, options)
-            .await;
+        return optimize_vector_indices_v2(
+            &dataset,
+            unindexed,
+            vector_column,
+            &sources,
+            options,
+            included_columns,
+        )
+        .await;
     }
 
     let new_uuid = Uuid::new_v4();
@@ -688,6 +698,9 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[ExistingIndex],
     options: &OptimizeOptions,
+    // Covering ("included") column names to preserve through the merge/split/join.
+    // Empty for ordinary indexes.
+    included_columns: &[String],
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
@@ -714,6 +727,8 @@ pub(crate) async fn optimize_vector_indices_v2(
     let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
+    // Every vector index type supports covering ("included") columns, so each branch below
+    // threads `included_columns` into its builder regardless of quantizer.
     let summary = match index_type {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
@@ -730,6 +745,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
+                .with_include_columns(included_columns.to_vec())
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
@@ -748,6 +764,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
+                .with_include_columns(included_columns.to_vec())
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
@@ -771,6 +788,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -791,6 +809,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -811,6 +830,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -830,6 +850,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -849,6 +870,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
+                .with_include_columns(included_columns.to_vec())
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
@@ -867,6 +889,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
+                .with_include_columns(included_columns.to_vec())
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
@@ -890,6 +913,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -910,6 +934,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -2431,7 +2456,6 @@ pub(crate) async fn merge_segments_with_progress(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(files),
-        included_fields: Vec::new(),
         ..merged_segment
     };
     Ok(merged_segment)
@@ -4860,6 +4884,7 @@ mod tests {
             "vector",
             &sources,
             &OptimizeOptions::new(),
+            &[],
         )
         .await
         .unwrap();
@@ -4875,6 +4900,7 @@ mod tests {
             "vector",
             &sources,
             &OptimizeOptions::merge(1),
+            &[],
         )
         .await
         .unwrap();

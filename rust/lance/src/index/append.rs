@@ -663,6 +663,7 @@ async fn build_fresh_vector_segment(
     logical_index: &LogicalVectorIndex,
     field_path: &str,
     fragment_bitmap: &RoaringBitmap,
+    covering_columns: &[String],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<IndexMetadata> {
     let (reference_metadata, reference_index) = logical_index.iter().last().ok_or_else(|| {
@@ -671,7 +672,12 @@ async fn build_fresh_vector_segment(
             logical_index.name()
         ))
     })?;
-    let params = fresh_vector_segment_params(reference_metadata, reference_index.as_ref())?;
+    let mut params = fresh_vector_segment_params(reference_metadata, reference_index.as_ref())?;
+    // A retrain rebuilds the storage from scratch, so re-declare the covering
+    // ("included") columns -- otherwise the fresh files omit the payload while the
+    // committed metadata still advertises `included_fields`, and covered queries
+    // then expect columns the storage cannot emit.
+    params.include_columns(covering_columns.to_vec());
     let mut build_dataset = dataset.clone();
     CreateIndexBuilder::new(
         &mut build_dataset,
@@ -692,12 +698,17 @@ async fn scan_vector_fragments(
     field_path: &str,
     column_nullable: bool,
     fragments: &[Fragment],
+    covering_columns: &[String],
 ) -> Result<crate::dataset::scanner::DatasetRecordBatchStream> {
     let mut scanner = dataset.scan();
+    // Project the vector column plus any covering ("included") columns so rows from the
+    // newly-indexed fragments carry the same columns as the existing partitions.
+    let mut projection: Vec<&str> = vec![field_path];
+    projection.extend(covering_columns.iter().map(String::as_str));
     scanner
         .with_fragments(fragments.to_vec())
         .with_row_id()
-        .project(&[field_path])?;
+        .project(&projection)?;
     if column_nullable {
         let column_expr = lance_datafusion::logical_expr::field_path_to_expr(field_path)?;
         scanner.filter_expr(column_expr.is_not_null());
@@ -788,6 +799,29 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         .as_ref()
         .map(|resolved| resolved.canonical_path.clone())
         .unwrap_or(raw_field_path);
+    // Covering ("included") columns recorded on the index, resolved to names.
+    // Threaded into the merge builder and projected into the new-data scan so
+    // they survive optimize/merge and partition split/join. An unresolvable id
+    // must fail loudly: the merged delta is committed with the original
+    // `included_fields`, so silently rebuilding without the column would leave
+    // metadata advertising a column the storage cannot emit.
+    let covering_columns: Vec<String> = old_indices[0]
+        .included_fields
+        .iter()
+        .map(|id| {
+            dataset
+                .schema()
+                .field_by_id(*id)
+                .map(|f| f.name.clone())
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Append index: covering field id {} recorded on index '{}' does not \
+                         exist in the dataset schema; index metadata and schema are inconsistent",
+                        id, old_indices[0].name
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
     let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
     for idx in old_indices.iter().skip(1) {
         let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;
@@ -878,6 +912,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     &logical_index,
                     &field_path,
                     &fragment_bitmap,
+                    &covering_columns,
                     options.progress.clone(),
                 )
                 .await?;
@@ -920,6 +955,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     &field_path,
                     column.nullable,
                     unindexed,
+                    &covering_columns,
                 )
                 .await?;
                 let mut append_options = options.clone();
@@ -931,6 +967,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     &field_path,
                     &reference_ivf_view,
                     &append_options,
+                    &covering_columns,
                 )
                 .boxed()
                 .await?;
@@ -1012,6 +1049,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     &field_path,
                     &selected_ivf_view,
                     options,
+                    &covering_columns,
                 ))
                 .await?;
                 if indices_merged == 0 {
@@ -1067,6 +1105,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             &field_path,
                             column.nullable,
                             unindexed,
+                            &covering_columns,
                         )
                         .await?,
                     )
@@ -1078,6 +1117,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     &field_path,
                     &merge_ivf_view,
                     options,
+                    &covering_columns,
                 )
                 .boxed()
                 .await?;
@@ -2810,6 +2850,69 @@ mod tests {
         assert!(
             merge_result.is_some(),
             "subset merges should respect the caller-provided indices"
+        );
+    }
+
+    /// An index whose `included_fields` records a field id missing from the current
+    /// schema is metadata/schema-inconsistent. Optimize must fail loudly rather than
+    /// silently rebuild without the covered column: the merged delta would be committed
+    /// still advertising the column, and every covered query would then fail at read
+    /// time.
+    #[tokio::test]
+    async fn test_merge_indices_errors_on_unresolvable_covered_field() {
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let vectors = generate_random_array(TOTAL * DIM);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            ),
+            Field::new("id", DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap()),
+                Arc::new(UInt32Array::from_iter_values(0..TOTAL as u32)),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let mut stale_index = indices[0].clone();
+        stale_index.included_fields = vec![9999];
+        let old_indices = vec![&stale_index];
+        let result = merge_indices_with_unindexed_frags(
+            Arc::new(dataset),
+            &old_indices,
+            &[],
+            &OptimizeOptions::merge(1),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::Index { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("9999"),
+            "error should name the unresolvable covered field id: {err}"
         );
     }
 
