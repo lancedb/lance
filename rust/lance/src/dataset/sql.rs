@@ -246,6 +246,28 @@ mod tests {
         let is_foo = batches[0].column(0).as_boolean();
         assert!(is_foo.value(0));
         assert!(!is_foo.value(1));
+
+        let batches = dataset
+            .sql("SELECT blob, _rowid, _rowaddr FROM dataset")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .blob_handling(BlobHandling::AllBinary)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        let blobs = batch.column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+        let row_ids = batch.column(1).as_primitive::<UInt64Type>();
+        assert_eq!(row_ids.value(0), 0);
+        assert_eq!(row_ids.value(1), 1);
+        let row_addrs = batch.column(2).as_primitive::<UInt64Type>();
+        assert_eq!(row_addrs.value(0), 0);
+        assert_eq!(row_addrs.value(1), 1);
     }
 
     #[tokio::test]
