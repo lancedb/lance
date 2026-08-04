@@ -2371,7 +2371,7 @@ mod tests {
         EncodedBatchReaderExt, FileReader, FileReaderOptions, ProjectedFileReader, ReaderProjection,
     };
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
-    use crate::version::ConcreteFileVersion;
+    use crate::version::{ConcreteFileVersion, LanceFileVersion};
     use crate::versions;
     use crate::writer::FileWriterOptions;
     use lance_encoding::decoder::DecoderConfig;
