@@ -7,40 +7,62 @@ use lance_core::{Error, Result};
 use super::{RowIdSequence, U64Segment, encoded_array::EncodedU64Array};
 use prost::Message;
 
-const ROW_ID_METADATA_NAME: &str = "row id metadata";
+const ROW_ID_METADATA: &str = "row ID metadata";
 
-fn checked_range_len(encoding: &str, start: u64, end: u64) -> Result<usize> {
+fn corrupt_row_id_metadata(message: impl Into<String>) -> Error {
+    Error::corrupt_file_named(ROW_ID_METADATA, message)
+}
+
+fn validate_range(segment_type: &str, start: u64, end: u64) -> Result<usize> {
     let len = end.checked_sub(start).ok_or_else(|| {
-        Error::corrupt_file_named(
-            ROW_ID_METADATA_NAME,
-            format!("{encoding} end {end} is before start {start}"),
-        )
+        corrupt_row_id_metadata(format!(
+            "{segment_type} range start {start} exceeds end {end}"
+        ))
     })?;
     usize::try_from(len).map_err(|_| {
-        Error::corrupt_file_named(
-            ROW_ID_METADATA_NAME,
-            format!("{encoding} length {len} does not fit in usize"),
-        )
+        corrupt_row_id_metadata(format!(
+            "{segment_type} range length {len} for start {start} and end {end} exceeds usize::MAX"
+        ))
     })
 }
 
-fn validate_sorted_array(encoding: &str, array: &EncodedU64Array) -> Result<()> {
-    let mut values = array.iter();
-    let Some(mut previous) = values.next() else {
-        return Ok(());
-    };
-    for value in values {
-        if value <= previous {
-            return Err(Error::corrupt_file_named(
-                ROW_ID_METADATA_NAME,
-                format!(
-                    "{encoding} values are not sorted in strictly increasing order: {value} follows {previous}"
-                ),
-            ));
-        }
-        previous = value;
+fn validate_packed_array_length(array_type: &str, byte_len: usize, width: usize) -> Result<()> {
+    if !byte_len.is_multiple_of(width) {
+        return Err(corrupt_row_id_metadata(format!(
+            "encoded {array_type} array byte length {byte_len} is not a multiple of element width {width}"
+        )));
     }
     Ok(())
+}
+
+fn first_descending_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64)> {
+    match array {
+        EncodedU64Array::U16 { offsets, .. } => offsets
+            .windows(2)
+            .position(|pair| pair[0] > pair[1])
+            .map(|index| (index, offsets[index] as u64, offsets[index + 1] as u64)),
+        EncodedU64Array::U32 { offsets, .. } => offsets
+            .windows(2)
+            .position(|pair| pair[0] > pair[1])
+            .map(|index| (index, offsets[index] as u64, offsets[index + 1] as u64)),
+        EncodedU64Array::U64(values) => values
+            .windows(2)
+            .position(|pair| pair[0] > pair[1])
+            .map(|index| (index, values[index], values[index + 1])),
+    }
+}
+
+fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64)> {
+    let mut values = array.iter();
+    let previous = values.next()?;
+    values
+        .scan(previous, |previous, value| {
+            let pair = (*previous, value);
+            *previous = value;
+            Some(pair)
+        })
+        .enumerate()
+        .find_map(|(index, (previous, next))| (previous >= next).then_some((index, previous, next)))
 }
 
 impl TryFrom<pb::RowIdSequence> for RowIdSequence {
@@ -64,34 +86,26 @@ impl TryFrom<pb::U64Segment> for U64Segment {
         use pb::u64_segment::Segment::*;
         match pb.segment {
             Some(Range(pb_seg::Range { start, end })) => {
-                checked_range_len("Range", start, end)?;
+                validate_range("Range", start, end)?;
                 Ok(Self::Range(start..end))
             }
             Some(RangeWithHoles(pb_seg::RangeWithHoles { start, end, holes })) => {
-                let range_len = checked_range_len("RangeWithHoles", start, end)?;
+                validate_range("RangeWithHoles", start, end)?;
                 let holes = holes
                     .ok_or_else(|| {
-                        Error::corrupt_file_named(
-                            ROW_ID_METADATA_NAME,
-                            "RangeWithHoles is missing its holes array",
-                        )
+                        corrupt_row_id_metadata("RangeWithHoles is missing its holes array")
                     })?
                     .try_into()?;
-                validate_sorted_array("RangeWithHoles holes", &holes)?;
-                if holes.len() > range_len {
-                    return Err(Error::corrupt_file_named(
-                        ROW_ID_METADATA_NAME,
-                        format!(
-                            "RangeWithHoles contains {} holes for a range of length {range_len}",
-                            holes.len()
-                        ),
-                    ));
+                if let Some((index, previous, next)) = first_non_increasing_pair(&holes) {
+                    return Err(corrupt_row_id_metadata(format!(
+                        "RangeWithHoles values are not strictly increasing at indices {index} and {}: {previous} is not less than {next}",
+                        index + 1
+                    )));
                 }
                 if let Some(hole) = holes.iter().find(|hole| *hole < start || *hole >= end) {
-                    return Err(Error::corrupt_file_named(
-                        ROW_ID_METADATA_NAME,
-                        format!("RangeWithHoles hole {hole} is outside the range {start}..{end}"),
-                    ));
+                    return Err(corrupt_row_id_metadata(format!(
+                        "RangeWithHoles hole {hole} is outside the range {start}..{end}"
+                    )));
                 }
                 Ok(Self::RangeWithHoles {
                     range: start..end,
@@ -99,30 +113,22 @@ impl TryFrom<pb::U64Segment> for U64Segment {
                 })
             }
             Some(RangeWithBitmap(pb_seg::RangeWithBitmap { start, end, bitmap })) => {
-                let range_len = checked_range_len("RangeWithBitmap", start, end)?;
+                let range_len = validate_range("RangeWithBitmap", start, end)?;
                 let expected_bitmap_len = range_len.div_ceil(8);
                 if bitmap.len() != expected_bitmap_len {
-                    return Err(Error::corrupt_file_named(
-                        ROW_ID_METADATA_NAME,
-                        format!(
-                            "RangeWithBitmap bitmap byte length {} does not match range length {range_len}; expected {expected_bitmap_len}",
-                            bitmap.len()
-                        ),
-                    ));
+                    return Err(corrupt_row_id_metadata(format!(
+                        "RangeWithBitmap byte length {} does not match expected {expected_bitmap_len} for range start {start}, end {end}, and length {range_len}",
+                        bitmap.len()
+                    )));
                 }
                 let remainder = range_len % 8;
                 if remainder != 0 {
-                    let padding_mask = !((1u8 << remainder) - 1);
-                    if bitmap
-                        .last()
-                        .is_some_and(|last_byte| last_byte & padding_mask != 0)
-                    {
-                        return Err(Error::corrupt_file_named(
-                            ROW_ID_METADATA_NAME,
-                            format!(
-                                "RangeWithBitmap has set padding bits beyond range length {range_len}"
-                            ),
-                        ));
+                    let padding_mask = !((1_u8 << remainder) - 1);
+                    let last_byte = bitmap[expected_bitmap_len - 1];
+                    if last_byte & padding_mask != 0 {
+                        return Err(corrupt_row_id_metadata(format!(
+                            "RangeWithBitmap padding bits must be zero for range start {start}, end {end}, and length {range_len}: last byte {last_byte:#04x} has padding mask {padding_mask:#04x} set"
+                        )));
                     }
                 }
                 Ok(Self::RangeWithBitmap {
@@ -135,16 +141,18 @@ impl TryFrom<pb::U64Segment> for U64Segment {
             }
             Some(SortedArray(array)) => {
                 let array = EncodedU64Array::try_from(array)?;
-                validate_sorted_array("SortedArray", &array)?;
+                if let Some((index, previous, next)) = first_descending_pair(&array) {
+                    return Err(corrupt_row_id_metadata(format!(
+                        "SortedArray values are not sorted at indices {index} and {}: {previous} exceeds {next}",
+                        index + 1
+                    )));
+                }
                 Ok(Self::SortedArray(array))
             }
             Some(Array(array)) => Ok(Self::Array(EncodedU64Array::try_from(array)?)),
             // TODO: why non-exhaustive?
             // Some(_) => Err(Error::invalid_input("unknown segment type")),
-            None => Err(Error::corrupt_file_named(
-                ROW_ID_METADATA_NAME,
-                "missing row id segment type",
-            )),
+            None => Err(corrupt_row_id_metadata("missing row ID segment type")),
         }
     }
 }
@@ -157,15 +165,7 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
         use pb::encoded_u64_array::Array::*;
         match pb.array {
             Some(U16Array(pb_arr::U16Array { base, offsets })) => {
-                if offsets.len() % 2 != 0 {
-                    return Err(Error::corrupt_file_named(
-                        ROW_ID_METADATA_NAME,
-                        format!(
-                            "U16Array byte length {} is not a multiple of 2",
-                            offsets.len()
-                        ),
-                    ));
-                }
+                validate_packed_array_length("u16", offsets.len(), 2)?;
                 let offsets = offsets
                     .chunks_exact(2)
                     .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
@@ -173,25 +173,14 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
                 if let Some(max_offset) = offsets.iter().copied().max()
                     && base.checked_add(u64::from(max_offset)).is_none()
                 {
-                    return Err(Error::corrupt_file_named(
-                        ROW_ID_METADATA_NAME,
-                        format!(
-                            "U16Array base {base} plus maximum offset {max_offset} overflows u64"
-                        ),
-                    ));
+                    return Err(corrupt_row_id_metadata(format!(
+                        "U16Array base {base} plus maximum offset {max_offset} overflows u64"
+                    )));
                 }
                 Ok(Self::U16 { base, offsets })
             }
             Some(U32Array(pb_arr::U32Array { base, offsets })) => {
-                if offsets.len() % 4 != 0 {
-                    return Err(Error::corrupt_file_named(
-                        ROW_ID_METADATA_NAME,
-                        format!(
-                            "U32Array byte length {} is not a multiple of 4",
-                            offsets.len()
-                        ),
-                    ));
-                }
+                validate_packed_array_length("u32", offsets.len(), 4)?;
                 let offsets = offsets
                     .chunks_exact(4)
                     .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -199,25 +188,14 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
                 if let Some(max_offset) = offsets.iter().copied().max()
                     && base.checked_add(u64::from(max_offset)).is_none()
                 {
-                    return Err(Error::corrupt_file_named(
-                        ROW_ID_METADATA_NAME,
-                        format!(
-                            "U32Array base {base} plus maximum offset {max_offset} overflows u64"
-                        ),
-                    ));
+                    return Err(corrupt_row_id_metadata(format!(
+                        "U32Array base {base} plus maximum offset {max_offset} overflows u64"
+                    )));
                 }
                 Ok(Self::U32 { base, offsets })
             }
             Some(U64Array(pb_arr::U64Array { values })) => {
-                if values.len() % 8 != 0 {
-                    return Err(Error::corrupt_file_named(
-                        ROW_ID_METADATA_NAME,
-                        format!(
-                            "U64Array byte length {} is not a multiple of 8",
-                            values.len()
-                        ),
-                    ));
-                }
+                validate_packed_array_length("u64", values.len(), 8)?;
                 let values = values
                     .chunks_exact(8)
                     .map(|chunk| {
@@ -231,10 +209,7 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
             }
             // TODO: shouldn't this enum be non-exhaustive?
             // Some(_) => Err(Error::invalid_input("unknown array type")),
-            None => Err(Error::corrupt_file_named(
-                ROW_ID_METADATA_NAME,
-                "missing encoded row id array type",
-            )),
+            None => Err(corrupt_row_id_metadata("missing encoded row ID array type")),
         }
     }
 }
@@ -332,10 +307,7 @@ pub fn write_row_ids(sequence: &RowIdSequence) -> Vec<u8> {
 /// Deserialize a rowid sequence from some bytes.
 pub fn read_row_ids(reader: &[u8]) -> Result<RowIdSequence> {
     let pb_sequence = pb::RowIdSequence::decode(reader).map_err(|error| {
-        Error::corrupt_file_named(
-            ROW_ID_METADATA_NAME,
-            format!("failed to decode row id sequence: {error}"),
-        )
+        corrupt_row_id_metadata(format!("failed to decode row ID sequence: {error}"))
     })?;
     RowIdSequence::try_from(pb_sequence)
 }
@@ -345,6 +317,7 @@ mod test {
     use super::*;
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
+    use rstest::rstest;
 
     fn read_segment(segment: pb::u64_segment::Segment) -> Result<RowIdSequence> {
         let sequence = pb::RowIdSequence {
@@ -355,7 +328,7 @@ mod test {
         read_row_ids(&sequence.encode_to_vec())
     }
 
-    fn assert_corrupt(segment: pb::u64_segment::Segment, expected_message: &str) {
+    fn assert_corrupt_segment(segment: pb::u64_segment::Segment, expected_message: &str) {
         let error = read_segment(segment).unwrap_err();
         assert!(matches!(&error, Error::CorruptFile { .. }));
         assert!(
@@ -372,9 +345,11 @@ mod test {
             range: 100..200,
             holes: EncodedU64Array::U64(vec![104, 108, 150]),
         });
+        let mut bitmap = Bitmap::new_empty(100);
+        bitmap.set(99);
         sequence.0.push(U64Segment::RangeWithBitmap {
             range: 200..300,
-            bitmap: Bitmap::new_empty(100),
+            bitmap,
         });
         sequence
             .0
@@ -384,7 +359,7 @@ mod test {
             }));
         sequence
             .0
-            .push(U64Segment::Array(EncodedU64Array::U64(vec![1, 2, 3])));
+            .push(U64Segment::Array(EncodedU64Array::U64(vec![3, 1, 2])));
 
         let serialized = write_row_ids(&sequence);
 
@@ -423,7 +398,7 @@ mod test {
                 let error = read_segment(segment).unwrap_err();
                 let is_corrupt_file = matches!(&error, Error::CorruptFile { .. });
                 prop_assert!(is_corrupt_file);
-                prop_assert!(error.to_string().contains("bitmap byte length"));
+                prop_assert!(error.to_string().contains("byte length"));
             }
         }
 
@@ -446,7 +421,7 @@ mod test {
             let error = read_segment(segment).unwrap_err();
             let is_corrupt_file = matches!(&error, Error::CorruptFile { .. });
             prop_assert!(is_corrupt_file);
-            prop_assert!(error.to_string().contains("set padding bits"));
+            prop_assert!(error.to_string().contains("padding bits must be zero"));
         }
 
         #[test]
@@ -464,7 +439,7 @@ mod test {
             let error = read_segment(segment).unwrap_err();
             let is_corrupt_file = matches!(&error, Error::CorruptFile { .. });
             prop_assert!(is_corrupt_file);
-            prop_assert!(error.to_string().contains("is before start"));
+            prop_assert!(error.to_string().contains("range start"));
         }
 
         #[test]
@@ -501,32 +476,6 @@ mod test {
     }
 
     #[test]
-    fn test_rejects_unsorted_sorted_arrays() {
-        use pb::encoded_u64_array as pb_array;
-
-        let arrays = [
-            pb_array::Array::U16Array(pb_array::U16Array {
-                base: 0,
-                offsets: vec![1, 0, 0, 0],
-            }),
-            pb_array::Array::U32Array(pb_array::U32Array {
-                base: 0,
-                offsets: [1u32, 0].into_iter().flat_map(u32::to_le_bytes).collect(),
-            }),
-            pb_array::Array::U64Array(pb_array::U64Array {
-                values: [1u64, 0].into_iter().flat_map(u64::to_le_bytes).collect(),
-            }),
-        ];
-
-        for array in arrays {
-            assert_corrupt(
-                pb::u64_segment::Segment::SortedArray(pb::EncodedU64Array { array: Some(array) }),
-                "SortedArray values are not sorted",
-            );
-        }
-    }
-
-    #[test]
     fn test_rejects_encoded_offset_overflow() {
         use pb::encoded_u64_array as pb_array;
 
@@ -541,10 +490,152 @@ mod test {
             }),
         ];
         for array in arrays {
-            assert_corrupt(
+            assert_corrupt_segment(
                 pb::u64_segment::Segment::Array(pb::EncodedU64Array { array: Some(array) }),
                 "overflows u64",
             );
         }
+    }
+
+    #[rstest]
+    #[case::descending(vec![6, 5], "not strictly increasing")]
+    #[case::duplicate(vec![5, 5], "not strictly increasing")]
+    #[case::below_range(vec![4], "outside the range")]
+    #[case::at_end(vec![7], "outside the range")]
+    fn test_rejects_invalid_range_with_holes(#[case] values: Vec<u64>, #[case] message: &str) {
+        let values = values.into_iter().flat_map(u64::to_le_bytes).collect();
+        assert_corrupt_segment(
+            pb::u64_segment::Segment::RangeWithHoles(pb::u64_segment::RangeWithHoles {
+                start: 5,
+                end: 7,
+                holes: Some(pb::EncodedU64Array {
+                    array: Some(pb::encoded_u64_array::Array::U64Array(
+                        pb::encoded_u64_array::U64Array { values },
+                    )),
+                }),
+            }),
+            message,
+        );
+    }
+
+    #[test]
+    fn test_rejects_missing_range_with_holes_array() {
+        assert_corrupt_segment(
+            pb::u64_segment::Segment::RangeWithHoles(pb::u64_segment::RangeWithHoles {
+                start: 5,
+                end: 7,
+                holes: None,
+            }),
+            "missing its holes array",
+        );
+    }
+
+    #[rstest]
+    #[case::u16(
+        pb::encoded_u64_array::Array::U16Array(pb::encoded_u64_array::U16Array {
+            base: 0,
+            offsets: vec![1],
+        }),
+        "encoded u16 array byte length 1 is not a multiple of element width 2"
+    )]
+    #[case::u32(
+        pb::encoded_u64_array::Array::U32Array(pb::encoded_u64_array::U32Array {
+            base: 0,
+            offsets: vec![1, 2, 3],
+        }),
+        "encoded u32 array byte length 3 is not a multiple of element width 4"
+    )]
+    #[case::u64(
+        pb::encoded_u64_array::Array::U64Array(pb::encoded_u64_array::U64Array {
+            values: vec![1, 2, 3, 4, 5, 6, 7],
+        }),
+        "encoded u64 array byte length 7 is not a multiple of element width 8"
+    )]
+    fn test_rejects_misaligned_encoded_array(
+        #[case] array: pb::encoded_u64_array::Array,
+        #[case] message: &str,
+    ) {
+        assert_corrupt_segment(
+            pb::u64_segment::Segment::Array(pb::EncodedU64Array { array: Some(array) }),
+            message,
+        );
+    }
+
+    #[rstest]
+    #[case::range(pb::u64_segment::Segment::Range(pb::u64_segment::Range {
+        start: 10,
+        end: 9,
+    }))]
+    #[case::range_with_holes(pb::u64_segment::Segment::RangeWithHoles(
+        pb::u64_segment::RangeWithHoles {
+            start: 10,
+            end: 9,
+            holes: Some(pb::EncodedU64Array {
+                array: Some(pb::encoded_u64_array::Array::U64Array(
+                    pb::encoded_u64_array::U64Array { values: Vec::new() },
+                )),
+            }),
+        }
+    ))]
+    #[case::range_with_bitmap(pb::u64_segment::Segment::RangeWithBitmap(
+        pb::u64_segment::RangeWithBitmap {
+            start: 10,
+            end: 9,
+            bitmap: Vec::new(),
+        }
+    ))]
+    fn test_rejects_reversed_range(#[case] segment: pb::u64_segment::Segment) {
+        assert_corrupt_segment(segment, "range start 10 exceeds end 9");
+    }
+
+    #[rstest]
+    #[case::short(vec![0])]
+    #[case::long(vec![0, 0, 0])]
+    fn test_rejects_incorrect_bitmap_length(#[case] bitmap: Vec<u8>) {
+        assert_corrupt_segment(
+            pb::u64_segment::Segment::RangeWithBitmap(pb::u64_segment::RangeWithBitmap {
+                start: 5,
+                end: 14,
+                bitmap,
+            }),
+            "does not match expected 2 for range start 5, end 14, and length 9",
+        );
+    }
+
+    #[test]
+    fn test_rejects_set_bitmap_padding_bits() {
+        assert_corrupt_segment(
+            pb::u64_segment::Segment::RangeWithBitmap(pb::u64_segment::RangeWithBitmap {
+                start: 5,
+                end: 14,
+                bitmap: vec![0xff, 0x03],
+            }),
+            "padding bits must be zero",
+        );
+    }
+
+    #[rstest]
+    #[case::u16(pb::encoded_u64_array::Array::U16Array(
+        pb::encoded_u64_array::U16Array {
+            base: 100,
+            offsets: vec![2, 0, 1, 0],
+        }
+    ))]
+    #[case::u32(pb::encoded_u64_array::Array::U32Array(
+        pb::encoded_u64_array::U32Array {
+            base: 100,
+            offsets: vec![2, 0, 0, 0, 1, 0, 0, 0],
+        }
+    ))]
+    #[case::u64(pb::encoded_u64_array::Array::U64Array(
+        pb::encoded_u64_array::U64Array {
+            values: vec![2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        }
+    ))]
+    fn test_rejects_unsorted_sorted_array(#[case] array: pb::encoded_u64_array::Array) {
+        assert_corrupt_segment(
+            pb::u64_segment::Segment::SortedArray(pb::EncodedU64Array { array: Some(array) }),
+            "SortedArray values are not sorted at indices 0 and 1: 2 exceeds 1",
+        );
     }
 }
