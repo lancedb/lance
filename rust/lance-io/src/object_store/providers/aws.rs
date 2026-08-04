@@ -13,11 +13,11 @@ use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::S3};
 
+use aws_config::Region;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::ecs::EcsCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
-use aws_config::Region;
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
@@ -127,6 +127,13 @@ impl AwsStoreProvider {
         // Start with all storage options as the config map
         // OpenDAL will handle environment variables through its default credentials chain
         let mut config_map: HashMap<String, String> = storage_options.0.clone();
+
+        if let Some(provider_scheme) = storage_options.aws_provider_scheme()? {
+            return Result::Err(Error::not_supported(format!(
+                "OpendalStore does not currently support an explicit provider_scheme (currently set to {:?})",
+                provider_scheme
+            )));
+        }
 
         // Set required OpenDAL configuration
         config_map.insert("bucket".to_string(), bucket);
@@ -358,8 +365,7 @@ pub async fn build_aws_credential(
                 ))
             }
             AwsProviderScheme::Irsa => {
-                let conf = ProviderConfig::default()
-                    .with_region(Some(Region::new(region.clone())));
+                let conf = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
                 let provider = WebIdentityTokenCredentialsProvider::builder()
                     .configure(&conf)
                     .build();
