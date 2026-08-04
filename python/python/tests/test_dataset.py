@@ -5653,8 +5653,8 @@ def test_dataset_sql_register_arrow(tmp_path: Path, as_reader: bool):
     table = pa.table({"id": [1, 2, 3, 4, 5], "value": ["a", "b", "c", "d", "e"]})
     ds = lance.write_dataset(table, tmp_path / "test")
 
-    # A subset of ids to join against, including one id (99) not in the dataset. Exercise both accepted input
-    # forms: a pyarrow Table and a RecordBatchReader.
+    # A subset of ids to join against, including one id (99) not in the dataset.
+    # Exercise both accepted input forms: a pyarrow Table and a RecordBatchReader.
     ids = pa.table({"id": [4, 2, 99]})
     data = ids.to_reader() if as_reader else ids
 
@@ -5675,8 +5675,8 @@ def test_dataset_sql_register_arrow_empty(tmp_path: Path):
     table = pa.table({"id": [1, 2, 3]})
     ds = lance.write_dataset(table, tmp_path / "test")
 
-    # An empty relation has no batches to derive a schema from, so registration raises (translated to ValueError
-    # by the PyO3 binding).
+    # An empty relation has no batches to derive a schema from, so registration
+    # raises (translated to ValueError by the PyO3 binding).
     schema = pa.schema([("id", pa.int64())])
     empty = pa.RecordBatchReader.from_batches(schema, [])
     with pytest.raises(ValueError):

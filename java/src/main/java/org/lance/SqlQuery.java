@@ -46,15 +46,17 @@ public class SqlQuery {
   }
 
   /**
-   * Register an additional in-memory Arrow relation (exported to {@code stream} via the C Data Interface) as a
-   * table named {@code name}, joinable in the SQL alongside the dataset. {@link #intoBatchRecords()} consumes the
-   * stream during the native call (it takes ownership of the underlying C stream); the caller still owns the
-   * {@link ArrowArrayStream} handle and should close it afterwards (typically via try-with-resources), as with
-   * {@code MergeInsert}. May be called multiple times to register multiple tables; if a name is registered twice,
-   * the later registration replaces the earlier one (deduplicated when the query is built).
+   * Register an additional in-memory Arrow relation (exported to {@code stream} via the C Data
+   * Interface) as a table named {@code name}, joinable in the SQL alongside the dataset. {@link
+   * #intoBatchRecords()} consumes the stream during the native call (it takes ownership of the
+   * underlying C stream); the caller still owns the {@link ArrowArrayStream} handle and should
+   * close it afterwards (typically via try-with-resources), as with {@code MergeInsert}. May be
+   * called multiple times to register multiple tables; if a name is registered twice, the later
+   * registration replaces the earlier one (deduplicated when the query is built).
    *
-   * <p>Because the registered stream is consumed on the first {@link #intoBatchRecords()} call, a query with
-   * registered relations is single-use; calling {@link #intoBatchRecords()} a second time throws.
+   * <p>Because the registered stream is consumed on the first {@link #intoBatchRecords()} call, a
+   * query with registered relations is single-use; calling {@link #intoBatchRecords()} a second
+   * time throws.
    *
    * @throws IllegalArgumentException if {@code name} is null or blank, or {@code stream} is null
    * @throws IllegalStateException if the query was already run via {@link #intoBatchRecords()}
@@ -62,13 +64,16 @@ public class SqlQuery {
   public SqlQuery registerArrow(String name, ArrowArrayStream stream) {
     if (consumed) {
       throw new IllegalStateException(
-          "registerArrow cannot be called after intoBatchRecords(); build a new query and re-register relations.");
+          "registerArrow cannot be called after intoBatchRecords(); build a new query and "
+              + "re-register relations.");
     }
     if (name == null || name.trim().isEmpty()) {
-      throw new IllegalArgumentException("registerArrow: table name must be non-empty, got: " + name);
+      throw new IllegalArgumentException(
+          "registerArrow: table name must be non-empty, got: " + name);
     }
     if (stream == null) {
-      throw new IllegalArgumentException("registerArrow: stream must not be null (table name: " + name + ")");
+      throw new IllegalArgumentException(
+          "registerArrow: stream must not be null (table name: " + name + ")");
     }
     this.extraTableNames.add(name);
     this.extraStreamAddresses.add(stream.memoryAddress());
@@ -88,12 +93,14 @@ public class SqlQuery {
   public ArrowReader intoBatchRecords() throws IOException {
     if (consumed) {
       throw new IllegalStateException(
-          "intoBatchRecords() was already called on this SqlQuery; a query with registered Arrow relations is "
-              + "single-use because the registered streams are consumed. Build a new query and re-register them.");
+          "intoBatchRecords() was already called on this SqlQuery; a query with registered "
+              + "Arrow relations is single-use because the registered streams are consumed. "
+              + "Build a new query and re-register them.");
     }
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
-      // A query with registered streams is one-shot: the native call below consumes them. Mark it consumed here,
-      // just before the native call, so a failure in the output-stream allocation above does not brick a retry.
+      // A query with registered streams is one-shot: the native call below consumes them. Mark it
+      // consumed just before that call, so a failed output-stream allocation does not brick a
+      // retry.
       if (!extraTableNames.isEmpty()) {
         consumed = true;
       }

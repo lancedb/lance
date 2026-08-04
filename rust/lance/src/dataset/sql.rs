@@ -582,7 +582,11 @@ mod tests {
 
     /// A one-batch relation `(id: Int32)` from `ids`.
     fn ids_batch(ids: Vec<i32>) -> RecordBatch {
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
     }
 
@@ -664,7 +668,9 @@ mod tests {
         let schema = ids_batch(vec![]).schema();
 
         // The general path: register any TableProvider (here a MemTable) and join it.
-        let table = Arc::new(MemTable::try_new(schema.clone(), vec![vec![ids_batch(vec![7, 88])]]).unwrap());
+        let table = Arc::new(
+            MemTable::try_new(schema.clone(), vec![vec![ids_batch(vec![7, 88])]]).unwrap(),
+        );
         let results = ds
             .sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
             .table_name("t")
@@ -707,6 +713,9 @@ mod tests {
             matches!(&err, lance_core::Error::InvalidInput { .. }),
             "expected InvalidInput, got {err:?}"
         );
-        assert!(err.to_string().contains("non-empty"), "message should mention the empty name: {err}");
+        assert!(
+            err.to_string().contains("non-empty"),
+            "message should mention the empty name: {err}"
+        );
     }
 }

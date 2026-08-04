@@ -126,7 +126,7 @@ public class SqlQueryTest {
 
   @Test
   public void testRegisterArrow() throws Exception {
-    // An additional in-memory Arrow relation (column `id`) to semi-join against the dataset; 100 is absent.
+    // An in-memory Arrow relation (column `id`) to semi-join against the dataset; 100 is absent.
     Schema idSchema =
         new Schema(Collections.singletonList(Field.nullable("id", new ArrowType.Int(32, true))));
     try (VectorSchemaRoot ids = VectorSchemaRoot.create(idSchema, allocator)) {
@@ -142,7 +142,10 @@ public class SqlQueryTest {
       try (ArrowArrayStream stream = toStream(ids)) {
         ArrowReader reader =
             dataset
-                .sql("select id from " + NAME + " where id in (select id from filter_ids) order by id")
+                .sql(
+                    "select id from "
+                        + NAME
+                        + " where id in (select id from filter_ids) order by id")
                 .tableName(NAME)
                 .registerArrow("filter_ids", stream)
                 .intoBatchRecords();
@@ -162,7 +165,7 @@ public class SqlQueryTest {
 
   @Test
   public void testRegisterArrowMultiple() throws Exception {
-    // Register two relations in one query and join both; only ids in the dataset and in both survive.
+    // Register two relations in one query and join both; only ids present in all three survive.
     try (VectorSchemaRoot a = idTable(1, 2, 3, 10);
         VectorSchemaRoot b = idTable(2, 3, 4, 10);
         ArrowArrayStream sa = toStream(a);
@@ -201,8 +204,8 @@ public class SqlQueryTest {
       Assertions.assertThrows(IllegalArgumentException.class, () -> q.registerArrow("ids", null));
     }
 
-    // A query with registered relations is single-use: the registered stream is consumed on the first call, so a
-    // second intoBatchRecords() throws rather than handing JNI a dead stream.
+    // A query with registered relations is single-use: the stream is consumed on the first call,
+    // so a second intoBatchRecords() throws rather than handing JNI a dead stream.
     try (VectorSchemaRoot ids = idTable(1, 2);
         ArrowArrayStream stream = toStream(ids)) {
       SqlQuery q =
@@ -213,7 +216,7 @@ public class SqlQueryTest {
       q.intoBatchRecords().close();
       Assertions.assertThrows(IllegalStateException.class, q::intoBatchRecords);
 
-      // Registering another relation after the query is consumed is also rejected (would be unexecutable).
+      // Registering another relation after the query is consumed is also rejected.
       try (VectorSchemaRoot more = idTable(3);
           ArrowArrayStream moreStream = toStream(more)) {
         Assertions.assertThrows(
@@ -236,7 +239,10 @@ public class SqlQueryTest {
     return root;
   }
 
-  /** Serialize a single-batch root to a self-contained Arrow C-Data stream (mirrors MergeInsertTest). */
+  /**
+   * Serialize a single-batch root to a self-contained Arrow C-Data stream (mirrors
+   * MergeInsertTest).
+   */
   private ArrowArrayStream toStream(VectorSchemaRoot root) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
@@ -244,7 +250,8 @@ public class SqlQueryTest {
       writer.writeBatch();
       writer.end();
     }
-    ArrowStreamReader reader = new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator);
+    ArrowStreamReader reader =
+        new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator);
     ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator);
     Data.exportArrayStream(allocator, reader, stream);
     return stream;
