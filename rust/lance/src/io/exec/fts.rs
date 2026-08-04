@@ -1412,7 +1412,7 @@ impl ExecutionPlan for MatchQueryExec {
     }
 }
 
-/// Filters the input, removing rows that do not share tokens with the query
+/// Filters the input according to a match query's token operator.
 #[derive(Debug)]
 pub struct FlatMatchFilterExec {
     dataset: Arc<Dataset>,
@@ -1448,17 +1448,20 @@ fn document_matches_query(
     match operator {
         Operator::Or => has_query_token(text, tokenizer, query_tokens),
         Operator::And => {
-            let mut remaining = query_tokens
-                .into_iter()
-                .map(String::as_str)
+            let mut remaining_positions = (0..query_tokens.len())
+                .map(|index| query_tokens.position(index))
                 .collect::<HashSet<_>>();
-            if remaining.is_empty() {
+            if remaining_positions.is_empty() {
                 return false;
             }
             let mut stream = tokenizer.token_stream_for_doc(text);
             while let Some(token) = stream.next() {
-                remaining.remove(token.text.as_str());
-                if remaining.is_empty() {
+                for index in 0..query_tokens.len() {
+                    if token.text == query_tokens.get_token(index) {
+                        remaining_positions.remove(&query_tokens.position(index));
+                    }
+                }
+                if remaining_positions.is_empty() {
                     return true;
                 }
             }
@@ -1656,6 +1659,12 @@ impl FlatMatchFilterExec {
                 "column not set for MatchQuery {}",
                 query.terms
             )))?;
+        if query.fuzziness != Some(0) {
+            return Err(DataFusionError::NotImplemented(format!(
+                "Fuzzy MatchQuery is not supported when FTS is used as a post-filter: column={}, fuzziness={:?}",
+                column, query.fuzziness
+            )));
+        }
         let document_granularity = resolved_field
             .as_ref()
             .map(|resolved| resolved.document_granularity)
