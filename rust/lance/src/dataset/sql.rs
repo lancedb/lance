@@ -231,6 +231,21 @@ mod tests {
         let blobs = batches[0].column(0).as_binary::<i64>();
         assert_eq!(blobs.value(0), b"foo");
         assert_eq!(blobs.value(1), b"bar");
+
+        // Expressions over the blob column require the planner to see the
+        // materialized LargeBinary type instead of the blob descriptor struct.
+        let batches = dataset
+            .sql("SELECT blob = X'666f6f' FROM dataset")
+            .blob_handling(BlobHandling::AllBinary)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let is_foo = batches[0].column(0).as_boolean();
+        assert!(is_foo.value(0));
+        assert!(!is_foo.value(1));
     }
 
     #[tokio::test]
