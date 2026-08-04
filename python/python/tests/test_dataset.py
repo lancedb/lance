@@ -3,6 +3,7 @@
 
 import base64
 import contextlib
+import importlib
 import os
 import pickle
 import platform
@@ -28,7 +29,6 @@ import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
-from lance.commit import CommitConflictError
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
@@ -4368,10 +4368,14 @@ def test_custom_commit_lock(tmp_path: Path):
         lance.write_dataset(
             pa.table({"a": range(100)}), tmp_path / "test2", commit_lock=commit_lock
         )
+    assert lance.dataset(tmp_path / "test2").count_rows() == 100
+
+    # Import only after the generic error case to verify users need not import it first.
+    commit_module = importlib.import_module("lance.commit")
 
     @contextlib.contextmanager
     def commit_lock(_version: int):
-        raise CommitConflictError()
+        raise commit_module.CommitConflictError()
 
     with pytest.raises(Exception, match="CommitConflictError"):
         lance.write_dataset(

@@ -901,7 +901,7 @@ impl MemTableFlusher {
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_core::ROW_ID;
-        use lance_file::writer::{FileWriter, FileWriterOptions};
+        use lance_file::writer::FileWriterOptions;
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
         use lance_index::vector::SQ_CODE_COLUMN;
@@ -992,13 +992,11 @@ impl MemTableFlusher {
         storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut storage_writer = FileWriter::try_new(
+        let mut storage_writer = lance_file::versions::create_writer(
+            lance_file::version::ConcreteFileVersion::from(storage_version),
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
-            FileWriterOptions {
-                format_version: Some(storage_version),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )?;
         storage_writer.write_batch(&storage_batch).await?;
 
@@ -1067,13 +1065,11 @@ impl MemTableFlusher {
             ArrowSchema::new(fields)
         };
         let index_path = index_dir.clone().join(INDEX_FILE_NAME);
-        let mut index_writer = FileWriter::try_new(
+        let mut index_writer = lance_file::versions::create_writer(
+            lance_file::version::ConcreteFileVersion::from(storage_version),
             self.object_store.create(&index_path).await?,
             (&index_schema).try_into()?,
-            FileWriterOptions {
-                format_version: Some(storage_version),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )?;
         index_writer.write_batch(&hnsw_batch).await?;
 

@@ -209,7 +209,14 @@ pub fn validate_index_configs(
         // reject any `field_id` that does not name the resolved column.
         let resolved_field_id = lance_schema
             .field(column)
-            .expect("column resolved in the Arrow schema is present in the Lance schema")
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "index '{}' is configured on column '{}', which is present in the Arrow \
+                     schema but absent from the Lance schema",
+                    config.name(),
+                    column,
+                ))
+            })?
             .id;
         if resolved_field_id != config.field_id() {
             return Err(Error::invalid_input(format!(
@@ -1913,6 +1920,42 @@ mod tests {
         let error =
             validate_index_configs(&[wrong_field_id], &schema, &lance_schema, &[]).unwrap_err();
         assert!(error.to_string().contains("final field_id"), "{error}");
+    }
+
+    #[test]
+    fn test_validate_index_configs_rejects_diverged_lance_schema() {
+        let arrow_schema = ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&ArrowSchema::new(vec![Field::new(
+            "other",
+            DataType::Int32,
+            false,
+        )]))
+        .expect("test Lance schema must be valid");
+        let config = MemIndexConfig::BTree(BTreeIndexConfig {
+            name: "idx".into(),
+            field_id: 0,
+            column: "id".into(),
+        });
+
+        let error = validate_index_configs(&[config], &arrow_schema, &lance_schema, &[])
+            .expect_err("diverged Arrow and Lance schemas must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("index 'idx'"),
+            "error must name the index: {message}"
+        );
+        assert!(
+            message.contains("column 'id'"),
+            "error must name the column: {message}"
+        );
+        assert!(
+            message.contains("absent from the Lance schema"),
+            "error must explain the schema divergence: {message}"
+        );
     }
 
     /// A composite PK builds an order-preserving encoded key, so its columns must

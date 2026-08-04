@@ -13,10 +13,11 @@ use std::collections::{HashMap, HashSet};
 pub struct FtsSearchParams {
     /// Controls result completeness for each recursively planned FTS node.
     ///
-    /// `Some(k)` permits bounded top-k execution, while `None` requires complete
-    /// results so an outer compound query can combine every candidate exactly.
-    /// Future competitive-score pruning must use a separate planning contract
-    /// instead of inferring a bound from the ambient scanner limit.
+    /// `Some(k)` permits bounded top-k execution. Posting-backed compound
+    /// queries apply it only at their root collector and propagate the
+    /// resulting competitive score through child scorers. The exact
+    /// DataFusion fallback passes `None` recursively so intermediate children
+    /// remain complete.
     pub limit: Option<usize>,
     pub wand_factor: f32,
     pub fuzziness: Option<u32>,
@@ -287,7 +288,9 @@ pub struct MatchQuery {
     pub column: Option<String>,
     pub terms: String,
 
-    // literal default is not supported so we set it by function
+    /// Finite, non-negative score multiplier. Validation occurs at the FTS
+    /// query boundary so direct struct deserialization follows the same
+    /// contract as builder-created queries.
     #[serde(default = "MatchQuery::default_boost")]
     pub boost: f32,
 
@@ -460,6 +463,7 @@ impl FtsQueryNode for PhraseQuery {
 pub struct BoostQuery {
     pub positive: Box<FtsQuery>,
     pub negative: Box<FtsQuery>,
+    /// Finite, non-negative multiplier subtracted from the positive score.
     #[serde(default = "BoostQuery::default_negative_boost")]
     pub negative_boost: f32,
 }

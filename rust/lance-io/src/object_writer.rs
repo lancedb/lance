@@ -21,7 +21,7 @@ use lance_core::{Error, Result};
 use tracing::Instrument;
 
 use crate::traits::Writer;
-use crate::utils::tracking_store::IOTracker;
+use crate::utils::tracking_store::{IOTracker, IoMetricsGuard};
 use tokio::runtime::Handle;
 
 /// Start at 5MB.
@@ -522,7 +522,7 @@ pub struct LocalWriter {
 
 #[derive(Default)]
 enum LocalWriteState {
-    Writing(WritingState),
+    Writing(Box<WritingState>),
     Finishing {
         size: usize,
         future: BoxFuture<'static, Result<WriteResult>>,
@@ -538,6 +538,10 @@ struct WritingState {
     /// Temp path that auto-deletes on drop. Set to `None` after `persist()`.
     temp_path: tempfile::TempPath,
     io_tracker: Arc<IOTracker>,
+    /// The whole file is reported as a single `put`, so this covers everything
+    /// from opening the file to it being durable under its final path. A writer
+    /// dropped before `persist()` records nothing, like an aborted upload.
+    metrics: IoMetricsGuard,
 }
 
 impl LocalWriter {
@@ -549,12 +553,13 @@ impl LocalWriter {
     ) -> Self {
         Self {
             path,
-            state: LocalWriteState::Writing(WritingState {
+            state: LocalWriteState::Writing(Box::new(WritingState {
                 writer: tokio::io::BufWriter::new(file),
                 cursor: 0,
                 temp_path,
+                metrics: io_tracker.begin_io("put"),
                 io_tracker,
-            }),
+            })),
         }
     }
 
@@ -574,9 +579,10 @@ impl LocalWriter {
         final_path: Path,
         size: usize,
         io_tracker: Arc<IOTracker>,
+        metrics: IoMetricsGuard,
     ) -> Result<WriteResult> {
         let local_path = crate::local::to_local_path(&final_path);
-        let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
+        let persisted = tokio::task::spawn_blocking(move || -> Result<String> {
             temp_path.persist(&local_path).map_err(|e| {
                 Error::io(format!(
                     "failed to persist temp file to {}: {}",
@@ -590,7 +596,11 @@ impl LocalWriter {
             Ok(get_etag(&metadata))
         })
         .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
+        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))
+        .and_then(|e_tag| e_tag);
+
+        metrics.record(&persisted, size as u64);
+        let e_tag = persisted?;
 
         io_tracker.record_write("put", final_path, size as u64);
 
@@ -655,6 +665,7 @@ impl AsyncWrite for LocalWriter {
                             mut_self.path.clone(),
                             size,
                             state.io_tracker,
+                            state.metrics,
                         )),
                     };
                 }

@@ -36,7 +36,7 @@ use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::{
     version::{ConcreteFileVersion, LanceFileVersion},
-    writer::{FileWriter, FileWriterOptions},
+    writer::FileWriterOptions,
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
@@ -449,13 +449,10 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
             .create(&dataset.data_dir().join(file_name))
             .await
             .unwrap();
-        let mut writer = FileWriter::try_new(
+        let mut writer = lance_file::versions::v2_2::create_writer(
             object_writer,
             crate::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )
         .unwrap();
         writer.write_batch(&batch).await.unwrap();
@@ -1530,6 +1527,42 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+}
+
+#[tokio::test]
+async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
+    use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let source_uri = source_dir.to_str().unwrap();
+    let target_dir = test_dir.join("target");
+    let target_uri = target_dir.to_str().unwrap();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(32), BatchCount::from(1));
+    let mut source = Dataset::write(
+        data_reader,
+        source_uri,
+        Some(WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let source_transaction_file = source.manifest().transaction_file.clone();
+
+    handler.fail_next(AmbiguousFailure::LandAndConflict);
+    let cloned = source
+        .deep_clone(target_uri, source.version().version, None)
+        .await
+        .expect("readback must identify the deep-clone transaction that landed");
+
+    assert_eq!(cloned.count_rows(None).await.unwrap(), 32);
+    assert_ne!(cloned.manifest().transaction_file, source_transaction_file);
+    assert!(cloned.manifest().transaction_section.is_some());
 }
 
 // Uses an in-memory source store to force a cross-store copy. The in-memory store has

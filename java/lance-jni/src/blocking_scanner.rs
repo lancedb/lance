@@ -30,7 +30,7 @@ use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
 use crate::{
-    RT,
+    RT, block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::IntoJava,
     utils::parse_approx_mode,
@@ -69,17 +69,17 @@ impl BlockingScanner {
 
     pub fn open_stream(&self) -> Result<DatasetRecordBatchStream> {
         self.reset_stats();
-        let res = RT.block_on(self.inner.try_into_stream())?;
+        let res = block_on(self.inner.try_into_stream())?;
         Ok(res)
     }
 
     pub fn schema(&self) -> Result<SchemaRef> {
-        let res = RT.block_on(self.inner.schema())?;
+        let res = block_on(self.inner.schema())?;
         Ok(res)
     }
 
     pub fn count_rows(&self) -> Result<u64> {
-        let res = RT.block_on(self.inner.count_rows())?;
+        let res = block_on(self.inner.count_rows())?;
         Ok(res)
     }
 
@@ -308,7 +308,7 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     let substrait_opt = env.get_bytes_opt(&options.substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait) })?;
+        block_on(async { scanner.filter_substrait(substrait) })?;
     }
 
     let filter_opt = env.get_string_opt(&options.filter_obj)?;

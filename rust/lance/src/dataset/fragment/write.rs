@@ -147,17 +147,16 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let mut writer = lance_file::writer::FileWriter::try_new(
+        let file_version =
+            ConcreteFileVersion::from(params.data_storage_version.unwrap_or_default());
+        let mut writer = lance_file::versions::create_writer(
+            file_version,
             obj_writer,
             schema,
-            FileWriterOptions {
-                format_version: params.data_storage_version,
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )?;
 
-        let data_file =
-            DataFile::new_unstarted(filename, ConcreteFileVersion::from(writer.version()));
+        let data_file = DataFile::new_unstarted(filename, file_version);
         fragment.files.push(data_file);
 
         progress.begin(&fragment).await?;

@@ -112,8 +112,8 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
-    commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments,
+    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
+    commit_transaction, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -1617,6 +1617,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
+            DEFAULT_COMMIT_RETRY_TIMEOUT,
             self.manifest_location.naming_scheme,
             None,
         )
@@ -3973,6 +3974,12 @@ impl Default for ManifestWriteConfig {
 impl ManifestWriteConfig {
     pub fn disable_transaction_file(&self) -> bool {
         self.disable_transaction_file
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
+        self.disable_transaction_file = true;
+        self
     }
 }
 

@@ -2415,18 +2415,50 @@ struct FlatValueCounts {
     last_chunk_values: u64,
 }
 
-fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
+fn analyze_value_counts(words: &Words, items_in_page: u64) -> Result<FlatValueCounts> {
     let num_chunks = words.len();
     let logs = words.iter().map(|w| (w & 0x0F) as u8).collect::<Vec<_>>();
     let mut counted = 0u64;
-    for &log in logs.iter().take(num_chunks.saturating_sub(1)) {
-        // Non-last chunks always encode a positive log value count.
-        debug_assert!(log > 0);
-        counted += 1u64 << log;
+    for (chunk_index, &log) in logs.iter().take(num_chunks.saturating_sub(1)).enumerate() {
+        if log == 0 {
+            return Err(Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "non-final chunk {chunk_index} of {num_chunks} has invalid log_num_values=0"
+                ),
+            ));
+        }
+        counted = counted.checked_add(1u64 << log).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "value count overflow at chunk {chunk_index}: counted_values={counted}, \
+                     log_num_values={log}, items_in_page={items_in_page}"
+                ),
+            )
+        })?;
     }
-    let last_chunk_values = items_in_page - counted;
-    if let Some(&last_log) = logs.last() {
-        debug_assert!(last_log == 0 || (1u64 << last_log) == last_chunk_values);
+    let last_chunk_values = items_in_page.checked_sub(counted).ok_or_else(|| {
+        Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "non-final chunks account for counted_values={counted}, exceeding \
+                 items_in_page={items_in_page}"
+            ),
+        )
+    })?;
+    if let Some(&last_log) = logs.last()
+        && last_log != 0
+        && (1u64 << last_log) != last_chunk_values
+    {
+        return Err(Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "final chunk log_num_values={last_log} does not match \
+                 last_chunk_values={last_chunk_values}: counted_values={counted}, \
+                 items_in_page={items_in_page}"
+            ),
+        ));
     }
     let uniform = num_chunks <= 1 || logs[..num_chunks - 1].iter().all(|&log| log == logs[0]);
     // A single-chunk page has no "non-last" chunk to derive a stride from; use the
@@ -2436,27 +2468,24 @@ fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
     } else {
         1u64 << logs[0]
     };
-    FlatValueCounts {
+    Ok(FlatValueCounts {
         logs,
         uniform,
         values_per_chunk,
         last_chunk_values,
-    }
+    })
 }
 
 /// Iterator over per-chunk value counts for a non-uniform flat page.  Non-last
-/// chunks yield `1 << log`; the last yields the remaining items in the page.
-fn flat_value_counts_iter(logs: &[u8], items_in_page: u64) -> impl Iterator<Item = u64> + '_ {
+/// chunks yield `1 << log`; the last yields the validated remaining item count.
+fn flat_value_counts_iter(logs: &[u8], last_chunk_values: u64) -> impl Iterator<Item = u64> + '_ {
     let num_chunks = logs.len();
-    let mut counted = 0u64;
     (0..num_chunks).map(move |i| {
-        let count = if i + 1 < num_chunks {
+        if i + 1 < num_chunks {
             1u64 << logs[i]
         } else {
-            items_in_page - counted
-        };
-        counted += count;
-        count
+            last_chunk_values
+        }
     })
 }
 
@@ -2471,8 +2500,12 @@ fn build_chunk_index(
     data_buf_size: u64,
     rep_index_bytes: Option<&[u8]>,
     repetition_index_depth: u16,
-) -> MiniBlockChunkIndex {
+) -> Result<MiniBlockChunkIndex> {
     let num_chunks = words.len();
+    // Validate item counts before byte sizes because both share a metadata word,
+    // and an invalid count must not reach the final-chunk subtraction.
+    let value_counts = analyze_value_counts(words, items_in_page)?;
+
     // Each chunk stores `(divided_bytes + 1) * MINIBLOCK_ALIGNMENT` bytes, so the
     // deltas are the chunk sizes and their grand total is the data buffer size.
     let byte_starts = PrefixSums::from_deltas(
@@ -2489,7 +2522,6 @@ fn build_chunk_index(
         assert!(rep_index_data.len() % 8 == 0);
         let stride = repetition_index_depth as usize + 1;
         let (row_starts, has_trailer) = parse_nested_rep(rep_index_data, stride);
-        let value_counts = analyze_value_counts(words, items_in_page);
         let item_counts = if value_counts.uniform {
             ItemCounts::Uniform {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -2507,7 +2539,6 @@ fn build_chunk_index(
             item_counts,
         }
     } else {
-        let value_counts = analyze_value_counts(words, items_in_page);
         if value_counts.uniform {
             RowMapping::UniformFlat {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -2516,7 +2547,7 @@ fn build_chunk_index(
             }
         } else {
             let value_starts = PrefixSums::from_deltas(
-                flat_value_counts_iter(&value_counts.logs, items_in_page),
+                flat_value_counts_iter(&value_counts.logs, value_counts.last_chunk_values),
                 num_chunks,
                 items_in_page,
             );
@@ -2524,7 +2555,7 @@ fn build_chunk_index(
         }
     };
 
-    MiniBlockChunkIndex::new(base, byte_starts, rows)
+    Ok(MiniBlockChunkIndex::new(base, byte_starts, rows))
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
@@ -2574,7 +2605,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 data_buf_size,
                 rep_index_bytes.as_deref(),
                 self.repetition_index_depth,
-            );
+            )?;
 
             // decode dictionary
             let dictionary = if let Some(ref mut dictionary) = self.dictionary {
@@ -2952,7 +2983,7 @@ impl FullZipScheduler {
                     num_rows,
                     bits_per_offset,
                     bits_per_offset,
-                )))
+                )?))
             }
         }
     }
@@ -3367,7 +3398,7 @@ impl VariableFullZipDecoder {
         num_rows: u64,
         in_bits_per_length: u8,
         out_bits_per_offset: u8,
-    ) -> Self {
+    ) -> Result<Self> {
         let decompressor = match details.value_decompressor {
             PerValueDecompressor::Variable(ref d) => d.clone(),
             _ => unreachable!(),
@@ -3412,9 +3443,9 @@ impl VariableFullZipDecoder {
         //   - We could force each decode task to do a full unzip of all the data.  Each decode task now
         //     has to do more work but the work is all fused.
         //   - We could just try doing this work on the decode thread and see if it is a problem.
-        decoder.unzip(data, in_bits_per_length, out_bits_per_offset, num_rows);
+        decoder.unzip(data, in_bits_per_length, out_bits_per_offset, num_rows)?;
 
-        decoder
+        Ok(decoder)
     }
 
     fn slice_batch_data_and_rebase_offsets_typed<T>(
@@ -3489,28 +3520,33 @@ impl VariableFullZipDecoder {
         }
     }
 
-    unsafe fn parse_length(data: &[u8], bits_per_offset: u8) -> u64 {
-        match bits_per_offset {
-            8 => *data.get_unchecked(0) as u64,
-            16 => u16::from_le_bytes([*data.get_unchecked(0), *data.get_unchecked(1)]) as u64,
-            32 => u32::from_le_bytes([
-                *data.get_unchecked(0),
-                *data.get_unchecked(1),
-                *data.get_unchecked(2),
-                *data.get_unchecked(3),
-            ]) as u64,
-            64 => u64::from_le_bytes([
-                *data.get_unchecked(0),
-                *data.get_unchecked(1),
-                *data.get_unchecked(2),
-                *data.get_unchecked(3),
-                *data.get_unchecked(4),
-                *data.get_unchecked(5),
-                *data.get_unchecked(6),
-                *data.get_unchecked(7),
-            ]),
-            _ => unreachable!(),
+    /// Reads a single length prefix from the front of `data`.
+    ///
+    /// The bytes come from the file. A page whose item walk ends with a partial
+    /// trailing item leaves fewer than `bits_per_offset / 8` bytes here, so this
+    /// is bounds checked and reports a corrupt file rather than reading past the
+    /// end of the buffer.
+    fn parse_length(data: &[u8], bits_per_offset: u8) -> Result<u64> {
+        let width = bits_per_offset as usize / 8;
+        if data.len() < width {
+            return Err(Error::corrupt_file_named(
+                "variable_full_zip",
+                format!(
+                    "truncated length prefix: {} byte(s) remain in the page buffer but a \
+                     {}-bit length prefix requires {}",
+                    data.len(),
+                    bits_per_offset,
+                    width
+                ),
+            ));
         }
+        Ok(match bits_per_offset {
+            8 => data[0] as u64,
+            16 => u16::from_le_bytes(data[..2].try_into().unwrap()) as u64,
+            32 => u32::from_le_bytes(data[..4].try_into().unwrap()) as u64,
+            64 => u64::from_le_bytes(data[..8].try_into().unwrap()),
+            _ => unreachable!(),
+        })
     }
 
     fn unzip(
@@ -3519,7 +3555,7 @@ impl VariableFullZipDecoder {
         in_bits_per_length: u8,
         out_bits_per_offset: u8,
         num_rows: u64,
-    ) {
+    ) -> Result<()> {
         // This undercounts if there are lists but, at this point, we don't really know how many items we have
         let mut rep = Vec::with_capacity(num_rows as usize);
         let mut def = Vec::with_capacity(num_rows as usize);
@@ -3570,9 +3606,7 @@ impl VariableFullZipDecoder {
                 if ctrl_desc.is_visible {
                     visible_item_count += 1;
                     if ctrl_desc.is_valid_item {
-                        // Safety: Data should have at least bytes_per_length bytes remaining
-                        debug_assert!(databuf.len() >= bytes_per_length);
-                        let length = unsafe { Self::parse_length(databuf, in_bits_per_length) };
+                        let length = Self::parse_length(databuf, in_bits_per_length)?;
                         match out_bits_per_offset {
                             32 => offsets_data
                                 .extend_from_slice(&(current_offset as u32).to_le_bytes()),
@@ -3608,6 +3642,7 @@ impl VariableFullZipDecoder {
         self.def = ScalarBuffer::from(def);
         self.data = LanceBuffer::from(unzipped_data);
         self.offsets = LanceBuffer::from(offsets_data);
+        Ok(())
     }
 }
 
@@ -7784,7 +7819,7 @@ mod tests {
     ) {
         let base = 100u64;
         let (words, data_buf_size) = words_from(entries);
-        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0);
+        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0).unwrap();
 
         assert_eq!(index.row_mapping_debug(), expected_kind);
         assert_eq!(index.num_chunks(), entries.len());
@@ -7815,7 +7850,7 @@ mod tests {
 
         // Uniform leaf chunking: value counts 4, 4, 2.
         let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1);
+        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1).unwrap();
         assert_eq!(index.row_mapping_debug(), "nested");
         assert_eq!(index.num_chunks(), 3);
         // Rows come from the repetition index, not the value counts.
@@ -7832,7 +7867,7 @@ mod tests {
 
         // Non-uniform leaf chunking: value counts 8, 2, 5.
         let (words_nu, dbs_nu) = words_from(&[(3, 8), (1, 8), (0, 8)]);
-        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1);
+        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1).unwrap();
         assert_eq!(index_nu.row_mapping_debug(), "nested");
         assert_eq!(index_nu.items_in_chunk(0), 8);
         assert_eq!(index_nu.items_in_chunk(1), 2);
@@ -7845,7 +7880,7 @@ mod tests {
     fn test_uniform_flat_matches_prefix_sum_flat() {
         // Distribution: 4 chunks of 4 values, last chunk 3 (15 items total).
         let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (2, 8), (0, 8)]);
-        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0);
+        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
 
         // The same distribution expressed as a non-uniform Flat prefix-sum index.
@@ -7896,12 +7931,12 @@ mod tests {
         let heap = |index: &MiniBlockChunkIndex| index.deep_size_of_children(&mut Context::new());
 
         let (uniform_words, uniform_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0);
+        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
         assert!(heap(&uniform) < LEGACY_PER_CHUNK * num_chunks);
 
         let (flat_words, flat_dbs) = words_from(&[(3, 8), (1, 8), (0, 8)]);
-        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0);
+        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0).unwrap();
         assert_eq!(flat.row_mapping_debug(), "flat");
         assert!(heap(&flat) < LEGACY_PER_CHUNK * num_chunks);
         // Flat carries a value-starts array that UniformFlat derives arithmetically.
@@ -7909,7 +7944,7 @@ mod tests {
 
         let rep = rep_bytes_from(&[4, 0, 3, 0, 3, 0]);
         let (nested_words, nested_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1);
+        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1).unwrap();
         assert_eq!(nested.row_mapping_debug(), "nested");
         assert!(heap(&nested) < LEGACY_PER_CHUNK * num_chunks);
     }
@@ -9854,5 +9889,75 @@ mod tests {
 
         let test_cases = TestCases::default().with_structural_encodings();
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    fn truncated_tail_details() -> std::sync::Arc<super::FullZipDecodeDetails> {
+        use crate::compression::VariablePerValueDecompressor;
+        use crate::encodings::physical::binary::VariableDecoder;
+        use crate::repdef::{ControlWordParser, DefinitionInterpretation};
+        use std::sync::Arc;
+        Arc::new(super::FullZipDecodeDetails {
+            value_decompressor: super::PerValueDecompressor::Variable(Arc::new(
+                VariableDecoder::default(),
+            )
+                as Arc<dyn VariablePerValueDecompressor>),
+            def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
+            ctrl_word_parser: ControlWordParser::new(0, 0),
+            max_rep: 0,
+            max_visible_def: 0,
+        })
+    }
+
+    fn decode_variable_full_zip(
+        buf: Vec<u8>,
+        bits_per_offset: u8,
+    ) -> lance_core::Result<super::VariableFullZipDecoder> {
+        use std::collections::VecDeque;
+        let mut data = VecDeque::new();
+        data.push_back(crate::buffer::LanceBuffer::from(buf));
+        super::VariableFullZipDecoder::new(
+            truncated_tail_details(),
+            data,
+            1,
+            bits_per_offset,
+            bits_per_offset,
+        )
+    }
+
+    /// A well-formed length prefix decodes without incident, for both widths.
+    #[test]
+    fn variable_full_zip_wellformed_length_prefix() {
+        assert!(decode_variable_full_zip(0u32.to_le_bytes().to_vec(), 32).is_ok());
+        assert!(decode_variable_full_zip(0u64.to_le_bytes().to_vec(), 64).is_ok());
+    }
+
+    /// A page whose item walk ends with a partial length prefix must surface a
+    /// corrupt-file error rather than read past the end of the buffer.
+    ///
+    /// This asserts the error variant and message rather than merely expecting a
+    /// panic: before the length prefix was bounds checked, the read was
+    /// `get_unchecked` behind a `debug_assert!`, so a debug build panicked here
+    /// (which a `#[should_panic]` test would have accepted as a pass) while a
+    /// release build read up to 8 bytes out of a 4 byte allocation.
+    #[test]
+    fn variable_full_zip_truncated_length_prefix_is_corrupt_file() {
+        use lance_core::Error;
+
+        for (bits, buf_len) in [(32u8, 3usize), (64u8, 4usize)] {
+            let err = decode_variable_full_zip(vec![0xAA; buf_len], bits)
+                .expect_err("a truncated length prefix must not decode");
+            assert!(
+                matches!(err, Error::CorruptFile { .. }),
+                "expected CorruptFile for a {}-bit prefix with {} byte(s), got: {:?}",
+                bits,
+                buf_len,
+                err
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("truncated length prefix"),
+                "error should say what is wrong, got: {msg}"
+            );
+        }
     }
 }

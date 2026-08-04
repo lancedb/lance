@@ -538,7 +538,7 @@ mod tests {
         array::AsArray,
         datatypes::{Int64Type, UInt32Type},
     };
-    use arrow_array::types::Float32Type;
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
@@ -550,7 +550,7 @@ mod tests {
     use lance_datagen::{Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
-    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
@@ -1282,6 +1282,154 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[rstest]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, "i < 100", 100)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, "i = 0", 1)]
+    #[tokio::test]
+    async fn test_addr_domain_index_does_not_cover_rewritten_update_fragment(
+        #[case] index_type: BuiltinIndexType,
+        #[case] query: &str,
+        #[case] expected_rows: usize,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col("category", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".to_string()),
+                &ScalarIndexParams::for_builtin(index_type),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let before = dataset
+            .scan()
+            .filter(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(before.num_rows(), expected_rows);
+
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i < 20")
+            .unwrap()
+            .set("category", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|index| index.name == "i_idx").unwrap();
+        assert_eq!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0],
+            "the address-domain index must not cover the rewritten fragment"
+        );
+
+        let after = dataset
+            .scan()
+            .filter(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(after.num_rows(), expected_rows);
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/8076
+    ///
+    /// A bloom filter index reports matches as physical row addresses. An update that
+    /// replaces every row of a fragment removes that fragment, but the index keeps the
+    /// addresses it holds for it, so translating its results to row ids has to tolerate
+    /// a fragment that is gone rather than fail with an internal error.
+    #[tokio::test]
+    async fn test_addr_domain_index_after_update_drops_fragment() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BloomFilter,
+                Some("i_idx".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Rewrites all of fragment 1 (rows 3, 4, 5), which drops the fragment.
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i >= 3")
+            .unwrap()
+            .set("i", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        assert!(dataset.get_fragments().iter().all(|frag| frag.id() != 1));
+
+        // The index still holds a block for the dropped fragment, and a bloom filter
+        // cannot rule out a value it once held, so this query is the one that reaches
+        // the index with addresses in that fragment.
+        let matched = dataset
+            .scan()
+            .filter("i = 4")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(matched.num_rows(), 0);
+
+        let updated = dataset
+            .scan()
+            .filter("i = -1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(updated.num_rows(), 3);
     }
 
     #[tokio::test]

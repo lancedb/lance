@@ -36,7 +36,7 @@ use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
-use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
+use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
@@ -609,6 +609,11 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     ivf: IvfModel,
 
     reader: FileReader,
+    /// Narrowed read of the index file, when the sub-index declares that
+    /// [`IvfSubIndex::load`] consumes only part of what it writes. `None` reads
+    /// every column. Built once here because it is fallible and only depends on
+    /// the file schema.
+    read_projection: Option<ReaderProjection>,
     sub_index_metadata: Vec<String>,
     storage: IvfQuantizationStorage<Q>,
 
@@ -649,6 +654,18 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
+    fn read_projection(reader: &FileReader) -> Result<Option<ReaderProjection>> {
+        S::read_columns()
+            .map(|columns| {
+                ReaderProjection::from_column_names(
+                    reader.metadata().version(),
+                    reader.schema(),
+                    columns,
+                )
+            })
+            .transpose()
+    }
+
     fn use_query_residual(
         storage: &IvfQuantizationStorage<Q>,
         distance_type: DistanceType,
@@ -1091,6 +1108,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         // cumulative stats are exactly the one-time index-open I/O.
         let open_io_stats = scheduler.stats();
 
+        let read_projection = Self::read_projection(&index_reader)?;
+
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),
@@ -1101,6 +1120,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             ivf,
             reader: index_reader,
+            read_projection,
             storage,
             sub_index_metadata,
             distance_type,
@@ -1125,11 +1145,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_cache: LanceCache,
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
-        Self {
+        let read_projection = Self::read_projection(&reader)?;
+        Ok(Self {
             uri,
             index_path,
             uuid,
@@ -1139,6 +1160,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             ivf,
             reader,
+            read_projection,
             storage,
             sub_index_metadata,
             distance_type,
@@ -1149,7 +1171,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
             _marker: PhantomData,
-        }
+        })
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -1205,7 +1227,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<PartitionEntry<S, Q>> {
-        let schema = Arc::new(self.reader.schema().as_ref().into());
+        // `concat_batches` indexes the batches by this schema's field positions
+        // without comparing the two, so the schema has to describe exactly what
+        // was read: the full file schema over a projected read would index past
+        // the last column.
+        let schema = Arc::new(match &self.read_projection {
+            Some(projection) => projection.schema.as_ref().into(),
+            None => self.reader.schema().as_ref().into(),
+        });
         let batch = match self.reader.metadata().num_rows {
             0 => RecordBatch::new_empty(schema),
             _ => {
@@ -1223,16 +1252,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                         }
                         None => Cow::Borrowed(&self.reader),
                     };
-                    let batches = reader
-                        .read_stream(
-                            ReadBatchParams::Range(row_range),
-                            u32::MAX,
-                            1,
-                            FilterExpression::no_filter(),
-                        )
-                        .await?
-                        .try_collect::<Vec<_>>()
-                        .await?;
+                    let params = ReadBatchParams::Range(row_range);
+                    let stream = match &self.read_projection {
+                        Some(projection) => {
+                            reader
+                                .read_stream_projected(
+                                    params,
+                                    u32::MAX,
+                                    1,
+                                    projection.clone(),
+                                    FilterExpression::no_filter(),
+                                )
+                                .await?
+                        }
+                        None => {
+                            reader
+                                .read_stream(params, u32::MAX, 1, FilterExpression::no_filter())
+                                .await?
+                        }
+                    };
+                    let batches = stream.try_collect::<Vec<_>>().await?;
                     concat_batches(&schema, batches.iter())?
                 }
             }
@@ -1982,7 +2021,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         index_cache,
         io_parallelism,
         rq_search_cache,
-    );
+    )?;
     Ok(Arc::new(index))
 }
 
@@ -2016,12 +2055,13 @@ mod tests {
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
     use lance_index::vector::storage::VectorStore;
+    use lance_index::vector::v3::subindex::IvfSubIndex;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::v2::{
-        IVFPartitionKey, IvfFlatIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
+        IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
     };
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
@@ -2037,17 +2077,18 @@ mod tests {
     use lance_core::{ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
-    use lance_file::writer::FileWriter;
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::FlatIndex;
+    use lance_index::vector::hnsw::HNSW;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
     use lance_index::vector::quantizer::QuantizerMetadata;
+    use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
@@ -4750,6 +4791,226 @@ mod tests {
         }
     }
 
+    // `lance-index` keeps these crate-private; spelling them out here also pins
+    // the on-disk names, which are part of the index file contract.
+    const HNSW_VECTOR_ID_COL: &str = "__vector_id";
+    const HNSW_NEIGHBORS_COL: &str = "__neighbors";
+
+    async fn build_ivf_hnsw_sq(test_uri: &str, nlist: usize) -> Dataset {
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(nlist),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        dataset
+    }
+
+    async fn open_ivf_hnsw_sq(dataset: &Dataset) -> Arc<dyn VectorIndex> {
+        let indices = dataset.load_indices().await.unwrap();
+        dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_hnsw_columns(dataset: &Dataset, context: &str) {
+        let index = open_ivf_hnsw_sq(dataset).await;
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<IvfHnswSqIndex>()
+            .expect("IVF_HNSW_SQ should open as IvfHnswSqIndex");
+
+        let written = hnsw
+            .reader
+            .schema()
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            written,
+            vec![HNSW_VECTOR_ID_COL, HNSW_NEIGHBORS_COL, DIST_COL],
+            "{context}: the written index file must keep every column"
+        );
+
+        // Every partition, not just the first: a projection that applied
+        // unevenly would leave the partition cache holding mixed schemas.
+        for partition_id in 0..hnsw.ivf.num_partitions() {
+            let entry = hnsw.load_partition_entry(partition_id, None).await.unwrap();
+            let loaded = entry.index.to_batch().unwrap();
+            let loaded_schema = loaded.schema();
+            let read = loaded_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                read,
+                vec![HNSW_VECTOR_ID_COL, HNSW_NEIGHBORS_COL],
+                "{context}: partition {partition_id} materialized the write-only distance column"
+            );
+        }
+    }
+
+    /// The index file keeps all three HNSW columns while a loaded partition
+    /// carries only the two the graph reads. Both halves matter: shrinking the
+    /// written schema would panic readers older than v8.0.0, and widening the
+    /// read back would undo the saving.
+    ///
+    /// Re-checked after a delta merge, because that is the one path that writes
+    /// a new index file while an already-projected index is open.
+    #[tokio::test]
+    async fn test_hnsw_partition_load_reads_only_graph_columns() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = build_ivf_hnsw_sq(test_dir.as_str(), 4).await;
+        assert_hnsw_columns(&dataset, "fresh index").await;
+
+        append_dataset::<Float32Type>(&mut dataset, 64, 0.0..1.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(10))
+            .await
+            .unwrap();
+        assert_hnsw_columns(&dataset, "after delta merge").await;
+    }
+
+    /// The saving is the point of the change, so pin it: reading a real
+    /// partition range through the declared projection must move strictly fewer
+    /// bytes than the full-schema read the index used to perform.
+    #[tokio::test]
+    async fn test_hnsw_read_projection_moves_fewer_bytes() {
+        use futures::TryStreamExt as _;
+
+        let test_dir = TempStrDir::default();
+        let dataset = build_ivf_hnsw_sq(test_dir.as_str(), 4).await;
+        let index = open_ivf_hnsw_sq(&dataset).await;
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<IvfHnswSqIndex>()
+            .expect("IVF_HNSW_SQ should open as IvfHnswSqIndex");
+
+        let projection = hnsw
+            .read_projection
+            .as_ref()
+            .expect("HNSW declares a read projection");
+        assert_eq!(projection.schema.fields.len(), 2);
+
+        let row_range = hnsw.ivf.row_range(0);
+        assert!(!row_range.is_empty(), "partition 0 should hold rows");
+        let store = dataset.object_store.as_ref();
+
+        let read_bytes_for = async |projection: lance_file::reader::ReaderProjection| {
+            let _ = store.io_stats_incremental();
+            hnsw.reader
+                .read_stream_projected(
+                    lance_io::ReadBatchParams::Range(row_range.clone()),
+                    u32::MAX,
+                    1,
+                    projection,
+                    lance_encoding::decoder::FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            store.io_stats_incremental().read_bytes
+        };
+
+        // Projected first on purpose: it then pays any first-touch metadata
+        // cost, so the comparison understates rather than flatters the saving.
+        let projected_bytes = read_bytes_for(projection.clone()).await;
+        let full_bytes = read_bytes_for(lance_file::reader::ReaderProjection::from_whole_schema(
+            hnsw.reader.schema(),
+            hnsw.reader.metadata().version(),
+        ))
+        .await;
+
+        assert!(
+            projected_bytes > 0,
+            "the projected read still has to fetch the graph"
+        );
+        assert_lt!(projected_bytes, full_bytes);
+    }
+
+    /// The projection selects columns by field id, and `__neighbors` and
+    /// `_distance` are both 4-byte-item lists whose child fields share a name,
+    /// so a wrong column index would reinterpret distances as neighbor ids with
+    /// no type error to catch it. Compare the columns themselves, not just names.
+    #[tokio::test]
+    async fn test_hnsw_projected_read_matches_full_read() {
+        use futures::TryStreamExt as _;
+
+        let test_dir = TempStrDir::default();
+        let dataset = build_ivf_hnsw_sq(test_dir.as_str(), 4).await;
+        let index = open_ivf_hnsw_sq(&dataset).await;
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<IvfHnswSqIndex>()
+            .expect("IVF_HNSW_SQ should open as IvfHnswSqIndex");
+        let projection = hnsw
+            .read_projection
+            .as_ref()
+            .expect("HNSW declares a read projection");
+
+        let read_range = async |proj: lance_file::reader::ReaderProjection,
+                                range: std::ops::Range<usize>| {
+            let batches = hnsw
+                .reader
+                .read_stream_projected(
+                    lance_io::ReadBatchParams::Range(range),
+                    u32::MAX,
+                    1,
+                    proj,
+                    lance_encoding::decoder::FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap()
+        };
+
+        let mut compared = 0;
+        for partition_id in 0..hnsw.ivf.num_partitions() {
+            let range = hnsw.ivf.row_range(partition_id);
+            if range.is_empty() {
+                continue;
+            }
+            let full = read_range(
+                lance_file::reader::ReaderProjection::from_whole_schema(
+                    hnsw.reader.schema(),
+                    hnsw.reader.metadata().version(),
+                ),
+                range.clone(),
+            )
+            .await;
+            let projected = read_range(projection.clone(), range).await;
+
+            assert_eq!(projected.num_columns(), 2);
+            assert_eq!(projected.num_rows(), full.num_rows());
+            for name in [HNSW_VECTOR_ID_COL, HNSW_NEIGHBORS_COL] {
+                assert_eq!(
+                    projected.column_by_name(name).unwrap(),
+                    full.column_by_name(name).unwrap(),
+                    "partition {partition_id}: {name} differs between the projected and full read"
+                );
+            }
+            compared += 1;
+        }
+        assert!(compared > 0, "no non-empty partition was compared");
+    }
+
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
         // we introduce XTR for performance, which would reduce the recall a little bit
         let recall_requirement = recall_requirement * 0.9;
@@ -5280,7 +5541,7 @@ mod tests {
         let batches = batches.try_collect::<Vec<_>>().await?;
         let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
         let new_aux_path = new_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut writer = FileWriter::try_new(
+        let mut writer = lance_file::versions::v2_1::create_writer(
             obj_store.create(&new_aux_path).await?,
             batch.schema_ref().as_ref().try_into()?,
             Default::default(),
@@ -6663,8 +6924,29 @@ mod tests {
     /// serializing cache backend, then query. Verifies that entries are
     /// serialized to bytes and that queries produce correct results after
     /// deserialization.
+    #[rstest]
+    #[case::ivf_pq(
+        VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        ),
+        <PartitionEntry<FlatIndex, ProductQuantizer> as CacheCodecImpl>::TYPE_ID
+    )]
+    #[case::ivf_hnsw_sq(
+        VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        ),
+        <PartitionEntry<HNSW, ScalarQuantizer> as CacheCodecImpl>::TYPE_ID
+    )]
     #[tokio::test]
-    async fn test_prewarm_and_query_with_serializing_backend() {
+    async fn test_prewarm_and_query_with_serializing_backend(
+        #[case] params: VectorIndexParams,
+        #[case] partition_type_id: &'static str,
+    ) {
         use crate::utils::test::serializing_cache::SerializingCacheBackend;
         use lance_io::assert_io_eq;
 
@@ -6673,11 +6955,6 @@ mod tests {
 
         // Create dataset with vector index using default cache
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            IvfBuildParams::new(4),
-            PQBuildParams::default(),
-        );
         dataset
             .create_index(
                 &["vector"],
@@ -6709,8 +6986,6 @@ mod tests {
         dataset.prewarm_index("serde_idx").await.unwrap();
         let serialized = backend.serialized_entry_count().await;
         let state_type_id = IvfStateEntryBox::TYPE_ID;
-        let partition_type_id =
-            <PartitionEntry<FlatIndex, ProductQuantizer> as CacheCodecImpl>::TYPE_ID;
         let state_inserts = backend.serialized_insert_count(state_type_id).await;
         let partition_inserts = backend.serialized_insert_count(partition_type_id).await;
         let passthrough = backend.l1_entry_count().await;

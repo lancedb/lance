@@ -31,7 +31,7 @@ use crate::versions::v1::reader::FileReader as V1Reader;
 use crate::versions::v1::writer::{
     FileWriter as V1Writer, FileWriterOptions as V1WriterOptions, NotSelfDescribing,
 };
-use crate::writer::{EncodedBatchWriteExt, FileWriterOptions};
+use crate::writer::FileWriterOptions;
 
 fn compatibility_fixture_batch() -> RecordBatch {
     let row_count = 4097;
@@ -293,7 +293,6 @@ async fn write_current_fixture(
 }
 
 async fn write_v2_0_embedded_fixtures(batch: &RecordBatch, schema: &LanceSchema) -> (Bytes, Bytes) {
-    let version = LanceFileVersion::from(ConcreteFileVersion::V2_0);
     let options = EncodingOptions {
         cache_bytes_per_column: 1,
         max_page_bytes: 1024,
@@ -311,8 +310,8 @@ async fn write_v2_0_embedded_fixtures(batch: &RecordBatch, schema: &LanceSchema)
     .unwrap();
 
     (
-        encoded_batch.try_to_self_described_lance(version).unwrap(),
-        encoded_batch.try_to_mini_lance(version).unwrap(),
+        versions::v2_0::encode_self_described_batch(&encoded_batch).unwrap(),
+        versions::v2_0::encode_mini_batch(&encoded_batch).unwrap(),
     )
 }
 
