@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
-use lance_core::Result;
 use lance_core::datatypes::{Field, NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::{Result, is_system_column};
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::FileReader;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -156,6 +156,20 @@ async fn plan_column_writes(
                     .into());
                 }
             }
+        }
+    }
+
+    // The system columns are virtual, injected into scan results at read time
+    // and never stored, so a stored column with one of those names commits and
+    // validates but then collides with the injected field and breaks
+    // projection. `new_column_schema` rejects them, but a caller can build a
+    // staging schema by hand, so the commit boundary must reject them too.
+    for field in &new_columns {
+        if is_system_column(&field.name) {
+            return Err(ColumnWriteError::ReservedColumnName {
+                name: field.name.clone(),
+            }
+            .into());
         }
     }
 

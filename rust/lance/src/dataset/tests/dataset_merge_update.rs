@@ -4295,26 +4295,6 @@ async fn test_merge_insert_target_all_bases() {
     }
 }
 
-/// Lance schema for new columns described by `column_arrow`, with fresh field
-/// ids (and parent links) assigned after the dataset's current max field id.
-fn new_columns_schema(dataset: &Dataset, column_arrow: &ArrowSchema) -> LanceSchema {
-    let mut merged = dataset.schema().merge(column_arrow).unwrap();
-    merged.set_field_id(Some(dataset.manifest.max_field_id()));
-    let new_names: HashSet<&str> = column_arrow
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-    LanceSchema {
-        fields: merged
-            .fields
-            .into_iter()
-            .filter(|f| new_names.contains(f.name.as_str()))
-            .collect(),
-        metadata: Default::default(),
-    }
-}
-
 /// Single-column ("id": Int32 1..=rows) dataset split at `max_rows_per_file`.
 async fn id_dataset(rows: i32, max_rows_per_file: usize) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -4353,18 +4333,15 @@ async fn stage_column(
         .unwrap()
 }
 
-/// Lance schema for new nullable Int32 columns with fresh sequential field ids.
+/// Staging schema for new nullable Int32 columns, numbered by the dataset.
 fn new_int32_columns_schema(dataset: &Dataset, names: &[&str]) -> LanceSchema {
     let fields: Vec<ArrowField> = names
         .iter()
         .map(|name| ArrowField::new(*name, DataType::Int32, true))
         .collect();
-    let mut schema = LanceSchema::try_from(&ArrowSchema::new(fields)).unwrap();
-    let base_id = dataset.manifest.max_field_id() + 1;
-    for (offset, field) in schema.fields.iter_mut().enumerate() {
-        field.id = base_id + offset as i32;
-    }
-    schema
+    dataset
+        .new_column_schema(&ArrowSchema::new(fields))
+        .unwrap()
 }
 
 /// The returned `DataReplacementGroup` must describe the staged file well
@@ -4674,7 +4651,7 @@ async fn test_write_commit_column_round_trip_schema_zoo(#[case] new_fields: Vec<
     assert_eq!(dataset.get_fragments().len(), 2);
 
     let column_arrow = Arc::new(ArrowSchema::new(new_fields));
-    let column_schema = new_columns_schema(&dataset, column_arrow.as_ref());
+    let column_schema = dataset.new_column_schema(column_arrow.as_ref()).unwrap();
 
     let mut expected = Vec::new();
     let mut replacements = Vec::new();
@@ -4840,7 +4817,7 @@ async fn test_commit_column_writes_nullable_struct_with_non_nullable_leaf_partia
         DataType::Struct(Fields::from(vec![leaf.clone()])),
         true,
     )]));
-    let column_schema = new_columns_schema(&dataset, column_arrow.as_ref());
+    let column_schema = dataset.new_column_schema(column_arrow.as_ref()).unwrap();
 
     let staged = RecordBatch::try_new(
         column_arrow.clone(),
@@ -4960,8 +4937,20 @@ async fn run_column_write_scenario(
     use roaring::RoaringBitmap;
 
     let base = id_dataset(rows, max_rows_per_file).await;
-    // Every staged column claims the same fresh id, whatever its name.
-    let field_id = base.manifest.max_field_id() + 1;
+    // The dataset numbers new columns, and every handle stages against the
+    // version as created, so each staged column lands on the same fresh id
+    // whatever it is named.
+    let numbering = base.clone();
+    let staging_schema = |column: &str| {
+        numbering
+            .new_column_schema(&ArrowSchema::new(vec![ArrowField::new(
+                column,
+                DataType::Int32,
+                nullable,
+            )]))
+            .unwrap()
+    };
+    let field_id = staging_schema("value").fields[0].id;
     let frag_ids: Vec<u64> = base.get_fragments().iter().map(|f| f.id() as u64).collect();
     let mut handles = vec![base];
     let mut staged: HashMap<usize, Vec<DataReplacementGroup>> = HashMap::new();
@@ -4980,13 +4969,12 @@ async fn run_column_write_scenario(
                 column,
                 values,
             } => {
+                let schema = staging_schema(column);
                 let arrow = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                     column,
                     DataType::Int32,
                     nullable,
                 )]));
-                let mut schema = LanceSchema::try_from(arrow.as_ref()).unwrap();
-                schema.fields[0].id = field_id;
                 let batch =
                     RecordBatch::try_new(arrow, vec![Arc::new(Int32Array::from(values))]).unwrap();
                 let replacement = handles[handle]
@@ -5238,4 +5226,150 @@ async fn test_commit_column_writes_rejects_stale_write_over_concurrent_overlay()
         Some(&[Some(30), Some(30)]),
     )
     .await;
+}
+
+/// However staging fails, it must leave no file behind. Such a file is
+/// unreferenced, so version cleanup reclaims it eventually, but a caller
+/// looping prepare/conflict/recompute would accumulate a full column copy per
+/// attempt until then.
+///
+/// The two cases fail at different points and are guarded differently. A
+/// stream that errors never reaches `finish`, so no object is published and
+/// there is nothing to delete -- this pins that, since a writer that started
+/// publishing eagerly would begin leaking. A row-count mismatch is rejected
+/// after `finish` has published the file, so that one is deleted explicitly.
+#[rstest]
+#[case::stream_error(true)]
+#[case::row_count_mismatch(false)]
+#[tokio::test]
+async fn test_write_fragment_column_deletes_its_file_when_staging_fails(
+    #[case] stream_error: bool,
+) {
+    let dataset = id_dataset(2, 1024).await;
+    let data_dir = dataset.data_dir();
+    let before = dataset
+        .object_store
+        .read_dir(data_dir.clone())
+        .await
+        .unwrap();
+
+    let column_schema = new_int32_columns_schema(&dataset, &["value"]);
+    let fragment_id = dataset.get_fragments()[0].id() as u64;
+    let batches: Vec<Result<RecordBatch, Error>> = if stream_error {
+        vec![Err(Error::invalid_input("stream blew up".to_string()))]
+    } else {
+        // One row short of the fragment's two physical rows.
+        vec![Ok(
+            arrow_array::record_batch!(("value", Int32, [7])).unwrap()
+        )]
+    };
+    dataset
+        .write_fragment_column(fragment_id, futures::stream::iter(batches), &column_schema)
+        .await
+        .unwrap_err();
+
+    let after = dataset.object_store.read_dir(data_dir).await.unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "staging left a file behind: {:?}",
+        after
+    );
+}
+
+/// `new_column_schema` numbers a new column above the dataset's current
+/// maximum, nested children included, which is what `commit_column_writes`
+/// requires of a column that does not exist yet.
+#[tokio::test]
+async fn test_new_column_schema_numbers_fields_above_dataset_max() {
+    let dataset = id_dataset(2, 1024).await;
+    let max_before = dataset.manifest.max_field_id();
+
+    let arrow = ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        DataType::Struct(Fields::from(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("y", DataType::Utf8, true),
+        ])),
+        true,
+    )]);
+    let schema = dataset.new_column_schema(&arrow).unwrap();
+
+    assert_eq!(schema.fields.len(), 1);
+    let mut ids = vec![schema.fields[0].id];
+    ids.extend(schema.fields[0].children.iter().map(|c| c.id));
+    assert_eq!(ids.len(), 3, "parent and both children must be numbered");
+    assert!(
+        ids.iter().all(|id| *id > max_before),
+        "ids {ids:?} must sit above the dataset max {max_before}"
+    );
+}
+
+/// Numbering a column that already exists would give it a fresh id and stage
+/// bytes the commit cannot match to the live field, so it is rejected and the
+/// caller is pointed at the dataset schema instead.
+#[tokio::test]
+async fn test_new_column_schema_rejects_an_existing_column() {
+    let dataset = id_dataset(2, 1024).await;
+    let arrow = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, true)]);
+
+    let error = dataset.new_column_schema(&arrow).unwrap_err();
+    assert!(matches!(
+        ColumnWriteError::of(&error),
+        Some(ColumnWriteError::ColumnAlreadyExists { .. })
+    ));
+}
+
+/// The system columns are virtual: the scanner injects them at read time, so a
+/// stored column with one of those names commits and passes `validate`, and
+/// only fails later when a projection sees two fields of that name. Staging
+/// must refuse them up front.
+#[rstest]
+#[case::row_id(ROW_ID)]
+#[case::row_addr(ROW_ADDR)]
+#[tokio::test]
+async fn test_new_column_schema_rejects_reserved_system_columns(#[case] reserved: &str) {
+    let dataset = id_dataset(2, 1024).await;
+    let arrow = ArrowSchema::new(vec![ArrowField::new(reserved, DataType::Int32, true)]);
+
+    let error = dataset.new_column_schema(&arrow).unwrap_err();
+    assert!(matches!(
+        ColumnWriteError::of(&error),
+        Some(ColumnWriteError::ReservedColumnName { .. })
+    ));
+}
+
+/// The commit boundary has to reject reserved names too. A caller can build a
+/// staging schema by hand and never call `new_column_schema`, so the guard
+/// there alone would leave the collision reachable.
+#[tokio::test]
+async fn test_commit_column_writes_rejects_hand_built_reserved_column() {
+    let mut dataset = id_dataset(2, 1024).await;
+
+    // Bypass new_column_schema entirely, the way a caller assembling its own
+    // staging schema would.
+    let arrow = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        ROW_ID,
+        DataType::Int32,
+        true,
+    )]));
+    let mut column_schema = LanceSchema::try_from(arrow.as_ref()).unwrap();
+    column_schema.fields[0].id = dataset.manifest.max_field_id() + 1;
+
+    let staged = RecordBatch::try_new(arrow, vec![Arc::new(Int32Array::from(vec![7, 8]))]).unwrap();
+    let fragment_id = dataset.get_fragments()[0].id() as u64;
+    let replacement = stage_column(&dataset, fragment_id, staged, &column_schema).await;
+
+    let error = dataset
+        .commit_column_writes(vec![replacement], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        ColumnWriteError::of(&error),
+        Some(ColumnWriteError::ReservedColumnName { .. })
+    ));
+
+    // The reserved name still projects, which is what the collision broke.
+    dataset.checkout_latest().await.unwrap();
+    assert!(dataset.scan().project(&[ROW_ID]).is_ok());
 }

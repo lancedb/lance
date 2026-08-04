@@ -25,6 +25,15 @@ pub enum ColumnWriteError {
     FragmentNotFound { fragment_id: u64 },
 
     #[snafu(display(
+        "column '{name}' already exists; project it out of the dataset schema to rewrite it \
+         rather than numbering it as a new column"
+    ))]
+    ColumnAlreadyExists { name: String },
+
+    #[snafu(display("column '{name}' is a reserved name and cannot be used in a Lance dataset"))]
+    ReservedColumnName { name: String },
+
+    #[snafu(display(
         "column data for fragment {fragment_id} has {staged_rows} rows but the fragment has \
          {physical_rows} physical rows"
     ))]

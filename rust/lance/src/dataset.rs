@@ -5,7 +5,7 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
@@ -3572,6 +3572,16 @@ impl Dataset {
     /// The staged file records `schema` and the dataset version it was
     /// prepared against; committing validates against that record, not
     /// caller-supplied copies.
+    ///
+    /// Use [`Self::new_column_schema`] to build `schema` for a column that
+    /// does not exist yet; to rewrite one that does, project the field out of
+    /// [`Self::schema`] so it keeps its committed id and contract.
+    ///
+    /// A staged file that is never committed -- because staging failed, or
+    /// because the caller abandoned the write -- is unreferenced by any
+    /// manifest, so `cleanup_old_versions` reclaims it once it ages past the
+    /// unverified-file threshold. Staging failures delete their own file
+    /// immediately rather than waiting for that.
     pub async fn write_fragment_column(
         &self,
         fragment_id: u64,
@@ -3586,10 +3596,37 @@ impl Dataset {
         let file_name = format!("{}.lance", fragment::write::generate_random_filename());
         let path = self.data_dir().join(file_name.as_str());
 
+        match self
+            .stage_column_file(&path, &file_name, fragment_id, expected_rows, data, schema)
+            .await
+        {
+            Ok(data_file) => Ok(transaction::DataReplacementGroup(fragment_id, data_file)),
+            Err(error) => {
+                // Best effort: a write that never finished may have produced
+                // no object at all, and whatever does survive is unreferenced,
+                // so version cleanup reclaims it either way.
+                let _ = self.object_store.delete(&path).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Write one fragment's column data as a standalone file at `path`,
+    /// leaving the file in place for [`Self::write_fragment_column`] to
+    /// discard if anything here fails.
+    async fn stage_column_file(
+        &self,
+        path: &Path,
+        file_name: &str,
+        fragment_id: u64,
+        expected_rows: u64,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Result<DataFile> {
         let file_version =
             ConcreteFileVersion::from(self.manifest.data_storage_format.lance_file_version()?);
 
-        let writer = self.object_store.create(&path).await?;
+        let writer = self.object_store.create(path).await?;
         let mut file_writer = lance_file::versions::create_writer(
             file_version,
             writer,
@@ -3609,9 +3646,6 @@ impl Dataset {
         let field_id_mapping = file_writer.field_id_to_column_indices().to_vec();
         let summary = file_writer.finish().await?;
         if summary.num_rows != expected_rows {
-            if let Err(delete_error) = self.object_store.delete(&path).await {
-                log::warn!("failed to delete staged column file '{path}': {delete_error}");
-            }
             return Err(ColumnWriteError::RowCountMismatch {
                 fragment_id,
                 staged_rows: summary.num_rows,
@@ -3630,17 +3664,65 @@ impl Dataset {
 
         let (major, minor) = file_version.to_data_file_numbers();
 
-        let data_file = DataFile {
-            path: file_name,
+        Ok(DataFile {
+            path: file_name.to_string(),
             fields: field_ids.into(),
             column_indices: column_indices.into(),
             file_major_version: major,
             file_minor_version: minor,
             file_size_bytes: CachedFileSize::new(summary.size_bytes),
             base_id: None,
-        };
+        })
+    }
 
-        Ok(transaction::DataReplacementGroup(fragment_id, data_file))
+    /// Build the schema for staging columns that do not exist in this dataset
+    /// yet, for [`Self::write_fragment_column`].
+    ///
+    /// Field ids are assigned above the dataset's current maximum, nested
+    /// children included, which is the numbering
+    /// [`Self::commit_column_writes`] requires of a new column. Build the
+    /// schema once and stage the same one for every fragment of a column
+    /// write, so all its files agree on the ids.
+    ///
+    /// Rewriting a column that already exists is a different operation: the
+    /// staged file must carry that field's committed id, name, type and
+    /// nullability, so project it out of [`Self::schema`] rather than
+    /// numbering it here. Naming an existing column is therefore an error, as
+    /// is naming a reserved system column.
+    pub fn new_column_schema(
+        &self,
+        columns: &ArrowSchema,
+    ) -> Result<lance_core::datatypes::Schema> {
+        for field in columns.fields() {
+            // The system columns are virtual: they are injected into scan
+            // results at read time and never stored. A stored column sharing
+            // one of those names commits and validates, but then collides
+            // with the injected field and makes projection fail.
+            if lance_core::is_system_column(field.name()) {
+                return Err(ColumnWriteError::ReservedColumnName {
+                    name: field.name().clone(),
+                }
+                .into());
+            }
+            if self.schema().field(field.name()).is_some() {
+                return Err(ColumnWriteError::ColumnAlreadyExists {
+                    name: field.name().clone(),
+                }
+                .into());
+            }
+        }
+        let mut merged = self.schema().merge(columns)?;
+        merged.set_field_id(Some(self.manifest.max_field_id()));
+        let new_names: HashSet<&str> = columns
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        merged
+            .fields
+            .retain(|f| new_names.contains(f.name.as_str()));
+        merged.metadata = Default::default();
+        Ok(merged)
     }
 
     /// Commit per-fragment column writes from [`Self::write_fragment_column`]
