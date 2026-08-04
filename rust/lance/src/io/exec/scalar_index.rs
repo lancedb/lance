@@ -652,6 +652,8 @@ impl ExecutionPlan for MapIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        // Cross-batch deduplication retains every emitted candidate until the
+        // stream ends, so this state is not covered by per-batch reservations.
         let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
             .register(context.memory_pool());
         let input = self.input.execute(partition, context)?;
