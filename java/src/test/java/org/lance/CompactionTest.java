@@ -49,11 +49,18 @@ public class CompactionTest {
       testDataset.write(1, 10).close();
       try (Dataset dataset = testDataset.write(2, 10)) {
         CompactionOptions compactionOptions =
-            CompactionOptions.builder().withTargetRowsPerFragment(100).withNumThreads(1).build();
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withNumThreads(1)
+                .withMaxSourceBytes(Long.MAX_VALUE)
+                .build();
         CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
 
         // will plan to compact two fragments into one.
         assertEquals(1, compactionPlan.getCompactionTasks().size());
+        assertEquals(
+            Long.MAX_VALUE,
+            compactionPlan.getCompactionOptions().getMaxSourceBytes().orElseThrow());
         CompactionTask task = compactionPlan.getCompactionTasks().get(0);
         assertEquals(2, task.getTaskData().getFragments().size());
 

@@ -46,6 +46,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
     max_source_fragments: JObject,            // Optional<Long>
+    max_source_bytes: JObject,                // Optional<Long>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -62,7 +63,8 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             defer_index_remap,
             compaction_mode,
             binary_copy_read_batch_bytes,
-            max_source_fragments
+            max_source_fragments,
+            max_source_bytes
         ),
         JObject::null()
     )
@@ -83,6 +85,7 @@ fn inner_plan_compaction<'local>(
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
     max_source_fragments: JObject,            // Optional<Long>
+    max_source_bytes: JObject,                // Optional<Long>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -102,6 +105,7 @@ fn inner_plan_compaction<'local>(
         &compaction_mode,
         &binary_copy_read_batch_bytes,
         &max_source_fragments,
+        Some(&max_source_bytes),
         &config,
     )?;
 
@@ -188,6 +192,7 @@ fn inner_commit_compaction<'local>(
         &compaction_mode,
         &binary_copy_read_batch_bytes,
         &max_source_fragments,
+        None,
         &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -286,6 +291,7 @@ fn inner_execute_task<'local>(
         &compaction_mode,
         &binary_copy_read_batch_bytes,
         &max_source_fragments,
+        None,
         &config,
     )?;
     let compaction_task = CompactionTask {
@@ -312,7 +318,7 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -377,6 +383,19 @@ impl IntoJava for &CompactionOptions {
         let max_source_fragments =
             to_java_long_obj(env, self.max_source_fragments.map(|v| v as i64))?;
         let max_source_fragments_opt = to_java_optional(env, max_source_fragments)?;
+        let max_source_bytes = self
+            .max_source_bytes
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    crate::error::Error::runtime_error(format!(
+                        "max_source_bytes {} exceeds Java Long.MAX_VALUE",
+                        value
+                    ))
+                })
+            })
+            .transpose()?;
+        let max_source_bytes = to_java_long_obj(env, max_source_bytes)?;
+        let max_source_bytes_opt = to_java_optional(env, max_source_bytes)?;
 
         Ok(env.new_object(
             COMPACTION_OPTIONS_CLASS,
@@ -393,6 +412,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&compaction_mode_opt),
                 JValueGen::Object(&binary_copy_read_batch_bytes_opt),
                 JValueGen::Object(&max_source_fragments_opt),
+                JValueGen::Object(&max_source_bytes_opt),
             ],
         )?)
     }

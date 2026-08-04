@@ -1710,6 +1710,7 @@ public class DatasetTest {
                 .withNumThreads(1)
                 .withBatchSize(5)
                 .withDeferIndexRemap(false)
+                .withMaxSourceBytes(1024 * 1024)
                 .build();
 
         dataset2.compact(allOptions);
@@ -1734,6 +1735,7 @@ public class DatasetTest {
         assertTrue(allOptions.getBatchSize().isPresent());
         assertEquals(5, allOptions.getBatchSize().get().intValue());
         assertFalse(allOptions.getDeferIndexRemap().get());
+        assertEquals(1024 * 1024, allOptions.getMaxSourceBytes().get().intValue());
       }
     }
   }

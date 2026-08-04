@@ -40,6 +40,7 @@ public class CompactionOptions implements Serializable {
   private Optional<CompactionMode> compactionMode;
   private Optional<Long> binaryCopyReadBatchBytes;
   private Optional<Long> maxSourceFragments;
+  private Optional<Long> maxSourceBytes;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -52,7 +53,8 @@ public class CompactionOptions implements Serializable {
       Optional<Boolean> deferIndexRemap,
       Optional<CompactionMode> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
-      Optional<Long> maxSourceFragments) {
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceBytes) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -64,6 +66,7 @@ public class CompactionOptions implements Serializable {
     this.compactionMode = compactionMode;
     this.binaryCopyReadBatchBytes = binaryCopyReadBatchBytes;
     this.maxSourceFragments = maxSourceFragments;
+    this.maxSourceBytes = maxSourceBytes;
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -81,6 +84,10 @@ public class CompactionOptions implements Serializable {
 
   public Optional<Long> getMaxSourceFragments() {
     return maxSourceFragments;
+  }
+
+  public Optional<Long> getMaxSourceBytes() {
+    return maxSourceBytes;
   }
 
   public Optional<Boolean> getMaterializeDeletions() {
@@ -129,6 +136,7 @@ public class CompactionOptions implements Serializable {
         .add("compactionMode", compactionMode.orElse(null))
         .add("binaryCopyReadBatchBytes", binaryCopyReadBatchBytes.orElse(null))
         .add("maxSourceFragments", maxSourceFragments.orElse(null))
+        .add("maxSourceBytes", maxSourceBytes.orElse(null))
         .toString();
   }
 
@@ -144,6 +152,7 @@ public class CompactionOptions implements Serializable {
     output.writeObject(compactionMode.map(CompactionMode::getValue).orElse(null));
     output.writeObject(binaryCopyReadBatchBytes.orElse(null));
     output.writeObject(maxSourceFragments.orElse(null));
+    output.writeObject(maxSourceBytes.orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -167,6 +176,7 @@ public class CompactionOptions implements Serializable {
     }
     this.binaryCopyReadBatchBytes = Optional.ofNullable((Long) input.readObject());
     this.maxSourceFragments = Optional.ofNullable((Long) input.readObject());
+    this.maxSourceBytes = Optional.ofNullable((Long) input.readObject());
   }
 
   /** Builder for CompactionOptions. */
@@ -182,6 +192,7 @@ public class CompactionOptions implements Serializable {
     private Optional<CompactionMode> compactionMode = Optional.empty();
     private Optional<Long> binaryCopyReadBatchBytes = Optional.empty();
     private Optional<Long> maxSourceFragments = Optional.empty();
+    private Optional<Long> maxSourceBytes = Optional.empty();
 
     private Builder() {}
 
@@ -245,6 +256,19 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
+    /**
+     * Maximum physical size of source data files in one compaction task. Candidate fragments are
+     * split at fragment boundaries so tasks stay within this limit whenever possible. A single
+     * oversized fragment, or the minimum group needed for compaction to make progress, may exceed
+     * it. The size includes base and overlay data files, but excludes deletion files and indices.
+     * This option is not supported for datasets with blob v2 columns because blob sidecar sizes are
+     * not recorded in the manifest.
+     */
+    public Builder withMaxSourceBytes(long maxSourceBytes) {
+      this.maxSourceBytes = Optional.of(maxSourceBytes);
+      return this;
+    }
+
     public CompactionOptions build() {
       return new CompactionOptions(
           targetRowsPerFragment,
@@ -257,7 +281,8 @@ public class CompactionOptions implements Serializable {
           deferIndexRemap,
           compactionMode,
           binaryCopyReadBatchBytes,
-          maxSourceFragments);
+          maxSourceFragments,
+          maxSourceBytes);
     }
   }
 }

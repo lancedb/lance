@@ -84,6 +84,7 @@ use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::num::NonZero;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
 
@@ -116,7 +117,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::{DataFile, Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -262,6 +263,16 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
+    /// Maximum physical size in bytes of source data files in one compaction
+    /// task. Candidate fragments are split at fragment boundaries so tasks stay
+    /// within this limit whenever possible. A single oversized fragment, or the
+    /// minimum group needed for compaction to make progress, may exceed it. The
+    /// size includes base and overlay data files, but excludes deletion files and
+    /// indices. This option is not supported for datasets with blob v2 columns
+    /// because blob sidecar sizes are not recorded in the manifest.
+    ///
+    /// Defaults to `None` (task formation is based on rows only).
+    pub max_source_bytes: Option<u64>,
     /// Maximum number of data overlay files a fragment may carry before it is
     /// fully compacted. When set, any fragment with more than this many overlays
     /// is rewritten into a fresh fragment with its overlays (and deletions)
@@ -300,6 +311,7 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
+            max_source_bytes: None,
             max_overlays_per_fragment: Some(10),
             transaction_properties: None,
         }
@@ -327,6 +339,7 @@ impl CompactionOptions {
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
+    /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
@@ -432,6 +445,14 @@ impl CompactionOptions {
                 }
                 "max_source_fragments" => {
                     self.max_source_fragments = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "max_source_bytes" => {
+                    self.max_source_bytes = Some(value.parse().map_err(|_| {
                         Error::invalid_input(format!(
                             "Invalid value for {}: '{}' (expected a non-negative integer)",
                             key, value
@@ -701,6 +722,18 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             ));
         }
 
+        if self.options.max_source_bytes.is_some()
+            && dataset
+                .schema()
+                .fields_pre_order()
+                .any(|field| field.is_blob_v2())
+        {
+            return Err(Error::not_supported(
+                "max_source_bytes is not supported for datasets with blob v2 columns because blob sidecar sizes are not recorded in the manifest"
+                    .to_string(),
+            ));
+        }
+
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
         let fragments = dataset.get_fragments();
@@ -806,27 +839,25 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let all_tasks: Vec<TaskData> = candidate_bins
-            .into_iter()
-            .filter(|bin| !bin.is_noop())
-            .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
-            .map(|bin| TaskData {
-                fragments: bin.fragments,
-            })
-            .collect();
+        let mut all_tasks = Vec::new();
+        for bin in candidate_bins.into_iter().filter(|bin| !bin.is_noop()) {
+            let source_size_bins = if let Some(max_source_bytes) = self.options.max_source_bytes {
+                let source_bytes = source_bytes_by_fragment(dataset, &bin.fragments).await?;
+                bin.split_for_source_bytes(max_source_bytes, &source_bytes)?
+            } else {
+                vec![bin]
+            };
+            all_tasks.extend(
+                source_size_bins
+                    .into_iter()
+                    .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
+                    .map(|bin| TaskData {
+                        fragments: bin.fragments,
+                    }),
+            );
+        }
 
-        let tasks = if let Some(max_frags) = self.options.max_source_fragments {
-            let mut total_frags = 0;
-            all_tasks
-                .into_iter()
-                .take_while(|task| {
-                    total_frags += task.fragments.len();
-                    total_frags <= max_frags
-                })
-                .collect()
-        } else {
-            all_tasks
-        };
+        let tasks = limit_tasks_by_source_fragments(all_tasks, &self.options)?;
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
@@ -834,6 +865,132 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         Ok(compaction_plan)
     }
+}
+
+async fn data_file_size_bytes(dataset: &Dataset, data_file: &DataFile) -> Result<u64> {
+    if let Some(size) = data_file.file_size_bytes.get() {
+        return Ok(size.get());
+    }
+
+    let object_store = dataset.object_store_for_data_file(data_file).await?;
+    let data_dir = dataset.data_file_dir_for_base(data_file.base_id)?;
+    let path = data_dir.join(data_file.path.as_str());
+    let size = object_store.size(&path).await?;
+    let size = NonZero::new(size).ok_or_else(|| {
+        Error::internal(format!(
+            "Source data file '{}' has size 0 while planning compaction",
+            path
+        ))
+    })?;
+    data_file.file_size_bytes.set(size);
+    Ok(size.get())
+}
+
+async fn source_bytes_by_fragment(dataset: &Dataset, fragments: &[Fragment]) -> Result<Vec<u64>> {
+    let num_data_files = fragments
+        .iter()
+        .try_fold(0_usize, |total, fragment| {
+            total
+                .checked_add(fragment.files.len())?
+                .checked_add(fragment.overlays.len())
+        })
+        .ok_or_else(|| {
+            Error::internal("Source data file count overflowed usize while planning compaction")
+        })?;
+    let mut unknown_data_files = Vec::with_capacity(num_data_files);
+    for fragment in fragments {
+        for data_file in fragment
+            .files
+            .iter()
+            .chain(fragment.overlays.iter().map(|overlay| &overlay.data_file))
+        {
+            if data_file.file_size_bytes.get().is_none() {
+                unknown_data_files.push(data_file);
+            }
+        }
+    }
+
+    let mut unknown_data_files = unknown_data_files.into_iter();
+    let mut sizes = futures::stream::FuturesUnordered::new();
+    let size_parallelism = dataset.object_store.as_ref().io_parallelism().max(1);
+    for _ in 0..size_parallelism {
+        if let Some(data_file) = unknown_data_files.next() {
+            sizes.push(data_file_size_bytes(dataset, data_file));
+        } else {
+            break;
+        }
+    }
+    while sizes.try_next().await?.is_some() {
+        if let Some(data_file) = unknown_data_files.next() {
+            sizes.push(data_file_size_bytes(dataset, data_file));
+        }
+    }
+
+    fragments
+        .iter()
+        .map(|fragment| {
+            fragment
+                .files
+                .iter()
+                .chain(fragment.overlays.iter().map(|overlay| &overlay.data_file))
+                .try_fold(0_u64, |total, data_file| {
+                    let size = data_file.file_size_bytes.get().ok_or_else(|| {
+                        Error::internal(format!(
+                            "Source data file '{}' still has unknown size after metadata lookup",
+                            data_file.path
+                        ))
+                    })?;
+                    total.checked_add(size.get()).ok_or_else(|| {
+                        Error::internal(
+                            "Source data file sizes overflowed u64 while planning compaction",
+                        )
+                    })
+                })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+async fn task_source_bytes(dataset: &Dataset, task: &TaskData) -> Result<u64> {
+    source_bytes_by_fragment(dataset, &task.fragments)
+        .await?
+        .into_iter()
+        .try_fold(0_u64, |total, size| {
+            total.checked_add(size).ok_or_else(|| {
+                Error::internal("Source data file sizes overflowed u64 while planning compaction")
+            })
+        })
+}
+
+fn limit_tasks_by_source_fragments(
+    all_tasks: Vec<TaskData>,
+    options: &CompactionOptions,
+) -> Result<Vec<TaskData>> {
+    if options.max_source_fragments.is_none() {
+        return Ok(all_tasks);
+    }
+
+    let mut tasks = Vec::with_capacity(all_tasks.len());
+    let mut total_fragments = 0_usize;
+
+    for task in all_tasks {
+        let next_total_fragments = total_fragments
+            .checked_add(task.fragments.len())
+            .ok_or_else(|| {
+                Error::internal("Source fragment count overflowed usize while planning compaction")
+            })?;
+        if options
+            .max_source_fragments
+            .is_some_and(|max| next_total_fragments > max)
+        {
+            break;
+        }
+
+        total_fragments = next_total_fragments;
+        tasks.push(task);
+    }
+
+    Ok(tasks)
 }
 
 /// Compacts the files in the dataset without reordering them.
@@ -1464,6 +1621,66 @@ impl CandidateBin {
             }
         }
 
+        self.split_at_lengths(split_lengths)
+    }
+
+    /// Split at fragment boundaries so each useful bin stays within the source
+    /// byte limit whenever possible. A single oversized fragment, or the minimum
+    /// group needed to avoid a no-op, remains together so compaction can make
+    /// progress.
+    fn split_for_source_bytes(
+        self,
+        max_source_bytes: u64,
+        source_bytes: &[u64],
+    ) -> Result<Vec<Self>> {
+        if source_bytes.len() != self.fragments.len() {
+            return Err(Error::internal(format!(
+                "Source byte count length {} did not match candidate fragment count {}",
+                source_bytes.len(),
+                self.fragments.len()
+            )));
+        }
+
+        let mut split_lengths = Vec::new();
+        let mut current_start = 0_usize;
+        let mut current_len = 0_usize;
+        let mut current_bytes = 0_u64;
+
+        for source_bytes in source_bytes {
+            let next_bytes = current_bytes.checked_add(*source_bytes).ok_or_else(|| {
+                Error::internal("Source data file sizes overflowed u64 while planning compaction")
+            })?;
+            let current_is_noop = current_len == 1
+                && matches!(
+                    self.candidacy[current_start],
+                    CompactionCandidacy::CompactWithNeighbors
+                );
+            if current_len > 0 && next_bytes > max_source_bytes && !current_is_noop {
+                split_lengths.push(current_len);
+                current_start += current_len;
+                current_len = 0;
+                current_bytes = 0;
+            }
+
+            current_bytes = current_bytes.checked_add(*source_bytes).ok_or_else(|| {
+                Error::internal("Source data file sizes overflowed u64 while planning compaction")
+            })?;
+            current_len += 1;
+        }
+
+        let remainder_is_noop = current_len == 1
+            && matches!(
+                self.candidacy[current_start],
+                CompactionCandidacy::CompactWithNeighbors
+            );
+        if remainder_is_noop {
+            split_lengths.pop();
+        }
+
+        Ok(self.split_at_lengths(split_lengths))
+    }
+
+    fn split_at_lengths(self, split_lengths: Vec<usize>) -> Vec<Self> {
         if split_lengths.is_empty() {
             return vec![self];
         }
@@ -2378,7 +2595,7 @@ mod tests {
         assert!(!single_bin.is_noop());
 
         let big_bin = CandidateBin {
-            fragments: std::iter::repeat_n(fragment, 8).collect(),
+            fragments: std::iter::repeat_n(fragment.clone(), 8).collect(),
             pos_range: 0..8,
             candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 8).collect(),
             row_counts: vec![100, 400, 200, 200, 400, 300, 300, 100],
@@ -2419,6 +2636,48 @@ mod tests {
         assert_eq!(split[0].pos_range, 0..1);
         assert_eq!(split[1].pos_range, 1..2);
         assert_eq!(split[2].pos_range, 2..3);
+
+        let byte_split_bin = CandidateBin {
+            fragments: std::iter::repeat_n(fragment.clone(), 6).collect(),
+            pos_range: 0..6,
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactWithNeighbors, 6).collect(),
+            row_counts: vec![100; 6],
+            indices: vec![],
+        };
+        let split = byte_split_bin
+            .split_for_source_bytes(100, &[80, 20, 90, 10, 60, 40])
+            .unwrap();
+        assert_eq!(split.len(), 3);
+        assert_eq!(split[0].pos_range, 0..2);
+        assert_eq!(split[1].pos_range, 2..4);
+        assert_eq!(split[2].pos_range, 4..6);
+
+        let oversized_bin = CandidateBin {
+            fragments: std::iter::repeat_n(fragment.clone(), 2).collect(),
+            pos_range: 0..2,
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 2).collect(),
+            row_counts: vec![100; 2],
+            indices: vec![],
+        };
+        let split = oversized_bin
+            .split_for_source_bytes(100, &[150, 40])
+            .unwrap();
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].pos_range, 0..1);
+        assert_eq!(split[1].pos_range, 1..2);
+
+        let minimum_useful_bin = CandidateBin {
+            fragments: std::iter::repeat_n(fragment, 2).collect(),
+            pos_range: 0..2,
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactWithNeighbors, 2).collect(),
+            row_counts: vec![100; 2],
+            indices: vec![],
+        };
+        let split = minimum_useful_bin
+            .split_for_source_bytes(100, &[80, 80])
+            .unwrap();
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].pos_range, 0..2);
     }
 
     fn sample_data() -> RecordBatch {
@@ -6755,6 +7014,10 @@ mod tests {
                 "lance.compaction.index_remap_mode".to_string(),
                 "compact".to_string(),
             ),
+            (
+                "lance.compaction.max_source_bytes".to_string(),
+                "10737418240".to_string(),
+            ),
         ]);
 
         let opts = CompactionOptions::from_dataset_config(&config).unwrap();
@@ -6768,6 +7031,7 @@ mod tests {
         assert_eq!(opts.io_buffer_size, Some(1_073_741_824));
         assert_eq!(opts.compaction_mode, Some(CompactionMode::TryBinaryCopy));
         assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
+        assert_eq!(opts.max_source_bytes, Some(10_737_418_240));
         // A non-default value proves the config string was actually parsed.
         assert_eq!(opts.index_remap_mode, IndexRemapMode::Compact);
     }
@@ -6793,6 +7057,7 @@ mod tests {
         assert_eq!(opts.index_remap_mode, IndexRemapMode::Direct);
         assert_eq!(opts.batch_size, defaults.batch_size);
         assert_eq!(opts.compaction_mode, defaults.compaction_mode);
+        assert_eq!(opts.max_source_bytes, defaults.max_source_bytes);
         assert_eq!(
             opts.binary_copy_read_batch_bytes,
             defaults.binary_copy_read_batch_bytes
@@ -6955,7 +7220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_source_fragments() {
+    async fn test_max_source_limits() {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -7003,6 +7268,112 @@ mod tests {
             "need multiple tasks to test bounding, got {}",
             plan_all.num_tasks()
         );
+
+        let first_task_bytes = task_source_bytes(&dataset, &plan_all.tasks()[0])
+            .await
+            .unwrap();
+        assert!(first_task_bytes > 0);
+
+        let mut task_with_overlay = plan_all.tasks()[0].clone();
+        let overlay_data_file = task_with_overlay.fragments[0].files[0].clone();
+        let overlay_bytes = overlay_data_file.file_size_bytes.get().unwrap().get();
+        task_with_overlay.fragments[0]
+            .overlays
+            .push(DataOverlayFile {
+                data_file: overlay_data_file,
+                coverage: OverlayCoverage::dense(RoaringBitmap::new()),
+                committed_version: dataset.version().version,
+            });
+        assert_eq!(
+            task_source_bytes(&dataset, &task_with_overlay)
+                .await
+                .unwrap(),
+            first_task_bytes + overlay_bytes
+        );
+
+        let all_source_fragments = plan_all
+            .tasks()
+            .iter()
+            .flat_map(|task| task.fragments.iter().cloned())
+            .collect::<Vec<_>>();
+        let source_bytes = source_bytes_by_fragment(&dataset, &all_source_fragments)
+            .await
+            .unwrap();
+        let two_fragment_bytes = source_bytes[0] + source_bytes[1];
+
+        // The byte limit participates in task formation instead of truncating
+        // the plan. All eligible fragments remain covered by smaller tasks.
+        let opts_bytes_bounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_bytes: Some(two_fragment_bytes),
+            ..Default::default()
+        };
+        let plan_bytes_bounded = plan_compaction(&dataset, &opts_bytes_bounded)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan_bytes_bounded
+                .tasks()
+                .iter()
+                .map(|task| task.fragments.len())
+                .sum::<usize>(),
+            10
+        );
+        assert!(plan_bytes_bounded.num_tasks() > plan_all.num_tasks());
+        for task in plan_bytes_bounded.tasks() {
+            assert!(task_source_bytes(&dataset, task).await.unwrap() <= two_fragment_bytes);
+        }
+
+        let plan_both_bounded = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 250,
+                max_source_fragments: Some(4),
+                max_source_bytes: Some(two_fragment_bytes),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plan_both_bounded
+                .tasks()
+                .iter()
+                .map(|task| task.fragments.len())
+                .sum::<usize>(),
+            4
+        );
+        for task in plan_both_bounded.tasks() {
+            assert!(task_source_bytes(&dataset, task).await.unwrap() <= two_fragment_bytes);
+        }
+
+        // File size metadata may be unknown. Planning falls back to object-store
+        // metadata and caches the resolved sizes on the task.
+        let mut uncached_task = plan_all.tasks()[0].clone();
+        for fragment in &mut uncached_task.fragments {
+            for data_file in fragment.files.iter_mut().chain(
+                fragment
+                    .overlays
+                    .iter_mut()
+                    .map(|overlay| &mut overlay.data_file),
+            ) {
+                data_file.file_size_bytes = CachedFileSize::unknown();
+            }
+        }
+        assert_eq!(
+            task_source_bytes(&dataset, &uncached_task).await.unwrap(),
+            first_task_bytes
+        );
+        assert!(uncached_task.fragments.iter().all(|fragment| {
+            fragment
+                .files
+                .iter()
+                .all(|file| file.file_size_bytes.get().is_some())
+                && fragment
+                    .overlays
+                    .iter()
+                    .all(|overlay| overlay.data_file.file_size_bytes.get().is_some())
+        }));
 
         // Plan with max_source_fragments=4 should include tasks covering <= 4
         // source fragments
@@ -7804,6 +8175,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(dataset.get_fragments().len(), 3);
+
+        let error = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                max_source_bytes: Some(u64::MAX),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("blob v2"));
 
         compact_files(
             &mut dataset,
@@ -8655,7 +9039,6 @@ mod tests {
     use arrow_array::record_batch;
     use lance_file::writer::FileWriterOptions;
     use lance_io::utils::CachedFileSize;
-    use lance_table::format::DataFile;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use std::collections::BTreeMap;
 

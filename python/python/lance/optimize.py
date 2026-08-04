@@ -13,7 +13,7 @@ from .lance import RewriteResult as RewriteResult
 # from .lance import CompactionPlan as CompactionPlan
 
 
-class CompactionOptions(TypedDict):
+class CompactionOptions(TypedDict, total=False):
     """Options for compaction."""
 
     target_rows_per_fragment: Optional[int]
@@ -96,4 +96,15 @@ class CompactionOptions(TypedDict):
     allowing for incremental compaction (e.g., compact 20 fragments at a
     time). Fragments are processed oldest first.
     (default: None, no limit)
+    """
+    max_source_bytes: Optional[int]
+    """
+    Maximum physical size of source data files in one compaction task.
+    Candidate fragments are split at fragment boundaries so tasks stay within
+    this limit whenever possible. A single oversized fragment, or the minimum
+    group needed for compaction to make progress, may exceed it. The size
+    includes base and overlay data files, but excludes deletion files and
+    indices. This option is not supported for datasets with blob v2 columns
+    because blob sidecar sizes are not recorded in the manifest.
+    (default: None, task formation is based on rows only)
     """

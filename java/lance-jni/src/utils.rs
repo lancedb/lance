@@ -191,6 +191,7 @@ pub fn build_compaction_options(
     compaction_mode: &JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: &JObject,    // Optional<Long>
     max_source_fragments: &JObject,            // Optional<Long>
+    max_source_bytes: Option<&JObject>,        // Optional<Long>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -233,6 +234,17 @@ pub fn build_compaction_options(
     }
     if let Some(max_source_fragments_val) = env.get_long_opt(max_source_fragments)? {
         compaction_options.max_source_fragments = Some(max_source_fragments_val as usize);
+    }
+    if let Some(max_source_bytes) = max_source_bytes
+        && let Some(max_source_bytes_val) = env.get_long_opt(max_source_bytes)?
+    {
+        compaction_options.max_source_bytes =
+            Some(u64::try_from(max_source_bytes_val).map_err(|_| {
+                Error::input_error(format!(
+                    "max_source_bytes must be non-negative, got {}",
+                    max_source_bytes_val
+                ))
+            })?);
     }
 
     Ok(compaction_options)

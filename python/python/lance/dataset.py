@@ -7071,6 +7071,7 @@ class DatasetOptimizer:
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
         max_source_fragments: Optional[int] = None,
+        max_source_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7102,7 +7103,8 @@ class DatasetOptimizer:
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
         ``lance.compaction.binary_copy_read_batch_bytes``,
-        ``lance.compaction.max_source_fragments``.
+        ``lance.compaction.max_source_fragments``,
+        ``lance.compaction.max_source_bytes``.
 
         Parameters
         ----------
@@ -7161,6 +7163,16 @@ class DatasetOptimizer:
             exceed this limit, allowing compaction to proceed incrementally.
             Fragments are processed oldest first. If not specified, uses the
             manifest config value, or applies no limit.
+        max_source_bytes: int, optional
+            Maximum physical size of source data files in one compaction task.
+            Candidate fragments are split at fragment boundaries so tasks stay
+            within this limit whenever possible. A single oversized fragment,
+            or the minimum group needed for compaction to make progress, may
+            exceed it. The size includes base and overlay data files, but
+            excludes deletion files and indices. If not specified, uses the
+            manifest config value and otherwise forms tasks based on rows only.
+            This option is not supported for datasets with blob v2 columns
+            because blob sidecar sizes are not recorded in the manifest.
 
         Returns
         -------
@@ -7185,6 +7197,7 @@ class DatasetOptimizer:
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
                 max_source_fragments=max_source_fragments,
+                max_source_bytes=max_source_bytes,
             ).items()
             if v is not None
         }

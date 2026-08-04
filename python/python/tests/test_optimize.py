@@ -11,7 +11,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from lance.lance import Compaction
-from lance.optimize import RewriteResult
+from lance.optimize import CompactionOptions, RewriteResult
 from lance.vector import vec_to_table
 
 
@@ -54,6 +54,38 @@ def test_compact_files_max_source_fragments(tmp_path: Path):
     assert metrics.fragments_removed == 4
     assert metrics.fragments_added == 1
     assert len(dataset.get_fragments()) == 7
+
+
+def test_compact_files_max_source_bytes(tmp_path: Path):
+    rows_per_fragment = 256 * 1024
+    dataset = lance.write_dataset(
+        pa.table({"a": pa.nulls(10 * rows_per_fragment)}),
+        tmp_path / "dataset",
+        max_rows_per_file=rows_per_fragment,
+    )
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=10 * rows_per_fragment,
+        max_source_bytes=1,
+        num_threads=1,
+    )
+    # The byte limit splits task formation but still allows the minimum useful
+    # two-fragment groups to exceed the limit and make progress.
+    assert metrics.fragments_removed == 10
+    assert metrics.fragments_added == 5
+    assert len(dataset.get_fragments()) == 5
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=10 * rows_per_fragment,
+        max_source_bytes=1024**4,
+        num_threads=1,
+    )
+    assert metrics.fragments_removed == 5
+    assert metrics.fragments_added == 1
+
+
+def test_compaction_options_keys_are_optional():
+    assert "max_source_bytes" in CompactionOptions.__optional_keys__
 
 
 def test_blob_compaction(tmp_path: Path):

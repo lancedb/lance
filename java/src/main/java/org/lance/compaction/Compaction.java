@@ -44,7 +44,8 @@ public class Compaction {
         compactionOptions.getDeferIndexRemap(),
         compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments());
+        compactionOptions.getMaxSourceFragments(),
+        compactionOptions.getMaxSourceBytes());
   }
 
   public static CompactionMetrics commitCompaction(
@@ -95,5 +96,6 @@ public class Compaction {
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
-      Optional<Long> maxSourceFragments);
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceBytes);
 }
