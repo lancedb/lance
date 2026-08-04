@@ -328,9 +328,19 @@ async fn search_segments(
 
     while let Some(documents) = searches.try_next().await? {
         for document in documents {
+            // Segments complete in whatever order `buffer_unordered` yields, so the
+            // merge evicts on the full `(score DESC, row_id ASC)` key: a score tie
+            // with a lower row_id wins whichever segment produced it. A NaN score is
+            // rejected first, because the total order ranks NaN above every real score.
+            if document.score.0.is_nan() {
+                continue;
+            }
             if candidates.len() < limit {
                 candidates.push(std::cmp::Reverse(document));
-            } else if candidates.peek().unwrap().0.score < document.score {
+            } else if candidates
+                .peek()
+                .is_some_and(|std::cmp::Reverse(worst)| *worst < document)
+            {
                 candidates.pop();
                 candidates.push(std::cmp::Reverse(document));
             }

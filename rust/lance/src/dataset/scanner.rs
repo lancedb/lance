@@ -4540,15 +4540,27 @@ impl Scanner {
             plan,
             Partitioning::RoundRobinBatch(1),
         )?);
-        let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
-            options: SortOptions {
-                descending: true,
-                nulls_first: false,
+        // Indexed and flat hits arrive from independent plans, so the top-k over
+        // their union sorts on the full FTS key (score DESC, row_id ASC) rather than
+        // on score alone, which a `SortExec` top-k does not break deterministically.
+        let sort_exprs = [
+            PhysicalSortExpr {
+                expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
+                options: SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
             },
-        };
+            PhysicalSortExpr {
+                expr: expressions::col(ROW_ID, plan.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            },
+        ];
         Ok(Arc::new(
-            SortExec::new([sort_expr].into(), plan).with_fetch(params.limit),
+            SortExec::new(sort_exprs.into(), plan).with_fetch(params.limit),
         ))
     }
 
@@ -13225,7 +13237,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+      SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
@@ -13234,7 +13246,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+    SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
       CoalescePartitionsExec
         UnionExec
           MatchQuery: column=s, query=[hello]
@@ -13287,7 +13299,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+      SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
@@ -13309,7 +13321,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+    SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
       CoalescePartitionsExec
         UnionExec
           MatchQuery: column=s, query=[hello]
