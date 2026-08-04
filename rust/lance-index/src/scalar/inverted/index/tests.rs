@@ -150,3 +150,4 @@ mod prewarm_cache;
 mod query;
 mod scoring;
 mod stats;
+mod topk_tiebreak;

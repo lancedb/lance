@@ -477,13 +477,15 @@ impl InvertedIndex {
         &self,
         request: ModernSearchRequest<'_>,
     ) -> Result<Vec<ScoredDoc>> {
+        let limit = request.limit;
         let ranked = self.bm25_search_modern_candidates(request).await?;
         if let Some(result) = self.resolve_resident_modern_candidates(&ranked)? {
-            return Ok(result);
+            return Ok(rank_resolved_documents(result, limit));
         }
         self.document_projections_resident
             .store(false, Ordering::Release);
-        self.resolve_deferred_modern_candidates(ranked).await
+        let resolved = self.resolve_deferred_modern_candidates(ranked).await?;
+        Ok(rank_resolved_documents(resolved, limit))
     }
 
     async fn bm25_search_modern_deferred(
@@ -524,14 +526,16 @@ impl InvertedIndex {
                 .try_collect::<Vec<_>>()
                 .await?;
         }
+        let limit = request.limit;
         let ranked = self.bm25_search_modern_candidates(request).await?;
-        self.resolve_deferred_modern_candidates(ranked).await
+        let resolved = self.resolve_deferred_modern_candidates(ranked).await?;
+        Ok(rank_resolved_documents(resolved, limit))
     }
 
     async fn bm25_search_modern_candidates(
         &self,
         request: ModernSearchRequest<'_>,
-    ) -> Result<Vec<Reverse<ScoredPartitionDoc>>> {
+    ) -> Result<Vec<ScoredPartitionDoc>> {
         let ModernSearchRequest {
             tokens,
             params,
@@ -570,86 +574,17 @@ impl InvertedIndex {
                 let impact_shared_threshold = impact_shared_threshold.clone();
                 async move {
                     let loads = chunk.into_iter().map(|(partition_ordinal, part)| {
-                        let tokens = tokens.clone();
-                        let params = params.clone();
-                        let mask = mask.clone();
-                        let metrics = metrics.clone();
-                        let impact_scorer = impact_scorer.clone();
-                        let impact_shared_threshold = impact_shared_threshold.clone();
-                        async move {
-                            let LoadedPostings {
-                                postings,
-                                grouped_expansions,
-                                impact_safe,
-                                exact_scoring_required,
-                            } = part
-                                .load_posting_lists(
-                                    tokens.as_ref(),
-                                    params.as_ref(),
-                                    operator,
-                                    impact_scorer.as_ref(),
-                                    metrics.as_ref(),
-                                    false,
-                                )
-                                .await?;
-                            if postings.is_empty() {
-                                return Result::Ok(None);
-                            }
-                            let documents = part.docs.modern().cloned().ok_or_else(|| {
-                                Error::internal("modern index contains legacy partition documents")
-                            })?;
-                            let materialize_selected = operator == Operator::Or
-                                && mask.max_len().is_some_and(|selected| {
-                                    u128::from(selected).saturating_mul(100)
-                                        <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
-                                            .saturating_mul(documents.len() as u128)
-                                });
-                            let visibility = match documents
-                                .immediate_visibility(mask.clone(), materialize_selected)
-                            {
-                                Some(visibility) => visibility,
-                                None => {
-                                    documents
-                                        .visibility(mask.clone(), materialize_selected)
-                                        .await?
-                                }
-                            };
-                            if visibility.is_empty() {
-                                return Result::Ok(None);
-                            }
-                            let lengths = match documents.cached_lengths() {
-                                Some(lengths) => lengths,
-                                None => documents.lengths().await?,
-                            };
-                            let max_position = postings
-                                .iter()
-                                .map(|posting| posting.term_index() as usize)
-                                .max()
-                                .unwrap_or_default();
-                            let mut tokens_by_position = vec![String::new(); max_position + 1];
-                            for posting in &postings {
-                                tokens_by_position[posting.term_index() as usize] =
-                                    posting.token().to_owned();
-                            }
-                            let use_global_scorer = impact_safe || exact_scoring_required;
-                            let threshold = if use_global_scorer {
-                                impact_shared_threshold
-                            } else {
-                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
-                            };
-                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
-                            Result::Ok(Some((
-                                partition_ordinal,
-                                part,
-                                lengths,
-                                visibility,
-                                postings,
-                                wand_scorer,
-                                threshold,
-                                tokens_by_position,
-                                grouped_expansions,
-                            )))
-                        }
+                        load_modern_partition(
+                            partition_ordinal,
+                            part,
+                            tokens.clone(),
+                            params.clone(),
+                            operator,
+                            mask.clone(),
+                            metrics.clone(),
+                            impact_scorer.clone(),
+                            impact_shared_threshold.clone(),
+                        )
                     });
                     let loaded = stream::iter(loads)
                         .buffer_unordered(io_parallelism)
@@ -663,39 +598,17 @@ impl InvertedIndex {
                     }
 
                     let results = spawn_cpu(move || {
-                        let mut results = Vec::with_capacity(loaded.len());
-                        for (
-                            partition_ordinal,
-                            part,
-                            lengths,
-                            visibility,
-                            postings,
-                            wand_scorer,
-                            threshold,
-                            tokens_by_position,
-                            grouped_expansions,
-                        ) in loaded
-                        {
-                            let candidates = part.bm25_search_modern(
-                                lengths.as_ref(),
-                                &visibility,
-                                params.as_ref(),
-                                operator,
-                                postings,
-                                wand_scorer,
-                                metrics.as_ref(),
-                                threshold,
-                            )?;
-                            results.push((
-                                partition_ordinal,
-                                PartitionCandidates {
-                                    tokens_by_position,
-                                    grouped_expansions,
-                                    candidates,
-                                },
-                            ));
-                        }
-                        Result::Ok(results)
+                        loaded
+                            .into_iter()
+                            .map(|partition| {
+                                score_modern_partition(
+                                    partition,
+                                    params.as_ref(),
+                                    operator,
+                                    metrics.as_ref(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()
                     })
                     .await?;
                     Result::Ok(results)
@@ -703,29 +616,86 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
 
-        let mut ranked = BinaryHeap::new();
+        let mut ranked = ModernCandidates::default();
         let mut idf_cache = HashMap::new();
+        // Partitions whose k-th-score tie band outgrew the collector's buffer.
+        // Their candidates are not the exact top-k, so they are rescored below
+        // against resolved row addresses instead of being merged here.
+        let mut retries = Vec::new();
         let mut parts = stream::iter(parts)
             .buffer_unordered(get_num_compute_intensive_cpus().min(32))
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
-        while let Some((partition_ordinal, partition)) = parts.try_next().await? {
-            for (doc_id, score) in rescore_partition_candidates(partition, scorer, &mut idf_cache) {
-                push_scored_partition_doc(
-                    &mut ranked,
-                    limit,
-                    PartitionDocId::try_new(partition_ordinal, doc_id)?,
-                    score,
-                );
+        while let Some(scored) = parts.try_next().await? {
+            if scored.score_floor_overflow {
+                retries.push((scored.partition_ordinal, scored.part));
+                continue;
             }
+            merge_modern_partition(
+                &mut ranked,
+                limit,
+                scored.partition_ordinal,
+                scored.candidates,
+                scorer,
+                &mut idf_cache,
+            )?;
         }
 
-        Ok(ranked.into_sorted_vec())
+        for (partition_ordinal, part) in retries {
+            let documents = part.docs.modern().cloned().ok_or_else(|| {
+                Error::internal("modern index contains legacy partition documents")
+            })?;
+            // Loading the addresses lets the retry order the tie band exactly, with
+            // a heap bounded by `limit`. It costs no extra read for a partition that
+            // reaches the final top-k, whose addresses are resolved either way.
+            let addresses = documents.address_projection().await?;
+            let Some(mut loaded) = load_modern_partition(
+                partition_ordinal,
+                part,
+                tokens.clone(),
+                params.clone(),
+                operator,
+                mask.clone(),
+                metrics.clone(),
+                impact_scorer.clone(),
+                impact_shared_threshold.clone(),
+            )
+            .await?
+            else {
+                continue;
+            };
+            loaded.addresses = Some(addresses);
+            let retry_params = params.clone();
+            let retry_metrics = metrics.clone();
+            let scored = spawn_cpu(move || {
+                score_modern_partition(
+                    loaded,
+                    retry_params.as_ref(),
+                    operator,
+                    retry_metrics.as_ref(),
+                )
+            })
+            .await?;
+            debug_assert!(
+                !scored.score_floor_overflow,
+                "an address-ordered retry cannot overflow its score floor"
+            );
+            merge_modern_partition(
+                &mut ranked,
+                limit,
+                scored.partition_ordinal,
+                scored.candidates,
+                scorer,
+                &mut idf_cache,
+            )?;
+        }
+
+        Ok(ranked.into_vec())
     }
 
     fn resolve_resident_modern_candidates(
         &self,
-        ranked: &[Reverse<ScoredPartitionDoc>],
+        ranked: &[ScoredPartitionDoc],
     ) -> Result<Option<Vec<ScoredDoc>>> {
         if self.partitions.iter().any(|partition| {
             partition
@@ -737,10 +707,10 @@ impl InvertedIndex {
         }
         let mut resolved_documents = ranked
             .iter()
-            .map(|Reverse(candidate)| ScoredDoc::new(0, candidate.score.0))
+            .map(|candidate| ScoredDoc::new(0, candidate.score.0))
             .collect::<Vec<_>>();
         let mut by_partition = BTreeMap::<usize, Vec<(usize, DocId)>>::new();
-        for (rank, Reverse(candidate)) in ranked.iter().enumerate() {
+        for (rank, candidate) in ranked.iter().enumerate() {
             let partition_ordinal = candidate.document.partition_ordinal();
             let doc_id = candidate.document.doc_id;
             by_partition
@@ -774,14 +744,14 @@ impl InvertedIndex {
 
     async fn resolve_deferred_modern_candidates(
         &self,
-        ranked: Vec<Reverse<ScoredPartitionDoc>>,
+        ranked: Vec<ScoredPartitionDoc>,
     ) -> Result<Vec<ScoredDoc>> {
         let mut resolved_documents = ranked
             .iter()
-            .map(|Reverse(candidate)| ScoredDoc::new(0, candidate.score.0))
+            .map(|candidate| ScoredDoc::new(0, candidate.score.0))
             .collect::<Vec<_>>();
         let mut by_partition = BTreeMap::<usize, Vec<(usize, DocId)>>::new();
-        for (rank, Reverse(candidate)) in ranked.iter().enumerate() {
+        for (rank, candidate) in ranked.iter().enumerate() {
             let partition_ordinal = candidate.document.partition_ordinal();
             let doc_id = candidate.document.doc_id;
             by_partition

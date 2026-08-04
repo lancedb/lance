@@ -697,7 +697,7 @@ impl InvertedPartition {
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<u64>>> {
         let documents = LegacyWandDocuments::new(docs, mask);
-        self.bm25_search_with_documents(
+        let (candidates, score_floor_overflow) = self.bm25_search_with_documents(
             &documents,
             params,
             operator,
@@ -705,23 +705,34 @@ impl InvertedPartition {
             impact_scorer,
             metrics,
             shared_threshold,
-        )
+        )?;
+        debug_assert!(
+            !score_floor_overflow,
+            "legacy postings carry row addresses, so their ties never defer"
+        );
+        Ok(candidates)
     }
 
+    /// Search one modern partition.
+    ///
+    /// Returns the candidates plus [`Wand::score_floor_overflow`]: when set, the
+    /// walk could not order its whole k-th-score tie band by row address and the
+    /// caller must retry with `addresses` attached.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bm25_search_modern(
         &self,
         lengths: &DocLengths,
         visibility: &DocVisibility,
+        addresses: Option<&ResidentAddressProjection>,
         params: &FtsSearchParams,
         operator: Operator,
         postings: Vec<PostingIterator>,
         impact_scorer: Option<Arc<MemBM25Scorer>>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
-    ) -> Result<Vec<DocCandidate<DocId>>> {
+    ) -> Result<(Vec<DocCandidate<DocId>>, bool)> {
         if visibility.is_all() {
-            let documents = ModernWandDocuments::all(lengths);
+            let documents = ModernWandDocuments::all(lengths).with_addresses(addresses);
             self.bm25_search_with_documents(
                 &documents,
                 params,
@@ -732,7 +743,8 @@ impl InvertedPartition {
                 shared_threshold,
             )
         } else {
-            let documents = ModernWandDocuments::filtered(lengths, visibility);
+            let documents =
+                ModernWandDocuments::filtered(lengths, visibility).with_addresses(addresses);
             self.bm25_search_with_documents(
                 &documents,
                 params,
@@ -756,22 +768,23 @@ impl InvertedPartition {
         impact_scorer: Option<Arc<MemBM25Scorer>>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
-    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
+    ) -> Result<(Vec<DocCandidate<D::Candidate>>, bool)> {
         if postings.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
-        let hits = if let Some(scorer) = impact_scorer {
+        if let Some(scorer) = impact_scorer {
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
-            wand.search(params, metrics)?
+            let hits = wand.search(params, metrics)?;
+            Ok((hits, wand.score_floor_overflow()))
         } else {
             let scorer = IndexBM25Scorer::new(std::iter::once(self));
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
-            wand.search(params, metrics)?
-        };
-        Ok(hits)
+            let hits = wand.search(params, metrics)?;
+            Ok((hits, wand.score_floor_overflow()))
+        }
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {

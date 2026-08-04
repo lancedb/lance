@@ -61,6 +61,7 @@ use tracing::{info, instrument, warn};
 
 use super::documents::{
     DocId, DocLengths, DocVisibility, PartitionDocumentStore, PartitionDocuments,
+    ResidentAddressProjection,
 };
 use super::encoding::{MAX_POSTING_BLOCK_SIZE, PositionBlockBuilder};
 use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder};
