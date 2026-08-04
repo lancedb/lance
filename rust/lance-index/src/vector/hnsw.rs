@@ -61,10 +61,10 @@ impl Default for HnswMetadata {
 ///
 /// This uses the paper's `extendCandidates = false` and
 /// `keepPrunedConnections = true` configuration. Keeping pruned connections
-/// fills the requested degree without exceeding it, which prevents sparse
-/// directed components when callers search with a large result budget.
-/// Callers supply the complete candidate set that should participate in this
-/// selection.
+/// fills the requested degree without exceeding it, reducing sparse directed
+/// components. It does not guarantee that every node is reachable: lower
+/// construction settings trade graph quality for size and build work. Callers
+/// supply the complete candidate set that should participate in this selection.
 ///
 /// # NOTE
 /// The results are not ordered.

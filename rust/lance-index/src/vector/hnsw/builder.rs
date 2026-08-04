@@ -57,6 +57,10 @@ pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 /// ([`super::online::OnlineHnswBuilder`]) builders so both produce comparable graphs.
 pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
 
+/// Minimum edge count that avoids severely fragmented graphs during parallel
+/// construction while still allowing deliberately small test and index sizes.
+pub(crate) const MIN_HNSW_M: usize = 4;
+
 /// Draw a node level using the distribution from Algorithm 1.
 pub(crate) fn random_level_with<R: Rng + ?Sized>(params: &HnswBuildParams, rng: &mut R) -> u16 {
     let ml = 1.0 / (params.m as f32).ln();
@@ -112,6 +116,9 @@ impl HnswBuildParams {
     }
 
     /// The number of connections to establish while inserting new element
+    ///
+    /// Must be at least 4. Smaller values produce severely fragmented graphs
+    /// during parallel construction.
     /// The default value is `20`.
     pub fn num_edges(mut self, m: usize) -> Self {
         self.m = m;
@@ -134,10 +141,10 @@ impl HnswBuildParams {
                 self.max_level
             )));
         }
-        if self.m <= 1 {
+        if self.m < MIN_HNSW_M {
             return Err(Error::invalid_input(format!(
-                "HnswBuildParams::m must be greater than 1, got {}",
-                self.m
+                "HnswBuildParams::m must be at least {MIN_HNSW_M} to avoid severely fragmented graphs, got {}",
+                self.m,
             )));
         }
         if self.m > usize::MAX / 2 {
@@ -1547,12 +1554,12 @@ mod tests {
     use lance_table::io::manifest::ManifestDescribing;
     use lance_testing::datagen::generate_random_array;
     use object_store::path::Path;
-    use rand::{SeedableRng, rngs::SmallRng};
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
 
     use super::{
         HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
-        ImmutableHnswLevelView, random_level_with,
+        ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
@@ -1718,11 +1725,15 @@ mod tests {
     )]
     #[case::zero_m(
         HnswBuildParams::default().num_edges(0),
-        "m must be greater than 1"
+        "m must be at least 4"
     )]
     #[case::one_m(
         HnswBuildParams::default().num_edges(1),
-        "m must be greater than 1"
+        "m must be at least 4"
+    )]
+    #[case::three_m(
+        HnswBuildParams::default().num_edges(3),
+        "m must be at least 4"
     )]
     #[case::small_ef(
         HnswBuildParams::default().num_edges(20).ef_construction(19),
@@ -1747,6 +1758,52 @@ mod tests {
         assert!(
             error.to_string().contains(expected_message),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The lowest accepted construction settings retain a useful graph, but
+    /// do not promise full reachability. This seeded floor makes that quality
+    /// trade-off explicit and guards against catastrophic fragmentation.
+    #[test]
+    fn test_minimum_params_reachability() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let mut rng = SmallRng::seed_from_u64(0);
+        let values = Float32Array::from(
+            (0..TOTAL * DIM)
+                .map(|_| rng.random::<f32>())
+                .collect::<Vec<_>>(),
+        );
+        let vectors = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let store = FlatFloatStorage::new(vectors.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default()
+                .num_edges(MIN_HNSW_M)
+                .ef_construction(MIN_HNSW_M),
+        )
+        .unwrap();
+        let results = hnsw
+            .search_basic(
+                vectors.value(0),
+                TOTAL,
+                &HnswQueryParams {
+                    ef: TOTAL,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                },
+                None,
+                &store,
+            )
+            .unwrap();
+
+        let minimum_reachable = TOTAL * 90 / 100;
+        assert!(
+            results.len() >= minimum_reachable,
+            "minimum HNSW construction settings reached only {} of {TOTAL} nodes; expected at least {minimum_reachable}",
+            results.len(),
         );
     }
 

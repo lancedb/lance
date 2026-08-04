@@ -583,11 +583,15 @@ mod tests {
     )]
     #[case::zero_m(
         HnswBuildParams::default().num_edges(0),
-        "m must be greater than 1"
+        "m must be at least 4"
     )]
     #[case::one_m(
         HnswBuildParams::default().num_edges(1),
-        "m must be greater than 1"
+        "m must be at least 4"
+    )]
+    #[case::three_m(
+        HnswBuildParams::default().num_edges(3),
+        "m must be at least 4"
     )]
     #[case::small_ef(
         HnswBuildParams::default().num_edges(20).ef_construction(19),
@@ -746,7 +750,8 @@ mod tests {
             .max_level(1)
             .num_edges(2)
             .ef_construction(5);
-        let builder = OnlineHnswBuilder::try_with_capacity(5, params).unwrap();
+        // Bypass public validation to isolate the Algorithm 1 degree rule.
+        let builder = OnlineHnswBuilder::new(5, params);
 
         for id in 0..5 {
             builder.insert(id, &storage);
