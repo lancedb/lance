@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, TryReserveError};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -236,11 +236,13 @@ struct LevelLinks {
 }
 
 impl LevelLinks {
-    fn new(capacity: usize) -> Self {
-        Self {
+    fn try_new(capacity: usize) -> std::result::Result<Self, TryReserveError> {
+        let mut ranked = Vec::new();
+        ranked.try_reserve_exact(capacity)?;
+        Ok(Self {
             published: ArcSwap::from_pointee(Vec::<u32>::new()),
-            ranked: Mutex::new(Vec::with_capacity(capacity)),
-        }
+            ranked: Mutex::new(ranked),
+        })
     }
 
     fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
@@ -257,15 +259,23 @@ struct Node {
 }
 
 impl Node {
-    fn new(target_level: u16, m: usize) -> Self {
+    fn try_new(target_level: u16, m: usize) -> Result<Self> {
         let levels = (0..=target_level)
-            .map(|level| LevelLinks::new(max_reciprocal_neighbors(m, level)))
-            .collect();
-        Self {
+            .map(|level| {
+                let neighbor_capacity = max_reciprocal_neighbors(m, level);
+                LevelLinks::try_new(neighbor_capacity).map_err(|error| {
+                    Error::invalid_input(format!(
+                        "BuildParams::m={m} requires neighbor_capacity={neighbor_capacity} at level={level} for ScoredPoint values (element_size={} bytes), but the allocation is invalid: {error}",
+                        std::mem::size_of::<ScoredPoint>()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
             target_level,
             levels,
             dirty_levels: AtomicU64::new(0),
-        }
+        })
     }
 
     fn has_level(&self, level: u16) -> bool {
@@ -320,7 +330,7 @@ impl HnswGraph {
         let mut nodes = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             let target_level = random_level(&params, &mut rng);
-            nodes.push(Node::new(target_level, params.m));
+            nodes.push(Node::try_new(target_level, params.m)?);
         }
 
         let pool_size = rayon::current_num_threads().max(1) * 2;
@@ -1215,6 +1225,12 @@ mod tests {
             .num_edges(usize::MAX)
             .ef_construction(usize::MAX),
         "level-0 reciprocal limit can be represented"
+    )]
+    #[case::unallocatable_level_zero_limit(
+        BuildParams::default()
+            .num_edges(usize::MAX / 2)
+            .ef_construction(usize::MAX / 2),
+        "neighbor_capacity"
     )]
     fn test_rejects_invalid_build_params(
         #[case] params: BuildParams,
