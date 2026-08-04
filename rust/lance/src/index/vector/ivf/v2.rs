@@ -5524,7 +5524,7 @@ mod tests {
 
         // Rewrite auxiliary file with PQ codebook inlined into schema metadata.
         let mut metadata = reader.schema().metadata.clone();
-        let projection = lance_file::reader::ReaderProjection::from_whole_schema(
+        let projection = lance_file::versions::reader_projection_from_whole_schema(
             reader.schema(),
             reader.metadata().version(),
         );

@@ -25,7 +25,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions};
 use crate::testing::FsFixture;
-use crate::version::{ConcreteFileVersion, LanceFileVersion};
+use crate::version::ConcreteFileVersion;
 use crate::versions;
 use crate::versions::v1::reader::FileReader as V1Reader;
 use crate::versions::v1::writer::{
@@ -338,10 +338,7 @@ async fn assert_current_reader_roundtrip(
     )
     .await
     .unwrap();
-    assert_eq!(
-        ConcreteFileVersion::from(reader.metadata().version()),
-        version
-    );
+    assert_eq!(reader.metadata().version(), version);
     assert!(
         reader
             .metadata()
@@ -421,7 +418,6 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
     assert_eq!(footer_version(expected_self_described), expected_footer);
     assert_eq!(footer_version(expected_mini), expected_footer);
 
-    let version = LanceFileVersion::from(ConcreteFileVersion::V2_0);
     let self_described =
         EncodedBatch::try_from_self_described_lance(Bytes::from_static(expected_self_described))
             .unwrap();
@@ -438,8 +434,7 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
     assert_record_batch_eq(&decoded, &batch);
 
     let mini =
-        EncodedBatch::try_from_mini_lance(Bytes::from_static(expected_mini), &schema, version)
-            .unwrap();
+        EncodedBatch::try_from_mini_lance(Bytes::from_static(expected_mini), &schema).unwrap();
     let decoded = decode_batch(
         &mini,
         &FilterExpression::no_filter(),

@@ -52,7 +52,7 @@ mod tests {
         schema: &LanceSchema,
         column_names: &[&str],
     ) -> lance_core::Result<ReaderProjection> {
-        ReaderProjection::from_column_names(version.into(), schema, column_names)
+        versions::reader_projection_from_column_names(version, schema, column_names)
     }
 
     #[tokio::test]
@@ -993,10 +993,7 @@ mod tests {
 
         // Verify metadata
         let metadata = file_reader.metadata();
-        assert_eq!(
-            ConcreteFileVersion::from(metadata.version()),
-            ConcreteFileVersion::V2_1
-        );
+        assert_eq!(metadata.version(), ConcreteFileVersion::V2_1);
 
         let schema = file_reader.schema();
         assert_eq!(
