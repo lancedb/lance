@@ -1919,13 +1919,15 @@ impl Transaction {
                 ..
             } => {
                 // Remove the deleted fragments
+                // Hash lookups keep this linear on tables with many fragments.
+                let deleted_ids: HashSet<u64> = deleted_fragment_ids.iter().copied().collect();
+                let updated_by_id: HashMap<u64, &Fragment> =
+                    updated_fragments.iter().map(|f| (f.id, f)).collect();
                 final_fragments.extend(maybe_existing_fragments?.clone());
-                final_fragments.retain(|f| !deleted_fragment_ids.contains(&f.id));
+                final_fragments.retain(|f| !deleted_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
-                    for updated in updated_fragments {
-                        if updated.id == f.id {
-                            *f = updated.clone();
-                        }
+                    if let Some(updated) = updated_by_id.get(&f.id) {
+                        *f = (*updated).clone();
                     }
                 });
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
@@ -1945,13 +1947,20 @@ impl Transaction {
                 let existing_fragments = maybe_existing_fragments?;
 
                 // Apply updates to existing fragments
+                // Hash lookups keep this linear on tables with many fragments.
+                let removed_ids: HashSet<u64> = removed_fragment_ids.iter().copied().collect();
+                let mut updated_by_id: HashMap<u64, &Fragment> =
+                    HashMap::with_capacity(updated_fragments.len());
+                for fragment in updated_fragments {
+                    updated_by_id.entry(fragment.id).or_insert(fragment);
+                }
                 let updated_frags: Vec<Fragment> = existing_fragments
                     .iter()
                     .filter_map(|f| {
-                        if removed_fragment_ids.contains(&f.id) {
+                        if removed_ids.contains(&f.id) {
                             return None;
                         }
-                        if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
+                        if let Some(&updated) = updated_by_id.get(&f.id) {
                             let mut updated = updated.clone();
                             // Carry forward the fragment's current overlays (which
                             // may include ones added by a concurrent commit). An
@@ -2052,9 +2061,14 @@ impl Transaction {
 
                     // The original fragments that carried an overlay: their moved rows may have a
                     // stale index entry (see `register_pure_rewrite_rows_update_frags_in_indices`).
+                    // Reuse the hash lookups built above instead of scanning
+                    // `original_fragment_ids` per fragment.
                     let original_overlaid_frags: HashMap<u32, &Fragment> = existing_fragments
                         .iter()
-                        .filter(|f| original_fragment_ids.contains(&f.id) && !f.overlays.is_empty())
+                        .filter(|f| {
+                            (removed_ids.contains(&f.id) || updated_by_id.contains_key(&f.id))
+                                && !f.overlays.is_empty()
+                        })
                         .map(|f| (f.id as u32, f))
                         .collect();
 
@@ -4162,10 +4176,14 @@ mod tests {
     use crate::session::Session;
 
     fn sample_manifest() -> Manifest {
+        sample_manifest_with_fragments(0..1)
+    }
+
+    fn sample_manifest_with_fragments(ids: std::ops::Range<u64>) -> Manifest {
         let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
         Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
-            Arc::new(vec![Fragment::new(0)]),
+            Arc::new(ids.map(Fragment::new).collect()),
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
@@ -4389,6 +4407,88 @@ mod tests {
                 .iter()
                 .any(|idx| idx.uuid == second_index.uuid)
         );
+    }
+
+    #[test]
+    fn test_update_build_manifest_replaces_and_removes_fragments() {
+        let manifest = sample_manifest_with_fragments(0..5);
+
+        let mut updated2 = Fragment::new(2);
+        updated2.physical_rows = Some(42);
+        let mut updated4 = Fragment::new(4);
+        updated4.physical_rows = Some(43);
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![1],
+                // Fragment 99 does not exist in the dataset; it must be ignored,
+                // not appended.
+                updated_fragments: vec![updated2, updated4, Fragment::new(99)],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![0, 2, 3, 4]);
+        let rows: Vec<Option<usize>> = new_manifest
+            .fragments
+            .iter()
+            .map(|f| f.physical_rows)
+            .collect();
+        assert_eq!(rows, vec![None, Some(42), None, Some(43)]);
+    }
+
+    #[test]
+    fn test_delete_build_manifest_replaces_and_removes_fragments() {
+        let manifest = sample_manifest_with_fragments(0..5);
+
+        let mut updated2 = Fragment::new(2);
+        updated2.physical_rows = Some(42);
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Delete {
+                updated_fragments: vec![updated2],
+                deleted_fragment_ids: vec![1, 3],
+                predicate: "id > 0".to_string(),
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![0, 2, 4]);
+        let rows: Vec<Option<usize>> = new_manifest
+            .fragments
+            .iter()
+            .map(|f| f.physical_rows)
+            .collect();
+        assert_eq!(rows, vec![None, Some(42), None]);
     }
 
     #[test]
