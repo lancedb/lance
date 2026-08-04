@@ -777,6 +777,43 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
     let (new_uuid, removed_indices, new_fragment_bitmap, created_index, new_dataset_version) =
         if first_is_vector_index {
+            // Segments with stored rows (raw coverage) but no live coverage
+            // (e.g. a definition retained through a full rewrite) are dormant.
+            // With stable row ids their stored postings still share ids with
+            // live rows, so merging them would resurrect stale vectors; they
+            // may only be replaced. A born-empty segment (deferred build) has
+            // no stored rows and stays mergeable.
+            let (live_segments, dormant_segments): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
+                old_indices.iter().copied().partition(|idx| {
+                    let has_stored_rows = idx
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| !bitmap.is_empty());
+                    let has_live_coverage = idx
+                        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                        .is_none_or(|bitmap| !bitmap.is_empty());
+                    !has_stored_rows || has_live_coverage
+                });
+            if !dormant_segments.is_empty() && !live_segments.is_empty() && !options.retrain {
+                // Optimize the live segments as usual; the dormant segments
+                // are superseded by whatever that produces.
+                let mut merged = Box::pin(merge_indices_with_unindexed_frags(
+                    dataset.clone(),
+                    &live_segments,
+                    unindexed,
+                    options,
+                ))
+                .await?;
+                if let Some(results) = merged.as_mut() {
+                    results.removed_indices.extend(dormant_segments);
+                }
+                return Ok(merged);
+            }
+            let rebuild_dormant = live_segments.is_empty() && !dormant_segments.is_empty();
+            if rebuild_dormant && unindexed.is_empty() {
+                return Ok(None);
+            }
+
             let full_logical_index = dataset
                 .open_logical_vector_index(&field_path, &old_indices[0].name)
                 .await?;
@@ -805,7 +842,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .collect(),
             )?;
 
-            if options.retrain {
+            if options.retrain || rebuild_dormant {
                 let fragment_bitmap = dataset.fragment_bitmap.as_ref().clone();
                 let segment = build_fresh_vector_segment(
                     dataset.as_ref(),
