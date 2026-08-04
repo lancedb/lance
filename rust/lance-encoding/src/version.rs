@@ -59,34 +59,6 @@ impl LanceFileVersion {
         self >= &Self::Next
     }
 
-    pub fn try_from_major_minor(major: u32, minor: u32) -> Result<Self> {
-        match (major, minor) {
-            (0, 0) => Ok(Self::Legacy),
-            (0, 1) => Ok(Self::Legacy),
-            (0, 2) => Ok(Self::Legacy),
-            (0, 3) => Ok(Self::V2_0),
-            (2, 0) => Ok(Self::V2_0),
-            (2, 1) => Ok(Self::V2_1),
-            (2, 2) => Ok(Self::V2_2),
-            (2, 3) => Ok(Self::V2_3),
-            _ => Err(Error::invalid_input_source(
-                format!("Unknown Lance storage version: {}.{}", major, minor).into(),
-            )),
-        }
-    }
-
-    pub fn to_numbers(&self) -> (u32, u32) {
-        match self {
-            Self::Legacy => (0, 2),
-            Self::V2_0 => (2, 0),
-            Self::V2_1 => (2, 1),
-            Self::V2_2 => (2, 2),
-            Self::V2_3 => (2, 3),
-            Self::Stable => self.resolve().to_numbers(),
-            Self::Next => self.resolve().to_numbers(),
-        }
-    }
-
     pub fn iter_non_legacy() -> impl Iterator<Item = Self> {
         use strum::IntoEnumIterator;
 

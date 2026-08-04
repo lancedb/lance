@@ -523,17 +523,35 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest =
-            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        let manifest_and_indexes = async {
+            let manifest =
+                read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            let indexes =
+                read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+            Ok::<_, Error>((manifest, indexes))
+        }
+        .await;
+        let (manifest, indexes) = match manifest_and_indexes {
+            Ok(manifest_and_indexes) => manifest_and_indexes,
+            Err(error) if location.version < self.read_version && error.is_not_found() => {
+                // Another cleanup may remove an old manifest after this cleanup lists it.
+                // The current manifest is never safe to skip because it anchors our snapshot.
+                debug!(
+                    manifest_version = location.version,
+                    read_version = self.read_version,
+                    manifest_path = %location.path,
+                    "Skipping old manifest removed by concurrent cleanup"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
-        let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -2030,6 +2048,42 @@ mod tests {
         assert_gt!(after_count.num_data_files, 0);
         // We should keep referenced tx files
         assert_gt!(after_count.num_tx_files, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_ignores_old_manifest_removed_after_listing() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let old_manifest = dataset
+            .commit_handler
+            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .try_filter(|location| future::ready(location.version == 1))
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        dataset
+            .object_store
+            .delete(&old_manifest.path)
+            .await
+            .unwrap();
+
+        let cleanup = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default().build(),
+            CleanupAction::Execute,
+        );
+        cleanup
+            .process_manifest_file(
+                old_manifest,
+                &Mutex::new(CleanupInspection::default()),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

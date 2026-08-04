@@ -3,7 +3,7 @@
 
 use crate::Error;
 use crate::JNIEnvExt;
-use crate::RT;
+use crate::block_on;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
 use crate::error::Result;
 use crate::traits::{
@@ -26,7 +26,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
@@ -594,19 +594,38 @@ pub(crate) fn convert_to_java_schema<'local>(
         .l()?)
 }
 
+/// Parse a `CommitBuilder.storageFormat` string into a [`LanceFileVersion`].
+///
+/// The canonical spellings ("2.1", "stable", ...) are the ones every other Lance
+/// binding accepts and the ones [`LanceFileVersion`]'s `Display` emits.
+///
+/// The `v`-prefixed spellings are a Java-only accident: this function originally
+/// hand-rolled its match by walking the `LanceFileVersion` variant identifiers
+/// (`V2_1` -> `"v2_1"`) instead of delegating to `FromStr`, so it accepted those
+/// identifiers and rejected the canonical "2.1". They were documented on
+/// `CommitBuilder.storageFormat` and shipped from 3.0.0, so they are translated
+/// here for compatibility. The set is deliberately frozen to what shipped —
+/// newer versions are reachable only by their canonical name.
 fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
-    match name.to_lowercase().as_str() {
-        "legacy" => Ok(LanceFileVersion::Legacy),
-        "v2_0" | "v2.0" => Ok(LanceFileVersion::V2_0),
-        "stable" => Ok(LanceFileVersion::Stable),
-        "v2_1" | "v2.1" => Ok(LanceFileVersion::V2_1),
-        "next" => Ok(LanceFileVersion::Next),
-        "v2_2" | "v2.2" => Ok(LanceFileVersion::V2_2),
-        _ => Err(Error::input_error(format!(
-            "Unknown storage format: {}",
-            name
-        ))),
+    let requested = name.to_lowercase();
+    let canonical = match requested.as_str() {
+        "v2_0" | "v2.0" => V2_FORMAT_2_0,
+        "v2_1" | "v2.1" => V2_FORMAT_2_1,
+        "v2_2" | "v2.2" => V2_FORMAT_2_2,
+        _ => requested.as_str(),
+    };
+
+    if canonical != requested {
+        log::warn!(
+            "Storage format \"{}\" is deprecated and will be removed in a future release; use \"{}\" instead",
+            name,
+            canonical
+        );
     }
+
+    canonical
+        .parse::<LanceFileVersion>()
+        .map_err(|_| Error::input_error(format!("Unknown storage format: {}", name)))
 }
 
 /// Translate the Java `commitTimeoutNanos` sentinel into an
@@ -1574,7 +1593,7 @@ fn inner_commit_to_uri<'local>(
         builder = builder.with_commit_handler(commit_handler);
     }
 
-    let dataset = RT.block_on(builder.execute(transaction))?;
+    let dataset = block_on(builder.execute(transaction))?;
     let blocking_ds = BlockingDataset { inner: dataset };
     blocking_ds.into_java(env)
 }
@@ -1835,5 +1854,81 @@ mod tests {
             schema.metadata,
             HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())])
         );
+    }
+
+    #[test]
+    fn test_parse_storage_format_canonical_forms() {
+        let cases = [
+            ("2.0", LanceFileVersion::V2_0),
+            ("2.1", LanceFileVersion::V2_1),
+            ("2.2", LanceFileVersion::V2_2),
+            ("2.3", LanceFileVersion::V2_3),
+            ("0.1", LanceFileVersion::Legacy),
+            ("legacy", LanceFileVersion::Legacy),
+            ("stable", LanceFileVersion::Stable),
+            ("next", LanceFileVersion::Next),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_storage_format(input).unwrap(),
+                expected,
+                "parse_storage_format({:?}) failed",
+                input
+            );
+        }
+    }
+
+    /// The `v`-prefixed spellings shipped in the `CommitBuilder.storageFormat`
+    /// Javadoc and must keep working for existing Java callers.
+    #[test]
+    fn test_parse_storage_format_deprecated_aliases() {
+        let cases = [
+            ("v2_0", LanceFileVersion::V2_0),
+            ("v2.0", LanceFileVersion::V2_0),
+            ("v2_1", LanceFileVersion::V2_1),
+            ("v2.1", LanceFileVersion::V2_1),
+            ("v2_2", LanceFileVersion::V2_2),
+            ("v2.2", LanceFileVersion::V2_2),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_storage_format(input).unwrap(),
+                expected,
+                "parse_storage_format({:?}) failed",
+                input
+            );
+        }
+    }
+
+    /// The alias set is frozen to what shipped, so versions added after the
+    /// aliases were deprecated are reachable only by their canonical name.
+    #[test]
+    fn test_parse_storage_format_does_not_extend_aliases_to_new_versions() {
+        assert!(parse_storage_format("v2_3").is_err());
+        assert!(parse_storage_format("v2.3").is_err());
+        assert_eq!(parse_storage_format("2.3").unwrap(), LanceFileVersion::V2_3);
+    }
+
+    #[test]
+    fn test_parse_storage_format_case_insensitive() {
+        assert_eq!(
+            parse_storage_format("LEGACY").unwrap(),
+            LanceFileVersion::Legacy
+        );
+        assert_eq!(
+            parse_storage_format("Stable").unwrap(),
+            LanceFileVersion::Stable
+        );
+        assert_eq!(
+            parse_storage_format("V2_1").unwrap(),
+            LanceFileVersion::V2_1
+        );
+    }
+
+    #[test]
+    fn test_parse_storage_format_rejects_invalid() {
+        assert!(parse_storage_format("v3.0").is_err());
+        assert!(parse_storage_format("").is_err());
+        assert!(parse_storage_format("foo").is_err());
     }
 }

@@ -19,6 +19,7 @@ use jieba::JiebaTokenizerBuilder;
 use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
+use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
@@ -44,9 +45,71 @@ pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 const LANCE_FTS_FORMAT_VERSION_ENV_KEY: &str = "LANCE_FTS_FORMAT_VERSION";
 
+/// The unit treated as one logical full-text-search document.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentGranularity {
+    /// All text selected from one dataset row belongs to one document.
+    #[default]
+    Row,
+    /// Each element of the deepest list on the field path is one document.
+    ListElement,
+}
+
+impl DocumentGranularity {
+    /// Whether results identify a list element within the dataset row.
+    pub fn is_list_element(self) -> bool {
+        self == Self::ListElement
+    }
+}
+
+impl TryFrom<&str> for DocumentGranularity {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "row" => Ok(Self::Row),
+            "list_element" => Ok(Self::ListElement),
+            _ => Err(Error::invalid_input(format!(
+                "unknown FTS document granularity '{value}'; expected 'row' or 'list_element'"
+            ))),
+        }
+    }
+}
+
+impl TryFrom<i32> for DocumentGranularity {
+    type Error = Error;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match PbDocumentGranularity::try_from(value) {
+            Ok(PbDocumentGranularity::Row) => Ok(Self::Row),
+            Ok(PbDocumentGranularity::ListElement) => Ok(Self::ListElement),
+            Err(_) => Err(Error::invalid_input(format!(
+                "unknown FTS document granularity value {value}"
+            ))),
+        }
+    }
+}
+
+impl From<DocumentGranularity> for PbDocumentGranularity {
+    fn from(value: DocumentGranularity) -> Self {
+        match value {
+            DocumentGranularity::Row => Self::Row,
+            DocumentGranularity::ListElement => Self::ListElement,
+        }
+    }
+}
+
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct InvertedIndexParams {
+    /// The logical document boundary used while creating an index.
+    ///
+    /// This is persisted in `InvertedIndexDetails`, not in the tokenizer
+    /// params stored inside the physical index. Creation JSON adds it back
+    /// explicitly in [`Self::to_training_json`].
+    #[serde(default, skip_serializing)]
+    pub(crate) document_granularity: DocumentGranularity,
     /// Document-level tokenizer.
     ///
     /// This decides how Lance extracts searchable text from the stored value:
@@ -177,6 +240,7 @@ pub struct InvertedIndexParams {
 struct RawInvertedIndexParams {
     // Input-only preset expanded before constructing normalized params.
     analyzer: Option<String>,
+    document_granularity: Option<DocumentGranularity>,
     lance_tokenizer: Option<String>,
     base_tokenizer: Option<String>,
     language: Option<Language>,
@@ -271,6 +335,9 @@ impl RawInvertedIndexParams {
             _ => unreachable!("analyzer is normalized above"),
         };
 
+        if let Some(document_granularity) = self.document_granularity {
+            params.document_granularity = document_granularity;
+        }
         if let Some(lance_tokenizer) = self.lance_tokenizer {
             params.lance_tokenizer = Some(lance_tokenizer);
         }
@@ -358,6 +425,8 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
                     index_operators: params.index_operators,
                 },
             ),
+            document_granularity: PbDocumentGranularity::from(params.document_granularity) as i32,
+            posting_format_version: Some(params.resolved_format_version().index_version()),
         })
     }
 }
@@ -372,13 +441,18 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             ));
         }
         if details.base_tokenizer.is_none() && details.language.is_empty() {
-            let params = Self {
+            let mut params = Self {
                 block_size: match details.block_size {
                     Some(block_size) => validate_block_size(block_size as usize)?,
                     None => LEGACY_BLOCK_SIZE,
                 },
                 ..Self::default()
             };
+            params.document_granularity = details.document_granularity.try_into()?;
+            params.format_version = details
+                .posting_format_version
+                .map(|version| resolve_fts_format_version(Some(&version.to_string())))
+                .transpose()?;
             return Ok(params);
         }
 
@@ -419,6 +493,11 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             }
             params.index_operators = code_config.index_operators;
         }
+        params.document_granularity = details.document_granularity.try_into()?;
+        params.format_version = details
+            .posting_format_version
+            .map(|version| resolve_fts_format_version(Some(&version.to_string())))
+            .transpose()?;
         params.validate()?;
         Ok(params)
     }
@@ -554,6 +633,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: Language) -> Self {
         let mut params = Self {
+            document_granularity: DocumentGranularity::Row,
             lance_tokenizer: None,
             base_tokenizer,
             language,
@@ -648,6 +728,17 @@ impl InvertedIndexParams {
     pub fn lance_tokenizer(mut self, lance_tokenizer: String) -> Self {
         self.lance_tokenizer = Some(lance_tokenizer);
         self
+    }
+
+    /// Set the logical FTS document boundary.
+    pub fn document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = document_granularity;
+        self
+    }
+
+    /// Return the logical FTS document boundary.
+    pub fn get_document_granularity(&self) -> DocumentGranularity {
+        self.document_granularity
     }
 
     /// Set the lexical tokenizer implementation.
@@ -856,9 +947,22 @@ impl InvertedIndexParams {
         Ok(())
     }
 
+    /// Serialize user-visible params, including logical index identity fields.
+    pub(crate) fn to_details_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        let object = value
+            .as_object_mut()
+            .expect("inverted index params should serialize to a JSON object");
+        object.insert(
+            "document_granularity".to_string(),
+            serde_json::to_value(self.document_granularity)?,
+        );
+        Ok(value)
+    }
+
     /// Serialize params for the build/training path, including build-only fields.
     pub fn to_training_json(&self) -> serde_json::Result<serde_json::Value> {
-        let mut value = serde_json::to_value(self)?;
+        let mut value = self.to_details_json()?;
         let object = value
             .as_object_mut()
             .expect("inverted index params should serialize to a JSON object");
@@ -1040,20 +1144,23 @@ pub fn language_model_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::pbold;
+    use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 
-    use super::{InvertedIndexParams, InvertedListFormatVersion, Language};
+    use super::{DocumentGranularity, InvertedIndexParams, InvertedListFormatVersion};
     use lance_core::Error;
-    use lance_tokenizer::TokenStream;
+    use lance_tokenizer::{Language, TokenStream};
     use rstest::rstest;
     use serde_json::json;
 
     #[test]
-    fn test_build_only_fields_are_not_serialized() {
+    fn test_physical_params_omit_creation_only_fields() {
         let params = InvertedIndexParams::default()
+            .document_granularity(DocumentGranularity::ListElement)
             .memory_limit_mb(4096)
             .num_workers(7)
             .format_version(InvertedListFormatVersion::V1);
         let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("document_granularity").is_none());
         assert!(json.get("memory_limit").is_none());
         assert!(json.get("num_workers").is_none());
         assert!(json.get("format_version").is_none());
@@ -1087,12 +1194,17 @@ mod tests {
     }
 
     #[test]
-    fn test_training_json_serializes_build_only_fields() {
+    fn test_training_json_serializes_creation_fields() {
         let params = InvertedIndexParams::default()
+            .document_granularity(DocumentGranularity::ListElement)
             .memory_limit_mb(4096)
             .num_workers(3)
             .format_version(InvertedListFormatVersion::V1);
         let json = params.to_training_json().unwrap();
+        assert_eq!(
+            json.get("document_granularity"),
+            Some(&serde_json::Value::from("list_element"))
+        );
         assert_eq!(
             json.get("memory_limit"),
             Some(&serde_json::Value::from(4096))
@@ -1293,7 +1405,8 @@ mod tests {
         let params = InvertedIndexParams::code()
             .with_position(true)
             .index_operators(true)
-            .preserve_original(false);
+            .preserve_original(false)
+            .format_version(InvertedListFormatVersion::V3);
         let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
         let code_config = details.code_config.as_ref().unwrap();
         assert_eq!(code_config.split_on_numerics, Some(true));
@@ -1444,9 +1557,29 @@ mod tests {
             prefix_only: false,
             block_size: None,
             code_config: None,
+            document_granularity: PbDocumentGranularity::Row as i32,
+            posting_format_version: None,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);
+        assert_eq!(params.get_document_granularity(), DocumentGranularity::Row);
+    }
+
+    #[test]
+    fn test_document_granularity_details_conversion() {
+        let params =
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement);
+        let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        assert_eq!(details.posting_format_version, Some(2));
+        assert_eq!(
+            details.document_granularity,
+            PbDocumentGranularity::ListElement as i32
+        );
+        let roundtrip = InvertedIndexParams::try_from(&details).unwrap();
+        assert_eq!(
+            roundtrip.get_document_granularity(),
+            DocumentGranularity::ListElement
+        );
     }
 
     #[rstest]

@@ -99,7 +99,7 @@ use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
-use crate::io::commit::{commit_transaction, migrate_fragments};
+use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::Array;
@@ -518,7 +518,7 @@ async fn can_use_binary_copy_impl(
     fragments: &[Fragment],
 ) -> Result<bool> {
     use lance_file::reader::FileReader as LFReader;
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
     if matches!(options.compaction_mode(), CompactionMode::Reencode) {
@@ -578,12 +578,9 @@ async fn can_use_binary_copy_impl(
         }
 
         for data_file in &fragment.files {
-            let version_ok = LanceFileVersion::try_from_major_minor(
-                data_file.file_major_version,
-                data_file.file_minor_version,
-            )
-            .map(|v| v.resolve())
-            .is_ok_and(|v| v == storage_file_version);
+            let version_ok = data_file
+                .file_version()
+                .is_ok_and(|v| v == ConcreteFileVersion::from(storage_file_version));
 
             if !version_ok {
                 is_same_version = false;
@@ -1574,6 +1571,7 @@ async fn reserve_fragment_ids(
         &transaction,
         &Default::default(),
         &Default::default(),
+        DEFAULT_COMMIT_RETRY_TIMEOUT,
         dataset.manifest_location.naming_scheme,
         None,
     )
@@ -2064,6 +2062,15 @@ pub async fn commit_compaction(
 
     let mut completed_tasks = completed_tasks;
 
+    // Collect the rewritten fragments' file paths up front so every failure
+    // path below can clean them up (or deliberately keep them). Fragment ids
+    // may still be reassigned by reserve_fragment_ids; cleanup only needs the
+    // file paths, which never change.
+    let all_new_fragments: Vec<Fragment> = completed_tasks
+        .iter()
+        .flat_map(|t| t.new_fragments.iter().cloned())
+        .collect();
+
     // Single reserve_fragment_ids for all address-style tasks
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
@@ -2071,7 +2078,10 @@ pub async fn commit_compaction(
             .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
-        reserve_fragment_ids(dataset, frags.into_iter()).await?;
+        if let Err(e) = reserve_fragment_ids(dataset, frags.into_iter()).await {
+            cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments).await;
+            return Err(e);
+        }
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -2210,7 +2220,10 @@ pub async fn commit_compaction(
             .iter_mut()
             .flat_map(|group| group.new_fragments.iter_mut())
             .collect::<Vec<_>>();
-        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
+        if let Err(e) = reserve_fragment_ids(dataset, new_fragments.into_iter()).await {
+            cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments).await;
+            return Err(e);
+        }
         Vec::new()
     } else {
         Vec::new()
@@ -2227,13 +2240,6 @@ pub async fn commit_compaction(
         }
         None
     };
-
-    // Collect new fragment paths before moving rewrite_groups into the transaction,
-    // so we can clean them up if the commit fails.
-    let all_new_fragments: Vec<Fragment> = rewrite_groups
-        .iter()
-        .flat_map(|g| g.new_fragments.iter().cloned())
-        .collect();
 
     let transaction = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
@@ -2257,17 +2263,34 @@ pub async fn commit_compaction(
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await
     {
-        cleanup_data_fragments(
-            &dataset.object_store,
-            &dataset.base,
-            None,
-            &all_new_fragments,
-        )
-        .await;
+        // RewriteResult is serializable and may be retried after an earlier
+        // ambiguous success. A conflict on this call therefore does not prove
+        // that the rewritten files are unreferenced. Leave them for dataset GC.
+        log::warn!(
+            "Compaction commit failed; leaving {} rewritten fragment(s) in place for GC: {}",
+            all_new_fragments.len(),
+            e
+        );
         return Err(e);
     }
 
     Ok(metrics)
+}
+
+/// Remove rewritten files after fragment-id reservation fails. Reservation
+/// commits do not reference the rewritten files, so they are still owned by
+/// this uncommitted compaction attempt and are safe to delete.
+async fn cleanup_compaction_files_after_reservation_failure(
+    dataset: &Dataset,
+    all_new_fragments: &[Fragment],
+) {
+    cleanup_data_fragments(
+        &dataset.object_store,
+        &dataset.base,
+        None,
+        all_new_fragments,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -2595,6 +2618,169 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 0);
+    }
+
+    fn list_data_files(uri: &str) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(std::path::Path::new(uri).join("data"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn execute_compaction_plan(
+        dataset: &Dataset,
+        options: &CompactionOptions,
+    ) -> Vec<RewriteResult> {
+        let plan = plan_compaction(dataset, options).await.unwrap();
+        assert!(!plan.tasks.is_empty());
+        let snapshot = dataset.clone();
+        futures::stream::iter(plan.tasks)
+            .map(|task| rewrite_files(Cow::Borrowed(&snapshot), task, options))
+            .buffer_unordered(1)
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    /// When the compaction commit's status is unknown (the commit errored and
+    /// verification was unavailable), the rewritten files must NOT be deleted:
+    /// if the commit landed they are referenced by the new version, and
+    /// deleting them would corrupt the table.
+    #[tokio::test]
+    async fn test_compaction_retry_after_ambiguous_success_preserves_live_files() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let data = sample_data();
+        let num_rows = data.num_rows();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 3_000,
+            enable_stable_row_ids: true,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let files_before = list_data_files(test_uri);
+        let options = CompactionOptions::default();
+        let completed = execute_compaction_plan(&dataset, &options).await;
+        let serialized = serde_json::to_vec(&completed).unwrap();
+        let retry_results: Vec<RewriteResult> = serde_json::from_slice(&serialized).unwrap();
+        let rewritten_files = list_data_files(test_uri)
+            .difference(&files_before)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!rewritten_files.is_empty());
+
+        handler.fail_next_rewrite(AmbiguousFailure::LandAndError);
+        handler
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect_err("unknown commit status must surface as an error");
+        assert!(
+            err.is_commit_status_unknown(),
+            "expected CommitStatusUnknown, got: {:?}",
+            err
+        );
+
+        handler
+            .fail_resolve
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Retrying the same serialized RewriteResult now conflicts with the
+        // Rewrite that already landed. The retry must not delete those files.
+        let retry_error = commit_compaction(
+            &mut dataset,
+            retry_results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect_err("the replayed rewrite must conflict with its landed predecessor");
+        assert!(
+            matches!(retry_error, Error::RetryableCommitConflict { .. }),
+            "expected RetryableCommitConflict, got: {retry_error:?}"
+        );
+        let files_after_retry = list_data_files(test_uri);
+        assert!(
+            rewritten_files
+                .iter()
+                .all(|file| files_after_retry.contains(file)),
+            "a replayed RewriteResult must not delete files referenced by the landed rewrite"
+        );
+
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
+        let scanned = ds.scan().try_into_batch().await.unwrap();
+        assert_eq!(scanned.num_rows(), num_rows);
+    }
+
+    /// A failed ReserveFragments commit cannot reference the rewritten files,
+    /// so both stable-row-id reservation paths must still clean them up.
+    #[tokio::test]
+    async fn test_compaction_cleans_up_files_when_fragment_reservation_fails() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let data = sample_data();
+        let num_rows = data.num_rows();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 3_000,
+            enable_stable_row_ids: true,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let files_before = list_data_files(test_uri);
+        let options = CompactionOptions::default();
+        let completed = execute_compaction_plan(&dataset, &options).await;
+        assert!(list_data_files(test_uri).len() > files_before.len());
+
+        handler.fail_next_reserve(AmbiguousFailure::FailOutright);
+        let err = commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect_err("fragment reservation that did not land must fail");
+        assert!(
+            !err.is_commit_status_unknown(),
+            "a verified-absent reservation is a definite failure, got: {:?}",
+            err
+        );
+
+        let files_after = list_data_files(test_uri);
+        let leftover: Vec<_> = files_after.difference(&files_before).collect();
+        assert!(
+            leftover.is_empty(),
+            "rewritten files must be cleaned up after reservation fails; leftover: {:?}",
+            leftover
+        );
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
     }
 
     #[tokio::test]
@@ -3285,6 +3471,77 @@ mod tests {
 
         let after_scalar_result = scalar_query(&dataset).await;
         assert_eq!(before_scalar_result, after_scalar_result);
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/8076
+    ///
+    /// A zone map or bloom filter index reports matches as physical row addresses, so
+    /// compaction invalidates it even under stable row ids. Reusing it for the rewritten
+    /// fragments made a filtered scan fail with an internal error (a fragment referenced
+    /// by the index no longer existed) or, once translation tolerated that, silently drop
+    /// every match.
+    #[rstest]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter)]
+    #[tokio::test]
+    async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
+        #[case] builtin: BuiltinIndexType,
+        #[case] index_type: IndexType,
+    ) {
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(200),
+            "memory://test/table",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 100, // 2 fragments, so compaction has something to merge
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                index_type,
+                None,
+                &ScalarIndexParams::for_builtin(builtin),
+                false,
+            )
+            .await
+            .unwrap();
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // The index only knows the pre-compaction fragments, so it must not claim to
+        // cover the fragment they were rewritten into.
+        let live_fragments: RoaringBitmap =
+            dataset.fragments().iter().map(|f| f.id as u32).collect();
+        let index = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.fields == vec![0])
+            .expect("index must survive compaction")
+            .clone();
+        assert!(
+            index
+                .effective_fragment_bitmap(&live_fragments)
+                .is_none_or(|covered| covered.is_empty()),
+            "compaction must not point an address-domain index at the fragments it wrote"
+        );
+
+        // Every fragment therefore falls back to a full scan, and the filter is answered
+        // in full.
+        let mut scanner = dataset.scan();
+        scanner.filter("i > 0").unwrap();
+        let matched = scanner.try_into_batch().await.unwrap();
+        assert_eq!(matched.num_rows(), 199);
     }
 
     // Regression test for https://github.com/lancedb/lance/issues/6161
@@ -7095,12 +7352,12 @@ mod tests {
         count_all_files_in(&data_dir).unwrap_or(0)
     }
 
-    /// Site 2 in PR #6320: when `commit_compaction` fails to apply the commit
-    /// after `rewrite_files` has already written new data files, those files
-    /// must be cleaned up. We force the commit failure by injecting an error on
-    /// writes to the `_transactions/` directory.
+    /// Once `commit_compaction` reaches the Rewrite commit, its input may be a
+    /// replay of a result whose earlier commit landed ambiguously. A failure on
+    /// this call must therefore leave data files for GC instead of deleting
+    /// files that an existing version may reference.
     #[tokio::test]
-    async fn test_commit_compaction_cleans_up_data_on_commit_failure() {
+    async fn test_commit_compaction_leaves_data_for_gc_on_commit_failure() {
         use crate::dataset::builder::DatasetBuilder;
         use crate::utils::test::FailingProxyStore;
         use lance_io::object_store::ObjectStoreParams;
@@ -7119,10 +7376,6 @@ mod tests {
             &routed_uri,
             Some(WriteParams {
                 max_rows_per_file: 100,
-                // Stable row IDs lets `commit_compaction` skip the
-                // `reserve_fragment_ids` pre-commit (which would otherwise fail
-                // *before* the new data files exist), isolating the failure to
-                // the `apply_commit` call we want to test.
                 enable_stable_row_ids: true,
                 ..Default::default()
             }),
@@ -7168,15 +7421,14 @@ mod tests {
             "Compaction should fail when transaction commit fails"
         );
 
-        assert_eq!(
-            count_data_files_in(test_uri),
-            baseline_files,
-            "Compaction data files should be cleaned up when commit fails"
+        assert!(
+            count_data_files_in(test_uri) > baseline_files,
+            "Compaction data files should be retained for GC after the Rewrite commit fails"
         );
     }
 
     #[tokio::test]
-    async fn test_commit_compaction_cleans_up_blob_v2_sidecars_on_commit_failure() {
+    async fn test_commit_compaction_leaves_blob_v2_sidecars_for_gc_on_commit_failure() {
         use crate::BlobArrayBuilder;
         use crate::dataset::builder::DatasetBuilder;
         use crate::utils::test::FailingProxyStore;
@@ -7249,10 +7501,9 @@ mod tests {
             "Compaction should fail when transaction commit fails"
         );
 
-        assert_eq!(
-            count_data_files_in(test_uri),
-            baseline_files,
-            "Blob v2 sidecars should be cleaned up when commit fails"
+        assert!(
+            count_data_files_in(test_uri) > baseline_files,
+            "Blob v2 sidecars should be retained for GC after the Rewrite commit fails"
         );
     }
 
@@ -8402,7 +8653,7 @@ mod tests {
     // overlay files into a fresh fragment with the overlays (and deletions)
     // materialized into the base data.
     use arrow_array::record_batch;
-    use lance_file::writer::{FileWriter, FileWriterOptions};
+    use lance_file::writer::FileWriterOptions;
     use lance_io::utils::CachedFileSize;
     use lance_table::format::DataFile;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -8454,22 +8705,20 @@ mod tests {
         let filename = format!("{}.lance", Uuid::new_v4());
         let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
         let obj_writer = dataset.object_store.create(&path).await.unwrap();
-        let mut writer = FileWriter::try_new(
+        let file_version = lance_file::version::ConcreteFileVersion::from(LanceFileVersion::Stable);
+        let mut writer = lance_file::versions::create_writer(
+            file_version,
             obj_writer,
             overlay_schema,
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::Stable),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )
         .unwrap();
-        let (major, minor) = writer.version().to_numbers();
         for (column_index, array) in columns.into_iter().enumerate() {
             writer.write_column(column_index, array).await.unwrap();
         }
         let summary = writer.finish().await.unwrap();
 
-        let mut data_file = DataFile::new_unstarted(filename, major, minor);
+        let mut data_file = DataFile::new_unstarted(filename, file_version);
         data_file.fields = writer
             .field_id_to_column_indices()
             .iter()

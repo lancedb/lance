@@ -11,9 +11,9 @@ use lance_arrow::DataTypeExt;
 use lance_core::Error;
 use lance_encoding::decoder::{ColumnInfo, PageEncoding, PageInfo as DecPageInfo};
 use lance_encoding::version::LanceFileVersion;
-use lance_file::format::pbfile;
 use lance_file::reader::FileReader as LFReader;
-use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::writer::FileWriterOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Writer;
 use lance_table::format::{DataFile, Fragment};
@@ -134,10 +134,12 @@ async fn finalize_current_output_file(
     flush_footer(writer, schema, &final_cols, total_rows_in_current, version).await?;
 
     // Register the newly closed output file as a fragment data file
-    let (maj, min) = version.to_numbers();
     let mut fragment = Fragment::new(0);
     let field_column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
-    let mut data_file = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
+    let mut data_file = DataFile::new_unstarted(
+        current_filename.take().unwrap(),
+        ConcreteFileVersion::from(version),
+    );
     data_file.fields = full_field_ids.to_vec().into();
     data_file.column_indices = field_column_indices.into();
     fragment.files.push(data_file);
@@ -193,12 +195,12 @@ pub async fn rewrite_files_binary_copy(
     let full_field_ids = schema.field_ids();
 
     // The previous checks have ensured that the file versions of all files are consistent.
-    let version = LanceFileVersion::try_from_major_minor(
+    let version: LanceFileVersion = ConcreteFileVersion::from_data_file_numbers(
         fragments[0].files[0].file_major_version,
         fragments[0].files[0].file_minor_version,
     )
     .unwrap()
-    .resolve();
+    .into();
     // v2.0 and v2.1+ handle structural headers differently during file writing:
     // - v2_0 materializes ALL fields in pre-order traversal (leaf fields + non-leaf struct headers),
     //   which means the ColumnInfo set includes all fields in pre-order traversal.
@@ -512,9 +514,7 @@ pub async fn rewrite_files_binary_copy(
 ///
 /// This function does not manually craft the footer. Instead it:
 /// - Pads the current `ObjectWriter` position to a 64‑byte boundary (required for v2_1+ readers).
-/// - Converts the collected per‑column info (`final_cols`) into `ColumnMetadata`.
-/// - Constructs a `lance_file::writer::FileWriter` with the active `schema`, column metadata,
-///   and `total_rows_in_current`.
+/// - Initializes a `lance_file::writer::FileWriter` from the collected column metadata.
 /// - Calls `FileWriter::finish()` to emit column metadata, offset tables, global buffers
 ///   (schema descriptor), version, and to close the writer.
 ///
@@ -535,68 +535,16 @@ async fn flush_footer(
     let pos = writer.tell().await? as u64;
     let _new_pos = apply_alignment_padding(writer.as_mut(), pos, version).await?;
 
-    let mut col_metadatas = Vec::with_capacity(final_cols.len());
-    for col in final_cols {
-        let pages = col
-            .page_infos
-            .iter()
-            .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
-                let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
-                    .buffer_offsets_and_sizes
-                    .as_ref()
-                    .iter()
-                    .cloned()
-                    .unzip();
-                Ok(pbfile::column_metadata::Page {
-                    buffer_offsets,
-                    buffer_sizes,
-                    encoding: Some(pbfile::Encoding {
-                        location: Some(pbfile::encoding::Location::Direct(
-                            pbfile::DirectEncoding {
-                                encoding: encoded_encoding,
-                            },
-                        )),
-                    }),
-                    length: page_info.num_rows,
-                    priority: page_info.priority,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
-            col.buffer_offsets_and_sizes.iter().cloned().unzip();
-        let encoded_col_encoding = Any::from_msg(&col.encoding)?.encode_to_vec();
-        let column = pbfile::ColumnMetadata {
-            pages,
-            buffer_offsets,
-            buffer_sizes,
-            encoding: Some(pbfile::Encoding {
-                location: Some(pbfile::encoding::Location::Direct(pbfile::DirectEncoding {
-                    encoding: encoded_col_encoding,
-                })),
-            }),
-        };
-        col_metadatas.push(column);
-    }
-    let mut file_writer = FileWriter::new_lazy(
+    let mut file_writer = lance_file::versions::create_lazy_writer(
+        ConcreteFileVersion::from(version),
         writer,
-        FileWriterOptions {
-            format_version: Some(version),
-            ..Default::default()
-        },
-    );
-    file_writer.initialize_with_external_metadata(
+        FileWriterOptions::default(),
+    )?;
+    file_writer.initialize_with_external_columns(
         schema.clone(),
-        col_metadatas,
+        final_cols,
         total_rows_in_current,
-    );
+    )?;
     file_writer.finish().await?;
     Ok(())
 }

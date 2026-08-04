@@ -240,6 +240,12 @@ use lance_core::error::LanceOptionExt;
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
 
+use crate::array_encoding::logical::list::OffsetPageInfo;
+use crate::array_encoding::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
+use crate::array_encoding::logical::{
+    binary::BinaryFieldScheduler, blob::BlobFieldScheduler, list::ListFieldScheduler,
+    primitive::PrimitiveFieldScheduler,
+};
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
 use crate::encoder::EncodedBatch;
@@ -250,16 +256,71 @@ use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
 use crate::format::pb21;
-use crate::previous::decoder::LogicalPageDecoder;
-use crate::previous::encodings::logical::list::OffsetPageInfo;
-use crate::previous::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
-use crate::previous::encodings::logical::{
-    binary::BinaryFieldScheduler, blob::BlobFieldScheduler, list::ListFieldScheduler,
-    primitive::PrimitiveFieldScheduler,
-};
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
-use crate::version::LanceFileVersion;
 use crate::{BufferScheduler, EncodingsIo};
+
+pub trait SchedulingJob: std::fmt::Debug {
+    fn schedule_next(
+        &mut self,
+        context: &mut SchedulerContext,
+        priority: &dyn PriorityRange,
+    ) -> Result<ScheduledScanLine>;
+
+    fn num_rows(&self) -> u64;
+}
+
+/// Schedules the I/O needed to decode one field.
+pub trait FieldScheduler: Send + Sync + std::fmt::Debug {
+    fn initialize<'a>(
+        &'a self,
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+    ) -> Result<Box<dyn SchedulingJob + 'a>>;
+
+    fn num_rows(&self) -> u64;
+}
+
+#[derive(Debug)]
+pub struct DecoderReady {
+    pub decoder: Box<dyn LogicalPageDecoder>,
+    pub path: VecDeque<u32>,
+}
+
+/// Stateful decoder for one logical page.
+pub trait LogicalPageDecoder: std::fmt::Debug + Send {
+    fn accept_child(&mut self, _child: DecoderReady) -> Result<()> {
+        Err(Error::internal(format!(
+            "The decoder {:?} does not expect children but received a child",
+            self
+        )))
+    }
+
+    fn wait_for_loaded(&'_ mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>>;
+
+    fn rows_loaded(&self) -> u64;
+
+    fn rows_unloaded(&self) -> u64 {
+        self.num_rows() - self.rows_loaded()
+    }
+
+    fn num_rows(&self) -> u64;
+
+    fn rows_drained(&self) -> u64;
+
+    fn rows_left(&self) -> u64 {
+        self.num_rows() - self.rows_drained()
+    }
+
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
+
+    fn data_type(&self) -> &DataType;
+}
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
@@ -288,13 +349,13 @@ fn inline_scheduling_threshold() -> u64 {
     })
 }
 
-/// Top-level encoding message for a page.  Wraps both the
-/// legacy pb::ArrayEncoding and the newer pb::PageLayout
+/// Top-level encoding message for a page. Wraps both the v2.0
+/// [`pb::ArrayEncoding`] grammar and the structural [`pb21::PageLayout`] grammar.
 ///
 /// A file should only use one or the other and never both.
 /// 2.0 decoders can always assume this is pb::ArrayEncoding
 /// and 2.1+ decoders can always assume this is pb::PageLayout
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PageEncoding {
     Legacy(pb::ArrayEncoding),
     Structural(pb21::PageLayout),
@@ -402,21 +463,21 @@ impl ColumnInfo {
 
 enum RootScheduler {
     Structural(Box<dyn StructuralFieldScheduler>),
-    Legacy(Arc<dyn crate::previous::decoder::FieldScheduler>),
+    Array(Arc<dyn FieldScheduler>),
 }
 
 impl RootScheduler {
-    fn as_legacy(&self) -> &Arc<dyn crate::previous::decoder::FieldScheduler> {
+    fn as_array(&self) -> &Arc<dyn FieldScheduler> {
         match self {
-            Self::Structural(_) => panic!("Expected a legacy scheduler"),
-            Self::Legacy(s) => s,
+            Self::Structural(_) => panic!("Expected an array scheduler"),
+            Self::Array(s) => s,
         }
     }
 
     fn as_structural(&self) -> &dyn StructuralFieldScheduler {
         match self {
             Self::Structural(s) => s.as_ref(),
-            Self::Legacy(_) => panic!("Expected a structural scheduler"),
+            Self::Array(_) => panic!("Expected a structural scheduler"),
         }
     }
 }
@@ -606,14 +667,14 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
-    fn is_primitive_legacy(data_type: &DataType) -> bool {
+    fn is_array_primitive(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
                 DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
-                DataType::FixedSizeList(inner, _) => Self::is_primitive_legacy(inner.data_type()),
+                DataType::FixedSizeList(inner, _) => Self::is_array_primitive(inner.data_type()),
                 _ => false,
             }
         }
@@ -624,7 +685,7 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column: &ColumnInfo,
         buffers: FileBuffers,
-    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn FieldScheduler>> {
         Self::ensure_values_encoded(column, &field.name)?;
         // Primitive fields map to a single column
         let column_buffers = ColumnBuffers {
@@ -667,14 +728,14 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         offsets_column: &ColumnInfo,
-    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn FieldScheduler>> {
         Self::ensure_values_encoded(offsets_column, &list_field.name)?;
         let offsets_column_buffers = ColumnBuffers {
             file_buffers: buffers,
             positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
         };
         let items_scheduler =
-            self.create_legacy_field_scheduler(&list_field.children[0], column_infos, buffers)?;
+            self.create_array_field_scheduler(&list_field.children[0], column_infos, buffers)?;
 
         let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
             .page_infos
@@ -712,7 +773,7 @@ impl CoreFieldDecoderStrategy {
             Arc::from(inner_infos.into_boxed_slice()),
             offsets_column_buffers,
             self.validate_data,
-        )) as Arc<dyn crate::previous::decoder::FieldScheduler>;
+        )) as Arc<dyn FieldScheduler>;
         let items_field = match list_field.data_type() {
             DataType::List(inner) => inner,
             DataType::LargeList(inner) => inner,
@@ -853,15 +914,15 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
-    fn create_legacy_field_scheduler(
+    fn create_array_field_scheduler(
         &self,
         field: &Field,
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
-    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn FieldScheduler>> {
         let data_type = field.data_type();
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
-        if Self::is_primitive_legacy(&data_type) {
+        if Self::is_array_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
             return Ok(scheduler);
@@ -920,7 +981,7 @@ impl CoreFieldDecoderStrategy {
             DataType::FixedSizeList(inner, _dimension) => {
                 // A fixed size list column could either be a physical or a logical decoder
                 // depending on the child data type.
-                if Self::is_primitive_legacy(inner.data_type()) {
+                if Self::is_array_primitive(inner.data_type()) {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -930,7 +991,7 @@ impl CoreFieldDecoderStrategy {
                 }
             }
             DataType::Dictionary(_key_type, value_type) => {
-                if Self::is_primitive_legacy(value_type) || value_type.is_binary_like() {
+                if Self::is_array_primitive(value_type) || value_type.is_binary_like() {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -974,7 +1035,7 @@ impl CoreFieldDecoderStrategy {
                     for field in &field.children {
                         column_infos.next_top_level();
                         let field_scheduler =
-                            self.create_legacy_field_scheduler(field, column_infos, buffers)?;
+                            self.create_array_field_scheduler(field, column_infos, buffers)?;
                         child_schedulers.push(Arc::from(field_scheduler));
                     }
 
@@ -1008,7 +1069,7 @@ fn root_column(num_rows: u64) -> ColumnInfo {
                     pb::SimpleStruct {},
                 )),
             }),
-            priority: 0, // not used in legacy scheduler
+            priority: 0, // not used by the array scheduler
             buffer_offsets_and_sizes: Arc::new([]),
         })
         .collect::<Vec<_>>();
@@ -1024,21 +1085,21 @@ fn root_column(num_rows: u64) -> ColumnInfo {
 
 pub enum RootDecoder {
     Structural(StructuralStructDecoder),
-    Legacy(SimpleStructDecoder),
+    Array(SimpleStructDecoder),
 }
 
 impl RootDecoder {
     pub fn into_structural(self) -> StructuralStructDecoder {
         match self {
             Self::Structural(decoder) => decoder,
-            Self::Legacy(_) => panic!("Expected a structural decoder"),
+            Self::Array(_) => panic!("Expected a structural decoder"),
         }
     }
 
-    pub fn into_legacy(self) -> SimpleStructDecoder {
+    pub fn into_array(self) -> SimpleStructDecoder {
         match self {
-            Self::Legacy(decoder) => decoder,
-            Self::Structural(_) => panic!("Expected a legacy decoder"),
+            Self::Array(decoder) => decoder,
+            Self::Structural(_) => panic!("Expected an array decoder"),
         }
     }
 }
@@ -1104,27 +1165,27 @@ impl DecodeBatchScheduler {
             let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
             let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
             let root_scheduler =
-                strategy.create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
+                strategy.create_array_field_scheduler(&root_field, &mut column_iter, buffers)?;
 
             let context = SchedulerContext::new(io, cache.clone());
             root_scheduler.initialize(filter, &context).await?;
 
             Ok(Self {
-                root_scheduler: RootScheduler::Legacy(root_scheduler.into()),
+                root_scheduler: RootScheduler::Array(root_scheduler.into()),
                 root_fields,
                 cache,
             })
         }
     }
 
-    #[deprecated(since = "0.29.1", note = "This is for legacy 2.0 paths")]
+    #[deprecated(since = "0.29.1", note = "This is for v2.0 array-encoding paths")]
     pub fn from_scheduler(
-        root_scheduler: Arc<dyn crate::previous::decoder::FieldScheduler>,
+        root_scheduler: Arc<dyn FieldScheduler>,
         root_fields: Fields,
         cache: Arc<LanceCache>,
     ) -> Self {
         Self {
-            root_scheduler: RootScheduler::Legacy(root_scheduler),
+            root_scheduler: RootScheduler::Array(root_scheduler),
             root_fields,
             cache,
         }
@@ -1174,7 +1235,7 @@ impl DecodeBatchScheduler {
         }
     }
 
-    fn do_schedule_ranges_legacy(
+    fn do_schedule_ranges_array(
         &mut self,
         ranges: &[Range<u64>],
         filter: &FilterExpression,
@@ -1185,7 +1246,7 @@ impl DecodeBatchScheduler {
         // tasks are scheduled at the same top level row.
         priority: Option<Box<dyn PriorityRange>>,
     ) {
-        let root_scheduler = self.root_scheduler.as_legacy();
+        let root_scheduler = self.root_scheduler.as_array();
         let rows_requested = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         trace!(
             "Scheduling {} ranges across {}..{} ({} rows){}",
@@ -1249,8 +1310,8 @@ impl DecodeBatchScheduler {
         priority: Option<Box<dyn PriorityRange>>,
     ) {
         match &self.root_scheduler {
-            RootScheduler::Legacy(_) => {
-                self.do_schedule_ranges_legacy(ranges, filter, io, schedule_action, priority)
+            RootScheduler::Array(_) => {
+                self.do_schedule_ranges_array(ranges, filter, io, schedule_action, priority)
             }
             RootScheduler::Structural(_) => {
                 self.do_schedule_ranges_structural(ranges, filter, io, schedule_action)
@@ -1422,7 +1483,7 @@ impl BatchDecodeStream {
         }
     }
 
-    fn accept_decoder(&mut self, decoder: crate::previous::decoder::DecoderReady) -> Result<()> {
+    fn accept_decoder(&mut self, decoder: DecoderReady) -> Result<()> {
         if decoder.path.is_empty() {
             // The root decoder we can ignore
             Ok(())
@@ -1443,7 +1504,7 @@ impl BatchDecodeStream {
                     let scan_line = scan_line?;
                     self.rows_scheduled = scan_line.scheduled_so_far;
                     for message in scan_line.decoders {
-                        self.accept_decoder(message.into_legacy())?;
+                        self.accept_decoder(message.into_array())?;
                     }
                 }
                 None => {
@@ -1552,7 +1613,7 @@ impl BatchDecodeStream {
 // we can have a single implementation of the batch decode iterator
 enum RootDecoderMessage {
     LoadedPage(LoadedPageShard),
-    LegacyPage(crate::previous::decoder::DecoderReady),
+    ArrayPage(DecoderReady),
 }
 trait RootDecoderType {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()>;
@@ -1576,10 +1637,10 @@ impl RootDecoderType for StructuralStructDecoder {
 }
 impl RootDecoderType for SimpleStructDecoder {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
-        let RootDecoderMessage::LegacyPage(legacy_page) = message else {
+        let RootDecoderMessage::ArrayPage(array_page) = message else {
             unreachable!()
         };
-        self.accept_child(legacy_page)
+        self.accept_child(array_page)
     }
     fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         self.drain(num_rows)
@@ -1663,7 +1724,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                         // The root decoder we can ignore
                         if !decoder_ready.path.is_empty() {
                             self.root_decoder
-                                .accept_message(RootDecoderMessage::LegacyPage(decoder_ready))?;
+                                .accept_message(RootDecoderMessage::ArrayPage(decoder_ready))?;
                         }
                     }
                 }
@@ -1789,7 +1850,8 @@ pub struct StructuralBatchDecodeStream {
     // - false: run `into_batch` inline, which avoids Tokio scheduling overhead and is
     //   typically better for point lookups / small takes.
     spawn_batch_decode_tasks: bool,
-    /// If set, target this many bytes per batch instead of `rows_per_batch` rows.
+    /// If set, target this many bytes per batch while retaining `rows_per_batch`
+    /// as an independent upper bound.
     batch_size_bytes: Option<u64>,
     /// Schema-based estimate of bytes per row, computed once at construction.
     /// Only meaningful when `batch_size_bytes` is `Some`.
@@ -1877,6 +1939,7 @@ impl StructuralBatchDecodeStream {
             return Ok(None);
         }
 
+        let row_limit = self.rows_remaining.min(self.rows_per_batch as u64);
         let mut to_take = if let Some(batch_size_bytes) = self.batch_size_bytes {
             let feedback = self.bytes_per_row_feedback.load(Ordering::Relaxed);
             let bpr = if feedback > 0 {
@@ -1885,9 +1948,9 @@ impl StructuralBatchDecodeStream {
                 self.schema_bytes_per_row
             };
             let rows = (batch_size_bytes as f64 / bpr) as u64;
-            self.rows_remaining.min(rows.max(1))
+            row_limit.min(rows.max(1))
         } else {
-            self.rows_remaining.min(self.rows_per_batch as u64)
+            row_limit
         };
         self.rows_remaining -= to_take;
 
@@ -2051,7 +2114,8 @@ pub struct SchedulerDecoderConfig {
     pub cache: Arc<LanceCache>,
     /// Decoder configuration
     pub decoder_config: DecoderConfig,
-    /// If set, target this many bytes per batch instead of using `batch_size` rows.
+    /// If set, target this many bytes per batch while retaining `batch_size` as
+    /// an independent row-count upper bound.
     ///
     /// Only supported for v2.1+ (structural) files. For v2.0 files this
     /// option is ignored and a warning is logged.
@@ -2631,17 +2695,14 @@ impl SchedulerContext {
         VecDeque::from_iter(self.path.iter().copied())
     }
 
-    #[deprecated(since = "0.29.1", note = "This is for legacy 2.0 paths")]
-    pub fn locate_decoder(
-        &mut self,
-        decoder: Box<dyn crate::previous::decoder::LogicalPageDecoder>,
-    ) -> crate::previous::decoder::DecoderReady {
+    #[deprecated(since = "0.29.1", note = "This is for v2.0 array-encoding paths")]
+    pub fn locate_decoder(&mut self, decoder: Box<dyn LogicalPageDecoder>) -> DecoderReady {
         trace!(
             "Scheduling decoder of type {:?} for {:?}",
             decoder.data_type(),
             self.path,
         );
-        crate::previous::decoder::DecoderReady {
+        DecoderReady {
             decoder,
             path: self.current_path(),
         }
@@ -2762,7 +2823,7 @@ pub enum MessageType {
     // decoder itself.  The messages were not sent in priority order and the decoder
     // had to wait for I/O, figuring out the correct priority.  This was a lot of
     // complexity.
-    DecoderReady(crate::previous::decoder::DecoderReady),
+    DecoderReady(DecoderReady),
     // Starting in 2.1 we use a simpler scheme where the scheduling happens in priority
     // order and the message is an unloaded decoder.  These can be awaited, in order, and
     // the decoder does not have to worry about waiting for I/O.
@@ -2770,7 +2831,7 @@ pub enum MessageType {
 }
 
 impl MessageType {
-    pub fn into_legacy(self) -> crate::previous::decoder::DecoderReady {
+    pub fn into_array(self) -> DecoderReady {
         match self {
             Self::DecoderReady(decoder) => decoder,
             Self::UnloadedPage(_) => {
@@ -2870,13 +2931,22 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
 #[derive(Debug, Default)]
 pub struct DecoderPlugins {}
 
+/// The top-level column layout used by an in-memory encoded batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedBatchLayout {
+    /// Array pages include structural columns.
+    Array,
+    /// Structural pages include only leaf columns.
+    Structural,
+}
+
 /// Decodes a batch of data from an in-memory structure created by [`crate::encoder::encode_batch`]
 pub async fn decode_batch(
     batch: &EncodedBatch,
     filter: &FilterExpression,
     decoder_plugins: Arc<DecoderPlugins>,
     should_validate: bool,
-    version: LanceFileVersion,
+    layout: EncodedBatchLayout,
     cache: Option<Arc<LanceCache>>,
 ) -> Result<RecordBatch> {
     // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
@@ -2906,7 +2976,7 @@ pub async fn decode_batch(
     .await?;
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
-    let is_structural = version >= LanceFileVersion::V2_1;
+    let is_structural = layout == EncodedBatchLayout::Structural;
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
     let spawn_structural_batch_decode_tasks = !matches!(mode.ok().as_deref(), Some("never"));
     let mut decode_stream = create_decode_stream(
@@ -2926,7 +2996,6 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
-    use crate::previous::decoder::{DecoderReady, LogicalPageDecoder};
     use std::collections::VecDeque;
 
     #[derive(Debug)]
@@ -3028,11 +3097,11 @@ mod tests {
             err
         );
 
-        let mut legacy_columns = ColumnInfoIter::new(vec![], &[]);
+        let mut array_columns = ColumnInfoIter::new(vec![], &[]);
         let err = strategy
-            .create_legacy_field_scheduler(
+            .create_array_field_scheduler(
                 &field,
-                &mut legacy_columns,
+                &mut array_columns,
                 FileBuffers {
                     positions_and_sizes: &[],
                 },
@@ -3047,7 +3116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_stream_stops_on_load_error() {
+    async fn test_array_stream_stops_on_load_error() {
         use arrow_schema::Field as ArrowField;
 
         let rows_per_batch = 1;
@@ -3081,7 +3150,7 @@ mod tests {
         let err = batches
             .next()
             .await
-            .expect("stream should emit the legacy page-load error")
+            .expect("stream should emit the array page-load error")
             .unwrap_err();
         assert!(
             err.to_string().contains(load_error_message),
@@ -3090,7 +3159,7 @@ mod tests {
         );
         assert!(
             batches.next().await.is_none(),
-            "stream should stop after the legacy page-load error"
+            "stream should stop after the array page-load error"
         );
     }
 
@@ -3186,15 +3255,14 @@ mod tests {
         batch_size: u32,
         batch_size_bytes: Option<u64>,
     ) -> Vec<RecordBatch> {
-        use crate::encoder::{EncodingOptions, default_encoding_strategy, encode_batch};
-        use crate::version::LanceFileVersion;
-
-        let version = LanceFileVersion::V2_1;
-        let options = EncodingOptions {
-            version,
-            ..Default::default()
+        use crate::{
+            encoder::{EncodingOptions, encode_batch},
+            testing::{TestEncoding, test_encoding_strategy},
         };
-        let strategy = default_encoding_strategy(version);
+
+        let version = TestEncoding::StructuralU16;
+        let options = EncodingOptions::default();
+        let strategy = test_encoding_strategy(version);
         let schema = Schema::try_from(batch.schema().as_ref()).unwrap();
         let encoded = encode_batch(batch, Arc::new(schema.clone()), strategy.as_ref(), &options)
             .await
@@ -3332,6 +3400,29 @@ mod tests {
                 batch.num_rows()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_byte_sized_batches_respect_row_limit() {
+        use arrow_array::Int32Array;
+
+        let num_rows: i32 = 1000;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let input_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+
+        // The byte limit can hold every row, so the 100-row limit must win.
+        let batches =
+            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 100, Some(10_000)).await;
+        assert_eq!(batches.len(), 10);
+        assert!(batches.iter().all(|batch| batch.num_rows() == 100));
     }
 
     #[tokio::test]

@@ -27,9 +27,8 @@ use lance_core::utils::tracing::{
     DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS,
 };
 use lance_datafusion::projection::ProjectionPlan;
-use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     ChainedWrappingObjectStore, LanceNamespaceStorageOptionsProvider, ObjectStore,
@@ -44,7 +43,7 @@ use lance_io::utils::{
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb,
+    pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -113,8 +112,8 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
-    commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments,
+    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
+    commit_transaction, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -773,9 +772,7 @@ impl Dataset {
                 .await;
         }
 
-        if manifest.should_use_legacy_format() {
-            populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
-        }
+        populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
 
         Ok(manifest)
     }
@@ -1180,7 +1177,7 @@ impl Dataset {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
+        if manifest.schema.has_dictionary_types() {
             let reader = if let Some(size) = location.size {
                 self.object_store
                     .open_with_size(&location.path, size as usize)
@@ -1188,7 +1185,7 @@ impl Dataset {
             } else {
                 self.object_store.open(&location.path).await?
             };
-            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+            populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
         }
         let manifest_arc = Arc::new(manifest);
         self.metadata_cache
@@ -1620,6 +1617,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
+            DEFAULT_COMMIT_RETRY_TIMEOUT,
             self.manifest_location.naming_scheme,
             None,
         )
@@ -2230,10 +2228,11 @@ impl Dataset {
             .await?;
         let file_metadata = FileReader::read_all_metadata(&file).await?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            file_metadata.major_version as u32,
-            file_metadata.minor_version as u32,
+        let lance_file_format = ConcreteFileVersion::from_footer_numbers(
+            file_metadata.major_version,
+            file_metadata.minor_version,
         )?;
+        let file_version: LanceFileVersion = lance_file_format.into();
 
         let is_structural = file_version >= LanceFileVersion::V2_1;
         let physical_columns = file_metadata.column_metadatas.len();
@@ -2451,8 +2450,7 @@ impl Dataset {
             path,
             fields,
             column_indices,
-            file_metadata.major_version as u32,
-            file_metadata.minor_version as u32,
+            lance_file_format,
             file_size_nz,
             base_id,
         ))
@@ -3976,6 +3974,12 @@ impl Default for ManifestWriteConfig {
 impl ManifestWriteConfig {
     pub fn disable_transaction_file(&self) -> bool {
         self.disable_transaction_file
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
+        self.disable_transaction_file = true;
+        self
     }
 }
 

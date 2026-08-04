@@ -1946,6 +1946,80 @@ def dataset_for_pandas_no_blob_tests(tmp_path):
     return lance.write_dataset(table, tmp_path / "no_blob_pandas_ds")
 
 
+def _lazy_blob_values(dataset):
+    values = dataset.scanner(columns=["blob"]).to_pandas(blob_mode="lazy")["blob"]
+    return [None if value is None else value.readall() for value in values]
+
+
+@pytest.mark.parametrize(
+    "values, has_sidecar",
+    [
+        pytest.param([b"", b"payload", None], False, id="leading_empty"),
+        pytest.param([b"", b"", b""], False, id="all_empty"),
+        pytest.param(
+            [b"payload", b"", None, b"tail", b""],
+            False,
+            id="payload_empty_null",
+        ),
+        pytest.param(
+            [b"", b"p" * (64 * 1024 + 1024), None, b""],
+            True,
+            id="sidecar_backed",
+        ),
+    ],
+)
+def test_blob_v2_lazy_preserves_empty_and_null(tmp_path, values, has_sidecar):
+    dataset_path = tmp_path / "blob_v2_lazy_empty"
+    schema = pa.schema([lance.blob_field("blob")])
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays([lance.blob_array(values)], schema=schema),
+        dataset_path,
+        data_storage_version="2.2",
+    )
+
+    descriptions = dataset.to_table(columns=["blob"]).column("blob").to_pylist()
+    assert [description is None for description in descriptions] == [
+        value is None for value in values
+    ]
+    if values[0] == b"":
+        assert descriptions[0]["position"] == 0
+        assert descriptions[0]["size"] == 0
+    if has_sidecar:
+        assert any(
+            description is not None and description["kind"] == 1
+            for description in descriptions
+        )
+        assert any(path.suffix == ".blob" for path in _dataset_file_set(dataset_path))
+
+    assert _lazy_blob_values(dataset) == values
+
+
+def test_blob_v1_lazy_preserves_empty_and_null_sentinels(tmp_path):
+    values = [b"", None, b"payload"]
+    schema = pa.schema(
+        [
+            pa.field(
+                "blob",
+                pa.large_binary(),
+                metadata={"lance-encoding:blob": "true"},
+            )
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays(
+            [pa.array(values, type=pa.large_binary())],
+            schema=schema,
+        ),
+        tmp_path / "blob_v1_lazy_empty",
+        data_storage_version="2.0",
+    )
+
+    descriptions = dataset.to_table(columns=["blob"]).column("blob").to_pylist()
+    assert descriptions[0] == {"position": 0, "size": 0}
+    assert descriptions[1] == {"position": 1, "size": 0}
+    assert _lazy_blob_values(dataset) == values
+
+
 @pytest.mark.parametrize("source", ["dataset", "scanner", "fragment"])
 def test_to_pandas_without_blobs_matches_arrow_with_kwargs(
     dataset_for_pandas_no_blob_tests,

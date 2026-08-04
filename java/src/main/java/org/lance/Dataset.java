@@ -19,6 +19,7 @@ import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
 import org.lance.index.Index;
+import org.lance.index.IndexBuildProgress;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
@@ -1153,6 +1154,29 @@ public class Dataset implements Closeable {
   private native void innerMergeIndexMetadata(
       String indexUUID, int indexType, Optional<Integer> batchReadHead);
 
+  /**
+   * Merge distributed index metadata while reporting stage-level progress.
+   *
+   * @param indexUUID shared UUID used by the distributed index parts
+   * @param indexType type of index metadata to merge
+   * @param batchReadHead optional limit for metadata read concurrency
+   * @param progress thread-safe progress callback
+   */
+  public void mergeIndexMetadata(
+      String indexUUID,
+      IndexType indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress) {
+    Preconditions.checkNotNull(progress, "progress cannot be null");
+    innerMergeIndexMetadataWithProgress(indexUUID, indexType.getValue(), batchReadHead, progress);
+  }
+
+  private native void innerMergeIndexMetadataWithProgress(
+      String indexUUID,
+      int indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress);
+
   /** Merge one caller-defined group of existing uncommitted vector index segments. */
   public Index mergeExistingIndexSegments(List<Index> segments) {
     Preconditions.checkNotNull(segments, "segments cannot be null");
@@ -1302,6 +1326,36 @@ public class Dataset implements Closeable {
   }
 
   private native List<FragmentMetadata> getFragmentsNative();
+
+  /**
+   * Get per-fragment statistics for all fragments in this dataset version.
+   *
+   * <p>Unlike {@link #getFragments()}, this is a metadata-only bulk operation: no per-fragment Java
+   * objects are materialized, making it suitable for planning over datasets with a very large
+   * number of fragments. Row counts match {@link FragmentMetadata#getNumRows()} (physical rows
+   * minus deleted rows).
+   *
+   * @return per-fragment statistics as parallel arrays, in manifest order
+   */
+  public FragmentStatistics getFragmentStatistics() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      // Flattened as [id0, rowCount0, dataFileNum0, id1, ...] to keep the JNI surface primitive
+      long[] flat = nativeGetFragmentStatistics();
+      int count = flat.length / 3;
+      int[] ids = new int[count];
+      long[] rowCounts = new long[count];
+      int[] dataFileNums = new int[count];
+      for (int i = 0; i < count; i++) {
+        ids[i] = (int) flat[3 * i];
+        rowCounts[i] = flat[3 * i + 1];
+        dataFileNums[i] = (int) flat[3 * i + 2];
+      }
+      return new FragmentStatistics(ids, rowCounts, dataFileNums);
+    }
+  }
+
+  private native long[] nativeGetFragmentStatistics();
 
   /**
    * Gets the arrow schema of the dataset.

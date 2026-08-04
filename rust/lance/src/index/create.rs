@@ -47,6 +47,25 @@ fn default_index_name(fields: &[&str]) -> String {
     }
 }
 
+fn resolved_inverted_params(params: &ScalarIndexParams) -> Result<InvertedIndexParams> {
+    let mut merged = serde_json::to_value(InvertedIndexParams::default())?;
+    if let Some(raw_params) = params.params.as_deref() {
+        let provided = serde_json::from_str::<serde_json::Value>(raw_params)?;
+        let merged = merged.as_object_mut().ok_or_else(|| {
+            Error::internal("default inverted index parameters are not a JSON object".to_string())
+        })?;
+        let provided = provided.as_object().ok_or_else(|| {
+            Error::invalid_input("inverted index parameters must be a JSON object".to_string())
+        })?;
+        merged.extend(provided.clone());
+    }
+    Ok(serde_json::from_value(merged)?)
+}
+
+fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
+    Ok(ScalarIndexParams::new("inverted".to_string()).with_params(&params.to_training_json()?))
+}
+
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
     columns: Vec<String>,
@@ -147,19 +166,87 @@ impl<'a> CreateIndexBuilder<'a> {
             ));
         }
         let column_input = &self.columns[0];
+        let scalar_fts_request = self.index_type == IndexType::Scalar
+            && self
+                .params
+                .as_any()
+                .downcast_ref::<ScalarIndexParams>()
+                .is_some_and(|params| {
+                    params.index_type.eq_ignore_ascii_case("inverted")
+                        || params.index_type.eq_ignore_ascii_case("fts")
+                });
+        let inverted_params = if self.index_type == IndexType::Inverted {
+            if let Some(params) = self
+                .params
+                .as_any()
+                .downcast_ref::<InvertedIndexParams>()
+            {
+                Some(params.clone())
+            } else if let Some(params) =
+                self.params.as_any().downcast_ref::<ScalarIndexParams>()
+            {
+                Some(resolved_inverted_params(params)?)
+            } else {
+                return Err(Error::index(
+                    "Inverted index type must take InvertedIndexParams or ScalarIndexParams"
+                        .to_string(),
+                ));
+            }
+        } else if scalar_fts_request {
+            Some(resolved_inverted_params(
+                self.params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .expect("scalar_fts_request verified scalar params"),
+            )?)
+        } else {
+            None
+        };
+        let resolved_fts_field = if let Some(params) = &inverted_params {
+            Some(crate::index::scalar::inverted::resolve_fts_field(
+                self.dataset.schema(),
+                column_input,
+                params.get_document_granularity(),
+            )?)
+        } else {
+            None
+        };
+        let lookup_column = resolved_fts_field
+            .as_ref()
+            .map(|resolved| resolved.root_column.as_str())
+            .unwrap_or(column_input);
         // Use case-insensitive lookup for both simple and nested paths.
         // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
-        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
+        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(lookup_column) else {
             return Err(Error::index(format!(
                 "CreateIndex: column '{column_input}' does not exist"
             )));
         };
-        let field = *field_path.last().unwrap();
+        let field = if let Some(resolved) = &resolved_fts_field {
+            self.dataset
+                .schema()
+                .field_by_id(resolved.final_field_id)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "CreateIndex: FTS field path '{column_input}' resolved to missing field id {}",
+                        resolved.final_field_id
+                    ))
+                })?
+        } else {
+            *field_path.last().ok_or_else(|| {
+                Error::index(format!(
+                    "CreateIndex: column '{column_input}' resolved to an empty field path"
+                ))
+            })?
+        };
         // Reconstruct the column path with correct case from schema
         // Use quoted format for SQL parsing (special chars are quoted)
         let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
         let quoted_column: String = format_field_path(&names);
-        let column = quoted_column.as_str();
+        let column = resolved_fts_field
+            .as_ref()
+            .map(|resolved| resolved.canonical_path.as_str())
+            .unwrap_or(quoted_column.as_str());
 
         let vector_fragments_for_validation =
             is_builtin_vector_index(self.index_type, self.params)
@@ -182,7 +269,16 @@ impl<'a> CreateIndexBuilder<'a> {
             name
         } else {
             // Generate default name with collision handling
-            let column_path = default_index_name(&names);
+            let column_path = resolved_fts_field
+                .as_ref()
+                .map(|resolved| {
+                    if resolved.document_granularity.is_list_element() {
+                        format!("{}_list_element", resolved.canonical_path)
+                    } else {
+                        resolved.canonical_path.clone()
+                    }
+                })
+                .unwrap_or_else(|| default_index_name(&names));
             let base_name = format!("{column_path}_idx");
             let mut candidate = base_name.clone();
             let mut counter = 2; // Start with no suffix, then use _2, _3, ...
@@ -244,7 +340,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
-                let params = if let Some(provided_params) =
+                let mut params = if let Some(provided_params) =
                     self.params.as_any().downcast_ref::<ScalarIndexParams>()
                 {
                     if let Some(params_json) = &provided_params.params {
@@ -262,6 +358,9 @@ impl<'a> CreateIndexBuilder<'a> {
                 } else {
                     base_params
                 };
+                if let Some(inverted_params) = &inverted_params {
+                    params = scalar_params_from_inverted(inverted_params)?;
+                }
 
                 let preprocesssed_data = self
                     .preprocessed_data
@@ -314,12 +413,18 @@ impl<'a> CreateIndexBuilder<'a> {
                     .downcast_ref::<ScalarIndexParams>()
                     .ok_or_else(|| {
                         Error::index("Scalar index type must take a ScalarIndexParams".to_string())
-                    })?;
+                    })?
+                    .clone();
+                let params = if let Some(inverted_params) = &inverted_params {
+                    scalar_params_from_inverted(inverted_params)?
+                } else {
+                    params
+                };
                 build_scalar_index(
                     self.dataset,
                     column,
                     index_id,
-                    params,
+                    &params,
                     train,
                     self.fragments.clone(),
                     None,
@@ -329,18 +434,11 @@ impl<'a> CreateIndexBuilder<'a> {
             }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
-                let inverted_params = self
-                    .params
-                    .as_any()
-                    .downcast_ref::<InvertedIndexParams>()
-                    .ok_or_else(|| {
-                        Error::index(
-                            "Inverted index type must take a InvertedIndexParams".to_string(),
-                        )
-                    })?;
+                let inverted_params = inverted_params
+                    .as_ref()
+                    .expect("IndexType::Inverted parameters were resolved above");
 
-                let params = ScalarIndexParams::new("inverted".to_string())
-                    .with_params(&inverted_params.to_training_json()?);
+                let params = scalar_params_from_inverted(inverted_params)?;
                 build_scalar_index(
                     self.dataset,
                     column,
@@ -536,28 +634,15 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = if uses_segment_commit_path(self.index_type, self.params) {
-            let dataset_version = new_idx.dataset_version;
-            TransactionBuilder::new(
-                dataset_version,
-                Operation::CreateIndex {
-                    new_indices: vec![new_idx],
-                    removed_indices,
-                },
-            )
-            .transaction_properties(self.transaction_properties.clone())
-            .build()
-        } else {
-            TransactionBuilder::new(
-                new_idx.dataset_version,
-                Operation::CreateIndex {
-                    new_indices: vec![new_idx],
-                    removed_indices,
-                },
-            )
-            .transaction_properties(self.transaction_properties.clone())
-            .build()
-        };
+        let transaction = TransactionBuilder::new(
+            new_idx.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices,
+            },
+        )
+        .transaction_properties(self.transaction_properties.clone())
+        .build();
 
         self.dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
@@ -791,20 +876,6 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 }
 
-fn is_btree_scalar_params(params: &dyn IndexParams) -> bool {
-    params
-        .as_any()
-        .downcast_ref::<ScalarIndexParams>()
-        .is_some_and(|p| p.index_type.eq_ignore_ascii_case("btree"))
-}
-
-fn is_ngram_scalar_params(params: &dyn IndexParams) -> bool {
-    params
-        .as_any()
-        .downcast_ref::<ScalarIndexParams>()
-        .is_some_and(|params| params.index_type.eq_ignore_ascii_case("ngram"))
-}
-
 fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> bool {
     params.index_name() == LANCE_VECTOR_INDEX
         && matches!(
@@ -897,38 +968,6 @@ fn ensure_index_uuid_allowed(
     }
 
     Ok(())
-}
-
-fn uses_segment_commit_path(index_type: IndexType, params: &dyn IndexParams) -> bool {
-    let params_family = params.index_name();
-
-    if params_family == LANCE_VECTOR_INDEX
-        && matches!(
-            index_type,
-            IndexType::Vector
-                | IndexType::IvfPq
-                | IndexType::IvfSq
-                | IndexType::IvfFlat
-                | IndexType::IvfRq
-                | IndexType::IvfHnswFlat
-                | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq
-        )
-        && params.as_any().is::<VectorIndexParams>()
-    {
-        return true;
-    }
-
-    if params_family == LANCE_SCALAR_INDEX {
-        match index_type {
-            IndexType::BTree | IndexType::NGram => return true,
-            IndexType::Scalar if is_btree_scalar_params(params) => return true,
-            IndexType::Scalar if is_ngram_scalar_params(params) => return true,
-            _ => {}
-        }
-    }
-
-    false
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
@@ -2389,6 +2428,8 @@ mod tests {
             .await
             .unwrap();
 
+        let version_before_optimize = dataset.version().version;
+        let segments_before_optimize = dataset.load_indices_by_name("vector_idx").await.unwrap();
         let err = dataset
             .optimize_indices(&OptimizeOptions::merge(2))
             .await
@@ -2397,6 +2438,116 @@ mod tests {
             err.to_string()
                 .contains("vector index segments do not share IVF centroids"),
             "unexpected error: {err}"
+        );
+        assert_eq!(dataset.version().version, version_before_optimize);
+        assert_eq!(
+            dataset.load_indices_by_name("vector_idx").await.unwrap(),
+            segments_before_optimize,
+            "an incompatible merge must not partially commit index metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_optimize_only_validates_requested_compatible_suffix() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 4);
+        let tail_start = fragments.len() - 2;
+
+        let mut independent_ivf = IvfBuildParams::new(2);
+        independent_ivf.max_iters = 7;
+        let independent_params =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, independent_ivf);
+        let independent_segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &["vector"],
+            IndexType::Vector,
+            &independent_params,
+        )
+        .name("vector_idx".to_string())
+        .fragments(
+            fragments[..tail_start]
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect(),
+        )
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+        let mut shared_ivf = prepare_vector_ivf(&dataset, "vector").await;
+        shared_ivf.max_iters = 13;
+        let shared_params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, shared_ivf);
+        let mut compatible_tail = Vec::new();
+        for fragment in fragments.iter().skip(tail_start) {
+            compatible_tail.push(
+                CreateIndexBuilder::new(
+                    &mut dataset,
+                    &["vector"],
+                    IndexType::Vector,
+                    &shared_params,
+                )
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+            );
+        }
+
+        let independent_uuid = independent_segment.uuid;
+        let tail_uuids = compatible_tail
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        let expected_merged_fragments = compatible_tail
+            .iter()
+            .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
+            .collect::<RoaringBitmap>();
+        let expected_merged_details = compatible_tail.last().unwrap().index_details.clone();
+        assert_ne!(
+            independent_segment.index_details, expected_merged_details,
+            "test setup must distinguish base and suffix metadata"
+        );
+        let mut segments = vec![independent_segment];
+        segments.extend(compatible_tail);
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let optimized = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(optimized.len(), 2);
+        assert!(
+            optimized
+                .iter()
+                .any(|segment| segment.uuid == independent_uuid),
+            "the incompatible base segment must not participate in the requested suffix merge"
+        );
+        assert!(
+            tail_uuids
+                .iter()
+                .all(|uuid| optimized.iter().all(|segment| segment.uuid != *uuid)),
+            "both compatible suffix segments must be replaced"
+        );
+        let merged = optimized
+            .iter()
+            .find(|segment| segment.uuid != independent_uuid)
+            .unwrap();
+        assert_eq!(
+            merged.fragment_bitmap.as_ref().unwrap(),
+            &expected_merged_fragments
+        );
+        assert_eq!(
+            merged.index_details, expected_merged_details,
+            "merged metadata must come from the selected suffix, not an incompatible base segment"
         );
     }
 
@@ -3339,7 +3490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_index_ivf_rq_preserves_index_version_on_segment_commit_path() {
+    async fn test_create_index_ivf_rq_preserves_index_version() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
