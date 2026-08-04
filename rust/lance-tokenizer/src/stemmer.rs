@@ -79,16 +79,14 @@ impl StemmerAlgorithm {
             Self::Legacy(algorithm) => {
                 StemmerBackend::Legacy(rust_stemmers::Stemmer::create(algorithm))
             }
-            Self::Greek => StemmerBackend::Greek(pagefind_stem::Stemmer::create(
-                pagefind_stem::Algorithm::Greek,
-            )),
+            Self::Greek => StemmerBackend::Greek(frostem::Stemmer::new(frostem::Algorithm::Greek)),
         }
     }
 }
 
 enum StemmerBackend {
     Legacy(rust_stemmers::Stemmer),
-    Greek(pagefind_stem::Stemmer),
+    Greek(frostem::Stemmer),
 }
 
 impl StemmerBackend {

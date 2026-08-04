@@ -3078,6 +3078,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "frostem"
+version = "1.20260804.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d0ae10cfccbae085dd8612669ccc116fe88bd5dfe39d202a8fa68c24c1e546f"
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5144,10 +5150,10 @@ dependencies = [
 name = "lance-tokenizer"
 version = "10.1.0-beta.2"
 dependencies = [
+ "frostem",
  "icu_segmenter",
  "jieba-rs",
  "lindera",
- "pagefind_stem",
  "rust-stemmers",
  "serde",
  "stop-words",
@@ -6439,12 +6445,6 @@ dependencies = [
  "libc",
  "winapi",
 ]
-
-[[package]]
-name = "pagefind_stem"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dfa810b158f3ac364e5acd43ca4a6020a6e729d40c15ce1bed1d911237a52e5"
 
 [[package]]
 name = "parking"
