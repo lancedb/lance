@@ -2427,7 +2427,18 @@ impl ShardWriter {
             pending_wal_batch_count: pending_wal.batch_count,
             pending_wal_row_count: pending_wal.row_count,
             pending_wal_estimated_bytes: pending_wal.estimated_bytes,
+            frozen_count: state.frozen_memtables.len(),
+            frozen_bytes: state.frozen_memtable_bytes,
         })
+    }
+
+    /// Snapshot of the backpressure counters. Both writer modes answer, so a
+    /// caller asking "am I throttled" need not know which mode it is in.
+    pub fn backpressure_stats(&self) -> BackpressureStatsSnapshot {
+        match &self.mode {
+            WriterMode::MemTable { backpressure, .. }
+            | WriterMode::WalOnly { backpressure, .. } => backpressure.stats().snapshot(),
+        }
     }
 
     /// Create a scanner for querying the current MemTable data.
@@ -2847,6 +2858,14 @@ pub struct MemTableStats {
     pub pending_wal_batch_count: usize,
     pub pending_wal_row_count: usize,
     pub pending_wal_estimated_bytes: usize,
+    /// Frozen memtables in the read view: sealed-awaiting-flush, plus flushed
+    /// ones still inside `frozen_memtable_grace`.
+    pub frozen_count: usize,
+    /// Heap bytes still owed to flush. Drains on flush commit, so unlike
+    /// `frozen_count` it excludes in-grace tables. Plus the active memtable's
+    /// `estimated_size`, this is what backpressure meters against
+    /// `max_unflushed_memtable_bytes`.
+    pub frozen_bytes: usize,
 }
 
 /// WAL statistics.
@@ -4723,6 +4742,87 @@ mod tests {
             stats.generation > initial_gen,
             "Generation should increment after auto-flush"
         );
+
+        writer.close().await.unwrap();
+    }
+
+    /// The two fields count different things on purpose: bytes drain on flush
+    /// commit, the handle lingers for `frozen_memtable_grace`. A long grace
+    /// therefore leaves count non-zero with bytes back at zero.
+    #[tokio::test]
+    async fn test_memtable_stats_frozen_count_outlives_frozen_bytes() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 1024, // small enough to seal within the loop below
+            frozen_memtable_grace: Duration::from_secs(600),
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let fresh = writer.memtable_stats().await.unwrap();
+        assert_eq!(fresh.frozen_count, 0);
+        assert_eq!(fresh.frozen_bytes, 0);
+
+        for i in 0..20 {
+            let batch = create_test_batch(&schema, i * 10, 10);
+            writer.put(vec![batch]).await.unwrap();
+        }
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.frozen_count > 0,
+            "flushed memtables must stay in the read view for the grace window"
+        );
+        assert_eq!(
+            stats.frozen_bytes, 0,
+            "every seal flushed, so nothing is owed to flush"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// The controller sits in a private `WriterMode` variant, reachable only
+    /// through the writer. Both modes must answer.
+    #[rstest::rstest]
+    #[case::memtable(true)]
+    #[case::wal_only(false)]
+    #[tokio::test]
+    async fn test_backpressure_stats_reachable_in_both_modes(#[case] enable_memtable: bool) {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            enable_memtable,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        // A writer well under the threshold has never throttled.
+        let stats = writer.backpressure_stats();
+        assert_eq!(stats.total_count, 0);
+        assert_eq!(stats.total_wait_ms, 0);
 
         writer.close().await.unwrap();
     }
