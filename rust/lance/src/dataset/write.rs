@@ -1692,10 +1692,12 @@ async fn open_writer_with_options(
         let writer = object_store.create(&full_path).await?;
         let enable_blob_v2 = storage_version >= LanceFileVersion::V2_2;
         let version = ConcreteFileVersion::from(storage_version);
+        let mut file_schema = schema.clone();
+        file_schema.metadata.remove(BLOB_SIDECAR_STATS_META_KEY);
         let file_writer = lance_file::versions::create_writer(
             version,
             writer,
-            schema.clone(),
+            file_schema,
             FileWriterOptions::default(),
         )?;
         let preprocessor = if enable_blob_v2 {

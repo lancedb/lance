@@ -862,4 +862,48 @@ mod tests {
             blob_stats.bytes_on_disk
         );
     }
+
+    #[tokio::test]
+    async fn test_unrelated_schema_metadata_is_not_blob_stats() {
+        async fn write_dataset(metadata: HashMap<String, String>) -> (TempStrDir, Arc<Dataset>) {
+            let schema = Arc::new(ArrowSchema::new_with_metadata(
+                vec![ArrowField::new("value", DataType::Int32, false)],
+                metadata,
+            ));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let test_dir = TempStrDir::default();
+            let dataset = Arc::new(
+                Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema),
+                    &test_dir,
+                    Some(WriteParams {
+                        data_storage_version: Some(LanceFileVersion::V2_2),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            (test_dir, dataset)
+        }
+
+        let (_baseline_dir, baseline_dataset) = write_dataset(HashMap::new()).await;
+        let baseline = baseline_dataset.calculate_data_stats().await.unwrap();
+
+        let (_colliding_dir, colliding_dataset) = write_dataset(HashMap::from([(
+            "lance:blob-sidecar-stats:v1".to_string(),
+            "[[0,100]]".to_string(),
+        )]))
+        .await;
+        let colliding = colliding_dataset.calculate_data_stats().await.unwrap();
+
+        assert_eq!(
+            colliding.fields[0].bytes_on_disk,
+            baseline.fields[0].bytes_on_disk
+        );
+    }
 }

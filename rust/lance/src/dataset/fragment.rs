@@ -890,8 +890,15 @@ impl FileFragment {
                 .fields_pre_order()
                 .filter(|field| field.is_blob_v2())
                 .map(|field| field.id as u32)
-                .collect::<Vec<_>>();
-            if let Some(sidecar_stats) = reader.blob_sidecar_stats()? {
+                .collect::<HashSet<_>>();
+            // This is writer-private metadata. Malformed values or field ids that do not
+            // identify blob leaves stored in this file must use the descriptor fallback.
+            let sidecar_stats = reader.blob_sidecar_stats().ok().flatten().filter(|stats| {
+                stats
+                    .iter()
+                    .all(|(field_id, _)| reader_blob_fields.contains(field_id))
+            });
+            if let Some(sidecar_stats) = sidecar_stats {
                 persisted_blob_fields.extend(sidecar_stats.iter().map(|(field_id, _)| *field_id));
                 stats.extend(sidecar_stats);
             } else {
