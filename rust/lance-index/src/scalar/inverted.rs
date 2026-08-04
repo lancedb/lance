@@ -144,27 +144,6 @@ impl InvertedIndexPlugin {
         fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        Self::train_inverted_index_with_list_document_mode(
-            data,
-            index_store,
-            params,
-            fragment_ids,
-            progress,
-            ListDocumentMode::Row,
-        )
-        .await
-    }
-
-    /// Builds an index segment using the document representation resolved from
-    /// an existing string-list index.
-    pub async fn train_inverted_index_with_list_document_mode(
-        data: SendableRecordBatchStream,
-        index_store: &dyn IndexStore,
-        params: InvertedIndexParams,
-        fragment_ids: Option<Vec<u32>>,
-        progress: Arc<dyn IndexBuildProgress>,
-        list_document_mode: ListDocumentMode,
-    ) -> Result<CreatedIndex> {
         let fragment_mask = fragment_ids.as_ref().and_then(|frag_ids| {
             if !frag_ids.is_empty() {
                 // Create a mask with fragment_id in high 32 bits for distributed indexing
@@ -182,7 +161,6 @@ impl InvertedIndexPlugin {
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
-                .with_list_document_mode(list_document_mode)
                 .with_progress(progress);
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {

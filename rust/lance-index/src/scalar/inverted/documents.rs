@@ -790,7 +790,7 @@ impl PartitionDocuments {
         self.store.open_index_file(&self.path).await
     }
 
-    pub(crate) async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
+    async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
         let store = self.store.clone();
         let path = self.path.clone();
         let num_docs = self.num_docs;

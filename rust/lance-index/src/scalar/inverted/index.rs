@@ -51,7 +51,7 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
-use roaring::{RoaringBitmap, RoaringTreemap};
+use roaring::RoaringBitmap;
 use std::sync::LazyLock;
 use tokio::{
     sync::{Mutex, OnceCell},
@@ -146,119 +146,12 @@ pub const FTS_FORMAT_VERSION_KEY: &str = "format_version";
 pub const POSITIONS_LAYOUT_KEY: &str = "positions_layout";
 pub const POSITIONS_CODEC_KEY: &str = "positions_codec";
 pub const POSTING_BLOCK_SIZE_KEY: &str = "posting_block_size";
-pub const LIST_DOCUMENT_MODE_KEY: &str = "list_document_mode";
 pub const POSTING_TAIL_CODEC_FIXED32_V1: &str = "fixed32_v1";
 pub const POSTING_TAIL_CODEC_VARINT_DELTA_V1: &str = "varint_delta_v1";
 pub const POSITIONS_LAYOUT_SHARED_STREAM_V2: &str = "shared_stream_v2";
 pub const POSITIONS_CODEC_VARINT_DOC_DELTA_V2: &str = "varint_doc_delta_v2";
 pub const POSITIONS_CODEC_PACKED_DELTA_V1: &str = "packed_delta_v1";
 pub const DELETED_FRAGMENTS_COL: &str = "deleted_fragments";
-
-/// How values in a string-list row are represented as indexed documents.
-///
-/// This is persisted in new inverted-index metadata so flat fallback can use
-/// the same tokenizer boundaries as the indexed portion of a dataset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListDocumentMode {
-    /// Each non-null list element is a separate document.
-    Elements,
-    /// All non-null list elements are space-joined into one row document.
-    Row,
-    /// The index lacks enough durable evidence to identify one document model.
-    ///
-    /// Indexed-only queries remain readable, but operations that need to index
-    /// or flat-search additional list rows must require an index rebuild.
-    Ambiguous,
-}
-
-impl ListDocumentMode {
-    /// Returns whether document boundaries for `data_type` are controlled by
-    /// this mode.
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use arrow_schema::{DataType, Field};
-    /// # use lance_index::scalar::inverted::ListDocumentMode;
-    /// let strings = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-    /// assert!(ListDocumentMode::applies_to(&strings));
-    /// assert!(!ListDocumentMode::applies_to(&DataType::Utf8));
-    /// ```
-    pub fn applies_to(data_type: &DataType) -> bool {
-        matches!(data_type, DataType::List(_) | DataType::LargeList(_))
-    }
-
-    pub(super) fn combine(self, other: Self) -> Self {
-        if self == other { self } else { Self::Ambiguous }
-    }
-
-    pub(super) fn persisted_value(self) -> &'static str {
-        match self {
-            Self::Elements => "elements",
-            Self::Row => "row",
-            Self::Ambiguous => "ambiguous",
-        }
-    }
-}
-
-#[derive(Default)]
-pub(super) struct UnmarkedListDocumentModeInference {
-    has_row_document_layout: bool,
-    seen_row_ids: RoaringTreemap,
-    has_element_documents: bool,
-}
-
-impl UnmarkedListDocumentModeInference {
-    pub(super) fn observe_row_document_layout(&mut self, has_row_document_layout: bool) {
-        self.has_row_document_layout |= has_row_document_layout;
-    }
-
-    pub(super) fn observe_row_ids(&mut self, mut row_ids: impl Iterator<Item = u64>) {
-        if self.has_element_documents {
-            return;
-        }
-        self.has_element_documents = row_ids.any(|row_id| !self.seen_row_ids.insert(row_id));
-    }
-
-    fn has_element_documents(&self) -> bool {
-        self.has_element_documents
-    }
-
-    pub(super) fn finish(self) -> ListDocumentMode {
-        match (self.has_element_documents, self.has_row_document_layout) {
-            (true, false) => ListDocumentMode::Elements,
-            (false, true) => ListDocumentMode::Row,
-            // Conflicting evidence identifies a mixed index. No evidence is
-            // insufficient because an element index containing only singleton
-            // lists is indistinguishable from a row-document index.
-            (true, true) | (false, false) => ListDocumentMode::Ambiguous,
-        }
-    }
-}
-
-impl Display for ListDocumentMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Elements => write!(f, "elements"),
-            Self::Row => write!(f, "row"),
-            Self::Ambiguous => write!(f, "ambiguous"),
-        }
-    }
-}
-
-impl FromStr for ListDocumentMode {
-    type Err = Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "elements" => Ok(Self::Elements),
-            "row" => Ok(Self::Row),
-            "ambiguous" => Ok(Self::Ambiguous),
-            other => Err(Error::index(format!(
-                "unsupported list document mode {other:?}; expected \"elements\", \"row\", or \"ambiguous\""
-            ))),
-        }
-    }
-}
 
 // Just a heuristic when we need to pre-allocate memory for tokens
 pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
@@ -831,7 +724,6 @@ pub struct InvertedIndex {
     tokenizer: Box<dyn LanceTokenizer>,
     token_set_format: TokenSetFormat,
     format_version: InvertedListFormatVersion,
-    list_document_mode: Arc<OnceCell<ListDocumentMode>>,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
     corpus_stats: Arc<OnceCell<(u64, usize)>>,
     prewarm_state: Arc<Mutex<InvertedPrewarmState>>,
@@ -849,7 +741,6 @@ impl Debug for InvertedIndex {
             .field("params", &self.params)
             .field("token_set_format", &self.token_set_format)
             .field("format_version", &self.format_version)
-            .field("list_document_mode", &self.list_document_mode.get())
             .field("partitions", &self.partitions)
             .field("deleted_fragments", &self.deleted_fragments)
             .finish()
@@ -887,15 +778,11 @@ impl InvertedIndex {
             .unwrap_or_default()
     }
 
-    fn to_builder(&self, list_document_mode: ListDocumentMode) -> InvertedIndexBuilder {
-        self.to_builder_with_offset(None, list_document_mode)
+    fn to_builder(&self) -> InvertedIndexBuilder {
+        self.to_builder_with_offset(None)
     }
 
-    fn to_builder_with_offset(
-        &self,
-        fragment_mask: Option<u64>,
-        list_document_mode: ListDocumentMode,
-    ) -> InvertedIndexBuilder {
+    fn to_builder_with_offset(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
             InvertedIndexBuilder::from_existing_index(
@@ -930,7 +817,6 @@ impl InvertedIndex {
                 self.deleted_fragments.clone(),
             )
             .with_format_version(self.format_version())
-            .with_list_document_mode(list_document_mode)
         }
     }
 
@@ -940,67 +826,6 @@ impl InvertedIndex {
 
     pub fn params(&self) -> &InvertedIndexParams {
         &self.params
-    }
-
-    /// Returns the resolved string-list document representation.
-    ///
-    /// Unmarked historical indexes resolve the mode lazily from their document
-    /// layout and row IDs. Indexed-only and scalar operations do not need to
-    /// call this method.
-    pub async fn list_document_mode(&self) -> Result<ListDocumentMode> {
-        Ok(*self
-            .list_document_mode
-            .get_or_try_init(|| self.infer_unmarked_list_document_mode())
-            .await?)
-    }
-
-    /// Remaps row ids using the indexed column type supplied by the dataset layer.
-    ///
-    /// Unmarked string-list indexes infer their historical document model while
-    /// remapping. Other column types always use row documents, avoiding inference
-    /// work whose result cannot affect their semantics.
-    #[doc(hidden)]
-    pub async fn remap_with_document_type(
-        &self,
-        mapping: &RowAddrRemap,
-        dest_store: &dyn IndexStore,
-        document_type: &DataType,
-    ) -> Result<CreatedIndex> {
-        self.remap_with_mode_inference(
-            mapping,
-            dest_store,
-            ListDocumentMode::applies_to(document_type),
-        )
-        .await
-    }
-
-    async fn remap_with_mode_inference(
-        &self,
-        mapping: &RowAddrRemap,
-        dest_store: &dyn IndexStore,
-        infer_unmarked_list_document_mode: bool,
-    ) -> Result<CreatedIndex> {
-        let list_document_mode = self.list_document_mode.get().copied();
-        let unresolved_mode = if infer_unmarked_list_document_mode {
-            ListDocumentMode::Ambiguous
-        } else {
-            ListDocumentMode::Row
-        };
-        let mut builder = self.to_builder(list_document_mode.unwrap_or(unresolved_mode));
-        if list_document_mode.is_none() && infer_unmarked_list_document_mode {
-            builder = builder.with_list_document_mode_inference_on_remap();
-        }
-        let files = builder
-            .remap(mapping, self.store.clone(), dest_store)
-            .await?;
-
-        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: self.index_version(),
-            files,
-        })
     }
 
     /// Returns the number of partitions in this inverted index.
@@ -1055,19 +880,7 @@ impl InvertedIndex {
             }
         }
 
-        let list_document_mode =
-            if ListDocumentMode::applies_to(new_data.schema().field(0).data_type()) {
-                let mut mode = first.list_document_mode().await?;
-                for segment in segments.iter().skip(1) {
-                    mode = mode.combine(segment.list_document_mode().await?);
-                }
-                mode
-            } else {
-                ListDocumentMode::Row
-            };
-        let mut builder = InvertedIndexBuilder::new(first.params.clone())
-            .with_progress(progress)
-            .with_list_document_mode(list_document_mode);
+        let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
         builder = builder
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version());
@@ -1953,7 +1766,6 @@ impl InvertedIndex {
             tokenizer,
             token_set_format: TokenSetFormat::Arrow,
             format_version: InvertedListFormatVersion::V1,
-            list_document_mode: Arc::new(OnceCell::from(ListDocumentMode::Elements)),
             partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
@@ -2004,33 +1816,6 @@ impl InvertedIndex {
         }
     }
 
-    async fn infer_unmarked_list_document_mode(&self) -> Result<ListDocumentMode> {
-        let mut inference = UnmarkedListDocumentModeInference::default();
-        for partition in &self.partitions {
-            let documents = partition.modern_documents()?;
-            inference.observe_row_document_layout(documents.has_row_document_layout());
-        }
-
-        // A row-document index stores each row id once. Repetition anywhere in
-        // the index is positive evidence for historical element documents. Read
-        // one partition at a time so inference does not retain every row-ID
-        // array simultaneously.
-        for partition in &self.partitions {
-            let documents = partition.modern_documents()?;
-            let row_ids = documents.row_ids_column().await?;
-            inference = spawn_cpu(move || {
-                inference.observe_row_ids(row_ids.values().iter().copied());
-                Ok::<_, Error>(inference)
-            })
-            .await?;
-            if inference.has_element_documents() {
-                break;
-            }
-        }
-
-        Ok(inference.finish())
-    }
-
     pub async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
@@ -2065,15 +1850,6 @@ impl InvertedIndex {
                     .transpose()?
                     .unwrap_or(TokenSetFormat::Arrow);
                 let format_version = parse_format_version_from_metadata(&reader.schema().metadata)?;
-                // Unmarked partitioned indexes may use either released model.
-                // Resolve them from positive document-layout evidence after the
-                // partitions load; never synthesize a hybrid representation.
-                let list_document_mode = reader
-                    .schema()
-                    .metadata
-                    .get(LIST_DOCUMENT_MODE_KEY)
-                    .map(|value| ListDocumentMode::from_str(value))
-                    .transpose()?;
 
                 // Load deleted_fragments if present (optional for backward compatibility)
                 let deleted_fragments = if reader.num_rows() > 0 {
@@ -2138,7 +1914,6 @@ impl InvertedIndex {
                     tokenizer,
                     token_set_format,
                     format_version,
-                    list_document_mode: Arc::new(OnceCell::new_with(list_document_mode)),
                     partitions,
                     corpus_stats: Arc::new(OnceCell::new()),
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
@@ -2510,8 +2285,18 @@ impl ScalarIndex for InvertedIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        self.remap_with_mode_inference(mapping, dest_store, true)
-            .await
+        let files = self
+            .to_builder()
+            .remap(mapping, self.store.clone(), dest_store)
+            .await?;
+
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: self.index_version(),
+            files,
+        })
     }
 
     async fn update(
@@ -2520,14 +2305,8 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let list_document_mode =
-            if ListDocumentMode::applies_to(new_data.schema().field(0).data_type()) {
-                self.list_document_mode().await?
-            } else {
-                ListDocumentMode::Row
-            };
         let files = self
-            .to_builder(list_document_mode)
+            .to_builder()
             .update(new_data, dest_store, old_data_filter)
             .await?;
 
@@ -2604,14 +2383,6 @@ impl InvertedPartition {
 
     pub fn is_legacy(&self) -> bool {
         self.inverted_list.is_legacy_layout()
-    }
-
-    pub(super) fn modern_documents(&self) -> Result<&PartitionDocuments> {
-        self.docs.modern().map(Arc::as_ref).ok_or_else(|| {
-            Error::internal(
-                "partitioned FTS index unexpectedly uses the legacy document store".to_owned(),
-            )
-        })
     }
 
     pub async fn load(
@@ -8323,7 +8094,6 @@ async fn tokenize_and_count(
     tokenizer: Box<dyn LanceTokenizer>,
     query_tokens: Arc<Tokens>,
     doc_col_idx: usize,
-    list_document_mode: ListDocumentMode,
     elapsed_compute: Option<Time>,
     coordinate_rank: usize,
     phrase_slop: Option<u32>,
@@ -9026,7 +8796,6 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
         tokenizer,
         query_tokens.clone(),
         doc_col_idx,
-        list_document_mode,
         elapsed_compute.clone(),
         coordinate_rank,
         phrase_slop,
@@ -9112,7 +8881,6 @@ mod tests {
 
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
-    use rstest::rstest;
 
     use super::*;
 
@@ -9125,44 +8893,6 @@ mod tests {
             address_read_concurrency(64, 2 * MAX_CONCURRENT_ADDRESS_READ_BYTES),
             1
         );
-    }
-
-    fn raw_tokenizer() -> Box<dyn LanceTokenizer> {
-        InvertedIndexParams::default()
-            .base_tokenizer("raw".to_owned())
-            .max_token_length(None)
-            .lower_case(false)
-            .stem(false)
-            .remove_stop_words(false)
-            .ascii_folding(false)
-            .build()
-            .unwrap()
-    }
-
-    #[test]
-    fn flat_full_text_search_preserves_string_list_element_boundaries() {
-        let mut docs_builder =
-            GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
-        docs_builder.values().append_value("a");
-        docs_builder.values().append_null();
-        docs_builder.values().append_value("b");
-        docs_builder.append(true);
-
-        let docs = Arc::new(docs_builder.finish()) as ArrayRef;
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                ROW_ID_FIELD.clone(),
-                Field::new("text", docs.data_type().clone(), true),
-            ])),
-            vec![Arc::new(UInt64Array::from(vec![1_u64])) as ArrayRef, docs],
-        )
-        .unwrap();
-        let joined =
-            flat_full_text_search(&[&batch], "text", "a b", Some(raw_tokenizer())).unwrap();
-        let element = flat_full_text_search(&[&batch], "text", "a", Some(raw_tokenizer())).unwrap();
-
-        assert!(joined.is_empty());
-        assert_eq!(element, vec![1]);
     }
 
     #[derive(Debug)]
@@ -9365,49 +9095,6 @@ mod tests {
         writer.finish_with_metadata(metadata).await?;
 
         InvertedIndex::load(store, None, &LanceCache::no_cache()).await
-    }
-
-    async fn load_unmarked_index_with_row_ids(
-        store: Arc<LanceIndexStore>,
-        row_ids: &[u64],
-    ) -> Arc<InvertedIndex> {
-        let format_version = InvertedListFormatVersion::V1;
-        let mut partition = InnerBuilder::new_with_format_version(
-            0,
-            false,
-            TokenSetFormat::default(),
-            format_version,
-        );
-        partition.tokens.add("test".to_owned());
-        partition
-            .posting_lists
-            .push(PostingListBuilder::new_with_posting_tail_codec(
-                false,
-                format_version.posting_tail_codec(),
-            ));
-        for (doc_id, row_id) in row_ids.iter().copied().enumerate() {
-            partition.posting_lists[0]
-                .add(u32::try_from(doc_id).unwrap(), PositionRecorder::Count(1));
-            partition.docs.append(row_id, 1);
-        }
-        write_test_partition_with_optional_impacts(
-            &store,
-            0,
-            partition,
-            TokenSetFormat::default(),
-            false,
-        )
-        .await;
-        write_test_metadata(
-            &store,
-            vec![0],
-            InvertedIndexParams::default().format_version(format_version),
-        )
-        .await;
-
-        InvertedIndex::load(store, None, &LanceCache::no_cache())
-            .await
-            .unwrap()
     }
 
     fn empty_doc_stream() -> SendableRecordBatchStream {
@@ -13619,7 +13306,6 @@ mod tests {
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(updated.format_version(), format_version);
         assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V2);
-        assert_eq!(updated.list_document_mode().await?, ListDocumentMode::Row);
         assert_eq!(updated.partitions.len(), 2);
         for partition in &updated.partitions {
             assert_eq!(
@@ -13723,7 +13409,6 @@ mod tests {
         let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(merged.index_version(), 0);
         assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
-        assert_eq!(merged.list_document_mode().await?, ListDocumentMode::Row);
 
         let tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
@@ -13890,217 +13575,13 @@ mod tests {
             .unwrap();
         writer.finish_with_metadata(metadata).await.unwrap();
 
-        let counter = Arc::new(PostingMetadataCounter::default());
-        let counting_store: Arc<dyn IndexStore> = Arc::new(CountingStore {
-            inner: store,
-            posting_file: doc_file_path(0),
-            counter: counter.clone(),
-        });
-        let index = InvertedIndex::load(counting_store, None, &LanceCache::no_cache())
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert!(
             index.deleted_fragments().is_empty(),
             "index without deleted_fragments column should have empty bitmap"
         );
-        assert_eq!(
-            counter.rows_read(),
-            0,
-            "opening an unmarked scalar index must not scan document row IDs"
-        );
-        assert_eq!(
-            index.list_document_mode().await.unwrap(),
-            ListDocumentMode::Row
-        );
-        assert_eq!(
-            counter.rows_read(),
-            1,
-            "resolving an unmarked list mode should scan document row IDs lazily"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_unmarked_index_with_repeated_row_ids_infers_element_documents() {
-        let tmpdir = TempObjDir::default();
-        let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let index = load_unmarked_index_with_row_ids(store, &[100, 100]).await;
-
-        assert_eq!(
-            index.list_document_mode().await.unwrap(),
-            ListDocumentMode::Elements
-        );
-    }
-
-    #[rstest]
-    #[case::unresolved_elements(&[100, 100], false, true, ListDocumentMode::Elements)]
-    #[case::already_resolved_elements(&[100, 100], true, true, ListDocumentMode::Elements)]
-    #[case::unresolved_ambiguous(&[100], false, true, ListDocumentMode::Ambiguous)]
-    #[case::generic_unresolved_elements(&[100, 100], false, false, ListDocumentMode::Elements)]
-    #[tokio::test]
-    async fn test_remap_preserves_unmarked_document_mode(
-        #[case] row_ids: &[u64],
-        #[case] resolve_before_remap: bool,
-        #[case] use_document_type: bool,
-        #[case] expected_mode: ListDocumentMode,
-    ) {
-        let src_dir = TempObjDir::default();
-        let dest_dir = TempObjDir::default();
-        let src_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            src_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        let dest_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            dest_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        drop(load_unmarked_index_with_row_ids(src_store.clone(), row_ids).await);
-        let counter = Arc::new(PostingMetadataCounter::default());
-        let counting_store: Arc<dyn IndexStore> = Arc::new(CountingStore {
-            inner: src_store,
-            posting_file: doc_file_path(0),
-            counter: counter.clone(),
-        });
-        let index = InvertedIndex::load(counting_store, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-        assert!(index.list_document_mode.get().is_none());
-        assert_eq!(counter.rows_read(), 0);
-        if resolve_before_remap {
-            assert_eq!(index.list_document_mode().await.unwrap(), expected_mode);
-        }
-        let rows_read_before_remap = counter.rows_read();
-
-        if use_document_type {
-            index
-                .remap_with_document_type(
-                    &RowAddrRemap::direct(HashMap::from([(100, Some(101))])),
-                    dest_store.as_ref(),
-                    &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                )
-                .await
-                .unwrap();
-        } else {
-            index
-                .remap(
-                    &RowAddrRemap::direct(HashMap::from([(100, Some(101))])),
-                    dest_store.as_ref(),
-                )
-                .await
-                .unwrap();
-        }
-        assert_eq!(
-            counter.rows_read() - rows_read_before_remap,
-            row_ids.len(),
-            "remap should infer the document mode from its existing document rewrite read"
-        );
-
-        let remapped = InvertedIndex::load(dest_store, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-        assert_eq!(
-            remapped.list_document_mode.get(),
-            Some(&expected_mode),
-            "remap must persist the inferred historical document mode"
-        );
-        assert_eq!(remapped.list_document_mode().await.unwrap(), expected_mode);
-    }
-
-    #[tokio::test]
-    async fn test_scalar_remap_skips_unmarked_list_document_mode_inference() {
-        let src_dir = TempObjDir::default();
-        let dest_dir = TempObjDir::default();
-        let src_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            src_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        let dest_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            dest_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        let index = load_unmarked_index_with_row_ids(src_store, &[100, 100]).await;
-        assert!(index.list_document_mode.get().is_none());
-
-        index
-            .remap_with_document_type(
-                &RowAddrRemap::direct(HashMap::from([(100, Some(101))])),
-                dest_store.as_ref(),
-                &DataType::Utf8,
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            index.list_document_mode.get().is_none(),
-            "scalar remap must not initialize list-document inference"
-        );
-        let remapped = InvertedIndex::load(dest_store, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-        assert_eq!(
-            remapped.list_document_mode.get(),
-            Some(&ListDocumentMode::Row),
-            "duplicate row IDs are a sentinel for accidental list-mode inference"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ambiguous_unmarked_list_index_requires_rebuild_before_update() {
-        let src_dir = TempObjDir::default();
-        let dest_dir = TempObjDir::default();
-        let src_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            src_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        let dest_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            dest_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        let index = load_unmarked_index_with_row_ids(src_store, &[100]).await;
-        assert_eq!(
-            index.list_document_mode().await.unwrap(),
-            ListDocumentMode::Ambiguous
-        );
-
-        let mut docs = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
-        docs.values().append_value("test");
-        docs.append(true);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "doc",
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                true,
-            ),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(docs.finish()) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![101_u64])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-        let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
-
-        let error = index
-            .update(Box::pin(stream), dest_store.as_ref(), None)
-            .await
-            .err()
-            .expect("ambiguous list update should fail");
-
-        assert!(matches!(error, Error::Index { .. }));
-        assert!(error.to_string().contains("rebuild the index"));
     }
 
     #[tokio::test]
@@ -14285,7 +13766,6 @@ mod tests {
             params.build().unwrap(),
             query_tokens.clone(),
             1,
-            ListDocumentMode::Elements,
             None,
             0,
             None,
@@ -14417,12 +13897,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flat_bm25_search_rejects_ambiguous_list_document_mode() {
+    async fn flat_bm25_search_treats_string_lists_as_row_documents() {
         let mut docs_builder =
             GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
-        docs_builder.values().append_value("a");
-        docs_builder.values().append_value("b");
+        docs_builder.values().append_value("alpha");
+        docs_builder.values().append_value("alpha beta");
         docs_builder.append(true);
+        docs_builder.values().append_value("beta");
+        docs_builder.append(true);
+        docs_builder.append(true);
+        docs_builder.values().append_null();
+        docs_builder.append(true);
+        docs_builder.append(false);
 
         let docs = Arc::new(docs_builder.finish()) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
@@ -14431,7 +13917,10 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(UInt64Array::from(vec![2_u64])) as ArrayRef, docs],
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3, 4])) as ArrayRef,
+                docs,
+            ],
         )
         .unwrap();
 
@@ -14439,95 +13928,26 @@ mod tests {
             schema.clone(),
             stream::iter(vec![Ok(batch)]),
         ));
-        let error = flat_bm25_search_stream_with_mode_and_operator(
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+
+        let result_stream = flat_bm25_search_stream_with_metrics(
             input,
             "text".to_string(),
-            "a".to_string(),
-            raw_tokenizer(),
+            "alpha".to_string(),
+            tokenizer,
             None,
             100,
-            ListDocumentMode::Ambiguous,
-            Operator::Or,
             None,
         )
         .await
-        .err()
-        .expect("ambiguous list fallback should fail");
-
-        assert!(matches!(
-            error,
-            datafusion_common::DataFusionError::Execution(_)
-        ));
-        assert!(error.to_string().contains("rebuild the index"));
-    }
-
-    #[rstest]
-    #[case::default_elements_element(None, "a", &[2])]
-    #[case::elements_joined(Some(ListDocumentMode::Elements), "a b", &[])]
-    #[case::row_element(Some(ListDocumentMode::Row), "a", &[])]
-    #[case::row_joined(Some(ListDocumentMode::Row), "a b", &[2])]
-    #[tokio::test]
-    async fn flat_bm25_search_honors_list_document_mode(
-        #[case] mode: Option<ListDocumentMode>,
-        #[case] query: &str,
-        #[case] expected_row_ids: &[u64],
-    ) {
-        let mut docs = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
-        docs.values().append_value("a");
-        docs.values().append_value("b");
-        docs.append(true);
-
-        let docs = Arc::new(docs.finish()) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![
-            ROW_ID_FIELD.clone(),
-            Field::new("text", docs.data_type().clone(), true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt64Array::from(vec![2_u64])) as ArrayRef, docs],
-        )
         .unwrap();
-        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        ));
-
-        let output = match mode {
-            Some(mode) => {
-                flat_bm25_search_stream_with_mode_and_operator(
-                    input,
-                    "text".to_owned(),
-                    query.to_owned(),
-                    raw_tokenizer(),
-                    None,
-                    100,
-                    mode,
-                    Operator::Or,
-                    None,
-                )
-                .await
-            }
-            None => {
-                flat_bm25_search_stream_with_metrics(
-                    input,
-                    "text".to_owned(),
-                    query.to_owned(),
-                    raw_tokenizer(),
-                    None,
-                    100,
-                    None,
-                )
-                .await
-            }
-        }
-        .unwrap();
-        let batches: Vec<_> = output.try_collect().await.unwrap();
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
         let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+        let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
 
-        assert_eq!(
-            scored[ROW_ID].as_primitive::<UInt64Type>().values(),
-            expected_row_ids
-        );
+        assert_eq!(row_ids.values(), &[0]);
     }
 
     #[tokio::test]
