@@ -53,6 +53,7 @@ const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
+const SEED_NULL_BITMAP_META_KEY: &str = "seed_null_bitmap";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
@@ -782,13 +783,37 @@ impl ZoneMapIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<Option<CreatedIndex>> {
         let mut new_zones = self.zones.clone();
+        let mut merged_null_rows = self.null_rows.clone();
+        let mut any_missing_bitmap = self.null_rows.is_none();
+
         for seed in seeds {
-            let mut zones = ZoneMapSeedWriter::deserialize_seed(
+            let (mut zones, seed_null_bitmap) = ZoneMapSeedWriter::deserialize_seed(
                 seed.fragment_id,
                 &seed.bytes,
                 self.rows_per_zone,
             )?;
             new_zones.append(&mut zones);
+
+            if !any_missing_bitmap {
+                match seed_null_bitmap {
+                    Some(bitmap) => {
+                        let frag_id = u32::try_from(seed.fragment_id).map_err(|_| {
+                            Error::invalid_input(format!(
+                                "fragment_id {} exceeds u32::MAX",
+                                seed.fragment_id
+                            ))
+                        })?;
+                        merged_null_rows
+                            .as_mut()
+                            .unwrap()
+                            .insert_bitmap(frag_id, bitmap);
+                    }
+                    None => {
+                        any_missing_bitmap = true;
+                        merged_null_rows = None;
+                    }
+                }
+            }
         }
         new_zones.sort_by_key(|z| (z.bound.fragment_id, z.bound.start));
 
@@ -797,6 +822,7 @@ impl ZoneMapIndex {
             self.data_type.clone(),
         )?;
         builder.maps = new_zones;
+        builder.null_rows = merged_null_rows;
         let files = builder.write_index(dest_store).await?;
 
         Ok(Some(CreatedIndex {
@@ -1394,6 +1420,8 @@ pub struct ZoneMapSeedWriter {
     processor: ZoneMapProcessor,
     rows_in_current_zone: u64,
     next_zone_start: u64,
+    /// Null row offsets within this fragment (sequential, 0-indexed).
+    null_offsets: RoaringBitmap,
 }
 
 impl ZoneMapSeedWriter {
@@ -1417,6 +1445,7 @@ impl ZoneMapSeedWriter {
             processor,
             rows_in_current_zone: 0,
             next_zone_start: 0,
+            null_offsets: RoaringBitmap::new(),
         })
     }
 
@@ -1459,15 +1488,16 @@ impl ZoneMapSeedWriter {
         Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
     }
 
-    /// Deserialize zone map seed bytes (Arrow IPC) into zone statistics.
+    /// Deserialize zone map seed bytes (Arrow IPC) into zone statistics and a null bitmap.
     ///
-    /// Returns a list of `ZoneMapStatistics` with bounds reconstructed from
-    /// the sequential layout (zone `i` starts at `i * rows_per_zone`).
+    /// Returns zone statistics (bounds reconstructed from sequential fragment layout) and an
+    /// optional `RoaringBitmap` of null row offsets within the fragment. The bitmap is absent
+    /// for seeds written by older code that did not track null positions.
     pub(crate) fn deserialize_seed(
         fragment_id: u64,
         bytes: &bytes::Bytes,
         rows_per_zone: u64,
-    ) -> Result<Vec<ZoneMapStatistics>> {
+    ) -> Result<(Vec<ZoneMapStatistics>, Option<RoaringBitmap>)> {
         use arrow_ipc::reader::FileReader;
         use std::io::Cursor;
 
@@ -1475,6 +1505,25 @@ impl ZoneMapSeedWriter {
         let mut reader = FileReader::try_new(cursor, None).map_err(|e| {
             lance_core::Error::invalid_input(format!("failed to read zone map seed IPC: {}", e))
         })?;
+
+        let null_bitmap = if let Some(hex) = reader.schema().metadata.get(SEED_NULL_BITMAP_META_KEY)
+        {
+            let bitmap_bytes = hex_decode(hex).map_err(|e| {
+                lance_core::Error::invalid_input(format!(
+                    "failed to decode seed null bitmap hex: {}",
+                    e
+                ))
+            })?;
+            let bitmap = RoaringBitmap::deserialize_from(bitmap_bytes.as_slice()).map_err(|e| {
+                lance_core::Error::invalid_input(format!(
+                    "failed to deserialize seed null bitmap: {}",
+                    e
+                ))
+            })?;
+            Some(bitmap)
+        } else {
+            None
+        };
 
         let batch = match reader.next() {
             Some(Ok(batch)) => batch,
@@ -1484,7 +1533,7 @@ impl ZoneMapSeedWriter {
                     e
                 )));
             }
-            None => return Ok(Vec::new()),
+            None => return Ok((Vec::new(), null_bitmap)),
         };
 
         let min_col = batch
@@ -1535,7 +1584,7 @@ impl ZoneMapSeedWriter {
                 },
             });
         }
-        Ok(zones)
+        Ok((zones, null_bitmap))
     }
 }
 
@@ -1552,6 +1601,16 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
             let chunk_len = ((values.len() as u64 - offset as u64).min(remaining_in_zone)) as usize;
             let chunk = values.slice(offset, chunk_len);
             self.processor.process_chunk(&chunk)?;
+
+            if chunk.null_count() > 0 {
+                let base_offset = (self.next_zone_start + self.rows_in_current_zone) as u32;
+                for i in 0..chunk_len {
+                    if chunk.is_null(i) {
+                        self.null_offsets.insert(base_offset + i as u32);
+                    }
+                }
+            }
+
             self.rows_in_current_zone += chunk_len as u64;
             offset += chunk_len;
 
@@ -1595,6 +1654,28 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
 
         let batch = Self::seed_batch_from_zones(&self.completed_zones, &self.data_type)?;
 
+        // Embed null bitmap in schema metadata so deserialize_seed can reconstruct null_rows.
+        let null_offsets = std::mem::take(&mut self.null_offsets);
+        let batch = if null_offsets.is_empty() {
+            batch
+        } else {
+            let mut bitmap_bytes = Vec::with_capacity(null_offsets.serialized_size());
+            null_offsets
+                .serialize_into(&mut bitmap_bytes)
+                .map_err(|e| {
+                    lance_core::Error::invalid_input(format!(
+                        "failed to serialize seed null bitmap: {}",
+                        e
+                    ))
+                })?;
+            let mut schema = batch.schema().as_ref().clone();
+            schema.metadata.insert(
+                SEED_NULL_BITMAP_META_KEY.to_string(),
+                hex_encode(&bitmap_bytes),
+            );
+            RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec())?
+        };
+
         // Serialize to Arrow IPC
         let mut buf = Cursor::new(Vec::new());
         {
@@ -1628,6 +1709,22 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
     fn schema_metadata_value(&self, buf_index: u32) -> String {
         format!("{}:{}", buf_index, self.rows_per_zone)
     }
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    if !s.len().is_multiple_of(2) {
+        return Err(format!("odd hex length: {}", s.len()));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("invalid hex at {}: {}", i, e))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3585,8 +3682,12 @@ mod tests {
         assert_eq!(meta_val, "3:4");
 
         // Deserialize and verify
-        let zones = ZoneMapSeedWriter::deserialize_seed(42, &bytes, rows_per_zone).unwrap();
+        let (zones, null_bitmap) =
+            ZoneMapSeedWriter::deserialize_seed(42, &bytes, rows_per_zone).unwrap();
         assert_eq!(zones.len(), 3, "expected 3 zones");
+
+        // No nulls in the input, so no null bitmap
+        assert!(null_bitmap.is_none(), "no nulls → no null bitmap");
 
         // Zone 0: values 0..4 -> min=0, max=3
         assert_eq!(zones[0].bound.fragment_id, 42);
@@ -3630,7 +3731,8 @@ mod tests {
         writer.observe_batch(&batch).unwrap();
 
         let bytes = writer.finish().unwrap().expect("should produce bytes");
-        let zones = ZoneMapSeedWriter::deserialize_seed(1, &bytes, rows_per_zone).unwrap();
+        let (zones, _null_bitmap) =
+            ZoneMapSeedWriter::deserialize_seed(1, &bytes, rows_per_zone).unwrap();
         assert_eq!(
             zones.len(),
             3,
@@ -3659,6 +3761,401 @@ mod tests {
         let mut writer = ZoneMapSeedWriter::new("col", 8, DataType::Int32).unwrap();
         let result = writer.finish().unwrap();
         assert!(result.is_none(), "empty fragment should return None");
+    }
+
+    /// Seeds produced for fragments that contain null values must carry a null
+    /// bitmap so that `try_update_with_seeds` can reconstruct `null_rows` without
+    /// rescanning data.
+    #[tokio::test]
+    async fn test_seed_null_bitmap_round_trip() {
+        use crate::scalar::seed::IndexSeedWriter;
+        use crate::scalar::zonemap::ZoneMapSeedWriter;
+        use arrow_array::Int32Array;
+        use lance_select::RowSetOps;
+
+        // rows_per_zone = 4, 10 rows: nulls at positions 1, 3, 5, 9
+        //   zone 0: rows 0-3 → nulls at 1, 3
+        //   zone 1: rows 4-7 → null at 5
+        //   zone 2: rows 8-9 → null at 9
+        let rows_per_zone = 4u64;
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(0),
+            None, // offset 1
+            Some(2),
+            None, // offset 3
+            Some(4),
+            None, // offset 5
+            Some(6),
+            Some(7),
+            Some(8),
+            None, // offset 9
+        ]));
+
+        let mut writer = ZoneMapSeedWriter::new("col", rows_per_zone, DataType::Int32).unwrap();
+        writer.observe_batch(&values).unwrap();
+        let bytes = writer.finish().unwrap().expect("should produce bytes");
+
+        let (zones, null_bitmap) =
+            ZoneMapSeedWriter::deserialize_seed(7, &bytes, rows_per_zone).unwrap();
+        assert_eq!(zones.len(), 3);
+        assert_eq!(zones[0].null_count, 2);
+        assert_eq!(zones[1].null_count, 1);
+        assert_eq!(zones[2].null_count, 1);
+
+        let bitmap = null_bitmap.expect("null bitmap must be present");
+        assert!(bitmap.contains(1), "offset 1 must be in bitmap");
+        assert!(bitmap.contains(3), "offset 3 must be in bitmap");
+        assert!(bitmap.contains(5), "offset 5 must be in bitmap");
+        assert!(bitmap.contains(9), "offset 9 must be in bitmap");
+        assert_eq!(bitmap.len(), 4, "exactly 4 null positions");
+
+        // Reconstruct a RowAddrTreeMap as try_update_with_seeds would do.
+        let mut null_rows = RowAddrTreeMap::new();
+        null_rows.insert_bitmap(7, bitmap);
+        // Verify the row addresses are (fragment 7 << 32 | offset).
+        let frag7 = 7u64 << 32;
+        assert!(null_rows.contains(frag7 | 1));
+        assert!(null_rows.contains(frag7 | 3));
+        assert!(null_rows.contains(frag7 | 5));
+        assert!(null_rows.contains(frag7 | 9));
+        assert!(!null_rows.contains(frag7));
+    }
+
+    /// After updating a zone map index via seeds from a fragment that contains
+    /// nulls, IS NULL must return an exact result (not a zone-scan approximation).
+    #[tokio::test]
+    async fn test_update_with_seeds_propagates_null_bitmap() {
+        use crate::scalar::seed::{FragmentSeed, IndexSeedWriter};
+        use crate::scalar::zonemap::{ZoneMapIndexBuilder, ZoneMapSeedWriter};
+        use arrow_array::Int32Array;
+        use lance_select::RowSetOps;
+
+        // Build an initial zone map index with one fragment that has nulls at rows 0 and 2.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Initial training: fragment 0, rows 0-3, nulls at 0 and 2.
+        let rows_per_zone = 4u64;
+        let initial_values: ArrayRef = Arc::new(Int32Array::from(vec![
+            None, // frag 0, row 0
+            Some(1),
+            None, // frag 0, row 2
+            Some(3),
+        ]));
+        let mut builder = ZoneMapIndexBuilder::try_new(
+            ZoneMapIndexBuilderParams::new(rows_per_zone),
+            DataType::Int32,
+        )
+        .unwrap();
+        let row_addrs: ArrayRef = Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![initial_values, row_addrs]).unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::once(async { Ok(batch) }),
+        ));
+        builder.train(stream).await.unwrap();
+        builder.write_index(store.as_ref()).await.unwrap();
+
+        // Load the trained index.
+        let index = ZoneMapIndex::load(store.clone(), None, &LanceCache::no_cache(), true)
+            .await
+            .unwrap();
+        assert!(
+            index.null_rows.is_some(),
+            "initial index must have null bitmap"
+        );
+
+        // Build a seed for fragment 1: rows 0-3, null at row 1.
+        let seed_values: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(10),
+            None, // frag 1, row 1
+            Some(12),
+            Some(13),
+        ]));
+        let mut seed_writer =
+            ZoneMapSeedWriter::new("value", rows_per_zone, DataType::Int32).unwrap();
+        seed_writer.observe_batch(&seed_values).unwrap();
+        let seed_bytes = seed_writer
+            .finish()
+            .unwrap()
+            .expect("seed must produce bytes");
+
+        let seed = FragmentSeed {
+            fragment_id: 1,
+            bytes: seed_bytes,
+            metadata_value: format!("0:{}", rows_per_zone),
+        };
+
+        // Update the index with the seed.
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        index
+            .try_update_with_seeds(&[seed], dest_store.as_ref())
+            .await
+            .unwrap()
+            .expect("update must produce a result");
+
+        let updated_index = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
+            .await
+            .unwrap();
+
+        // The updated index must have a null bitmap covering both fragments.
+        let null_rows = updated_index
+            .null_rows
+            .as_ref()
+            .expect("updated index must have null bitmap");
+
+        // Fragment 0: nulls at offsets 0 and 2
+        assert!(null_rows.contains(0u64), "frag 0 row 0 must be null");
+        assert!(null_rows.contains(2u64), "frag 0 row 2 must be null");
+        assert!(!null_rows.contains(1u64), "frag 0 row 1 must not be null");
+
+        // Fragment 1: null at offset 1
+        let frag1 = 1u64 << 32;
+        assert!(null_rows.contains(frag1 | 1), "frag 1 row 1 must be null");
+        assert!(!null_rows.contains(frag1), "frag 1 row 0 must not be null");
+
+        // IS NULL must return exact results (not a zone-scan approximation).
+        let result = updated_index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(result.is_exact(), "IS NULL after seed update must be exact");
+    }
+
+    /// A legacy index (null_rows = None) updated with a seed must still have
+    /// null_rows = None in the result.  The seed cannot retroactively supply null
+    /// positions for the rows already in the old index, so the updated index must
+    /// stay conservative and fall back to zone-scan for IS NULL.
+    #[tokio::test]
+    async fn test_update_with_seeds_legacy_index_keeps_null_rows_none() {
+        use crate::scalar::seed::{FragmentSeed, IndexSeedWriter};
+        use crate::scalar::zonemap::{ZoneMapIndex, ZoneMapSeedWriter};
+        use arrow_array::{Int32Array, UInt32Array};
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Build a legacy index (fragment 0, null_rows = None).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Int32, true),
+            Field::new("max", DataType::Int32, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(0i32)])) as _,
+                Arc::new(Int32Array::from(vec![Some(9i32)])) as _,
+                Arc::new(UInt32Array::from(vec![2u32])) as _, // 2 nulls, positions unknown
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![10u64])) as _,
+            ],
+        )
+        .unwrap();
+        let cache = LanceCache::no_cache();
+        let legacy_index = Arc::new(
+            ZoneMapIndex::try_from_serialized(
+                batch,
+                store.clone(),
+                None,
+                &cache,
+                10,
+                None, // legacy: null positions unknown
+                true,
+            )
+            .unwrap(),
+        );
+        assert!(legacy_index.null_rows.is_none());
+
+        // Build a seed for fragment 1 with known null positions.
+        let rows_per_zone = 10u64;
+        let seed_values: ArrayRef = Arc::new(Int32Array::from(vec![
+            None, // frag 1, row 0
+            Some(1),
+        ]));
+        let mut seed_writer =
+            ZoneMapSeedWriter::new("value", rows_per_zone, DataType::Int32).unwrap();
+        seed_writer.observe_batch(&seed_values).unwrap();
+        let seed_bytes = seed_writer
+            .finish()
+            .unwrap()
+            .expect("seed must produce bytes");
+
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        legacy_index
+            .try_update_with_seeds(
+                &[FragmentSeed {
+                    fragment_id: 1,
+                    bytes: seed_bytes,
+                    metadata_value: format!("0:{}", rows_per_zone),
+                }],
+                dest_store.as_ref(),
+            )
+            .await
+            .unwrap()
+            .expect("update must produce a result");
+
+        let updated = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            updated.null_rows.is_none(),
+            "updating a legacy index must not fabricate a null bitmap: \
+             the old fragment's null positions were never tracked"
+        );
+
+        let result = updated
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_exact(),
+            "IS NULL on an index derived from a legacy source must use zone scan, not exact lookup"
+        );
+    }
+
+    /// Merging a modern index (null_rows = Some) with a legacy index (null_rows = None)
+    /// must produce a merged index with null_rows = None.  Returning the modern
+    /// fragment's bitmap as-is would be a false negative for the legacy fragment.
+    #[tokio::test]
+    async fn test_merge_modern_and_legacy_index_drops_null_bitmap() {
+        use arrow_array::{Int32Array, UInt32Array};
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let cache = LanceCache::no_cache();
+
+        // Modern index: fragment 0, null_rows = Some(bitmap with 1 known null).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Int32, true),
+            Field::new("max", DataType::Int32, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]));
+        let modern_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1i32)])) as _,
+                Arc::new(Int32Array::from(vec![Some(5i32)])) as _,
+                Arc::new(UInt32Array::from(vec![1u32])) as _,
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![10u64])) as _,
+            ],
+        )
+        .unwrap();
+        let mut modern_null_rows = RowAddrTreeMap::new();
+        modern_null_rows.insert(2u64); // frag 0, row 2
+        let modern_index = Arc::new(
+            ZoneMapIndex::try_from_serialized(
+                modern_batch,
+                store.clone(),
+                None,
+                &cache,
+                10,
+                Some(modern_null_rows),
+                false,
+            )
+            .unwrap(),
+        );
+
+        // Legacy index: fragment 1, null_rows = None.
+        let legacy_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10i32)])) as _,
+                Arc::new(Int32Array::from(vec![Some(20i32)])) as _,
+                Arc::new(UInt32Array::from(vec![3u32])) as _, // 3 nulls, positions unknown
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
+                Arc::new(UInt64Array::from(vec![1u64])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![10u64])) as _,
+            ],
+        )
+        .unwrap();
+        let legacy_index = Arc::new(
+            ZoneMapIndex::try_from_serialized(
+                legacy_batch,
+                store.clone(),
+                None,
+                &cache,
+                10,
+                None, // legacy: null positions unknown
+                false,
+            )
+            .unwrap(),
+        );
+
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let all_frags = RoaringBitmap::from_iter([0u32, 1]);
+        merge_zonemap_indices(
+            &[modern_index.as_ref(), legacy_index.as_ref()],
+            dest_store.as_ref(),
+            &all_frags,
+        )
+        .await
+        .unwrap();
+
+        let merged = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), false)
+            .await
+            .unwrap();
+
+        assert!(
+            merged.null_rows.is_none(),
+            "merging a modern index with a legacy index must drop the null bitmap: \
+             the legacy fragment's null positions are unknown"
+        );
+
+        let result = merged
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_exact(),
+            "IS NULL on a merged index with a legacy source must use zone scan, not exact lookup"
+        );
     }
 
     // ───────────────────────────── Nested type zone map tests ─────────────────────────────
