@@ -378,7 +378,7 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     priority: u128,
     num_reqs: usize,
     num_delivered: usize,
-    err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    err: Option<Error>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
     bypass_backpressure: bool,
     // Queue the batch's backpressure reservation is refunded to once its response
@@ -417,7 +417,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
         // If we have an error, return that. Otherwise return the data, as long as the I/O requests have been processed.
         let result = if let Some(err) = self.err.take() {
-            Err(Error::wrapped(err))
+            Err(err)
         } else if self.num_delivered < self.data_buffers.len() {
             // This usually happens on tokio runtime shutdown
             Err(Error::io(format!(
@@ -469,7 +469,7 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
             }
             Err(err) => {
                 // This keeps the original error, if present
-                self.err.get_or_insert(Box::new(err));
+                self.err.get_or_insert(err);
             }
         }
     }
@@ -481,6 +481,23 @@ struct IoTask {
     when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
     priority: u128,
     bypass_backpressure: bool,
+}
+
+fn validate_read_length(
+    file_path: &Path,
+    requested_range: &Range<u64>,
+    bytes: Bytes,
+) -> Result<Bytes> {
+    let expected_len = requested_range.end - requested_range.start;
+    if bytes.len() as u64 != expected_len {
+        return Err(Error::io(format!(
+            "I/O request for file {file_path} and range {}..{} returned {} bytes, expected {expected_len} bytes",
+            requested_range.start,
+            requested_range.end,
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 impl Eq for IoTask {}
@@ -534,6 +551,7 @@ impl IoTask {
                 })
                 .await
                 .map_err(Error::from)
+                .and_then(|bytes| validate_read_length(self.reader.path(), &self.to_read, bytes))
         };
         // Emit per-file I/O trace event only when tracing is enabled
         tracing::trace!(
@@ -1056,11 +1074,15 @@ impl ScanScheduler {
             .map(|task| {
                 let reader = reader.clone();
                 let queue = io_queue.clone();
+                let requested_range = task.clone();
                 let run_fn = Box::new(move || {
-                    reader
-                        .get_range(task.start as usize..task.end as usize)
-                        .map_err(Error::from)
-                        .boxed()
+                    let bytes_fut = reader
+                        .get_range(requested_range.start as usize..requested_range.end as usize);
+                    async move {
+                        let bytes = bytes_fut.await.map_err(Error::from)?;
+                        validate_read_length(reader.path(), &requested_range, bytes)
+                    }
+                    .boxed()
                 });
                 queue.submit(task, priority, run_fn, bypass_backpressure)
             })
@@ -1224,25 +1246,12 @@ impl FileScheduler {
             priority,
             self.bypass_backpressure,
         );
-        let file_path = self.reader.path().clone();
 
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
 
         async move {
             let bytes_vec = bytes_vec_fut.await?;
-
-            for (range, bytes) in updated_requests.iter().zip(&bytes_vec) {
-                let expected_len = range.end - range.start;
-                if bytes.len() as u64 != expected_len {
-                    return Err(Error::io(format!(
-                        "I/O request for file {file_path} and range {}..{} returned {} bytes, expected {expected_len} bytes",
-                        range.start,
-                        range.end,
-                        bytes.len()
-                    )));
-                }
-            }
 
             let mut orig_index = 0;
             while (updated_index < updated_requests.len()) && (orig_index < request.len()) {
@@ -1358,6 +1367,7 @@ mod tests {
     use futures::poll;
     use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
+    use rstest::rstest;
 
     use object_store::{GetRange, ObjectStore as OSObjectStore, ObjectStoreExt, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
@@ -1576,12 +1586,16 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
     #[tokio::test]
-    async fn test_short_read_returns_io_error() {
-        let scheduler = ScanScheduler::new(
-            Arc::new(ObjectStore::memory()),
-            SchedulerConfig::default_for_testing(),
-        );
+    async fn test_short_read_returns_io_error(#[case] use_lite_scheduler: bool) {
+        let config = SchedulerConfig {
+            use_lite_scheduler: Some(use_lite_scheduler),
+            ..SchedulerConfig::default_for_testing()
+        };
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::memory()), config);
         let reader = Arc::new(ShortReader {
             path: Path::parse("short-file").unwrap(),
         });
