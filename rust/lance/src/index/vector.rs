@@ -1137,16 +1137,6 @@ async fn build_vector_index_impl(
         }
     }
 
-    // Covering is implemented for IVF_PQ in this change; the other IVF vector types land in a
-    // follow-up. Reject covering on a non-PQ index up front rather than recording
-    // `included_fields` the storage cannot serve.
-    if !params.include_columns.is_empty() && !matches!(index_type, IndexType::IvfPq) {
-        return Err(Error::invalid_input(
-            "include_columns (covering columns) are currently only supported for IVF_PQ indexes"
-                .to_string(),
-        ));
-    }
-
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
