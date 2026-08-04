@@ -3,7 +3,7 @@
 
 pub mod datatypes;
 pub mod format;
-pub(crate) mod io;
+pub mod io;
 pub mod reader;
 pub mod testing;
 pub mod version;
@@ -13,7 +13,7 @@ pub mod writer;
 #[cfg(test)]
 mod compatibility_tests;
 
-pub use io::LanceEncodingsIo;
+pub use io::{LanceEncodingsIo, SentinelEncodingsIo};
 
 use format::MAGIC;
 use lance_core::{Error, Result};

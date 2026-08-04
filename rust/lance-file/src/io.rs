@@ -9,6 +9,37 @@ use lance_io::scheduler::FileScheduler;
 
 use super::reader::DEFAULT_READ_CHUNK_SIZE;
 
+/// A placeholder [`EncodingsIo`] used by cached / unbound [`crate::reader::FileReader`]
+/// instances.
+///
+/// A `FileReader` opened via [`crate::reader::FileReader::try_open_unbound_with_file_metadata`]
+/// holds this sentinel in its scheduler slot. The caller MUST call
+/// [`crate::reader::FileReader::with_scheduler`] to bind a real scheduler before
+/// performing any reads — invoking I/O against the sentinel panics.
+///
+/// This exists to let callers cache an immutable, fully-projected `FileReader`
+/// across requests without baking in per-request object stores or open file
+/// handles. Each request rebinds the cached reader to its own scheduler.
+#[derive(Debug)]
+pub struct SentinelEncodingsIo;
+
+impl EncodingsIo for SentinelEncodingsIo {
+    fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
+        None
+    }
+
+    fn submit_request(
+        &self,
+        _ranges: Vec<std::ops::Range<u64>>,
+        _priority: u64,
+    ) -> BoxFuture<'static, lance_core::Result<Vec<bytes::Bytes>>> {
+        panic!(
+            "SentinelEncodingsIo::submit_request called — this FileReader was opened \
+             without a scheduler; bind one with FileReader::with_scheduler before reading"
+        );
+    }
+}
+
 #[derive(Debug)]
 pub struct LanceEncodingsIo {
     scheduler: FileScheduler,
