@@ -1574,8 +1574,6 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
     let mut indices = array_dict.keys();
     let num_values = indices.len() as u64;
     let mut values = array_dict.values().clone();
-    // Placeholder, if we need to upcast, we will initialize this and set `indices` to refer to it
-    let mut upcast = None;
 
     // TODO: Should we just always normalize indices to u32?  That would make logic simpler
     // and we're going to bitpack them soon anyways
@@ -1591,18 +1589,22 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
         let first_invalid_index = first_invalid_index.unwrap_or_else(|| {
             let null_arr = new_null_array(values.data_type(), 1);
             values = arrow_select::concat::concat(&[values.as_ref(), null_arr.as_ref()]).unwrap();
-            let null_index = values.len() - 1;
-            let max_index_val = max_index_val(indices.data_type());
-            if null_index as u64 > max_index_val {
-                // Widen the index type
-                if max_index_val >= u32::MAX as u64 {
-                    unimplemented!("Dictionary arrays with 2^32 unique value (or more) and a null")
-                }
-                upcast = Some(arrow_cast::cast(indices, &DataType::UInt32).unwrap());
-                indices = upcast.as_ref().unwrap();
-            }
-            null_index
+            values.len() - 1
         });
+        let max_index_val = max_index_val(indices.data_type());
+        let upcast = if first_invalid_index as u64 > max_index_val {
+            // Widen the index type when the null dictionary value cannot be addressed by the
+            // declared key type, whether the value already existed or was appended above.
+            if max_index_val >= u32::MAX as u64 {
+                unimplemented!("Dictionary arrays with 2^32 unique value (or more) and a null")
+            }
+            Some(arrow_cast::cast(indices, &DataType::UInt32).unwrap())
+        } else {
+            None
+        };
+        if let Some(upcast) = upcast.as_ref() {
+            indices = upcast;
+        }
         // This can't fail since we already checked for fit
         let null_index_arr = arrow_cast::cast(
             &UInt64Array::from(vec![first_invalid_index as u64]),

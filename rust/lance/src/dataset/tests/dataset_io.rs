@@ -2128,12 +2128,26 @@ async fn append_dictionary(
     }
 }
 
+#[rstest]
+#[case::appended_null_value(
+    (0..=i8::MAX)
+        .map(|value| Some(format!("value-{value}")))
+        .collect(),
+    (0..=i8::MAX).map(Some).chain([None]).collect()
+)]
+#[case::existing_unaddressable_null_value(
+    (0..130)
+        .map(|value| (value != 129).then(|| format!("value-{value}")))
+        .collect(),
+    vec![Some(0_i8), None]
+)]
 #[tokio::test]
-async fn write_rejects_dictionary_indices_wider_than_declared_key_type() {
-    let dictionary = Arc::new(StringArray::from_iter_values(
-        (0..=i8::MAX).map(|value| format!("value-{value}")),
-    ));
-    let indices = Int8Array::from((0..=i8::MAX).map(Some).chain([None]).collect::<Vec<_>>());
+async fn write_rejects_dictionary_null_index_outside_declared_key_range(
+    #[case] values: Vec<Option<String>>,
+    #[case] indices: Vec<Option<i8>>,
+) {
+    let dictionary = Arc::new(StringArray::from(values));
+    let indices = Int8Array::from(indices);
     let dictionary = Int8DictionaryArray::try_new(indices, dictionary).unwrap();
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "d",
