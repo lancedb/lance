@@ -14,6 +14,7 @@
 package org.lance.ipc;
 
 import org.lance.Dataset;
+import org.lance.LanceException;
 import org.lance.LockManager;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -137,18 +138,18 @@ public class AsyncScanner implements AutoCloseable {
             pendingTasks.remove(taskId);
 
             if (error != null) {
-              throw new RuntimeException("Scan failed", error);
+              throw new LanceException("Scan failed", error);
             }
 
             if (streamPtr < 0) {
-              throw new RuntimeException("Native scan error");
+              throw new LanceException("Native scan returned an invalid stream pointer");
             }
 
             try {
               ArrowArrayStream stream = ArrowArrayStream.wrap(streamPtr);
               return Data.importArrayStream(allocator, stream);
             } catch (Exception e) {
-              throw new RuntimeException(e);
+              throw new LanceException("Failed to import scan stream", e);
             }
           });
     }
@@ -166,7 +167,7 @@ public class AsyncScanner implements AutoCloseable {
   private void failTask(long taskId, String errorMessage) {
     CompletableFuture<Long> future = pendingTasks.get(taskId);
     if (future != null) {
-      future.completeExceptionally(new RuntimeException(errorMessage));
+      future.completeExceptionally(new LanceException(errorMessage));
     }
   }
 

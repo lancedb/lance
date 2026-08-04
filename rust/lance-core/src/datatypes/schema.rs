@@ -1870,6 +1870,11 @@ mod tests {
             vec!["simple".to_string()]
         );
 
+        assert_eq!(
+            parse_field_path("tags[*]").unwrap(),
+            vec!["tags[*]".to_string()]
+        );
+
         // Quoted field at the end
         assert_eq!(
             parse_field_path("parent.`field.with.dot`").unwrap(),

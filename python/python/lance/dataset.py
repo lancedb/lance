@@ -74,7 +74,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .query import FullTextQuery
+from .query import DocumentGranularity, FullTextQuery
 from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -1246,12 +1246,14 @@ class LanceDataset(pa.dataset.Dataset):
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
-            smaller than this size.  Note: this can be overridden by
-            ``batch_size_bytes`` or by a dataset-level ``batch_size_bytes``
-            configured via ``FileReaderOptions``.
+            smaller than this size. If a byte limit is also configured, both
+            limits apply and the one reached first determines the batch size.
         batch_size_bytes: int, default None
             If set, the scanner will produce batches whose total size in bytes
-            is approximately this value, overriding the row-based ``batch_size``.
+            is approximately this value. If ``batch_size`` is also set, both
+            limits apply and the one reached first determines the batch size.
+            This cannot be combined with ``strict_batch_size=True`` because
+            strict row batching can merge batches beyond the byte limit.
             This can also be configured at the dataset level via
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
@@ -1329,6 +1331,10 @@ class LanceDataset(pa.dataset.Dataset):
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
             re-raised.
+        strict_batch_size: bool, default False
+            If True, all batches except the last batch will have exactly
+            ``batch_size`` rows. This cannot be combined with a byte limit,
+            including one configured through ``FileReaderOptions``.
         include_deleted_rows: bool, default False
             If True, then rows that have been deleted, but are still present in the
             fragment, will be returned.  These rows will have the _rowid column set
@@ -3251,8 +3257,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         column = column[0]
         lance_field = self._ds.lance_schema.field_case_insensitive(column)
-        if lance_field is None:
-            raise KeyError(f"{column} not found in schema")
 
         if isinstance(index_type, str):
             index_type = index_type.upper()
@@ -3274,6 +3278,12 @@ class LanceDataset(pa.dataset.Dataset):
                         f"scalar columns.  Received {index_type}",
                     )
                 )
+
+            if lance_field is None:
+                if index_type in ["INVERTED", "FTS"]:
+                    # Rust resolves public FTS paths through intervening list layers.
+                    return column, index_type, index_type
+                raise KeyError(f"{column} not found in schema")
 
             field = lance_field.to_arrow()
 
@@ -3332,7 +3342,12 @@ class LanceDataset(pa.dataset.Dataset):
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
-            config = json.dumps(index_type.parameters)
+            if lance_field is None and logical_index_type not in ["INVERTED", "FTS"]:
+                raise KeyError(f"{column} not found in schema")
+            parameters = dict(index_type.parameters)
+            if logical_index_type in ["INVERTED", "FTS"]:
+                parameters["document_granularity"] = kwargs["document_granularity"]
+            config = json.dumps(parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
             return column, "scalar", logical_index_type
         else:
@@ -3401,6 +3416,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         format_version: Optional[Union[int, str]] = None,
+        document_granularity: DocumentGranularity = DocumentGranularity.ROW,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -3514,6 +3530,11 @@ class LanceDataset(pa.dataset.Dataset):
             otherwise writes v2 for text analysis with ``block_size=128`` and
             v3 for code analysis or ``block_size=256``.
 
+        document_granularity: DocumentGranularity, default ROW
+            This is for the ``INVERTED`` / ``FTS`` index. ``ROW`` treats all
+            selected text in one dataset row as one document. ``LIST_ELEMENT``
+            treats each element of the deepest list on ``column`` as one document.
+
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
@@ -3607,6 +3628,11 @@ class LanceDataset(pa.dataset.Dataset):
         ``MaterializeIndex`` operator.
 
         """
+        if not isinstance(document_granularity, DocumentGranularity):
+            raise TypeError(
+                "document_granularity must be a lance.query.DocumentGranularity"
+            )
+        kwargs["document_granularity"] = document_granularity.value
         column, index_type, logical_index_type = self._prepare_scalar_index_request(
             column, index_type, kwargs
         )
@@ -3628,7 +3654,6 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["progress_callback"] = progress_callback
         if format_version is not None:
             kwargs["format_version"] = format_version
-
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def _create_index_impl(
@@ -6361,9 +6386,8 @@ class ScannerBuilder:
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set the maximum number of rows per batch.
 
-        Note: this can be overridden by ``batch_size_bytes`` or by a
-        dataset-level ``batch_size_bytes`` configured via
-        ``FileReaderOptions``.
+        If a byte limit is also configured, both limits apply and the one
+        reached first determines the batch size.
         """
         self._batch_size = batch_size
         return self
@@ -6372,7 +6396,8 @@ class ScannerBuilder:
         """Set the target batch size in bytes.
 
         When set, the scanner will produce batches whose total size in bytes
-        is approximately this value, overriding the row-based ``batch_size``.
+        is approximately this value. If ``batch_size`` is also set, both
+        limits apply and the one reached first determines the batch size.
 
         This can also be configured at the dataset level via
         ``FileReaderOptions``.  A scanner-level setting takes precedence
@@ -6751,6 +6776,9 @@ class ScannerBuilder:
         If this is true then small batches will need to be merged together
         which will require a data copy and incur a (typically very small)
         performance penalty.
+
+        This cannot be combined with ``batch_size_bytes`` because merging
+        batches to the strict row count can exceed the byte limit.
         """
         self._strict_batch_size = strict_batch_size
         return self
@@ -7240,7 +7268,7 @@ class Tags:
         """
         return self._ds.tags()
 
-    def get_version(self, tag: str) -> Optional[int]:
+    def get_version(self, tag: str) -> int:
         """
         Get the version of a specific tag by name.
 
@@ -7251,8 +7279,13 @@ class Tags:
 
         Returns
         -------
-        int or None
-            The version number of the tag if it exists, otherwise None.
+        int
+            The version number of the tag.
+
+        Raises
+        ------
+        ValueError
+            If the tag does not exist. Use :meth:`list` to check for presence.
         """
         return self._ds.get_version(tag)
 

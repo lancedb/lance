@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use arrow_array::{BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array};
 use arrow_buffer::NullBuffer;
 use futures::{
     FutureExt, Stream, StreamExt,
-    future::BoxFuture,
+    future::{BoxFuture, Shared},
     stream::{BoxStream, FuturesOrdered},
 };
 use lance_arrow::RecordBatchExt;
 use lance_core::{
-    ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD, Result,
     utils::{address::RowAddress, deletion::DeletionVector},
 };
@@ -31,27 +31,124 @@ pub struct ReadBatchTask {
 pub type ReadBatchTaskStream = BoxStream<'static, ReadBatchTask>;
 pub type ReadBatchFutStream = BoxStream<'static, ReadBatchFut>;
 
+type SharedReadBatchFut = Shared<BoxFuture<'static, std::result::Result<RecordBatch, Arc<Error>>>>;
+
+#[derive(Debug)]
+struct SharedReadError(Arc<Error>);
+
+impl fmt::Display for SharedReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for SharedReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+struct PendingReadBatch {
+    task: Option<ReadBatchFut>,
+    shared_task: Option<SharedReadBatchFut>,
+    offset: u32,
+    num_rows: u32,
+}
+
+impl PendingReadBatch {
+    fn new(task: ReadBatchTask) -> Self {
+        Self {
+            task: Some(task.task),
+            shared_task: None,
+            offset: 0,
+            num_rows: task.num_rows,
+        }
+    }
+
+    fn take(&mut self, num_rows: u32) -> ReadBatchFut {
+        debug_assert!(num_rows <= self.num_rows);
+
+        if self.offset == 0 && num_rows == self.num_rows && self.shared_task.is_none() {
+            self.num_rows = 0;
+            let Some(task) = self.task.take() else {
+                return async {
+                    Err(Error::internal(
+                        "missing read task while merging aligned streams".to_string(),
+                    ))
+                }
+                .boxed();
+            };
+            return task;
+        }
+
+        let shared_task = self
+            .shared_task
+            .get_or_insert_with(|| {
+                let task = self.task.take();
+                async move {
+                    let Some(task) = task else {
+                        return Err(Arc::new(Error::internal(
+                            "missing read task while splitting a merged stream".to_string(),
+                        )));
+                    };
+                    task.await.map_err(Arc::new)
+                }
+                .boxed()
+                .shared()
+            })
+            .clone();
+        let offset = self.offset;
+        self.offset += num_rows;
+        self.num_rows -= num_rows;
+
+        async move {
+            match shared_task.await {
+                Ok(batch) => Ok(batch.slice(offset as usize, num_rows as usize)),
+                Err(error) => Err(Error::wrapped(Box::new(SharedReadError(error)))),
+            }
+        }
+        .boxed()
+    }
+}
+
 struct MergeStream {
     streams: Vec<ReadBatchTaskStream>,
-    next_batch: FuturesOrdered<ReadBatchFut>,
-    next_num_rows: u32,
+    pending: Vec<Option<PendingReadBatch>>,
     index: usize,
 }
 
 impl MergeStream {
     fn emit(&mut self) -> ReadBatchTask {
-        let mut iter = std::mem::take(&mut self.next_batch);
+        let num_rows = self
+            .pending
+            .iter()
+            .filter_map(|pending| pending.as_ref().map(|pending| pending.num_rows))
+            .min()
+            .unwrap_or_default();
+        let mut batches = FuturesOrdered::new();
+        for pending in &mut self.pending {
+            let Some(pending_batch) = pending.as_mut() else {
+                continue;
+            };
+            batches.push_back(pending_batch.take(num_rows));
+            if pending_batch.num_rows == 0 {
+                *pending = None;
+            }
+        }
         let task = async move {
-            let mut batch = iter.next().await.unwrap()?;
-            while let Some(next) = iter.next().await {
+            let Some(first) = batches.next().await else {
+                return Err(Error::internal(
+                    "cannot merge an empty set of read batches".to_string(),
+                ));
+            };
+            let mut batch = first?;
+            while let Some(next) = batches.next().await {
                 let next = next?;
                 batch = batch.merge(&next)?;
             }
             Ok(batch)
         }
         .boxed();
-        let num_rows = self.next_num_rows;
-        self.next_num_rows = 0;
         ReadBatchTask { task, num_rows }
     }
 }
@@ -64,21 +161,19 @@ impl Stream for MergeStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         loop {
+            if self.pending.iter().all(Option::is_some) {
+                return std::task::Poll::Ready(Some(self.emit()));
+            }
+
             let index = self.index;
+            if self.pending[index].is_some() {
+                self.index = (index + 1) % self.streams.len();
+                continue;
+            }
             match self.streams[index].poll_next_unpin(cx) {
                 std::task::Poll::Ready(Some(batch_task)) => {
-                    if self.index == 0 {
-                        self.next_num_rows = batch_task.num_rows;
-                    } else {
-                        debug_assert_eq!(self.next_num_rows, batch_task.num_rows);
-                    }
-                    self.next_batch.push_back(batch_task.task);
-                    self.index += 1;
-                    if self.index == self.streams.len() {
-                        self.index = 0;
-                        let next_batch = self.emit();
-                        return std::task::Poll::Ready(Some(next_batch));
-                    }
+                    self.pending[index] = Some(PendingReadBatch::new(batch_task));
+                    self.index = (index + 1) % self.streams.len();
                 }
                 std::task::Poll::Ready(None) => {
                     return std::task::Poll::Ready(None);
@@ -95,19 +190,20 @@ impl Stream for MergeStream {
 ///
 /// This pulls one batch from each stream and then combines the columns from
 /// all of the batches into a single batch.  The order of the batches in the
-/// streams is maintained and the merged batch columns will be in order from
-/// first to last stream.
+/// streams is maintained and the merged batch columns will be in order from first
+/// to last stream. If the streams use different batch boundaries then batches are
+/// sliced so each merged output remains row-aligned.
 ///
 /// This stream ends as soon as any of the input streams ends (we do not
 /// verify that the other input streams are finished as well)
-///
-/// This will panic if any of the input streams return a batch with a different
-/// number of rows than the first stream.
 pub fn merge_streams(streams: Vec<ReadBatchTaskStream>) -> ReadBatchTaskStream {
+    if streams.is_empty() {
+        return futures::stream::empty().boxed();
+    }
+    let pending = (0..streams.len()).map(|_| None).collect();
     MergeStream {
         streams,
-        next_batch: FuturesOrdered::new(),
-        next_num_rows: 0,
+        pending,
         index: 0,
     }
     .boxed()
@@ -422,7 +518,10 @@ mod tests {
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::{RecordBatch, UInt32Array, types::Int32Type};
     use arrow_schema::ArrowError;
-    use futures::{FutureExt, StreamExt, TryStreamExt, stream::BoxStream};
+    use futures::{
+        FutureExt, StreamExt, TryStreamExt,
+        stream::{self, BoxStream},
+    };
     use lance_core::{
         ROW_ID,
         utils::{address::RowAddress, deletion::DeletionVector},
@@ -474,6 +573,46 @@ mod tests {
             .into_reader_rows(RowCount::from(100), BatchCount::from(10))
             .collect::<Result<Vec<_>, ArrowError>>()
             .unwrap();
+        assert_eq!(merged, expected);
+    }
+
+    #[tokio::test]
+    async fn test_zip_with_different_batch_boundaries() {
+        let left_batch =
+            arrow_array::record_batch!(("x", Int32, (0..10).collect::<Vec<_>>())).unwrap();
+        let right_batch =
+            arrow_array::record_batch!(("y", Int32, (10..20).collect::<Vec<_>>())).unwrap();
+        let left = batch_task_stream(
+            stream::iter([Ok(left_batch.slice(0, 6)), Ok(left_batch.slice(6, 4))]).boxed(),
+        );
+        let right = batch_task_stream(
+            stream::iter([Ok(right_batch.slice(0, 4)), Ok(right_batch.slice(4, 6))]).boxed(),
+        );
+
+        let merged = super::merge_streams(vec![left, right])
+            .map(|batch_task| batch_task.task)
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let expected = vec![
+            arrow_array::record_batch!(
+                ("x", Int32, (0..4).collect::<Vec<_>>()),
+                ("y", Int32, (10..14).collect::<Vec<_>>())
+            )
+            .unwrap(),
+            arrow_array::record_batch!(
+                ("x", Int32, (4..6).collect::<Vec<_>>()),
+                ("y", Int32, (14..16).collect::<Vec<_>>())
+            )
+            .unwrap(),
+            arrow_array::record_batch!(
+                ("x", Int32, (6..10).collect::<Vec<_>>()),
+                ("y", Int32, (16..20).collect::<Vec<_>>())
+            )
+            .unwrap(),
+        ];
         assert_eq!(merged, expected);
     }
 

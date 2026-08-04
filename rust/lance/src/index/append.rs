@@ -24,6 +24,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata};
+use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -36,7 +37,9 @@ use super::{CreateIndexBuilder, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
-use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
+use crate::index::scalar::{
+    IndexDetails, fetch_index_details, load_fts_training_data, load_training_data,
+};
 use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
@@ -758,7 +761,33 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             old_indices[0].fields[0]
         )))?;
 
-    let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
+    let raw_field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
+    let first_details =
+        super::scalar::fetch_index_details(dataset.as_ref(), &raw_field_path, old_indices[0])
+            .await?;
+    let resolved_fts = if first_details.type_url.ends_with("InvertedIndexDetails") {
+        let details =
+            lance_index::pbold::InvertedIndexDetails::decode(first_details.value.as_slice())
+                .map_err(|error| {
+                    Error::io(format!(
+                        "failed to decode InvertedIndexDetails payload: {error}"
+                    ))
+                })?;
+        let granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
+            details.document_granularity,
+        )?;
+        Some(crate::index::scalar::inverted::resolve_fts_field_by_id(
+            dataset.schema(),
+            old_indices[0].fields[0],
+            granularity,
+        )?)
+    } else {
+        None
+    };
+    let field_path = resolved_fts
+        .as_ref()
+        .map(|resolved| resolved.canonical_path.clone())
+        .unwrap_or(raw_field_path);
     let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
     for idx in old_indices.iter().skip(1) {
         let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;
@@ -777,6 +806,43 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
     let (new_uuid, removed_indices, new_fragment_bitmap, created_index, new_dataset_version) =
         if first_is_vector_index {
+            // Segments with stored rows (raw coverage) but no live coverage
+            // (e.g. a definition retained through a full rewrite) are dormant.
+            // With stable row ids their stored postings still share ids with
+            // live rows, so merging them would resurrect stale vectors; they
+            // may only be replaced. A born-empty segment (deferred build) has
+            // no stored rows and stays mergeable.
+            let (live_segments, dormant_segments): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
+                old_indices.iter().copied().partition(|idx| {
+                    let has_stored_rows = idx
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| !bitmap.is_empty());
+                    let has_live_coverage = idx
+                        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                        .is_none_or(|bitmap| !bitmap.is_empty());
+                    !has_stored_rows || has_live_coverage
+                });
+            if !dormant_segments.is_empty() && !live_segments.is_empty() && !options.retrain {
+                // Optimize the live segments as usual; the dormant segments
+                // are superseded by whatever that produces.
+                let mut merged = Box::pin(merge_indices_with_unindexed_frags(
+                    dataset.clone(),
+                    &live_segments,
+                    unindexed,
+                    options,
+                ))
+                .await?;
+                if let Some(results) = merged.as_mut() {
+                    results.removed_indices.extend(dormant_segments);
+                }
+                return Ok(merged);
+            }
+            let rebuild_dormant = live_segments.is_empty() && !dormant_segments.is_empty();
+            if rebuild_dormant && unindexed.is_empty() {
+                return Ok(None);
+            }
+
             let full_logical_index = dataset
                 .open_logical_vector_index(&field_path, &old_indices[0].name)
                 .await?;
@@ -805,7 +871,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .collect(),
             )?;
 
-            if options.retrain {
+            if options.retrain || rebuild_dormant {
                 let fragment_bitmap = dataset.fragment_bitmap.as_ref().clone();
                 let segment = build_fresh_vector_segment(
                     dataset.as_ref(),
@@ -1138,9 +1204,15 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         };
                     let update_criteria = reference_index.update_criteria();
                     if update_criteria.requires_old_data {
-                        let new_data_stream = load_training_data(
+                        let params = reference_index.derive_index_params()?;
+                        let resolved = resolved_fts.as_ref().ok_or_else(|| {
+                            Error::internal(
+                                "Inverted index metadata did not resolve an FTS field".to_string(),
+                            )
+                        })?;
+                        let new_data_stream = load_fts_training_data(
                             dataset.as_ref(),
-                            &field_path,
+                            resolved,
                             &update_criteria.data_criteria,
                             None,
                             true,
@@ -1150,7 +1222,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         let new_uuid = Uuid::new_v4();
                         let created_index = super::scalar::build_scalar_index(
                             dataset.as_ref(),
-                            column.name.as_str(),
+                            &resolved.canonical_path,
                             new_uuid,
                             &reference_params,
                             true,
@@ -1171,9 +1243,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     }
 
                     let fragments = Some(unindexed.to_vec());
-                    let new_data_stream = load_training_data(
+                    let resolved = resolved_fts.as_ref().ok_or_else(|| {
+                        Error::internal(
+                            "Inverted index metadata did not resolve an FTS field".to_string(),
+                        )
+                    })?;
+                    let new_data_stream = load_fts_training_data(
                         dataset.as_ref(),
-                        &field_path,
+                        resolved,
                         &update_criteria.data_criteria,
                         fragments,
                         true,
@@ -1233,10 +1310,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         let reference_inverted_params =
                             serde_json::from_str::<InvertedIndexParams>(reference_params_json)?;
                         (
-                            InvertedIndexPlugin::train_inverted_index_with_list_document_mode(
-                                new_data_stream,
-                                &new_store,
-                                reference_inverted_params,
+                            super::scalar::build_scalar_index(
+                                dataset.as_ref(),
+                                &resolved.canonical_path,
+                                new_uuid,
+                                &reference_index.derive_index_params()?,
+                                true,
                                 None,
                                 Arc::new(NoopIndexBuildProgress),
                                 reference_list_document_mode,

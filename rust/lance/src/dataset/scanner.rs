@@ -51,7 +51,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{FloatType, coerce_float_vector};
 use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
 use lance_core::datatypes::{
-    BlobHandling, Field, OnMissing, Projection, escape_field_path_for_project, format_field_path,
+    BlobHandling, Field, OnMissing, Projection, escape_field_path_for_project,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -65,19 +65,24 @@ use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::query::{
-    FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
+    FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator, PhraseQuery,
+    fill_fts_query_column,
 };
-use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
+use lance_index::scalar::inverted::{
+    DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, SCORE_COL, SCORE_FIELD, fts_schema,
+};
+use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
-use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
+use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
@@ -90,7 +95,9 @@ use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
-use crate::index::scalar::inverted::{load_segment_details, load_segments};
+use crate::index::scalar::inverted::{
+    load_segment_details, load_segments, resolve_fts_field, resolve_query_document_granularity,
+};
 use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
@@ -99,8 +106,8 @@ use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::fts::{
-    BoostQueryExec, CompoundQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
-    PhraseQueryExec,
+    BoostQueryExec, CompoundQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, FtsDocumentExec,
+    MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -119,7 +126,7 @@ use crate::io::exec::{
 use crate::{Error, Result};
 use crate::{
     datatypes::Schema,
-    io::exec::fts::{BoolSlot, BooleanQueryExec, build_boolean_query_children},
+    io::exec::fts::{BoolSlot, BooleanQueryExec, build_boolean_query_children_with_schema},
 };
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -879,7 +886,8 @@ pub struct Scanner {
     batch_size: Option<usize>,
 
     /// If set, the scanner will produce batches whose total size in bytes
-    /// is approximately this value, overriding the row-based `batch_size`.
+    /// is approximately this value. When both limits are set, the scanner uses
+    /// the smaller row count selected by either limit.
     batch_size_bytes: Option<u64>,
 
     /// Number of batches to prefetch
@@ -1407,15 +1415,6 @@ impl Scanner {
     ///    .into_stream();
     /// ```
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
-        let fields = query.columns();
-        if !fields.is_empty() {
-            for field in fields.iter() {
-                if self.dataset.schema().field(field).is_none() {
-                    return Err(Error::invalid_input(format!("Column {} not found", field)));
-                }
-            }
-        }
-
         self.full_text_query = Some(query);
         Ok(self)
     }
@@ -1447,9 +1446,9 @@ impl Scanner {
 
     /// Set the maximum number of rows per batch.
     ///
-    /// Note: this can be overridden by [`Self::batch_size_bytes`] or by a dataset-level
-    /// `batch_size_bytes` set via [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  When a byte-based
-    /// batch size is active, the row-based batch size is used only as an initial estimate.
+    /// When a byte limit is also configured through [`Self::batch_size_bytes`] or
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options),
+    /// both limits apply and the one reached first determines the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
         self
@@ -1458,7 +1457,10 @@ impl Scanner {
     /// Set the target batch size in bytes.
     ///
     /// When set, the scanner will produce batches whose total size in bytes
-    /// is approximately this value, overriding the row-based `batch_size`.
+    /// is approximately this value. When a row-based `batch_size` is also set,
+    /// both limits apply and the one reached first determines the batch size.
+    /// This cannot be combined with [`Self::strict_batch_size`] because strict
+    /// row batching can merge batches beyond the byte limit.
     ///
     /// This can also be configured at the dataset level via
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  A scanner-level setting takes
@@ -1566,6 +1568,10 @@ impl Scanner {
     /// By default, this is False and output batches are allowed to have fewer than `batch_size` rows
     /// Setting this to True will require us to merge batches, incurring a data copy, for a minor performance
     /// penalty.
+    ///
+    /// This cannot be enabled when a byte limit is configured through
+    /// [`Self::batch_size_bytes`] or
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.strict_batch_size = strict_batch_size;
         self
@@ -2100,7 +2106,11 @@ impl Scanner {
         }
     }
 
-    fn add_extra_columns(&self, schema: Schema) -> Result<Schema> {
+    fn add_extra_columns(
+        &self,
+        schema: Schema,
+        fts_document_granularity: Option<DocumentGranularity>,
+    ) -> Result<Schema> {
         let mut extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
 
         if self.nearest.as_ref().is_some() {
@@ -2112,6 +2122,15 @@ impl Scanner {
 
         if self.full_text_query.is_some() {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
+            if fts_document_granularity
+                .map(DocumentGranularity::is_list_element)
+                // `get_expr_filter` is synchronous, so an omitted granularity
+                // cannot be resolved from index metadata here. Include the
+                // column conservatively; `create_plan` uses the resolved value.
+                .unwrap_or(true)
+            {
+                extra_columns.push(DOC_INDEX_FIELD.clone());
+            }
         }
 
         schema.merge(&ArrowSchema::new(extra_columns))
@@ -2122,6 +2141,17 @@ impl Scanner {
     /// This is the schema of the dataset, any metadata columns like _rowid or _rowaddr
     /// and any extra columns like _distance or _score
     fn filterable_schema(&self) -> Result<Arc<Schema>> {
+        let fts_document_granularity = self
+            .full_text_query
+            .as_ref()
+            .and_then(|query| self.fts_document_granularity(&query.query).ok());
+        self.filterable_schema_with_fts_granularity(fts_document_granularity)
+    }
+
+    fn filterable_schema_with_fts_granularity(
+        &self,
+        fts_document_granularity: Option<DocumentGranularity>,
+    ) -> Result<Arc<Schema>> {
         let base_schema = Projection::full(self.dataset.clone())
             .with_row_id()
             .with_row_addr()
@@ -2129,7 +2159,10 @@ impl Scanner {
             .with_row_created_at_version()
             .to_schema();
 
-        Ok(Arc::new(self.add_extra_columns(base_schema)?))
+        Ok(Arc::new(self.add_extra_columns(
+            base_schema,
+            fts_document_granularity,
+        )?))
     }
 
     /// This takes the current output, and the user's requested projection, and calculates the
@@ -2143,6 +2176,16 @@ impl Scanner {
         // Select the columns from the output schema based on the user's projection (or the list
         // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
+
+        if self.full_text_query.is_some()
+            && current_schema.field_with_name(DOC_INDEX_COL).is_ok()
+            && output_expr.iter().all(|(_, name)| name != DOC_INDEX_COL)
+        {
+            output_expr.push((
+                expressions::col(DOC_INDEX_COL, current_schema)?,
+                DOC_INDEX_COL.to_string(),
+            ));
+        }
 
         // Make sure _distance and _score are _always_ in the output unless user has opted out of the legacy
         // projection behavior
@@ -2541,6 +2584,19 @@ impl Scanner {
             ));
         }
 
+        if self.strict_batch_size
+            && let Some(batch_size_bytes) = self
+                .resolved_file_reader_options()
+                .and_then(|options| options.batch_size_bytes)
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}; strict row batching can merge batches beyond the byte limit"
+                )
+                .into(),
+            ));
+        }
+
         if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::invalid_input_source(
                 "include_deleted_rows is set but with_row_id is false".into(),
@@ -2571,8 +2627,14 @@ impl Scanner {
         Ok(())
     }
 
-    async fn create_filter_plan(&self, use_scalar_index: bool) -> Result<FilterPlan> {
-        let filter_schema = self.filterable_schema()?;
+    async fn create_filter_plan(
+        &self,
+        use_scalar_index: bool,
+        query_filter: Option<QueryFilter>,
+        fts_document_granularity: Option<DocumentGranularity>,
+    ) -> Result<FilterPlan> {
+        let filter_schema =
+            self.filterable_schema_with_fts_granularity(fts_document_granularity)?;
         let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
 
         // Check expr filter
@@ -2602,15 +2664,15 @@ impl Scanner {
                     // fallback to a non-indexed filter
                     let filter_plan =
                         planner.create_filter_plan(expr.clone(), &index_info, false)?;
-                    FilterPlan::new(self.filter.query_filter.clone(), filter_plan)
+                    FilterPlan::new(query_filter.clone(), filter_plan)
                 } else {
-                    FilterPlan::new(self.filter.query_filter.clone(), filter_plan)
+                    FilterPlan::new(query_filter.clone(), filter_plan)
                 }
             } else {
-                FilterPlan::new(self.filter.query_filter.clone(), filter_plan)
+                FilterPlan::new(query_filter.clone(), filter_plan)
             }
         } else {
-            FilterPlan::new(self.filter.query_filter.clone(), ExprFilterPlan::default())
+            FilterPlan::new(query_filter, ExprFilterPlan::default())
         };
 
         // Check query filter
@@ -2723,13 +2785,31 @@ impl Scanner {
         log::trace!("creating scanner plan");
         self.validate_options()?;
 
+        let full_text_query = match &self.full_text_query {
+            Some(query) => Some(self.resolve_full_text_search_query(query).await?),
+            None => None,
+        };
+        let query_filter = match &self.filter.query_filter {
+            Some(QueryFilter::Fts(query)) => Some(QueryFilter::Fts(
+                self.resolve_full_text_search_query(query).await?,
+            )),
+            Some(QueryFilter::Vector(query)) => Some(QueryFilter::Vector(query.clone())),
+            None => None,
+        };
+        let fts_document_granularity = full_text_query
+            .as_ref()
+            .map(|query| self.fts_document_granularity(&query.query))
+            .transpose()?;
+
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
-        let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
+        let mut filter_plan = self
+            .create_filter_plan(use_scalar_index, query_filter, fts_document_granularity)
+            .await?;
 
         let mut use_limit_node = true;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
-        let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
+        let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &full_text_query) {
             (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
             (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
             (None, None) => {
@@ -3344,7 +3424,10 @@ impl Scanner {
             // If we are prefiltering then the ann / knn node will take care of the filter
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.fts_filter() {
                 Some(fts_query) => {
-                    let fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
+                    let mut fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
+                    if fts_plan.schema().field_with_name(DOC_INDEX_COL).is_ok() {
+                        fts_plan = self.deduplicate_fts_filter_rows(fts_plan)?;
+                    }
                     let projection = self
                         .dataset
                         .empty_projection()
@@ -3370,14 +3453,45 @@ impl Scanner {
         }
     }
 
+    /// Convert element-document hits into the row-selection semantics required
+    /// when FTS is used as a filter for another query.
+    fn deduplicate_fts_filter_rows(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let group_expr = vec![(
+            expressions::col(ROW_ID, schema.as_ref())?,
+            ROW_ID.to_string(),
+        )];
+        let input = Arc::new(RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(group_expr),
+            Vec::new(),
+            Vec::new(),
+            input,
+            schema,
+        )?))
+    }
+
     async fn fragments_covered_by_fts_leaf(
         &self,
         column: &str,
+        document_granularity: DocumentGranularity,
         accum: &mut RoaringBitmap,
     ) -> Result<bool> {
         let index = self
             .dataset
-            .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(column)
+                    .supports_fts()
+                    .with_fts_document_granularity(document_granularity),
+            )
             .await?;
         match index {
             Some(index) => match &index.fragment_bitmap {
@@ -3399,10 +3513,14 @@ impl Scanner {
     ) -> Result<bool> {
         match query {
             FtsQuery::Match(match_query) => {
+                let document_granularity = match_query.document_granularity.ok_or_else(|| {
+                    Error::internal("FTS Match query granularity was not resolved".to_string())
+                })?;
                 self.fragments_covered_by_fts_leaf(
                     match_query.column.as_ref().ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
                     ))?,
+                    document_granularity,
                     accum,
                 )
                 .await
@@ -3415,11 +3533,17 @@ impl Scanner {
                     .await?),
             FtsQuery::MultiMatch(multi_match) => {
                 for mq in &multi_match.match_queries {
+                    let document_granularity = mq.document_granularity.ok_or_else(|| {
+                        Error::internal(
+                            "FTS MultiMatch query granularity was not resolved".to_string(),
+                        )
+                    })?;
                     if !self
                         .fragments_covered_by_fts_leaf(
                             mq.column.as_ref().ok_or(Error::invalid_input(
                                 "the column must be specified in the query".to_string(),
                             ))?,
+                            document_granularity,
                             accum,
                         )
                         .await?
@@ -3430,10 +3554,14 @@ impl Scanner {
                 Ok(true)
             }
             FtsQuery::Phrase(phrase_query) => {
+                let document_granularity = phrase_query.document_granularity.ok_or_else(|| {
+                    Error::internal("FTS Phrase query granularity was not resolved".to_string())
+                })?;
                 self.fragments_covered_by_fts_leaf(
                     phrase_query.column.as_ref().ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
                     ))?,
+                    document_granularity,
                     accum,
                 )
                 .await
@@ -3476,13 +3604,291 @@ impl Scanner {
         }
     }
 
+    fn fts_document_granularity(&self, query: &FtsQuery) -> Result<DocumentGranularity> {
+        #[derive(Default)]
+        struct TargetState {
+            granularity: Option<DocumentGranularity>,
+            list_element_field_id: Option<i32>,
+        }
+
+        fn add_leaf(
+            schema: &lance_core::datatypes::Schema,
+            column: Option<&str>,
+            document_granularity: Option<DocumentGranularity>,
+            state: &mut TargetState,
+        ) -> Result<()> {
+            let document_granularity = document_granularity.ok_or_else(|| {
+                Error::internal("FTS query document granularity was not resolved".to_string())
+            })?;
+            if let Some(existing) = state.granularity
+                && existing != document_granularity
+            {
+                return Err(Error::invalid_input(
+                    "FTS queries cannot mix Row and ListElement document granularities".to_string(),
+                ));
+            }
+            state.granularity = Some(document_granularity);
+
+            let Some(column) = column else {
+                if document_granularity.is_list_element() {
+                    return Err(Error::invalid_input(
+                        "ListElement FTS queries must explicitly specify a field path".to_string(),
+                    ));
+                }
+                return Ok(());
+            };
+            let resolved = resolve_fts_field(schema, column, document_granularity)?;
+            if document_granularity.is_list_element() {
+                if let Some(existing) = state.list_element_field_id
+                    && existing != resolved.final_field_id
+                {
+                    return Err(Error::invalid_input(
+                        "all leaves in a ListElement FTS query must use the same final field"
+                            .to_string(),
+                    ));
+                }
+                state.list_element_field_id = Some(resolved.final_field_id);
+            }
+            Ok(())
+        }
+
+        fn visit(
+            schema: &lance_core::datatypes::Schema,
+            query: &FtsQuery,
+            state: &mut TargetState,
+        ) -> Result<()> {
+            match query {
+                FtsQuery::Match(query) => add_leaf(
+                    schema,
+                    query.column.as_deref(),
+                    query.document_granularity,
+                    state,
+                ),
+                FtsQuery::Phrase(query) => add_leaf(
+                    schema,
+                    query.column.as_deref(),
+                    query.document_granularity,
+                    state,
+                ),
+                FtsQuery::Boost(query) => {
+                    visit(schema, &query.positive, state)?;
+                    visit(schema, &query.negative, state)
+                }
+                FtsQuery::Boolean(query) => {
+                    for child in query
+                        .must
+                        .iter()
+                        .chain(&query.should)
+                        .chain(&query.must_not)
+                    {
+                        visit(schema, child, state)?;
+                    }
+                    Ok(())
+                }
+                FtsQuery::MultiMatch(query) => {
+                    for child in &query.match_queries {
+                        if child
+                            .document_granularity
+                            .is_some_and(|value| value.is_list_element())
+                        {
+                            return Err(Error::not_supported(
+                                "MultiMatch does not support ListElement document granularity"
+                                    .to_string(),
+                            ));
+                        }
+                        add_leaf(
+                            schema,
+                            child.column.as_deref(),
+                            child.document_granularity,
+                            state,
+                        )?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        let mut state = TargetState::default();
+        visit(self.dataset.schema(), query, &mut state)?;
+        state.granularity.ok_or_else(|| {
+            Error::invalid_input("FTS query must contain at least one leaf query".to_string())
+        })
+    }
+
+    #[async_recursion]
+    async fn resolve_fts_query_document_granularity(&self, query: FtsQuery) -> Result<FtsQuery> {
+        match query {
+            FtsQuery::Match(mut query) => {
+                let column = query.column.as_deref().ok_or_else(|| {
+                    Error::invalid_input("the column must be specified in the query".to_string())
+                })?;
+                query.document_granularity = Some(
+                    resolve_query_document_granularity(
+                        self.dataset.as_ref(),
+                        column,
+                        query.document_granularity,
+                    )
+                    .await?,
+                );
+                Ok(FtsQuery::Match(query))
+            }
+            FtsQuery::Phrase(mut query) => {
+                let column = query.column.as_deref().ok_or_else(|| {
+                    Error::invalid_input("the column must be specified in the query".to_string())
+                })?;
+                query.document_granularity = Some(
+                    resolve_query_document_granularity(
+                        self.dataset.as_ref(),
+                        column,
+                        query.document_granularity,
+                    )
+                    .await?,
+                );
+                Ok(FtsQuery::Phrase(query))
+            }
+            FtsQuery::Boost(mut query) => {
+                query.positive = Box::new(
+                    self.resolve_fts_query_document_granularity(*query.positive)
+                        .await?,
+                );
+                query.negative = Box::new(
+                    self.resolve_fts_query_document_granularity(*query.negative)
+                        .await?,
+                );
+                Ok(FtsQuery::Boost(query))
+            }
+            FtsQuery::Boolean(mut query) => {
+                let mut must = Vec::with_capacity(query.must.len());
+                for child in query.must {
+                    must.push(self.resolve_fts_query_document_granularity(child).await?);
+                }
+                let mut should = Vec::with_capacity(query.should.len());
+                for child in query.should {
+                    should.push(self.resolve_fts_query_document_granularity(child).await?);
+                }
+                let mut must_not = Vec::with_capacity(query.must_not.len());
+                for child in query.must_not {
+                    must_not.push(self.resolve_fts_query_document_granularity(child).await?);
+                }
+                query.must = must;
+                query.should = should;
+                query.must_not = must_not;
+                Ok(FtsQuery::Boolean(query))
+            }
+            FtsQuery::MultiMatch(mut query) => {
+                for child in &mut query.match_queries {
+                    let column = child.column.as_deref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "the column must be specified in the query".to_string(),
+                        )
+                    })?;
+                    child.document_granularity = Some(
+                        resolve_query_document_granularity(
+                            self.dataset.as_ref(),
+                            column,
+                            child.document_granularity,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(FtsQuery::MultiMatch(query))
+            }
+        }
+    }
+
+    fn set_missing_query_granularity(
+        query: &mut FtsQuery,
+        document_granularity: DocumentGranularity,
+    ) {
+        match query {
+            FtsQuery::Match(query) => {
+                query
+                    .document_granularity
+                    .get_or_insert(document_granularity);
+            }
+            FtsQuery::Phrase(query) => {
+                query
+                    .document_granularity
+                    .get_or_insert(document_granularity);
+            }
+            FtsQuery::Boost(query) => {
+                Self::set_missing_query_granularity(&mut query.positive, document_granularity);
+                Self::set_missing_query_granularity(&mut query.negative, document_granularity);
+            }
+            FtsQuery::Boolean(query) => {
+                for child in query
+                    .must
+                    .iter_mut()
+                    .chain(&mut query.should)
+                    .chain(&mut query.must_not)
+                {
+                    Self::set_missing_query_granularity(child, document_granularity);
+                }
+            }
+            FtsQuery::MultiMatch(query) => {
+                for child in &mut query.match_queries {
+                    child
+                        .document_granularity
+                        .get_or_insert(document_granularity);
+                }
+            }
+        }
+    }
+
+    fn query_requests_list_element(query: &FtsQuery) -> bool {
+        match query {
+            FtsQuery::Match(query) => query
+                .document_granularity
+                .is_some_and(DocumentGranularity::is_list_element),
+            FtsQuery::Phrase(query) => query
+                .document_granularity
+                .is_some_and(DocumentGranularity::is_list_element),
+            FtsQuery::Boost(query) => {
+                Self::query_requests_list_element(&query.positive)
+                    || Self::query_requests_list_element(&query.negative)
+            }
+            FtsQuery::Boolean(query) => query
+                .must
+                .iter()
+                .chain(&query.should)
+                .chain(&query.must_not)
+                .any(Self::query_requests_list_element),
+            FtsQuery::MultiMatch(query) => query.match_queries.iter().any(|query| {
+                query
+                    .document_granularity
+                    .is_some_and(DocumentGranularity::is_list_element)
+            }),
+        }
+    }
+
+    async fn resolve_full_text_search_query(
+        &self,
+        query: &FullTextSearchQuery,
+    ) -> Result<FullTextSearchQuery> {
+        let mut resolved = query.clone();
+        if resolved.columns().is_empty() {
+            if Self::query_requests_list_element(&resolved.query) {
+                return Err(Error::invalid_input(
+                    "ListElement FTS queries must explicitly specify a field path".to_string(),
+                ));
+            }
+            let indexed_columns = fts_indexed_columns(self.dataset.clone()).await?;
+            resolved.query = fill_fts_query_column(&resolved.query, &indexed_columns, false)?;
+            Self::set_missing_query_granularity(&mut resolved.query, DocumentGranularity::Row);
+        }
+        resolved.query = self
+            .resolve_fts_query_document_granularity(resolved.query)
+            .await?;
+        self.fts_document_granularity(&resolved.query)?;
+        Ok(resolved)
+    }
+
     // Create an execution plan to do full text search
     async fn fts(
         &self,
         filter_plan: &ExprFilterPlan,
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let columns = query.columns();
         let mut params = query.params();
         if params.limit.is_none() {
             let search_limit = match (self.limit, self.offset) {
@@ -3493,15 +3899,8 @@ impl Scanner {
             };
             params = params.with_limit(search_limit);
         }
-        let query = if columns.is_empty() {
-            // the field is not specified,
-            // try to search over all indexed fields including nested ones
-            let indexed_columns = fts_indexed_columns(self.dataset.clone()).await?;
-            fill_fts_query_column(&query.query, &indexed_columns, false)?
-        } else {
-            query.query.clone()
-        };
-        validate_fts_query_contract(&query)?;
+        let query = &query.query;
+        validate_fts_query_contract(query)?;
 
         // TODO: Could maybe walk the query here to find all the indices that will be
         // involved in the query to calculate a more accuarate required_fragments than
@@ -3509,7 +3908,7 @@ impl Scanner {
         let prefilter_source = self
             .prefilter_source(
                 filter_plan,
-                self.fragments_covered_by_fts_query(&query).await?,
+                self.fragments_covered_by_fts_query(query).await?,
             )
             .await?;
         // Data overlay masking: match queries drop stale segments and re-evaluate the affected
@@ -3517,7 +3916,7 @@ impl Scanner {
         // and phrase queries exclude stale segments (`plan_phrase_query`). Both keep stale index
         // hits out of the result.
         let fts_exec = self
-            .plan_fts(&query, &params, filter_plan, &prefilter_source)
+            .plan_fts(query, &params, filter_plan, &prefilter_source)
             .await?;
         Ok(fts_exec)
     }
@@ -3527,6 +3926,7 @@ impl Scanner {
         query: &FtsQuery,
         params: &FtsSearchParams,
         prefilter_source: &PreFilterSource,
+        document_granularity: DocumentGranularity,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut columns = HashSet::new();
         collect_all_fts_columns(query, &mut columns);
@@ -3536,15 +3936,20 @@ impl Scanner {
 
         let index = self
             .dataset
-            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(&column)
+                    .supports_fts()
+                    .with_fts_document_granularity(document_granularity),
+            )
             .await?;
         let Some(index) = index else {
             return Ok(None);
         };
-        let target_fragments = self
+        let target_fragments: &[Fragment] = self
             .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
         if !self
             .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?)
             .is_empty()
@@ -3555,7 +3960,7 @@ impl Scanner {
             return Ok(None);
         }
         let (stale_fragments, fresh_segments) = self
-            .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+            .fts_stale_frags_and_fresh_segments(&column, document_granularity, target_fragments)
             .await?;
         if !stale_fragments.is_empty() {
             return Ok(None);
@@ -3563,7 +3968,7 @@ impl Scanner {
 
         let segments = match fresh_segments {
             Some(segments) => segments,
-            None => load_segments(&self.dataset, &column)
+            None => load_segments(&self.dataset, &column, document_granularity)
                 .await?
                 .ok_or_else(|| {
                     Error::invalid_input(format!("No Inverted index found for column {column}"))
@@ -3594,9 +3999,11 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if supports_compound_scorer(query)
+        let document_granularity = self.fts_document_granularity(query)?;
+        if !document_granularity.is_list_element()
+            && supports_compound_scorer(query)
             && let Some(plan) = self
-                .plan_compound_scorer(query, params, prefilter_source)
+                .plan_compound_scorer(query, params, prefilter_source, document_granularity)
                 .await?
         {
             return Ok(plan);
@@ -3611,7 +4018,7 @@ impl Scanner {
                     .await?
             }
             FtsQuery::Phrase(query) => {
-                self.plan_phrase_query(query, params, prefilter_source)
+                self.plan_phrase_query(query, params, filter_plan, prefilter_source)
                     .await?
             }
 
@@ -3744,11 +4151,32 @@ impl Scanner {
                     );
                 }
 
-                let should = build_boolean_query_children(BoolSlot::Should, should)?
-                    .expect("Should slot always returns Some");
-                let must = build_boolean_query_children(BoolSlot::Must, must)?;
-                let must_not = build_boolean_query_children(BoolSlot::MustNot, must_not)?
-                    .expect("MustNot slot always returns Some");
+                let boolean_schema = fts_schema(document_granularity);
+                let should = build_boolean_query_children_with_schema(
+                    BoolSlot::Should,
+                    should,
+                    boolean_schema.clone(),
+                )?
+                .ok_or_else(|| {
+                    Error::internal(
+                        "boolean should planning returned no execution plan".to_string(),
+                    )
+                })?;
+                let must = build_boolean_query_children_with_schema(
+                    BoolSlot::Must,
+                    must,
+                    boolean_schema.clone(),
+                )?;
+                let must_not = build_boolean_query_children_with_schema(
+                    BoolSlot::MustNot,
+                    must_not,
+                    boolean_schema,
+                )?
+                .ok_or_else(|| {
+                    Error::internal(
+                        "boolean must-not planning returned no execution plan".to_string(),
+                    )
+                })?;
 
                 if query.should.is_empty() && must.is_none() {
                     return Err(Error::invalid_input(
@@ -3773,59 +4201,171 @@ impl Scanner {
         &self,
         query: &PhraseQuery,
         params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query.column.clone().ok_or(Error::invalid_input(
             "the column must be specified in the query".to_string(),
         ))?;
-
-        let segments = load_segments(&self.dataset, &column)
-            .await?
-            .ok_or(Error::invalid_input(format!(
-                "No Inverted index found for column {}",
-                column
-            )))?;
-        let details = load_segment_details(&self.dataset, &column, &segments).await?;
-
-        if !details.with_position {
-            return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
-                .to_string()));
-        }
-
-        // Mask data overlay files: a fragment with an overlay committed after this FTS index can
-        // no longer be trusted to its inverted-index positions, so a stale phrase could still
-        // match. Exclude any segment covering such a fragment. Unlike match queries, phrase
-        // queries have no flat re-evaluation path, so — exactly as for unindexed fragments, which
-        // phrase queries already do not search — overlaid fragments are simply dropped from the
-        // phrase result; new phrase matches there surface once compaction folds the overlay into
-        // the base. This removes stale hits without introducing wrong ones.
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::internal("FTS Phrase query granularity was not resolved".to_string())
+        })?;
+        resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
+        let output_schema = fts_schema(document_granularity);
+        let index = self
+            .dataset
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(&column)
+                    .supports_fts()
+                    .with_fts_document_granularity(document_granularity),
+            )
+            .await?;
         let target_fragments: &[Fragment] = self
             .fragments
             .as_deref()
             .unwrap_or_else(|| self.dataset.fragments());
-        let (_flat_frag_ids, fresh_segments) = self
-            .fts_stale_frags_and_fresh_segments(&column, target_fragments)
-            .await?;
+        let flat_query = MatchQuery::new(query.terms.clone())
+            .with_column(Some(column.clone()))
+            .with_operator(Operator::And)
+            .with_document_granularity(document_granularity);
 
-        let exec: Arc<dyn ExecutionPlan> = match fresh_segments {
-            // Every segment covers a stale fragment: with no flat phrase path there is nothing
-            // trustworthy left to search, so the phrase query returns no rows.
-            Some(segs) if segs.is_empty() => Arc::new(EmptyExec::new(FTS_SCHEMA.clone())),
-            Some(segs) => Arc::new(PhraseQueryExec::new_with_segments(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                prefilter_source.clone(),
-                segs,
-            )),
-            None => Arc::new(PhraseQueryExec::new(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                prefilter_source.clone(),
-            )),
+        let (phrase_plan, flat_phrase_plan) = match &index {
+            Some(index) => {
+                let unindexed_fragments = self
+                    .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
+                let (stale_flat_frag_ids, fresh_segments) = self
+                    .fts_stale_frags_and_fresh_segments(
+                        &column,
+                        document_granularity,
+                        target_fragments,
+                    )
+                    .await?;
+                let flat_fragments: Vec<Fragment> = {
+                    let mut seen = RoaringBitmap::new();
+                    let mut fragments = Vec::new();
+                    for fragment in unindexed_fragments.iter().chain(
+                        target_fragments
+                            .iter()
+                            .filter(|fragment| stale_flat_frag_ids.contains(fragment.id as u32)),
+                    ) {
+                        if seen.insert(fragment.id as u32) {
+                            fragments.push(fragment.clone());
+                        }
+                    }
+                    fragments
+                };
+
+                if flat_fragments.len() == target_fragments.len() {
+                    if self.fast_search {
+                        return Ok(Arc::new(EmptyExec::new(output_schema)));
+                    }
+                    let flat_phrase_plan = self
+                        .plan_flat_match_query(
+                            flat_fragments,
+                            &flat_query,
+                            params,
+                            filter_plan,
+                            None,
+                            Some(query.slop),
+                        )
+                        .await?;
+                    return Ok(flat_phrase_plan);
+                }
+
+                let segments = load_segments(&self.dataset, &column, document_granularity)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "FTS metadata routed column {column} without loadable segments"
+                        ))
+                    })?;
+                let details = load_segment_details(&self.dataset, &column, &segments).await?;
+                if !details.with_position {
+                    return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
+                        .to_string()));
+                }
+
+                if self.fast_search || flat_fragments.is_empty() {
+                    let phrase_plan: Arc<dyn ExecutionPlan> = match fresh_segments {
+                        Some(segments) => {
+                            Arc::new(PhraseQueryExec::new_with_segments_and_document_granularity(
+                                self.dataset.clone(),
+                                query.clone(),
+                                params.clone(),
+                                prefilter_source.clone(),
+                                segments,
+                                document_granularity,
+                            ))
+                        }
+                        None => Arc::new(PhraseQueryExec::new_with_document_granularity(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            prefilter_source.clone(),
+                            document_granularity,
+                        )),
+                    };
+                    (Some(phrase_plan), None)
+                } else {
+                    let shared_scorer = document_granularity
+                        .is_list_element()
+                        .then(|| Arc::new(SharedFtsScorer::new()));
+                    let mut phrase_plan = match fresh_segments {
+                        Some(segments) => {
+                            PhraseQueryExec::new_with_segments_and_document_granularity(
+                                self.dataset.clone(),
+                                query.clone(),
+                                params.clone(),
+                                prefilter_source.clone(),
+                                segments,
+                                document_granularity,
+                            )
+                        }
+                        None => PhraseQueryExec::new_with_document_granularity(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            prefilter_source.clone(),
+                            document_granularity,
+                        ),
+                    };
+                    if let Some(shared_scorer) = &shared_scorer {
+                        phrase_plan = phrase_plan.with_shared_scorer(shared_scorer.clone());
+                    }
+                    let phrase_plan: Arc<dyn ExecutionPlan> = Arc::new(phrase_plan);
+                    let flat_phrase_plan = self
+                        .plan_flat_match_query(
+                            flat_fragments,
+                            &flat_query,
+                            params,
+                            filter_plan,
+                            shared_scorer,
+                            Some(query.slop),
+                        )
+                        .await?;
+                    (Some(phrase_plan), Some(flat_phrase_plan))
+                }
+            }
+            None => {
+                if self.fast_search {
+                    return Ok(Arc::new(EmptyExec::new(output_schema)));
+                }
+                let flat_phrase_plan = self
+                    .plan_flat_match_query(
+                        target_fragments.to_vec(),
+                        &flat_query,
+                        params,
+                        filter_plan,
+                        None,
+                        Some(query.slop),
+                    )
+                    .await?;
+                (None, Some(flat_phrase_plan))
+            }
         };
-        Ok(exec)
+
+        Self::combine_fts_leaf_plans(phrase_plan, flat_phrase_plan, params)
     }
 
     async fn plan_match_query(
@@ -3842,10 +4382,20 @@ impl Scanner {
                 "the column must be specified in the query".to_string(),
             ))?
             .clone();
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::internal("FTS Match query granularity was not resolved".to_string())
+        })?;
+        resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
+        let output_schema = fts_schema(document_granularity);
 
         let index = self
             .dataset
-            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(&column)
+                    .supports_fts()
+                    .with_fts_document_granularity(document_granularity),
+            )
             .await?;
 
         // Get target fragments
@@ -3863,7 +4413,11 @@ impl Scanner {
                 // Fragments whose FTS index entries may be stale due to a newer data overlay.
                 // These are excluded from the indexed path and re-evaluated on the flat path.
                 let (stale_flat_frag_ids, fresh_segments) = self
-                    .fts_stale_frags_and_fresh_segments(&column, target_fragments)
+                    .fts_stale_frags_and_fresh_segments(
+                        &column,
+                        document_granularity,
+                        target_fragments,
+                    )
                     .await?;
 
                 // Fragments that need flat evaluation: unindexed + stale (deduplicated).
@@ -3885,55 +4439,112 @@ impl Scanner {
                 // If all target fragments need flat evaluation, skip the indexed path.
                 if flat_fragments.len() == target_fragments.len() {
                     if self.fast_search {
-                        return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                        return Ok(Arc::new(EmptyExec::new(output_schema)));
                     }
                     let flat_match_plan = self
-                        .plan_flat_match_query(flat_fragments, query, params, filter_plan)
+                        .plan_flat_match_query(
+                            flat_fragments,
+                            query,
+                            params,
+                            filter_plan,
+                            None,
+                            None,
+                        )
                         .await?;
                     return Ok(flat_match_plan);
                 }
 
-                // Build the indexed path. When overlays made some segments stale we use
-                // `new_with_segments` to restrict the search to fresh segments only.
-                let match_plan: Arc<dyn ExecutionPlan> = match fresh_segments {
-                    Some(segs) => Arc::new(MatchQueryExec::new_with_segments(
-                        self.dataset.clone(),
-                        query.clone(),
-                        params.clone(),
-                        prefilter_source.clone(),
-                        segs,
-                    )),
-                    None => Arc::new(MatchQueryExec::new(
-                        self.dataset.clone(),
-                        query.clone(),
-                        params.clone(),
-                        prefilter_source.clone(),
-                    )),
-                };
-
                 if self.fast_search || flat_fragments.is_empty() {
+                    let match_plan: Arc<dyn ExecutionPlan> = match fresh_segments {
+                        Some(segments) => {
+                            Arc::new(MatchQueryExec::new_with_segments_and_document_granularity(
+                                self.dataset.clone(),
+                                query.clone(),
+                                params.clone(),
+                                prefilter_source.clone(),
+                                segments,
+                                document_granularity,
+                            ))
+                        }
+                        None => Arc::new(MatchQueryExec::new_with_document_granularity(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            prefilter_source.clone(),
+                            document_granularity,
+                        )),
+                    };
                     (Some(match_plan), None)
                 } else {
+                    let shared_scorer = document_granularity
+                        .is_list_element()
+                        .then(|| Arc::new(SharedFtsScorer::new()));
+                    let mut match_plan = match fresh_segments {
+                        Some(segments) => {
+                            MatchQueryExec::new_with_segments_and_document_granularity(
+                                self.dataset.clone(),
+                                query.clone(),
+                                params.clone(),
+                                prefilter_source.clone(),
+                                segments,
+                                document_granularity,
+                            )
+                        }
+                        None => MatchQueryExec::new_with_document_granularity(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            prefilter_source.clone(),
+                            document_granularity,
+                        ),
+                    };
+                    if let Some(shared_scorer) = &shared_scorer {
+                        // Element-document results from indexed and flat
+                        // fragments must use one corpus-wide scorer.
+                        match_plan = match_plan.with_shared_scorer(shared_scorer.clone());
+                    }
+                    let match_plan: Arc<dyn ExecutionPlan> = Arc::new(match_plan);
                     let flat_match_plan = self
-                        .plan_flat_match_query(flat_fragments, query, params, filter_plan)
+                        .plan_flat_match_query(
+                            flat_fragments,
+                            query,
+                            params,
+                            filter_plan,
+                            shared_scorer,
+                            None,
+                        )
                         .await?;
                     (Some(match_plan), Some(flat_match_plan))
                 }
             }
             None => {
                 if self.fast_search {
-                    return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                    return Ok(Arc::new(EmptyExec::new(output_schema)));
                 }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
+                    .plan_flat_match_query(
+                        target_fragments.to_vec(),
+                        query,
+                        params,
+                        filter_plan,
+                        None,
+                        None,
+                    )
                     .await?;
                 (None, Some(flat_match_plan))
             }
         };
 
-        // Combine plans
-        let plan = match (match_plan, flat_match_plan) {
+        Self::combine_fts_leaf_plans(match_plan, flat_match_plan, params)
+    }
+
+    fn combine_fts_leaf_plans(
+        indexed_plan: Option<Arc<dyn ExecutionPlan>>,
+        flat_plan: Option<Arc<dyn ExecutionPlan>>,
+        params: &FtsSearchParams,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan = match (indexed_plan, flat_plan) {
             (Some(match_plan), Some(flat_match_plan)) => {
                 let match_plan = UnionExec::try_new(vec![match_plan, flat_match_plan])?;
                 let match_plan = Arc::new(RepartitionExec::try_new(
@@ -3951,7 +4562,11 @@ impl Scanner {
             }
             (Some(match_plan), None) => match_plan,
             (None, Some(flat_match_plan)) => flat_match_plan,
-            (None, None) => unreachable!(),
+            (None, None) => {
+                return Err(Error::internal(
+                    "FTS leaf planning produced neither an indexed nor a flat plan".to_string(),
+                ));
+            }
         };
 
         Ok(plan)
@@ -3964,6 +4579,8 @@ impl Scanner {
         query: &MatchQuery,
         params: &FtsSearchParams,
         filter_plan: &ExprFilterPlan,
+        shared_scorer: Option<Arc<SharedFtsScorer>>,
+        phrase_slop: Option<u32>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query
             .column
@@ -3972,8 +4589,21 @@ impl Scanner {
                 "the column must be specified in the query".to_string(),
             ))?
             .clone();
-
-        let mut columns = vec![column.clone()];
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::internal("FTS Match query granularity was not resolved".to_string())
+        })?;
+        let resolved = resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
+        let scan_column = if resolved.has_lists() {
+            resolved.root_column.clone()
+        } else {
+            resolved.canonical_path.clone()
+        };
+        let document_column = if resolved.has_lists() {
+            VALUE_COLUMN_NAME.to_string()
+        } else {
+            resolved.canonical_path.clone()
+        };
+        let mut columns = vec![scan_column.clone()];
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             columns.extend(Planner::column_names_in_expr(refine_expr));
         }
@@ -3997,15 +4627,26 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
         }
-        plan = self.ensure_column_alias(plan, &column)?;
-
-        let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
+        if resolved.has_lists() {
+            plan = Arc::new(FtsDocumentExec::new(plan, resolved.clone()));
+        } else {
+            plan = self.ensure_column_alias(plan, &document_column)?;
+        }
+        let mut flat_match_plan = FlatMatchQueryExec::new_with_document_granularity(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
             plan,
-        ));
-        Ok(flat_match_plan)
+            document_granularity,
+            document_column,
+        );
+        if let Some(shared_scorer) = shared_scorer {
+            flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
+        }
+        if let Some(phrase_slop) = phrase_slop {
+            flat_match_plan = flat_match_plan.with_phrase_slop(phrase_slop);
+        }
+        Ok(Arc::new(flat_match_plan))
     }
 
     // ANN/KNN search execution node with optional prefilter
@@ -4618,6 +5259,7 @@ impl Scanner {
     async fn fts_stale_frags_and_fresh_segments(
         &self,
         column: &str,
+        document_granularity: DocumentGranularity,
         target_fragments: &[Fragment],
     ) -> Result<(RoaringBitmap, Option<Vec<IndexMetadata>>)> {
         // Fast path: no overlays on any target fragment.
@@ -4625,7 +5267,8 @@ impl Scanner {
             return Ok((RoaringBitmap::new(), None));
         }
 
-        let Some(segments) = load_segments(&self.dataset, column).await? else {
+        let Some(segments) = load_segments(&self.dataset, column, document_granularity).await?
+        else {
             return Ok((RoaringBitmap::new(), None));
         };
 
@@ -5031,14 +5674,9 @@ impl Scanner {
         input: Arc<dyn ExecutionPlan>,
         q: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fts_query = if q.columns().is_empty() {
-            let indexed_columns = fts_indexed_columns(self.dataset.clone()).await?;
-            fill_fts_query_column(&q.query, &indexed_columns, false)?
-        } else {
-            q.query.clone()
-        };
+        let fts_query = &q.query;
 
-        match &fts_query {
+        match fts_query {
             FtsQuery::Match(match_query) => {
                 let schema = Arc::new((input.schema()).try_with_column(SCORE_FIELD.clone())?);
 
@@ -5049,22 +5687,37 @@ impl Scanner {
                         "the column must be specified in the query".to_string(),
                     ))?
                     .clone();
-                let input = if schema.column_with_name(&column).is_none() {
+                let document_granularity = match_query.document_granularity.ok_or_else(|| {
+                    Error::internal("FTS Match query granularity was not resolved".to_string())
+                })?;
+                let resolved =
+                    resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
+                let scan_column = if resolved.has_lists() {
+                    resolved.root_column.clone()
+                } else {
+                    resolved.canonical_path.clone()
+                };
+                let input = if schema.column_with_name(&scan_column).is_none() {
                     let projection = self
                         .dataset
                         .empty_projection()
-                        .union_column(&column, OnMissing::Error)?;
+                        .union_column(&scan_column, OnMissing::Error)?;
                     let input = self.take(input, projection)?;
-                    self.ensure_column_alias(input, &column)?
+                    if resolved.has_lists() {
+                        input
+                    } else {
+                        self.ensure_column_alias(input, &scan_column)?
+                    }
                 } else {
                     input
                 };
 
-                Ok(Arc::new(FlatMatchFilterExec::new(
+                Ok(Arc::new(FlatMatchFilterExec::new_with_resolved_field(
                     input,
                     self.dataset.clone(),
                     match_query.clone(),
                     q.params(),
+                    resolved,
                 )))
             }
             _ => Err(Error::not_supported(
@@ -5082,14 +5735,9 @@ impl Scanner {
         input: Arc<dyn ExecutionPlan>,
         q: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fts_query = if q.columns().is_empty() {
-            let indexed_columns = fts_indexed_columns(self.dataset.clone()).await?;
-            fill_fts_query_column(&q.query, &indexed_columns, false)?
-        } else {
-            q.query.clone()
-        };
+        let fts_query = &q.query;
 
-        match &fts_query {
+        match fts_query {
             FtsQuery::Match(match_query) => {
                 let schema = Arc::new((input.schema()).try_with_column(SCORE_FIELD.clone())?);
 
@@ -5100,22 +5748,48 @@ impl Scanner {
                         "the column must be specified in the query".to_string(),
                     ))?
                     .clone();
-                let input = if schema.column_with_name(&column).is_none() {
+                let document_granularity = match_query.document_granularity.ok_or_else(|| {
+                    Error::internal("FTS Match query granularity was not resolved".to_string())
+                })?;
+                let resolved =
+                    resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
+                let scan_column = if resolved.has_lists() {
+                    resolved.root_column.clone()
+                } else {
+                    resolved.canonical_path.clone()
+                };
+                let document_column = if resolved.has_lists() {
+                    VALUE_COLUMN_NAME.to_string()
+                } else {
+                    resolved.canonical_path.clone()
+                };
+                let input = if schema.column_with_name(&scan_column).is_none() {
                     let projection = self
                         .dataset
                         .empty_projection()
-                        .union_column(&column, OnMissing::Error)?;
+                        .union_column(&scan_column, OnMissing::Error)?;
                     let input = self.take(input, projection)?;
-                    self.ensure_column_alias(input, &column)?
+                    if resolved.has_lists() {
+                        input
+                    } else {
+                        self.ensure_column_alias(input, &document_column)?
+                    }
+                } else {
+                    input
+                };
+                let input = if resolved.has_lists() {
+                    Arc::new(FtsDocumentExec::new(input, resolved)) as Arc<dyn ExecutionPlan>
                 } else {
                     input
                 };
 
-                Ok(Arc::new(FlatMatchQueryExec::new(
+                Ok(Arc::new(FlatMatchQueryExec::new_with_document_granularity(
                     self.dataset.clone(),
                     match_query.clone(),
                     q.params(),
                     input,
+                    document_granularity,
+                    document_column,
                 )))
             }
             _ => {
@@ -5653,49 +6327,43 @@ impl Scanner {
     }
 }
 
-fn is_fts_indexable_field(field: &Field) -> bool {
-    match field.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 => true,
-        DataType::List(inner_field) | DataType::LargeList(inner_field) => {
-            matches!(
-                inner_field.data_type(),
-                DataType::Utf8 | DataType::LargeUtf8
-            )
-        }
-        _ => false,
-    }
-}
-
 // Search over all indexed fields including nested ones, collecting columns that have an
-// inverted index
+// inverted index. Automatic discovery is intentionally restricted to Row
+// granularity because ListElement queries require an explicit field path.
 async fn fts_indexed_columns(dataset: Arc<Dataset>) -> Result<Vec<String>> {
     let mut indexed_columns = Vec::new();
-    for field in dataset.schema().fields_pre_order() {
-        if is_fts_indexable_field(field) {
-            // Build the full field path for nested fields
-            let column_path =
-                if let Some(ancestors) = dataset.schema().field_ancestry_by_id(field.id) {
-                    let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
-                    format_field_path(&field_refs)
-                } else {
-                    continue; // Skip if we can't find the field ancestry
-                };
-
-            // Check if this field has an inverted index
-            let has_fts_index = dataset
-                .load_scalar_index(
-                    IndexCriteria::default()
-                        .for_column(&column_path)
-                        .supports_fts(),
-                )
-                .await?
-                .is_some();
-
-            if has_fts_index {
-                indexed_columns.push(column_path);
-            }
+    for index in dataset.load_indices().await?.iter() {
+        let Some(field_id) = index.fields.first().copied() else {
+            continue;
+        };
+        let Ok(preliminary_path) = dataset.schema().field_path(field_id) else {
+            continue;
+        };
+        let details =
+            crate::index::scalar::fetch_index_details(dataset.as_ref(), &preliminary_path, index)
+                .await?;
+        if !details.type_url.ends_with("InvertedIndexDetails") {
+            continue;
         }
+        let details = lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())
+            .map_err(|error| {
+                Error::io(format!(
+                    "failed to decode InvertedIndexDetails payload: {error}"
+                ))
+            })?;
+        if DocumentGranularity::try_from(details.document_granularity)? != DocumentGranularity::Row
+        {
+            continue;
+        }
+        let resolved = crate::index::scalar::inverted::resolve_fts_field_by_id(
+            dataset.schema(),
+            field_id,
+            DocumentGranularity::Row,
+        )?;
+        indexed_columns.push(resolved.canonical_path);
     }
+    indexed_columns.sort();
+    indexed_columns.dedup();
     Ok(indexed_columns)
 }
 
@@ -6046,9 +6714,9 @@ mod test {
 
     use super::*;
     use crate::dataset::WriteMode;
-    use crate::dataset::WriteParams;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
+    use crate::dataset::{NewColumnTransform, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
@@ -6259,6 +6927,120 @@ mod test {
                 rows_read += next.num_rows();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_across_data_files() {
+        let num_rows = 300;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                max_rows_per_file: num_rows as usize + 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let wide_value = "abcdefghij".repeat(6);
+        let wide_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "wide",
+            DataType::Utf8,
+            false,
+        )]));
+        let wide_batch = RecordBatch::try_new(
+            wide_schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..num_rows).map(|_| wide_value.as_str()),
+            ))],
+        )
+        .unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(wide_batch)],
+                    wide_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragment(0).unwrap().num_data_files(), 2);
+
+        let target_bytes = 8 * 1024;
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            num_rows as usize
+        );
+        for batch in &batches {
+            let wide = batch["wide"].as_string::<i32>();
+            let values_bytes = (*wide.value_offsets().last().unwrap()
+                - *wide.value_offsets().first().unwrap()) as usize;
+            let logical_bytes = batch.num_rows() * std::mem::size_of::<i64>()
+                + std::mem::size_of_val(wide.value_offsets())
+                + values_bytes;
+            assert!(
+                logical_bytes <= target_bytes as usize,
+                "batch has {logical_bytes} logical bytes, target is {target_bytes}"
+            );
+        }
+
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size(10)
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 10));
+
+        let mut scan = dataset.scan();
+        scan.project(&["id", "wide"])
+            .unwrap()
+            .batch_size(200)
+            .batch_size_bytes(target_bytes)
+            .strict_batch_size(true);
+        let error = scan
+            .try_into_stream()
+            .await
+            .err()
+            .expect("strict row and byte batch limits should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("strict_batch_size=true cannot be combined with batch_size_bytes=8192"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

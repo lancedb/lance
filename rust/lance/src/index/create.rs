@@ -47,6 +47,25 @@ fn default_index_name(fields: &[&str]) -> String {
     }
 }
 
+fn resolved_inverted_params(params: &ScalarIndexParams) -> Result<InvertedIndexParams> {
+    let mut merged = serde_json::to_value(InvertedIndexParams::default())?;
+    if let Some(raw_params) = params.params.as_deref() {
+        let provided = serde_json::from_str::<serde_json::Value>(raw_params)?;
+        let merged = merged.as_object_mut().ok_or_else(|| {
+            Error::internal("default inverted index parameters are not a JSON object".to_string())
+        })?;
+        let provided = provided.as_object().ok_or_else(|| {
+            Error::invalid_input("inverted index parameters must be a JSON object".to_string())
+        })?;
+        merged.extend(provided.clone());
+    }
+    Ok(serde_json::from_value(merged)?)
+}
+
+fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
+    Ok(ScalarIndexParams::new("inverted".to_string()).with_params(&params.to_training_json()?))
+}
+
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
     columns: Vec<String>,
@@ -147,19 +166,87 @@ impl<'a> CreateIndexBuilder<'a> {
             ));
         }
         let column_input = &self.columns[0];
+        let scalar_fts_request = self.index_type == IndexType::Scalar
+            && self
+                .params
+                .as_any()
+                .downcast_ref::<ScalarIndexParams>()
+                .is_some_and(|params| {
+                    params.index_type.eq_ignore_ascii_case("inverted")
+                        || params.index_type.eq_ignore_ascii_case("fts")
+                });
+        let inverted_params = if self.index_type == IndexType::Inverted {
+            if let Some(params) = self
+                .params
+                .as_any()
+                .downcast_ref::<InvertedIndexParams>()
+            {
+                Some(params.clone())
+            } else if let Some(params) =
+                self.params.as_any().downcast_ref::<ScalarIndexParams>()
+            {
+                Some(resolved_inverted_params(params)?)
+            } else {
+                return Err(Error::index(
+                    "Inverted index type must take InvertedIndexParams or ScalarIndexParams"
+                        .to_string(),
+                ));
+            }
+        } else if scalar_fts_request {
+            Some(resolved_inverted_params(
+                self.params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .expect("scalar_fts_request verified scalar params"),
+            )?)
+        } else {
+            None
+        };
+        let resolved_fts_field = if let Some(params) = &inverted_params {
+            Some(crate::index::scalar::inverted::resolve_fts_field(
+                self.dataset.schema(),
+                column_input,
+                params.get_document_granularity(),
+            )?)
+        } else {
+            None
+        };
+        let lookup_column = resolved_fts_field
+            .as_ref()
+            .map(|resolved| resolved.root_column.as_str())
+            .unwrap_or(column_input);
         // Use case-insensitive lookup for both simple and nested paths.
         // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
-        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
+        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(lookup_column) else {
             return Err(Error::index(format!(
                 "CreateIndex: column '{column_input}' does not exist"
             )));
         };
-        let field = *field_path.last().unwrap();
+        let field = if let Some(resolved) = &resolved_fts_field {
+            self.dataset
+                .schema()
+                .field_by_id(resolved.final_field_id)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "CreateIndex: FTS field path '{column_input}' resolved to missing field id {}",
+                        resolved.final_field_id
+                    ))
+                })?
+        } else {
+            *field_path.last().ok_or_else(|| {
+                Error::index(format!(
+                    "CreateIndex: column '{column_input}' resolved to an empty field path"
+                ))
+            })?
+        };
         // Reconstruct the column path with correct case from schema
         // Use quoted format for SQL parsing (special chars are quoted)
         let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
         let quoted_column: String = format_field_path(&names);
-        let column = quoted_column.as_str();
+        let column = resolved_fts_field
+            .as_ref()
+            .map(|resolved| resolved.canonical_path.as_str())
+            .unwrap_or(quoted_column.as_str());
 
         let vector_fragments_for_validation =
             is_builtin_vector_index(self.index_type, self.params)
@@ -182,7 +269,16 @@ impl<'a> CreateIndexBuilder<'a> {
             name
         } else {
             // Generate default name with collision handling
-            let column_path = default_index_name(&names);
+            let column_path = resolved_fts_field
+                .as_ref()
+                .map(|resolved| {
+                    if resolved.document_granularity.is_list_element() {
+                        format!("{}_list_element", resolved.canonical_path)
+                    } else {
+                        resolved.canonical_path.clone()
+                    }
+                })
+                .unwrap_or_else(|| default_index_name(&names));
             let base_name = format!("{column_path}_idx");
             let mut candidate = base_name.clone();
             let mut counter = 2; // Start with no suffix, then use _2, _3, ...
@@ -244,7 +340,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
-                let params = if let Some(provided_params) =
+                let mut params = if let Some(provided_params) =
                     self.params.as_any().downcast_ref::<ScalarIndexParams>()
                 {
                     if let Some(params_json) = &provided_params.params {
@@ -262,6 +358,9 @@ impl<'a> CreateIndexBuilder<'a> {
                 } else {
                     base_params
                 };
+                if let Some(inverted_params) = &inverted_params {
+                    params = scalar_params_from_inverted(inverted_params)?;
+                }
 
                 let preprocesssed_data = self
                     .preprocessed_data
@@ -314,12 +413,18 @@ impl<'a> CreateIndexBuilder<'a> {
                     .downcast_ref::<ScalarIndexParams>()
                     .ok_or_else(|| {
                         Error::index("Scalar index type must take a ScalarIndexParams".to_string())
-                    })?;
+                    })?
+                    .clone();
+                let params = if let Some(inverted_params) = &inverted_params {
+                    scalar_params_from_inverted(inverted_params)?
+                } else {
+                    params
+                };
                 build_scalar_index(
                     self.dataset,
                     column,
                     index_id,
-                    params,
+                    &params,
                     train,
                     self.fragments.clone(),
                     None,
@@ -329,18 +434,11 @@ impl<'a> CreateIndexBuilder<'a> {
             }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
-                let inverted_params = self
-                    .params
-                    .as_any()
-                    .downcast_ref::<InvertedIndexParams>()
-                    .ok_or_else(|| {
-                        Error::index(
-                            "Inverted index type must take a InvertedIndexParams".to_string(),
-                        )
-                    })?;
+                let inverted_params = inverted_params
+                    .as_ref()
+                    .expect("IndexType::Inverted parameters were resolved above");
 
-                let params = ScalarIndexParams::new("inverted".to_string())
-                    .with_params(&inverted_params.to_training_json()?);
+                let params = scalar_params_from_inverted(inverted_params)?;
                 build_scalar_index(
                     self.dataset,
                     column,
