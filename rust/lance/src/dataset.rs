@@ -141,6 +141,7 @@ pub use write::merge_insert::{
 };
 
 use crate::dataset::index::LanceIndexStoreExt;
+pub use write::column_write_error::ColumnWriteError;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -3577,9 +3578,9 @@ impl Dataset {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &lance_core::datatypes::Schema,
     ) -> Result<transaction::DataReplacementGroup> {
-        let fragment = self.get_fragment(fragment_id as usize).ok_or_else(|| {
-            Error::invalid_input(format!("fragment {fragment_id} not found in dataset"))
-        })?;
+        let fragment = self
+            .get_fragment(fragment_id as usize)
+            .ok_or(ColumnWriteError::FragmentNotFound { fragment_id })?;
         let expected_rows = fragment.physical_rows().await? as u64;
 
         let file_name = format!("{}.lance", fragment::write::generate_random_filename());
@@ -3611,11 +3612,12 @@ impl Dataset {
             if let Err(delete_error) = self.object_store.delete(&path).await {
                 log::warn!("failed to delete staged column file '{path}': {delete_error}");
             }
-            return Err(Error::invalid_input(format!(
-                "column data for fragment {fragment_id} has {} rows but the fragment has {} \
-                 physical rows",
-                summary.num_rows, expected_rows
-            )));
+            return Err(ColumnWriteError::RowCountMismatch {
+                fragment_id,
+                staged_rows: summary.num_rows,
+                physical_rows: expected_rows,
+            }
+            .into());
         }
         let field_ids: Vec<i32> = field_id_mapping
             .iter()

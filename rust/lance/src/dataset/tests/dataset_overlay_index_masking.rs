@@ -31,7 +31,7 @@ use lance_file::writer::FileWriterOptions;
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
-use crate::dataset::{WriteDestination, WriteParams};
+use crate::dataset::{ColumnWriteError, WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 
@@ -1368,8 +1368,14 @@ async fn test_stale_column_write_rejected_over_concurrent_overlay(#[case] stable
     )
     .await;
 
-    let result = dataset.commit_column_writes(vec![stale], None).await;
-    assert!(result.is_err(), "stale write must not erase the overlay");
+    let error = dataset
+        .commit_column_writes(vec![stale], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        ColumnWriteError::of(&error),
+        Some(ColumnWriteError::StaleFragmentData { .. })
+    ));
     dataset.checkout_latest().await.unwrap();
     let batch = dataset
         .scan()
@@ -1436,11 +1442,14 @@ async fn test_stale_column_write_rejected_over_overlay_coverage_change() {
     .await
     .unwrap();
 
-    let result = stale.commit_column_writes(vec![replacement], None).await;
-    assert!(
-        result.is_err(),
-        "stale write must not erase the moved overlay coverage"
-    );
+    let error = stale
+        .commit_column_writes(vec![replacement], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        ColumnWriteError::of(&error),
+        Some(ColumnWriteError::StaleFragmentData { .. })
+    ));
 }
 
 /// A concurrent Merge can remap a base file's column indices while keeping
@@ -1489,9 +1498,12 @@ async fn test_stale_column_write_rejected_over_base_mapping_change() {
     .await
     .unwrap();
 
-    let result = stale.commit_column_writes(vec![replacement], None).await;
-    assert!(
-        result.is_err(),
-        "stale write must not clobber the remapped base file"
-    );
+    let error = stale
+        .commit_column_writes(vec![replacement], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        ColumnWriteError::of(&error),
+        Some(ColumnWriteError::StaleFragmentData { .. })
+    ));
 }

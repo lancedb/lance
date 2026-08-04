@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use std::vec;
@@ -10,7 +10,9 @@ use crate::dataset::ROW_ID;
 use crate::dataset::WriteDestination;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
-use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder};
+use crate::dataset::{
+    AutoCleanupParams, ColumnWriteError, MergeInsertBuilder, ProjectionRequest, UpdateBuilder,
+};
 use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
 use lance_core::{ROW_ADDR, datatypes::Schema as LanceSchema};
@@ -4365,6 +4367,11 @@ fn new_int32_columns_schema(dataset: &Dataset, names: &[&str]) -> LanceSchema {
     schema
 }
 
+/// The returned `DataReplacementGroup` must describe the staged file well
+/// enough to commit it without reopening it: the writer's field-id to
+/// column-index mapping, and the dataset's own file version rather than the
+/// crate default. Streaming the column as several batches must not change
+/// that description.
 #[rstest]
 #[tokio::test]
 async fn test_write_fragment_column_metadata(
@@ -4411,6 +4418,10 @@ async fn test_write_fragment_column_metadata(
     );
 }
 
+/// A staged file must cover the fragment's physical rows exactly. A short
+/// file leaves rows with no value and makes later scans fail; a long one
+/// silently drops its surplus. Both are caught while staging, so a bad file
+/// can never reach a commit, and the file is not left behind.
 #[tokio::test]
 async fn test_write_fragment_column_rejects_row_count_mismatch() {
     let dataset = id_dataset(2, 1024).await;
@@ -4430,10 +4441,10 @@ async fn test_write_fragment_column_rejects_row_count_mismatch() {
             )
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("physical rows"),
-            "expected row-count mismatch error, got: {err}"
-        );
+        assert!(matches!(
+            ColumnWriteError::of(&err),
+            Some(ColumnWriteError::RowCountMismatch { .. })
+        ));
     }
 
     let ok = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
@@ -4441,57 +4452,16 @@ async fn test_write_fragment_column_rejects_row_count_mismatch() {
         .write_fragment_column(99, futures::stream::iter([Ok(ok)]), &lance_schema)
         .await
         .unwrap_err();
-    assert!(
-        err.to_string().contains("not found"),
-        "expected missing-fragment error, got: {err}"
-    );
+    assert!(matches!(
+        ColumnWriteError::of(&err),
+        Some(ColumnWriteError::FragmentNotFound { .. })
+    ));
 }
 
-/// A column write computes per-fragment replacements, then a concurrent
-/// compaction rewrites those fragments into new ids before the commit.
-/// `commit_column_writes` must fail rather than commit a column with null
-/// data for the rewritten fragments.
-#[tokio::test]
-async fn test_commit_column_writes_rejects_orphaned_replacements_after_compaction() {
-    // One row per file: two fragments to compact together.
-    let mut dataset = id_dataset(2, 1).await;
-    let orig_frag_ids: Vec<u64> = dataset
-        .get_fragments()
-        .iter()
-        .map(|f| f.id() as u64)
-        .collect();
-    assert_eq!(orig_frag_ids.len(), 2);
-
-    let lance_schema = new_int32_columns_schema(&dataset, &["value"]);
-    let mut replacements = Vec::new();
-    for frag_id in &orig_frag_ids {
-        let out = arrow_array::record_batch!(("value", Int32, [0])).unwrap();
-        replacements.push(stage_column(&dataset, *frag_id, out, &lance_schema).await);
-    }
-
-    compact_files(&mut dataset, CompactionOptions::default(), None)
-        .await
-        .unwrap();
-    let new_frag_ids: Vec<u64> = dataset
-        .get_fragments()
-        .iter()
-        .map(|f| f.id() as u64)
-        .collect();
-    assert!(new_frag_ids.iter().all(|id| !orig_frag_ids.contains(id)));
-
-    let err = dataset
-        .commit_column_writes(replacements, None)
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("no longer in the dataset"),
-        "expected orphaned-replacement error, got: {err}"
-    );
-}
-
-/// Committing a replacement for a column that already exists must not
-/// duplicate the field, and must tombstone the fragment's previous coverage
-/// so the new file is authoritative.
+/// Committing a replacement for a column that already exists is an in-place
+/// rewrite, not a second column: the field must still appear once in the
+/// schema, and the fragment's previous coverage must be tombstoned so the new
+/// file is the only one answering for the field.
 #[tokio::test]
 async fn test_commit_column_writes_incremental_rewrite_tombstones_old_file() {
     let mut dataset = id_dataset(2, 1024).await;
@@ -4536,55 +4506,9 @@ async fn test_commit_column_writes_incremental_rewrite_tombstones_old_file() {
     assert_eq!(covering, 1);
 }
 
-/// Two stale writers derive the same fresh field id from one snapshot. After
-/// the first commits, the second must fail and recompute -- whether it staged
-/// a different column or an identical twin -- instead of replaying stale
-/// bytes over the winner.
-#[rstest]
-#[case::different_field("second_value")]
-#[case::same_field("value")]
-#[tokio::test]
-async fn test_commit_column_writes_rejects_stale_replacement(#[case] second_name: &str) {
-    let mut ds1 = id_dataset(2, 1024).await;
-    let mut ds2 = ds1.clone();
-
-    let schema1 = new_int32_columns_schema(&ds1, &["value"]);
-    let schema2 = new_int32_columns_schema(&ds2, &[second_name]);
-    assert_eq!(schema1.fields[0].id, schema2.fields[0].id);
-    let fragment_id = ds1.get_fragments()[0].id() as u64;
-
-    let b1 = arrow_array::record_batch!(("value", Int32, [10, 20])).unwrap();
-    let r1 = stage_column(&ds1, fragment_id, b1, &schema1).await;
-    let b2 = RecordBatch::try_new(
-        Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            second_name,
-            DataType::Int32,
-            true,
-        )])),
-        vec![Arc::new(Int32Array::from(vec![30, 40]))],
-    )
-    .unwrap();
-    let r2 = stage_column(&ds2, fragment_id, b2, &schema2).await;
-
-    ds1.commit_column_writes(vec![r1], None).await.unwrap();
-    let err = ds2.commit_column_writes(vec![r2], None).await.unwrap_err();
-    assert!(
-        err.to_string().contains("stale schema"),
-        "expected stale-schema conflict, got: {err}"
-    );
-
-    // The winner's data is intact and the loser's was not applied.
-    ds2.checkout_latest().await.unwrap();
-    let batch = ds2.scan().try_into_batch().await.unwrap();
-    assert_eq!(
-        batch["value"].as_primitive::<Int32Type>().values(),
-        &[10, 20]
-    );
-    if second_name != "value" {
-        assert!(ds2.schema().field(second_name).is_none());
-    }
-}
-
+/// Staging one file per column is a supported way to assemble a multi-column
+/// write, so a fragment with several staged files must apply all of them.
+/// Keeping only the last would publish nulls for every other column.
 #[tokio::test]
 async fn test_commit_column_writes_applies_multiple_files_per_fragment() {
     let mut dataset = id_dataset(2, 1024).await;
@@ -4617,6 +4541,10 @@ async fn test_commit_column_writes_applies_multiple_files_per_fragment() {
     );
 }
 
+/// The staged footers are the source of truth for the column schema, so files
+/// sharing a field id must agree on it. Accepting two fragments staged under
+/// one id with different types would reinterpret one fragment's stored bytes
+/// under the other fragment's type.
 #[tokio::test]
 async fn test_commit_column_writes_rejects_disagreeing_staged_schemas() {
     // One row per file: two fragments to stage separately.
@@ -4651,12 +4579,16 @@ async fn test_commit_column_writes_rejects_disagreeing_staged_schemas() {
         .commit_column_writes(vec![r1, r2], None)
         .await
         .unwrap_err();
-    assert!(
-        err.to_string().contains("disagree on field id"),
-        "expected staged-schema disagreement error, got: {err}"
-    );
+    assert!(matches!(
+        ColumnWriteError::of(&err),
+        Some(ColumnWriteError::StagedSchemasDisagree { .. })
+    ));
 }
 
+/// An in-place rewrite must match the existing field's whole contract, not
+/// just its name and type. Narrowing a committed nullable column to
+/// non-nullable would leave the nulls already stored for other fragments
+/// unreadable under the new declaration.
 #[tokio::test]
 async fn test_commit_column_writes_rejects_nullability_change_on_rewrite() {
     let mut dataset = id_dataset(2, 1024).await;
@@ -4688,10 +4620,10 @@ async fn test_commit_column_writes_rejects_nullability_change_on_rewrite() {
         .commit_column_writes(vec![replacement], None)
         .await
         .unwrap_err();
-    assert!(
-        err.to_string().contains("conflicts with field id"),
-        "expected field-contract mismatch error, got: {err}"
-    );
+    assert!(matches!(
+        ColumnWriteError::of(&err),
+        Some(ColumnWriteError::FieldContractConflict { .. })
+    ));
 }
 
 #[rstest]
@@ -4731,6 +4663,11 @@ async fn test_commit_column_writes_rejects_nullability_change_on_rewrite() {
         ArrowField::new("x", DataType::Int32, true),
     ])), true),
 ])]
+/// Values written by `write_fragment_column` and published by
+/// `commit_column_writes` must read back unchanged across the type shapes the
+/// file writer handles -- nested structs, lists, fixed-size lists and
+/// variable-length binary -- staged per fragment over a multi-fragment
+/// dataset and read through a fresh handle.
 #[tokio::test]
 async fn test_write_commit_column_round_trip_schema_zoo(#[case] new_fields: Vec<ArrowField>) {
     let mut dataset = id_dataset(6, 3).await;
@@ -4791,58 +4728,10 @@ async fn test_write_commit_column_round_trip_schema_zoo(#[case] new_fields: Vec<
     }
 }
 
-#[rstest]
-#[case::nullable(true)]
-#[case::non_nullable(false)]
-#[tokio::test]
-async fn test_commit_column_writes_concurrent_append(#[case] nullable: bool) {
-    let mut dataset = id_dataset(2, 1024).await;
-
-    let column_arrow = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "value",
-        DataType::Int32,
-        nullable,
-    )]));
-    let column_schema = new_columns_schema(&dataset, column_arrow.as_ref());
-
-    let fragment_id = dataset.get_fragments()[0].id() as u64;
-    let staged = RecordBatch::try_new(
-        column_arrow.clone(),
-        vec![Arc::new(Int32Array::from(vec![10, 20]))],
-    )
-    .unwrap();
-    let replacement = stage_column(&dataset, fragment_id, staged, &column_schema).await;
-
-    // An append lands between the write and the commit.
-    let append = arrow_array::record_batch!(("id", Int32, [3])).unwrap();
-    let append_reader = RecordBatchIterator::new(vec![Ok(append.clone())], append.schema());
-    dataset.append(append_reader, None).await.unwrap();
-
-    let result = dataset.commit_column_writes(vec![replacement], None).await;
-    if nullable {
-        // The appended fragment reads null, matching add_columns semantics.
-        result.unwrap();
-        dataset.validate().await.unwrap();
-        let scanned = dataset
-            .scan()
-            .project(&["value"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let values = scanned["value"].as_primitive::<Int32Type>();
-        assert_eq!(scanned.num_rows(), 3);
-        assert!(values.is_null(2));
-    } else {
-        // An uncovered non-nullable column would synthesize invalid nulls.
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("non-nullable column"),
-            "expected coverage error, got: {err}"
-        );
-    }
-}
-
+/// Rewriting a column in place must not leave a scalar index answering from
+/// the replaced values: the commit tombstones the old coverage, so filtered
+/// queries have to find the new values and must not return phantom hits for
+/// the old ones.
 #[tokio::test]
 async fn test_commit_column_writes_rewrite_updates_indexed_column_queries() {
     let batch =
@@ -4901,6 +4790,10 @@ async fn test_commit_column_writes_rewrite_updates_indexed_column_queries() {
     assert_eq!(stale.num_rows(), 0, "stale index entries must not surface");
 }
 
+/// Staged data is addressed by physical row offset, not by live row, so a
+/// fragment carrying a deletion vector still expects a value for every
+/// physical row. The deleted row's staged value is written and then filtered
+/// out by the deletion vector on read.
 #[tokio::test]
 async fn test_write_fragment_column_covers_physical_rows_with_deletions() {
     let mut dataset = id_dataset(3, 1024).await;
@@ -4931,6 +4824,10 @@ async fn test_write_fragment_column_covers_physical_rows_with_deletions() {
     );
 }
 
+/// A non-nullable leaf inside a nullable struct does not force full coverage.
+/// An uncovered fragment reads the whole struct as null, which never
+/// materializes a null leaf, so partial coverage is legal here -- only a
+/// non-nullable top-level column requires every live fragment to be staged.
 #[tokio::test]
 async fn test_commit_column_writes_nullable_struct_with_non_nullable_leaf_partial_coverage() {
     let mut dataset = id_dataset(2, 1).await;
@@ -4976,127 +4873,369 @@ async fn test_commit_column_writes_nullable_struct_with_non_nullable_leaf_partia
     );
 }
 
-/// Two handles rewrite the same existing column from one snapshot. The
-/// loser's staged bytes are bound to the prepare-time backing file, so the
-/// retry fails instead of tombstoning the winner's fresh data.
-#[tokio::test]
-async fn test_commit_column_writes_rejects_stale_existing_column_rewrite() {
-    let mut ds1 = id_dataset(2, 1024).await;
-    let column_schema = new_int32_columns_schema(&ds1, &["value"]);
-    let fragment_id = ds1.get_fragments()[0].id() as u64;
-    let seed = arrow_array::record_batch!(("value", Int32, [10, 20])).unwrap();
-    let replacement = stage_column(&ds1, fragment_id, seed, &column_schema).await;
-    ds1.commit_column_writes(vec![replacement], None)
-        .await
-        .unwrap();
-
-    let mut ds2 = ds1.clone();
-    let b1 = arrow_array::record_batch!(("value", Int32, [30, 40])).unwrap();
-    let r1 = stage_column(&ds1, fragment_id, b1, &column_schema).await;
-    let b2 = arrow_array::record_batch!(("value", Int32, [50, 60])).unwrap();
-    let r2 = stage_column(&ds2, fragment_id, b2, &column_schema).await;
-
-    ds1.commit_column_writes(vec![r1], None).await.unwrap();
-    let err = ds2.commit_column_writes(vec![r2], None).await.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("changed since the column was prepared"),
-        "expected stale-rewrite conflict, got: {err}"
-    );
-
-    ds2.checkout_latest().await.unwrap();
-    let batch = ds2.scan().try_into_batch().await.unwrap();
-    assert_eq!(
-        batch["value"].as_primitive::<Int32Type>().values(),
-        &[30, 40]
-    );
+/// One step in a concurrent column-write scenario.
+///
+/// Handles model independent `Dataset` references racing to commit. Handle 0
+/// is the dataset as created; every higher handle is cloned from handle 0 the
+/// first time a step names it, which is the shared snapshot the writers race
+/// from. Staged replacements accumulate per handle until that handle commits.
+enum Step {
+    /// Stage `values` for fragment `fragment` on `handle`, under column
+    /// `column`. Every staged column takes the same fresh field id, so two
+    /// handles staging different names collide on one id.
+    Stage {
+        handle: usize,
+        fragment: usize,
+        column: &'static str,
+        values: Vec<i32>,
+    },
+    /// Commit everything `handle` has staged.
+    Commit { handle: usize, expect: Expect },
+    /// Append rows, creating a fragment the staged writes do not cover.
+    Append(Vec<i32>),
+    /// Land a `DataOverlay` supplying new values for the staged column,
+    /// changing the fragment's coverage without touching its base file.
+    Overlay { fragment: usize, values: Vec<i32> },
+    /// Compact every fragment, which rewrites them under new ids.
+    Compact,
 }
 
-/// Two handles fill the same still-uncovered fragment of a nullable column.
-/// Absence is part of the prepare-time binding, so the loser's retry fails
-/// instead of tombstoning the winner's fill.
-#[tokio::test]
-async fn test_commit_column_writes_rejects_stale_fill_of_uncovered_fragment() {
-    let mut ds1 = id_dataset(2, 1).await;
-    let frag_ids: Vec<u64> = ds1.get_fragments().iter().map(|f| f.id() as u64).collect();
-
-    // Establish a nullable column covering only the first fragment.
-    let column_schema = new_int32_columns_schema(&ds1, &["value"]);
-    let seed = arrow_array::record_batch!(("value", Int32, [10])).unwrap();
-    let replacement = stage_column(&ds1, frag_ids[0], seed, &column_schema).await;
-    ds1.commit_column_writes(vec![replacement], None)
-        .await
-        .unwrap();
-
-    // Two handles stage a fill for the uncovered second fragment.
-    let mut ds2 = ds1.clone();
-    let b1 = arrow_array::record_batch!(("value", Int32, [30])).unwrap();
-    let r1 = stage_column(&ds1, frag_ids[1], b1, &column_schema).await;
-    let b2 = arrow_array::record_batch!(("value", Int32, [50])).unwrap();
-    let r2 = stage_column(&ds2, frag_ids[1], b2, &column_schema).await;
-
-    ds1.commit_column_writes(vec![r1], None).await.unwrap();
-    let err = ds2.commit_column_writes(vec![r2], None).await.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("changed since the column was prepared"),
-        "expected stale-fill conflict, got: {err}"
-    );
-
-    ds2.checkout_latest().await.unwrap();
-    let batch = ds2.scan().try_into_batch().await.unwrap();
-    assert_eq!(
-        batch["value"].as_primitive::<Int32Type>().values(),
-        &[10, 30]
-    );
+/// What a [`Step::Commit`] must produce.
+enum Expect {
+    Ok,
+    /// The commit must fail with a [`ColumnWriteError`] the predicate accepts.
+    Err(fn(&ColumnWriteError) -> bool),
 }
 
-/// A concurrent DataOverlay covering the staged field changes the fragment's
-/// coverage identity without touching its base file. The stale column write
-/// must fail rather than tombstone the overlay winner.
-#[tokio::test]
-async fn test_commit_column_writes_rejects_stale_write_over_concurrent_overlay() {
+impl Step {
+    fn stage(handle: usize, fragment: usize, values: Vec<i32>) -> Self {
+        Self::Stage {
+            handle,
+            fragment,
+            column: "value",
+            values,
+        }
+    }
+
+    fn stage_as(handle: usize, fragment: usize, column: &'static str, values: Vec<i32>) -> Self {
+        Self::Stage {
+            handle,
+            fragment,
+            column,
+            values,
+        }
+    }
+
+    fn commit_ok(handle: usize) -> Self {
+        Self::Commit {
+            handle,
+            expect: Expect::Ok,
+        }
+    }
+
+    fn commit_err(handle: usize, accepts: fn(&ColumnWriteError) -> bool) -> Self {
+        Self::Commit {
+            handle,
+            expect: Expect::Err(accepts),
+        }
+    }
+}
+
+/// Run `steps` against a fresh `rows`-row dataset split at `max_rows_per_file`,
+/// then assert the committed "value" column.
+///
+/// `expected` is the column's final contents (`None` entries are nulls), or
+/// `None` if no commit should have introduced the column at all. Either way
+/// the final schema must hold exactly the columns that implies, so a losing
+/// writer's column cannot slip in unnoticed.
+async fn run_column_write_scenario(
+    rows: i32,
+    max_rows_per_file: usize,
+    nullable: bool,
+    steps: Vec<Step>,
+    expected: Option<&[Option<i32>]>,
+) {
     use super::dataset_overlay_index_masking::commit_overlay;
     use lance_table::format::overlay::OverlayCoverage;
     use roaring::RoaringBitmap;
 
-    let mut ds1 = id_dataset(2, 1024).await;
-    let column_schema = new_int32_columns_schema(&ds1, &["value"]);
-    let fragment_id = ds1.get_fragments()[0].id() as u64;
-    let seed = arrow_array::record_batch!(("value", Int32, [10, 20])).unwrap();
-    let replacement = stage_column(&ds1, fragment_id, seed, &column_schema).await;
-    ds1.commit_column_writes(vec![replacement], None)
+    let base = id_dataset(rows, max_rows_per_file).await;
+    // Every staged column claims the same fresh id, whatever its name.
+    let field_id = base.manifest.max_field_id() + 1;
+    let frag_ids: Vec<u64> = base.get_fragments().iter().map(|f| f.id() as u64).collect();
+    let mut handles = vec![base];
+    let mut staged: HashMap<usize, Vec<DataReplacementGroup>> = HashMap::new();
+
+    for step in steps {
+        if let Step::Stage { handle, .. } | Step::Commit { handle, .. } = step {
+            while handles.len() <= handle {
+                let snapshot = handles[0].clone();
+                handles.push(snapshot);
+            }
+        }
+        match step {
+            Step::Stage {
+                handle,
+                fragment,
+                column,
+                values,
+            } => {
+                let arrow = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    column,
+                    DataType::Int32,
+                    nullable,
+                )]));
+                let mut schema = LanceSchema::try_from(arrow.as_ref()).unwrap();
+                schema.fields[0].id = field_id;
+                let batch =
+                    RecordBatch::try_new(arrow, vec![Arc::new(Int32Array::from(values))]).unwrap();
+                let replacement = handles[handle]
+                    .write_fragment_column(
+                        frag_ids[fragment],
+                        futures::stream::iter([Ok(batch)]),
+                        &schema,
+                    )
+                    .await
+                    .unwrap();
+                staged.entry(handle).or_default().push(replacement);
+            }
+            Step::Commit { handle, expect } => {
+                let replacements = staged.remove(&handle).unwrap_or_default();
+                let result = handles[handle]
+                    .commit_column_writes(replacements, None)
+                    .await;
+                match expect {
+                    Expect::Ok => result.unwrap(),
+                    Expect::Err(accepts) => {
+                        let error = result.unwrap_err();
+                        let cause = ColumnWriteError::of(&error)
+                            .unwrap_or_else(|| panic!("expected a ColumnWriteError, got: {error}"));
+                        assert!(accepts(cause), "unexpected column-write failure: {cause}");
+                    }
+                }
+            }
+            Step::Append(values) => {
+                let arrow = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "id",
+                    DataType::Int32,
+                    true,
+                )]));
+                let batch =
+                    RecordBatch::try_new(arrow.clone(), vec![Arc::new(Int32Array::from(values))])
+                        .unwrap();
+                let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow);
+                handles[0].append(reader, None).await.unwrap();
+            }
+            Step::Overlay { fragment, values } => {
+                let coverage = RoaringBitmap::from_iter(0..values.len() as u32);
+                commit_overlay(
+                    handles[0].clone(),
+                    "scenario_overlay",
+                    frag_ids[fragment],
+                    &[field_id],
+                    OverlayCoverage::dense(coverage),
+                    vec![Arc::new(Int32Array::from(values)) as ArrayRef],
+                )
+                .await;
+            }
+            Step::Compact => {
+                compact_files(&mut handles[0], CompactionOptions::default(), None)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    let mut final_dataset = handles.swap_remove(0);
+    final_dataset.checkout_latest().await.unwrap();
+    let columns: HashSet<&str> = final_dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let Some(expected) = expected else {
+        assert_eq!(columns, HashSet::from(["id"]), "no column should be live");
+        return;
+    };
+    assert_eq!(columns, HashSet::from(["id", "value"]));
+    final_dataset.validate().await.unwrap();
+    let batch = final_dataset
+        .scan()
+        .project(&["value"])
+        .unwrap()
+        .try_into_batch()
         .await
         .unwrap();
+    let values = batch["value"].as_primitive::<Int32Type>();
+    let actual: Vec<Option<i32>> = (0..batch.num_rows())
+        .map(|row| (!values.is_null(row)).then(|| values.value(row)))
+        .collect();
+    assert_eq!(actual, expected);
+}
 
-    // Stage a stale rewrite, then land a concurrent overlay on the field.
-    let staged = arrow_array::record_batch!(("value", Int32, [50, 50])).unwrap();
-    let stale = stage_column(&ds1, fragment_id, staged, &column_schema).await;
-    let value_id = ds1.schema().field("value").unwrap().id;
-    commit_overlay(
-        ds1.clone(),
-        "value_overlay",
-        fragment_id,
-        &[value_id],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32, 1])),
-        vec![Arc::new(Int32Array::from(vec![30, 30])) as ArrayRef],
+/// A column write stages replacements for every fragment, then a concurrent
+/// compaction rewrites those fragments under new ids. The staged replacements
+/// no longer name live fragments; dropping them silently would publish a
+/// column whose data is all null, so the commit must fail and the caller must
+/// recompute against the new fragments.
+#[tokio::test]
+async fn test_commit_column_writes_rejects_orphaned_replacements_after_compaction() {
+    // One row per file, so there are two fragments to compact together.
+    run_column_write_scenario(
+        2,
+        1,
+        true,
+        vec![
+            Step::stage(0, 0, vec![0]),
+            Step::stage(0, 1, vec![0]),
+            Step::Compact,
+            Step::commit_err(0, |e| {
+                matches!(e, ColumnWriteError::OrphanedReplacements { .. })
+            }),
+        ],
+        None,
     )
     .await;
+}
 
-    let err = ds1
-        .commit_column_writes(vec![stale], None)
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("changed since the column was prepared"),
-        "expected stale-over-overlay conflict, got: {err}"
-    );
+/// Two writers derive the same fresh field id from one snapshot, because both
+/// take `max_field_id() + 1`. Once the first commits, that id belongs to its
+/// column; the second's file was written under the same id but holds different
+/// data, and staged files cannot be renumbered. The loser must fail and
+/// recompute rather than publish its bytes under the winner's id.
+///
+/// Both cases matter: the loser may have staged a differently named column
+/// (a visible collision) or an identical twin (a silent overwrite).
+#[rstest]
+#[case::different_column("second_value")]
+#[case::same_column("value")]
+#[tokio::test]
+async fn test_commit_column_writes_rejects_stale_replacement(#[case] second_column: &'static str) {
+    run_column_write_scenario(
+        2,
+        1024,
+        true,
+        vec![
+            Step::stage(0, 0, vec![10, 20]),
+            Step::stage_as(1, 0, second_column, vec![30, 40]),
+            Step::commit_ok(0),
+            Step::commit_err(1, |e| matches!(e, ColumnWriteError::StaleSchema { .. })),
+        ],
+        Some(&[Some(10), Some(20)]),
+    )
+    .await;
+}
 
-    ds1.checkout_latest().await.unwrap();
-    let batch = ds1.scan().try_into_batch().await.unwrap();
-    assert_eq!(
-        batch["value"].as_primitive::<Int32Type>().values(),
-        &[30, 30]
-    );
+/// An append lands between staging and committing, so the appended fragment
+/// has no staged data. A nullable column may read null there, matching
+/// `add_columns` semantics. A non-nullable one would have to synthesize nulls
+/// it declares impossible, so that commit must fail instead.
+#[rstest]
+#[case::nullable(true, Some(&[Some(10), Some(20), None][..]))]
+#[case::non_nullable(false, None)]
+#[tokio::test]
+async fn test_commit_column_writes_concurrent_append(
+    #[case] nullable: bool,
+    #[case] expected: Option<&[Option<i32>]>,
+) {
+    let commit = if nullable {
+        Step::commit_ok(0)
+    } else {
+        Step::commit_err(0, |e| {
+            matches!(e, ColumnWriteError::UncoveredNonNullableColumn { .. })
+        })
+    };
+    run_column_write_scenario(
+        2,
+        1024,
+        nullable,
+        vec![
+            Step::stage(0, 0, vec![10, 20]),
+            Step::Append(vec![3]),
+            commit,
+        ],
+        expected,
+    )
+    .await;
+}
+
+/// Two handles rewrite the same existing column from one snapshot. Committing
+/// a rewrite tombstones the fragment's prior coverage, so replaying the
+/// loser's staged bytes would erase the winner's fresh data. Each replacement
+/// is bound to the data file backing the field when it was prepared; the
+/// winner's commit changed that backing, so the loser's retry fails.
+#[tokio::test]
+async fn test_commit_column_writes_rejects_stale_existing_column_rewrite() {
+    run_column_write_scenario(
+        2,
+        1024,
+        true,
+        vec![
+            Step::stage(0, 0, vec![10, 20]),
+            Step::commit_ok(0),
+            Step::stage(0, 0, vec![30, 40]),
+            Step::stage(1, 0, vec![50, 60]),
+            Step::commit_ok(0),
+            Step::commit_err(1, |e| {
+                matches!(e, ColumnWriteError::StaleFragmentData { .. })
+            }),
+        ],
+        Some(&[Some(30), Some(40)]),
+    )
+    .await;
+}
+
+/// The same race on a fragment the column does not cover yet: a nullable
+/// column is committed for the first fragment only, then two handles fill the
+/// second. The prepare-time binding records that the field had no backing
+/// there at all, so the loser is caught by that absence rather than by a
+/// changed file.
+#[tokio::test]
+async fn test_commit_column_writes_rejects_stale_fill_of_uncovered_fragment() {
+    // One row per file, so the seeded column covers only the first fragment.
+    run_column_write_scenario(
+        2,
+        1,
+        true,
+        vec![
+            Step::stage(0, 0, vec![10]),
+            Step::commit_ok(0),
+            Step::stage(0, 1, vec![30]),
+            Step::stage(1, 1, vec![50]),
+            Step::commit_ok(0),
+            Step::commit_err(1, |e| {
+                matches!(e, ColumnWriteError::StaleFragmentData { .. })
+            }),
+        ],
+        Some(&[Some(10), Some(30)]),
+    )
+    .await;
+}
+
+/// A concurrent `DataOverlay` supplies new values for the staged field
+/// without touching the fragment's base file. Committing the stale write
+/// would tombstone that overlay, so the binding covers overlay identity too
+/// and the write must fail; the overlay's values survive.
+#[tokio::test]
+async fn test_commit_column_writes_rejects_stale_write_over_concurrent_overlay() {
+    run_column_write_scenario(
+        2,
+        1024,
+        true,
+        vec![
+            Step::stage(0, 0, vec![10, 20]),
+            Step::commit_ok(0),
+            Step::stage(0, 0, vec![50, 50]),
+            Step::Overlay {
+                fragment: 0,
+                values: vec![30, 30],
+            },
+            Step::commit_err(0, |e| {
+                matches!(e, ColumnWriteError::StaleFragmentData { .. })
+            }),
+        ],
+        Some(&[Some(30), Some(30)]),
+    )
+    .await;
 }

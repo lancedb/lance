@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
+use lance_core::Result;
 use lance_core::datatypes::{Field, NullabilityComparison, Schema, SchemaCompareOptions};
-use lance_core::{Error, Result};
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::FileReader;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -17,6 +17,7 @@ use lance_table::format::{DataFile, Fragment};
 use roaring::RoaringBitmap;
 
 use super::CommitBuilder;
+use super::column_write_error::ColumnWriteError;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use crate::Dataset;
 use crate::dataset::COLUMN_WRITE_READ_VERSION_METADATA_KEY;
@@ -33,9 +34,7 @@ pub async fn commit_column_writes(
     transaction_properties: Option<Arc<HashMap<String, String>>>,
 ) -> Result<()> {
     if replacements.is_empty() {
-        return Err(Error::invalid_input(
-            "no column replacements to commit".to_string(),
-        ));
+        return Err(ColumnWriteError::NoReplacements.into());
     }
 
     let staged_schemas = read_staged_schemas(ds, &replacements).await?;
@@ -120,29 +119,19 @@ async fn plan_column_writes(
         let stamped = schema
             .metadata
             .get(COLUMN_WRITE_READ_VERSION_METADATA_KEY)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "file '{}' was not staged by write_fragment_column (missing read-version \
-                     metadata)",
-                    file.path
-                ))
-            })?
-            .parse::<u64>()
-            .map_err(|parse_error| {
-                Error::invalid_input(format!(
-                    "file '{}' has an unparsable read-version stamp: {}",
-                    file.path, parse_error
-                ))
+            .and_then(|stamp| stamp.parse::<u64>().ok())
+            .ok_or_else(|| ColumnWriteError::NotStaged {
+                path: file.path.clone(),
             })?;
         match read_version {
             None => read_version = Some(stamped),
             Some(prev) if prev == stamped => {}
             Some(prev) => {
-                return Err(Error::invalid_input(format!(
-                    "staged files span dataset versions {} and {}; stage all fragments against \
-                     one version",
-                    prev, stamped
-                )));
+                return Err(ColumnWriteError::MixedReadVersions {
+                    first: prev,
+                    second: stamped,
+                }
+                .into());
             }
         }
     }
@@ -157,14 +146,14 @@ async fn plan_column_writes(
                 None => new_columns.push(field.clone()),
                 Some(existing) if fields_match(existing, field) => {}
                 Some(existing) => {
-                    return Err(Error::invalid_input(format!(
-                        "staged files disagree on field id {}: '{}' ({}) vs '{}' ({})",
-                        field.id,
-                        existing.name,
-                        existing.data_type(),
-                        field.name,
-                        field.data_type(),
-                    )));
+                    return Err(ColumnWriteError::StagedSchemasDisagree {
+                        field_id: field.id,
+                        name: existing.name.clone(),
+                        data_type: existing.data_type().to_string(),
+                        other_name: field.name.clone(),
+                        other_data_type: field.data_type().to_string(),
+                    }
+                    .into());
                 }
             }
         }
@@ -180,24 +169,26 @@ async fn plan_column_writes(
             collect_field_ids(field, &mut subtree_ids);
         }
         if file.fields.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "staged file '{}' records no field ids",
-                file.path
-            )));
+            return Err(ColumnWriteError::NoStagedFieldIds {
+                path: file.path.clone(),
+            }
+            .into());
         }
         let recorded = recorded_by_fragment.entry(*frag_id).or_default();
         for field_id in file.fields.iter() {
             if !subtree_ids.contains(field_id) {
-                return Err(Error::invalid_input(format!(
-                    "staged file '{}' records field id {}, which is not in its staged schema",
-                    file.path, field_id
-                )));
+                return Err(ColumnWriteError::StagedFieldNotInSchema {
+                    path: file.path.clone(),
+                    field_id: *field_id,
+                }
+                .into());
             }
             if !recorded.insert(*field_id) {
-                return Err(Error::invalid_input(format!(
-                    "fragment {} has multiple staged files covering field id {}",
-                    frag_id, field_id
-                )));
+                return Err(ColumnWriteError::DuplicateFieldCoverage {
+                    fragment_id: *frag_id,
+                    field_id: *field_id,
+                }
+                .into());
             }
         }
         covered_by_fragment
@@ -209,13 +200,10 @@ async fn plan_column_writes(
     // Classify each staged column against the schema it was prepared under.
     // Ids that were already this exact field are incremental rewrites; ids
     // that were absent must still be unclaimed at commit time.
-    let prepare_dataset = ds.checkout_version(read_version).await.map_err(|error| {
-        Error::invalid_input(format!(
-            "dataset version {} the columns were staged against is no longer available; \
-             recompute against the current dataset: {}",
-            read_version, error
-        ))
-    })?;
+    let prepare_dataset = ds
+        .checkout_version(read_version)
+        .await
+        .map_err(|_| ColumnWriteError::ReadVersionUnavailable { read_version })?;
     let prepare_schema = prepare_dataset.schema();
     let mut preexisting_field_ids = HashSet::new();
     for field in &new_columns {
@@ -225,16 +213,15 @@ async fn plan_column_writes(
                 preexisting_field_ids.insert(field.id);
             }
             Some(existing) => {
-                return Err(Error::schema(format!(
-                    "staged column '{}' ({}) conflicts with field id {} ('{}', {}) in dataset \
-                     version {} it was prepared against",
-                    field.name,
-                    field.data_type(),
-                    field.id,
-                    existing.name,
-                    existing.data_type(),
+                return Err(ColumnWriteError::FieldContractConflict {
+                    field_id: field.id,
+                    name: field.name.clone(),
+                    data_type: field.data_type().to_string(),
+                    other_name: existing.name.clone(),
+                    other_data_type: existing.data_type().to_string(),
                     read_version,
-                )));
+                }
+                .into());
             }
         }
     }
@@ -250,10 +237,11 @@ async fn plan_column_writes(
     let mut prepare_backing: HashMap<u64, Vec<(i32, FieldBacking)>> = HashMap::new();
     for DataReplacementGroup(frag_id, file) in replacements {
         let Some(prepare_fragment) = prepare_fragments.get(frag_id) else {
-            return Err(Error::invalid_input(format!(
-                "fragment {} does not exist at dataset version {} the write was prepared against",
-                frag_id, read_version
-            )));
+            return Err(ColumnWriteError::FragmentNotInReadVersion {
+                fragment_id: *frag_id,
+                read_version,
+            }
+            .into());
         };
         let bindings = prepare_backing.entry(*frag_id).or_default();
         for field_id in file.fields.iter() {
@@ -328,13 +316,12 @@ impl RetryExecutor for CommitColumnWritesJob {
                 // changed, or a field dropped). Staged files cannot be
                 // renumbered; replaying them would clobber the winner.
                 _ => {
-                    return Err(Error::schema(format!(
-                        "field id {} ('{}', {}) was computed against a stale schema; recompute \
-                         the column against the current dataset",
-                        field.id,
-                        field.name,
-                        field.data_type(),
-                    )));
+                    return Err(ColumnWriteError::StaleSchema {
+                        field_id: field.id,
+                        name: field.name.clone(),
+                        data_type: field.data_type().to_string(),
+                    }
+                    .into());
                 }
             }
         }
@@ -355,11 +342,11 @@ impl RetryExecutor for CommitColumnWritesJob {
                     .get(&frag_id)
                     .is_some_and(|ids| ids.contains(&field.id));
                 if !covered {
-                    return Err(Error::invalid_input(format!(
-                        "non-nullable column '{}' has no staged data for fragment {} (possibly \
-                         appended concurrently); stage every live fragment and recommit",
-                        field.name, frag_id
-                    )));
+                    return Err(ColumnWriteError::UncoveredNonNullableColumn {
+                        name: field.name.clone(),
+                        fragment_id: frag_id,
+                    }
+                    .into());
                 }
             }
         }
@@ -377,11 +364,11 @@ impl RetryExecutor for CommitColumnWritesJob {
                 if let Some(bindings) = self.plan.prepare_backing.get(&frag_id) {
                     for (field_id, prepare_state) in bindings {
                         if field_backing(&metadata, *field_id) != *prepare_state {
-                            return Err(Error::schema(format!(
-                                "fragment {}'s data for field id {} changed since the column \
-                                 was prepared; recompute against the current dataset",
-                                frag_id, field_id
-                            )));
+                            return Err(ColumnWriteError::StaleFragmentData {
+                                fragment_id: frag_id,
+                                field_id: *field_id,
+                            }
+                            .into());
                         }
                     }
                 }
@@ -398,10 +385,7 @@ impl RetryExecutor for CommitColumnWritesJob {
         if !orphaned.is_empty() {
             let mut ids: Vec<u64> = orphaned.into_iter().collect();
             ids.sort_unstable();
-            return Err(Error::invalid_input(format!(
-                "column replacements reference fragments {ids:?}, which are no longer in the \
-                 dataset; re-run the column write against the current fragments"
-            )));
+            return Err(ColumnWriteError::OrphanedReplacements { fragment_ids: ids }.into());
         }
 
         let operation = Operation::Merge { fragments, schema };
