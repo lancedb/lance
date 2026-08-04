@@ -21,7 +21,7 @@ use crate::{
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
+use lance_index::{IndexParams, IndexType, registry::plugin_name_from_details_url, scalar::CreatedIndex};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{
@@ -288,7 +288,7 @@ impl<'a> CreateIndexBuilder<'a> {
             while indices.iter().any(|idx| {
                 idx.name == candidate
                     && (idx.fields != [field.id]
-                        || !index_matches_type(idx, self.index_type))
+                        || !index_matches_type(idx, self.index_type, self.params))
             }) {
                 candidate = format!("{base_name}_{counter}");
                 counter += 1;
@@ -878,12 +878,27 @@ impl<'a> CreateIndexBuilder<'a> {
 }
 
 /// Returns true if an existing `IndexMetadata` matches the given type
-fn index_matches_type(idx: &IndexMetadata, index_type: IndexType) -> bool {
-    match &idx.index_details {
-        Some(d) => index_type.matches_details(d),
+fn index_matches_type(
+    idx: &IndexMetadata,
+    index_type: IndexType,
+    params: &dyn IndexParams,
+) -> bool {
+    let Some(d) = &idx.index_details else {
         // Fallback for legacy indexes, assume we are not trying to change the type
-        None => true,
+        return true;
+    };
+    // When index_type is Scalar the actual type is carried in ScalarIndexParams as a
+    // plugin name string (e.g. "zonemap").  The registry uses the same normalization
+    // for type_url lookup: lowercase the last path segment and strip "indexdetails".
+    // Compare directly instead of going through IndexType so this path stays valid
+    // as we move away from the IndexType enum.
+    if index_type == IndexType::Scalar {
+        if let Some(scalar_params) = params.as_any().downcast_ref::<ScalarIndexParams>() {
+            return scalar_params.index_type.to_lowercase()
+                == plugin_name_from_details_url(&d.type_url);
+        }
     }
+    index_type.matches_details(d)
 }
 
 fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> bool {
