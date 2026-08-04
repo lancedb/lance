@@ -95,12 +95,13 @@ class Target:
 def _open_target(name: str) -> Iterable[Target]:
     uri = get_dataset_uri(name)
     dataset = lance.dataset(uri)
-    base_version = dataset.tags.get_version(BASE_TAG)
-    if base_version is None:
+    tags = dataset.tags.list()
+    if BASE_TAG not in tags:
         pytest.skip(
             f"Dataset {name} has no {BASE_TAG} tag; "
             "run python/ci_benchmarks/datagen/gen_all.py"
         )
+    base_version = tags[BASE_TAG]["version"]
 
     yield Target(uri=uri, dataset=dataset, base_version=base_version)
 

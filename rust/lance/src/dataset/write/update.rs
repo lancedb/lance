@@ -1284,6 +1284,85 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, "i < 100", 100)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, "i = 0", 1)]
+    #[tokio::test]
+    async fn test_addr_domain_index_does_not_cover_rewritten_update_fragment(
+        #[case] index_type: BuiltinIndexType,
+        #[case] query: &str,
+        #[case] expected_rows: usize,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col("category", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".to_string()),
+                &ScalarIndexParams::for_builtin(index_type),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let before = dataset
+            .scan()
+            .filter(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(before.num_rows(), expected_rows);
+
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i < 20")
+            .unwrap()
+            .set("category", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|index| index.name == "i_idx").unwrap();
+        assert_eq!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0],
+            "the address-domain index must not cover the rewritten fragment"
+        );
+
+        let after = dataset
+            .scan()
+            .filter(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(after.num_rows(), expected_rows);
+    }
+
     /// Regression test for https://github.com/lance-format/lance/issues/8076
     ///
     /// A bloom filter index reports matches as physical row addresses. An update that
