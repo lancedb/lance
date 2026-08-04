@@ -27,6 +27,40 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 
+/// Host suffixes only a hierarchical account is addressed by: the ADLS Gen2 endpoint, and
+/// Fabric's, whose OneLake is built on ADLS Gen2 whichever of its endpoints it is reached
+/// through.
+const HIERARCHICAL_HOST_SUFFIXES: &[&str] = &["dfs.core.windows.net", "fabric.microsoft.com"];
+
+/// Storage options that ask for Fabric's endpoint, which `object_store` also sets itself from
+/// a Fabric URL.
+const FABRIC_ENDPOINT_OPTIONS: &[&str] = &["azure_use_fabric_endpoint", "use_fabric_endpoint"];
+
+/// Whether the account being addressed has a hierarchical namespace: ADLS Gen2, or the OneLake
+/// built on it.
+///
+/// Such an account orders each directory level by child name rather than by whole key, so a
+/// sibling whose name extends another's comes back the other way round from a flat namespace:
+/// `foo` before `foo-bar`, where a flat namespace compares the keys `foo/` and `foo-bar/` and
+/// puts `foo-bar` first, `-` sorting before `/`. Paginated listing resumes from a key, which
+/// only reaches the rest of a directory on a store that sorts by key, so a hierarchical account
+/// gets no paginated lister and is listed in full instead.
+///
+/// This reads the spelling rather than the endpoint. The blob endpoint serves a hierarchical
+/// account too, so a `blob.core.windows.net` host proves nothing either way; `abfss` and
+/// Fabric, on the other hand, are only used to reach one.
+fn has_hierarchical_namespace(base_path: &Url, storage_options: &StorageOptions) -> bool {
+    base_path.scheme() == "abfss"
+        || base_path.host_str().is_some_and(|host| {
+            HIERARCHICAL_HOST_SUFFIXES
+                .iter()
+                .any(|suffix| host.ends_with(suffix))
+        })
+        || FABRIC_ENDPOINT_OPTIONS
+            .iter()
+            .any(|key| storage_options.0.get(*key).is_some_and(|set| set == "true"))
+}
+
 #[derive(Default, Debug)]
 pub struct AzureBlobStoreProvider;
 
@@ -266,6 +300,12 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             let paginated_lister = Some(NativeDirLister::for_store(store.clone()));
             (store as Arc<dyn OSObjectStore>, paginated_lister)
         };
+        // A hierarchical account cannot be paged, so it keeps the full listing it has today.
+        // `list_is_lexically_ordered` is not the switch for this: it also decides how manifests
+        // are resolved, and a manifest name holds no delimiter for the two orders to differ over.
+        let paginated_lister =
+            paginated_lister.filter(|_| !has_hierarchical_namespace(&base_path, &storage_options));
+
         let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
         let (inner, paginated_lister) = with_throttling(throttle_config, inner, paginated_lister)?;
 
@@ -537,6 +577,32 @@ mod tests {
         assert_eq!(prefix, "abfss$myfs@myaccount");
     }
 
+    /// Paging resumes from a key, so it is only correct on an account that lists a directory
+    /// in key order. A hierarchical account does not, and the ones that can be recognised are
+    /// recognised from how they are addressed rather than from the endpoint that serves them.
+    #[rstest::rstest]
+    #[case::blob("az://container@account.blob.core.windows.net/data", &[], true)]
+    #[case::container_only("az://container/data", &[], true)]
+    #[case::adls_gen2("abfss://fs@account.dfs.core.windows.net/data", &[], false)]
+    #[case::adls_gen2_over_az("az://container@account.dfs.core.windows.net/data", &[], false)]
+    #[case::onelake("abfss://workspace@onelake.dfs.fabric.microsoft.com/data", &[], false)]
+    #[case::fabric_option("az://container/data", &[("use_fabric_endpoint", "true")], false)]
+    #[case::fabric_option_off("az://container/data", &[("use_fabric_endpoint", "false")], true)]
+    fn test_only_a_flat_namespace_is_paged(
+        #[case] url: &str,
+        #[case] options: &[(&str, &str)],
+        #[case] expected: bool,
+    ) {
+        let url = Url::parse(url).unwrap();
+        let options = StorageOptions(
+            options
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        );
+        assert_eq!(!has_hierarchical_namespace(&url, &options), expected);
+    }
+
     #[tokio::test]
     async fn test_abfss_default_uses_microsoft_builder() {
         use crate::object_store::StorageOptionsAccessor;
@@ -562,6 +628,29 @@ mod tests {
             "abfss:// without use_opendal should use MicrosoftAzureBuilder, got: {}",
             inner_desc
         );
+        assert!(
+            store.paginated_lister.is_none(),
+            "an ADLS Gen2 account is listed in full"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_blob_container_is_paged() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("az://container@testaccount.blob.core.windows.net/data").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), "testaccount".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(url, &params).await.unwrap();
+        assert!(store.paginated_lister.is_some());
     }
 
     #[tokio::test]

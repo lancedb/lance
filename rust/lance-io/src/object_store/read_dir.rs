@@ -607,7 +607,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::native::NativeDirLister;
-    use super::store_model::{BudgetMode, OffsetMode, Resume, StoreModel};
+    use super::store_model::{BudgetMode, KeyOrder, OffsetMode, Resume, StoreModel};
     use super::*;
     use crate::object_store::throttle::{AimdThrottleConfig, AimdThrottledStore};
     use crate::object_store::{ObjectStoreParams, ObjectStoreRegistry};
@@ -627,8 +627,11 @@ mod tests {
         ExclusiveOffset,
         /// A paginated API whose offset is inclusive, like Azure's `startFrom`.
         InclusiveOffset,
+        /// A paginated API over a store that orders each directory level by child name rather
+        /// than by whole key, which Azure documents for accounts with a hierarchical namespace.
+        NameOrdered,
     }
-    use Backend::{ExclusiveOffset, FullListing, InclusiveOffset};
+    use Backend::{ExclusiveOffset, FullListing, InclusiveOffset, NameOrdered};
 
     /// One list request, as the backend saw it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -748,9 +751,14 @@ mod tests {
                 InclusiveOffset => OffsetMode::Inclusive,
                 _ => OffsetMode::Exclusive,
             };
+            let order = match backend {
+                NameOrdered => KeyOrder::DelimiterLowest,
+                _ => KeyOrder::ByKey,
+            };
             store.paginated_lister = Some(Arc::new(FakeDirLister {
                 model: StoreModel::new(keys.to_vec())
                     .with_offset(offset)
+                    .with_order(order)
                     .with_budget(BudgetMode::PerScannedKey),
                 requests: requests.clone(),
             }));
@@ -881,6 +889,91 @@ mod tests {
         assert_eq!(
             seen,
             vec!["foo-bar.lance", "foo.lance", "foo2.lance", "zzz.txt"]
+        );
+    }
+
+    /// The two orders a store can list a level in only disagree over siblings where one name
+    /// is a prefix of another: `foo/` and `foo-bar/` differ at `/` against `-`, so a store
+    /// ordering by whole key puts `foo-bar` first and one ordering by child name puts `foo`
+    /// first. A cursor is a key, and the listing has to stay complete whichever order the key
+    /// it names sits in.
+    #[rstest]
+    #[tokio::test]
+    async fn test_paging_a_prefix_shaped_sibling_is_complete(
+        #[values(FullListing, ExclusiveOffset, InclusiveOffset)] backend: Backend,
+        #[values(1, 2, 3)] page_size: usize,
+    ) {
+        let keys = ["db/foo/inside", "db/foo-bar/inside", "db/zzz.txt"];
+        let store = test_store(backend, &keys).await;
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let options = ReadDirOptions {
+                resume_from: cursor.take(),
+                page_size: Some(page_size),
+            };
+            let page: Vec<DirEntry> = store
+                .store
+                .read_dir_stream(Path::from("db"), options)
+                .take(page_size)
+                .try_collect()
+                .await
+                .unwrap();
+            let Some(last) = page.last() else {
+                break;
+            };
+            cursor = Some(last.cursor());
+            seen.extend(page.into_iter().map(|entry| entry.name));
+        }
+
+        // The order the children come back in is the store's, so only what came back is
+        // asserted here: every child, and none of them twice.
+        let mut listed = seen.clone();
+        listed.sort();
+        assert_eq!(listed, vec!["foo", "foo-bar", "zzz.txt"], "from {seen:?}");
+    }
+
+    /// Why a store that orders a directory level by child name is not paged, and why the
+    /// providers that can recognise one install no paginated lister for it.
+    ///
+    /// A cursor is a key. On such a store a key that sorts before the cursor can still be a
+    /// child the listing has not reached: it lists `foo` before `foo-bar`, while by key
+    /// `foo-bar/` comes first, `-` sorting before `/`. Resuming after `foo` then reads
+    /// `foo-bar/` as a child already handed over, and the fallback for a backend that appears
+    /// to have ignored the resume position filters by the same key, so it drops it twice.
+    ///
+    /// Paging such a store would need the order it actually used, which no list API reports.
+    #[tokio::test]
+    async fn test_paging_a_name_ordered_store_loses_a_child() {
+        let keys = ["db/foo/inside", "db/foo-bar/inside", "db/zzz.txt"];
+        let store = test_store(NameOrdered, &keys).await;
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let options = ReadDirOptions {
+                resume_from: cursor.take(),
+                page_size: Some(1),
+            };
+            let page: Vec<DirEntry> = store
+                .store
+                .read_dir_stream(Path::from("db"), options)
+                .take(1)
+                .try_collect()
+                .await
+                .unwrap();
+            let Some(last) = page.last() else {
+                break;
+            };
+            cursor = Some(last.cursor());
+            seen.extend(page.into_iter().map(|entry| entry.name));
+        }
+
+        assert_eq!(
+            seen,
+            vec!["foo", "zzz.txt"],
+            "foo-bar is lost, which is what the providers keep such a store away from"
         );
     }
 

@@ -28,6 +28,40 @@ pub enum OffsetMode {
     Ignored,
 }
 
+/// The order a store lists its keys in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOrder {
+    /// Byte order over whole keys, which is what a flat namespace gives: a key is a name and
+    /// names sort against each other whole.
+    ByKey,
+    /// Byte order with the delimiter below every other character. A store that holds a real
+    /// directory tree orders each level by child name, so a directory comes before a sibling
+    /// whose name extends it — `foo/` before `foo-bar/`, where byte order has them the other
+    /// way round. Azure documents this for accounts with a hierarchical namespace.
+    DelimiterLowest,
+}
+
+impl KeyOrder {
+    fn cmp(&self, left: &str, right: &str) -> std::cmp::Ordering {
+        match self {
+            Self::ByKey => left.cmp(right),
+            Self::DelimiterLowest => left
+                .bytes()
+                .map(Self::rank)
+                .cmp(right.bytes().map(Self::rank)),
+        }
+    }
+
+    /// The delimiter moved below every byte that sorts under it, and nothing else disturbed.
+    fn rank(byte: u8) -> u8 {
+        match byte {
+            b'/' => 0,
+            byte if byte < b'/' => byte + 1,
+            byte => byte,
+        }
+    }
+}
+
 /// What a page limit is spent on, which the S3 API does not pin down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetMode {
@@ -45,24 +79,37 @@ pub struct StoreModel {
     keys: Vec<String>,
     offset: OffsetMode,
     budget: BudgetMode,
+    order: KeyOrder,
     page_bound: usize,
 }
 
 impl StoreModel {
     pub fn new<K: Into<String>>(keys: impl IntoIterator<Item = K>) -> Self {
-        let mut keys: Vec<String> = keys.into_iter().map(Into::into).collect();
-        keys.sort();
+        let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
         Self {
             keys,
             offset: OffsetMode::Exclusive,
             budget: BudgetMode::PerEntry,
+            order: KeyOrder::ByKey,
             page_bound: DEFAULT_PAGE_BOUND,
         }
+        .sorted()
+    }
+
+    fn sorted(mut self) -> Self {
+        let order = self.order;
+        self.keys.sort_by(|left, right| order.cmp(left, right));
+        self
     }
 
     pub fn with_offset(mut self, offset: OffsetMode) -> Self {
         self.offset = offset;
         self
+    }
+
+    pub fn with_order(mut self, order: KeyOrder) -> Self {
+        self.order = order;
+        self.sorted()
     }
 
     pub fn with_budget(mut self, budget: BudgetMode) -> Self {
@@ -101,7 +148,7 @@ impl StoreModel {
                 idx += 1;
                 continue;
             };
-            if resume.consumes(key, self.offset) {
+            if resume.consumes(key, self.offset, self.order) {
                 idx += 1;
                 continue;
             }
@@ -149,13 +196,14 @@ pub enum Resume<'a> {
 }
 
 impl Resume<'_> {
-    fn consumes(&self, key: &str, offset: OffsetMode) -> bool {
+    fn consumes(&self, key: &str, offset: OffsetMode, order: KeyOrder) -> bool {
+        use std::cmp::Ordering::{Equal, Less};
         match self {
             Self::Start => false,
-            Self::Token(token) => key <= *token,
+            Self::Token(token) => order.cmp(key, token) != std::cmp::Ordering::Greater,
             Self::Offset(offset_key) => match offset {
-                OffsetMode::Exclusive => key <= *offset_key,
-                OffsetMode::Inclusive => key < *offset_key,
+                OffsetMode::Exclusive => matches!(order.cmp(key, offset_key), Less | Equal),
+                OffsetMode::Inclusive => order.cmp(key, offset_key) == Less,
                 OffsetMode::Ignored => false,
             },
         }
