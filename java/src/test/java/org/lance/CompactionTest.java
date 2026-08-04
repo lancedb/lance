@@ -31,8 +31,10 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** Add test for distributed compaction. */
 public class CompactionTest {
@@ -49,8 +51,20 @@ public class CompactionTest {
       testDataset.write(1, 10).close();
       try (Dataset dataset = testDataset.write(2, 10)) {
         CompactionOptions compactionOptions =
-            CompactionOptions.builder().withTargetRowsPerFragment(100).withNumThreads(1).build();
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withNumThreads(1)
+                .withMaxSourceRows(1000)
+                .withMaxSourceBytes(10L * 1024 * 1024)
+                .build();
         CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
+
+        // The source budgets are loose, so the plan is unaffected and the
+        // options must survive the JNI round trip.
+        assertEquals(Optional.of(1000L), compactionPlan.getCompactionOptions().getMaxSourceRows());
+        assertEquals(
+            Optional.of(10L * 1024 * 1024),
+            compactionPlan.getCompactionOptions().getMaxSourceBytes());
 
         // will plan to compact two fragments into one.
         assertEquals(1, compactionPlan.getCompactionTasks().size());

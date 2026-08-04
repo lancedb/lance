@@ -3146,6 +3146,22 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let max_source_rows = env
+        .call_method(
+            &java_options,
+            "getMaxSourceRows",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_source_bytes = env
+        .call_method(
+            &java_options,
+            "getMaxSourceBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3160,6 +3176,8 @@ fn convert_java_compaction_options_to_rust(
         &compaction_mode,
         &binary_copy_read_batch_bytes,
         &max_source_fragments,
+        &max_source_rows,
+        &max_source_bytes,
         config,
     )
 }

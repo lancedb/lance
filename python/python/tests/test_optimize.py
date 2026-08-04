@@ -27,6 +27,9 @@ def test_dataset_optimize(tmp_path: Path):
         target_rows_per_fragment=1000,
         materialize_deletions=False,
         num_threads=1,
+        # Loose source budgets: all fragments still compact in one run.
+        max_source_rows=100_000,
+        max_source_bytes=1024 * 1024 * 1024,
     )
 
     assert metrics.fragments_removed == 10
@@ -35,6 +38,37 @@ def test_dataset_optimize(tmp_path: Path):
     assert metrics.files_added == 1
 
     assert dataset.version == 3
+
+
+def test_compact_files_source_budgets(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(1000), "b": range(1000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
+    assert len(dataset.get_fragments()) == 10
+
+    # A row budget of 250 admits the first two 100-row fragments only, so the
+    # run is incremental instead of compacting all 10 at once.
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=200,
+        num_threads=1,
+        max_source_rows=250,
+    )
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 1
+
+    # The budgets are hard upper bounds: a budget smaller than a single task
+    # produces an empty plan and compaction is a no-op.
+    version_before = dataset.version
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=200,
+        num_threads=1,
+        max_source_bytes=1,
+    )
+    assert metrics.fragments_removed == 0
+    assert dataset.version == version_before
+
+    with pytest.raises(OSError, match="must be greater than 0"):
+        dataset.optimize.compact_files(max_source_rows=0)
 
 
 def test_compact_files_max_source_fragments(tmp_path: Path):
