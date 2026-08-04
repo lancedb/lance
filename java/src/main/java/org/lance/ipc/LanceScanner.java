@@ -14,6 +14,7 @@
 package org.lance.ipc;
 
 import org.lance.Dataset;
+import org.lance.LanceException;
 import org.lance.LockManager;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -140,8 +141,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
         openStream(s.memoryAddress());
         return Data.importArrayStream(allocator, s);
       } catch (IOException e) {
-        // TODO: handle IO exception?
-        throw new RuntimeException(e);
+        throw new LanceException("Failed to open scan stream", e);
       }
     }
   }
