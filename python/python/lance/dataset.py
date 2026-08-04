@@ -5632,8 +5632,12 @@ class SqlQueryBuilder:
         (``IDs`` registers the table ``ids``) while a quoted one keeps its case
         (``"IDs"``). If two names resolve to the same table, the later
         registration wins. A name that resolves to the query's own
-        :meth:`table_name` would hide the dataset and is rejected by
-        :meth:`build`.
+        :meth:`table_name` would hide the dataset and is rejected.
+
+        Registered names are validated when the query is executed, not when
+        :meth:`build` returns, so a rejected name raises from
+        :meth:`SqlQuery.to_batch_records` (as ``ValueError``) or
+        :meth:`SqlQuery.to_stream_reader` (as ``OSError``).
 
         Parameters
         ----------

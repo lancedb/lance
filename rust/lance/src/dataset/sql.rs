@@ -749,14 +749,18 @@ mod tests {
         );
     }
 
-    /// DataFusion parses a registered name as a SQL identifier, so two spellings of the same
-    /// unquoted identifier are one table and the later registration wins.
+    /// DataFusion parses a registered name as a SQL identifier and resolves it to a
+    /// catalog.schema.table slot, so two spellings of the same table are one registration and the
+    /// later one wins.
     #[rstest]
     #[case::later_lowercase("IDs", "ids")]
     #[case::later_mixed_case("ids", "IDs")]
     #[case::later_quoted("ids", "\"ids\"")]
+    #[case::later_schema_qualified("ids", "public.ids")]
+    #[case::earlier_fully_qualified("datafusion.public.ids", "ids")]
+    #[case::both_qualified("public.IDs", "datafusion.public.ids")]
     #[tokio::test]
-    async fn test_sql_register_duplicate_name_ignores_case(
+    async fn test_sql_register_duplicate_name_resolution(
         #[case] first: &str,
         #[case] second: &str,
     ) {

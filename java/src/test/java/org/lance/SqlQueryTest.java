@@ -225,12 +225,18 @@ public class SqlQueryTest {
     }
 
     // A relation whose name resolves to the query's own table name would hide the dataset, so the
-    // native build rejects it (the Rust InvalidInput surfaces as IllegalArgumentException).
+    // native build rejects it (the Rust InvalidInput surfaces as IllegalArgumentException). Assert
+    // on the message too: DataFusion's own "table already exists" error maps to the same exception.
     try (VectorSchemaRoot ids = idTable(1, 2);
         ArrowArrayStream stream = toStream(ids)) {
       SqlQuery q =
           dataset.sql("select id from " + NAME).tableName(NAME).registerArrow(NAME, stream);
-      Assertions.assertThrows(IllegalArgumentException.class, q::intoBatchRecords);
+      IllegalArgumentException error =
+          Assertions.assertThrows(IllegalArgumentException.class, q::intoBatchRecords);
+      Assertions.assertTrue(
+          error.getMessage().contains("resolves to")
+              && error.getMessage().contains("the query's table name '" + NAME + "'"),
+          "unexpected message: " + error.getMessage());
     }
   }
 

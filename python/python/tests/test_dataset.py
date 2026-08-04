@@ -5671,6 +5671,28 @@ def test_dataset_sql_register_arrow(tmp_path: Path, as_reader: bool):
     assert pa.Table.from_batches(result) == expected
 
 
+@pytest.mark.parametrize("name", ["t", "T", '"t"'], ids=["exact", "case", "quoted"])
+def test_dataset_sql_register_arrow_table_name_collision(tmp_path: Path, name: str):
+    table = pa.table({"id": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # A registered name that resolves to the query's own table name would hide the
+    # dataset. The check lives in the Rust builder, which runs when the query is
+    # executed rather than when build() returns, so build() itself succeeds.
+    builder = (
+        ds.sql("SELECT id FROM t")
+        .table_name("t")
+        .register_arrow(name, pa.table({"id": [4]}))
+    )
+    query = builder.build()
+
+    # to_batch_records surfaces Lance errors as ValueError, to_stream_reader as OSError.
+    with pytest.raises(ValueError, match="resolves to"):
+        query.to_batch_records()
+    with pytest.raises(OSError, match="resolves to"):
+        builder.build().to_stream_reader()
+
+
 def test_dataset_sql_register_arrow_empty(tmp_path: Path):
     table = pa.table({"id": [1, 2, 3]})
     ds = lance.write_dataset(table, tmp_path / "test")
