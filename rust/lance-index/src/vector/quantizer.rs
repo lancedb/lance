@@ -81,7 +81,9 @@ impl FromStr for QuantizationType {
             "FLATBIN" => Ok(Self::FlatBin),
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
-            "RABIT" => Ok(Self::Rabit),
+            // `Display` writes "RQ"; "RABIT" is accepted for headers written
+            // before this variant round-tripped.
+            "RQ" | "RABIT" => Ok(Self::Rabit),
             _ => Err(Error::index(format!("Unknown quantization type: {}", s))),
         }
     }
@@ -383,5 +385,36 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             None,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    /// `IvfIndexState` persists the quantization type with `Display` and reads
+    /// it back with `FromStr`, so the two must agree for every variant.
+    #[rstest]
+    #[case::flat(QuantizationType::Flat)]
+    #[case::flat_bin(QuantizationType::FlatBin)]
+    #[case::product(QuantizationType::Product)]
+    #[case::scalar(QuantizationType::Scalar)]
+    #[case::rabit(QuantizationType::Rabit)]
+    fn test_display_from_str_round_trip(#[case] quantization_type: QuantizationType) {
+        let encoded = quantization_type.to_string();
+        assert_eq!(
+            encoded.parse::<QuantizationType>().unwrap(),
+            quantization_type,
+            "{encoded} did not round-trip"
+        );
+    }
+
+    #[test]
+    fn test_from_str_accepts_legacy_rabit_spelling() {
+        assert_eq!(
+            "RABIT".parse::<QuantizationType>().unwrap(),
+            QuantizationType::Rabit
+        );
     }
 }
