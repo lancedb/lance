@@ -7527,19 +7527,8 @@ mod shard_writer_tests {
         writer.close().await.unwrap();
     }
 
-    #[rstest::rstest]
-    #[case::v1(
-        lance_tokenizer::Language::English,
-        Some(InvertedListFormatVersion::V1),
-        1
-    )]
-    #[case::snowball3_greek(lance_tokenizer::Language::Greek, None, 4)]
     #[tokio::test]
-    async fn test_mem_wal_maintained_fts_flush_preserves_version(
-        #[case] language: lance_tokenizer::Language,
-        #[case] format_version: Option<InvertedListFormatVersion>,
-        #[case] expected_index_version: i32,
-    ) {
+    async fn test_mem_wal_maintained_fts_v1_flush_preserves_format() {
         use tempfile::TempDir;
 
         let vector_dim = 32;
@@ -7553,10 +7542,8 @@ mod shard_writer_tests {
             .await
             .expect("Failed to create dataset");
 
-        let mut fts_params = InvertedIndexParams::new("simple".to_string(), language);
-        if let Some(format_version) = format_version {
-            fts_params = fts_params.format_version(format_version);
-        }
+        let fts_params =
+            InvertedIndexParams::default().format_version(InvertedListFormatVersion::V1);
         dataset
             .create_index(
                 &["text"],
@@ -7566,10 +7553,10 @@ mod shard_writer_tests {
                 false,
             )
             .await
-            .expect("Failed to create FTS index");
+            .expect("Failed to create v1 FTS index");
         let base_indices = dataset.load_indices().await.unwrap();
         assert_eq!(base_indices.len(), 1);
-        assert_eq!(base_indices[0].index_version, expected_index_version);
+        assert_eq!(base_indices[0].index_version, 1);
 
         dataset
             .initialize_mem_wal()
@@ -7611,8 +7598,8 @@ mod shard_writer_tests {
         assert_eq!(sstable_indices.len(), 1);
         assert_eq!(sstable_indices[0].name, "text_fts");
         assert_eq!(
-            sstable_indices[0].index_version, expected_index_version,
-            "maintained FTS index capability version changed during flush"
+            sstable_indices[0].index_version, 1,
+            "maintained v1 FTS index must flush as v1"
         );
 
         let results = sstable

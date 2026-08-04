@@ -98,11 +98,9 @@ use std::str::FromStr;
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
 // Version 3: Version 2 layout with configurable posting blocks and analyzer metadata.
-// Version 4: Version 3 capabilities plus Snowball 3 Greek vocabulary semantics.
 pub const INVERTED_INDEX_VERSION_V1: u32 = 1;
 pub const INVERTED_INDEX_VERSION_V2: u32 = 2;
 pub const INVERTED_INDEX_VERSION_V3: u32 = 3;
-pub const INVERTED_INDEX_VERSION_V4: u32 = 4;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -168,20 +166,6 @@ pub fn resolve_fts_format_version(
     match value {
         Some(value) => value.parse(),
         None => Ok(default_fts_format_version()),
-    }
-}
-
-/// Return the manifest capability version required by an inverted-index
-/// analyzer and its physical posting-list format.
-#[doc(hidden)]
-pub fn index_version_for_params(
-    params: &InvertedIndexParams,
-    format_version: InvertedListFormatVersion,
-) -> u32 {
-    if params.uses_snowball3_greek() {
-        INVERTED_INDEX_VERSION_V4
-    } else {
-        format_version.index_version()
     }
 }
 
@@ -750,9 +734,6 @@ impl InvertedIndex {
     }
 
     fn index_version(&self) -> u32 {
-        if self.params.uses_snowball3_greek() {
-            return INVERTED_INDEX_VERSION_V4;
-        }
         match (self.token_set_format, self.format_version()) {
             (
                 TokenSetFormat::Arrow,
@@ -1756,8 +1737,7 @@ impl InvertedIndex {
                     .metadata
                     .get("params")
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
-                Ok(serde_json::from_str::<InvertedIndexParams>(params)?
-                    .normalize_loaded_greek_stemmer())
+                Ok(serde_json::from_str::<InvertedIndexParams>(params)?)
             }
             Err(metadata_error) => {
                 // Legacy format: params live in the tokens file (see
@@ -1773,8 +1753,7 @@ impl InvertedIndex {
                     .get("tokenizer")
                     .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
                     .transpose()?
-                    .unwrap_or_default()
-                    .normalize_loaded_greek_stemmer())
+                    .unwrap_or_default())
             }
         }
     }
@@ -1798,8 +1777,7 @@ impl InvertedIndex {
                     .metadata
                     .get("params")
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
-                let params = serde_json::from_str::<InvertedIndexParams>(params)?
-                    .normalize_loaded_greek_stemmer();
+                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
                 let partitions = reader
                     .schema()
                     .metadata
@@ -8356,7 +8334,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::scalar::inverted::tokenizer::GreekStemmerVersion;
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
 
@@ -8573,76 +8550,6 @@ mod tests {
         writer.finish_with_metadata(metadata).await?;
 
         InvertedIndex::load(store, None, &LanceCache::no_cache()).await
-    }
-
-    #[tokio::test]
-    async fn test_legacy_greek_stemmer_load_query_and_update() -> Result<()> {
-        let src_dir = TempObjDir::default();
-        let dest_dir = TempObjDir::default();
-        let src_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            src_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        let dest_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            dest_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let current_params = InvertedIndexParams::new("raw".to_string(), Language::Greek)
-            .max_token_length(None)
-            .remove_stop_words(false)
-            .ascii_folding(false);
-        let mut legacy_json = serde_json::to_value(current_params)?;
-        legacy_json
-            .as_object_mut()
-            .expect("inverted index params should serialize to an object")
-            .remove("greek_stemmer");
-        let legacy_params: InvertedIndexParams = serde_json::from_value(legacy_json)?;
-        assert_eq!(legacy_params.greek_stemmer, None);
-
-        // rust-stemmers 1.2.0 produced an empty term for this word. The
-        // manually written term and missing version field model a persisted
-        // index created before Greek stemmer versioning.
-        let index =
-            write_single_partition_index(src_store, legacy_params, TokenSetFormat::Fst, "", 100)
-                .await?;
-        assert_eq!(
-            index.params.greek_stemmer,
-            Some(GreekStemmerVersion::Legacy)
-        );
-
-        let matches = index.do_search("ίσα").await?;
-        let row_ids = matches[ROW_ID].as_primitive::<UInt64Type>();
-        assert_eq!(row_ids.values(), &[100]);
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("doc", DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-        let docs = Arc::new(StringArray::from(vec![Some("ίσα")]));
-        let row_ids = Arc::new(UInt64Array::from(vec![101_u64]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![docs, row_ids])?;
-        let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
-        index
-            .update(Box::pin(stream), dest_store.as_ref(), None)
-            .await?;
-
-        let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(
-            updated.params.greek_stemmer,
-            Some(GreekStemmerVersion::Legacy)
-        );
-        let matches = updated.do_search("ίσα").await?;
-        let mut row_ids = matches[ROW_ID]
-            .as_primitive::<UInt64Type>()
-            .values()
-            .to_vec();
-        row_ids.sort_unstable();
-        assert_eq!(row_ids, vec![100, 101]);
-
-        Ok(())
     }
 
     fn empty_doc_stream() -> SendableRecordBatchStream {

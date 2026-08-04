@@ -5154,7 +5154,6 @@ dependencies = [
  "icu_segmenter",
  "jieba-rs",
  "lindera",
- "rust-stemmers",
  "serde",
  "stop-words",
  "unicode-normalization",
@@ -7838,16 +7837,6 @@ checksum = "796e8d2b6696392a43bea58116b667fb4c29727dc5abd27d6acf338bb4f688c7"
 dependencies = [
  "cfg-if 1.0.4",
  "ordered-multimap",
-]
-
-[[package]]
-name = "rust-stemmers"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
-dependencies = [
- "serde",
- "serde_derive",
 ]
 
 [[package]]

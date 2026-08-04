@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::mem;
 
+use frostem::Algorithm;
 use serde::{Deserialize, Serialize};
 
 use crate::{Token, TokenFilter, TokenStream, Tokenizer};
@@ -34,91 +35,39 @@ pub enum Language {
 }
 
 impl Language {
-    fn algorithm(self) -> StemmerAlgorithm {
+    fn algorithm(self) -> Algorithm {
         match self {
-            Self::Greek => StemmerAlgorithm::Greek,
-            language => StemmerAlgorithm::Legacy(language.legacy_algorithm()),
-        }
-    }
-
-    fn legacy_algorithm(self) -> rust_stemmers::Algorithm {
-        match self {
-            Self::Arabic => rust_stemmers::Algorithm::Arabic,
-            Self::Danish => rust_stemmers::Algorithm::Danish,
-            Self::Dutch => rust_stemmers::Algorithm::Dutch,
-            Self::English => rust_stemmers::Algorithm::English,
-            Self::Finnish => rust_stemmers::Algorithm::Finnish,
-            Self::French => rust_stemmers::Algorithm::French,
-            Self::German => rust_stemmers::Algorithm::German,
-            Self::Greek => rust_stemmers::Algorithm::Greek,
-            Self::Hungarian => rust_stemmers::Algorithm::Hungarian,
-            Self::Italian => rust_stemmers::Algorithm::Italian,
-            Self::Norwegian => rust_stemmers::Algorithm::Norwegian,
-            Self::Portuguese => rust_stemmers::Algorithm::Portuguese,
-            Self::Romanian => rust_stemmers::Algorithm::Romanian,
-            Self::Russian => rust_stemmers::Algorithm::Russian,
-            Self::Spanish => rust_stemmers::Algorithm::Spanish,
-            Self::Swedish => rust_stemmers::Algorithm::Swedish,
-            Self::Tamil => rust_stemmers::Algorithm::Tamil,
-            Self::Turkish => rust_stemmers::Algorithm::Turkish,
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-enum StemmerAlgorithm {
-    Legacy(rust_stemmers::Algorithm),
-    // The legacy generated Greek algorithm can retain stale UTF-8 byte offsets
-    // after shortening a word and panic when it slices the resulting stem.
-    Greek,
-}
-
-impl StemmerAlgorithm {
-    fn create(self) -> StemmerBackend {
-        match self {
-            Self::Legacy(algorithm) => {
-                StemmerBackend::Legacy(rust_stemmers::Stemmer::create(algorithm))
-            }
-            Self::Greek => StemmerBackend::Greek(frostem::Stemmer::new(frostem::Algorithm::Greek)),
-        }
-    }
-}
-
-enum StemmerBackend {
-    Legacy(rust_stemmers::Stemmer),
-    Greek(frostem::Stemmer),
-}
-
-impl StemmerBackend {
-    fn stem<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        match self {
-            Self::Legacy(stemmer) => stemmer.stem(input),
-            Self::Greek(stemmer) => stemmer.stem(input),
+            Self::Arabic => Algorithm::Arabic,
+            Self::Danish => Algorithm::Danish,
+            Self::Dutch => Algorithm::Dutch,
+            Self::English => Algorithm::English,
+            Self::Finnish => Algorithm::Finnish,
+            Self::French => Algorithm::French,
+            Self::German => Algorithm::German,
+            Self::Greek => Algorithm::Greek,
+            Self::Hungarian => Algorithm::Hungarian,
+            Self::Italian => Algorithm::Italian,
+            Self::Norwegian => Algorithm::Norwegian,
+            Self::Portuguese => Algorithm::Portuguese,
+            Self::Romanian => Algorithm::Romanian,
+            Self::Russian => Algorithm::Russian,
+            Self::Spanish => Algorithm::Spanish,
+            Self::Swedish => Algorithm::Swedish,
+            Self::Tamil => Algorithm::Tamil,
+            Self::Turkish => Algorithm::Turkish,
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Stemmer {
-    stemmer_algorithm: StemmerAlgorithm,
+    stemmer_algorithm: Algorithm,
 }
 
 impl Stemmer {
     pub fn new(language: Language) -> Self {
         Self {
             stemmer_algorithm: language.algorithm(),
-        }
-    }
-
-    /// Create a stemmer with the semantics used by indexes written before the
-    /// corrected Greek stemmer was introduced.
-    ///
-    /// This is only intended for reading and incrementally updating persisted
-    /// index metadata that does not identify its Greek stemmer version.
-    #[doc(hidden)]
-    pub fn new_legacy(language: Language) -> Self {
-        Self {
-            stemmer_algorithm: StemmerAlgorithm::Legacy(language.legacy_algorithm()),
         }
     }
 }
@@ -142,7 +91,7 @@ impl TokenFilter for Stemmer {
 
 #[derive(Clone)]
 pub struct StemmerFilter<T> {
-    stemmer_algorithm: StemmerAlgorithm,
+    stemmer_algorithm: Algorithm,
     inner: T,
 }
 
@@ -152,7 +101,7 @@ impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
         StemmerTokenStream {
             tail: self.inner.token_stream(text),
-            stemmer: self.stemmer_algorithm.create(),
+            stemmer: frostem::Stemmer::new(self.stemmer_algorithm),
             buffer: String::new(),
         }
     }
@@ -160,7 +109,7 @@ impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
 
 pub struct StemmerTokenStream<T> {
     tail: T,
-    stemmer: StemmerBackend,
+    stemmer: frostem::Stemmer,
     buffer: String,
 }
 
@@ -204,23 +153,5 @@ mod tests {
 
         assert!(stream.advance());
         assert_eq!(stream.token().text, "ανετ");
-    }
-
-    #[test]
-    fn test_legacy_greek_stemmer_preserves_existing_terms() {
-        let mut legacy = TextAnalyzer::builder(RawTokenizer::default())
-            .filter(Stemmer::new_legacy(Language::Greek))
-            .build();
-        let mut current = TextAnalyzer::builder(RawTokenizer::default())
-            .filter(Stemmer::new(Language::Greek))
-            .build();
-
-        let mut legacy_stream = legacy.token_stream("ίσα");
-        assert!(legacy_stream.advance());
-        assert_eq!(legacy_stream.token().text, "");
-
-        let mut current_stream = current.token_stream("ίσα");
-        assert!(current_stream.advance());
-        assert_eq!(current_stream.token().text, "ισ");
     }
 }

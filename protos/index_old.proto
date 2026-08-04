@@ -41,14 +41,6 @@ message ZoneMapIndexDetails {
   optional bool use_seeds = 2;
 }
 message InvertedIndexDetails {
-  enum GreekStemmer {
-    // Legacy rust-stemmers 1.2.0 semantics. An absent field also selects this
-    // value so indexes written before stemmer versioning remain compatible.
-    GREEK_STEMMER_LEGACY = 0;
-    // Snowball 3 Greek semantics, including corrected UTF-8 offset handling.
-    GREEK_STEMMER_SNOWBALL_3 = 1;
-  }
-
   message CodeTokenizerConfig {
     // Split one lexical identifier into subwords, e.g. getUserName ->
     // get/user/name.
@@ -92,9 +84,4 @@ message InvertedIndexDetails {
   // configuration used to build the index; absence means there is no
   // code-specific configuration to apply.
   CodeTokenizerConfig code_config = 13;
-  // Greek stemming semantics used to build this index. An absent value means
-  // the legacy rust-stemmers 1.2.0 implementation. The Snowball 3 value is
-  // present only when Greek stemming is active and requires inverted-index
-  // capability version 4 so older readers reject the segment.
-  optional GreekStemmer greek_stemmer = 14;
 }

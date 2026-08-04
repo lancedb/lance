@@ -13,7 +13,6 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::mem_wal::{ShardManifest, SsTable};
-use lance_index::scalar::inverted::index_version_for_params;
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
@@ -776,7 +775,6 @@ impl MemTableFlusher {
 
             let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
             let format_version = fts_cfg.params.resolved_format_version();
-            let index_version = index_version_for_params(&fts_cfg.params, format_version);
 
             let index_meta = IndexMetadata {
                 uuid: index_uuid,
@@ -785,7 +783,7 @@ impl MemTableFlusher {
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
-                index_version: index_version as i32,
+                index_version: format_version.index_version() as i32,
                 created_at: None,
                 base_id: None,
                 files: None,
