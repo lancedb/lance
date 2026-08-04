@@ -27,7 +27,7 @@ members = [
     "rust/arrow-scalar",
     "rust/arrow-stats",
 ]
-exclude = ["python", "java/lance-jni", "rust/vendor/datafusion-sql"]
+exclude = ["python", "java/lance-jni", "vendor/datafusion-sql"]
 # Python package needs to be built by maturin.
 resolver = "3"
 
@@ -222,7 +222,7 @@ pretty_assertions = "1.4.0"
 
 # Remove after a DataFusion release includes https://github.com/apache/datafusion/pull/23058.
 [patch.crates-io]
-datafusion-sql = { path = "rust/vendor/datafusion-sql" }
+datafusion-sql = { path = "vendor/datafusion-sql" }
 
 [profile.bench]
 opt-level = 3
