@@ -248,7 +248,13 @@ public class MergeInsertParams {
    * Mark MemWAL SSTables as compacted into the base table.
    *
    * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
-   * to prevent the same SSTables from being compacted again.
+   * to prevent the same SSTables from being compacted again, in the same commit as the data.
+   *
+   * <p><b>For multi-pass compaction, call this only on the final successful data-changing pass.</b>
+   * Intermediate passes must not carry compaction progress. Lance cannot tell whether a caller has
+   * another pass planned, so it cannot enforce this: if a delete pass carried the marker and the
+   * process then died before the matching upsert, the recorded progress would claim rows were
+   * copied in that never were.
    *
    * @param sstables the SSTables being compacted
    * @return This MergeInsertParams instance
