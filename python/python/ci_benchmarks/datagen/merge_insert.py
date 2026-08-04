@@ -43,6 +43,9 @@ Datasets
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
+
 import lance
 import numpy as np
 import pyarrow as pa
@@ -52,6 +55,13 @@ from ci_benchmarks.datasets import get_dataset_uri
 
 # Tag marking the pristine version that benchmarks restore to.
 BASE_TAG = "merge_insert_base"
+
+# BTREE training sorts the full column under DataFusion's FairSpillPool. The
+# default 150 MiB pool is tight for 10M 32-byte string keys (uuid columns):
+# ExternalSorterMerge has peaked near the pool edge and aborted datagen with
+# ResourcesExhausted. Index build is one-shot setup, not a measured path, so
+# temporarily enlarge the pool only around create_scalar_index.
+_INDEX_BUILD_MEM_POOL_SIZE = str(1024 * 1024 * 1024)
 
 NARROW_NUM_ROWS = 10_000_000
 NARROW_ROWS_PER_FRAGMENT = 1_000_000
@@ -272,6 +282,20 @@ def _already_generated(uri: str, expected_rows: int) -> bool:
     return ds.checkout_version(base_version).count_rows() == expected_rows
 
 
+@contextmanager
+def _enlarged_mem_pool_for_index_build():
+    """Raise LANCE_MEM_POOL_SIZE only for the duration of index training."""
+    previous = os.environ.get("LANCE_MEM_POOL_SIZE")
+    os.environ["LANCE_MEM_POOL_SIZE"] = _INDEX_BUILD_MEM_POOL_SIZE
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("LANCE_MEM_POOL_SIZE", None)
+        else:
+            os.environ["LANCE_MEM_POOL_SIZE"] = previous
+
+
 def _gen(
     name: str,
     data,
@@ -294,9 +318,10 @@ def _gen(
         max_rows_per_file=rows_per_fragment,
         max_rows_per_group=min(rows_per_fragment, 100_000),
     )
-    for column in indexed_columns:
-        LOGGER.info("Building BTREE index on %s.%s", name, column)
-        ds.create_scalar_index(column, "BTREE")
+    with _enlarged_mem_pool_for_index_build():
+        for column in indexed_columns:
+            LOGGER.info("Building BTREE index on %s.%s", name, column)
+            ds.create_scalar_index(column, "BTREE")
     _tag_base(ds)
     return ds
 

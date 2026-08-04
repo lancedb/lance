@@ -309,26 +309,6 @@ impl std::fmt::Debug for LanceExecutionOptions {
 const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
-/// Ceiling for [`sort_spill_reservation_bytes`]: multi-GB pools should not
-/// pre-reserve multi-GB for the unspillable merge phase.
-const MAX_SORT_SPILL_RESERVATION_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Bytes reserved for DataFusion's unspillable in-memory sort/merge while an
-/// external sort spills.
-///
-/// Sized at ~1/3 of the memory pool (see #7675). DataFusion's default 10 MiB
-/// is too small: `ExternalSorter` double-counts buffered batches so roughly
-/// half the pool is already spoken for when merge starts, and merge then needs
-/// additional headroom for cursors and accumulation.
-///
-/// The previous 40 MiB ceiling was below what merge needs under the default
-/// 150 MiB pool (`pool / 3` = 50 MiB). Training a BTREE index on large string
-/// columns (e.g. 10M uuid keys in merge_insert datagen) peaked near 48 MiB in
-/// `ExternalSorterMerge` and failed with `ResourcesExhausted`.
-fn sort_spill_reservation_bytes(mem_pool_size: u64) -> usize {
-    (mem_pool_size / 3).min(MAX_SORT_SPILL_RESERVATION_BYTES) as usize
-}
-
 impl LanceExecutionOptions {
     pub fn mem_pool_size(&self) -> u64 {
         let num_partitions = self.target_partition.unwrap_or(1) as u64;
@@ -382,9 +362,14 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
-        session_config = session_config.with_sort_spill_reservation_bytes(
-            sort_spill_reservation_bytes(options.mem_pool_size()),
-        );
+        // The default 10MB sort spill reservation seems to be too small for many common cases.
+        //
+        // There currently is no reasonable guidance provided by DataFusion for setting this value.
+        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        let sort_spill_reservation_bytes =
+            (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
+        session_config =
+            session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let disk_manager_builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
@@ -1357,28 +1342,5 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_sort_spill_reservation_bytes() {
-        // Small pools: ~1/3, no floor that could exceed the pool.
-        assert_eq!(
-            sort_spill_reservation_bytes(4 * 1024 * 1024),
-            4 * 1024 * 1024 / 3
-        );
-
-        // Default pool: pool/3 (= 50 MiB), not the old 40 MiB hard cap.
-        let default_pool = DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION;
-        assert_eq!(
-            sort_spill_reservation_bytes(default_pool),
-            (default_pool / 3) as usize
-        );
-        assert!(sort_spill_reservation_bytes(default_pool) > 40 * 1024 * 1024);
-
-        // Large pools: ceiling, not unbounded growth.
-        assert_eq!(
-            sort_spill_reservation_bytes(8 * 1024 * 1024 * 1024),
-            MAX_SORT_SPILL_RESERVATION_BYTES as usize
-        );
     }
 }
