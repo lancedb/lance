@@ -5654,6 +5654,7 @@ mod tests {
                 };
                 has_added_files(&fragments_after[1]);
                 has_added_files(&fragments_after[2]);
+                ds.validate().await.unwrap();
 
                 if insert {
                     assert_eq!(fragments_after.len(), 5);

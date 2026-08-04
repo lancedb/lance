@@ -1406,30 +1406,18 @@ impl FileFragment {
     /// Validate the fragment
     ///
     /// Verifies:
-    /// * All field ids in the fragment are distinct
-    /// * Within each data file, field ids are in increasing order
+    /// * All live field ids in the fragment are distinct
+    /// * Within each legacy data file, field ids are in increasing order
     /// * All data files exist and have the same length
-    /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
     /// * `Fragment.physical_rows` matches length of file
     /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
     pub async fn validate(&self) -> Result<()> {
         let mut seen_fields = HashSet::new();
         for data_file in &self.metadata.files {
-            let last = -1;
-            for field_id in data_file.fields.iter() {
-                if *field_id <= last {
-                    return Err(Error::corrupt_file(
-                        self.dataset
-                            .data_file_dir(data_file)?
-                            .join(data_file.path.as_str()),
-                        format!(
-                            "Field id {} is not in increasing order in fragment {:#?}",
-                            field_id, self
-                        ),
-                    ));
-                }
-
+            // Negative field ids are sentinels for obsolete physical columns and
+            // do not identify logical fields.
+            for field_id in data_file.fields.iter().copied().filter(|id| *id >= 0) {
                 if !seen_fields.insert(field_id) {
                     return Err(Error::corrupt_file(
                         self.dataset
