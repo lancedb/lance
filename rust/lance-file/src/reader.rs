@@ -65,6 +65,39 @@ pub struct BufferDescriptor {
     pub size: u64,
 }
 
+impl BufferDescriptor {
+    fn checked_range(&self, buffer_index: usize, file_len: u64) -> Result<Range<u64>> {
+        let end = self.position.checked_add(self.size).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!(
+                    "Global buffer {} range overflows: position={}, size={}",
+                    buffer_index, self.position, self.size
+                )
+                .into(),
+            )
+        })?;
+        if self.position > file_len {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Global buffer {} position {} is outside file of size {}",
+                    buffer_index, self.position, file_len
+                )
+                .into(),
+            ));
+        }
+        if end > file_len {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Global buffer {} range {}..{} is outside file of size {}",
+                    buffer_index, self.position, end, file_len
+                )
+                .into(),
+            ));
+        }
+        Ok(self.position..end)
+    }
+}
+
 /// Statistics summarize some of the file metadata for quick summary info
 #[derive(Debug)]
 pub struct FileStatistics {
@@ -787,25 +820,22 @@ impl FileReader {
         gbo_table: &[BufferDescriptor],
         tail_bytes: &Bytes,
         tail_offset: u64,
-    ) -> BTreeMap<u32, Bytes> {
-        let tail_end = tail_offset + tail_bytes.len() as u64;
-        gbo_table
-            .iter()
-            .enumerate()
-            .skip(1)
-            .filter_map(|(index, buffer)| {
-                let start = buffer.position;
-                let end = buffer.position + buffer.size;
-                if start >= tail_offset && end <= tail_end {
-                    let rel_start = (start - tail_offset) as usize;
-                    let rel_end = (end - tail_offset) as usize;
-                    let bytes = Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]);
-                    Some((index as u32, bytes))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        file_len: u64,
+    ) -> Result<BTreeMap<u32, Bytes>> {
+        let tail_end = tail_offset
+            .checked_add(tail_bytes.len() as u64)
+            .ok_or_else(|| Error::invalid_input_source("Tail byte range overflows".into()))?;
+        let mut retained_buffers = BTreeMap::new();
+        for (index, buffer) in gbo_table.iter().enumerate().skip(1) {
+            let range = buffer.checked_range(index, file_len)?;
+            if range.start >= tail_offset && range.end <= tail_end {
+                let rel_start = (range.start - tail_offset) as usize;
+                let rel_end = (range.end - tail_offset) as usize;
+                let bytes = Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]);
+                retained_buffers.insert(index as u32, bytes);
+            }
+        }
+        Ok(retained_buffers)
     }
 
     // Checks to make sure the footer is written correctly and returns the
@@ -929,7 +959,15 @@ impl FileReader {
         scheduler: &FileScheduler,
         file_len: u64,
     ) -> Result<Bytes> {
-        let num_bytes_needed = (file_len - start_pos) as usize;
+        let num_bytes_needed = file_len.checked_sub(start_pos).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!(
+                    "Tail read position {} is outside file of size {}",
+                    start_pos, file_len
+                )
+                .into(),
+            )
+        })? as usize;
         if data.len() >= num_bytes_needed {
             Ok(data.slice((data.len() - num_bytes_needed)..))
         } else {
@@ -945,25 +983,12 @@ impl FileReader {
         }
     }
 
-    fn do_decode_gbo_table(
-        gbo_bytes: &Bytes,
-        footer: &Footer,
-        version: LanceFileVersion,
-    ) -> Result<Vec<BufferDescriptor>> {
+    fn do_decode_gbo_table(gbo_bytes: &Bytes, footer: &Footer) -> Result<Vec<BufferDescriptor>> {
         let mut global_bufs_cursor = Cursor::new(gbo_bytes);
 
         let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
-        for buffer_index in 0..footer.num_global_buffers {
+        for _ in 0..footer.num_global_buffers {
             let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()?;
-            if version >= LanceFileVersion::V2_1 && buf_pos % PAGE_BUFFER_ALIGNMENT as u64 != 0 {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "Global buffer {} position {} is not aligned to {} bytes",
-                        buffer_index, buf_pos, PAGE_BUFFER_ALIGNMENT
-                    )
-                    .into(),
-                ));
-            }
             let buf_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
             global_buffers.push(BufferDescriptor {
                 position: buf_pos,
@@ -972,6 +997,28 @@ impl FileReader {
         }
 
         Ok(global_buffers)
+    }
+
+    fn validate_gbo_table(
+        gbo_table: &[BufferDescriptor],
+        file_len: u64,
+        version: LanceFileVersion,
+    ) -> Result<()> {
+        for (buffer_index, buffer) in gbo_table.iter().enumerate() {
+            if version >= LanceFileVersion::V2_1
+                && buffer.position % PAGE_BUFFER_ALIGNMENT as u64 != 0
+            {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Global buffer {} position {} is not aligned to {} bytes",
+                        buffer_index, buffer.position, PAGE_BUFFER_ALIGNMENT
+                    )
+                    .into(),
+                ));
+            }
+            buffer.checked_range(buffer_index, file_len)?;
+        }
+        Ok(())
     }
 
     async fn decode_gbo_table(
@@ -990,7 +1037,9 @@ impl FileReader {
             file_len,
         )
         .await?;
-        Self::do_decode_gbo_table(&gbo_bytes, footer, version)
+        let gbo_table = Self::do_decode_gbo_table(&gbo_bytes, footer)?;
+        Self::validate_gbo_table(&gbo_table, file_len, version)?;
+        Ok(gbo_table)
     }
 
     fn decode_schema(schema_bytes: Bytes) -> Result<(u64, lance_core::datatypes::Schema)> {
@@ -1038,7 +1087,15 @@ impl FileReader {
         let schema_start = gbo_table[0].position;
         let schema_size = gbo_table[0].size;
 
-        let num_footer_bytes = file_len - schema_start;
+        let num_footer_bytes = file_len.checked_sub(schema_start).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!(
+                    "Schema position {} is outside file of size {}",
+                    schema_start, file_len
+                )
+                .into(),
+            )
+        })?;
 
         // By default we read all column metadatas.  We do NOT read the column metadata buffers
         // at this point.  We only want to read the column metadata for columns we are actually loading.
@@ -1067,8 +1124,12 @@ impl FileReader {
         // is decoded above and never fetched via read_global_buffer) out of the tail
         // so read_global_buffer can serve them without I/O. We copy rather than slice
         // so the much larger tail allocation can be released once decoding is done.
-        let retained_global_buffers =
-            Self::retained_global_buffers_from_tail(&gbo_table, &tail_bytes, tail_offset);
+        let retained_global_buffers = Self::retained_global_buffers_from_tail(
+            &gbo_table,
+            &tail_bytes,
+            tail_offset,
+            file_len,
+        )?;
 
         Ok(CachedFileMetadata {
             file_schema: Arc::new(schema),
@@ -1110,11 +1171,12 @@ impl FileReader {
             Some((file_schema, num_rows)) => (file_schema, num_rows),
             None => {
                 let schema_buffer = &gbo_table[0];
+                let schema_range = schema_buffer.checked_range(0, file_len)?;
                 let schema_bytes = Self::read_range_from_tail_or_scheduler(
                     &tail_bytes,
                     tail_offset,
                     scheduler,
-                    schema_buffer.position..schema_buffer.position + schema_buffer.size,
+                    schema_range,
                 )
                 .await?;
                 let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
@@ -1131,8 +1193,12 @@ impl FileReader {
         .await?;
         let column_metadata_offsets = Self::decode_cmo_table(cmo_table, &footer)?;
 
-        let retained_global_buffers =
-            Self::retained_global_buffers_from_tail(&gbo_table, &tail_bytes, tail_offset);
+        let retained_global_buffers = Self::retained_global_buffers_from_tail(
+            &gbo_table,
+            &tail_bytes,
+            tail_offset,
+            file_len,
+        )?;
 
         Ok(FileMetadataIndex {
             file_schema,
@@ -1929,6 +1995,13 @@ impl FileMetadataProvider {
         }
     }
 
+    fn file_size(&self) -> u64 {
+        match self {
+            Self::Full(metadata) => metadata.file_size_bytes,
+            Self::Indexed(metadata_index) => metadata_index.file_size_bytes,
+        }
+    }
+
     fn file_statistics(&self) -> Option<FileStatistics> {
         let metadata = match self {
             Self::Full(metadata) => metadata,
@@ -2185,7 +2258,10 @@ impl FileReadCore {
         let bytes = self
             .scheduler
             .submit_request(
-                vec![buffer_desc.position..buffer_desc.position + buffer_desc.size],
+                vec![
+                    buffer_desc
+                        .checked_range(index as usize, self.metadata_provider.file_size())?,
+                ],
                 0,
             )
             .await?;
@@ -2672,20 +2748,22 @@ impl EncodedBatchReaderExt for EncodedBatch {
             ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
                 .into();
 
+        let file_len = bytes.len() as u64;
         let gbo_table = FileReader::do_decode_gbo_table(
             &bytes.slice(footer.global_buff_offsets_start as usize..),
             &footer,
-            file_version,
         )?;
+        FileReader::validate_gbo_table(&gbo_table, file_len, file_version)?;
         if gbo_table.is_empty() {
             return Err(Error::internal(
                 "File did not contain any global buffers, schema expected".to_string(),
             ));
         }
-        let schema_start = gbo_table[0].position as usize;
-        let schema_size = gbo_table[0].size as usize;
+        let schema_range = gbo_table[0].checked_range(0, file_len)?;
+        let schema_start = schema_range.start as usize;
+        let schema_end = schema_range.end as usize;
 
-        let schema_bytes = bytes.slice(schema_start..(schema_start + schema_size));
+        let schema_bytes = bytes.slice(schema_start..schema_end);
         let (_, schema) = FileReader::decode_schema(schema_bytes)?;
         let projection = ReaderProjection::from_whole_schema(&schema, file_version);
 
@@ -2753,7 +2831,7 @@ mod tests {
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::version::ConcreteFileVersion;
     use crate::versions;
-    use crate::writer::FileWriterOptions;
+    use crate::writer::{FileWriterOptions, PAGE_BUFFER_ALIGNMENT};
     use lance_encoding::decoder::DecoderConfig;
 
     fn footer_version(bytes: &[u8]) -> (u16, u16) {
@@ -4418,6 +4496,96 @@ mod tests {
         assert_eq!(buf_index, 1);
 
         file_writer.finish().await.unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MetadataReadPath {
+        Full,
+        Indexed,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidGboDescriptor {
+        Unaligned,
+        PastEof,
+        Overflowing,
+    }
+
+    #[rstest]
+    #[case::full_unaligned(MetadataReadPath::Full, InvalidGboDescriptor::Unaligned, "not aligned")]
+    #[case::full_past_eof(MetadataReadPath::Full, InvalidGboDescriptor::PastEof, "outside file")]
+    #[case::full_overflowing(
+        MetadataReadPath::Full,
+        InvalidGboDescriptor::Overflowing,
+        "overflows"
+    )]
+    #[case::indexed_unaligned(
+        MetadataReadPath::Indexed,
+        InvalidGboDescriptor::Unaligned,
+        "not aligned"
+    )]
+    #[case::indexed_past_eof(
+        MetadataReadPath::Indexed,
+        InvalidGboDescriptor::PastEof,
+        "outside file"
+    )]
+    #[case::indexed_overflowing(
+        MetadataReadPath::Indexed,
+        InvalidGboDescriptor::Overflowing,
+        "overflows"
+    )]
+    #[tokio::test]
+    async fn test_metadata_rejects_invalid_gbo_descriptor(
+        #[case] read_path: MetadataReadPath,
+        #[case] invalid_descriptor: InvalidGboDescriptor,
+        #[case] expected_message: &str,
+    ) {
+        let fs = FsFixture::default();
+        write_file_with_global_buffer(&fs, Bytes::from_static(b"hello")).await;
+
+        let mut file_bytes = fs
+            .object_store
+            .read_one_all(&fs.tmp_path)
+            .await
+            .unwrap()
+            .to_vec();
+        let file_len = file_bytes.len() as u64;
+        let footer = FileReader::decode_footer(&Bytes::copy_from_slice(&file_bytes)).unwrap();
+        let gbo_table_start = usize::try_from(footer.global_buff_offsets_start).unwrap();
+        let alignment = PAGE_BUFFER_ALIGNMENT as u64;
+        let (position, size) = match invalid_descriptor {
+            InvalidGboDescriptor::Unaligned => (1, 0),
+            InvalidGboDescriptor::PastEof => (((file_len + alignment) / alignment) * alignment, 0),
+            InvalidGboDescriptor::Overflowing => (u64::MAX - (u64::MAX % alignment), alignment),
+        };
+        file_bytes[gbo_table_start..gbo_table_start + 8].copy_from_slice(&position.to_le_bytes());
+        file_bytes[gbo_table_start + 8..gbo_table_start + 16].copy_from_slice(&size.to_le_bytes());
+        fs.object_store
+            .put(&fs.tmp_path, &file_bytes)
+            .await
+            .unwrap();
+
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let error = match read_path {
+            MetadataReadPath::Full => FileReader::read_all_metadata(&scheduler).await.map(|_| ()),
+            MetadataReadPath::Indexed => FileReader::read_metadata_index(&scheduler)
+                .await
+                .map(|_| ()),
+        }
+        .expect_err("invalid GBO descriptor must fail before metadata I/O");
+
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
     }
 
     /// A global buffer that fits inside the tail region captured at open is served
