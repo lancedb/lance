@@ -20,6 +20,7 @@ use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_plan::PhysicalExpr;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
@@ -28,7 +29,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -279,9 +280,23 @@ impl UpdateJob {
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
+        // The writer needs blob v2 columns in their struct view, so scan the descriptor view
+        // (+ `_rowaddr`) and rebuild it per-batch via `transform_blob_v2_batch`. `AllBinary` can't
+        // be used here: it flattens blobs to `LargeBinary` (which the writer rejects) and re-inlines
+        // untouched external blobs. Legacy `LargeBinary` blobs still take the `AllBinary` path.
+        let has_blob_v2 = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .any(|f| f.is_blob_v2());
+
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
-        scanner.blob_handling(BlobHandling::AllBinary);
+        if has_blob_v2 {
+            scanner.with_row_address();
+        } else {
+            scanner.blob_handling(BlobHandling::AllBinary);
+        }
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -298,11 +313,30 @@ impl UpdateJob {
 
         let schema = stream.schema();
 
-        let expected_schema = self.dataset.schema().into();
-        if schema.as_ref() != &expected_schema {
+        // Validate the scan schema against the dataset schema. On the blob v2 path the scan emits
+        // blob columns in their descriptor view, so compare against the descriptor-unloaded dataset
+        // schema and ignore the extra `_rowaddr` column (consumed by the blob transform below and
+        // never written).
+        let mut expected_lance_schema = self.dataset.schema().clone();
+        for field in &mut expected_lance_schema.fields {
+            field.unload_blobs_recursive();
+        }
+        let expected_schema: ArrowSchema = if has_blob_v2 {
+            (&expected_lance_schema).into()
+        } else {
+            self.dataset.schema().into()
+        };
+        let scan_fields_no_rowaddr: Vec<_> = schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() != ROW_ADDR)
+            .cloned()
+            .collect();
+        let scan_schema_no_rowaddr = ArrowSchema::new(scan_fields_no_rowaddr);
+        if scan_schema_no_rowaddr != expected_schema {
             return Err(Error::internal(format!(
                 "Expected schema {:?} but got {:?}",
-                expected_schema, schema
+                expected_schema, scan_schema_no_rowaddr
             )));
         }
 
@@ -318,20 +352,53 @@ impl UpdateJob {
                 Ok(Err(err)) => Err(err),
                 Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
             });
-        let stream = RecordBatchStreamAdapter::new(schema, stream);
+
+        // On the blob v2 path, rebuild the loaded struct view from the descriptor (reading
+        // untouched blob payloads back by `_rowaddr` and dropping `_rowaddr`); the resulting schema
+        // is the dataset's declared schema, which is what the writer expects. Off that path, the
+        // scan output already matches the dataset schema.
+        let write_schema: Arc<ArrowSchema> = Arc::new(self.dataset.schema().into());
+        let stream: SendableRecordBatchStream = if has_blob_v2 {
+            let dataset = self.dataset.clone();
+            let lance_schema = Arc::new(self.dataset.schema().clone());
+            let transformed = stream.then(move |batch_result| {
+                let dataset = dataset.clone();
+                let lance_schema = lance_schema.clone();
+                async move {
+                    let batch = batch_result?;
+                    crate::dataset::optimize::transform_blob_v2_batch(
+                        &dataset,
+                        &lance_schema,
+                        batch,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))
+                }
+            });
+            Box::pin(RecordBatchStreamAdapter::new(write_schema, transformed))
+        } else {
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+        };
 
         let version = self
             .dataset
             .manifest()
             .data_storage_format
             .lance_file_version()?;
+        let write_params = WriteParams {
+            // We are rewriting already-stored data, so an untouched external blob may reference a
+            // URI outside the dataset's base_paths (absolute `file://`, base_id == 0). Allow it,
+            // matching compaction's rewrite path; otherwise the writer would re-reject it.
+            allow_external_blob_outside_bases: true,
+            ..WriteParams::with_storage_version(version)
+        };
         let (mut new_fragments, _) = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
-            Box::pin(stream),
-            WriteParams::with_storage_version(version),
+            stream,
+            write_params,
             None, // TODO: support multiple bases for update
         )
         .await?;
@@ -1921,5 +1988,201 @@ mod tests {
 
         let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
         assert_eq!(blobs.value(idx_foo), b"foo");
+    }
+
+    /// Regression test: updating a scalar column on a dataset that also has a blob *v2* column
+    /// must succeed and must leave the blob untouched. Before the fix, the update path emitted the
+    /// blob column as a `LargeBinary` binary view (via `BlobHandling::AllBinary`) while the writer
+    /// and schema check expected the declared struct view, failing with an internal
+    /// "Expected schema ... but got ..." error for any blob-v2-bearing dataset. Distinct from
+    /// `test_update_with_blob`, which covers only *legacy* `LargeBinary` blobs.
+    ///
+    /// Parametrized over every blob v2 storage class
+    #[rstest]
+    #[case::inline(BlobStorage::Inline)]
+    #[case::packed(BlobStorage::Packed)]
+    #[case::dedicated(BlobStorage::Dedicated)]
+    #[case::external(BlobStorage::External)]
+    #[tokio::test]
+    async fn test_update_scalar_column_with_blob_v2_column(#[case] storage: BlobStorage) {
+        use crate::blob::BlobArrayBuilder;
+        use arrow::datatypes::UInt64Type;
+
+        // Distinct payload per row so a swapped/dropped blob is caught. Sized to land in the
+        // requested storage class given the thresholds set on the field below.
+        let payloads: [Vec<u8>; 3] = [
+            storage.payload_for(b'a'),
+            storage.payload_for(b'b'),
+            storage.payload_for(b'c'),
+        ];
+
+        // External blobs live in a separate directory and are referenced by URI; the other
+        // classes are inlined into the blob array as raw bytes.
+        let external_dir = TempStrDir::default();
+        let mut blob_builder = BlobArrayBuilder::new(3);
+        for (i, payload) in payloads.iter().enumerate() {
+            if storage == BlobStorage::External {
+                let path =
+                    std::path::Path::new(external_dir.as_str()).join(format!("blob_{i}.bin"));
+                std::fs::write(&path, payload).unwrap();
+                let path_str = path.display().to_string();
+                let path_prefix = if path_str.starts_with('/') { "" } else { "/" };
+                blob_builder
+                    .push_uri(format!("file://{path_prefix}{path_str}"))
+                    .unwrap();
+            } else {
+                blob_builder.push_bytes(payload).unwrap();
+            }
+        }
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("bar", DataType::Utf8, false),
+            storage.blob_field("blob_col"),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec!["foo", "baz", "foo"])),
+                blob_array,
+            ],
+        )
+        .unwrap();
+
+        // Blob v2 requires file version >= 2.2. External URIs point outside any registered base,
+        // so allow that on the initial write.
+        let test_dir = TempStrDir::default();
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: storage == BlobStorage::External,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let dataset = Arc::new(
+            Dataset::write(batches, &test_dir, Some(write_params))
+                .await
+                .unwrap(),
+        );
+
+        // Update only the scalar column; the blob column is never referenced.
+        let dataset = UpdateBuilder::new(dataset)
+            .set("bar", "'qux'")
+            .unwrap()
+            .update_where("bar = 'foo'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .expect("update of a scalar column must succeed on a blob-v2-bearing dataset")
+            .new_dataset;
+
+        // Scalar values landed: the two 'foo' rows became 'qux', the 'baz' row is unchanged.
+        // update() rewrites matched rows into new fragments, so physical row order is not
+        // preserved — assert the per-id mapping rather than a positional order.
+        let batch = dataset
+            .scan()
+            .project(&["id", "bar"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch.column(0).as_primitive::<UInt32Type>();
+        let bar = batch.column(1).as_string::<i32>();
+        let mut bar_by_id: HashMap<u32, &str> = HashMap::new();
+        for i in 0..batch.num_rows() {
+            bar_by_id.insert(ids.value(i), bar.value(i));
+        }
+        assert_eq!(bar_by_id[&0], "qux"); // was 'foo', rewritten
+        assert_eq!(bar_by_id[&1], "baz"); // unchanged, not rewritten
+        assert_eq!(bar_by_id[&2], "qux"); // was 'foo', rewritten
+
+        // Row count unchanged and every blob payload still readable + unchanged, keyed by the
+        // stable `id` (row order changed after the rewrite). Also assert the storage class
+        // round-tripped: the payload sizes and thresholds are chosen so each row keeps its class.
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        let full = dataset
+            .scan()
+            .with_row_id()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = full
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let full_ids = full.column(0).as_primitive::<UInt32Type>();
+        for i in 0..full.num_rows() {
+            let id = full_ids.value(i);
+            let blobs = dataset
+                .take_blobs(&[row_ids.value(i)], "blob_col")
+                .await
+                .unwrap();
+            assert_eq!(
+                blobs[0].read().await.unwrap().as_ref(),
+                payloads[id as usize].as_slice(),
+                "{storage:?}: blob payload for id {id} changed",
+            );
+            assert_eq!(
+                blobs[0].kind(),
+                storage.expected_kind(),
+                "{storage:?}: blob storage class for id {id} changed after update",
+            );
+        }
+    }
+
+    /// Blob v2 storage classes, used to parametrize the update round-trip test.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum BlobStorage {
+        Inline,
+        Packed,
+        Dedicated,
+        External,
+    }
+
+    impl BlobStorage {
+        // Thresholds (bytes) chosen so payload sizes below map to the intended class:
+        //   inline <= INLINE < packed <= DEDICATED < dedicated.
+        const INLINE_THRESHOLD: usize = 16;
+        const DEDICATED_THRESHOLD: usize = 64;
+
+        /// A blob field configured with thresholds that realize this storage class. External
+        /// blobs are referenced by URI, so their on-disk class is driven by the referenced size,
+        /// which `payload_for` keeps small (inline).
+        fn blob_field(&self, name: &str) -> arrow_schema::Field {
+            use crate::{BlobFieldOptions, blob_field_with_options};
+            use std::num::NonZeroUsize;
+            let options = BlobFieldOptions::default()
+                .with_inline_size_threshold(Self::INLINE_THRESHOLD)
+                .with_dedicated_size_threshold(
+                    NonZeroUsize::new(Self::DEDICATED_THRESHOLD).unwrap(),
+                );
+            blob_field_with_options(name, true, options)
+        }
+
+        /// A payload whose size lands in this storage class, filled with `byte` for identity.
+        fn payload_for(&self, byte: u8) -> Vec<u8> {
+            let len = match self {
+                // External references resolve to small (inline) payloads on disk.
+                Self::Inline | Self::External => Self::INLINE_THRESHOLD - 1,
+                Self::Packed => Self::INLINE_THRESHOLD + 1,
+                Self::Dedicated => Self::DEDICATED_THRESHOLD + 1,
+            };
+            vec![byte; len]
+        }
+
+        fn expected_kind(&self) -> lance_core::datatypes::BlobKind {
+            use lance_core::datatypes::BlobKind;
+            match self {
+                Self::Inline => BlobKind::Inline,
+                Self::Packed => BlobKind::Packed,
+                Self::Dedicated => BlobKind::Dedicated,
+                Self::External => BlobKind::External,
+            }
+        }
     }
 }
