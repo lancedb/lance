@@ -6230,6 +6230,69 @@ def test_shallow_clone(tmp_path: Path):
     assert lance.dataset(clone_branch_v3).to_table() == table_v3
 
 
+def test_cleanup_on_source_keeps_shallow_clone_files(tmp_path: Path):
+    src_dir = tmp_path / "clone_pin_src"
+    table_v1 = pa.table({"a": [1, 2, 3]})
+    lance.write_dataset(table_v1, src_dir, mode="create")
+
+    ds = lance.dataset(src_dir)
+    clone_dir = tmp_path / "clone_pin_clone"
+    clone = ds.shallow_clone(clone_dir, 1)
+    assert clone.to_table() == table_v1
+
+    pin_id = clone.source_pin_id
+    assert pin_id is not None
+    pins = ds.clone_pins.list()
+    assert len(pins) == 1
+    assert pins[0]["id"] == pin_id
+    assert pins[0]["version"] == 1
+    assert pins[0]["branch"] is None
+    assert pins[0]["branch_id"] is None
+
+    ds = lance.write_dataset(pa.table({"a": [4, 5, 6]}), src_dir, mode="overwrite")
+    ds.cleanup_old_versions(older_than=timedelta(0), delete_unverified=True)
+
+    assert lance.dataset(clone_dir).to_table() == table_v1
+
+    ds.clone_pins.unregister(pin_id)
+    assert ds.clone_pins.list() == []
+    with pytest.raises(ValueError, match="no shallow clone pin"):
+        ds.clone_pins.unregister(pin_id)
+
+
+def test_shallow_clone_require_tag_skips_source_pin(tmp_path: Path):
+    src_dir = tmp_path / "require_tag_src"
+    table = pa.table({"a": [1, 2, 3]})
+    ds = lance.write_dataset(table, src_dir, mode="create")
+    ds.tags.create("v1", 1)
+
+    clone_dir = tmp_path / "require_tag_clone"
+    clone = ds.shallow_clone(clone_dir, 1, retention="require_tag")
+
+    assert clone.to_table() == table
+    assert clone.source_pin_id is None
+    assert ds.clone_pins.list() == []
+
+
+def test_shallow_clone_require_tag_rejects_untagged_version(tmp_path: Path):
+    src_dir = tmp_path / "untagged_src"
+    table = pa.table({"a": [1, 2, 3]})
+    ds = lance.write_dataset(table, src_dir, mode="create")
+
+    with pytest.raises(ValueError, match="needs a tag"):
+        ds.shallow_clone(tmp_path / "untagged_clone", 1, retention="require_tag")
+    assert ds.clone_pins.list() == []
+
+
+def test_shallow_clone_rejects_unknown_retention(tmp_path: Path):
+    src_dir = tmp_path / "bad_retention_src"
+    ds = lance.write_dataset(pa.table({"a": [1]}), src_dir, mode="create")
+
+    with pytest.raises(ValueError, match="retention must be"):
+        ds.shallow_clone(tmp_path / "bad_retention_clone", 1, retention="whatever")
+    assert ds.clone_pins.list() == []
+
+
 def test_branches(tmp_path: Path):
     # Step 1: create branch1 from main → append to branch1 → create branch2 from tag
     base_dir = tmp_path / "test_branches"

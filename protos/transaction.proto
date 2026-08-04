@@ -185,6 +185,17 @@ message Transaction {
     string ref_path = 4;
     // if the target dataset is a branch, this is the branch name of the target dataset
     optional string branch_name = 5;
+    // Pin id written on the source under `_refs/clones/{id}.json` for a cross-dataset
+    // shallow clone. Absent for in-dataset branch creation and for deep clones.
+    // Present: the clone stores this id in its config so destroy/detach can remove the pin.
+    optional string source_pin_id = 6;
+    // Leaf UUID of the source branch incarnation resolved for this clone operation.
+    // Set for shallow clones, deep clones, and in-dataset branch creation, all of which
+    // read a source branch during commit. The commit path re-reads the source branch
+    // metadata after its source reads and refuses the commit if the leaf UUID no longer
+    // matches, which means the branch was deleted or recreated under the same name.
+    // Absent for the main branch and for older transactions.
+    optional string source_branch_id = 7;
   }
   
   // Exact set of key hashes for conflict detection.

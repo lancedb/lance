@@ -35,6 +35,7 @@
 
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
+use crate::dataset::refs::{BranchIdentifier, GcMarker};
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
@@ -53,7 +54,7 @@ use lance_core::{
 use lance_table::{
     format::{IndexMetadata, Manifest},
     io::{
-        commit::ManifestLocation,
+        commit::{ManifestLocation, ManifestNamingScheme},
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
@@ -64,7 +65,7 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::Mutex,
     time::Duration,
 };
 use tokio::time::{MissedTickBehavior, interval};
@@ -298,6 +299,18 @@ struct CleanupTask<'a> {
     include_referenced_branches: bool,
 }
 
+/// Versions cleanup keeps regardless of age.
+#[derive(Clone, Debug, Default)]
+struct RetainedVersions {
+    /// Versions retained by tags on the branch being cleaned.
+    tagged_versions: HashSet<u64>,
+    /// Versions retained by shallow-clone pins.
+    ///
+    /// Separate from `tagged_versions` because `error_if_tagged_old_versions` reports only user
+    /// tags. A clone pin is not something the caller is asked to remove first.
+    clone_pinned_versions: HashSet<u64>,
+}
+
 /// Information about the dataset that we learn by inspecting all of the manifests
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
@@ -467,7 +480,24 @@ impl<'a> CleanupTask<'a> {
             .map(|tag_content| tag_content.version)
             .collect();
 
-        let mut inspection = self.process_manifests(&tagged_versions).await?;
+        // Use one branch identifier throughout so branch recreation cannot mix
+        // marker and pin namespaces.
+        let branch_identifier = self.dataset.branch_identifier().await?;
+        let clone_pinned_versions: HashSet<u64> = self
+            .dataset
+            .clone_pins()
+            .list()
+            .await?
+            .into_iter()
+            .filter(|pin| pin.branch_id.as_deref() == branch_identifier.branch_id())
+            .map(|pin| pin.version)
+            .collect();
+
+        let retained = RetainedVersions {
+            tagged_versions,
+            clone_pinned_versions,
+        };
+        let mut inspection = self.process_manifests(&retained).await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -487,6 +517,18 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
+        // Mark delete candidates, then re-check pins and tags. A concurrent clone writes
+        // its pin and refuses to commit when it sees the marker. Markers are never cleared.
+        // An old version once selected by cleanup stays closed to new shallow clones.
+        inspection = self
+            .mark_old_versions_and_retain_protected(inspection, &branch_identifier)
+            .await?;
+
+        // Abort if this branch name now maps to a different incarnation. Deleting under
+        // the open dataset path would otherwise touch the recreated branch's files.
+        self.ensure_cleanup_branch_incarnation(&branch_identifier)
+            .await?;
+
         final_result.merge(
             self.delete_unreferenced_files(inspection).await?,
             candidate_file_limit,
@@ -495,17 +537,14 @@ impl<'a> CleanupTask<'a> {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn process_manifests(
-        &'a self,
-        tagged_versions: &HashSet<u64>,
-    ) -> Result<CleanupInspection> {
+    async fn process_manifests(&'a self, retained: &RetainedVersions) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions)
+                self.process_manifest_file(location, &inspection, retained)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -515,7 +554,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
-        tagged_versions: &HashSet<u64>,
+        retained: &RetainedVersions,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
@@ -546,12 +585,14 @@ impl<'a> CleanupTask<'a> {
             }
             Err(error) => return Err(error),
         };
-        // Don't delete the latest version, even if it is old. Don't delete tagged versions,
-        // regardless of age. Don't delete manifests if their version is newer than the dataset
-        // version.  These are either in-progress or newly added since we started.
+        // Keep the latest version even when old. Keep tagged and clone-pinned versions
+        // regardless of age. Keep manifests newer than the dataset version. Those are
+        // in-progress or added after cleanup started.
         let is_latest = self.read_version <= manifest.version;
-        let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        let is_tagged = retained.tagged_versions.contains(&manifest.version);
+        let is_clone_pinned = retained.clone_pinned_versions.contains(&manifest.version);
+        let in_working_set =
+            is_latest || !self.policy.should_clean(&manifest) || is_tagged || is_clone_pinned;
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -566,16 +607,135 @@ impl<'a> CleanupTask<'a> {
                 .old_manifests
                 .insert(location.path.clone(), manifest.version);
         } else {
-            let commit_ts = manifest.timestamp();
-            if let Some(ts) = inspection.earliest_retained_manifest_time {
-                if commit_ts < ts {
-                    inspection.earliest_retained_manifest_time = Some(commit_ts);
-                }
-            } else {
-                inspection.earliest_retained_manifest_time = Some(commit_ts);
-            }
+            Self::note_retained_manifest_time(&mut inspection, &manifest);
         }
         Ok(())
+    }
+
+    /// Abort if the branch was deleted or recreated during cleanup.
+    async fn ensure_cleanup_branch_incarnation(&self, expected: &BranchIdentifier) -> Result<()> {
+        match self
+            .dataset
+            .branches()
+            .matches_identifier(self.dataset.manifest.branch.as_deref(), expected)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::RefConflict {
+                message: format!(
+                    "branch {} was deleted or recreated during cleanup",
+                    self.dataset
+                        .manifest
+                        .branch
+                        .as_deref()
+                        .unwrap_or(crate::dataset::refs::MAIN_BRANCH),
+                ),
+            }),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Mark old versions, then retain any that a pin or tag protects.
+    ///
+    /// Markers stay after a version is deleted. Namespaces use branch incarnation
+    /// ids so a recreated branch does not inherit markers from an older incarnation.
+    ///
+    /// Tags are relisted because a `RequireTag` clone may begin after the initial
+    /// tag listing.
+    async fn mark_old_versions_and_retain_protected(
+        &self,
+        mut inspection: CleanupInspection,
+        branch_identifier: &BranchIdentifier,
+    ) -> Result<CleanupInspection> {
+        if !self.action.deletes_files() {
+            return Ok(inspection);
+        }
+
+        let branch = self.dataset.manifest.branch.as_deref();
+        let clone_pins = self.dataset.clone_pins();
+        let marker_namespace = branch_identifier.marker_namespace();
+        let versions_to_delete: HashSet<u64> = inspection.old_manifests.values().copied().collect();
+
+        stream::iter(versions_to_delete.iter().copied())
+            .map(Ok)
+            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |version| {
+                let clone_pins = &clone_pins;
+                async move {
+                    clone_pins
+                        .write_gc_marker_in_namespace(marker_namespace, GcMarker::Version(version))
+                        .await
+                }
+            })
+            .await?;
+
+        let pinned_versions: HashSet<u64> = clone_pins
+            .list()
+            .await?
+            .into_iter()
+            .filter(|pin| pin.branch_id.as_deref() == branch_identifier.branch_id())
+            .map(|pin| pin.version)
+            .collect();
+        let tagged_versions: HashSet<u64> = self
+            .dataset
+            .tags()
+            .list()
+            .await?
+            .into_values()
+            .filter(|tag| tag.branch.as_deref() == branch)
+            .map(|tag| tag.version)
+            .collect();
+        let protected_versions: HashSet<u64> =
+            pinned_versions.union(&tagged_versions).copied().collect();
+
+        for version in versions_to_delete.intersection(&protected_versions) {
+            self.retain_version(&mut inspection, *version).await?;
+        }
+
+        Ok(inspection)
+    }
+
+    async fn retain_version(&self, inspection: &mut CleanupInspection, version: u64) -> Result<()> {
+        let manifest_paths: Vec<Path> = inspection
+            .old_manifests
+            .iter()
+            .filter(|(_, v)| **v == version)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        for path in manifest_paths {
+            let filename = path.filename().ok_or_else(|| {
+                Error::internal(format!("manifest path {} has no filename", path))
+            })?;
+            let naming_scheme = ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| {
+                Error::internal(format!("invalid manifest filename: '{}'", filename))
+            })?;
+            let location = ManifestLocation {
+                path: path.clone(),
+                version,
+                size: None,
+                naming_scheme,
+                e_tag: None,
+            };
+            let manifest =
+                read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            let indexes =
+                read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+            self.process_manifest(&manifest, &indexes, true, inspection)?;
+            inspection.old_manifests.remove(&path);
+            Self::note_retained_manifest_time(inspection, &manifest);
+        }
+        Ok(())
+    }
+
+    fn note_retained_manifest_time(inspection: &mut CleanupInspection, manifest: &Manifest) {
+        let commit_ts = manifest.timestamp();
+        if let Some(ts) = inspection.earliest_retained_manifest_time {
+            if commit_ts < ts {
+                inspection.earliest_retained_manifest_time = Some(commit_ts);
+            }
+        } else {
+            inspection.earliest_retained_manifest_time = Some(commit_ts);
+        }
     }
 
     fn process_manifest(
@@ -583,7 +743,7 @@ impl<'a> CleanupTask<'a> {
         manifest: &Manifest,
         indexes: &Vec<IndexMetadata>,
         in_working_set: bool,
-        inspection: &mut MutexGuard<CleanupInspection>,
+        inspection: &mut CleanupInspection,
     ) -> Result<()> {
         // If this part of our working set then update referenced_files.  Otherwise, just mark the
         // file as verified.
@@ -1103,6 +1263,9 @@ impl<'a> CleanupTask<'a> {
 
     // Retain manifests containing files referenced by descendant branches.
     // This protects parent branch files that are still needed by child branches.
+    //
+    // Only the descendant direction is walked. Ancestor-direction retention waits on
+    // merge/rebase, tracked by https://github.com/lance-format/lance/issues/7263.
     async fn retain_branch_lineage_files(
         &self,
         inspection: CleanupInspection,
@@ -1553,6 +1716,7 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::dataset::create_shallow_clone_pin_with_hook;
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
@@ -1673,6 +1837,14 @@ mod tests {
                 object_store_wrapper: Some(self.mock_store.clone()),
                 ..Default::default()
             }
+        }
+
+        fn sibling_path(&self, name: &str) -> String {
+            let (parent, _) = self
+                .dataset_path
+                .rsplit_once('/')
+                .expect("dataset_path always has a parent directory");
+            format!("{parent}/{name}")
         }
 
         async fn write_data_impl(
@@ -1896,6 +2068,12 @@ mod tests {
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
+                // Cleanup writes permanent GC markers while it deletes. They are
+                // bookkeeping, not dataset content, and would skew the
+                // bytes_removed == before - after assertions.
+                if path.location.as_ref().contains("_refs/gc_markers/") {
+                    continue;
+                }
                 file_count.num_bytes += path.size;
                 match path.location.extension() {
                     Some("lance") => file_count.num_data_files += 1,
@@ -2050,6 +2228,637 @@ mod tests {
         assert_gt!(after_count.num_tx_files, 0);
     }
 
+    // Scan data files. A count from fragment metadata alone survives after those files are
+    // deleted.
+    async fn scan_row_count(dataset: &Dataset) -> Result<usize> {
+        Ok(dataset.scan().try_into_batch().await?.num_rows())
+    }
+
+    // Reachability-only cleanup. delete_unverified drops age-based retention for unreferenced
+    // files. Without it, a clone read updates source file mtimes and the pin goes untested.
+    async fn run_reachability_cleanup(fixture: &MockDatasetFixture) -> Result<RemovalStats> {
+        fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(8).unwrap(),
+                Some(true),
+                Some(false),
+            )
+            .await
+    }
+
+    async fn create_clone_then_overwrite_source(
+        fixture: &MockDatasetFixture,
+        clone_uri: &str,
+    ) -> Result<()> {
+        fixture.create_some_data().await?;
+        let mut source = fixture.load().await?;
+        let cloned_version = source.version().version;
+        source
+            .shallow_clone(clone_uri, cloned_version, Some(fixture.os_params()))
+            .await?;
+        fixture.overwrite_some_data().await?;
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_on_source_keeps_shallow_clone_files() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let clone_uri = fixture.sibling_path("my_clone");
+        create_clone_then_overwrite_source(&fixture, &clone_uri)
+            .await
+            .unwrap();
+
+        // Row count from the generator, not a clone read. Reading the clone first updates
+        // the source data file mtime and age-based cleanup would keep it even without a pin.
+        let expected_rows: usize = some_batch().map(|batch| batch.unwrap().num_rows()).sum();
+        assert_gt!(expected_rows, 0);
+        let before_count = fixture.count_files().await.unwrap();
+
+        let removed = run_reachability_cleanup(&fixture).await.unwrap();
+
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 0);
+        assert_eq!(fixture.count_files().await.unwrap(), before_count);
+
+        let clone = fixture.load_dataset(&clone_uri).await.unwrap();
+        assert_eq!(scan_row_count(&clone).await.unwrap(), expected_rows);
+    }
+
+    #[tokio::test]
+    async fn cleanup_reclaims_source_files_after_pin_removed() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let clone_uri = fixture.sibling_path("my_clone");
+        create_clone_then_overwrite_source(&fixture, &clone_uri)
+            .await
+            .unwrap();
+
+        let source = fixture.load().await.unwrap();
+        let clone = fixture.load_dataset(&clone_uri).await.unwrap();
+        let pin_id = clone.source_pin_id().unwrap().to_string();
+        source.clone_pins().unregister(&pin_id).await.unwrap();
+
+        let removed = run_reachability_cleanup(&fixture).await.unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+
+        let clone = fixture.load_dataset(&clone_uri).await.unwrap();
+        assert!(scan_row_count(&clone).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_on_source_keeps_version_pinned_by_remaining_clone() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let first_clone_uri = fixture.sibling_path("first_clone");
+        create_clone_then_overwrite_source(&fixture, &first_clone_uri)
+            .await
+            .unwrap();
+
+        let second_clone_uri = fixture.sibling_path("second_clone");
+        let mut source = fixture.load().await.unwrap();
+        let second = source
+            .shallow_clone(&second_clone_uri, 1, Some(fixture.os_params()))
+            .await
+            .unwrap();
+
+        let first = fixture.load_dataset(&first_clone_uri).await.unwrap();
+        source
+            .clone_pins()
+            .unregister(first.source_pin_id().unwrap())
+            .await
+            .unwrap();
+
+        let removed = run_reachability_cleanup(&fixture).await.unwrap();
+
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 0);
+
+        source
+            .clone_pins()
+            .unregister(second.source_pin_id().unwrap())
+            .await
+            .unwrap();
+        let removed = run_reachability_cleanup(&fixture).await.unwrap();
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_ignores_clone_pins_from_other_branches() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut source = fixture.load().await.unwrap();
+        fixture
+            .create_branch_and_load(&mut source, "dev", 1)
+            .await
+            .unwrap();
+
+        let dev_identifier = source.branches().get_identifier(Some("dev")).await.unwrap();
+        source
+            .clone_pins()
+            .create_pin(
+                Some("dev"),
+                &dev_identifier,
+                1,
+                Some(&fixture.sibling_path("branch_clone")),
+            )
+            .await
+            .unwrap();
+        // Force-drop the branch so lineage retention does not keep main version 1 and the
+        // pin becomes orphaned. Main cleanup must still ignore it because it carries a
+        // different branch_id.
+        source.force_delete_branch("dev").await.unwrap();
+
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let removed = run_reachability_cleanup(&fixture).await.unwrap();
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_on_branch_keeps_shallow_clone_files() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut source = fixture.load().await.unwrap();
+        let mut branch = fixture
+            .create_branch_and_load(&mut source, "dev", 1)
+            .await
+            .unwrap();
+
+        let clone_uri = fixture.sibling_path("branch_clone");
+        let cloned_version = branch.version().version;
+        let expected_rows = scan_row_count(&branch).await.unwrap();
+        branch
+            .shallow_clone(&clone_uri, cloned_version, Some(fixture.os_params()))
+            .await
+            .unwrap();
+
+        Dataset::write(
+            some_batch(),
+            &branch.uri,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let branch = fixture.load_dataset(&branch.uri).await.unwrap();
+        let removed = cleanup_old_versions(
+            &branch,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
+                .delete_unverified(true)
+                .error_if_tagged_old_versions(false)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 0);
+
+        let clone = fixture.load_dataset(&clone_uri).await.unwrap();
+        assert_eq!(scan_row_count(&clone).await.unwrap(), expected_rows);
+    }
+
+    #[tokio::test]
+    async fn branch_delete_refused_while_clone_pin_exists() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut source = fixture.load().await.unwrap();
+        let branch = fixture
+            .create_branch_and_load(&mut source, "dev", 1)
+            .await
+            .unwrap();
+        // Branch-local data, so branch deletion actually removes files the clone reads.
+        Dataset::write(
+            some_batch(),
+            &branch.uri,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut branch = fixture.load_dataset(&branch.uri).await.unwrap();
+
+        let clone_uri = fixture.sibling_path("branch_delete_clone");
+        let expected_rows = scan_row_count(&branch).await.unwrap();
+        let cloned_version = branch.version().version;
+        let clone = branch
+            .shallow_clone(&clone_uri, cloned_version, Some(fixture.os_params()))
+            .await
+            .unwrap();
+        let pin_id = clone.source_pin_id().unwrap().to_string();
+
+        let error = source.delete_branch("dev").await.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }), "{error:?}");
+        assert!(error.to_string().contains("unregister them"), "{error}");
+
+        // The refused delete leaves the fence. The clone keeps working, the
+        // incarnation is closed to new shallow clones.
+        let clone = fixture.load_dataset(&clone_uri).await.unwrap();
+        assert_eq!(scan_row_count(&clone).await.unwrap(), expected_rows);
+        let mut branch = fixture.load_dataset(&branch.uri).await.unwrap();
+        let blocked = branch
+            .shallow_clone(
+                &fixture.sibling_path("blocked_after_delete"),
+                cloned_version,
+                Some(fixture.os_params()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            blocked.to_string().contains("deletion of this branch"),
+            "{blocked}"
+        );
+
+        source.clone_pins().unregister(&pin_id).await.unwrap();
+        source.delete_branch("dev").await.unwrap();
+        let clone = fixture.load_dataset(&clone_uri).await.unwrap();
+        assert!(scan_row_count(&clone).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn branch_delete_fence_aborts_pin_created_after_check() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut source = fixture.load().await.unwrap();
+        fixture
+            .create_branch_and_load(&mut source, "dev", 1)
+            .await
+            .unwrap();
+
+        let identifier = source.branches().get_identifier(Some("dev")).await.unwrap();
+        let clone_pins = source.clone_pins();
+
+        // The fence lands between pin creation and the clone's second check, the way a
+        // concurrent delete_branch writes it after this clone passed the first check.
+        let error = create_shallow_clone_pin_with_hook(
+            &clone_pins,
+            Some("dev"),
+            &identifier,
+            1,
+            &fixture.sibling_path("racing_clone"),
+            async {
+                clone_pins
+                    .write_gc_marker_in_namespace(
+                        identifier.marker_namespace(),
+                        GcMarker::BranchDeleted,
+                    )
+                    .await
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("deletion of this branch"),
+            "{error}"
+        );
+        assert!(
+            clone_pins.list().await.unwrap().is_empty(),
+            "aborted clone must unregister its pin so the rerun delete proceeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn recreated_branch_does_not_inherit_gc_markers_or_pins() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut source = fixture.load().await.unwrap();
+        let branch = fixture
+            .create_branch_and_load(&mut source, "dev", 1)
+            .await
+            .unwrap();
+        let branch_version = branch.version().version;
+        let old_identifier = source.branches().get_identifier(Some("dev")).await.unwrap();
+        let old_branch_id = old_identifier.branch_id().map(str::to_string);
+
+        source
+            .clone_pins()
+            .write_gc_marker(Some("dev"), branch_version)
+            .await
+            .unwrap();
+        source
+            .clone_pins()
+            .create_pin(
+                Some("dev"),
+                &old_identifier,
+                branch_version,
+                Some(&fixture.sibling_path("old")),
+            )
+            .await
+            .unwrap();
+
+        // Force past the pin fence so the old pin survives as an orphan of the
+        // deleted incarnation.
+        source.force_delete_branch("dev").await.unwrap();
+
+        let mut recreated = fixture
+            .create_branch_and_load(&mut source, "dev", 1)
+            .await
+            .unwrap();
+        let resolved = source.branches().resolve_branch(Some("dev")).await.unwrap();
+        let new_identifier = resolved.identifier;
+        let new_branch_id = new_identifier.branch_id().map(str::to_string);
+        assert_eq!(resolved.location.branch.as_deref(), Some("dev"));
+        assert_ne!(
+            old_identifier.marker_namespace(),
+            new_identifier.marker_namespace()
+        );
+        assert_ne!(old_branch_id, new_branch_id);
+        assert!(
+            !source
+                .branches()
+                .matches_identifier(Some("dev"), &old_identifier)
+                .await
+                .unwrap()
+        );
+        assert!(
+            source
+                .branches()
+                .matches_identifier(Some("dev"), &new_identifier)
+                .await
+                .unwrap()
+        );
+        assert!(
+            source
+                .clone_pins()
+                .has_gc_marker_in_namespace(
+                    old_identifier.marker_namespace(),
+                    GcMarker::Version(branch_version),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !source
+                .clone_pins()
+                .has_gc_marker(Some("dev"), branch_version)
+                .await
+                .unwrap()
+        );
+
+        recreated
+            .shallow_clone(
+                &fixture.sibling_path("recreated_branch_clone"),
+                branch_version,
+                Some(fixture.os_params()),
+            )
+            .await
+            .unwrap();
+
+        let pins = source.clone_pins().list().await.unwrap();
+        assert_eq!(
+            pins.iter()
+                .filter(|pin| pin.branch_id == new_branch_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            pins.iter()
+                .filter(|pin| pin.branch_id == old_branch_id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_version_when_pin_appears_after_marker() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let dataset = fixture.load().await.unwrap();
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
+            .delete_unverified(true)
+            .error_if_tagged_old_versions(false)
+            .build();
+        let cleanup = CleanupTask::new(&dataset, policy, CleanupAction::Execute);
+
+        let retained = RetainedVersions::default();
+        let mut inspection = cleanup.process_manifests(&retained).await.unwrap();
+        assert!(
+            inspection
+                .old_manifests
+                .values()
+                .any(|&version| version == 1)
+        );
+
+        // Cleanup has marked the version. A concurrent clone writes its pin before the
+        // post-mark pin list. Cleanup retains the version and keeps the marker.
+        dataset.clone_pins().write_gc_marker(None, 1).await.unwrap();
+        dataset
+            .clone_pins()
+            .create_pin(
+                None,
+                &BranchIdentifier::main(),
+                1,
+                Some(&fixture.sibling_path("late_clone")),
+            )
+            .await
+            .unwrap();
+
+        inspection = cleanup
+            .mark_old_versions_and_retain_protected(inspection, &BranchIdentifier::main())
+            .await
+            .unwrap();
+        assert!(
+            !inspection
+                .old_manifests
+                .values()
+                .any(|&version| version == 1)
+        );
+        assert!(dataset.clone_pins().has_gc_marker(None, 1).await.unwrap());
+
+        let removed = cleanup.delete_unreferenced_files(inspection).await.unwrap();
+        assert_eq!(removed.stats.old_versions, 0);
+        assert_eq!(removed.stats.data_files_removed, 0);
+
+        let mut source = fixture.load().await.unwrap();
+        let error = source
+            .shallow_clone(
+                &fixture.sibling_path("closed_clone"),
+                1,
+                Some(fixture.os_params()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("marked it for deletion"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_version_when_tag_appears_after_initial_listing() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let dataset = fixture.load().await.unwrap();
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
+            .delete_unverified(true)
+            .error_if_tagged_old_versions(false)
+            .build();
+        let cleanup = CleanupTask::new(&dataset, policy, CleanupAction::Execute);
+
+        let retained = RetainedVersions::default();
+        let mut inspection = cleanup.process_manifests(&retained).await.unwrap();
+        assert!(
+            inspection
+                .old_manifests
+                .values()
+                .any(|&version| version == 1)
+        );
+
+        // A tag created after this run's first tag listing, the way a RequireTag clone's
+        // tag appears mid-cleanup. The post-mark recheck must see it and retain the version.
+        dataset.tags().create("late_tag", 1).await.unwrap();
+
+        inspection = cleanup
+            .mark_old_versions_and_retain_protected(inspection, &BranchIdentifier::main())
+            .await
+            .unwrap();
+        assert!(
+            !inspection
+                .old_manifests
+                .values()
+                .any(|&version| version == 1)
+        );
+
+        let removed = cleanup.delete_unreferenced_files(inspection).await.unwrap();
+        assert_eq!(removed.stats.old_versions, 0);
+        assert_eq!(removed.stats.data_files_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_marker_after_deleting_version() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let removed = run_reachability_cleanup(&fixture).await.unwrap();
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+
+        let source = fixture.load().await.unwrap();
+        assert!(source.clone_pins().has_gc_marker(None, 1).await.unwrap());
+
+        // A later cleanup must not clear the marker for an already-deleted version.
+        run_reachability_cleanup(&fixture).await.unwrap();
+        let source = fixture.load().await.unwrap();
+        assert!(source.clone_pins().has_gc_marker(None, 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn shallow_clone_rejects_version_marked_for_cleanup() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut source = fixture.load().await.unwrap();
+
+        source.clone_pins().write_gc_marker(None, 1).await.unwrap();
+
+        let clone_uri = fixture.sibling_path("blocked_clone");
+        let error = source
+            .shallow_clone(&clone_uri, 1, Some(fixture.os_params()))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("marked it for deletion"),
+            "{error}"
+        );
+        assert!(source.clone_pins().has_gc_marker(None, 1).await.unwrap());
+        assert!(
+            source.clone_pins().list().await.unwrap().is_empty(),
+            "rejected clone must not leave a pin"
+        );
+        assert!(fixture.load_dataset(&clone_uri).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shallow_clone_removes_pin_when_marker_appears_after_pin_creation() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let source = fixture.load().await.unwrap();
+        let clone_pins = source.clone_pins();
+        let clone_uri = fixture.sibling_path("second_check_clone");
+
+        let error = create_shallow_clone_pin_with_hook(
+            &clone_pins,
+            None,
+            &BranchIdentifier::main(),
+            1,
+            &clone_uri,
+            async {
+                clone_pins.write_gc_marker(None, 1).await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("marked it for deletion"),
+            "{error}"
+        );
+        assert!(clone_pins.has_gc_marker(None, 1).await.unwrap());
+        assert!(
+            clone_pins.list().await.unwrap().is_empty(),
+            "second marker check must unregister the unused pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_shallow_clone_does_not_block_later_cleanup() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let first_clone_uri = fixture.sibling_path("first_clone");
+        create_clone_then_overwrite_source(&fixture, &first_clone_uri)
+            .await
+            .unwrap();
+
+        let mut source = fixture.load().await.unwrap();
+        source.clone_pins().write_gc_marker(None, 1).await.unwrap();
+
+        source
+            .shallow_clone(
+                &fixture.sibling_path("rejected_clone"),
+                1,
+                Some(fixture.os_params()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(source.clone_pins().list().await.unwrap().len(), 1);
+
+        let first = fixture.load_dataset(&first_clone_uri).await.unwrap();
+        source
+            .clone_pins()
+            .unregister(first.source_pin_id().unwrap())
+            .await
+            .unwrap();
+
+        let removed = run_reachability_cleanup(&fixture).await.unwrap();
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+    }
+
     #[tokio::test]
     async fn cleanup_ignores_old_manifest_removed_after_listing() {
         let fixture = MockDatasetFixture::try_new().unwrap();
@@ -2080,7 +2889,7 @@ mod tests {
             .process_manifest_file(
                 old_manifest,
                 &Mutex::new(CleanupInspection::default()),
-                &HashSet::new(),
+                &RetainedVersions::default(),
             )
             .await
             .unwrap();
