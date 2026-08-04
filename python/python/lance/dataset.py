@@ -3292,7 +3292,7 @@ class LanceDataset(pa.dataset.Dataset):
             if hasattr(field_type, "storage_type"):
                 field_type = field_type.storage_type
 
-            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
+            if index_type in ["BTREE", "BITMAP"]:
                 if (
                     not pa.types.is_integer(field_type)
                     and not pa.types.is_floating(field_type)
@@ -3303,7 +3303,7 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
-                        f"BTREE/BITMAP/ZONEMAP index column {column} must be int",
+                        f"BTREE/BITMAP index column {column} must be int",
                         ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
