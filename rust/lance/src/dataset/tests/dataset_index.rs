@@ -4293,7 +4293,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Verify that the index file uses the same version as the dataset
     assert_eq!(
         index_reader.metadata().version(),
-        dataset_version,
+        dataset_version.into(),
         "Index file should use the same format version as the dataset"
     );
 
@@ -4322,7 +4322,7 @@ async fn test_index_inherits_dataset_file_version() {
 
         assert_eq!(
             aux_reader.metadata().version(),
-            dataset_version,
+            dataset_version.into(),
             "Auxiliary index file should use the same format version as the dataset"
         );
     }
@@ -4401,7 +4401,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Verify that the index file uses V2_0 (not legacy)
     assert_eq!(
         index_reader.metadata().version(),
-        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_0.into(),
         "Index files should never use legacy format, even for legacy datasets"
     );
 }
