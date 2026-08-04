@@ -5628,6 +5628,13 @@ class SqlQueryBuilder:
         other table in the SQL (for example joined or used in a subquery). It
         must be non-empty, since the schema is derived from the provided data.
 
+        ``name`` is parsed as a SQL identifier, so an unquoted name is lowercased
+        (``IDs`` registers the table ``ids``) while a quoted one keeps its case
+        (``"IDs"``). If two names resolve to the same table, the later
+        registration wins. A name that resolves to the query's own
+        :meth:`table_name` would hide the dataset and is rejected by
+        :meth:`build`.
+
         Parameters
         ----------
         name: str

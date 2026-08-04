@@ -51,8 +51,14 @@ public class SqlQuery {
    * #intoBatchRecords()} consumes the stream during the native call (it takes ownership of the
    * underlying C stream); the caller still owns the {@link ArrowArrayStream} handle and should
    * close it afterwards (typically via try-with-resources), as with {@code MergeInsert}. May be
-   * called multiple times to register multiple tables; if a name is registered twice, the later
-   * registration replaces the earlier one (deduplicated when the query is built).
+   * called multiple times to register multiple tables.
+   *
+   * <p>{@code name} is parsed as a SQL identifier, so an unquoted name is lowercased ({@code IDs}
+   * registers the table {@code ids}) while a quoted one keeps its case ({@code "IDs"} registers the
+   * table {@code IDs}). If two names resolve to the same table, the later registration replaces the
+   * earlier one (deduplicated when the query is built). A name that resolves to the query's own
+   * {@link #tableName(String)} would hide the dataset, so {@link #intoBatchRecords()} rejects it
+   * with an {@link IllegalArgumentException}.
    *
    * <p>Because the registered stream is consumed on the first {@link #intoBatchRecords()} call, a
    * query with registered relations is single-use; calling {@link #intoBatchRecords()} a second

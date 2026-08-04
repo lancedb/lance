@@ -223,6 +223,15 @@ public class SqlQueryTest {
             IllegalStateException.class, () -> q.registerArrow("more", moreStream));
       }
     }
+
+    // A relation whose name resolves to the query's own table name would hide the dataset, so the
+    // native build rejects it (the Rust InvalidInput surfaces as IllegalArgumentException).
+    try (VectorSchemaRoot ids = idTable(1, 2);
+        ArrowArrayStream stream = toStream(ids)) {
+      SqlQuery q =
+          dataset.sql("select id from " + NAME).tableName(NAME).registerArrow(NAME, stream);
+      Assertions.assertThrows(IllegalArgumentException.class, q::intoBatchRecords);
+    }
   }
 
   /** Build a single-column (`id`: Int32) in-memory relation. */

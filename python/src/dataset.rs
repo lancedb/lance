@@ -4099,6 +4099,12 @@ impl SqlQueryBuilder {
     /// table in the query. The `data` may be a pyarrow `Table` or
     /// `RecordBatchReader` (ingested the same way as `add`/`merge_insert`), and
     /// must be non-empty since the schema is derived from its batches.
+    ///
+    /// `name` is parsed as a SQL identifier, so an unquoted name is lowercased
+    /// (`IDs` registers the table `ids`) while a quoted one keeps its case
+    /// (`"IDs"`). If two names resolve to the same table, the later registration
+    /// wins. A name that resolves to the query's own `table_name` would hide the
+    /// dataset and is rejected by `build`.
     #[pyo3(signature = (name, data))]
     fn register_arrow(&self, name: &str, data: &Bound<PyAny>) -> PyResult<Self> {
         let reader = convert_reader(data)?;

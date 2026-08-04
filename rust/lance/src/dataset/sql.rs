@@ -5,6 +5,7 @@ use crate::Dataset;
 use crate::datafusion::LanceTableProvider;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
+use datafusion::common::TableReference;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::SendableRecordBatchStream;
@@ -57,7 +58,13 @@ impl SqlQueryBuilder {
 
     /// Register an additional table named `name` in the query's DataFusion context, joinable alongside the
     /// dataset. Accepts any `TableProvider`, such as a `MemTable` (an in-memory Arrow relation), another Lance
-    /// dataset's `LanceTableProvider`, or a view. May be called more than once; a later duplicate name wins.
+    /// dataset's `LanceTableProvider`, or a view.
+    ///
+    /// `name` is parsed as a SQL identifier, so an unquoted name is lowercased (`IDs` registers the table
+    /// `ids`) while a quoted one keeps its case (`"IDs"` registers the table `IDs`). May be called more than
+    /// once; if two names resolve to the same table, the later registration wins. Registering a name that
+    /// resolves to the query's own [`Self::table_name`] would hide the dataset, so [`Self::build`] rejects it
+    /// with an invalid-input error.
     ///
     /// # Examples
     ///
@@ -189,11 +196,23 @@ impl SqlQueryBuilder {
         let ctx = SessionContext::new();
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
+        // DataFusion parses a table name as a SQL identifier, lowercasing the unquoted parts, and
+        // resolves it to a catalog.schema.table slot. Resolve names the same way here so the
+        // duplicate detection below keys on the identifier DataFusion will actually register.
+        let config = ctx.copied_config();
+        let catalog_options = &config.options().catalog;
+        let resolve = |name: &str| {
+            TableReference::from(name).resolve(
+                &catalog_options.default_catalog,
+                &catalog_options.default_schema,
+            )
+        };
+        let dataset_table = resolve(&self.table_name);
         let mut provider = LanceTableProvider::new(self.dataset.clone(), row_id, row_addr);
         if let Some(blob_handling) = self.blob_handling {
             provider = provider.with_blob_handling(blob_handling);
         }
-        ctx.register_table(self.table_name, Arc::new(provider))?;
+        ctx.register_table(self.table_name.as_str(), Arc::new(provider))?;
         // Register the extra tables, keeping the LAST provider for a name registered more than once (registering
         // the same name into the context twice would otherwise error). Iterate in reverse and skip names already
         // registered, so a later duplicate wins.
@@ -204,7 +223,17 @@ impl SqlQueryBuilder {
                     "registered table name must be non-empty, got '{name}'"
                 )));
             }
-            if registered.insert(name.clone()) {
+            let table_ref = resolve(&name);
+            // An extra table on the dataset's own slot would hide the dataset from the query, so
+            // reject it rather than letting either one silently win.
+            if table_ref == dataset_table {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "registered table name '{name}' resolves to '{table_ref}', the same table as \
+                     the query's table name '{}'; register it under a different name",
+                    self.table_name
+                )));
+            }
+            if registered.insert(table_ref) {
                 ctx.register_table(name, provider)?;
             }
         }
@@ -272,6 +301,7 @@ mod tests {
     use lance_core::datatypes::BlobHandling;
     use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
+    use rstest::rstest;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -716,6 +746,87 @@ mod tests {
         assert!(
             err.to_string().contains("non-empty"),
             "message should mention the empty name: {err}"
+        );
+    }
+
+    /// DataFusion parses a registered name as a SQL identifier, so two spellings of the same
+    /// unquoted identifier are one table and the later registration wins.
+    #[rstest]
+    #[case::later_lowercase("IDs", "ids")]
+    #[case::later_mixed_case("ids", "IDs")]
+    #[case::later_quoted("ids", "\"ids\"")]
+    #[tokio::test]
+    async fn test_sql_register_duplicate_name_ignores_case(
+        #[case] first: &str,
+        #[case] second: &str,
+    ) {
+        let ds = ids_dataset("memory://").await;
+
+        let results = ds
+            .sql("SELECT id FROM ids ORDER BY id")
+            .table_name("t")
+            .register_arrow(first, vec![ids_batch(vec![1, 2])])
+            .unwrap()
+            .register_arrow(second, vec![ids_batch(vec![7, 8, 9])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn test_sql_register_quoted_name_keeps_case() {
+        let ds = ids_dataset("memory://").await;
+
+        // A quoted identifier is not lowercased, so `"IDs"` and `ids` are two different tables and
+        // both stay registered.
+        let results = ds
+            .sql(r#"SELECT id FROM "IDs" UNION ALL SELECT id FROM ids ORDER BY id"#)
+            .table_name("t")
+            .register_arrow(r#""IDs""#, vec![ids_batch(vec![1, 2])])
+            .unwrap()
+            .register_arrow("ids", vec![ids_batch(vec![7, 8, 9])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![1, 2, 7, 8, 9]);
+    }
+
+    /// A registered name that resolves to the query's own table name would shadow the dataset, so
+    /// it is rejected instead of reaching DataFusion's opaque "table already exists" error.
+    #[rstest]
+    #[case::exact("t")]
+    #[case::different_case("T")]
+    #[case::quoted("\"t\"")]
+    #[tokio::test]
+    async fn test_sql_register_collides_with_table_name(#[case] name: &str) {
+        let ds = ids_dataset("memory://").await;
+
+        let err = ds
+            .sql("SELECT id FROM t")
+            .table_name("t")
+            .register_arrow(name, vec![ids_batch(vec![1, 2])])
+            .unwrap()
+            .build()
+            .await
+            .err()
+            .expect("expected an error for a name colliding with the query's table name");
+        assert!(
+            matches!(&err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(name) && message.contains("table name 't'"),
+            "message should name the registered table and the query table: {message}"
         );
     }
 }
