@@ -14,6 +14,7 @@
 package org.lance.ipc;
 
 import org.lance.Dataset;
+import org.lance.DocumentGranularity;
 import org.lance.WriteParams;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
@@ -41,12 +42,31 @@ import java.util.Arrays;
 import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class LanceScannerFullTextSearchTest {
 
   @Test
   void testMatchQuery() throws Exception {
-    runFtsQuery("memory://fts_java_match", FullTextQuery.match("hello", "doc"), 2L);
+    runFtsQuery(
+        "memory://fts_java_match",
+        FullTextQuery.match("hello", "doc", DocumentGranularity.ROW),
+        2L);
+  }
+
+  @Test
+  void testExplicitListElementGranularityReachesRustRouting() {
+    RuntimeException error =
+        assertThrows(
+            RuntimeException.class,
+            () ->
+                runFtsQuery(
+                    "memory://fts_java_list_element_validation",
+                    FullTextQuery.match("hello", "doc", DocumentGranularity.LIST_ELEMENT),
+                    0L));
+    assertTrue(error.getMessage().contains("requested ListElement"), error.getMessage());
+    assertTrue(error.getMessage().contains("'doc_idx' (Row)"), error.getMessage());
   }
 
   @Test

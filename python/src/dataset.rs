@@ -71,7 +71,6 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -80,6 +79,7 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
+    scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
@@ -1283,6 +1283,13 @@ impl Dataset {
 
                 let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
                 let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
+                let document_granularity = match full_text_query.get_item("document_granularity")? {
+                    Some(value) if !value.is_none() => Some(
+                        DocumentGranularity::try_from(value.extract::<String>()?.as_str())
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                    ),
+                    _ => None,
+                };
 
                 if is_phrase {
                     // Remove the surrounding quotes for phrase queries
@@ -1290,8 +1297,20 @@ impl Dataset {
                 }
 
                 let query: FtsQuery = match (is_phrase, is_multi_match) {
-                    (false, _) => MatchQuery::new(query).into(),
-                    (true, false) => PhraseQuery::new(query).into(),
+                    (false, _) => {
+                        let mut query = MatchQuery::new(query);
+                        if let Some(document_granularity) = document_granularity {
+                            query = query.with_document_granularity(document_granularity);
+                        }
+                        query.into()
+                    }
+                    (true, false) => {
+                        let mut query = PhraseQuery::new(query);
+                        if let Some(document_granularity) = document_granularity {
+                            query = query.with_document_granularity(document_granularity);
+                        }
+                        query.into()
+                    }
                     (true, true) => {
                         return Err(PyValueError::new_err(
                             "Phrase queries cannot be used with multiple columns.",
@@ -2538,6 +2557,7 @@ impl Dataset {
                 if let Some(kwargs) = kwargs {
                     let allowed_kwargs = [
                         "analyzer",
+                        "document_granularity",
                         "with_position",
                         "base_tokenizer",
                         "language",
@@ -2622,6 +2642,13 @@ impl Dataset {
                         params = params
                             .analyzer(&analyzer)
                             .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    }
+                    if let Some(document_granularity) = kwargs.get_item("document_granularity")? {
+                        let document_granularity: String = document_granularity.extract()?;
+                        params = params.document_granularity(
+                            DocumentGranularity::try_from(document_granularity.as_str())
+                                .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                        );
                     }
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
@@ -5277,7 +5304,8 @@ pub struct PyFullTextQuery {
 #[pymethods]
 impl PyFullTextQuery {
     #[staticmethod]
-    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0))]
+    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0, document_granularity=None))]
+    #[allow(clippy::too_many_arguments)]
     fn match_query(
         query: String,
         column: String,
@@ -5286,30 +5314,48 @@ impl PyFullTextQuery {
         max_expansions: usize,
         operator: &str,
         prefix_length: u32,
+        document_granularity: Option<&str>,
     ) -> PyResult<Self> {
+        let mut query = MatchQuery::new(query)
+            .with_column(Some(column))
+            .with_boost(boost)
+            .with_fuzziness(fuzziness)
+            .with_max_expansions(max_expansions)
+            .with_operator(
+                Operator::try_from(operator)
+                    .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
+            )
+            .with_prefix_length(prefix_length);
+        if let Some(document_granularity) = document_granularity {
+            query = query.with_document_granularity(
+                DocumentGranularity::try_from(document_granularity)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            );
+        }
         Ok(Self {
-            inner: MatchQuery::new(query)
-                .with_column(Some(column))
-                .with_boost(boost)
-                .with_fuzziness(fuzziness)
-                .with_max_expansions(max_expansions)
-                .with_operator(
-                    Operator::try_from(operator)
-                        .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
-                )
-                .with_prefix_length(prefix_length)
-                .into(),
+            inner: query.into(),
         })
     }
 
     #[staticmethod]
-    #[pyo3(signature = (query, column, slop))]
-    fn phrase_query(query: String, column: String, slop: u32) -> PyResult<Self> {
+    #[pyo3(signature = (query, column, slop, document_granularity=None))]
+    fn phrase_query(
+        query: String,
+        column: String,
+        slop: u32,
+        document_granularity: Option<&str>,
+    ) -> PyResult<Self> {
+        let mut query = PhraseQuery::new(query)
+            .with_column(Some(column))
+            .with_slop(slop);
+        if let Some(document_granularity) = document_granularity {
+            query = query.with_document_granularity(
+                DocumentGranularity::try_from(document_granularity)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            );
+        }
         Ok(Self {
-            inner: PhraseQuery::new(query)
-                .with_column(Some(column))
-                .with_slop(slop)
-                .into(),
+            inner: query.into(),
         })
     }
 

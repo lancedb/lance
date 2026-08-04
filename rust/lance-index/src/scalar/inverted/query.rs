@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::inverted::DocumentGranularity;
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
@@ -317,6 +318,15 @@ pub struct MatchQuery {
     /// Default to 0.
     #[serde(default)]
     pub prefix_length: u32,
+
+    /// The requested logical document unit.
+    ///
+    /// When absent, query planning uses the granularity stored by the unique
+    /// FTS index on `column`. If no index exists, planning defaults to row
+    /// documents. Callers must set this when both row and list-element indexes
+    /// exist on the same field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_granularity: Option<DocumentGranularity>,
 }
 
 impl MatchQuery {
@@ -329,6 +339,7 @@ impl MatchQuery {
             max_expansions: 50,
             operator: Operator::Or,
             prefix_length: 0,
+            document_granularity: None,
         }
     }
 
@@ -370,6 +381,11 @@ impl MatchQuery {
         self
     }
 
+    pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = Some(document_granularity);
+        self
+    }
+
     pub fn auto_fuzziness(token: &str) -> u32 {
         match token.len() {
             0..=2 => 0,
@@ -397,6 +413,14 @@ pub struct PhraseQuery {
     pub terms: String,
     #[serde(default = "u32::default")]
     pub slop: u32,
+    /// The requested logical document unit.
+    ///
+    /// When absent, query planning uses the granularity stored by the unique
+    /// FTS index on `column`. If no index exists, planning defaults to row
+    /// documents. Callers must set this when both row and list-element indexes
+    /// exist on the same field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_granularity: Option<DocumentGranularity>,
 }
 
 impl PhraseQuery {
@@ -405,6 +429,7 @@ impl PhraseQuery {
             column: None,
             terms,
             slop: 0,
+            document_granularity: None,
         }
     }
 
@@ -415,6 +440,11 @@ impl PhraseQuery {
 
     pub fn with_slop(mut self, slop: u32) -> Self {
         self.slop = slop;
+        self
+    }
+
+    pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = Some(document_granularity);
         self
     }
 }
@@ -958,6 +988,19 @@ mod tests {
         assert_eq!(query.max_expansions, 50);
         assert_eq!(query.operator, Operator::Or);
         assert_eq!(query.prefix_length, 0);
+        assert_eq!(query.document_granularity, None);
+
+        let query = query.with_document_granularity(DocumentGranularity::ListElement);
+        assert_eq!(
+            query.document_granularity,
+            Some(DocumentGranularity::ListElement)
+        );
+        let serialized = serde_json::to_value(&query).unwrap();
+        assert_eq!(serialized["document_granularity"], "list_element");
+        assert_eq!(
+            serde_json::from_value::<MatchQuery>(serialized).unwrap(),
+            query
+        );
     }
 
     #[test]
@@ -982,6 +1025,14 @@ mod tests {
             .with_slop(2);
         let query: PhraseQuery = serde_json::from_value(query).unwrap();
         assert_eq!(query, expected);
+
+        let query = query.with_document_granularity(DocumentGranularity::ListElement);
+        let serialized = serde_json::to_value(&query).unwrap();
+        assert_eq!(serialized["document_granularity"], "list_element");
+        assert_eq!(
+            serde_json::from_value::<PhraseQuery>(serialized).unwrap(),
+            query
+        );
     }
 
     #[test]

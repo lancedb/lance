@@ -74,7 +74,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .query import FullTextQuery
+from .query import DocumentGranularity, FullTextQuery
 from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -3257,8 +3257,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         column = column[0]
         lance_field = self._ds.lance_schema.field_case_insensitive(column)
-        if lance_field is None:
-            raise KeyError(f"{column} not found in schema")
 
         if isinstance(index_type, str):
             index_type = index_type.upper()
@@ -3280,6 +3278,12 @@ class LanceDataset(pa.dataset.Dataset):
                         f"scalar columns.  Received {index_type}",
                     )
                 )
+
+            if lance_field is None:
+                if index_type in ["INVERTED", "FTS"]:
+                    # Rust resolves public FTS paths through intervening list layers.
+                    return column, index_type, index_type
+                raise KeyError(f"{column} not found in schema")
 
             field = lance_field.to_arrow()
 
@@ -3338,7 +3342,12 @@ class LanceDataset(pa.dataset.Dataset):
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
-            config = json.dumps(index_type.parameters)
+            if lance_field is None and logical_index_type not in ["INVERTED", "FTS"]:
+                raise KeyError(f"{column} not found in schema")
+            parameters = dict(index_type.parameters)
+            if logical_index_type in ["INVERTED", "FTS"]:
+                parameters["document_granularity"] = kwargs["document_granularity"]
+            config = json.dumps(parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
             return column, "scalar", logical_index_type
         else:
@@ -3407,6 +3416,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         format_version: Optional[Union[int, str]] = None,
+        document_granularity: DocumentGranularity = DocumentGranularity.ROW,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -3520,6 +3530,11 @@ class LanceDataset(pa.dataset.Dataset):
             otherwise writes v2 for text analysis with ``block_size=128`` and
             v3 for code analysis or ``block_size=256``.
 
+        document_granularity: DocumentGranularity, default ROW
+            This is for the ``INVERTED`` / ``FTS`` index. ``ROW`` treats all
+            selected text in one dataset row as one document. ``LIST_ELEMENT``
+            treats each element of the deepest list on ``column`` as one document.
+
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
@@ -3613,6 +3628,11 @@ class LanceDataset(pa.dataset.Dataset):
         ``MaterializeIndex`` operator.
 
         """
+        if not isinstance(document_granularity, DocumentGranularity):
+            raise TypeError(
+                "document_granularity must be a lance.query.DocumentGranularity"
+            )
+        kwargs["document_granularity"] = document_granularity.value
         column, index_type, logical_index_type = self._prepare_scalar_index_request(
             column, index_type, kwargs
         )
@@ -3634,7 +3654,6 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["progress_callback"] = progress_callback
         if format_version is not None:
             kwargs["format_version"] = format_version
-
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def _create_index_impl(
