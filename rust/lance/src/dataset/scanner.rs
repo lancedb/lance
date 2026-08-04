@@ -10705,6 +10705,65 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_tmp_review_ngram_contains_subtrigram() {
+        // TEMP (review-only): repro of issue #7841 on current main.
+        let unit = [
+            "this ramen recipe simmers",
+            "the beta ray shines",
+            "dog",
+            "c---d",
+        ];
+        let values: Vec<&str> = unit.iter().copied().cycle().take(60).collect();
+        let array = StringArray::from_iter_values(values);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let write_params = WriteParams {
+            max_rows_per_file: 20, // 60 rows -> 3 fragments
+            ..Default::default()
+        };
+        let mut dataset =
+            Dataset::write(reader, "memory://test_tmp_review_7841", Some(write_params))
+                .await
+                .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        async fn count(dataset: &Dataset, filter: &str) -> usize {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let batches = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            batches.iter().map(|b| b.num_rows()).sum()
+        }
+
+        // 'ra' (2 chars): units 0 and 1 match -> 30 of 60 rows.
+        assert_eq!(count(&dataset, "contains(text, 'ra')").await, 30);
+        // '---' (3 chars but every trigram is dropped by AlphaNumOnlyFilter):
+        // unit 3 matches -> 15 rows.
+        assert_eq!(count(&dataset, "contains(text, '---')").await, 15);
+        // 'ramen' (>= 3 chars): unit 0 -> 15 rows.
+        assert_eq!(count(&dataset, "contains(text, 'ramen')").await, 15);
+    }
+
+    #[tokio::test]
     async fn test_like_prefix_with_btree_index() {
         // Create dataset with string data that has various prefixes
         // Avoid LIKE special characters (%, _) in data to keep tests simple
