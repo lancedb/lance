@@ -2128,6 +2128,39 @@ async fn append_dictionary(
     }
 }
 
+#[tokio::test]
+async fn write_rejects_dictionary_indices_wider_than_declared_key_type() {
+    let dictionary = Arc::new(StringArray::from_iter_values(
+        (0..=i8::MAX).map(|value| format!("value-{value}")),
+    ));
+    let indices = Int8Array::from((0..=i8::MAX).map(Some).chain([None]).collect::<Vec<_>>());
+    let dictionary = Int8DictionaryArray::try_new(indices, dictionary).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect_err("the widened indices cannot be represented by Int8");
+
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("dictionary indices use 32 bits but the declared Int8 key type uses 8 bits")
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn overwrite_dataset(

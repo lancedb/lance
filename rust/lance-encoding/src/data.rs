@@ -985,6 +985,16 @@ impl DictionaryDataBlock {
         value_type: Box<DataType>,
         validate: bool,
     ) -> Result<ArrayData> {
+        let declared_key_bits = key_type.byte_width() as u64 * 8;
+        if self.indices.bits_per_value != declared_key_bits {
+            return Err(lance_core::Error::corrupt_file_named(
+                "dictionary",
+                format!(
+                    "dictionary indices use {} bits but the declared {} key type uses {} bits",
+                    self.indices.bits_per_value, key_type, declared_key_bits
+                ),
+            ));
+        }
         let indices = self.indices.into_arrow((*key_type).clone(), validate)?;
         let dictionary = self
             .dictionary
@@ -2472,6 +2482,35 @@ mod tests {
         assert!(
             matches!(error, Error::CorruptFile { .. }),
             "expected CorruptFile, got: {error}"
+        );
+    }
+
+    #[test]
+    fn dictionary_rejects_indices_wider_than_declared_key_type() {
+        let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 128]),
+                bits_per_value: 32,
+                num_values: 3,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec![
+                Some("zero"),
+                Some("one"),
+                None,
+            ]))),
+        });
+
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let error = dictionary
+            .into_arrow(data_type, false)
+            .expect_err("mismatched dictionary index widths must be rejected");
+
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(
+            error.to_string().contains(
+                "dictionary indices use 32 bits but the declared Int8 key type uses 8 bits"
+            )
         );
     }
 
