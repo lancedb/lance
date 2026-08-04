@@ -821,7 +821,7 @@ pub(crate) async fn cleanup_data_fragments(
     let data_dir = base_dir.clone().join(DATA_DIR);
     let mut skipped_external = 0usize;
     for fragment in fragments {
-        for file in &fragment.files {
+        for file in fragment.data_files() {
             let (store, file_dir) = if let Some(base_id) = file.base_id {
                 match target_bases.and_then(|bases| bases.iter().find(|b| b.base_id == base_id)) {
                     Some(base_info) => {
@@ -4013,6 +4013,58 @@ mod tests {
             count_data_files(test_uri),
             0,
             "Local data file should be deleted by cleanup"
+        );
+    }
+
+    /// Cleanup of a failed write must delete overlay data files, not only base
+    /// files.
+    #[tokio::test]
+    async fn test_cleanup_data_fragments_deletes_overlay_files() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+
+        let data_dir = base_dir.clone().join(DATA_DIR);
+        for name in ["base.lance", "overlay.lance"] {
+            object_store
+                .put(&data_dir.clone().join(name), b"x")
+                .await
+                .unwrap();
+        }
+        assert_eq!(count_data_files(test_uri), 2);
+
+        let fragments = vec![Fragment {
+            id: 0,
+            files: vec![DataFile::new_unstarted(
+                "base.lance",
+                ConcreteFileVersion::V2_1,
+            )],
+            overlays: vec![DataOverlayFile {
+                data_file: DataFile::new_unstarted("overlay.lance", ConcreteFileVersion::V2_1),
+                coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+                committed_version: 1,
+            }],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(0),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        }];
+
+        cleanup_data_fragments(&object_store, &base_dir, None, &fragments).await;
+
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "both the base file and the overlay's data file must be deleted"
         );
     }
 

@@ -3319,7 +3319,7 @@ impl Dataset {
                     external_file.path
                 )));
             }
-            for data_file in fragment.files.iter() {
+            for data_file in fragment.data_files() {
                 let base_root = if let Some(base_id) = data_file.base_id {
                     let base_path =
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {

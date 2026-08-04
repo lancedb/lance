@@ -594,7 +594,7 @@ impl<'a> CleanupTask<'a> {
         };
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.files.iter() {
+            for file in fragment.data_files() {
                 let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
@@ -2698,6 +2698,68 @@ mod tests {
         assert_gt!(removed.transaction_files_removed, 0);
         assert_gt!(removed.index_files_removed, 0);
         assert_gt!(removed.deletion_files_removed, 0);
+    }
+
+    /// A keep set built from `fragment.files` alone omits overlay data files, so
+    /// cleanup would delete live data.
+    #[tokio::test]
+    async fn keep_set_covers_referenced_overlay_files() {
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // The overlay file need not exist: the keep set comes from manifest
+        // metadata alone.
+        let mut dataset = fixture.open().await.unwrap();
+        let mut fragments: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        let mut overlay_file = fragments[0].files[0].clone();
+        overlay_file.path = "overlay.lance".to_string();
+        fragments[0].overlays = vec![DataOverlayFile {
+            data_file: overlay_file,
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: dataset.manifest.version,
+        }];
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Overwrite {
+                fragments,
+                schema: dataset.schema().clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+            CleanupAction::Execute,
+        );
+        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let kept: HashSet<&Path> = inspection
+            .referenced_files
+            .data_paths
+            .iter()
+            .chain(inspection.verified_files.data_paths.iter())
+            .collect();
+
+        let overlay_path = Path::from("data/overlay.lance");
+        assert!(
+            kept.contains(&overlay_path),
+            "the overlay's data file must be in the keep set, got {kept:?}"
+        );
     }
 
     #[tokio::test]
