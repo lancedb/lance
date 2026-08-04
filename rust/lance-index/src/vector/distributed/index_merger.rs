@@ -845,7 +845,7 @@ pub async fn merge_partial_vector_auxiliary_files(
 
         // Inherit format version from the first shard file
         if format_version.is_none() {
-            format_version = Some(meta.version());
+            format_version = Some(meta.version().into());
         }
 
         // Read distance type
