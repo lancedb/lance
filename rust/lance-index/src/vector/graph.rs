@@ -278,6 +278,65 @@ fn process_neighbors_with_look_ahead<F>(
     }
 }
 
+/// Smallest remainder that is worth padding up to 16 and sending through
+/// `distance_batch_16` rather than draining with scalar `distance()` calls.
+/// Overridable with `LANCE_HNSW_BATCH_PAD_MIN`; read once, this is hot-path.
+///
+/// Padding costs a tile pass over 16 rows whatever the batch holds, so the
+/// threshold is where that pass starts beating `k` scalar distance calls — which
+/// depends on how fast the build's scalar f16 kernel is, and is why this is
+/// tunable rather than a constant.
+///
+/// 3 is the default: it is the crossover for a build whose scalar f16 kernel the
+/// compiler leaves unvectorized, which is the case this batching exists to help.
+/// A build with a faster scalar kernel wants a higher value.
+///
+/// Measured end to end rather than in a microbenchmark, because the two disagree.
+/// A single-threaded microbenchmark on an idle machine puts the crossover at
+/// k = 1 for every configuration, since there a padded call's extra memory
+/// traffic is free. Under saturation it is not: on 100M x 1024, 32 physical cores
+/// at 97% utilisation, three rotated rounds, dropping the threshold from 3 to 1
+/// measured 0.999x on the unvectorized build (intervals overlapping) and 0.954x
+/// on a build whose scalar kernel is vectorized (intervals separated). The extra
+/// distances a lower threshold computes have to contend with every other query
+/// for the same cores.
+pub(crate) fn batch16_pad_min() -> usize {
+    static PAD_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAD_MIN.get_or_init(|| {
+        std::env::var("LANCE_HNSW_BATCH_PAD_MIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            // 0 would pad every single-neighbor remainder; 17+ would disable
+            // padding entirely. Both are legitimate as experiments, so only the
+            // unparseable case falls back.
+            .map(|v| v.min(17))
+            .unwrap_or(3)
+    })
+}
+
+/// Whether the fused-kernel arm of `beam_search_loop` lets its 16-wide neighbor
+/// buffer carry across popped nodes (`LANCE_HNSW_BATCH_SPAN=1`) instead of
+/// emptying it at the end of each node.
+///
+/// Off by default: spanning **changes search results**, because a neighbor found
+/// while visiting one node may not reach the candidate heap until after a later
+/// node has been popped, which reorders the traversal. With it off the batched
+/// arm stays equivalent to the unbatched one.
+///
+/// It exists because a per-node buffer is usually far from full — in
+/// steady-state beam search most of a node's neighbors are already visited — so
+/// spanning is what actually keeps the fused kernel fed. Read once; this sits on
+/// the search hot path.
+pub(crate) fn batch16_spans_nodes() -> bool {
+    static SPAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SPAN.get_or_init(|| {
+        matches!(
+            std::env::var("LANCE_HNSW_BATCH_SPAN").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 #[inline]
 fn furthest_distance(results: &BinaryHeap<OrderedNode>) -> OrderedFloat {
     results
@@ -296,6 +355,136 @@ fn push_result(results: &mut BinaryHeap<OrderedNode>, candidate: OrderedNode, k:
     }
 }
 
+/// Test-only instrumentation: number of *full* 16-wide neighbor batches flushed
+/// through [`DistCalculator::distance_batch_16`] by [`beam_search_loop`]. Lets the
+/// AMX activation test prove the batched (accelerated) path is actually exercised
+/// during graph construction, rather than every neighbor list being < 16 and
+/// silently draining through the scalar tail.
+#[cfg(test)]
+pub(crate) static BEAM_BATCH16_FLUSHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only instrumentation companion to [`BEAM_BATCH16_FLUSHES`]: number of
+/// non-empty sub-threshold remainder drains (the scalar tail). Confirms the
+/// remainder path is exercised, not just the full-batch path.
+#[cfg(test)]
+pub(crate) static BEAM_BATCH16_DRAINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only instrumentation: number of remainders that were padded up to 16 and
+/// sent through [`DistCalculator::distance_batch_16`] instead of drained scalar.
+/// In steady-state beam search most of a node's neighbors are already visited, so
+/// this is the path that carries the bulk of the fused-kernel work; a run where
+/// this stays 0 while [`BEAM_BATCH16_FLUSHES`] is small means the accelerated
+/// kernel is barely being used.
+#[cfg(test)]
+pub(crate) static BEAM_BATCH16_PADDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Gate for the two counters above. Off by default: the counter `fetch_add`s are
+/// a single shared atomic each, so leaving them live in the parallel build
+/// benchmark would serialize every flush across all worker threads and dominate
+/// the measurement. The (single-threaded) activation test flips this on around
+/// its build; the benchmark leaves it off, so only a cheap uncontended relaxed
+/// load remains on the hot path.
+#[cfg(test)]
+pub(crate) static BEAM_BATCH16_COUNT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Apply the beam-search accept / threshold / push logic for one already-computed
+/// neighbor distance. Extracted so the batched-flush path and the scalar-drain
+/// path in [`beam_search_loop`] share a single implementation.
+///
+/// `furthest` is the per-candidate snapshot of the results-heap frontier — read
+/// once when the current candidate was popped, exactly as the pre-batching loop
+/// did — while `results.len()` (and `push_result`'s own `peek`) are read fresh.
+/// Because distances are a pure function of (query, neighbor), independent of heap
+/// state, computing a batch of them up-front and then applying this in buffer order
+/// is byte-for-byte equivalent to the old interleaved per-neighbor loop.
+#[inline]
+fn apply_neighbor(
+    candidates: &mut BinaryHeap<Reverse<OrderedNode>>,
+    results: &mut BinaryHeap<OrderedNode>,
+    k: usize,
+    furthest: OrderedFloat,
+    accepts: impl Fn(u32, OrderedFloat) -> bool,
+    neighbor: u32,
+    dist: OrderedFloat,
+) {
+    if dist <= furthest || results.len() < k {
+        if accepts(neighbor, dist) {
+            push_result(results, (dist, neighbor).into(), k);
+        }
+        candidates.push(Reverse((dist, neighbor).into()));
+    }
+}
+
+/// Evaluate `len` buffered neighbors in one `distance_batch_16` call and apply
+/// them.
+///
+/// `len` is passed through, so a partial batch only gathers `len` rows: one tile
+/// pass costs the same for 3 useful lanes as for 16, but the gather scales with
+/// the rows staged.
+///
+/// **STALE — measured on the pre-`count` kernel**, which staged all 16 rows
+/// however small the batch. On Granite Rapids at dim=768 (gcc-13.4, scattered
+/// ids), one padded call against `len` scalar `distance()` calls: len=1 1.13x,
+/// len=2 0.88x, len=3 1.98x, len=4 2.30x, len=8 3.40x, len=16 5.70x. Passing
+/// `len` through is precisely what those small-`len` ratios were paying for, so
+/// they need re-measuring end to end.
+///
+/// The slots past `len` are still filled with `ids[0]` rather than left stale:
+/// the sixteen ids need not be distinct -- a calculator resolves each
+/// independently (`get_vector(ids[i])`), so a repeat merely recomputes that row
+/// -- which keeps an implementation that ignores `len` correct instead of
+/// letting it read a `u32` from an earlier flush.
+///
+/// Each neighbor is applied against the `furthest` snapshot taken when it was
+/// *discovered*, not one read at flush time, because the unbatched loop tests a
+/// neighbor against the threshold current at its parent's pop.
+macro_rules! flush_batch16 {
+    ($candidates:ident, $results:ident, $k:expr, $dist_calc:expr, $accepts_result:expr,
+     $batch_ids:ident, $batch_furthest:ident, $batch_len:ident) => {{
+        debug_assert!($batch_len > 0 && $batch_len <= 16);
+        let mut padded = $batch_ids;
+        for slot in padded.iter_mut().skip($batch_len) {
+            *slot = $batch_ids[0];
+        }
+        let mut batch_dists = [0f32; 16];
+        $dist_calc.distance_batch_16(&padded, &mut batch_dists, $batch_len);
+        #[cfg(test)]
+        if $crate::vector::graph::BEAM_BATCH16_COUNT_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if $batch_len == 16 {
+                $crate::vector::graph::BEAM_BATCH16_FLUSHES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                $crate::vector::graph::BEAM_BATCH16_PADDED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        for i in 0..$batch_len {
+            apply_neighbor(
+                &mut $candidates,
+                &mut $results,
+                $k,
+                $batch_furthest[i],
+                &$accepts_result,
+                $batch_ids[i],
+                batch_dists[i].into(),
+            );
+        }
+        // Emptied here rather than by each caller so the macro cannot leave a
+        // stale length behind. One caller — the final flush just before the
+        // traversal `break`s — never reads it again, hence the allow.
+        #[allow(unused_assignments)]
+        {
+            $batch_len = 0;
+        }
+    }};
+}
+
 macro_rules! beam_search_loop {
     (
         $candidates:ident,
@@ -307,28 +496,151 @@ macro_rules! beam_search_loop {
         $accepts_result:expr,
         |$current:ident, $process_neighbor:ident| $visit_neighbors:block
     ) => {{
-        while !$candidates.is_empty() {
+        // Decided once per search — `dist_calc` is fixed for the whole traversal.
+        // Only backends whose `distance_batch_16` is backed by a fused kernel take
+        // the batched arm; everything else (PQ, SQ, BQ, flat f32/f64, and fp16 on
+        // hosts without usable AMX-FP16) takes the `else` arm, which is the
+        // original traversal, so they are untouched by this path.
+        let use_batch16 = $dist_calc.has_batch_16_kernel();
+
+        // Opt-in via `LANCE_HNSW_BATCH_SPAN=1`: let the 16-wide buffer carry
+        // across popped nodes instead of being emptied at the end of each one.
+        //
+        // Off by default because it CHANGES RESULTS. A neighbor discovered while
+        // visiting node A may not reach `candidates` until after node B has been
+        // popped, so the traversal order differs from the unbatched loop and
+        // recall shifts rather than matching it exactly. With it off, the buffer
+        // is emptied before the next pop and the arm stays equivalent.
+        //
+        // Worth having because the buffer is per popped node, and in steady-state
+        // beam search most of a node's neighbors are already visited: a per-node
+        // buffer rarely reaches 16, so without spanning most distance work goes
+        // out through the (much smaller) remainder flushes.
+        let span_nodes = use_batch16 && $crate::vector::graph::batch16_spans_nodes();
+        // Read once per search rather than per node: `batch16_pad_min` is behind a
+        // OnceLock, but the call still costs an atomic load.
+        let pad_min = $crate::vector::graph::batch16_pad_min();
+
+        // Buffer state lives outside the loop so that it *can* span nodes. When
+        // `span_nodes` is false it is drained before the next pop, which makes it
+        // behave exactly like a buffer scoped to one node.
+        let mut batch_ids = [0u32; 16];
+        let mut batch_furthest = [OrderedFloat(0.0f32); 16];
+        let mut batch_len = 0usize;
+
+        loop {
+            if $candidates.is_empty() {
+                // Spanning can leave discovered-but-unevaluated neighbors behind,
+                // and their distances may still add candidates, so flush and
+                // re-test instead of exiting on an empty heap.
+                if batch_len == 0 {
+                    break;
+                }
+                flush_batch16!(
+                    $candidates, $results, $k, $dist_calc, $accepts_result,
+                    batch_ids, batch_furthest, batch_len
+                );
+                continue;
+            }
+
             let $current = $candidates.pop().expect("candidates is empty").0;
             let furthest = furthest_distance(&$results);
 
             if $current.dist > furthest && $results.len() == $k {
+                // Don't discard work already discovered: evaluate it so it can
+                // still enter `results`, then stop traversing.
+                if batch_len > 0 {
+                    flush_batch16!(
+                        $candidates, $results, $k, $dist_calc, $accepts_result,
+                        batch_ids, batch_furthest, batch_len
+                    );
+                }
                 break;
             }
 
-            let $process_neighbor = |neighbor: u32| {
-                if $visited.contains(neighbor) {
-                    return;
-                }
-                $visited.insert(neighbor);
-                let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
-                if dist <= furthest || $results.len() < $k {
-                    if $accepts_result(neighbor, dist) {
-                        push_result(&mut $results, (dist, neighbor).into(), $k);
+            if use_batch16 {
+                // Buffer freshly-visited neighbor ids and evaluate their distances
+                // in batches of 16 via `distance_batch_16` (one fused AMX-FP16 tile
+                // pass for flat fp16 Dot search) instead of one scalar call at a
+                // time — mirrors FAISS #5235's `search_from_candidates_fixVT`.
+                // Dedup / visited-marking still happens inline at first encounter,
+                // exactly where the scalar loop marks it; only the distance
+                // computation and its accept/push consequences are deferred to the
+                // flush.
+                let $process_neighbor = |neighbor: u32| {
+                    if $visited.contains(neighbor) {
+                        return;
                     }
-                    $candidates.push(Reverse((dist, neighbor).into()));
+                    $visited.insert(neighbor);
+                    batch_ids[batch_len] = neighbor;
+                    batch_furthest[batch_len] = furthest;
+                    batch_len += 1;
+                    if batch_len == 16 {
+                        flush_batch16!(
+                            $candidates, $results, $k, $dist_calc, $accepts_result,
+                            batch_ids, batch_furthest, batch_len
+                        );
+                    }
+                };
+                $visit_neighbors
+
+                if !span_nodes && batch_len > 0 {
+                    // Remainder for this node. Padding to 16 beats the scalar tail
+                    // above a crossover that depends on how fast the scalar f16
+                    // kernel is, i.e. on which compiler built it — see
+                    // `batch16_pad_min`. Below the crossover the gather is not
+                    // amortised, so keep the scalar drain.
+                    if batch_len >= pad_min {
+                        flush_batch16!(
+                            $candidates, $results, $k, $dist_calc, $accepts_result,
+                            batch_ids, batch_furthest, batch_len
+                        );
+                    } else {
+                        #[cfg(test)]
+                        if $crate::vector::graph::BEAM_BATCH16_COUNT_ENABLED
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            $crate::vector::graph::BEAM_BATCH16_DRAINS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        for i in 0..batch_len {
+                            let neighbor = batch_ids[i];
+                            let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
+                            apply_neighbor(
+                                &mut $candidates,
+                                &mut $results,
+                                $k,
+                                batch_furthest[i],
+                                &$accepts_result,
+                                neighbor,
+                                dist,
+                            );
+                        }
+                        batch_len = 0;
+                    }
                 }
-            };
-            $visit_neighbors
+            } else {
+                // The pre-batching traversal, unchanged: evaluate each freshly
+                // visited neighbor immediately. `apply_neighbor` holds the same
+                // accept / threshold / push logic this loop used to inline.
+                let $process_neighbor = |neighbor: u32| {
+                    if $visited.contains(neighbor) {
+                        return;
+                    }
+                    $visited.insert(neighbor);
+                    let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
+                    apply_neighbor(
+                        &mut $candidates,
+                        &mut $results,
+                        $k,
+                        furthest,
+                        &$accepts_result,
+                        neighbor,
+                        dist,
+                    );
+                };
+                $visit_neighbors
+            }
         }
     }};
 }
@@ -766,6 +1078,23 @@ pub fn greedy_search_borrowed(
 mod tests {
     use super::*;
 
+    use super::{BEAM_BATCH16_COUNT_ENABLED, BEAM_BATCH16_FLUSHES};
+    use crate::vector::flat::storage::FlatFloatStorage;
+    use crate::vector::hnsw::HNSW;
+    use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
+    use crate::vector::storage::{DistCalculator, VectorStore};
+    use crate::vector::v3::subindex::IvfSubIndex;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float16Array};
+    use half::f16;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_linalg::distance::DistanceType;
+    use lance_linalg::distance::dot_f16::amx_fp16_available;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
+
     struct ChainGraph {
         neighbors: Vec<Vec<u32>>,
     }
@@ -854,5 +1183,240 @@ mod tests {
         assert_eq!(basic_results.len(), PASSING_COUNT);
         assert_eq!(acorn_results.len(), PASSING_COUNT);
         assert!(acorn_results.iter().all(|node| mask.contains(node.id)));
+    }
+
+    /// Deterministic random f32 vectors in `[-1, 1)`, flat `n * dim` layout.
+    fn gen_vectors(seed: u64, n: usize, dim: usize) -> Vec<f32> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        (0..n * dim)
+            .map(|_| rng.random_range(-1.0f32..1.0))
+            .collect()
+    }
+
+    // ===== Flat fp16 (AMX-FP16) HNSW query-path tests & benchmark =====
+    //
+    // The AMX-FP16 override lives on the flat fp16 distance calculator, so it
+    // fires on the real user query path (table.search -> HNSW search ->
+    // FlatFloatDistanceCalc::distance_batch_16).
+
+    /// Flat (unquantized) fp16 storage over `values`, Dot metric: the symmetric
+    /// fp16-vs-fp16 comparison an `IvfHnswFlat` index over an fp16 column runs.
+    fn build_flat_f16_storage(values: &[f32], dim: usize) -> FlatFloatStorage {
+        let f16vals = Float16Array::from_iter_values(values.iter().map(|&v| f16::from_f32(v)));
+        let fsl = FixedSizeListArray::try_new_from_values(f16vals, dim as i32).unwrap();
+        FlatFloatStorage::new(fsl, DistanceType::Dot)
+    }
+
+    fn flat_f16_hnsw_topk(
+        hnsw: &HNSW,
+        storage: &FlatFloatStorage,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Vec<u32> {
+        let q = Arc::new(Float16Array::from_iter_values(
+            query.iter().map(|&v| f16::from_f32(v)),
+        )) as ArrayRef;
+        let params = HnswQueryParams {
+            ef,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        hnsw.search_basic(q, k, &params, None, storage)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect()
+    }
+
+    /// Exhaustive top-`k` under the same fp16 Dot distance (graph ground truth).
+    fn brute_force_flat_f16_topk(storage: &FlatFloatStorage, query: &[f32], k: usize) -> Vec<u32> {
+        let q = Arc::new(Float16Array::from_iter_values(
+            query.iter().map(|&v| f16::from_f32(v)),
+        )) as ArrayRef;
+        let dc = storage.dist_calculator(q, 0.0);
+        let mut all: Vec<(f32, u32)> = (0..storage.len() as u32)
+            .map(|id| (dc.distance(id), id))
+            .collect();
+        all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        all.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    /// Recall parity for the real fp16 query path. Builds HNSW+Flat(fp16, Dot),
+    /// runs queries, compares recall@k against brute-force fp16 ground truth, and
+    /// proves both that the 16-wide batch flush path is exercised during *search*
+    /// and (when not disabled) that it maps onto the AMX-FP16 tile kernel.
+    ///
+    /// Re-run with `LANCE_DISABLE_AMX=1` for the scalar/AVX-512-FP16 fallback
+    /// recall (out-of-band comparison; the two should be ~identical — tile
+    /// accumulation order only perturbs distances at the 1e-4 level).
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn test_flat_f16_hnsw_recall_and_amx_activation() {
+        let (n, dim, nq, k, ef) = (2000usize, 128usize, 100usize, 10usize, 100usize);
+        let values = gen_vectors(1, n, dim);
+        let storage = build_flat_f16_storage(&values, dim);
+
+        // Pin construction to 1 thread so the build is deterministic here.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let hnsw = pool
+            .install(|| HNSW::index_vectors(&storage, HnswBuildParams::default()))
+            .unwrap();
+
+        let qvals = gen_vectors(2, nq, dim);
+        BEAM_BATCH16_FLUSHES.store(0, Relaxed);
+        BEAM_BATCH16_COUNT_ENABLED.store(true, Relaxed);
+        let mut hits = 0usize;
+        for i in 0..nq {
+            let q = &qvals[i * dim..(i + 1) * dim];
+            let got = flat_f16_hnsw_topk(&hnsw, &storage, q, k, ef);
+            let truth: HashSet<u32> = brute_force_flat_f16_topk(&storage, q, k)
+                .into_iter()
+                .collect();
+            hits += got.iter().filter(|id| truth.contains(id)).count();
+        }
+        BEAM_BATCH16_COUNT_ENABLED.store(false, Relaxed);
+        let flushes = BEAM_BATCH16_FLUSHES.load(Relaxed);
+        let recall = hits as f64 / (nq * k) as f64;
+
+        eprintln!(
+            "[flat_f16] recall@{k}={recall:.4} search_flushes={flushes} amx_fp16_available={}",
+            amx_fp16_available()
+        );
+        assert!(recall > 0.90, "fp16 HNSW recall unexpectedly low: {recall}");
+        // The batched traversal must engage exactly when a fused kernel backs it.
+        // With AMX-FP16 usable the 16-wide flush path has to be exercised (runtime
+        // probe — the `kernel_support` cfg is set only for the lance-linalg crate,
+        // so it cannot gate here). Without it (no hardware, or LANCE_DISABLE_AMX
+        // set) the search must take the original per-neighbor traversal and never
+        // buffer at all, which is what keeps this change free for backends and
+        // hosts that cannot use the kernel.
+        if amx_fp16_available() {
+            assert!(
+                flushes > 0,
+                "16-wide batch flush path never hit during search"
+            );
+        } else {
+            assert_eq!(
+                flushes, 0,
+                "neighbors were buffered even though no fused kernel is available"
+            );
+            eprintln!("[flat_f16] AMX-FP16 unavailable; search used the scalar traversal");
+        }
+    }
+
+    /// Wall-clock HNSW+Flat(fp16) benchmark: construction time (all-core), then
+    /// query throughput/latency over a batch of `search()` calls (the metric
+    /// that matters, since AMX-FP16 fires on the query path) at each of three
+    /// concurrency settings. `#[ignore]` -- run:
+    ///   cargo test -p lance-index --release --features lance-linalg/amx \
+    ///     flat_f16_search_bench -- --ignored --nocapture
+    /// Without the `amx` feature this still runs, on the original per-neighbor
+    /// traversal, which is the pre-patch baseline. Toggle AMX at runtime with
+    /// `LANCE_DISABLE_AMX=1` (one setting per process — it is cached
+    /// process-wide). Tune with `BENCH_N` / `BENCH_DIM` / `BENCH_NQ` /
+    /// `BENCH_EF` / `BENCH_THREADS` (comma-separated; default `<ncpu>,32,1`).
+    ///
+    /// The index is built once (all-core) and then searched under each thread
+    /// count via an explicit rayon pool, so a single process yields the whole
+    /// concurrency sweep for one (dim, AMX) cell.
+    #[test]
+    #[ignore]
+    #[allow(clippy::print_stderr)]
+    fn hnsw_flat_f16_search_bench() {
+        use rayon::prelude::*;
+        use std::time::Instant;
+
+        let env_usize = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let n = env_usize("BENCH_N", 50_000);
+        let dim = env_usize("BENCH_DIM", 128);
+        let nq = env_usize("BENCH_NQ", 20_000);
+        let ef = env_usize("BENCH_EF", 100);
+        let k = 10usize;
+        let ncpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        let thread_counts: Vec<usize> = std::env::var("BENCH_THREADS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![ncpu, 32, 1]);
+
+        let values = gen_vectors(7, n, dim);
+        let storage = build_flat_f16_storage(&values, dim);
+
+        // Build once, all-core, so construction time is independent of the
+        // search-concurrency sweep. Both build and search take the AMX-FP16 path
+        // when enabled.
+        let build_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(ncpu)
+            .build()
+            .unwrap();
+        let t0 = Instant::now();
+        let hnsw = build_pool
+            .install(|| HNSW::index_vectors(&storage, HnswBuildParams::default()))
+            .unwrap();
+        let build_dt = t0.elapsed();
+        std::hint::black_box(&hnsw);
+        eprintln!(
+            "[flat_f16_bench] n={n} dim={dim} ef={ef} amx_fp16={} | build_allcore({ncpu}t)={:.3}s ({:.0} vec/s)",
+            amx_fp16_available(),
+            build_dt.as_secs_f64(),
+            n as f64 / build_dt.as_secs_f64(),
+        );
+
+        let qvals = gen_vectors(11, nq, dim);
+        let queries: Vec<&[f32]> = (0..nq).map(|i| &qvals[i * dim..(i + 1) * dim]).collect();
+
+        // Each concurrency level is measured for a fixed wall-time budget
+        // (repeating the query set), so single-thread and 384-thread runs take
+        // comparable time and all report stable numbers regardless of dim.
+        let budget = std::time::Duration::from_secs_f64(
+            std::env::var("BENCH_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.5),
+        );
+        for &nthreads in &thread_counts {
+            if nthreads == 0 || nthreads > ncpu {
+                continue;
+            }
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nthreads)
+                .build()
+                .unwrap();
+            let run_pass = || -> usize {
+                pool.install(|| {
+                    queries
+                        .par_iter()
+                        .map(|q| flat_f16_hnsw_topk(&hnsw, &storage, q, k, ef).len())
+                        .sum()
+                })
+            };
+            run_pass(); // warm up (page-in, thread spin-up) before timing
+            let t1 = Instant::now();
+            let mut served = 0usize;
+            let mut done = 0usize;
+            while t1.elapsed() < budget {
+                served += run_pass();
+                done += nq;
+            }
+            let search_dt = t1.elapsed();
+            std::hint::black_box(served);
+            let qps = done as f64 / search_dt.as_secs_f64();
+            let lat_us = search_dt.as_secs_f64() * 1e6 / done as f64;
+            eprintln!(
+                "[flat_f16_bench]   search_threads={nthreads:>3} queries={done:>8}: qps={qps:>9.0} lat={lat_us:>7.1}us/q",
+            );
+        }
     }
 }

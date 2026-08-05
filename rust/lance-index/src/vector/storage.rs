@@ -66,6 +66,48 @@ pub trait DistCalculator {
         *dists = self.distance_all(k_hint);
     }
 
+    /// Whether [`Self::distance_batch_16`] on this calculator is backed by a real
+    /// fused kernel rather than the 16-individual-[`Self::distance`] default.
+    ///
+    /// HNSW's `beam_search_loop!` reads this once per search to decide whether to
+    /// buffer neighbors 16 at a time at all. Backends answering `false` — the
+    /// default, i.e. every backend without a batched kernel — keep the original
+    /// evaluate-each-neighbor-immediately traversal, so they pay nothing for a
+    /// batching path they could not benefit from.
+    ///
+    /// Implementations must answer `true` only when the fused path would actually
+    /// be taken (correct metric and dimension, hardware usable at runtime);
+    /// answering `true` while [`Self::distance_batch_16`] falls back internally
+    /// would make the buffering pure overhead.
+    fn has_batch_16_kernel(&self) -> bool {
+        false
+    }
+
+    /// Compute distances for the first `len` of 16 ids in one call, writing
+    /// `dists[i]` for `ids[i]`. `len` must be in `1..=16`.
+    ///
+    /// `len` controls only *how many distances are computed*. It does not relax
+    /// the requirement on `ids`: **every element of `ids` must be a valid id**,
+    /// including the slots at or after `len`. Implementations are free to
+    /// resolve all 16 before looking at `len` — the flat fp16 override does
+    /// exactly that, and an out-of-range id there panics — so a caller with
+    /// fewer than 16 real ids must fill the rest with some valid id (repeating
+    /// `ids[0]` is what HNSW's `flush_batch16!` does) rather than leaving them
+    /// arbitrary.
+    ///
+    /// Only `dists[..len]` is written; the rest is left as the caller had it.
+    ///
+    /// The default implementation issues `len` individual [`Self::distance`]
+    /// calls, so every backend is correct with no behavior change. Backends with
+    /// a batched distance kernel override this to compute all `len` in a single
+    /// fused pass.
+    fn distance_batch_16(&self, ids: &[u32; 16], dists: &mut [f32; 16], len: usize) {
+        debug_assert!((1..=16).contains(&len), "len ({len}) must be in 1..=16");
+        for (dist, &id) in dists.iter_mut().zip(ids.iter()).take(len) {
+            *dist = self.distance(id);
+        }
+    }
+
     fn prefetch(&self, _id: u32) {}
 
     #[allow(clippy::too_many_arguments)]

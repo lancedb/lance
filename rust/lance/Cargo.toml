@@ -141,6 +141,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 backtrace = ["lance-core/backtrace"]
 fp16kernels = ["lance-linalg/fp16kernels"]
+# Opt-in AMX-FP16 tile kernel for batched fp16 dot products; see lance-linalg.
+amx = ["lance-linalg/amx"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
