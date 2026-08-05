@@ -24,6 +24,7 @@ pub async fn load_row_id_sequence(
         Some(RowIdMeta::Inline(data)) => {
             let data = data.clone();
             let key = RowIdSequenceKey {
+                version: dataset.manifest.version,
                 fragment_id: fragment.id,
             };
             dataset
@@ -35,6 +36,7 @@ pub async fn load_row_id_sequence(
             let file_slice = file_slice.clone();
             let dataset_clone = dataset.clone();
             let key = RowIdSequenceKey {
+                version: dataset.manifest.version,
                 fragment_id: fragment.id,
             };
             dataset
@@ -295,6 +297,7 @@ mod test {
     use lance_core::datatypes::Schema;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datagen::Dimension;
+    use lance_file::version::LanceFileVersion;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use std::collections::HashMap;
@@ -523,6 +526,73 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
         assert!(index.get(num_rows).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_filtered_scan_after_storage_version_overwrite() {
+        let first_batch = sequence_batch(255..256);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(first_batch.clone())], first_batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_group: 1,
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let second_batch = sequence_batch(105..106);
+        dataset
+            .append(
+                Box::new(RecordBatchIterator::new(
+                    [Ok(second_batch.clone())],
+                    second_batch.schema(),
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let all_rows = dataset.scan().try_into_batch().await.unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(all_rows.clone())], all_rows.schema()),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                max_rows_per_group: 1,
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].fast_physical_rows().unwrap(), 2);
+        assert_eq!(
+            load_row_id_sequence(&dataset, fragments[0].metadata())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let result = dataset
+            .scan()
+            .filter("id = 105")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(result["id"].as_primitive::<Int32Type>().value(0), 105);
     }
 
     #[tokio::test]

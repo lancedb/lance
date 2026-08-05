@@ -222,23 +222,28 @@ impl CacheKey for RowIdIndexKey {
 
 #[derive(Debug)]
 pub struct RowIdSequenceKey {
+    pub version: u64,
     pub fragment_id: u64,
 }
 
 impl CacheKey for RowIdSequenceKey {
     type ValueType = RowIdSequence;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
+        Cow::Owned(format!(
+            "row_id_sequence/{}/{}",
+            self.version, self.fragment_id
+        ))
     }
     fn type_name() -> &'static str {
         "RowIdSequence"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 1)
+        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
         builder.write_u64(self.fragment_id);
     }
 }
