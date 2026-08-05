@@ -41,7 +41,7 @@ use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
-use crate::blob::normalize_prepared_blob_schema;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::blob::{
     BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
@@ -1340,7 +1340,7 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
     validate_external_blob_write_params(&params)?;
-    let normalized_converted_schema = normalize_prepared_blob_schema(&converted_schema)?;
+    let normalized_converted_schema = prepared_to_logical_blob_schema(&converted_schema)?;
 
     let storage_version = resolve_storage_version(dataset, &params);
     versions::write_fragments(
