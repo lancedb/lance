@@ -48,6 +48,7 @@ use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_vers
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
@@ -1407,6 +1408,11 @@ impl FileFragment {
         for data_file in &self.metadata.files {
             let last = -1;
             for field_id in data_file.fields.iter() {
+                // A tombstone marks a field superseded by a later data file.
+                // It is not a field id: it has no ordering and can repeat.
+                if *field_id == TOMBSTONE_FIELD_ID {
+                    continue;
+                }
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
