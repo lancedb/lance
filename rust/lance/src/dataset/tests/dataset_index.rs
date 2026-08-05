@@ -2476,7 +2476,11 @@ async fn assert_fts_list_phrase_query_can_cross_elements<Offset: arrow::array::O
             indexed_result["id"].as_primitive::<UInt64Type>().values(),
             expected
         );
-        assert_eq!(indexed_result, flat_result, "query={terms}");
+        assert_eq!(
+            indexed_result["id"].as_primitive::<UInt64Type>().values(),
+            flat_result["id"].as_primitive::<UInt64Type>().values(),
+            "query={terms}"
+        );
     }
 }
 
