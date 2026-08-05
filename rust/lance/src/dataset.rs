@@ -3048,6 +3048,8 @@ impl Dataset {
             .try_collect::<Vec<()>>()
             .await?;
 
+        rowids::validate_stable_row_ids(self).await?;
+
         // Validate indices
         let indices = self.load_indices().await?;
         self.validate_indices(&indices)?;
