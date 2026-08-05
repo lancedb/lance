@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Dataset write policies that differ across exact Lance file versions.
 //!
 //! File grammar belongs to `lance_file::versions`. This module contains only
