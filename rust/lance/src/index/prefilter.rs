@@ -69,7 +69,9 @@ impl DatasetPreFilter {
         let mut fragments = RoaringBitmap::new();
         let all_have_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
         if !all_have_bitmaps {
-            fragments.insert_range(0..dataset.manifest.max_fragment_id.unwrap_or(0));
+            if let Some(max_fragment_id) = dataset.manifest.max_fragment_id() {
+                fragments.insert_range(0..=max_fragment_id as u32);
+            }
         } else {
             indices.iter().for_each(|idx| {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
@@ -437,6 +439,7 @@ impl PreFilter for DatasetPreFilter {
 mod test {
     use lance_select::RowSetOps;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use rstest::rstest;
 
     use crate::dataset::WriteParams;
 
@@ -543,6 +546,37 @@ mod test {
         expected.insert_fragment(1);
         expected.insert_fragment(2);
         assert_eq!(mask.block_list(), Some(&expected));
+    }
+
+    #[rstest]
+    #[case::stored_high_water_mark(false)]
+    #[case::computed_high_water_mark(true)]
+    #[tokio::test]
+    async fn test_legacy_index_mask_includes_max_fragment(#[case] unset_max_fragment_id: bool) {
+        let datasets = test_datasets(false).await;
+        let mut dataset = (*datasets.deletions_missing_frags).clone();
+        if unset_max_fragment_id {
+            Arc::make_mut(&mut dataset.manifest).max_fragment_id = None;
+        }
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: Vec::new(),
+            name: "legacy".to_string(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let prefilter = DatasetPreFilter::new(Arc::new(dataset), &[index], None);
+
+        prefilter.wait_for_ready().await.unwrap();
+
+        let mut expected = RowAddrTreeMap::from_iter(vec![(2 << 32) + 2]);
+        expected.insert_fragment(1);
+        assert_eq!(prefilter.mask().block_list(), Some(&expected));
     }
 
     #[tokio::test]

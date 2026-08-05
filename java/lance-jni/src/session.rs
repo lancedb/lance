@@ -10,7 +10,7 @@ use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
 use lance_io::object_store::ObjectStoreRegistry;
 
-use crate::RT;
+use crate::block_on;
 use crate::error::{Error, Result};
 
 /// Creates a new Session and returns a handle to it.
@@ -99,7 +99,7 @@ fn metadata_cache_stats_native<'local>(
 
     // Safety: We trust that the handle is valid and was created by createNative
     let session_arc = unsafe { &*(handle as *const Arc<LanceSession>) };
-    let stats = RT.block_on(session_arc.metadata_cache_stats());
+    let stats = block_on(session_arc.metadata_cache_stats());
 
     let stats_obj = env.new_object(
         "org/lance/CacheStats",

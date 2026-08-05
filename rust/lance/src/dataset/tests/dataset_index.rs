@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::vec;
 
 use crate::dataset::ROW_ID;
@@ -19,11 +19,11 @@ use crate::index::DatasetIndexExt;
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
-use arrow_array::{Array, GenericStringArray, StructArray, UInt64Array};
+use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
-    types::{Float32Type, Int32Type},
+    types::{Float32Type, Int32Type, Int64Type},
 };
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
@@ -31,14 +31,20 @@ use arrow_schema::{
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
+use lance_index::metrics::{
+    COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
+    COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
-    InvertedListFormatVersion,
-    query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
+    DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
+    query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
@@ -861,6 +867,363 @@ async fn test_fts_on_multiple_columns() {
         .await
         .unwrap();
     assert_eq!(results.num_rows(), 1);
+}
+
+async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str, with_position: bool) {
+    create_fragmented_fts_index_with_order(dataset, column, with_position, false).await;
+}
+
+async fn create_fragmented_fts_index_with_order(
+    dataset: &mut Dataset,
+    column: &str,
+    with_position: bool,
+    reverse_segments: bool,
+) {
+    let index_name = format!("{column}_idx");
+    let columns = [column];
+    let params = InvertedIndexParams::default().with_position(with_position);
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in &fragment_ids {
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::Inverted, &params)
+            .name(index_name.clone())
+            .fragments(vec![*fragment_id]);
+        segments.push(builder.execute_uncommitted().await.unwrap());
+    }
+    if reverse_segments {
+        segments.reverse();
+    }
+    dataset
+        .commit_existing_index_segments(&index_name, column, segments)
+        .await
+        .unwrap();
+
+    let segments =
+        crate::index::scalar::inverted::load_segments(dataset, column, DocumentGranularity::Row)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(segments.len(), fragment_ids.len());
+}
+
+fn compound_multimatch_query() -> FtsQuery {
+    MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![10.0, 1.0])
+    .unwrap()
+    .into()
+}
+
+fn compound_match_query(term: &str, column: &str, boost: f32) -> FtsQuery {
+    MatchQuery::new(term.to_owned())
+        .with_column(Some(column.to_owned()))
+        .with_boost(boost)
+        .into()
+}
+
+async fn compound_fts_results(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
+async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
+    let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
+    assert!(
+        exhaustive.len() > limit,
+        "the exhaustive result must contain candidates beyond k"
+    );
+    let limited = compound_fts_results(dataset, query, Some(limit as i64)).await;
+    assert_eq!(limited, exhaustive[..limit]);
+}
+
+#[tokio::test]
+async fn test_nested_multimatch_limit_propagation() {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "common",
+                "common filler filler filler filler filler filler filler",
+                "irrelevant",
+                "common tie",
+                "common tie",
+                "irrelevant"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "penalty",
+                "special",
+                "common",
+                "neutral",
+                "neutral",
+                "common filler filler filler penalty"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+
+    let must_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    let must_results = compound_fts_results(&dataset, must_query.clone(), None).await;
+    assert!(
+        must_results
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "the exhaustive result should include a deterministic score tie"
+    );
+    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+
+    let should_query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, should_query.clone(), 2).await;
+    let mut fallback_scanner = dataset.scan();
+    fallback_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(should_query))
+        .unwrap();
+    fallback_scanner.limit(Some(2), None).unwrap();
+    let fallback_plan = fallback_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        fallback_plan.contains("BooleanQuery"),
+        "cross-column compound FTS should retain its exact fallback:\n{fallback_plan}"
+    );
+    assert!(
+        !fallback_plan.contains("CompoundFtsScorer"),
+        "cross-column compound FTS is not yet supported by the scorer tree:\n{fallback_plan}"
+    );
+
+    let boost_query: FtsQuery = BoostQuery::new(
+        compound_multimatch_query(),
+        compound_match_query("penalty", "body", 100.0),
+        Some(1.0),
+    )
+    .into();
+    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+
+    assert_compound_fts_top_k(&dataset, compound_multimatch_query(), 1).await;
+}
+
+#[tokio::test]
+async fn test_same_column_compound_scorer_is_exact_and_bounded() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "common",
+            "common filler filler filler",
+            "irrelevant",
+            "common tie",
+            "common tie",
+            "common filler"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let match_query = |term: &str| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("common")),
+        (
+            Occur::Should,
+            BoostQuery::new(match_query("tie"), match_query("filler"), Some(0.5)).into(),
+        ),
+        (
+            Occur::Should,
+            PhraseQuery::new("common tie".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("irrelevant")),
+    ])
+    .into();
+
+    assert_compound_fts_top_k(&dataset, query.clone(), 2).await;
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column compound FTS should use the scorer tree:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "same-column compound FTS should not materialize intermediate joins:\n{plan}"
+    );
+
+    let same_column_multimatch: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![1.0, 0.5])
+    .unwrap()
+    .into();
+    assert_compound_fts_top_k(&dataset, same_column_multimatch.clone(), 2).await;
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(same_column_multimatch))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_tie_uses_resolved_row_id() {
+    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; 384])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 256,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(1), None).unwrap();
+    let limited = scanner.try_into_batch().await.unwrap();
+    let limited_row_id = limited[ROW_ID].as_primitive::<UInt64Type>().value(0);
+
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(limited_row_id, exhaustive[0].0);
+    assert_eq!(exhaustive.len(), 384);
+
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(COMPOUND_ADDRESSES_RESOLVED_METRIC),
+        Some(&384)
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC),
+        Some(&1)
+    );
+
+    let mut analyze_scanner = dataset.scan();
+    analyze_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    analyze_scanner.limit(Some(1), None).unwrap();
+    let analysis = analyze_scanner.analyze_plan().await.unwrap();
+    let compound_line = analysis
+        .lines()
+        .find(|line| line.contains("CompoundFtsScorer"))
+        .unwrap();
+    assert!(
+        compound_line.contains(&format!("{COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC}=128")),
+        "compound FTS metrics missing the bounded candidate peak: {compound_line}"
+    );
+    assert!(
+        compound_line.contains(&format!(
+            "{COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC}=128"
+        )),
+        "compound FTS metrics missing the bounded resolution batch: {compound_line}"
+    );
 }
 
 fn nested_fts_batch(
@@ -2057,6 +2420,33 @@ async fn assert_fts_list_phrase_query_can_cross_elements<Offset: arrow::array::O
     let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
     let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
 
+    let cases: [(&str, &[u64]); 3] = [
+        ("alpha beta", &[0]),
+        ("want the apple", &[1]),
+        ("want apple", &[2]),
+    ];
+    let mut flat_results = Vec::with_capacity(cases.len());
+    for (terms, expected) in cases {
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new(terms.to_owned())
+                        .with_column(Some("doc".to_owned()))
+                        .into(),
+                )
+                .limit(Some(10)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), expected);
+        flat_results.push(result);
+    }
+
     let params = InvertedIndexParams::default()
         .with_position(true)
         .remove_stop_words(true);
@@ -2065,47 +2455,29 @@ async fn assert_fts_list_phrase_query_can_cross_elements<Offset: arrow::array::O
         .await
         .unwrap();
 
-    let result = dataset
-        .scan()
-        .project(&["id"])
-        .unwrap()
-        .full_text_search(
-            FullTextSearchQuery::new_query(PhraseQuery::new("alpha beta".to_owned()).into())
+    for ((terms, expected), flat_result) in cases.into_iter().zip(flat_results) {
+        let indexed_result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new(terms.to_owned())
+                        .with_column(Some("doc".to_owned()))
+                        .into(),
+                )
                 .limit(Some(10)),
-        )
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[0]);
-
-    let result = dataset
-        .scan()
-        .project(&["id"])
-        .unwrap()
-        .full_text_search(
-            FullTextSearchQuery::new_query(PhraseQuery::new("want the apple".to_owned()).into())
-                .limit(Some(10)),
-        )
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[1]);
-
-    let result = dataset
-        .scan()
-        .project(&["id"])
-        .unwrap()
-        .full_text_search(
-            FullTextSearchQuery::new_query(PhraseQuery::new("want apple".to_owned()).into())
-                .limit(Some(10)),
-        )
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[2]);
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed_result["id"].as_primitive::<UInt64Type>().values(),
+            expected
+        );
+        assert_eq!(indexed_result, flat_result, "query={terms}");
+    }
 }
 
 #[tokio::test]
@@ -2472,124 +2844,6 @@ async fn test_prewarm_index_with_position_validation() {
     );
 }
 
-/// Cache backend that exercises the serialization codec on every insert and
-/// returns deserialized entries on every get. Items without a codec fall
-/// through to an in-memory passthrough so that non-FTS cache traffic still
-/// works during the test.
-///
-/// Mirrors the helper in `rust/lance/src/index/vector/ivf/v2.rs` tests; if a
-/// third user appears, lift this into a shared test utility.
-mod fts_serializing_backend {
-    use std::collections::HashMap;
-    use std::pin::Pin;
-
-    use futures::Future;
-    use lance_core::Result;
-    use lance_core::cache::{
-        CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend,
-    };
-
-    type SerializedEntry = (bytes::Bytes, CacheCodec, usize);
-
-    #[derive(Debug)]
-    pub struct SerializingBackend {
-        serialized: tokio::sync::Mutex<HashMap<InternalCacheKey, SerializedEntry>>,
-        passthrough: MokaCacheBackend,
-    }
-
-    impl SerializingBackend {
-        pub fn new() -> Self {
-            Self {
-                serialized: tokio::sync::Mutex::new(HashMap::new()),
-                passthrough: MokaCacheBackend::with_capacity(256 * 1024 * 1024),
-            }
-        }
-
-        pub async fn serialized_entry_count(&self) -> usize {
-            self.serialized.lock().await.len()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl CacheBackend for SerializingBackend {
-        async fn get(
-            &self,
-            key: &InternalCacheKey,
-            codec: Option<CacheCodec>,
-        ) -> Option<CacheEntry> {
-            let guard = self.serialized.lock().await;
-            if let Some((bytes, stored_codec, _)) = guard.get(key) {
-                return stored_codec.deserialize(&bytes.clone()).hit();
-            }
-            drop(guard);
-            self.passthrough.get(key, codec).await
-        }
-
-        async fn insert(
-            &self,
-            key: &InternalCacheKey,
-            entry: CacheEntry,
-            size_bytes: usize,
-            codec: Option<CacheCodec>,
-        ) {
-            if let Some(codec) = codec {
-                let mut bytes = Vec::new();
-                codec
-                    .serialize(&entry, &mut bytes)
-                    .expect("serialization should succeed");
-                self.serialized
-                    .lock()
-                    .await
-                    .insert(key.clone(), (bytes::Bytes::from(bytes), codec, size_bytes));
-            } else {
-                self.passthrough.insert(key, entry, size_bytes, None).await;
-            }
-        }
-
-        async fn get_or_insert<'a>(
-            &self,
-            key: &InternalCacheKey,
-            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
-            codec: Option<CacheCodec>,
-        ) -> Result<(CacheEntry, bool)> {
-            if let Some(entry) = self.get(key, codec).await {
-                return Ok((entry, true));
-            }
-            let (entry, size) = loader.await?;
-            self.insert(key, entry.clone(), size, codec).await;
-            Ok((entry, false))
-        }
-
-        async fn invalidate_prefix(&self, prefix: &str) {
-            self.serialized
-                .lock()
-                .await
-                .retain(|k, _| !k.starts_with(prefix));
-            self.passthrough.invalidate_prefix(prefix).await;
-        }
-
-        async fn clear(&self) {
-            self.serialized.lock().await.clear();
-            self.passthrough.clear().await;
-        }
-
-        async fn num_entries(&self) -> usize {
-            self.serialized.lock().await.len() + self.passthrough.num_entries().await
-        }
-
-        async fn size_bytes(&self) -> usize {
-            let serialized: usize = self
-                .serialized
-                .lock()
-                .await
-                .values()
-                .map(|(_, _, s)| *s)
-                .sum();
-            serialized + self.passthrough.size_bytes().await
-        }
-    }
-}
-
 /// Validates the OSS-741 contract: after FTS prewarm through a serializing
 /// cache backend, FTS queries serve results without any further IO. The
 /// serializing backend forces every cache hit through the new
@@ -2600,7 +2854,7 @@ mod fts_serializing_backend {
 async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2639,7 +2893,7 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     // Re-open the dataset on a session whose cache backend serializes every
     // entry through its codec. Set a generous capacity so nothing is evicted
     // before we query.
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -2718,7 +2972,7 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
 async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2754,7 +3008,7 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
 
     // Re-open on a session whose cache backend serializes every entry through
     // its codec, with a generous capacity so nothing is evicted before we query.
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -2781,9 +3035,32 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
          but the serializing store was empty"
     );
 
-    // After prewarm, an indexed-filter query must reconstruct the index and
-    // every page it touches from the cache, deserializing via the codec, with
-    // no disk IO. Project only `_rowid` so the scan does not read a data column.
+    drop(dataset);
+    let backend = Arc::new(backend.restart());
+    assert_eq!(
+        backend.l1_entry_count().await,
+        0,
+        "restarting must discard the in-memory L1"
+    );
+    assert_eq!(
+        backend.serialized_entry_count().await,
+        serialized_after_prewarm,
+        "restarting must retain only the serialized entries"
+    );
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend,
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // After recreating the backend, an indexed-filter query must reconstruct
+    // the index and every page it touches from serialized bytes, with no disk
+    // IO. Project only `_rowid` so the scan does not read a data column.
     dataset.object_store.as_ref().io_stats_incremental();
 
     let result = dataset
@@ -2821,7 +3098,7 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
 async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2855,7 +3132,7 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
         .await
         .unwrap();
 
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -2904,6 +3181,95 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
     );
 }
 
+#[rstest]
+#[case::list(false)]
+#[case::large_list(true)]
+#[tokio::test]
+async fn test_label_list_index_types(#[case] large_list: bool) {
+    let test_uri = TempStrDir::default();
+    let label_values = vec![
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(2)]),
+        Some(vec![Some(1)]),
+        Some(vec![Some(3)]),
+    ];
+    let labels: ArrayRef = if large_list {
+        Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+            label_values,
+        ))
+    } else {
+        Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+            label_values,
+        ))
+    };
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("labels", labels.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3])), labels],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+    let expected = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected_ids = expected
+        .column(0)
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(expected_ids, vec![0, 2]);
+
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let result_ids = result
+        .column(0)
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(result_ids, expected_ids);
+
+    let plan = dataset
+        .scan()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+        "Expected LabelList scalar index query in plan: {plan}"
+    );
+}
+
 /// LabelList analogue: after prewarming, an `array_has_any` query against a
 /// `LabelList` index serves results without any further IO. Exercises the
 /// `LabelListIndexState` codec (which embeds the inner bitmap state and the
@@ -2912,7 +3278,7 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
 async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2956,7 +3322,7 @@ async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_i
         "test dataset must contain at least one row whose labels include 3"
     );
 
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -3062,6 +3428,116 @@ async fn test_fts_phrase_query_with_removed_stop_words() {
         assert!(ids.contains(&1), "query={query}, ids={ids:?}");
         assert!(ids.contains(&2), "query={query}, ids={ids:?}");
     }
+}
+
+#[tokio::test]
+async fn test_fts_without_index_on_zero_fragment_dataset_is_empty() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::UInt64, false),
+        ArrowField::new("doc", DataType::Utf8, true),
+    ]));
+    let empty_reader = RecordBatchIterator::new(vec![], schema);
+    let dataset = Dataset::write(empty_reader, "memory://", None)
+        .await
+        .unwrap();
+    assert!(dataset.fragments().is_empty());
+
+    let mut scan = dataset.scan();
+    scan.project(&["id"]).unwrap();
+    scan.full_text_search(FullTextSearchQuery::new_query(
+        MatchQuery::new("alpha".to_owned())
+            .with_column(Some("doc".to_owned()))
+            .into(),
+    ))
+    .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("EmptyExec"), "unexpected plan: {plan}");
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
+}
+
+#[tokio::test]
+async fn test_fts_phrase_query_normalizes_leading_stop_word_position() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let initial = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(UInt64Array::from(vec![99])) as ArrayRef),
+        (
+            "doc",
+            Arc::new(StringArray::from(vec!["placeholder"])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let initial_reader =
+        RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema().clone());
+    let mut dataset = Dataset::write(initial_reader, &uri, None).await.unwrap();
+    let index_params = InvertedIndexParams::default()
+        .with_position(true)
+        .remove_stop_words(true);
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &index_params, true)
+        .await
+        .unwrap();
+
+    let appended = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(UInt64Array::from(vec![0, 1, 2])) as ArrayRef),
+        (
+            "doc",
+            Arc::new(StringArray::from(vec![
+                "alpha beta",
+                "the alpha beta",
+                "alpha gap beta",
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let appended_reader =
+        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema().clone());
+    dataset = Dataset::write(
+        appended_reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let appended_fragment = dataset.fragments().last().unwrap().clone();
+    let query = FullTextSearchQuery::new_query(
+        PhraseQuery::new("the alpha beta".to_owned())
+            .with_column(Some("doc".to_owned()))
+            .into(),
+    );
+
+    let mut flat_scan = dataset.scan();
+    flat_scan.with_fragments(vec![appended_fragment.clone()]);
+    flat_scan.project(&["id"]).unwrap();
+    flat_scan.full_text_search(query.clone()).unwrap();
+    let flat_result = flat_scan.try_into_batch().await.unwrap();
+    let mut flat_ids = flat_result["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    flat_ids.sort_unstable();
+    assert_eq!(flat_ids, vec![0, 1]);
+
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &index_params, true)
+        .await
+        .unwrap();
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.with_fragments(vec![appended_fragment]);
+    indexed_scan.project(&["id"]).unwrap();
+    indexed_scan.full_text_search(query).unwrap();
+    let indexed_result = indexed_scan.try_into_batch().await.unwrap();
+    let mut indexed_ids = indexed_result["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    indexed_ids.sort_unstable();
+    assert_eq!(indexed_ids, flat_ids);
 }
 
 #[tokio::test]
@@ -3936,7 +4412,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Verify that the index file uses the same version as the dataset
     assert_eq!(
         index_reader.metadata().version(),
-        dataset_version,
+        dataset_version.into(),
         "Index file should use the same format version as the dataset"
     );
 
@@ -3965,7 +4441,7 @@ async fn test_index_inherits_dataset_file_version() {
 
         assert_eq!(
             aux_reader.metadata().version(),
-            dataset_version,
+            dataset_version.into(),
             "Auxiliary index file should use the same format version as the dataset"
         );
     }
@@ -4044,7 +4520,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Verify that the index file uses V2_0 (not legacy)
     assert_eq!(
         index_reader.metadata().version(),
-        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_0.into(),
         "Index files should never use legacy format, even for legacy datasets"
     );
 }
@@ -4120,7 +4596,7 @@ async fn test_manifest_read_recovers_from_stale_size() {
 async fn test_load_segment_params_full_fidelity() {
     use crate::index::DatasetIndexInternalExt;
     use lance_index::metrics::NoOpMetricsCollector;
-    use lance_index::scalar::inverted::InvertedIndex;
+    use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndex};
 
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
@@ -4142,7 +4618,7 @@ async fn test_load_segment_params_full_fidelity() {
         .await
         .unwrap();
 
-    let segments = crate::index::scalar::load_segments(&dataset, "text")
+    let segments = crate::index::scalar::load_segments(&dataset, "text", DocumentGranularity::Row)
         .await
         .unwrap()
         .expect("FTS index segments");

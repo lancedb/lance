@@ -8,7 +8,7 @@ use std::{
 };
 
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
-use arrow_schema::{DataType, Field, Field as ArrowField, Schema, SortOptions};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
@@ -31,7 +31,7 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
-use lance_core::{Error, ROW_ID, Result, cache::LanceCache, error::LanceOptionExt};
+use lance_core::{Error, Result, cache::LanceCache, error::LanceOptionExt};
 
 use crate::{
     Index, IndexType,
@@ -369,11 +369,14 @@ impl JsonTrainingRequest {
         // for unordered input instead and let `train_index` sort the extracted value
         // stream itself, once, right before handing it to the target trainer.
         //
-        // This is safe for `Addresses` too: `scan_training_data` only special-cases
-        // `Values` (it calls `order_by` only then); an `Addresses` or `None` criteria
-        // both fall through to the same unordered-scan behavior, since the scan already
+        // Preserve `Addresses` so callers must still provide the ordering required by
+        // target trainers such as ZoneMap, even though the dataset scanner currently
         // returns rows in row-address order by default.
-        let mut criteria = TrainingCriteria::new(TrainingOrdering::None);
+        let ordering = match target_criteria.ordering {
+            TrainingOrdering::Values => TrainingOrdering::None,
+            ordering => ordering,
+        };
+        let mut criteria = TrainingCriteria::new(ordering);
         criteria.needs_row_ids = target_criteria.needs_row_ids;
         criteria.needs_row_addrs = target_criteria.needs_row_addrs;
         Self {
@@ -422,27 +425,30 @@ impl JsonIndexPlugin {
             .column_with_name(VALUE_COLUMN_NAME)
             .expect_ok()?
             .0;
-        let row_id_column_idx = input_schema.column_with_name(ROW_ID).expect_ok()?.0;
 
         // Call json_extract_with_type UDF
-        let exprs = vec![
-            (
-                Arc::new(ScalarFunctionExpr::try_new(
-                    Arc::new(lance_datafusion::udf::json::json_extract_with_type_udf()),
-                    vec![
-                        Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
-                        Arc::new(Literal::new(ScalarValue::Utf8(Some(path)))),
-                    ],
-                    &input_schema,
-                    Arc::new(ConfigOptions::default()),
-                )?) as Arc<dyn PhysicalExpr>,
-                "json_result".to_string(),
-            ),
-            (
-                Arc::new(Column::new(ROW_ID, row_id_column_idx)) as Arc<dyn PhysicalExpr>,
-                ROW_ID.to_string(),
-            ),
-        ];
+        let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(input_schema.fields().len());
+        exprs.push((
+            Arc::new(ScalarFunctionExpr::try_new(
+                Arc::new(lance_datafusion::udf::json::json_extract_with_type_udf()),
+                vec![
+                    Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
+                    Arc::new(Literal::new(ScalarValue::Utf8(Some(path)))),
+                ],
+                &input_schema,
+                Arc::new(ConfigOptions::default()),
+            )?) as Arc<dyn PhysicalExpr>,
+            "json_result".to_string(),
+        ));
+        for (column_idx, field) in input_schema.fields().iter().enumerate() {
+            if field.name() != VALUE_COLUMN_NAME {
+                exprs.push((
+                    Arc::new(Column::new(field.name(), column_idx)) as Arc<dyn PhysicalExpr>,
+                    field.name().clone(),
+                ));
+            }
+        }
 
         let project = ProjectionExec::try_new(exprs, input)?;
         let ctx = get_session_context(&LanceExecutionOptions::default());
@@ -514,7 +520,22 @@ impl JsonIndexPlugin {
         target_type: DataType,
     ) -> Result<SendableRecordBatchStream> {
         let input = Arc::new(OneShotExec::new(data));
-        let _input_schema = input.schema();
+        let input_schema = input.schema();
+        let passthrough_indices = input_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(column_idx, field)| (field.name() != "json_result").then_some(column_idx))
+            .collect::<Vec<_>>();
+        let output_schema = Arc::new(Schema::new(
+            std::iter::once(Field::new(VALUE_COLUMN_NAME, target_type.clone(), true))
+                .chain(
+                    passthrough_indices
+                        .iter()
+                        .map(|column_idx| input_schema.field(*column_idx).clone()),
+                )
+                .collect::<Vec<_>>(),
+        ));
         let ctx = get_session_context(&LanceExecutionOptions::default());
         let mut stream = input.execute(0, ctx.task_ctx())?;
 
@@ -655,37 +676,29 @@ impl JsonIndexPlugin {
                     }
                 };
 
-            // Get row_id column
-            let row_id_column = batch
-                .column_by_name(ROW_ID)
-                .ok_or_else(|| Error::invalid_input_source("Missing row_id column".into()))?
-                .clone();
-
-            // Create new batch with converted values
-            let new_schema = Arc::new(Schema::new(vec![
-                ArrowField::new(VALUE_COLUMN_NAME, target_type.clone(), true),
-                ArrowField::new(ROW_ID, DataType::UInt64, false),
-            ]));
-
-            let new_batch =
-                RecordBatch::try_new(new_schema.clone(), vec![converted_array, row_id_column])?;
+            let mut columns = Vec::with_capacity(output_schema.fields().len());
+            columns.push(converted_array);
+            columns.extend(
+                passthrough_indices
+                    .iter()
+                    .map(|column_idx| batch.column(*column_idx).clone()),
+            );
+            let new_batch = RecordBatch::try_new(output_schema.clone(), columns)?;
 
             converted_batches.push(new_batch);
         }
 
         // Create stream from converted batches
-        let schema = converted_batches
-            .first()
-            .map(|b| b.schema())
-            .ok_or_else(|| Error::invalid_input_source("No batches to convert".into()))?;
-
+        if converted_batches.is_empty() {
+            return Err(Error::invalid_input_source("No batches to convert".into()));
+        }
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
+            output_schema,
             futures::stream::iter(converted_batches.into_iter().map(Ok)),
         )))
     }
 
-    /// Sort a `(value, row_id)` stream ascending by value.
+    /// Sort a value stream and its row-location columns ascending by value.
     ///
     /// Target index types that require `TrainingOrdering::Values` (e.g. btree, whose
     /// per-page min/max stats are taken from the first/last row of each page) need this
@@ -903,6 +916,7 @@ mod tests {
     use crate::scalar::{SargableQuery, TextQuery};
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
@@ -1052,36 +1066,13 @@ mod tests {
     async fn train_and_load_json_index(
         store: Arc<dyn IndexStore>,
         target_index_type: &str,
+        expected_ordering: TrainingOrdering,
         path: &str,
         json_docs: &[&str],
     ) -> Arc<dyn ScalarIndex> {
         use crate::progress::noop_progress;
         use arrow_array::{LargeBinaryArray, UInt64Array};
         use futures::stream;
-
-        let jsonb: Vec<Vec<u8>> = json_docs
-            .iter()
-            .map(|s| s.parse::<jsonb::OwnedJsonb>().unwrap().to_vec())
-            .collect();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(LargeBinaryArray::from(
-                    jsonb.iter().map(|v| Some(v.as_slice())).collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(UInt64Array::from_iter_values(0..json_docs.len() as u64)) as ArrayRef,
-            ],
-        )
-        .unwrap();
-        let data = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        )) as SendableRecordBatchStream;
 
         let registry = IndexPluginRegistry::with_default_plugins();
         let plugin = registry.get_plugin_by_name("json").unwrap();
@@ -1094,11 +1085,42 @@ mod tests {
             )
             .unwrap();
 
-        // The scanner must be asked for unordered input: only this plugin knows the
-        // order of the extracted value, so sorting on the raw JSON column would be
-        // wasted work that either goes unused (non-`Values` targets) or still leaves
-        // the extracted stream unsorted (`Values` targets, see below).
-        assert_eq!(request.criteria().ordering, TrainingOrdering::None);
+        assert_eq!(request.criteria().ordering, expected_ordering);
+
+        let jsonb: Vec<Vec<u8>> = json_docs
+            .iter()
+            .map(|s| s.parse::<jsonb::OwnedJsonb>().unwrap().to_vec())
+            .collect();
+
+        let mut fields = Vec::with_capacity(3);
+        fields.push(Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true));
+        let mut columns = Vec::with_capacity(3);
+        columns.push(Arc::new(LargeBinaryArray::from(
+            jsonb.iter().map(|v| Some(v.as_slice())).collect::<Vec<_>>(),
+        )) as ArrayRef);
+        if request.criteria().needs_row_ids {
+            fields.push(Field::new(ROW_ID, DataType::UInt64, false));
+            columns.push(Arc::new(UInt64Array::from(
+                (0..json_docs.len() as u64).collect::<Vec<_>>(),
+            )) as ArrayRef);
+        }
+        if request.criteria().needs_row_addrs {
+            fields.push(Field::new(ROW_ADDR, DataType::UInt64, false));
+            columns.push(Arc::new(UInt64Array::from(
+                (0..json_docs.len())
+                    .map(|row_idx| {
+                        RowAddress::new_from_parts((row_idx / 2) as u32, (row_idx % 2) as u32)
+                            .into()
+                    })
+                    .collect::<Vec<u64>>(),
+            )) as ArrayRef);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        )) as SendableRecordBatchStream;
 
         let created = trainer
             .train_index(data, store.as_ref(), request, None, noop_progress())
@@ -1123,6 +1145,35 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         )) as Arc<dyn IndexStore>;
         (store, tmpdir)
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/7859.
+    #[rstest]
+    #[case::zonemap("zonemap", TrainingOrdering::Addresses)]
+    #[case::fm("fm", TrainingOrdering::None)]
+    #[tokio::test]
+    async fn test_json_index_preserves_row_addresses(
+        #[case] target_index_type: &str,
+        #[case] expected_ordering: TrainingOrdering,
+    ) {
+        let (store, _tmpdir) = local_json_index_store();
+        let index = train_and_load_json_index(
+            store,
+            target_index_type,
+            expected_ordering,
+            "value",
+            &[
+                r#"{"value": "alpha"}"#,
+                r#"{"value": "bravo"}"#,
+                r#"{"value": "charlie"}"#,
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter([0, 1])
+        );
     }
 
     /// Regression test for https://github.com/lance-format/lance/issues/7485.
@@ -1179,6 +1230,7 @@ mod tests {
         let index = train_and_load_json_index(
             store,
             "btree",
+            TrainingOrdering::None,
             "latitude",
             &[
                 r#"{"latitude": 10.5}"#,
@@ -1226,6 +1278,7 @@ mod tests {
         let index = train_and_load_json_index(
             store,
             "btree",
+            TrainingOrdering::None,
             "v",
             &[
                 r#"{"v": 40.1}"#,  // row 0
@@ -1298,6 +1351,7 @@ mod tests {
         let index = train_and_load_json_index(
             store,
             "ngram",
+            TrainingOrdering::None,
             "tag",
             &[
                 r#"{"tag": "unique-charlie"}"#,

@@ -4,9 +4,11 @@
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
-use lance_arrow::DataTypeExt;
 use lance_file::{
-    previous::writer::ManifestProvider as PreviousManifestProvider, version::LanceFileVersion,
+    version::ConcreteFileVersion,
+    versions::v1::{
+        encoding::write_schema_dictionaries, writer::ManifestProvider as V1ManifestProvider,
+    },
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -17,7 +19,6 @@ use tracing::instrument;
 
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
-    encodings::{Encoder, binary::BinaryEncoder, plain::PlainEncoder},
     object_store::ObjectStore,
     traits::{WriteExt, Writer},
     utils::read_message,
@@ -188,45 +189,14 @@ pub async fn write_manifest(
     indices: Option<Vec<IndexMetadata>>,
     transaction: Option<Transaction>,
 ) -> Result<usize> {
-    // Write dictionary values.
-    let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
-    let is_legacy_storage = manifest.should_use_legacy_format();
-    for field_id in 0..max_field_id + 1 {
-        if let Some(field) = manifest.schema.mut_field_by_id(field_id)
-            && field.data_type().is_dictionary()
-            && is_legacy_storage
-        {
-            let dict_info = field.dictionary.as_mut().ok_or_else(|| {
-                Error::io(format!("Lance field {} misses dictionary info", field.name))
-            })?;
-
-            let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                Error::io(format!(
-                    "Lance field {} is dictionary type, but misses the dictionary value array",
-                    field.name
-                ))
-            })?;
-
-            let data_type = value_arr.data_type();
-            let pos = match data_type {
-                dt if dt.is_numeric() => {
-                    let mut encoder = PlainEncoder::new(writer, dt);
-                    encoder.encode(&[value_arr]).await?
-                }
-                dt if dt.is_binary_like() => {
-                    let mut encoder = BinaryEncoder::new(writer);
-                    encoder.encode(&[value_arr]).await?
-                }
-                _ => {
-                    return Err(Error::schema(format!(
-                        "Does not support {} as dictionary value type",
-                        value_arr.data_type()
-                    )));
-                }
-            };
-            dict_info.offset = pos;
-            dict_info.length = value_arr.len();
+    match manifest.data_storage_format.version {
+        ConcreteFileVersion::V1 => {
+            write_schema_dictionaries(writer, &mut manifest.schema).await?;
         }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {}
     }
 
     do_write_manifest(writer, manifest, indices, transaction).await
@@ -237,7 +207,7 @@ pub async fn write_manifest(
 pub struct ManifestDescribing {}
 
 #[async_trait]
-impl PreviousManifestProvider for ManifestDescribing {
+impl V1ManifestProvider for ManifestDescribing {
     async fn store_schema(
         object_writer: &mut dyn Writer,
         schema: &Schema,
@@ -245,7 +215,7 @@ impl PreviousManifestProvider for ManifestDescribing {
         let mut manifest = Manifest::new(
             schema.clone(),
             Arc::new(vec![]),
-            DataStorageFormat::new(LanceFileVersion::Legacy),
+            DataStorageFormat::new(ConcreteFileVersion::V1),
             HashMap::new(),
         );
         let pos = do_write_manifest(object_writer, &mut manifest, None, None).await?;
@@ -261,8 +231,8 @@ mod test {
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-    use lance_file::previous::{
-        reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+    use lance_file::versions::v1::{
+        reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
     };
     use rand::{Rng, distr::Alphanumeric};
     use tokio::io::AsyncWriteExt;
@@ -335,7 +305,7 @@ mod test {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = PreviousFileWriter::<ManifestDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<ManifestDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -355,7 +325,7 @@ mod test {
         file_writer.finish_with_metadata(&metadata).await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
-        let reader = PreviousFileReader::try_new_self_described_from_reader(reader.into(), None)
+        let reader = V1FileReader::try_new_self_described_from_reader(reader.into(), None)
             .await
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());

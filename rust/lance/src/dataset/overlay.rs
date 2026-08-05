@@ -124,7 +124,7 @@ fn covers_fragment(coverage: Option<&RoaringBitmap>, frag_id: u32) -> bool {
 /// Index by fragment id the fragments that carry at least one overlay. Overlays are rare, so
 /// this is empty on the common path, letting callers skip index loading entirely; when non-empty
 /// it bounds the stale-collection loops to `O(overlaid fragments)`.
-pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
+pub(crate) fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
     fragments
         .iter()
         .filter(|f| !f.overlays.is_empty())
@@ -138,7 +138,7 @@ pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
 /// Used by the scalar and vector paths to block only the affected rows from index results and
 /// re-evaluate only those rows on the flat path, keeping overhead proportional to the number of
 /// overlaid rows rather than the whole fragment size.
-pub fn collect_overlay_stale_rows_for_segment(
+pub(crate) fn collect_overlay_stale_rows_for_segment(
     segment: &IndexMetadata,
     overlaid_frags: &HashMap<u32, &Fragment>,
     stale: &mut HashMap<u32, RoaringBitmap>,

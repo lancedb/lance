@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::inverted::DocumentGranularity;
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
@@ -10,6 +11,13 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtsSearchParams {
+    /// Controls result completeness for each recursively planned FTS node.
+    ///
+    /// `Some(k)` permits bounded top-k execution. Posting-backed compound
+    /// queries apply it only at their root collector and propagate the
+    /// resulting competitive score through child scorers. The exact
+    /// DataFusion fallback passes `None` recursively so intermediate children
+    /// remain complete.
     pub limit: Option<usize>,
     pub wand_factor: f32,
     pub fuzziness: Option<u32>,
@@ -280,7 +288,9 @@ pub struct MatchQuery {
     pub column: Option<String>,
     pub terms: String,
 
-    // literal default is not supported so we set it by function
+    /// Finite, non-negative score multiplier. Validation occurs at the FTS
+    /// query boundary so direct struct deserialization follows the same
+    /// contract as builder-created queries.
     #[serde(default = "MatchQuery::default_boost")]
     pub boost: f32,
 
@@ -308,6 +318,15 @@ pub struct MatchQuery {
     /// Default to 0.
     #[serde(default)]
     pub prefix_length: u32,
+
+    /// The requested logical document unit.
+    ///
+    /// When absent, query planning uses the granularity stored by the unique
+    /// FTS index on `column`. If no index exists, planning defaults to row
+    /// documents. Callers must set this when both row and list-element indexes
+    /// exist on the same field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_granularity: Option<DocumentGranularity>,
 }
 
 impl MatchQuery {
@@ -320,6 +339,7 @@ impl MatchQuery {
             max_expansions: 50,
             operator: Operator::Or,
             prefix_length: 0,
+            document_granularity: None,
         }
     }
 
@@ -361,6 +381,11 @@ impl MatchQuery {
         self
     }
 
+    pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = Some(document_granularity);
+        self
+    }
+
     pub fn auto_fuzziness(token: &str) -> u32 {
         match token.len() {
             0..=2 => 0,
@@ -388,6 +413,14 @@ pub struct PhraseQuery {
     pub terms: String,
     #[serde(default = "u32::default")]
     pub slop: u32,
+    /// The requested logical document unit.
+    ///
+    /// When absent, query planning uses the granularity stored by the unique
+    /// FTS index on `column`. If no index exists, planning defaults to row
+    /// documents. Callers must set this when both row and list-element indexes
+    /// exist on the same field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_granularity: Option<DocumentGranularity>,
 }
 
 impl PhraseQuery {
@@ -396,6 +429,7 @@ impl PhraseQuery {
             column: None,
             terms,
             slop: 0,
+            document_granularity: None,
         }
     }
 
@@ -406,6 +440,11 @@ impl PhraseQuery {
 
     pub fn with_slop(mut self, slop: u32) -> Self {
         self.slop = slop;
+        self
+    }
+
+    pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = Some(document_granularity);
         self
     }
 }
@@ -424,6 +463,7 @@ impl FtsQueryNode for PhraseQuery {
 pub struct BoostQuery {
     pub positive: Box<FtsQuery>,
     pub negative: Box<FtsQuery>,
+    /// Finite, non-negative multiplier subtracted from the positive score.
     #[serde(default = "BoostQuery::default_negative_boost")]
     pub negative_boost: f32,
 }
@@ -803,6 +843,13 @@ pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>)
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
+    if let Some(first_position) = positions.first().copied() {
+        // Phrase positions are relative to the first retained query token. This preserves gaps
+        // between retained tokens without requiring documents to contain filtered leading terms.
+        for position in &mut positions {
+            *position -= first_position;
+        }
+    }
     Tokens::with_positions(tokens, positions, token_type)
 }
 
@@ -948,6 +995,19 @@ mod tests {
         assert_eq!(query.max_expansions, 50);
         assert_eq!(query.operator, Operator::Or);
         assert_eq!(query.prefix_length, 0);
+        assert_eq!(query.document_granularity, None);
+
+        let query = query.with_document_granularity(DocumentGranularity::ListElement);
+        assert_eq!(
+            query.document_granularity,
+            Some(DocumentGranularity::ListElement)
+        );
+        let serialized = serde_json::to_value(&query).unwrap();
+        assert_eq!(serialized["document_granularity"], "list_element");
+        assert_eq!(
+            serde_json::from_value::<MatchQuery>(serialized).unwrap(),
+            query
+        );
     }
 
     #[test]
@@ -972,6 +1032,14 @@ mod tests {
             .with_slop(2);
         let query: PhraseQuery = serde_json::from_value(query).unwrap();
         assert_eq!(query, expected);
+
+        let query = query.with_document_granularity(DocumentGranularity::ListElement);
+        let serialized = serde_json::to_value(&query).unwrap();
+        assert_eq!(serialized["document_granularity"], "list_element");
+        assert_eq!(
+            serde_json::from_value::<PhraseQuery>(serialized).unwrap(),
+            query
+        );
     }
 
     #[test]

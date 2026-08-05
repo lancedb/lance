@@ -692,7 +692,7 @@ impl PyIndexDescription {
             .map(|field| {
                 dataset
                     .schema()
-                    .field_path(*field as i32)
+                    .field_path_minimal(*field as i32)
                     .unwrap_or_else(|_| "<unknown>".to_string())
             })
             .collect();
