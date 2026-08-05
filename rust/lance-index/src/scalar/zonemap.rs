@@ -742,10 +742,15 @@ impl ScalarIndex for ZoneMapIndex {
         builder.options.rows_per_zone = self.rows_per_zone;
         builder.maps = updated_zones;
         builder.null_rows = merged_null_rows;
+        let has_null_bitmap = builder.null_rows.is_some();
         let files = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: make_zone_map_index_details(self.rows_per_zone, self.use_seeds),
+            index_details: make_zone_map_index_details(
+                self.rows_per_zone,
+                self.use_seeds,
+                has_null_bitmap,
+            ),
             index_version: ZONEMAP_INDEX_VERSION,
             files,
         })
@@ -823,10 +828,15 @@ impl ZoneMapIndex {
         )?;
         builder.maps = new_zones;
         builder.null_rows = merged_null_rows;
+        let has_null_bitmap = builder.null_rows.is_some();
         let files = builder.write_index(dest_store).await?;
 
         Ok(Some(CreatedIndex {
-            index_details: make_zone_map_index_details(self.rows_per_zone, self.use_seeds),
+            index_details: make_zone_map_index_details(
+                self.rows_per_zone,
+                self.use_seeds,
+                has_null_bitmap,
+            ),
             index_version: ZONEMAP_INDEX_VERSION,
             files,
         }))
@@ -889,10 +899,11 @@ pub async fn merge_zonemap_indices(
     if !any_missing_bitmap {
         builder.null_rows = Some(merged_null_rows);
     }
+    let has_null_bitmap = builder.null_rows.is_some();
     let files = builder.write_index(dest_store).await?;
 
     Ok(CreatedIndex {
-        index_details: make_zone_map_index_details(rows_per_zone, use_seeds),
+        index_details: make_zone_map_index_details(rows_per_zone, use_seeds, has_null_bitmap),
         index_version: ZONEMAP_INDEX_VERSION,
         files,
     })
@@ -1172,11 +1183,15 @@ impl ZoneProcessor for ZoneMapProcessor {
     }
 }
 
-fn make_zone_map_index_details(rows_per_zone: u64, use_seeds: bool) -> prost_types::Any {
+fn make_zone_map_index_details(
+    rows_per_zone: u64,
+    use_seeds: bool,
+    has_null_bitmap: bool,
+) -> prost_types::Any {
     prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails {
         rows_per_zone: Some(rows_per_zone),
         use_seeds: Some(use_seeds),
-        has_null_bitmap: Some(true),
+        has_null_bitmap: Some(has_null_bitmap),
     })
     .unwrap()
 }
@@ -1282,8 +1297,10 @@ impl BasicTrainer for ZoneMapIndexPlugin {
         let rows_per_zone = request.params.rows_per_zone;
         let use_seeds = request.params.use_seeds.unwrap_or(false);
         let files = Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
+        // Training a new index will always populate the null bitmap
+        let has_null_bitmap = true;
         Ok(CreatedIndex {
-            index_details: make_zone_map_index_details(rows_per_zone, use_seeds),
+            index_details: make_zone_map_index_details(rows_per_zone, use_seeds, has_null_bitmap),
             index_version: ZONEMAP_INDEX_VERSION,
             files,
         })
@@ -1514,12 +1531,16 @@ impl ZoneMapSeedWriter {
                     e
                 ))
             })?;
-            let bitmap = RoaringBitmap::deserialize_from(bitmap_bytes.as_slice()).map_err(|e| {
-                lance_core::Error::invalid_input(format!(
-                    "failed to deserialize seed null bitmap: {}",
-                    e
-                ))
-            })?;
+            let bitmap = if bitmap_bytes.is_empty() {
+                RoaringBitmap::default()
+            } else {
+                RoaringBitmap::deserialize_from(bitmap_bytes.as_slice()).map_err(|e| {
+                    lance_core::Error::invalid_input(format!(
+                        "failed to deserialize seed null bitmap: {}",
+                        e
+                    ))
+                })?
+            };
             Some(bitmap)
         } else {
             None
@@ -1656,8 +1677,8 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
 
         // Embed null bitmap in schema metadata so deserialize_seed can reconstruct null_rows.
         let null_offsets = std::mem::take(&mut self.null_offsets);
-        let batch = if null_offsets.is_empty() {
-            batch
+        let bitmap_bytes = if null_offsets.is_empty() {
+            Vec::default()
         } else {
             let mut bitmap_bytes = Vec::with_capacity(null_offsets.serialized_size());
             null_offsets
@@ -1668,13 +1689,14 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
                         e
                     ))
                 })?;
-            let mut schema = batch.schema().as_ref().clone();
-            schema.metadata.insert(
-                SEED_NULL_BITMAP_META_KEY.to_string(),
-                hex_encode(&bitmap_bytes),
-            );
-            RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec())?
+            bitmap_bytes
         };
+        let mut schema = batch.schema().as_ref().clone();
+        schema.metadata.insert(
+            SEED_NULL_BITMAP_META_KEY.to_string(),
+            hex_encode(&bitmap_bytes),
+        );
+        let batch = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec())?;
 
         // Serialize to Arrow IPC
         let mut buf = Cursor::new(Vec::new());
@@ -1716,6 +1738,9 @@ fn hex_encode(data: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    if s.is_empty() {
+        return Ok(Vec::default());
+    }
     if !s.len().is_multiple_of(2) {
         return Err(format!("odd hex length: {}", s.len()));
     }
@@ -3686,8 +3711,8 @@ mod tests {
             ZoneMapSeedWriter::deserialize_seed(42, &bytes, rows_per_zone).unwrap();
         assert_eq!(zones.len(), 3, "expected 3 zones");
 
-        // No nulls in the input, so no null bitmap
-        assert!(null_bitmap.is_none(), "no nulls → no null bitmap");
+        // No nulls in the input, so null bitmap is empty
+        assert_eq!(null_bitmap, Some(RoaringBitmap::default()));
 
         // Zone 0: values 0..4 -> min=0, max=3
         assert_eq!(zones[0].bound.fragment_id, 42);
