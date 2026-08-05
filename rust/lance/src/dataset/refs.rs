@@ -596,6 +596,14 @@ impl Branches<'_> {
     pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
+        // Acquire with None, then resolve the incarnation under the lease. A prior
+        // list() could observe a branch that is deleted and recreated before we hold.
+        self.acquire_branch_path_lease(branch, None).await?;
+        let result = self.delete_with_lease_held(branch, force).await;
+        self.finish_branch_path_lease(branch, result).await
+    }
+
+    async fn delete_with_lease_held(&self, branch: &str, force: bool) -> Result<()> {
         let all_branches = self.list().await?;
         let branch_id = all_branches
             .get(branch)
@@ -660,8 +668,88 @@ impl Branches<'_> {
             self.object_store().delete(&branch_file).await?;
         }
 
-        // Clean up branch directories
         self.cleanup_branch_directories(branch).await
+    }
+
+    /// True when a create, delete, or cleanup holds the branch-name path lease.
+    pub(crate) async fn has_branch_path_lease(&self, branch: &str) -> Result<bool> {
+        let root_location = self.refs.root()?;
+        let path = branch_path_lease_path(&root_location.path, branch);
+        self.object_store().exists(&path).await
+    }
+
+    /// Acquire the branch-name path lease for a create, delete, or cleanup critical section.
+    ///
+    /// Keyed by display name, not incarnation id, because recreated branches reuse
+    /// `tree/{branch}/`. `branch_id` is recorded for debugging when known.
+    pub(crate) async fn acquire_branch_path_lease(
+        &self,
+        branch: &str,
+        branch_id: Option<&str>,
+    ) -> Result<()> {
+        check_valid_branch(branch)?;
+        let root_location = self.refs.root()?;
+        let path = branch_path_lease_path(&root_location.path, branch);
+        let body = BranchPathLease {
+            branch_id: branch_id.map(str::to_owned),
+        };
+        match put_if_not_exists(
+            self.object_store(),
+            &path,
+            serde_json::to_vec_pretty(&body)?.as_slice(),
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::AlreadyExists { .. })
+            | Err(ObjectStoreError::Precondition { .. }) => Err(Error::RefConflict {
+                message: format!(
+                    "branch {} is busy with another create, delete, or cleanup. Retry after it \
+                     finishes. If a process crashed, remove _refs/branch_path_leases/{} and retry",
+                    branch,
+                    encode_gc_marker_namespace(branch),
+                ),
+            }),
+            Err(error) => Err(Error::io(format!(
+                "acquiring branch path lease for {}: {}",
+                branch, error
+            ))),
+        }
+    }
+
+    /// Drop the branch-name path lease after the critical section finishes.
+    pub(crate) async fn release_branch_path_lease(&self, branch: &str) -> Result<()> {
+        let root_location = self.refs.root()?;
+        let path = branch_path_lease_path(&root_location.path, branch);
+        match self.object_store().delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Release the path lease and prefer a release failure over a silent success.
+    ///
+    /// A successful operation that leaves the lease behind would block the branch name
+    /// until the lease file is removed by hand.
+    pub(crate) async fn finish_branch_path_lease<T>(
+        &self,
+        branch: &str,
+        result: Result<T>,
+    ) -> Result<T> {
+        match (result, self.release_branch_path_lease(branch).await) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(release_err)) => Err(release_err),
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(release_err)) => {
+                log::warn!(
+                    "failed to release branch path lease for {}: {}",
+                    branch,
+                    release_err
+                );
+                Err(err)
+            }
+        }
     }
 
     pub async fn list_ordered(
@@ -1267,6 +1355,26 @@ pub fn clone_pin_path(base_path: &Path, pin_id: &str) -> Path {
 
 pub fn base_gc_markers_path(base_path: &Path) -> Path {
     base_path.clone().join("_refs").join("gc_markers")
+}
+
+pub fn base_branch_path_leases_path(base_path: &Path) -> Path {
+    base_path.clone().join("_refs").join("branch_path_leases")
+}
+
+/// Lease file under `_refs/branch_path_leases/<encoded-branch-name>`.
+///
+/// Held for the full create, delete, or cleanup critical section on that branch name.
+/// Keyed by display name because recreated branches reuse `tree/{branch}/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchPathLease {
+    /// Leaf UUID of the incarnation when known. Absent for create, delete acquire, and main.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+}
+
+fn branch_path_lease_path(base_path: &Path, branch: &str) -> Path {
+    base_branch_path_leases_path(base_path).join(encode_gc_marker_namespace(branch))
 }
 
 fn encode_gc_marker_namespace(namespace: &str) -> String {

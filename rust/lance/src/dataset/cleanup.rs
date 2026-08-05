@@ -527,10 +527,33 @@ impl<'a> CleanupTask<'a> {
         self.ensure_cleanup_branch_incarnation(&branch_identifier)
             .await?;
 
-        final_result.merge(
-            self.delete_unreferenced_files(inspection).await?,
-            candidate_file_limit,
-        );
+        // Named branches reuse tree/{name}/ across incarnations. Hold the branch-name
+        // path lease through the destructive phase so create/delete cannot touch those
+        // paths until this cleanup finishes.
+        let lease_branch = self
+            .action
+            .deletes_files()
+            .then(|| self.dataset.manifest.branch.clone())
+            .flatten();
+        let delete_result = if let Some(branch_name) = lease_branch.as_deref() {
+            self.dataset
+                .branches()
+                .acquire_branch_path_lease(branch_name, branch_identifier.branch_id())
+                .await?;
+            let result = async {
+                self.ensure_cleanup_branch_incarnation(&branch_identifier)
+                    .await?;
+                self.delete_unreferenced_files(inspection).await
+            }
+            .await;
+            self.dataset
+                .branches()
+                .finish_branch_path_lease(branch_name, result)
+                .await
+        } else {
+            self.delete_unreferenced_files(inspection).await
+        };
+        final_result.merge(delete_result?, candidate_file_limit);
         Ok(final_result)
     }
 
@@ -2449,7 +2472,7 @@ mod tests {
 
         let error = source.delete_branch("dev").await.unwrap_err();
         assert!(matches!(error, Error::RefConflict { .. }), "{error:?}");
-        assert!(error.to_string().contains("unregister them"), "{error}");
+        assert!(error.to_string().contains("Unregister them"), "{error}");
 
         let clone = fixture.load_dataset(&clone_uri).await.unwrap();
         assert_eq!(scan_row_count(&clone).await.unwrap(), expected_rows);
@@ -2471,6 +2494,99 @@ mod tests {
         source.delete_branch("dev").await.unwrap();
         let clone = fixture.load_dataset(&clone_uri).await.unwrap();
         assert!(scan_row_count(&clone).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn branch_path_lease_blocks_recreate_during_destructive_phase() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut source = fixture.load().await.unwrap();
+        let branch = fixture
+            .create_branch_and_load(&mut source, "dev", 1)
+            .await
+            .unwrap();
+        Dataset::write(
+            some_batch(),
+            &branch.uri,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let branch = fixture.load_dataset(&branch.uri).await.unwrap();
+        let expected_rows = scan_row_count(&branch).await.unwrap();
+        let cleanup = CleanupTask::new(
+            &branch,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
+                .delete_unverified(true)
+                .error_if_tagged_old_versions(false)
+                .build(),
+            CleanupAction::Execute,
+        );
+        let identifier = branch.branch_identifier().await.unwrap();
+        let inspection = cleanup
+            .process_manifests(&RetainedVersions::default())
+            .await
+            .unwrap();
+        let inspection = cleanup
+            .mark_old_versions_and_retain_protected(inspection, &identifier)
+            .await
+            .unwrap();
+        cleanup
+            .ensure_cleanup_branch_incarnation(&identifier)
+            .await
+            .unwrap();
+        branch
+            .branches()
+            .acquire_branch_path_lease("dev", identifier.branch_id())
+            .await
+            .unwrap();
+        assert!(
+            branch
+                .branches()
+                .has_branch_path_lease("dev")
+                .await
+                .unwrap()
+        );
+
+        let delete_error = source.delete_branch("dev").await.unwrap_err();
+        assert!(
+            matches!(delete_error, Error::RefConflict { .. }),
+            "{delete_error:?}"
+        );
+        assert!(
+            delete_error.to_string().contains("is busy"),
+            "{delete_error}"
+        );
+
+        // Create also acquires the path lease, so recreate is refused while cleanup
+        // holds it even before the "already exists" check.
+        let recreate_error = source.create_branch("dev", 1, None).await.unwrap_err();
+        assert!(
+            matches!(recreate_error, Error::RefConflict { .. }),
+            "{recreate_error:?}"
+        );
+        assert!(
+            recreate_error.to_string().contains("is busy"),
+            "{recreate_error}"
+        );
+
+        let delete_result = cleanup.delete_unreferenced_files(inspection).await;
+        branch
+            .branches()
+            .finish_branch_path_lease("dev", delete_result)
+            .await
+            .unwrap();
+
+        let branch = fixture.load_dataset(&branch.uri).await.unwrap();
+        assert_eq!(scan_row_count(&branch).await.unwrap(), expected_rows);
     }
 
     #[tokio::test]

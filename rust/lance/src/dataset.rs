@@ -562,7 +562,26 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
+        // Hold the path lease across clone commit and BranchContents write. Named branches
+        // reuse tree/{branch}/, so create must serialize with delete and cleanup.
+        self.branches()
+            .acquire_branch_path_lease(branch, None)
+            .await?;
+        let result = self
+            .create_branch_with_lease_held(branch, version.into(), store_params)
+            .await;
+        self.branches()
+            .finish_branch_path_lease(branch, result)
+            .await
+    }
+
+    async fn create_branch_with_lease_held(
+        &mut self,
+        branch: &str,
+        version: refs::Ref,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let (source_branch, version_number) = self.resolve_reference(version).await?;
         let source_branch_id = self
             .refs
             .branches()

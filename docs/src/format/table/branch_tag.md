@@ -147,6 +147,10 @@ Branch deletion writes an incarnation-wide `deleted` marker, then lists pins and
 The `deleted` marker is never removed. A refused delete leaves the incarnation closed to new shallow clones. Rerun delete after unregistering the listed pins.
 A force delete overrides the refusal and breaks those clones.
 Tag-retained clones do not block branch deletion.
+
+Named-branch create, delete, and cleanup hold a short-lived path lease under `_refs/branch_path_leases/<encoded-branch-name>` for their full critical sections.
+The lease serializes those operations so a delete/recreate cannot reuse `tree/{branch}/` paths while cleanup or another mutation is still using them.
+The lease is removed when the operation finishes. If a process crashes, remove the lease file before retrying create, delete, or cleanup.
 A pinned clone checks both markers, creates its pin, then checks both again before commit.
 A tag-retained clone verifies the tag and checks both markers without creating a pin.
 
@@ -161,6 +165,8 @@ Cleanup markers live under `_refs/gc_markers/<incarnation>/<version>`:
         clones/
             21b1c1b1a4f7f9f0d1e2c3b4a5968778.json
             8f0e1d2c3b4a5968778091a2b3c4d5e6.json
+        branch_path_leases/
+            feature%2Fdev
         gc_markers/
             main/
                 1
