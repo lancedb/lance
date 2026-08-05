@@ -197,7 +197,6 @@ serde_json = { version = "1" }
 semver = "1.0"
 serial_test = "3"
 snafu = "0.9"
-strum = "0.26"
 lindera = { version = "3.0.7" }
 tempfile = "3"
 test-log = { version = "0.2.15" }
