@@ -1905,6 +1905,355 @@ async fn test_shallow_clone_multiple_times(
     validate_dataset(&original, 36, 1, 0).await;
 }
 
+#[tokio::test]
+async fn test_shallow_clone_stores_source_pin_id() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    let mut source = Dataset::write(
+        data.into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let clone_uri = format!("{}/clone", test_uri);
+    let clone = source.shallow_clone(&clone_uri, 1, None).await.unwrap();
+
+    let pin_id = clone.source_pin_id().unwrap().to_string();
+    let pins = source.clone_pins().list().await.unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].id, pin_id);
+    assert_eq!(pins[0].version, 1);
+    assert_eq!(pins[0].branch, None);
+    assert_eq!(pins[0].clone_uri.as_deref(), Some(clone_uri.as_str()));
+
+    let other_uri = format!("{}/other", test_uri);
+    let other = source.shallow_clone(&other_uri, 1, None).await.unwrap();
+    assert_ne!(other.source_pin_id(), Some(pin_id.as_str()));
+    assert_eq!(source.clone_pins().list().await.unwrap().len(), 2);
+
+    source.clone_pins().unregister(&pin_id).await.unwrap();
+    assert_eq!(source.clone_pins().list().await.unwrap().len(), 1);
+
+    let error = source.clone_pins().unregister(&pin_id).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{:?}", error);
+}
+
+#[tokio::test]
+async fn test_source_pin_id_survives_clone_update() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    let mut source = Dataset::write(
+        data.into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let clone_uri = format!("{}/clone", test_uri);
+    let mut clone = source.shallow_clone(&clone_uri, 1, None).await.unwrap();
+    let pin_id = clone.source_pin_id().unwrap().to_string();
+
+    let append = gen_batch().col("index", array::step::<Int32Type>());
+    clone = Dataset::write(
+        append.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
+        &clone_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(clone.source_pin_id(), Some(pin_id.as_str()));
+
+    let overwrite = gen_batch().col("index", array::step::<Int32Type>());
+    Dataset::write(
+        overwrite.into_reader_rows(RowCount::from(3), BatchCount::from(1)),
+        &clone_uri,
+        Some(WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let reopened = Dataset::open(&clone_uri).await.unwrap();
+    assert_eq!(reopened.source_pin_id(), Some(pin_id.as_str()));
+}
+
+#[tokio::test]
+async fn test_shallow_clone_require_tag_skips_source_pin() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    let mut source = Dataset::write(
+        data.into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    source.tags().create("v1", 1).await.unwrap();
+
+    let clone_uri = format!("{}/tagged_clone", test_uri);
+    let clone = source
+        .shallow_clone_with_retention(
+            &clone_uri,
+            1,
+            None,
+            crate::dataset::ShallowCloneRetention::RequireTag,
+        )
+        .await
+        .unwrap();
+
+    assert!(clone.source_pin_id().is_none());
+    assert!(source.clone_pins().list().await.unwrap().is_empty());
+    assert_eq!(clone.count_rows(None).await.unwrap(), 10);
+}
+
+#[tokio::test]
+async fn test_shallow_clone_require_tag_rejects_untagged_version() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    let mut source = Dataset::write(
+        data.into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .shallow_clone_with_retention(
+            &format!("{}/untagged_clone", test_uri),
+            1,
+            None,
+            crate::dataset::ShallowCloneRetention::RequireTag,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("needs a tag"));
+    assert!(source.clone_pins().list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_shallow_clone_rejects_occupied_target_without_pin() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    let mut source = Dataset::write(
+        data.into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let occupied_uri = format!("{}/occupied", test_uri);
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    Dataset::write(
+        data.into_reader_rows(RowCount::from(5), BatchCount::from(1)),
+        &occupied_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    source
+        .shallow_clone(&occupied_uri, 1, None)
+        .await
+        .expect_err("cloning onto an existing dataset should fail");
+
+    let pins = source.clone_pins().list().await.unwrap();
+    assert!(pins.is_empty());
+}
+
+#[tokio::test]
+async fn test_failed_clone_commit_keeps_pin_when_outcome_is_ambiguous() {
+    use crate::dataset::refs::BranchIdentifier;
+
+    let test_uri = TempStrDir::default();
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    let source = Dataset::write(
+        data.into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let create_pin = || async {
+        source
+            .clone_pins()
+            .create_pin(
+                None,
+                &BranchIdentifier::main(),
+                1,
+                Some("memory://unused_clone"),
+            )
+            .await
+            .unwrap()
+    };
+
+    let pin_id = create_pin().await;
+    let definitive = Error::invalid_input("target validation failed");
+    source
+        .cleanup_pin_after_failed_clone_commit(&pin_id, &definitive)
+        .await;
+    assert!(source.clone_pins().list().await.unwrap().is_empty());
+
+    let pin_id = create_pin().await;
+    let unknown = Error::commit_status_unknown_source(1, "response lost".to_string().into());
+    source
+        .cleanup_pin_after_failed_clone_commit(&pin_id, &unknown)
+        .await;
+    assert_eq!(source.clone_pins().list().await.unwrap().len(), 1);
+
+    let timed_out = Error::timeout("commit timed out");
+    source
+        .cleanup_pin_after_failed_clone_commit(&pin_id, &timed_out)
+        .await;
+    assert_eq!(source.clone_pins().list().await.unwrap().len(), 1);
+
+    source.clone_pins().unregister(&pin_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn resolve_shallow_clone_source_matches_resolve_reference() {
+    use crate::dataset::refs::Ref;
+    use crate::dataset::write::{WriteMode, WriteParams};
+
+    let test_uri = TempStrDir::default();
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    let mut source = Dataset::write(
+        data.into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    Dataset::write(
+        gen_batch()
+            .col("index", array::step_custom::<Int32Type>(10, 1))
+            .into_reader_rows(RowCount::from(5), BatchCount::from(1)),
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    source.checkout_latest().await.unwrap();
+
+    let mut dev = source.create_branch("dev", 1, None).await.unwrap();
+    Dataset::write(
+        gen_batch()
+            .col("index", array::step_custom::<Int32Type>(100, 1))
+            .into_reader_rows(RowCount::from(3), BatchCount::from(1)),
+        dev.uri(),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dev.checkout_latest().await.unwrap();
+
+    source.tags().create("main_tag", 1).await.unwrap();
+    source.tags().create("dev_tag", ("dev", 2)).await.unwrap();
+
+    async fn assert_parity(dataset: &Dataset, reference: Ref) {
+        let (ref_name, version) = dataset.resolve_reference(reference.clone()).await.unwrap();
+        let source = dataset
+            .resolve_shallow_clone_source(reference)
+            .await
+            .unwrap();
+        assert_eq!(source.ref_name, ref_name);
+        assert_eq!(source.version, version);
+        assert_eq!(
+            source.identifier,
+            dataset
+                .branches()
+                .get_identifier(ref_name.as_deref())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            source.location,
+            dataset
+                .branch_location()
+                .find_branch(ref_name.as_deref())
+                .unwrap()
+        );
+    }
+
+    assert_parity(&source, Ref::VersionNumber(1)).await;
+    assert_parity(&dev, Ref::VersionNumber(1)).await;
+    assert_parity(&source, Ref::Version(Some("dev".to_string()), Some(1))).await;
+    assert_parity(&source, Ref::Version(Some("dev".to_string()), None)).await;
+    assert_parity(&source, Ref::Tag("main_tag".to_string())).await;
+    assert_parity(&source, Ref::Tag("dev_tag".to_string())).await;
+}
+
+#[tokio::test]
+async fn clone_commit_rejects_recreated_source_branch() {
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::write::CommitBuilder;
+
+    let test_uri = TempStrDir::default();
+    let data = gen_batch().col("index", array::step::<Int32Type>());
+    let mut source = Dataset::write(
+        data.into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let branch = source.create_branch("dev", 1, None).await.unwrap();
+    let old_branch_id = source
+        .branches()
+        .get_identifier(Some("dev"))
+        .await
+        .unwrap()
+        .branch_id()
+        .unwrap()
+        .to_string();
+    let branch_uri = branch.uri().to_string();
+    let branch_version = branch.version().version;
+
+    source.delete_branch("dev").await.unwrap();
+    source.create_branch("dev", 1, None).await.unwrap();
+
+    let clone_uri = format!("{}/stale_branch_clone", test_uri.as_str());
+    let error = CommitBuilder::new(WriteDestination::Uri(&clone_uri))
+        .with_object_store(Arc::new(source.object_store.as_ref().clone()))
+        .with_commit_handler(source.commit_handler.clone())
+        .execute(Transaction::new(
+            branch_version,
+            Operation::Clone {
+                is_shallow: true,
+                ref_name: Some("dev".to_string()),
+                ref_version: branch_version,
+                ref_path: branch_uri,
+                branch_name: None,
+                source_pin_id: None,
+                source_branch_id: Some(old_branch_id),
+            },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RefConflict { .. }),
+        "expected RefConflict for stale source_branch_id, got {:?}",
+        error
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_self_dataset_append(

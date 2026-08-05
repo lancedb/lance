@@ -44,8 +44,10 @@ use rand::{Rng, rng};
 
 use super::ObjectStore;
 use crate::Dataset;
+use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::refs::{BranchContents, SOURCE_PIN_ID_CONFIG_KEY, branch_contents_path};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
@@ -334,6 +336,58 @@ pub(crate) async fn write_transaction_file(
     Ok(file_name)
 }
 
+/// Refuse a clone when the source branch was deleted or recreated after resolution.
+///
+/// `source_branch_id` is the leaf UUID captured when the clone transaction was built.
+/// Absent means main, or an older transaction that did not record the incarnation.
+///
+/// Call this after every source read completes. A recreated branch reuses the same
+/// manifest paths. Checking before the reads leaves a window where those reads hit the
+/// new incarnation. `Branches::delete` removes the branch contents file before touching
+/// branch data, and recreation writes a fresh leaf UUID. The expected UUID still present
+/// after the reads proves they were served by that incarnation.
+async fn verify_clone_source_branch_incarnation(
+    source_store: &ObjectStore,
+    source_base_path: &Path,
+    ref_path: &str,
+    ref_name: &Option<String>,
+    source_branch_id: &Option<String>,
+) -> Result<()> {
+    let Some(expected) = source_branch_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(branch_name) = ref_name.as_deref() else {
+        return Err(Error::RefConflict {
+            message: "clone source_branch_id set but source has no branch name".to_string(),
+        });
+    };
+    let location = BranchLocation {
+        path: source_base_path.clone(),
+        uri: ref_path.to_string(),
+        branch: Some(branch_name.to_string()),
+    };
+    let root = location.find_main()?;
+    let branch_file = branch_contents_path(&root.path, branch_name);
+    if !source_store.exists(&branch_file).await? {
+        return Err(Error::RefConflict {
+            message: format!(
+                "branch {} was deleted or recreated during clone",
+                branch_name
+            ),
+        });
+    }
+    let contents = BranchContents::from_path(&branch_file, source_store, branch_name).await?;
+    if contents.identifier.branch_id() != Some(expected) {
+        return Err(Error::RefConflict {
+            message: format!(
+                "branch {} was deleted or recreated during clone",
+                branch_name
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
@@ -358,6 +412,8 @@ async fn do_commit_new_dataset(
         ref_version,
         ref_path,
         branch_name,
+        source_pin_id,
+        source_branch_id,
         ..
     } = &transaction.operation
     {
@@ -378,20 +434,25 @@ async fn do_commit_new_dataset(
         )
         .await?;
 
-        if *is_shallow {
+        let manifest_and_indices = if *is_shallow {
             let new_base_id = source_manifest
                 .base_paths
                 .keys()
                 .max()
                 .map(|id| *id + 1)
                 .unwrap_or(0);
-            let new_manifest = source_manifest.shallow_clone(
+            let mut new_manifest = source_manifest.shallow_clone(
                 ref_name.clone(),
                 ref_path.clone(),
                 new_base_id,
                 branch_name.clone(),
                 transaction_file.clone(),
             );
+            if let Some(pin_id) = source_pin_id {
+                new_manifest
+                    .config
+                    .insert(SOURCE_PIN_ID_CONFIG_KEY.to_string(), pin_id.clone());
+            }
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
                 let reader = source_store.open(&source_manifest_location.path).await?;
@@ -447,7 +508,20 @@ async fn do_commit_new_dataset(
                     .collect::<Result<Vec<_>>>()?;
             }
             (new_manifest, updated_indices)
-        }
+        };
+
+        // Every source read is done. Verify the source branch still maps to the
+        // incarnation captured at resolution before committing a manifest built
+        // from those reads.
+        verify_clone_source_branch_incarnation(
+            source_store,
+            &source_base_path,
+            ref_path,
+            ref_name,
+            source_branch_id,
+        )
+        .await?;
+        manifest_and_indices
     } else {
         let (manifest, indices) =
             transaction.build_manifest(None, vec![], &transaction_file, write_config)?;

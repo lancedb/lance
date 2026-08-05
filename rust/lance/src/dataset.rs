@@ -66,7 +66,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 pub(crate) mod blob;
 pub(crate) mod branch_location;
@@ -108,7 +108,10 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
+use crate::dataset::refs::{
+    BranchContents, BranchIdentifier, Branches, ClonePins, ResolvedBranch,
+    SOURCE_PIN_ID_CONFIG_KEY, Tags,
+};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
@@ -249,6 +252,20 @@ pub struct VersionTransaction {
 
     /// The transaction that produced this version, if one was recorded.
     pub transaction: Option<Transaction>,
+}
+
+/// How [`Dataset::shallow_clone`] retains the source version against cleanup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShallowCloneRetention {
+    /// Write a source pin so cleanup retains the cloned version.
+    ///
+    /// Requires write access to the source. This is the default.
+    #[default]
+    PinSource,
+    /// Do not write a source pin. Requires a tag on the source that already points at
+    /// the resolved version. Use when the source is read-only and the source owner has
+    /// tagged the version before cloning.
+    RequireTag,
 }
 
 /// Customize read behavior of a dataset.
@@ -487,6 +504,24 @@ impl Dataset {
         self.refs.branches()
     }
 
+    /// Source-side pins for shallow clones of this dataset.
+    ///
+    /// Each pin holds a source version so [`Self::cleanup_old_versions`] keeps the files
+    /// that clone still needs. [`Dataset::shallow_clone`] creates a pin and stores its id
+    /// on the clone. After the clone is deleted or detached, remove the pin with
+    /// [`ClonePins::unregister`].
+    pub fn clone_pins(&self) -> ClonePins<'_> {
+        self.refs.clone_pins()
+    }
+
+    /// Pin id this shallow clone holds on its source dataset, if any.
+    pub fn source_pin_id(&self) -> Option<&str> {
+        self.manifest
+            .config
+            .get(SOURCE_PIN_ID_CONFIG_KEY)
+            .map(|value| value.as_str())
+    }
+
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
         let (manifest, manifest_location) = self.latest_manifest().await?;
@@ -528,7 +563,33 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
+        // Hold the path lease across clone commit and BranchContents write. Named branches
+        // reuse tree/{branch}/, so create must serialize with delete and cleanup.
+        self.branches()
+            .acquire_branch_path_lease(branch, None)
+            .await?;
+        let result = self
+            .create_branch_with_lease_held(branch, version.into(), store_params)
+            .await;
+        self.branches()
+            .finish_branch_path_lease(branch, result)
+            .await
+    }
+
+    async fn create_branch_with_lease_held(
+        &mut self,
+        branch: &str,
+        version: refs::Ref,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let (source_branch, version_number) = self.resolve_reference(version).await?;
+        let source_branch_id = self
+            .refs
+            .branches()
+            .get_identifier(source_branch.as_deref())
+            .await?
+            .branch_id()
+            .map(str::to_owned);
         let branch_location = self.branch_location().find_branch(Some(branch))?;
         let source_location = self
             .branch_location()
@@ -539,6 +600,8 @@ impl Dataset {
             ref_version: version_number,
             ref_path: source_location.uri,
             branch_name: Some(branch.to_string()),
+            source_pin_id: None,
+            source_branch_id,
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
@@ -563,7 +626,9 @@ impl Dataset {
         self.branches().delete(branch, false).await
     }
 
-    /// Delete the branch even if the BranchContents is not found.
+    /// Delete the branch even if the BranchContents is not found, and even if
+    /// shallow-clone pins still target it. Clones holding those pins lose access
+    /// to branch-local files.
     /// This could be useful when we have zombie branches and want to clean them up immediately.
     pub async fn force_delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches().delete(branch, true).await
@@ -1417,6 +1482,10 @@ impl Dataset {
     ///
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
+    ///
+    /// Versions that are tagged, that a descendant branch still reads, or that a shallow-clone
+    /// pin under `_refs/clones/` holds are retained regardless of age, along with the files
+    /// they reference. See [`Self::clone_pins`]. Cleanup does not open clone URIs.
     ///
     /// # Arguments
     ///
@@ -3130,35 +3199,231 @@ impl Dataset {
         Ok(())
     }
 
-    /// Shallow clone the target version into a new dataset at target_path.
-    /// 'target_path': the uri string to clone the dataset into.
-    /// 'version': the version cloned from, could be a version number or tag.
-    /// 'store_params': the object store params to use for the new dataset.
+    /// Shallow clone the target version into a new dataset at `target_path`.
+    ///
+    /// Equivalent to [`Self::shallow_clone_with_retention`] with
+    /// [`ShallowCloneRetention::PinSource`].
     pub async fn shallow_clone(
         &mut self,
         target_path: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
-        let source_location = self.branch_location().find_branch(ref_name.as_deref())?;
+        self.shallow_clone_with_retention(
+            target_path,
+            version,
+            store_params,
+            ShallowCloneRetention::PinSource,
+        )
+        .await
+    }
+
+    /// Shallow clone the target version into a new dataset at `target_path`.
+    ///
+    /// The clone reads the source's data files in place without copying them.
+    ///
+    /// [`ShallowCloneRetention::PinSource`] writes a pin under `_refs/clones/` and stores
+    /// the pin id on the clone so [`Self::cleanup_old_versions`] keeps those files.
+    /// Requires write access to the source. This is the default via [`Self::shallow_clone`].
+    ///
+    /// [`ShallowCloneRetention::RequireTag`] skips the pin. A tag on the source must already
+    /// point at the resolved version. Keep that tag while the clone reads source files.
+    ///
+    /// Cleanup markers refuse the clone under either policy. An unused pin is removed when
+    /// cleanup marks the version before commit starts, or when the commit path verifies no
+    /// manifest landed. Unknown outcomes keep the pin. A leaked pin wastes storage. Removing
+    /// a pin for a live clone can lose data.
+    ///
+    /// After deleting or detaching a pinned clone, call
+    /// `source.clone_pins().unregister(clone.source_pin_id())`.
+    pub async fn shallow_clone_with_retention(
+        &mut self,
+        target_path: &str,
+        version: impl Into<refs::Ref>,
+        store_params: Option<ObjectStoreParams>,
+        retention: ShallowCloneRetention,
+    ) -> Result<Self> {
+        let source = self.resolve_shallow_clone_source(version.into()).await?;
+        let store_params =
+            store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default());
+        // Resolve before pin creation: an error after the pin is written would leak it.
+        let storage_format = self.manifest.data_storage_format.lance_file_version()?;
+
+        // Fail before writing a source pin when the destination is already a dataset.
+        ensure_shallow_clone_target_available(target_path, Some(&store_params)).await?;
+
+        let branch = source.ref_name.as_deref();
+        let source_pin_id = match retention {
+            ShallowCloneRetention::PinSource => Some(
+                create_shallow_clone_pin(
+                    &self.clone_pins(),
+                    branch,
+                    &source.identifier,
+                    source.version,
+                    target_path,
+                )
+                .await?,
+            ),
+            ShallowCloneRetention::RequireTag => {
+                if !source_version_is_tagged(self, branch, source.version).await? {
+                    return Err(Error::invalid_input(format!(
+                        "shallow clone with RequireTag needs a tag on version {} of branch {}; \
+                         create the tag on the source before cloning",
+                        source.version,
+                        branch.unwrap_or(refs::MAIN_BRANCH),
+                    )));
+                }
+                // Still refuse versions cleanup has already closed and branches whose
+                // deletion has been requested. Files may be gone or about to be.
+                ensure_clone_source_not_fenced(
+                    &self.clone_pins(),
+                    branch,
+                    source.identifier.marker_namespace(),
+                    source.version,
+                )
+                .await?;
+                None
+            }
+        };
+
+        // Pin creation can race with branch recreation. Re-check before commit.
+        if let Err(err) =
+            ensure_branch_incarnation_unchanged(&self.refs.branches(), branch, &source.identifier)
+                .await
+        {
+            if let Some(pin_id) = source_pin_id.as_deref()
+                && let Err(unregister_error) = self.clone_pins().unregister(pin_id).await
+            {
+                warn!(
+                    error = %unregister_error,
+                    pin_id,
+                    "failed to remove unused shallow-clone pin"
+                );
+            }
+            return Err(err);
+        }
+
         let clone_op = Operation::Clone {
             is_shallow: true,
-            ref_name,
-            ref_version: version_number,
-            ref_path: source_location.uri,
+            ref_name: source.ref_name.clone(),
+            ref_version: source.version,
+            ref_path: source.location.uri,
             branch_name: None,
+            source_pin_id: source_pin_id.clone(),
+            source_branch_id: source.identifier.branch_id().map(str::to_owned),
         };
-        let transaction = Transaction::new(version_number, clone_op, None);
+        let transaction = Transaction::new(source.version, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(
-                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
-            )
+            .with_store_params(store_params.clone())
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
-        builder.execute(transaction).await
+            .with_storage_format(storage_format);
+
+        match builder.execute(transaction).await {
+            Ok(dataset) => Ok(dataset),
+            Err(commit_error) => {
+                if let Some(pin_id) = source_pin_id.as_deref() {
+                    self.cleanup_pin_after_failed_clone_commit(pin_id, &commit_error)
+                        .await;
+                }
+                Err(commit_error)
+            }
+        }
+    }
+
+    /// Resolve the version, location, and branch incarnation for a shallow clone together.
+    ///
+    /// Captures the branch incarnation before reading the version on that branch so the
+    /// returned values cannot come from two different incarnations of the same name.
+    async fn resolve_shallow_clone_source(
+        &self,
+        reference: refs::Ref,
+    ) -> Result<ResolvedCloneSource> {
+        match reference {
+            refs::Ref::Tag(tag_name) => {
+                let tag = self.tags().get(tag_name.as_str()).await?;
+                let source = self
+                    .resolve_shallow_clone_source_on_branch(tag.branch, Some(tag.version))
+                    .await?;
+                let tag_again = self.tags().get(tag_name.as_str()).await?;
+                if tag_again.branch != source.ref_name || tag_again.version != source.version {
+                    return Err(Error::RefConflict {
+                        message: format!("tag {} changed during shallow clone", tag_name),
+                    });
+                }
+                ensure_branch_incarnation_unchanged(
+                    &self.refs.branches(),
+                    source.ref_name.as_deref(),
+                    &source.identifier,
+                )
+                .await?;
+                Ok(source)
+            }
+            refs::Ref::VersionNumber(version) => {
+                self.resolve_shallow_clone_source_on_branch(
+                    self.manifest.branch.clone(),
+                    Some(version),
+                )
+                .await
+            }
+            refs::Ref::Version(branch, version) => {
+                self.resolve_shallow_clone_source_on_branch(branch, version)
+                    .await
+            }
+        }
+    }
+
+    async fn resolve_shallow_clone_source_on_branch(
+        &self,
+        ref_name: Option<String>,
+        version: Option<u64>,
+    ) -> Result<ResolvedCloneSource> {
+        let branch = ref_name.as_deref();
+        // Resolve the incarnation first, then the version on that location.
+        let ResolvedBranch {
+            location,
+            identifier,
+        } = self.refs.branches().resolve_branch(branch).await?;
+        let version = if let Some(version) = version {
+            // Confirm the version exists on this incarnation's location before returning.
+            self.commit_handler
+                .resolve_version_location(&location.path, version, &self.object_store.inner)
+                .await?;
+            version
+        } else {
+            self.commit_handler
+                .resolve_latest_location(&location.path, &self.object_store)
+                .await?
+                .version
+        };
+        ensure_branch_incarnation_unchanged(&self.refs.branches(), branch, &identifier).await?;
+        Ok(ResolvedCloneSource {
+            ref_name,
+            version,
+            location,
+            identifier,
+        })
+    }
+
+    /// Remove an unused source pin only when the commit is known not to have landed.
+    ///
+    /// Unknown commit outcomes, timeouts, and commit handlers that may report errors
+    /// after success retain the pin.
+    async fn cleanup_pin_after_failed_clone_commit(&self, pin_id: &str, commit_error: &Error) {
+        let outcome_is_ambiguous = commit_error.is_commit_status_unknown()
+            || matches!(commit_error, Error::Timeout { .. })
+            || self.commit_handler.propagate_commit_error_after_success();
+        if outcome_is_ambiguous {
+            return;
+        }
+        if let Err(error) = self.clone_pins().unregister(pin_id).await {
+            warn!(
+                error = %error,
+                pin_id,
+                "failed to remove unused shallow-clone pin"
+            );
+        }
     }
 
     /// Deep clone the target version into a new dataset at target_path.
@@ -3263,12 +3528,21 @@ impl Dataset {
         // Record a Clone operation and commit via CommitBuilder
         let ref_name = src_ds.manifest.branch.clone();
         let ref_version = src_ds.manifest_location.version;
+        let source_branch_id = src_ds
+            .refs
+            .branches()
+            .get_identifier(ref_name.as_deref())
+            .await?
+            .branch_id()
+            .map(str::to_owned);
         let clone_op = Operation::Clone {
             is_shallow: false,
             ref_name,
             ref_version,
             ref_path: src_ds.uri().to_string(),
             branch_name: None,
+            source_pin_id: None,
+            source_branch_id,
         };
         let txn = Transaction::new(ref_version, clone_op, None);
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
@@ -4019,6 +4293,170 @@ pub(crate) async fn write_manifest_file(
             transaction.take().map(|tx| tx.into()),
         )
         .await
+}
+
+/// Version, location, and branch incarnation for one shallow-clone source.
+struct ResolvedCloneSource {
+    ref_name: Option<String>,
+    version: u64,
+    location: BranchLocation,
+    identifier: BranchIdentifier,
+}
+
+fn shallow_clone_marked_for_deletion_error(branch: Option<&str>, version: u64) -> Error {
+    Error::invalid_input(format!(
+        "cannot shallow clone version {} of branch {}: source cleanup has marked it for deletion",
+        version,
+        branch.unwrap_or(refs::MAIN_BRANCH),
+    ))
+}
+
+fn shallow_clone_branch_deleted_error(branch: Option<&str>) -> Error {
+    Error::invalid_input(format!(
+        "cannot shallow clone branch {}: deletion of this branch has been requested",
+        branch.unwrap_or(refs::MAIN_BRANCH),
+    ))
+}
+
+/// Refuse a clone of a version cleanup has fenced, or of a branch whose deletion
+/// has been requested. Both fences are permanent for the incarnation.
+async fn ensure_clone_source_not_fenced(
+    clone_pins: &ClonePins<'_>,
+    branch: Option<&str>,
+    namespace: &str,
+    version: u64,
+) -> Result<()> {
+    if clone_pins
+        .has_gc_marker_in_namespace(namespace, refs::GcMarker::Version(version))
+        .await?
+    {
+        return Err(shallow_clone_marked_for_deletion_error(branch, version));
+    }
+    if branch.is_some()
+        && clone_pins
+            .has_gc_marker_in_namespace(namespace, refs::GcMarker::BranchDeleted)
+            .await?
+    {
+        return Err(shallow_clone_branch_deleted_error(branch));
+    }
+    Ok(())
+}
+
+async fn ensure_shallow_clone_target_available(
+    target_path: &str,
+    store_params: Option<&ObjectStoreParams>,
+) -> Result<()> {
+    let builder = DatasetBuilder::from_uri(target_path).with_read_params(ReadParams {
+        store_options: store_params.cloned(),
+        ..Default::default()
+    });
+    match builder.load().await {
+        Ok(_) => Err(Error::invalid_input(format!(
+            "cannot shallow clone into {}: a dataset already exists at that URI",
+            target_path
+        ))),
+        Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+async fn ensure_branch_incarnation_unchanged(
+    branches: &Branches<'_>,
+    branch: Option<&str>,
+    expected: &BranchIdentifier,
+) -> Result<()> {
+    match branches.matches_identifier(branch, expected).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Error::RefConflict {
+            message: format!(
+                "branch {} was deleted or recreated during shallow clone",
+                branch.unwrap_or(refs::MAIN_BRANCH),
+            ),
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+async fn source_version_is_tagged(
+    dataset: &Dataset,
+    branch: Option<&str>,
+    version: u64,
+) -> Result<bool> {
+    let tags = dataset.tags().list().await?;
+    Ok(tags
+        .values()
+        .any(|tag| tag.branch.as_deref() == branch && tag.version == version))
+}
+
+/// Create a source pin for a shallow clone after GC-marker checks.
+///
+/// Checks for a cleanup marker before and after creating the pin. A marker present before
+/// commit begins causes any unused pin from this attempt to be removed. `identifier` must
+/// be `branch`'s current [`refs::BranchIdentifier`], resolved once by the caller.
+pub(crate) async fn create_shallow_clone_pin(
+    clone_pins: &ClonePins<'_>,
+    branch: Option<&str>,
+    identifier: &refs::BranchIdentifier,
+    version: u64,
+    clone_uri: &str,
+) -> Result<String> {
+    create_shallow_clone_pin_inner(
+        clone_pins,
+        branch,
+        identifier,
+        version,
+        clone_uri,
+        std::future::ready(Ok(())),
+    )
+    .await
+}
+
+/// Same as [`create_shallow_clone_pin`], with a hook between pin create and the second
+/// marker check. Used only by tests that inject a marker in that window.
+#[cfg(test)]
+pub(crate) async fn create_shallow_clone_pin_with_hook(
+    clone_pins: &ClonePins<'_>,
+    branch: Option<&str>,
+    identifier: &refs::BranchIdentifier,
+    version: u64,
+    clone_uri: &str,
+    after_pin_created: impl std::future::Future<Output = Result<()>>,
+) -> Result<String> {
+    create_shallow_clone_pin_inner(
+        clone_pins,
+        branch,
+        identifier,
+        version,
+        clone_uri,
+        after_pin_created,
+    )
+    .await
+}
+
+async fn create_shallow_clone_pin_inner(
+    clone_pins: &ClonePins<'_>,
+    branch: Option<&str>,
+    identifier: &refs::BranchIdentifier,
+    version: u64,
+    clone_uri: &str,
+    after_pin_created: impl std::future::Future<Output = Result<()>>,
+) -> Result<String> {
+    let namespace = identifier.marker_namespace();
+    ensure_clone_source_not_fenced(clone_pins, branch, namespace, version).await?;
+
+    let pin_id = clone_pins
+        .create_pin(branch, identifier, version, Some(clone_uri))
+        .await?;
+    after_pin_created.await?;
+
+    if let Err(fence_error) =
+        ensure_clone_source_not_fenced(clone_pins, branch, namespace, version).await
+    {
+        clone_pins.unregister(&pin_id).await?;
+        return Err(fence_error);
+    }
+
+    Ok(pin_id)
 }
 
 impl Projectable for Dataset {

@@ -3,12 +3,14 @@
 
 use std::ops::Range;
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -24,6 +26,9 @@ use std::fmt::Formatter;
 use uuid::Uuid;
 
 pub const MAIN_BRANCH: &str = "main";
+
+/// Config key on a shallow-clone manifest for the source pin id under `_refs/clones/`.
+pub const SOURCE_PIN_ID_CONFIG_KEY: &str = "lance.clone.source_pin_id";
 
 /// Lance Ref
 #[derive(Debug, Clone)]
@@ -111,6 +116,10 @@ impl Refs {
         Branches { refs: self }
     }
 
+    pub fn clone_pins(&self) -> ClonePins<'_> {
+        ClonePins { refs: self }
+    }
+
     pub fn base(&self) -> &Path {
         &self.base_location.path
     }
@@ -129,6 +138,12 @@ pub struct Tags<'a> {
 /// Branches operation
 #[derive(Debug, Clone)]
 pub struct Branches<'a> {
+    refs: &'a Refs,
+}
+
+/// Source-side pins for shallow clones stored at other URIs.
+#[derive(Debug, Clone)]
+pub struct ClonePins<'a> {
     refs: &'a Refs,
 }
 
@@ -433,10 +448,40 @@ impl Branches<'_> {
 
     pub async fn get_identifier(&self, branch: Option<&str>) -> Result<BranchIdentifier> {
         if let Some(branch_name) = branch {
-            let branch_contents = self.get(branch_name).await?;
-            Ok(branch_contents.identifier)
+            Ok(self.get(branch_name).await?.identifier)
         } else {
             Ok(BranchIdentifier::main())
+        }
+    }
+
+    /// Resolve the branch location and incarnation id together.
+    ///
+    /// The location comes from the path layout. The identifier comes from `BranchContents`
+    /// when the branch exists. Callers should keep both values from this result rather than
+    /// resolving them separately.
+    pub(crate) async fn resolve_branch(&self, branch: Option<&str>) -> Result<ResolvedBranch> {
+        let location = self.refs.base_location.find_branch(branch)?;
+        let identifier = if let Some(branch_name) = branch {
+            self.get(branch_name).await?.identifier
+        } else {
+            BranchIdentifier::main()
+        };
+        Ok(ResolvedBranch {
+            location,
+            identifier,
+        })
+    }
+
+    /// True when `branch` still maps to `expected`.
+    pub(crate) async fn matches_identifier(
+        &self,
+        branch: Option<&str>,
+        expected: &BranchIdentifier,
+    ) -> Result<bool> {
+        match self.get_identifier(branch).await {
+            Ok(current) => Ok(current == *expected),
+            Err(Error::RefNotFound { .. }) => Ok(false),
+            Err(err) => Err(err),
         }
     }
 
@@ -551,6 +596,14 @@ impl Branches<'_> {
     pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
+        // Acquire with None, then resolve the incarnation under the lease. A prior
+        // list() could observe a branch that is deleted and recreated before we hold.
+        self.acquire_branch_path_lease(branch, None).await?;
+        let result = self.delete_with_lease_held(branch, force).await;
+        self.finish_branch_path_lease(branch, result).await
+    }
+
+    async fn delete_with_lease_held(&self, branch: &str, force: bool) -> Result<()> {
         let all_branches = self.list().await?;
         let branch_id = all_branches
             .get(branch)
@@ -564,6 +617,42 @@ impl Branches<'_> {
                         branch, referenced_versions
                     ),
                 });
+            }
+
+            // Write BranchDeleted before listing pins. A clone that pins after this
+            // write aborts on its second marker check. The fence stays if deletion is
+            // refused. force skips the pin refusal and breaks those clones.
+            let namespace = branch_id.marker_namespace();
+            let clone_pins = self.refs.clone_pins();
+            clone_pins
+                .write_gc_marker_in_namespace(namespace, GcMarker::BranchDeleted)
+                .await?;
+            let pin_ids: Vec<String> = clone_pins
+                .list()
+                .await?
+                .into_iter()
+                .filter(|pin| pin.branch_id.as_deref() == branch_id.branch_id())
+                .map(|pin| pin.id)
+                .collect();
+            if !pin_ids.is_empty() {
+                if !force {
+                    return Err(Error::RefConflict {
+                        message: format!(
+                            "branch {} has {} shallow-clone pins [{}]. Unregister them, then \
+                             rerun delete. The branch stays closed to new shallow clones",
+                            branch,
+                            pin_ids.len(),
+                            pin_ids.join(", ")
+                        ),
+                    });
+                }
+                log::warn!(
+                    "force-deleting branch {} despite {} shallow-clone pins [{}]. The \
+                     clones holding them will lose access to branch-local files",
+                    branch,
+                    pin_ids.len(),
+                    pin_ids.join(", ")
+                );
             }
         } else if !force {
             return Err(Error::RefNotFound {
@@ -579,8 +668,89 @@ impl Branches<'_> {
             self.object_store().delete(&branch_file).await?;
         }
 
-        // Clean up branch directories
         self.cleanup_branch_directories(branch).await
+    }
+
+    /// True when a create, delete, or cleanup holds the branch-name path lease.
+    #[cfg(test)]
+    pub(crate) async fn has_branch_path_lease(&self, branch: &str) -> Result<bool> {
+        let root_location = self.refs.root()?;
+        let path = branch_path_lease_path(&root_location.path, branch);
+        self.object_store().exists(&path).await
+    }
+
+    /// Acquire the branch-name path lease for a create, delete, or cleanup critical section.
+    ///
+    /// Keyed by display name, not incarnation id, because recreated branches reuse
+    /// `tree/{branch}/`. `branch_id` is recorded for debugging when known.
+    pub(crate) async fn acquire_branch_path_lease(
+        &self,
+        branch: &str,
+        branch_id: Option<&str>,
+    ) -> Result<()> {
+        check_valid_branch(branch)?;
+        let root_location = self.refs.root()?;
+        let path = branch_path_lease_path(&root_location.path, branch);
+        let body = BranchPathLease {
+            branch_id: branch_id.map(str::to_owned),
+        };
+        match put_if_not_exists(
+            self.object_store(),
+            &path,
+            serde_json::to_vec_pretty(&body)?.as_slice(),
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::AlreadyExists { .. })
+            | Err(ObjectStoreError::Precondition { .. }) => Err(Error::RefConflict {
+                message: format!(
+                    "branch {} is busy with another create, delete, or cleanup. Retry after it \
+                     finishes. If a process crashed, remove _refs/branch_path_leases/{} and retry",
+                    branch,
+                    encode_gc_marker_namespace(branch),
+                ),
+            }),
+            Err(error) => Err(Error::io(format!(
+                "acquiring branch path lease for {}: {}",
+                branch, error
+            ))),
+        }
+    }
+
+    /// Drop the branch-name path lease after the critical section finishes.
+    pub(crate) async fn release_branch_path_lease(&self, branch: &str) -> Result<()> {
+        let root_location = self.refs.root()?;
+        let path = branch_path_lease_path(&root_location.path, branch);
+        match self.object_store().delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Release the path lease and prefer a release failure over a silent success.
+    ///
+    /// A successful operation that leaves the lease behind would block the branch name
+    /// until the lease file is removed by hand.
+    pub(crate) async fn finish_branch_path_lease<T>(
+        &self,
+        branch: &str,
+        result: Result<T>,
+    ) -> Result<T> {
+        match (result, self.release_branch_path_lease(branch).await) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(release_err)) => Err(release_err),
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(release_err)) => {
+                log::warn!(
+                    "failed to release branch path lease for {}: {}",
+                    branch,
+                    release_err
+                );
+                Err(err)
+            }
+        }
     }
 
     pub async fn list_ordered(
@@ -664,6 +834,218 @@ impl Branches<'_> {
     }
 }
 
+impl ClonePins<'_> {
+    fn object_store(&self) -> &ObjectStore {
+        &self.refs.object_store
+    }
+
+    /// Every shallow-clone pin on this dataset.
+    ///
+    /// Pins live at the root dataset level for every branch.
+    pub async fn list(&self) -> Result<Vec<ClonePin>> {
+        let root_location = self.refs.root()?;
+        let pin_files = match self
+            .object_store()
+            .read_dir(base_clone_pins_path(&root_location.path))
+            .await
+        {
+            Ok(files) => files,
+            Err(err) if err.is_not_found() => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        let pin_ids: Vec<String> = pin_files
+            .iter()
+            .filter_map(|name| name.strip_suffix(".json"))
+            .map(|name| name.to_string())
+            .collect_vec();
+
+        let root_path = &root_location.path;
+        let concurrency = self.object_store().io_parallelism();
+        futures::stream::iter(pin_ids)
+            .map(|pin_id| async move {
+                let mut pin =
+                    ClonePin::from_path(&clone_pin_path(root_path, &pin_id), self.object_store())
+                        .await?;
+                pin.id = pin_id;
+                pin.validate()?;
+                Ok(pin)
+            })
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await
+    }
+
+    /// Create a source pin for an already-resolved branch incarnation.
+    ///
+    /// Callers must perform the surrounding cleanup-marker protocol. Callers should
+    /// unregister unused pins when the clone commit clearly did not land. A leaked pin
+    /// wastes storage. Removing a pin for a live clone can lose data.
+    pub(crate) async fn create_pin(
+        &self,
+        branch: Option<&str>,
+        identifier: &BranchIdentifier,
+        version: u64,
+        clone_uri: Option<&str>,
+    ) -> Result<String> {
+        let root_location = self.refs.root()?;
+        let pin_id = Uuid::new_v4().simple().to_string();
+        let pin = ClonePin {
+            id: pin_id.clone(),
+            branch: branch.map(|branch| branch.to_string()),
+            branch_id: identifier.branch_id().map(|id| id.to_string()),
+            version,
+            created_at: utc_now(),
+            clone_uri: clone_uri.map(normalize_clone_uri),
+        };
+        pin.validate()?;
+        let pin_path = clone_pin_path(&root_location.path, &pin_id);
+        let body = serde_json::to_string_pretty(&pin)?;
+
+        match put_if_not_exists(self.object_store(), &pin_path, body.as_bytes()).await {
+            Ok(()) => Ok(pin_id),
+            Err(ObjectStoreError::AlreadyExists { .. })
+            | Err(ObjectStoreError::Precondition { .. }) => Err(Error::RefConflict {
+                message: format!("shallow clone pin {} already exists", pin_id),
+            }),
+            Err(error) => Err(Error::io(format!(
+                "creating shallow-clone source pin {}: {}",
+                pin_id, error
+            ))),
+        }
+    }
+
+    /// Drop the pin with `pin_id`.
+    ///
+    /// Call this after the clone is deleted or no longer reads this dataset. Versions that
+    /// other pins still reference stay retained.
+    pub async fn unregister(&self, pin_id: &str) -> Result<()> {
+        check_valid_pin_id(pin_id)?;
+        let root_location = self.refs.root()?;
+        let pin_path = clone_pin_path(&root_location.path, pin_id);
+
+        if !self.object_store().exists(&pin_path).await? {
+            return Err(Error::RefNotFound {
+                message: format!("no shallow clone pin {}", pin_id),
+            });
+        }
+
+        self.object_store().delete(&pin_path).await
+    }
+
+    /// Mark `version` of `branch`'s current incarnation as selected by cleanup.
+    ///
+    /// Test helper. Production cleanup resolves the branch identifier once and calls
+    /// [`Self::write_gc_marker_in_namespace`].
+    #[cfg(test)]
+    pub(crate) async fn write_gc_marker(&self, branch: Option<&str>, version: u64) -> Result<()> {
+        let identifier = self.refs.branches().get_identifier(branch).await?;
+        self.write_gc_marker_in_namespace(identifier.marker_namespace(), GcMarker::Version(version))
+            .await
+    }
+
+    /// Write a marker under an already-resolved incarnation namespace.
+    pub(crate) async fn write_gc_marker_in_namespace(
+        &self,
+        namespace: &str,
+        marker: GcMarker,
+    ) -> Result<()> {
+        let root_location = self.refs.root()?;
+        let path = gc_marker_path(&root_location.path, namespace, marker);
+        match put_if_not_exists(self.object_store(), &path, b"{}").await {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::AlreadyExists { .. })
+            | Err(ObjectStoreError::Precondition { .. }) => Ok(()),
+            Err(error) => Err(Error::io(format!(
+                "writing cleanup marker for {} in namespace {}: {}",
+                marker, namespace, error
+            ))),
+        }
+    }
+
+    /// True when cleanup has marked `version` of `branch`'s current incarnation.
+    ///
+    /// Test helper. Production code resolves the branch identifier once per operation
+    /// and calls [`Self::has_gc_marker_in_namespace`].
+    #[cfg(test)]
+    pub(crate) async fn has_gc_marker(&self, branch: Option<&str>, version: u64) -> Result<bool> {
+        let identifier = self.refs.branches().get_identifier(branch).await?;
+        self.has_gc_marker_in_namespace(identifier.marker_namespace(), GcMarker::Version(version))
+            .await
+    }
+
+    /// True when a marker exists under an already-resolved incarnation namespace.
+    pub(crate) async fn has_gc_marker_in_namespace(
+        &self,
+        namespace: &str,
+        marker: GcMarker,
+    ) -> Result<bool> {
+        let root_location = self.refs.root()?;
+        let path = gc_marker_path(&root_location.path, namespace, marker);
+        self.object_store().exists(&path).await
+    }
+}
+
+/// One fence file under `_refs/gc_markers/<incarnation>/`.
+///
+/// Fences are never removed. A fenced target stays closed to new shallow clones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GcMarker {
+    /// Closes one version. Cleanup writes this before deleting the version.
+    Version(u64),
+    /// Closes the whole incarnation. Branch deletion writes this before its pin check,
+    /// so a pin that appears after the check aborts its clone instead of dangling.
+    BranchDeleted,
+}
+
+impl GcMarker {
+    fn file_name(&self) -> String {
+        match self {
+            Self::Version(version) => version.to_string(),
+            // Version file names are numeric, so this name cannot collide with one.
+            Self::BranchDeleted => "deleted".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for GcMarker {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Version(version) => write!(f, "version {}", version),
+            Self::BranchDeleted => write!(f, "branch deletion"),
+        }
+    }
+}
+
+async fn put_if_not_exists(
+    object_store: &ObjectStore,
+    path: &Path,
+    bytes: &[u8],
+) -> std::result::Result<(), ObjectStoreError> {
+    object_store
+        .inner
+        .put_opts(
+            path,
+            Bytes::copy_from_slice(bytes).into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|_| ())
+}
+
+fn check_valid_pin_id(pin_id: &str) -> Result<()> {
+    if pin_id.is_empty() || !pin_id.chars().all(|c| c.is_ascii_hexdigit()) || pin_id.len() > 64 {
+        return Err(Error::invalid_input(format!(
+            "invalid shallow clone pin id {}",
+            pin_id
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq)]
 struct BranchRelativePath<'a> {
     segments: Vec<&'a str>,
@@ -736,6 +1118,13 @@ pub struct TagContents {
     pub metadata: HashMap<String, String>,
 }
 
+/// Location and incarnation id for one branch, resolved together.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedBranch {
+    pub(crate) location: BranchLocation,
+    pub(crate) identifier: BranchIdentifier,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
@@ -750,6 +1139,52 @@ pub struct BranchContents {
     /// Missing metadata is deserialized as an empty map.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+}
+
+/// A pin held on this dataset by a shallow clone stored at another URI.
+///
+/// Cleanup keeps `version` and every file that version references. The clone stores `id` in
+/// its config so destroy or detach can remove the pin. Cleanup does not open the clone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClonePin {
+    /// Random pin id. Also the `_refs/clones/{id}.json` file stem.
+    #[serde(default)]
+    pub id: String,
+    /// Display name of the branch that was cloned. Absent means the main branch.
+    pub branch: Option<String>,
+    /// Leaf UUID of the branch incarnation that was cloned. Absent means main.
+    ///
+    /// Cleanup matches pins by this field so a recreated branch with the same name does
+    /// not inherit retention from an older incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
+    /// Version of that incarnation that the clone's manifest reads from.
+    pub version: u64,
+    pub created_at: DateTime<Utc>,
+    /// Optional clone URI for listing. Not used as the registry key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_uri: Option<String>,
+}
+
+impl ClonePin {
+    /// Reject pins whose retention identity is incomplete.
+    ///
+    /// A named-branch pin without `branch_id` cannot be matched to a branch incarnation.
+    /// Fail the registry read rather than retain the wrong versions or drop protection.
+    fn validate(&self) -> Result<()> {
+        if self.branch.is_some() && self.branch_id.is_none() {
+            return Err(Error::corrupt_file(
+                Path::from(format!("_refs/clones/{}.json", self.id)),
+                format!(
+                    "clone pin {} names branch {} but has no branchId",
+                    self.id,
+                    self.branch.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -824,6 +1259,19 @@ impl BranchIdentifier {
         }
     }
 
+    /// Leaf UUID of this incarnation, or `None` for main.
+    pub fn branch_id(&self) -> Option<&str> {
+        self.version_mapping.last().map(|(_, uuid)| uuid.as_str())
+    }
+
+    /// Object-store path segment for markers of this incarnation.
+    ///
+    /// Main uses [`MAIN_BRANCH`]. Named branches use their leaf UUID so a recreated branch
+    /// name gets a distinct namespace.
+    pub fn marker_namespace(&self) -> &str {
+        self.branch_id().unwrap_or(MAIN_BRANCH)
+    }
+
     pub fn parse(identifier: &str) -> Result<Self> {
         let parts: Vec<&str> = identifier.split(':').collect();
         if !parts.len().is_multiple_of(2) {
@@ -889,6 +1337,10 @@ pub fn base_branches_contents_path(base_path: &Path) -> Path {
     base_path.clone().join("_refs").join("branches")
 }
 
+pub fn base_clone_pins_path(base_path: &Path) -> Path {
+    base_path.clone().join("_refs").join("clones")
+}
+
 pub fn tag_path(base_path: &Path, branch: &str) -> Path {
     base_tags_path(base_path).join(format!("{}.json", branch))
 }
@@ -896,6 +1348,51 @@ pub fn tag_path(base_path: &Path, branch: &str) -> Path {
 // Note: child will encode '/' to '%2F'
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).join(format!("{}.json", branch))
+}
+
+pub fn clone_pin_path(base_path: &Path, pin_id: &str) -> Path {
+    base_clone_pins_path(base_path).join(format!("{}.json", pin_id))
+}
+
+pub fn base_gc_markers_path(base_path: &Path) -> Path {
+    base_path.clone().join("_refs").join("gc_markers")
+}
+
+pub fn base_branch_path_leases_path(base_path: &Path) -> Path {
+    base_path.clone().join("_refs").join("branch_path_leases")
+}
+
+/// Lease file under `_refs/branch_path_leases/<encoded-branch-name>`.
+///
+/// Held for the full create, delete, or cleanup critical section on that branch name.
+/// Keyed by display name because recreated branches reuse `tree/{branch}/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchPathLease {
+    /// Leaf UUID of the incarnation when known. Absent for create, delete acquire, and main.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+}
+
+fn branch_path_lease_path(base_path: &Path, branch: &str) -> Path {
+    base_branch_path_leases_path(base_path).join(encode_gc_marker_namespace(branch))
+}
+
+fn encode_gc_marker_namespace(namespace: &str) -> String {
+    // Encode '%' first so a literal "%2F" in a value cannot collide with '/'.
+    namespace.replace('%', "%25").replace('/', "%2F")
+}
+
+fn gc_marker_namespace_path(base_path: &Path, namespace: &str) -> Path {
+    base_gc_markers_path(base_path).join(encode_gc_marker_namespace(namespace))
+}
+
+fn gc_marker_path(base_path: &Path, namespace: &str, marker: GcMarker) -> Path {
+    gc_marker_namespace_path(base_path, namespace).join(marker.file_name())
+}
+
+fn normalize_clone_uri(clone_uri: &str) -> String {
+    clone_uri.trim_end_matches('/').to_string()
 }
 
 pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
@@ -929,6 +1426,12 @@ where
 }
 
 impl TagContents {
+    pub async fn from_path(path: &Path, object_store: &ObjectStore) -> Result<Self> {
+        from_path(path, object_store).await
+    }
+}
+
+impl ClonePin {
     pub async fn from_path(path: &Path, object_store: &ObjectStore) -> Result<Self> {
         from_path(path, object_store).await
     }
@@ -1182,6 +1685,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gc_marker_paths_encode_percent_before_slash() {
+        let base_path = Path::from("dataset");
+        let slash = gc_marker_path(&base_path, "a/b", GcMarker::Version(1));
+        let encoded_slash = gc_marker_path(&base_path, "a%2Fb", GcMarker::Version(1));
+        assert_eq!(slash, Path::from("dataset/_refs/gc_markers/a%2Fb/1"));
+        assert_eq!(
+            encoded_slash,
+            Path::from("dataset/_refs/gc_markers/a%252Fb/1")
+        );
+        assert_ne!(slash, encoded_slash);
+    }
+
     #[tokio::test]
     async fn test_refs_from_traits() {
         // Test From<u64> for Ref
@@ -1242,6 +1758,43 @@ mod tests {
         let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
         let legacy_deserialized: BranchContents = serde_json::from_str(legacy_json).unwrap();
         assert!(legacy_deserialized.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_clone_pin_serialization() {
+        let pin = ClonePin {
+            id: "21b1c1b1a4f7f9f0d1e2c3b4a5968778".to_string(),
+            branch: Some("feature".to_string()),
+            branch_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            version: 7,
+            created_at: chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap(),
+            clone_uri: Some("s3://experiments/test-variant".to_string()),
+        };
+
+        let json = serde_json::to_string(&pin).unwrap();
+        assert!(json.contains("id"));
+        assert!(json.contains("branch"));
+        assert!(json.contains("branchId"));
+        assert!(json.contains("version"));
+        assert!(json.contains("createdAt"));
+        assert!(json.contains("cloneUri"));
+
+        let deserialized: ClonePin = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, pin);
+    }
+
+    #[test]
+    fn named_clone_pin_without_branch_id_fails_validation() {
+        let named = r#"{"id":"21b1c1b1a4f7f9f0d1e2c3b4a5968778","branch":"feature","version":7,"createdAt":"2009-02-13T23:31:30.123Z"}"#;
+        let named_pin: ClonePin = serde_json::from_str(named).unwrap();
+        let error = named_pin.validate().unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+        assert!(error.to_string().contains("branchId"), "{error}");
+
+        let main = r#"{"id":"21b1c1b1a4f7f9f0d1e2c3b4a5968778","branch":null,"version":7,"createdAt":"2009-02-13T23:31:30.123Z"}"#;
+        let main_pin: ClonePin = serde_json::from_str(main).unwrap();
+        assert!(main_pin.validate().is_ok());
+        assert_eq!(main_pin.branch_id, None);
     }
 
     #[tokio::test]

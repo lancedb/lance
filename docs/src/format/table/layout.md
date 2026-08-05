@@ -153,7 +153,12 @@ Only the manifest and new data files are stored in the clone location.
 2. Manifest includes base path pointing to source dataset
 3. Original fragments reference source via `base_id: 1`
 4. Subsequent writes reference clone location via `base_id: 0`
-5. Source dataset remains immutable and can be garbage collected independently
+5. By default the source writes a pin under `_refs/clones/` and the clone stores the pin id in its config. A read-only source may rely on a tag instead, with no pin written.
+6. The clone commit is refused if the source has a cleanup marker for that version under `_refs/gc_markers/`
+
+The clone reads the source's files in place. Cleanup on the source must keep that version even when no current source version still references those files.
+Cleanup does not open clone URIs. The pin or tag is the retention record.
+See [Clone Pin](branch_tag.md#clone-pin) for format and lifecycle.
 
 ## Dataset Portability
 

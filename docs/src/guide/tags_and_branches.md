@@ -123,3 +123,38 @@ print(ds.branches.list_ordered(order="desc"))
     Branches hold references to data files. Lance ensures that cleanup does not delete files still referenced by any branch.
 
     Delete unused branches to allow their referenced files to be cleaned up by `cleanup_old_versions()`.
+
+## Shallow clones and cleanup on the source
+
+A shallow clone created with `shallow_clone()` does not copy data.
+Its manifest points back at the source dataset and reads the source's data files in place.
+
+By default, `shallow_clone()` writes a pin under `_refs/clones/` on the source for the cloned version and stores that pin id on the clone.
+`cleanup_old_versions()` on the source keeps pinned versions the same way it keeps tagged versions. It does not open clone URIs.
+Creating a pin needs write access to the source. With read-only access, pass `retention="require_tag"` after the source owner tags the version. Keep that tag for as long as the clone reads source files.
+Cleanup writes a marker under `_refs/gc_markers/` before deleting a version. The marker stays after deletion so `shallow_clone()` cannot reopen that version.
+Markers and pin `branchId` values use the branch incarnation id, so a recreated branch with the same name does not inherit them. Existing clones keep working until their pins are unregistered.
+
+Unregister the pin after deleting or detaching the clone:
+
+```python
+clone = source.shallow_clone("s3://experiments/test-variant", 3)
+pin_id = clone.source_pin_id
+
+# After the clone is gone
+source.clone_pins.unregister(pin_id)
+```
+
+An unused pin is removed when cleanup marks the version before clone commit starts, or when the commit path verifies no manifest landed. If the commit outcome is unknown, the pin stays. A leaked pin wastes storage. Removing a pin for a live clone can lose data.
+
+Pins also block branch deletion. `delete_branch` is refused while pins target that incarnation. Unregister the listed pins, then delete again. A refused delete leaves the incarnation closed to new shallow clones. `force_delete_branch` overrides the refusal and breaks those clones.
+Tag-retained clones do not block branch deletion. Prefer pinned clones when the source branch may be deleted.
+
+!!! warning
+
+    Shallow clones created before this behavior existed have no pin and are not protected.
+    Re-clone them, or create a tag on the source version they read so cleanup retains it.
+
+    Libraries that predate pins ignore `_refs/clones/` during cleanup and can still delete
+    files a new clone needs. Run cleanup with a library that understands pins, or keep a
+    tag on the source version while older clients may vacuum the source.

@@ -2079,13 +2079,14 @@ impl Dataset {
     }
 
     /// Restore the current version
-    #[pyo3(signature = (target_path, reference, storage_options=None))]
+    #[pyo3(signature = (target_path, reference, storage_options=None, retention="pin_source"))]
     fn shallow_clone(
         &mut self,
         py: Python,
         target_path: String,
         reference: Option<Bound<PyAny>>,
         storage_options: Option<HashMap<String, String>>,
+        retention: &str,
     ) -> PyResult<Self> {
         // Perform a shallow clone of the dataset into the target path.
         // `version` can be a version number or a tag name.
@@ -2097,6 +2098,17 @@ impl Dataset {
             ..Default::default()
         });
 
+        let retention = match retention {
+            "pin_source" => lance::dataset::ShallowCloneRetention::PinSource,
+            "require_tag" => lance::dataset::ShallowCloneRetention::RequireTag,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "retention must be 'pin_source' or 'require_tag', got {}",
+                    other
+                )));
+            }
+        };
+
         // Use a mutable clone of the inner dataset for operations that require &mut self
         let mut new_self = self.ds.as_ref().clone();
         let reference = self.transform_ref(reference)?;
@@ -2104,9 +2116,17 @@ impl Dataset {
         let ds = rt()
             .block_on(
                 Some(py),
-                new_self.shallow_clone(&target_path, reference, store_params),
+                new_self.shallow_clone_with_retention(
+                    &target_path,
+                    reference,
+                    store_params,
+                    retention,
+                ),
             )?
-            .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: Error| match err {
+                Error::InvalidInput { .. } => PyValueError::new_err(err.to_string()),
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
 
         let uri = ds.uri().to_string();
         Ok(Self {
@@ -2236,6 +2256,41 @@ impl Dataset {
             pytags.set_item(k, dict.into_py_any(py)?)?;
         }
         pytags.into_py_any(py)
+    }
+
+    fn clone_pins(self_: PyRef<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = self_.py();
+        let clone_pins = rt()
+            .block_on(None, self_.ds.clone_pins().list())?
+            .infer_error()?;
+
+        let py_clone_pins = PyList::empty(py);
+        for pin in clone_pins {
+            let dict = PyDict::new(py);
+            dict.set_item("id", pin.id)?;
+            dict.set_item("branch", pin.branch)?;
+            dict.set_item("branch_id", pin.branch_id)?;
+            dict.set_item("version", pin.version)?;
+            dict.set_item("created_at", pin.created_at)?;
+            dict.set_item("clone_uri", pin.clone_uri)?;
+            py_clone_pins.append(dict)?;
+        }
+        py_clone_pins.into_py_any(py)
+    }
+
+    fn source_pin_id(&self) -> Option<String> {
+        self.ds.source_pin_id().map(|id| id.to_string())
+    }
+
+    fn unregister_clone_pin(&mut self, pin_id: String) -> PyResult<()> {
+        rt().block_on(None, self.ds.as_ref().clone_pins().unregister(&pin_id))?
+            .map_err(|err| match err {
+                Error::RefNotFound { .. } | Error::InvalidInput { .. } => {
+                    PyValueError::new_err(err.to_string())
+                }
+                _ => PyIOError::new_err(err.to_string()),
+            })?;
+        Ok(())
     }
 
     fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {

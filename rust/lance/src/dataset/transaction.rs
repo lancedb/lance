@@ -480,6 +480,15 @@ pub enum Operation {
         ref_version: u64,
         ref_path: String,
         branch_name: Option<String>,
+        /// Source pin id for a cross-dataset shallow clone. Absent for branches and deep clones.
+        source_pin_id: Option<String>,
+        /// Leaf UUID of the source branch incarnation used by this clone operation.
+        ///
+        /// Set for shallow clones, deep clones, and in-dataset branch creation, all of
+        /// which read a source branch during commit. The commit path verifies it after
+        /// its source reads and refuses the commit on a mismatch. Absent for main and
+        /// for older transactions.
+        source_branch_id: Option<String>,
     },
 
     // Update base paths in the dataset (currently only supports adding new bases).
@@ -569,6 +578,8 @@ impl PartialEq for Operation {
                     ref_version: a_ref_version,
                     ref_path: a_source_path,
                     branch_name: a_branch_name,
+                    source_pin_id: a_source_pin_id,
+                    source_branch_id: a_source_branch_id,
                 },
                 Self::Clone {
                     is_shallow: b_is_shallow,
@@ -576,6 +587,8 @@ impl PartialEq for Operation {
                     ref_version: b_ref_version,
                     ref_path: b_source_path,
                     branch_name: b_branch_name,
+                    source_pin_id: b_source_pin_id,
+                    source_branch_id: b_source_branch_id,
                 },
             ) => {
                 a_is_shallow == b_is_shallow
@@ -583,6 +596,8 @@ impl PartialEq for Operation {
                     && a_ref_version == b_ref_version
                     && a_source_path == b_source_path
                     && a_branch_name == b_branch_name
+                    && a_source_pin_id == b_source_pin_id
+                    && a_source_branch_id == b_source_branch_id
             }
             (
                 Self::Delete {
@@ -3352,12 +3367,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                 ref_version,
                 ref_path,
                 branch_name,
+                source_pin_id,
+                source_branch_id,
             })) => Operation::Clone {
                 is_shallow,
                 ref_name,
                 ref_version,
                 ref_path,
                 branch_name,
+                source_pin_id,
+                source_branch_id,
             },
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
                 updated_fragments,
@@ -3725,12 +3744,16 @@ impl From<&Transaction> for pb::Transaction {
                 ref_version,
                 ref_path,
                 branch_name,
+                source_pin_id,
+                source_branch_id,
             } => pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow: *is_shallow,
                 ref_name: ref_name.clone(),
                 ref_version: *ref_version,
                 ref_path: ref_path.clone(),
                 branch_name: branch_name.clone(),
+                source_pin_id: source_pin_id.clone(),
+                source_branch_id: source_branch_id.clone(),
             }),
             Operation::Delete {
                 updated_fragments,

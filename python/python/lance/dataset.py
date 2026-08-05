@@ -1021,6 +1021,40 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return Branches(self._ds)
 
+    @property
+    def clone_pins(self) -> "ClonePins":
+        """Source-side pins for shallow clones of this dataset.
+
+        By default, :py:meth:`shallow_clone` creates a pin here and stores the
+        pin id on the clone. Clones using ``retention="require_tag"`` do not
+        create a pin.
+
+        .. warning::
+
+            A pin outlives the clone. After deleting or detaching the clone, remove
+            the pin with :py:meth:`~ClonePins.unregister` using the clone's
+            :py:attr:`source_pin_id`.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            source = lance.dataset("dataset.lance")
+            clone = source.shallow_clone("s3://experiments/variant", 3)
+            pin_id = clone.source_pin_id
+
+            # Once the clone has been deleted
+            source.clone_pins.unregister(pin_id)
+
+        """
+        return ClonePins(self._ds)
+
+    @property
+    def source_pin_id(self) -> Optional[str]:
+        """Pin id this shallow clone holds on its source dataset, if any."""
+        return self._ds.source_pin_id()
+
     def create_branch(
         self,
         branch: str,
@@ -4939,6 +4973,7 @@ class LanceDataset(pa.dataset.Dataset):
         target_path: str | Path,
         reference: int | str | Tuple[Optional[str], Optional[int]],
         storage_options: Optional[Dict[str, str]] = None,
+        retention: str = "pin_source",
         **kwargs,
     ) -> "LanceDataset":
         """
@@ -4960,11 +4995,27 @@ class LanceDataset(pa.dataset.Dataset):
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). If not specified, the storage options of the source dataset
             will be used.
+        retention : {"pin_source", "require_tag"}, default "pin_source"
+            ``"pin_source"`` writes a retention pin on the source so
+            :py:meth:`cleanup_old_versions` keeps the cloned version. Requires write
+            access to the source. ``"require_tag"`` skips the pin and requires a tag on
+            the source that already points at the resolved version. Use that mode for
+            read-only sources after the owner tags the version. Keep the tag while the
+            clone reads source files.
 
         Returns
         -------
         LanceDataset
             A new LanceDataset representing the shallow-cloned dataset.
+
+        Notes
+        -----
+        The clone reads the source's data files in place. With
+        ``retention="pin_source"``, a pin is created on the source and the pin id is
+        stored on the clone. An unused pin is removed when the commit path verifies no
+        manifest landed. Unknown outcomes keep the pin. After deleting or detaching a
+        pinned clone, call ``source.clone_pins.unregister(clone.source_pin_id)``.
+        See :py:attr:`clone_pins`.
         """
         if isinstance(target_path, Path):
             target_uri = os.fspath(target_path)
@@ -4973,7 +5024,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         if storage_options is None:
             storage_options = self._storage_options
-        self._ds.shallow_clone(target_uri, reference, storage_options)
+        self._ds.shallow_clone(target_uri, reference, storage_options, retention)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
         return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
@@ -5705,6 +5756,15 @@ class Branch(TypedDict):
     create_at: int
     manifest_size: int
     metadata: Dict[str, str]
+
+
+class ClonePin(TypedDict):
+    id: str
+    branch: Optional[str]
+    branch_id: Optional[str]
+    version: int
+    created_at: datetime
+    clone_uri: Optional[str]
 
 
 class Version(TypedDict):
@@ -7429,6 +7489,44 @@ class Branches:
         Replace metadata for a branch.
         """
         self._ds.replace_branch_metadata(branch, metadata)
+
+
+class ClonePins:
+    """Source-side pins for shallow clones of a dataset."""
+
+    def __init__(self, dataset: _Dataset):
+        self._ds = dataset
+
+    def list(self) -> List[ClonePin]:
+        """
+        List every shallow-clone pin on this dataset.
+
+        Returns
+        -------
+        List[ClonePin]
+            One entry per pin with its id and the branch and version it holds.
+            Cleanup keeps those versions.
+        """
+        return self._ds.clone_pins()
+
+    def unregister(self, pin_id: str) -> None:
+        """
+        Drop the pin with ``pin_id``.
+
+        Call this after the clone has been deleted or detached. Until then the version
+        it pins stays retained. Versions that other pins still hold stay retained.
+
+        Parameters
+        ----------
+        pin_id: str
+            The pin id from :py:attr:`LanceDataset.source_pin_id` on the clone.
+
+        Raises
+        ------
+        ValueError
+            If no pin with that id exists.
+        """
+        self._ds.unregister_clone_pin(pin_id)
 
 
 @dataclass
