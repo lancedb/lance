@@ -129,8 +129,7 @@ impl AwsStoreProvider {
         }
 
         let operator = Operator::from_iter::<S3>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
     }

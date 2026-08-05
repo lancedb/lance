@@ -101,8 +101,7 @@ impl TosStoreProvider {
 
     fn build_tos_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
         let operator = Operator::from_iter::<Tos>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create TOS operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create TOS operator: {:?}", e)))?;
 
         Ok(OpendalStore::new(operator))
     }

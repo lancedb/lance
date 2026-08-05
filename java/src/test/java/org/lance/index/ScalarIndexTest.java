@@ -40,6 +40,7 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
@@ -52,6 +53,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -59,6 +62,113 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScalarIndexTest {
+
+  private static final class RecordingIndexBuildProgress implements IndexBuildProgress {
+    private final List<String> events = Collections.synchronizedList(new ArrayList<>());
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      events.add(
+          "start:" + stage + ":" + total.map(String::valueOf).orElse("unknown") + ":" + unit);
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      events.add("progress:" + stage + ":" + completed);
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      events.add("complete:" + stage);
+    }
+
+    private List<String> snapshot() {
+      synchronized (events) {
+        return new ArrayList<>(events);
+      }
+    }
+  }
+
+  private static final class FailingProgressIndexBuildProgress implements IndexBuildProgress {
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+      throw new IllegalStateException("progress callback failure");
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
+    }
+  }
+
+  private static final class FailingCompleteIndexBuildProgress implements IndexBuildProgress {
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
+      throw new IllegalStateException("complete callback failure");
+    }
+  }
+
+  /**
+   * Progress callback that re-enters the same Dataset via JNI. Without releasing the native field
+   * lock before merge starts, these calls would deadlock.
+   */
+  private static final class ReentrantDatasetIndexBuildProgress implements IndexBuildProgress {
+    private final Dataset dataset;
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+    private final AtomicInteger reentries = new AtomicInteger();
+
+    private ReentrantDatasetIndexBuildProgress(Dataset dataset) {
+      this.dataset = dataset;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+      touchDataset();
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+      touchDataset();
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
+      touchDataset();
+    }
+
+    private void touchDataset() {
+      assertNotNull(dataset.uri());
+      assertTrue(dataset.version() > 0);
+      assertTrue(dataset.countRows() > 0);
+      assertFalse(dataset.getFragments().isEmpty());
+      assertFalse(dataset.memWalIndexDetails().isPresent());
+      reentries.incrementAndGet();
+    }
+  }
 
   @Test
   public void testCreateBTreeIndex(@TempDir Path tempDir) throws Exception {
@@ -274,6 +384,175 @@ public class ScalarIndexTest {
             "expected BTree merge_index_metadata soft-break error, got: " + ex.getMessage());
       }
     }
+  }
+
+  @Test
+  public void testMergeInvertedIndexMetadataReportsProgress(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_progress").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+        RecordingIndexBuildProgress progress = new RecordingIndexBuildProgress();
+
+        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+
+        List<String> events = progress.snapshot();
+        assertEventsInOrder(
+            events,
+            "start:read_partition_metadata:",
+            "complete:read_partition_metadata",
+            "start:remap_partition_files:",
+            "complete:remap_partition_files",
+            "start:write_merged_metadata:",
+            "complete:write_merged_metadata");
+        assertTrue(
+            events.contains("progress:read_partition_metadata:2"),
+            "Expected metadata progress to reach both fragments, got: " + events);
+        assertTrue(
+            events.stream().anyMatch(event -> event.startsWith("progress:remap_partition_files:")),
+            "Expected remap progress, got: " + events);
+        assertTrue(
+            events.contains("progress:write_merged_metadata:1"),
+            "Expected merged metadata write progress, got: " + events);
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInvertedIndexMetadataPropagatesProgressFailure(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_progress_failure").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+
+        RuntimeException failure =
+            Assertions.assertThrows(
+                RuntimeException.class,
+                () ->
+                    dataset.mergeIndexMetadata(
+                        indexUuid,
+                        IndexType.INVERTED,
+                        Optional.empty(),
+                        new FailingProgressIndexBuildProgress()));
+
+        assertFalse(
+            failure instanceof IllegalArgumentException,
+            "Progress callback failures should not be reported as invalid input: " + failure);
+        assertTrue(
+            causeChainContains(failure, "stageProgress")
+                && causeChainContains(failure, "read_partition_metadata")
+                && causeChainContains(failure, "java.lang.IllegalStateException")
+                && causeChainContains(failure, "progress callback failure"),
+            "Expected callback context and original Java exception details, got: " + failure);
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInvertedIndexMetadataIgnoresCompleteFailure(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_complete_failure").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+        FailingCompleteIndexBuildProgress progress = new FailingCompleteIndexBuildProgress();
+
+        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+
+        assertTrue(
+            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
+            "Expected merge to continue after stageComplete callback failures");
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 60, unit = TimeUnit.SECONDS)
+  public void testMergeInvertedIndexMetadataAllowsReentrantDatasetAccess(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_reentrant_dataset").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+        ReentrantDatasetIndexBuildProgress progress =
+            new ReentrantDatasetIndexBuildProgress(dataset);
+
+        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+
+        assertTrue(
+            progress.reentries.get() > 0,
+            "Expected progress callbacks to re-enter Dataset JNI methods");
+        assertTrue(
+            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
+            "Expected merge to finish after re-entrant Dataset access, got: "
+                + progress.recorder.snapshot());
+      }
+    }
+  }
+
+  private static String createDistributedInvertedIndex(Dataset dataset) {
+    ScalarIndexParams scalarParams =
+        ScalarIndexParams.create(
+            "inverted",
+            "{\"base_tokenizer\":\"simple\",\"language\":\"English\","
+                + "\"max_token_length\":40,\"lower_case\":true,\"stem\":false,"
+                + "\"remove_stop_words\":false}");
+    IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+    String indexUuid = UUID.randomUUID().toString();
+    for (Fragment fragment : dataset.getFragments()) {
+      dataset.createIndex(
+          IndexOptions.builder(Collections.singletonList("name"), IndexType.INVERTED, indexParams)
+              .replace(true)
+              .withIndexName("inverted_progress_idx")
+              .withIndexUUID(indexUuid)
+              .withFragmentIds(Collections.singletonList(fragment.getId()))
+              .build());
+    }
+    return indexUuid;
+  }
+
+  private static void assertEventsInOrder(List<String> events, String... prefixes) {
+    int previous = -1;
+    for (String prefix : prefixes) {
+      int current = -1;
+      for (int i = previous + 1; i < events.size(); i++) {
+        if (events.get(i).startsWith(prefix)) {
+          current = i;
+          break;
+        }
+      }
+      assertTrue(
+          current >= 0,
+          "Missing event '" + prefix + "' after position " + previous + ": " + events);
+      previous = current;
+    }
+  }
+
+  private static boolean causeChainContains(Throwable failure, String expected) {
+    for (Throwable current = failure; current != null; current = current.getCause()) {
+      if (current.getMessage() != null && current.getMessage().contains(expected)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @Test

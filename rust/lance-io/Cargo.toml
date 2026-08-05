@@ -20,14 +20,8 @@ lance-arrow.workspace = true
 lance-core.workspace = true
 lance-namespace.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
-arrow-arith.workspace = true
 arrow-array.workspace = true
-arrow-buffer.workspace = true
-arrow-cast.workspace = true
-arrow-data.workspace = true
 arrow-schema.workspace = true
-arrow-select.workspace = true
-async-recursion.workspace = true
 async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }

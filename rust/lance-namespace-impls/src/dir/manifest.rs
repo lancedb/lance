@@ -36,7 +36,9 @@ use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{BuiltinIndexType, CreatedIndex, ScalarIndexParams};
+use lance_index::scalar::{
+    BuiltinIndexType, CreatedIndex, ScalarIndexParams, index_files_to_table,
+};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::stream::RecordBatchStream as LanceRecordBatchStream;
 use lance_namespace::LanceNamespace;
@@ -1279,7 +1281,7 @@ impl ManifestNamespace {
             index_version: trained_index.created_index.index_version as i32,
             created_at: None,
             base_id: None,
-            files: Some(trained_index.created_index.files),
+            files: Some(index_files_to_table(trained_index.created_index.files)),
         })
     }
 
@@ -3488,30 +3490,26 @@ impl LanceNamespace for ManifestNamespace {
             }
         }
 
-        // Create the .lance-reserved file to mark the table as existing
+        // Atomically create the .lance-reserved file to mark the table as declared.
+        // Shared with DirectoryNamespace via put_marker_file_atomic (dotfile-safe
+        // staging + MarkerFileError::AlreadyExists → TableAlreadyExists).
         let reserved_file_path = table_path.clone().join(".lance-reserved");
-
-        self.object_store
-            .create(&reserved_file_path)
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to create .lance-reserved file for table {}: {}",
-                        table_name, e
-                    ),
+        super::put_marker_file_atomic(
+            &self.object_store,
+            &reserved_file_path,
+            &format!("table {}", table_name),
+        )
+        .await
+        .map_err(|e| match e {
+            super::MarkerFileError::AlreadyExists { .. } => {
+                lance_core::Error::from(NamespaceError::TableAlreadyExists {
+                    message: table_name.to_string(),
                 })
-            })?
-            .shutdown()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to finalize .lance-reserved file for table {}: {}",
-                        table_name, e
-                    ),
-                })
-            })?;
+            }
+            super::MarkerFileError::Other { message } => {
+                lance_core::Error::from(NamespaceError::Internal { message })
+            }
+        })?;
 
         let metadata = Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
 

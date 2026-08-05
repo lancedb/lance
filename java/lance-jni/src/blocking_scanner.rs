@@ -18,16 +18,19 @@ use lance::dataset::scanner::{
     ExecutionSummaryCounts, Scanner,
 };
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::query::{
-    BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
-    MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
-    PhraseQuery as FtsPhraseQuery,
+use lance_index::scalar::inverted::{
+    DocumentGranularity,
+    query::{
+        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
+        MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
+        PhraseQuery as FtsPhraseQuery,
+    },
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
 use crate::{
-    RT,
+    RT, block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::IntoJava,
     utils::parse_approx_mode,
@@ -66,17 +69,17 @@ impl BlockingScanner {
 
     pub fn open_stream(&self) -> Result<DatasetRecordBatchStream> {
         self.reset_stats();
-        let res = RT.block_on(self.inner.try_into_stream())?;
+        let res = block_on(self.inner.try_into_stream())?;
         Ok(res)
     }
 
     pub fn schema(&self) -> Result<SchemaRef> {
-        let res = RT.block_on(self.inner.schema())?;
+        let res = block_on(self.inner.schema())?;
         Ok(res)
     }
 
     pub fn count_rows(&self) -> Result<u64> {
-        let res = RT.block_on(self.inner.count_rows())?;
+        let res = block_on(self.inner.count_rows())?;
         Ok(res)
     }
 
@@ -114,6 +117,7 @@ pub(crate) fn build_full_text_search_query<'a>(
             let max_expansions = env.get_int_as_usize_from_method(&java_obj, "getMaxExpansions")?;
             let operator = env.get_fts_operator_from_method(&java_obj)?;
             let prefix_length = env.get_u32_from_method(&java_obj, "getPrefixLength")?;
+            let document_granularity = get_document_granularity(env, &java_obj)?;
 
             let mut query = FtsMatchQuery::new(query_text);
             query = query.with_column(Some(column));
@@ -123,6 +127,9 @@ pub(crate) fn build_full_text_search_query<'a>(
                 .with_max_expansions(max_expansions)
                 .with_operator(operator)
                 .with_prefix_length(prefix_length);
+            if let Some(document_granularity) = document_granularity {
+                query = query.with_document_granularity(document_granularity);
+            }
 
             Ok(FtsQuery::Match(query))
         }
@@ -130,10 +137,14 @@ pub(crate) fn build_full_text_search_query<'a>(
             let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
             let column = env.get_string_from_method(&java_obj, "getColumn")?;
             let slop = env.get_u32_from_method(&java_obj, "getSlop")?;
+            let document_granularity = get_document_granularity(env, &java_obj)?;
 
             let mut query = FtsPhraseQuery::new(query_text);
             query = query.with_column(Some(column));
             query = query.with_slop(slop);
+            if let Some(document_granularity) = document_granularity {
+                query = query.with_document_granularity(document_granularity);
+            }
 
             Ok(FtsQuery::Phrase(query))
         }
@@ -229,6 +240,20 @@ pub(crate) fn build_full_text_search_query<'a>(
     }
 }
 
+fn get_document_granularity(
+    env: &mut JNIEnv<'_>,
+    java_obj: &JObject,
+) -> Result<Option<DocumentGranularity>> {
+    env.get_optional_from_method(
+        java_obj,
+        "getDocumentGranularity",
+        |env, granularity_obj| {
+            let value = env.get_string_from_method(&granularity_obj, "toRustString")?;
+            DocumentGranularity::try_from(value.as_str()).map_err(Error::from)
+        },
+    )
+}
+
 /// Scanner options passed from JNI - shared between blocking and async scanners
 pub(crate) struct ScannerOptions<'a> {
     pub fragment_ids_obj: JObject<'a>,
@@ -283,7 +308,7 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     let substrait_opt = env.get_bytes_opt(&options.substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait) })?;
+        block_on(async { scanner.filter_substrait(substrait) })?;
     }
 
     let filter_opt = env.get_string_opt(&options.filter_obj)?;
@@ -637,7 +662,7 @@ fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> Result<u64> {
 }
 
 const SCAN_STATS_CLASS: &str = "org/lance/ipc/ScanStats";
-const SCAN_STATS_CONSTRUCTOR_SIG: &str = "(JJJJJJLjava/util/Map;Ljava/util/Map;)V";
+const SCAN_STATS_CONSTRUCTOR_SIG: &str = "(JJJJJJJJLjava/util/Map;Ljava/util/Map;)V";
 
 fn export_usize_map<'a>(env: &mut JNIEnv<'a>, map: &HashMap<String, usize>) -> Result<JObject<'a>> {
     let hash_map = env.new_object("java/util/HashMap", "()V", &[])?;
@@ -669,6 +694,8 @@ impl IntoJava for &ExecutionSummaryCounts {
                 JValueGen::Long(self.indices_loaded as i64),
                 JValueGen::Long(self.parts_loaded as i64),
                 JValueGen::Long(self.index_comparisons as i64),
+                JValueGen::Long(self.index_cache_hits() as i64),
+                JValueGen::Long(self.index_cache_misses() as i64),
                 JValueGen::Object(&all_counts),
                 JValueGen::Object(&all_times),
             ],
