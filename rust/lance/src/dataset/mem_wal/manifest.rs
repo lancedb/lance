@@ -527,6 +527,35 @@ impl ShardManifestStore {
         }
     }
 
+    /// Reject a generation whose commit would leave a hole in the shard's L0
+    /// history.
+    ///
+    /// `current_generation` is the contiguous flush frontier: every generation
+    /// below it reached L0, and `replay_after_wal_entry_position` covers
+    /// exactly their WAL entries. A higher generation would push that cursor
+    /// past entries no SSTable holds, losing those rows on the next open; a
+    /// lower one would rewind it and replay entries already covered.
+    ///
+    /// A backstop, not the mechanism — the flush handler's retry loop keeps
+    /// generations ordered, so this never fires under correct operation. It
+    /// exists because the failure mode is silent data loss, and because only
+    /// the manifest can enforce this durably against a commit path added later.
+    pub(crate) fn check_generation_contiguous(
+        manifest: &ShardManifest,
+        generation: u64,
+        shard_id: Uuid,
+    ) -> Result<()> {
+        if generation == manifest.current_generation {
+            return Ok(());
+        }
+        Err(Error::prerequisite_failed(format!(
+            "cannot commit generation {} for shard {}: the shard's next expected generation is {}. \
+             Generations must reach L0 in order; committing this one would advance the replay \
+             cursor past WAL entries no SSTable holds",
+            generation, shard_id, manifest.current_generation
+        )))
+    }
+
     /// Update the manifest with retry on version conflict.
     ///
     /// This method:
@@ -539,7 +568,11 @@ impl ShardManifestStore {
     /// # Arguments
     ///
     /// * `local_epoch` - The writer's epoch (for fencing check)
-    /// * `prepare_fn` - Function that takes current manifest and returns new manifest
+    /// * `prepare_fn` - Function that takes current manifest and returns new
+    ///   manifest, or an error to abandon the commit. It reruns against a
+    ///   freshly read manifest on every attempt, so a precondition checked
+    ///   inside it holds for the manifest actually written; one checked by the
+    ///   caller beforehand would be stale after a conflict retry.
     ///
     /// # Returns
     ///
@@ -547,7 +580,7 @@ impl ShardManifestStore {
     #[instrument(name = "manifest_commit_update", level = "debug", skip_all, fields(shard_id = %self.shard_id, local_epoch))]
     pub async fn commit_update<F>(&self, local_epoch: u64, prepare_fn: F) -> Result<ShardManifest>
     where
-        F: Fn(&ShardManifest) -> ShardManifest,
+        F: Fn(&ShardManifest) -> Result<ShardManifest>,
     {
         const MAX_RETRIES: usize = 10;
 
@@ -562,7 +595,7 @@ impl ShardManifestStore {
             Self::check_fenced_against(&Some(current.clone()), local_epoch, self.shard_id)?;
 
             // Step 3: Prepare new manifest
-            let new_manifest = prepare_fn(&current);
+            let new_manifest = prepare_fn(&current)?;
 
             // Validate epoch matches
             if new_manifest.writer_epoch != local_epoch {
