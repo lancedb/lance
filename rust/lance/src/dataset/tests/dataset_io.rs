@@ -1928,7 +1928,6 @@ async fn test_shallow_clone_stores_source_pin_id() {
     assert_eq!(pins[0].branch, None);
     assert_eq!(pins[0].clone_uri.as_deref(), Some(clone_uri.as_str()));
 
-    // A second clone gets its own pin.
     let other_uri = format!("{}/other", test_uri);
     let other = source.shallow_clone(&other_uri, 1, None).await.unwrap();
     assert_ne!(other.source_pin_id(), Some(pin_id.as_str()));
@@ -2067,7 +2066,6 @@ async fn test_shallow_clone_rejects_occupied_target_without_pin() {
         .await
         .expect_err("cloning onto an existing dataset should fail");
 
-    // Occupied targets are rejected before a source pin is written.
     let pins = source.clone_pins().list().await.unwrap();
     assert!(pins.is_empty());
 }
@@ -2099,7 +2097,6 @@ async fn test_failed_clone_commit_keeps_pin_when_outcome_is_ambiguous() {
             .unwrap()
     };
 
-    // The commit path verified no manifest landed. The unused pin is removed.
     let pin_id = create_pin().await;
     let definitive = Error::invalid_input("target validation failed");
     source
@@ -2107,7 +2104,6 @@ async fn test_failed_clone_commit_keeps_pin_when_outcome_is_ambiguous() {
         .await;
     assert!(source.clone_pins().list().await.unwrap().is_empty());
 
-    // The commit outcome could not be verified. The pin must stay.
     let pin_id = create_pin().await;
     let unknown = Error::commit_status_unknown_source(1, "response lost".to_string().into());
     source
@@ -2115,7 +2111,6 @@ async fn test_failed_clone_commit_keeps_pin_when_outcome_is_ambiguous() {
         .await;
     assert_eq!(source.clone_pins().list().await.unwrap().len(), 1);
 
-    // A cancelled commit future may still land server side. The pin must stay.
     let timed_out = Error::timeout("commit timed out");
     source
         .cleanup_pin_after_failed_clone_commit(&pin_id, &timed_out)
@@ -2139,7 +2134,6 @@ async fn resolve_shallow_clone_source_matches_resolve_reference() {
     )
     .await
     .unwrap();
-    // Second main version so "latest" differs from version 1.
     Dataset::write(
         gen_batch()
             .col("index", array::step_custom::<Int32Type>(10, 1))
@@ -2197,17 +2191,11 @@ async fn resolve_shallow_clone_source_matches_resolve_reference() {
         );
     }
 
-    // Numeric version on main.
     assert_parity(&source, Ref::VersionNumber(1)).await;
-    // Numeric version on an opened branch.
     assert_parity(&dev, Ref::VersionNumber(1)).await;
-    // Explicit branch and version.
     assert_parity(&source, Ref::Version(Some("dev".to_string()), Some(1))).await;
-    // Explicit branch with latest version.
     assert_parity(&source, Ref::Version(Some("dev".to_string()), None)).await;
-    // Tag on main.
     assert_parity(&source, Ref::Tag("main_tag".to_string())).await;
-    // Tag on a named branch.
     assert_parity(&source, Ref::Tag("dev_tag".to_string())).await;
 }
 

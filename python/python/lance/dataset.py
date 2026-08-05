@@ -4998,12 +4998,10 @@ class LanceDataset(pa.dataset.Dataset):
         retention : {"pin_source", "require_tag"}, default "pin_source"
             ``"pin_source"`` writes a retention pin on the source so
             :py:meth:`cleanup_old_versions` keeps the cloned version. Requires write
-            access to the source. ``"require_tag"`` skips the pin and requires that a
-            tag on the source already points at the resolved version. Use
-            ``"require_tag"`` when the source is read-only and the source owner has
-            tagged the version before cloning. With ``"require_tag"``, the tag must
-            remain for the lifetime of the clone. Removing it allows source cleanup
-            to delete files the clone reads.
+            access to the source. ``"require_tag"`` skips the pin and requires a tag on
+            the source that already points at the resolved version. Use that mode for
+            read-only sources after the owner tags the version. Keep the tag while the
+            clone reads source files.
 
         Returns
         -------
@@ -5014,10 +5012,9 @@ class LanceDataset(pa.dataset.Dataset):
         -----
         The clone reads the source's data files in place. With
         ``retention="pin_source"``, a pin is created on the source and the pin id is
-        stored on the clone. If the commit fails and the commit path verifies that no
-        manifest landed, the unused pin is removed. If the outcome is unknown, the pin
-        is retained. After deleting or detaching a pinned clone, call
-        ``source.clone_pins.unregister(clone.source_pin_id)``.
+        stored on the clone. An unused pin is removed when the commit path verifies no
+        manifest landed. Unknown outcomes keep the pin. After deleting or detaching a
+        pinned clone, call ``source.clone_pins.unregister(clone.source_pin_id)``.
         See :py:attr:`clone_pins`.
         """
         if isinstance(target_path, Path):

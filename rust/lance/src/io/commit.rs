@@ -341,12 +341,11 @@ pub(crate) async fn write_transaction_file(
 /// `source_branch_id` is the leaf UUID captured when the clone transaction was built.
 /// Absent means main, or an older transaction that did not record the incarnation.
 ///
-/// Call this AFTER every read from the source, not before. A recreated branch reuses
-/// the same manifest paths, so a check before the reads leaves a window where the reads
-/// hit the recreated branch. `Branches::delete` removes the branch contents file
-/// before any branch data is touched, and recreation writes a fresh leaf UUID, so the
-/// expected UUID still being present after the reads proves every read was served by
-/// the expected incarnation.
+/// Call this after every source read completes. A recreated branch reuses the same
+/// manifest paths. Checking before the reads leaves a window where those reads hit the
+/// new incarnation. `Branches::delete` removes the branch contents file before touching
+/// branch data, and recreation writes a fresh leaf UUID. The expected UUID still present
+/// after the reads proves they were served by that incarnation.
 async fn verify_clone_source_branch_incarnation(
     source_store: &ObjectStore,
     source_base_path: &Path,

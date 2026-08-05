@@ -517,15 +517,13 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
-        // Mark delete candidates, then re-check pins and tags. A concurrent clone writes
-        // its pin and refuses to commit when it sees the marker. Markers are never cleared.
-        // An old version once selected by cleanup stays closed to new shallow clones.
+        // Mark candidates, then recheck pins and tags. A concurrent clone that sees the
+        // marker refuses to commit. Markers stay permanently once written.
         inspection = self
             .mark_old_versions_and_retain_protected(inspection, &branch_identifier)
             .await?;
 
-        // Abort if this branch name now maps to a different incarnation. Deleting under
-        // the open dataset path would otherwise touch the recreated branch's files.
+        // Abort if this branch name now maps to a different incarnation.
         self.ensure_cleanup_branch_incarnation(&branch_identifier)
             .await?;
 
@@ -585,9 +583,8 @@ impl<'a> CleanupTask<'a> {
             }
             Err(error) => return Err(error),
         };
-        // Keep the latest version even when old. Keep tagged and clone-pinned versions
-        // regardless of age. Keep manifests newer than the dataset version. Those are
-        // in-progress or added after cleanup started.
+        // Retain the latest version, tagged versions, clone-pinned versions, and
+        // manifests newer than the dataset version.
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = retained.tagged_versions.contains(&manifest.version);
         let is_clone_pinned = retained.clone_pinned_versions.contains(&manifest.version);
@@ -639,9 +636,8 @@ impl<'a> CleanupTask<'a> {
     ///
     /// Markers stay after a version is deleted. Namespaces use branch incarnation
     /// ids so a recreated branch does not inherit markers from an older incarnation.
-    ///
-    /// Tags are relisted because a `RequireTag` clone may begin after the initial
-    /// tag listing.
+    /// Tags are relisted so a `RequireTag` clone that starts mid-cleanup still protects
+    /// its version.
     async fn mark_old_versions_and_retain_protected(
         &self,
         mut inspection: CleanupInspection,
@@ -2068,9 +2064,7 @@ mod tests {
                 num_bytes: 0,
             };
             while let Some(path) = file_stream.try_next().await? {
-                // Cleanup writes permanent GC markers while it deletes. They are
-                // bookkeeping, not dataset content, and would skew the
-                // bytes_removed == before - after assertions.
+                // Exclude GC markers from byte and file counts.
                 if path.location.as_ref().contains("_refs/gc_markers/") {
                     continue;
                 }
@@ -2228,14 +2222,11 @@ mod tests {
         assert_gt!(after_count.num_tx_files, 0);
     }
 
-    // Scan data files. A count from fragment metadata alone survives after those files are
-    // deleted.
     async fn scan_row_count(dataset: &Dataset) -> Result<usize> {
         Ok(dataset.scan().try_into_batch().await?.num_rows())
     }
 
-    // Reachability-only cleanup. delete_unverified drops age-based retention for unreferenced
-    // files. Without it, a clone read updates source file mtimes and the pin goes untested.
+    // delete_unverified=true so retention is reachability-only.
     async fn run_reachability_cleanup(fixture: &MockDatasetFixture) -> Result<RemovalStats> {
         fixture
             .run_cleanup_with_override(
@@ -2269,8 +2260,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Row count from the generator, not a clone read. Reading the clone first updates
-        // the source data file mtime and age-based cleanup would keep it even without a pin.
         let expected_rows: usize = some_batch().map(|batch| batch.unwrap().num_rows()).sum();
         assert_gt!(expected_rows, 0);
         let before_count = fixture.count_files().await.unwrap();
@@ -2365,9 +2354,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // Force-drop the branch so lineage retention does not keep main version 1 and the
-        // pin becomes orphaned. Main cleanup must still ignore it because it carries a
-        // different branch_id.
         source.force_delete_branch("dev").await.unwrap();
 
         fixture.overwrite_some_data().await.unwrap();
@@ -2438,7 +2424,6 @@ mod tests {
             .create_branch_and_load(&mut source, "dev", 1)
             .await
             .unwrap();
-        // Branch-local data, so branch deletion actually removes files the clone reads.
         Dataset::write(
             some_batch(),
             &branch.uri,
@@ -2466,8 +2451,6 @@ mod tests {
         assert!(matches!(error, Error::RefConflict { .. }), "{error:?}");
         assert!(error.to_string().contains("unregister them"), "{error}");
 
-        // The refused delete leaves the fence. The clone keeps working, the
-        // incarnation is closed to new shallow clones.
         let clone = fixture.load_dataset(&clone_uri).await.unwrap();
         assert_eq!(scan_row_count(&clone).await.unwrap(), expected_rows);
         let mut branch = fixture.load_dataset(&branch.uri).await.unwrap();
@@ -2503,8 +2486,6 @@ mod tests {
         let identifier = source.branches().get_identifier(Some("dev")).await.unwrap();
         let clone_pins = source.clone_pins();
 
-        // The fence lands between pin creation and the clone's second check, the way a
-        // concurrent delete_branch writes it after this clone passed the first check.
         let error = create_shallow_clone_pin_with_hook(
             &clone_pins,
             Some("dev"),
@@ -2562,8 +2543,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Force past the pin fence so the old pin survives as an orphan of the
-        // deleted incarnation.
         source.force_delete_branch("dev").await.unwrap();
 
         let mut recreated = fixture
@@ -2659,8 +2638,6 @@ mod tests {
                 .any(|&version| version == 1)
         );
 
-        // Cleanup has marked the version. A concurrent clone writes its pin before the
-        // post-mark pin list. Cleanup retains the version and keeps the marker.
         dataset.clone_pins().write_gc_marker(None, 1).await.unwrap();
         dataset
             .clone_pins()
@@ -2728,8 +2705,6 @@ mod tests {
                 .any(|&version| version == 1)
         );
 
-        // A tag created after this run's first tag listing, the way a RequireTag clone's
-        // tag appears mid-cleanup. The post-mark recheck must see it and retain the version.
         dataset.tags().create("late_tag", 1).await.unwrap();
 
         inspection = cleanup
@@ -2762,7 +2737,6 @@ mod tests {
         let source = fixture.load().await.unwrap();
         assert!(source.clone_pins().has_gc_marker(None, 1).await.unwrap());
 
-        // A later cleanup must not clear the marker for an already-deleted version.
         run_reachability_cleanup(&fixture).await.unwrap();
         let source = fixture.load().await.unwrap();
         assert!(source.clone_pins().has_gc_marker(None, 1).await.unwrap());

@@ -3204,27 +3204,21 @@ impl Dataset {
 
     /// Shallow clone the target version into a new dataset at `target_path`.
     ///
-    /// The clone reads the source's data files in place. It does not copy them.
+    /// The clone reads the source's data files in place without copying them.
     ///
-    /// With [`ShallowCloneRetention::PinSource`] (the default via [`Self::shallow_clone`]),
-    /// creates a pin on the source under `_refs/clones/` and stores the pin id on the
-    /// clone so [`Self::cleanup_old_versions`] on the source keeps the cloned version's
-    /// files. Requires write access to the source.
+    /// [`ShallowCloneRetention::PinSource`] writes a pin under `_refs/clones/` and stores
+    /// the pin id on the clone so [`Self::cleanup_old_versions`] keeps those files.
+    /// Requires write access to the source. This is the default via [`Self::shallow_clone`].
     ///
-    /// With [`ShallowCloneRetention::RequireTag`], no source pin is written. A tag on the
-    /// source must already point at the resolved version. Use this when the source is
-    /// read-only and the source owner has tagged the version before cloning. The tag must
-    /// remain while the clone reads source files. Removing it allows cleanup to reclaim
-    /// the cloned version.
+    /// [`ShallowCloneRetention::RequireTag`] skips the pin. A tag on the source must already
+    /// point at the resolved version. Keep that tag while the clone reads source files.
     ///
-    /// If cleanup has marked the version, the clone is refused under either policy.
-    /// When pinning, if cleanup marks the version before the clone commit begins, the
-    /// unused pin is removed. If the clone commit fails and the commit path verified
-    /// that no manifest landed, the unused pin is removed. When the outcome is unknown,
-    /// the pin is kept. A leaked pin wastes storage. Removing a pin for a live clone
-    /// can lose data.
+    /// Cleanup markers refuse the clone under either policy. An unused pin is removed when
+    /// cleanup marks the version before commit starts, or when the commit path verifies no
+    /// manifest landed. Unknown outcomes keep the pin. A leaked pin wastes storage. Removing
+    /// a pin for a live clone can lose data.
     ///
-    /// After deleting or detaching a pinned clone, remove the pin with
+    /// After deleting or detaching a pinned clone, call
     /// `source.clone_pins().unregister(clone.source_pin_id())`.
     pub async fn shallow_clone_with_retention(
         &mut self,
@@ -4380,8 +4374,8 @@ async fn source_version_is_tagged(
 
 /// Create a source pin for a shallow clone after GC-marker checks.
 ///
-/// Checks for a cleanup marker before and after creating the pin. If a marker is present
-/// before commit begins, any unused pin from this attempt is removed. `identifier` must
+/// Checks for a cleanup marker before and after creating the pin. A marker present before
+/// commit begins causes any unused pin from this attempt to be removed. `identifier` must
 /// be `branch`'s current [`refs::BranchIdentifier`], resolved once by the caller.
 pub(crate) async fn create_shallow_clone_pin(
     clone_pins: &ClonePins<'_>,

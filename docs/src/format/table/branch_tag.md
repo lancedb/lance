@@ -128,28 +128,27 @@ Each tag file is a JSON file with the following fields:
 
 ## Clone Pin
 
-A shallow clone stores its manifest at its own URI but reads the source dataset's data, deletion, and index files in place through `base_paths`.
-The source does not discover clones on its own. Cleanup on the source does not open clone URIs.
-By default, at clone time the source writes a pin under `_refs/clones/` for the cloned version, and the clone stores that pin id in its config under `lance.clone.source_pin_id`.
-A clone of a read-only source may instead rely on a tag the source owner created, in which case no pin is written.
-Cleanup keeps a pinned version's manifest and every file it references, the same way it keeps a tagged version.
+A shallow clone stores its manifest at its own URI and reads the source's data, deletion, and index files in place through `base_paths`.
+Cleanup on the source does not open clone URIs.
+By default the source writes a pin under `_refs/clones/` for the cloned version, and the clone stores that pin id under `lance.clone.source_pin_id`.
+A read-only source may rely on a tag the owner created instead, with no pin written.
+Cleanup keeps a pinned version the same way it keeps a tagged version.
 
-Pins are not removed when the clone is created. Remove the pin when the clone is deleted or detached.
-Several clones may each hold a pin on the same version. The version stays retained until the last pin is removed.
+Remove the pin when the clone is deleted or detached. Several clones may pin the same version. Retention lasts until the last pin is removed.
 
-Before deleting a version, cleanup writes a per-version marker under `_refs/gc_markers/`, then relists pins and tags.
-If a pin for the current branch incarnation or a tag protects the version, cleanup retains it. Otherwise it deletes the version.
-Tags are rechecked because a clone of a read-only source relies on a tag instead of a pin, and that tag may appear after cleanup's first tag listing.
-Markers stay after the version is deleted so a marked version stays closed to new shallow clones.
-Marker paths and pin `branchId` values use the branch incarnation id, not only the display name.
-A recreated branch with the same name gets a new incarnation and does not inherit prior markers or pins.
-Existing clones keep working through their pins until those pins are unregistered. A later cleanup then deletes the version.
-Deleting a branch is also fenced. Deletion writes an incarnation-wide `deleted` marker, then lists pins and is refused while any pin targets that incarnation.
-The `deleted` marker is never removed. An incarnation whose deletion was requested stays closed to new shallow clones even when the deletion was refused, and deletion can be rerun once the listed pins are unregistered.
-A force delete overrides the refusal and breaks the clones holding those pins.
-Tag-retained clones do not block branch deletion. Deleting the source branch breaks them.
-A pinned shallow clone checks both markers, creates its pin, then checks both again before beginning the commit.
-A tag-retained clone verifies that a tag retains the version and checks both markers without creating a pin.
+Before deleting a version, cleanup writes a marker under `_refs/gc_markers/`, then relists pins and tags.
+A pin for the current incarnation or a matching tag retains the version. Otherwise cleanup deletes it.
+Tags are rechecked so a mid-cleanup `require_tag` clone still protects its version.
+Markers stay after deletion, so a marked version stays closed to new shallow clones.
+Marker paths and pin `branchId` values use the branch incarnation id. A recreated branch with the same name gets a new incarnation and does not inherit prior markers or pins.
+Existing clones keep working until their pins are unregistered.
+
+Branch deletion writes an incarnation-wide `deleted` marker, then lists pins and is refused while any pin targets that incarnation.
+The `deleted` marker is never removed. A refused delete leaves the incarnation closed to new shallow clones. Rerun delete after unregistering the listed pins.
+A force delete overrides the refusal and breaks those clones.
+Tag-retained clones do not block branch deletion.
+A pinned clone checks both markers, creates its pin, then checks both again before commit.
+A tag-retained clone verifies the tag and checks both markers without creating a pin.
 
 ### Clone Pin Storage
 

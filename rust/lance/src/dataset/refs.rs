@@ -611,12 +611,9 @@ impl Branches<'_> {
                 });
             }
 
-            // Fence, then check pins. A clone that pins after this write sees the fence
-            // on its second marker check and aborts, so a pin list taken after the fence
-            // is complete. The fence stays if deletion is refused. The incarnation is
-            // then closed to new shallow clones, and deletion can be rerun once the
-            // listed pins are unregistered. `force` skips the pin refusal with a warning
-            // and breaks the clones holding those pins.
+            // Write BranchDeleted before listing pins. A clone that pins after this
+            // write aborts on its second marker check. The fence stays if deletion is
+            // refused. force skips the pin refusal and breaks those clones.
             let namespace = branch_id.marker_namespace();
             let clone_pins = self.refs.clone_pins();
             clone_pins
@@ -633,7 +630,7 @@ impl Branches<'_> {
                 if !force {
                     return Err(Error::RefConflict {
                         message: format!(
-                            "branch {} has {} shallow-clone pins [{}]; unregister them, then \
+                            "branch {} has {} shallow-clone pins [{}]. Unregister them, then \
                              rerun delete. The branch stays closed to new shallow clones",
                             branch,
                             pin_ids.len(),
@@ -642,7 +639,7 @@ impl Branches<'_> {
                     });
                 }
                 log::warn!(
-                    "force-deleting branch {} despite {} shallow-clone pins [{}]; the \
+                    "force-deleting branch {} despite {} shallow-clone pins [{}]. The \
                      clones holding them will lose access to branch-local files",
                     branch,
                     pin_ids.len(),
@@ -1084,9 +1081,8 @@ pub struct ClonePin {
 impl ClonePin {
     /// Reject pins whose retention identity is incomplete.
     ///
-    /// A named-branch pin without `branch_id` cannot be matched to any branch incarnation.
-    /// Treating it as a main pin would retain the wrong versions, and ignoring it would
-    /// silently drop a clone's protection, so the registry read fails instead.
+    /// A named-branch pin without `branch_id` cannot be matched to a branch incarnation.
+    /// Fail the registry read rather than retain the wrong versions or drop protection.
     fn validate(&self) -> Result<()> {
         if self.branch.is_some() && self.branch_id.is_none() {
             return Err(Error::corrupt_file(

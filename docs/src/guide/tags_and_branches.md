@@ -129,19 +129,13 @@ print(ds.branches.list_ordered(order="desc"))
 A shallow clone created with `shallow_clone()` does not copy data.
 Its manifest points back at the source dataset and reads the source's data files in place.
 
-By default, `shallow_clone()` creates a pin on the **source** under `_refs/clones/` for the version it clones, and stores the pin id on the clone.
-That keeps `cleanup_old_versions()` on the source from deleting files the clone still reads.
-Cleanup treats pinned versions like tagged versions. It does not open clone URIs.
-Pinned clones need write access to the source so they can create the pin.
-If you only have read access, pass `retention="require_tag"` after the source owner has tagged the version.
-With `require_tag`, the tag must remain for as long as the clone reads source files.
-Removing the tag removes the clone's cleanup protection.
-Before deleting a version, cleanup writes a marker under `_refs/gc_markers/`.
-That marker stays after the version is deleted so `shallow_clone()` cannot reopen it.
-Marker and pin identity use the branch incarnation id, not only the display name, so a recreated branch does not inherit the previous incarnation's markers or pins.
-Existing clones of a marked version keep working until their pins are unregistered.
+By default, `shallow_clone()` writes a pin under `_refs/clones/` on the source for the cloned version and stores that pin id on the clone.
+`cleanup_old_versions()` on the source keeps pinned versions the same way it keeps tagged versions. It does not open clone URIs.
+Creating a pin needs write access to the source. With read-only access, pass `retention="require_tag"` after the source owner tags the version. Keep that tag for as long as the clone reads source files.
+Cleanup writes a marker under `_refs/gc_markers/` before deleting a version. The marker stays after deletion so `shallow_clone()` cannot reopen that version.
+Markers and pin `branchId` values use the branch incarnation id, so a recreated branch with the same name does not inherit them. Existing clones keep working until their pins are unregistered.
 
-After deleting or detaching the clone, remove the pin on the source:
+Unregister the pin after deleting or detaching the clone:
 
 ```python
 clone = source.shallow_clone("s3://experiments/test-variant", 3)
@@ -151,15 +145,10 @@ pin_id = clone.source_pin_id
 source.clone_pins.unregister(pin_id)
 ```
 
-If cleanup marks the version before the clone commit begins, the unused pin is removed.
-If the commit path verifies that no manifest landed, the unused pin is removed.
-If the outcome is unknown, the pin is retained.
-A leaked pin wastes storage. Removing a pin for a live clone can lose data.
+An unused pin is removed when cleanup marks the version before clone commit starts, or when the commit path verifies no manifest landed. If the commit outcome is unknown, the pin stays. A leaked pin wastes storage. Removing a pin for a live clone can lose data.
 
-Pins also block branch deletion.
-Deleting a branch is refused while shallow-clone pins target it. Unregister the listed pins, then rerun the delete.
-A refused delete leaves the branch closed to new shallow clones. `force_delete_branch` overrides the refusal and breaks the clones holding those pins.
-Tag-retained clones do not block branch deletion. Deleting the source branch breaks clones that rely on a tag, so prefer pinned clones when the source branch may be deleted.
+Pins also block branch deletion. `delete_branch` is refused while pins target that incarnation. Unregister the listed pins, then delete again. A refused delete leaves the incarnation closed to new shallow clones. `force_delete_branch` overrides the refusal and breaks those clones.
+Tag-retained clones do not block branch deletion. Prefer pinned clones when the source branch may be deleted.
 
 !!! warning
 
