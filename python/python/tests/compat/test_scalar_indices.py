@@ -230,7 +230,12 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
         # Older versions without a null bitmap fall back to a zone scan, which
         # is still correct; newer versions may return an exact result.
         table = ds.to_table(filter="zonemap IS NULL")
-        assert table.num_rows == 2
+        if 1000 in table.column("idx").to_pylist():
+            # After write, there are 3 NULLs
+            assert table.num_rows == 3
+        else:
+            # Before write, there are 2 NULLs
+            assert table.num_rows == 2
 
         # Test BLOOMFILTER
         table = ds.to_table(filter="bloomfilter == 7")
@@ -256,6 +261,10 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
         # regardless of which version handles the seed-based index update.
         table = ds.to_table(filter="zonemap IS NULL")
         assert table.num_rows >= 1
+
+    def skip_downgrade(self, version: str) -> bool:
+        # In 0.X the zonemap index did not properly handle NULL in filters
+        return version.startswith("0.")
 
 
 @compat_test(min_version="0.36.0")
