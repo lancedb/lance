@@ -1510,6 +1510,7 @@ impl DatasetIndexExt for Dataset {
             Operation::CreateIndex {
                 new_indices: vec![],
                 removed_indices: indices.clone(),
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -1992,6 +1993,7 @@ impl DatasetIndexExt for Dataset {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -2133,6 +2135,7 @@ impl DatasetIndexExt for Dataset {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                mem_wal_index_catchup_advances: Vec::new(),
             },
         )
         .transaction_properties(options.transaction_properties.clone())
@@ -8058,6 +8061,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: legacy,
                 removed_indices: current,
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );

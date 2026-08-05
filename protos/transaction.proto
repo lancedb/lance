@@ -81,6 +81,31 @@ message Transaction {
   message CreateIndex {
     repeated IndexMetadata new_indices = 1;
     repeated IndexMetadata removed_indices = 2;
+
+    // Proof that one logical index now covers named per-shard compaction
+    // generations, published in the same commit as the index change it
+    // describes.
+    message IndexCatchupAdvance {
+      // One user-visible logical index, possibly backed by several segments.
+      string index_name = 1;
+
+      // Exact final physical segment UUID set expected after this operation.
+      // Ordering has no meaning; duplicates are rejected. The commit fails if
+      // the segments actually present differ, so a repair cannot claim
+      // coverage for an index that something else replaced underneath it.
+      repeated UUID expected_index_segment_uuids = 2;
+
+      // Compaction numbers captured when the repair job opened the table.
+      // Recording only these, rather than whatever is current at commit time,
+      // keeps the claim to what the job actually indexed.
+      repeated CompactedSsTable caught_up_generations = 3;
+    }
+
+    // Empty for every ordinary index operation, which is why an ordinary
+    // create, reindex, append, or remap conservatively loses whatever coverage
+    // its index had proved. Empty means "this operation proves no new
+    // coverage"; it never means "inherit what the previous index proved".
+    repeated IndexCatchupAdvance mem_wal_index_catchup_advances = 3;
   }
 
   // An operation that rewrites but does not change the data in the table. These
@@ -355,6 +380,14 @@ message Transaction {
   message UpdateMemWalState {
     // SSTables being marked as compacted.
     repeated CompactedSsTable compacted_sstables = 1;
+
+    // Presence with true requests the one-way migration to safe retirement.
+    // False is invalid; absence is an ordinary progress update.
+    //
+    // The migration is one-way because returning to legacy semantics — where a
+    // missing coverage entry reads as "fully caught up" — is unsafe once any
+    // SSTable has been retired against proved coverage.
+    optional bool activate_safe_retirement = 2;
   }
 
   // An operation that updates base paths in the dataset.

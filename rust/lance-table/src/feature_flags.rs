@@ -30,8 +30,20 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
+/// MemWAL SSTables are retired only against proved index coverage.
+///
+/// A reader without this bit would read a missing `index_catchup` entry as
+/// "fully caught up" and could answer an index-only query without the SSTables
+/// holding the newest rows. A writer without it would change an index without
+/// invalidating the coverage that index had proved, leaving stale proof behind.
+/// Both must refuse the table.
+pub const FLAG_MEM_WAL_SAFE_RETIREMENT: u64 = 128;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 128;
+pub const FLAG_UNKNOWN: u64 = 256;
+
+// This build only understands flags below the unknown boundary, so a bit
+// allocated at or above it would be refused by the very readers meant to use it.
+const _: () = assert!(FLAG_MEM_WAL_SAFE_RETIREMENT < FLAG_UNKNOWN);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -43,6 +55,15 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
+    // Preserved rather than derived: this bit depends on the `__lance_mem_wal`
+    // index details, and a manifest carries only a byte offset to its index
+    // section, not the indices themselves. Whoever holds the final index list
+    // sets it; every other recomputation must leave it alone, or an unrelated
+    // transaction would silently downgrade the table to legacy semantics.
+    // Clearing it is an explicit MemWAL disable, never a side effect.
+    let mem_wal_safe_retirement = (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & FLAG_MEM_WAL_SAFE_RETIREMENT;
+
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -100,6 +121,9 @@ pub fn apply_feature_flags(
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
+
+    manifest.reader_feature_flags |= mem_wal_safe_retirement;
+    manifest.writer_feature_flags |= mem_wal_safe_retirement;
     Ok(())
 }
 
@@ -304,5 +328,51 @@ mod tests {
             multi_base_manifest.writer_feature_flags & FLAG_BASE_PATHS,
             0
         );
+    }
+
+    /// The MemWAL bit depends on the `__lance_mem_wal` index details, which a
+    /// manifest cannot see — it holds only a byte offset to its index section.
+    /// So an unrelated recomputation must preserve the bit rather than derive
+    /// it, or a later transaction would silently downgrade the table to legacy
+    /// semantics and a reader would treat missing coverage as complete.
+    #[test]
+    fn an_unrelated_recomputation_preserves_the_mem_wal_bit() {
+        use crate::format::DataStorageFormat;
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags = FLAG_MEM_WAL_SAFE_RETIREMENT;
+        manifest.writer_feature_flags = FLAG_MEM_WAL_SAFE_RETIREMENT;
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_ne!(
+            manifest.reader_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT,
+            0
+        );
+    }
+
+    /// A build that does not know the bit must refuse the table rather than
+    /// continue with legacy semantics.
+    #[test]
+    fn the_mem_wal_bit_is_below_the_unknown_boundary() {
+        assert!(can_read_dataset(FLAG_MEM_WAL_SAFE_RETIREMENT));
+        assert!(can_write_dataset(FLAG_MEM_WAL_SAFE_RETIREMENT));
+        // The next bit up is still unknown, so allocating this one did not
+        // silently widen what this build claims to understand.
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
     }
 }

@@ -411,6 +411,7 @@ fn convert_to_java_operation_inner<'local>(
         Operation::CreateIndex {
             new_indices,
             removed_indices,
+            ..
         } => {
             let java_new_indices = export_vec(env, &new_indices)?;
             let java_removed_indices = export_vec(env, &removed_indices)?;
@@ -1332,6 +1333,7 @@ fn convert_to_rust_operation(
             return Ok(Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                mem_wal_index_catchup_advances: Vec::new(),
             });
         }
         _ => unimplemented!(),
