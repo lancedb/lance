@@ -4259,7 +4259,7 @@ impl Scanner {
                             Some(query.slop),
                         )
                         .await?;
-                    return Ok(flat_phrase_plan);
+                    return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
                 }
 
                 let (stale_rows, preset_segments) = match self
@@ -4286,7 +4286,7 @@ impl Scanner {
                                 Some(query.slop),
                             )
                             .await?;
-                        return Ok(flat_phrase_plan);
+                        return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
                     }
                 };
                 let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
@@ -4423,7 +4423,7 @@ impl Scanner {
                             None,
                         )
                         .await?;
-                    return Ok(flat_match_plan);
+                    return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
                 }
 
                 let (stale_rows, preset_segments) = match self
@@ -4450,7 +4450,7 @@ impl Scanner {
                                 None,
                             )
                             .await?;
-                        return Ok(flat_match_plan);
+                        return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
                     }
                 };
                 let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
