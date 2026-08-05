@@ -849,6 +849,13 @@ pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>)
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
+    if let Some(first_position) = positions.first().copied() {
+        // Phrase positions are relative to the first retained query token. This preserves gaps
+        // between retained tokens without requiring documents to contain filtered leading terms.
+        for position in &mut positions {
+            *position -= first_position;
+        }
+    }
     Tokens::with_positions(tokens, positions, token_type)
 }
 
