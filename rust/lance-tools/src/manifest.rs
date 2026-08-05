@@ -31,10 +31,11 @@ const TRANSACTIONS_DIR: &str = "_transactions";
 const VERSIONS_DIR: &str = "_versions";
 const LATEST_MANIFEST: &str = "_latest.manifest";
 
-pub struct LanceToolManifest {
+pub(crate) struct LanceToolManifest {
     path: Path,
     dataset_base: Option<Path>,
-    raw_manifest: pb::Manifest,
+    has_timestamp: bool,
+    has_data_format: bool,
     manifest: Manifest,
     indices: OptionalSection<Vec<IndexView>>,
     transaction: OptionalSection<TransactionView>,
@@ -72,7 +73,9 @@ impl LanceToolManifest {
         let source = resolve_manifest_source(&args.source).await?;
         let raw_manifest =
             read_manifest_proto(&source.object_store, &source.manifest_path, None).await?;
-        let manifest = Manifest::try_from(raw_manifest.clone())?;
+        let has_timestamp = raw_manifest.timestamp.is_some();
+        let has_data_format = raw_manifest.data_format.is_some();
+        let manifest = Manifest::try_from(raw_manifest)?;
         let indices = load_indices(
             &source.object_store,
             &source.manifest_path,
@@ -90,7 +93,8 @@ impl LanceToolManifest {
         Ok(Self {
             path: source.manifest_path,
             dataset_base: source.dataset_base,
-            raw_manifest,
+            has_timestamp,
+            has_data_format,
             manifest,
             indices,
             transaction,
@@ -108,6 +112,12 @@ async fn resolve_manifest_source(source: &str) -> Result<ManifestSource> {
     })
 }
 
+/// Infer the dataset base from `<base>/_latest.manifest` or
+/// `<base>/_versions/*.manifest`.
+///
+/// Returns `None` when the dataset base cannot be inferred, which means
+/// external transaction files cannot be resolved. Root-level manifests also
+/// return `None` because [`path_from_parts`] rejects an empty prefix.
 fn infer_dataset_base_from_manifest_path(path: &Path) -> Option<Path> {
     let parts = path
         .parts()
@@ -124,6 +134,10 @@ fn infer_dataset_base_from_manifest_path(path: &Path) -> Option<Path> {
     None
 }
 
+/// Build a non-empty object-store path from path parts.
+///
+/// Returns `None` for an empty prefix, including root-level `_latest.manifest`
+/// paths where there is no dataset base before the manifest filename.
 fn path_from_parts(parts: &[String]) -> Option<Path> {
     if parts.is_empty() {
         None
@@ -180,22 +194,32 @@ async fn load_transaction(
             .clone()
             .join(TRANSACTIONS_DIR)
             .join(transaction_file.as_str());
-        match object_store.inner.get(&path).await {
-            Ok(result) => match result.bytes().await {
-                Ok(data) => match pb::Transaction::decode(data) {
-                    Ok(transaction) => OptionalSection::Loaded(TransactionView {
-                        source: TransactionSource::External { path },
-                        transaction,
-                    }),
-                    Err(e) => OptionalSection::Error(e.to_string()),
-                },
-                Err(e) => OptionalSection::Error(e.to_string()),
-            },
-            Err(e) => OptionalSection::Error(e.to_string()),
+        match read_external_transaction(object_store, &path).await {
+            Ok(transaction) => OptionalSection::Loaded(TransactionView {
+                source: TransactionSource::External { path },
+                transaction,
+            }),
+            Err(error) => OptionalSection::Error(error),
         }
     } else {
         OptionalSection::NotPresent
     }
+}
+
+async fn read_external_transaction(
+    object_store: &ObjectStore,
+    path: &Path,
+) -> std::result::Result<pb::Transaction, String> {
+    let result = object_store
+        .inner
+        .get(path)
+        .await
+        .map_err(|error| format!("failed to read external transaction {path}: {error}"))?;
+    let data = result.bytes().await.map_err(|error| {
+        format!("failed to read bytes for external transaction {path}: {error}")
+    })?;
+    pb::Transaction::decode(data)
+        .map_err(|error| format!("failed to decode external transaction {path}: {error}"))
 }
 
 async fn read_section<M: Message + Default>(
@@ -234,20 +258,14 @@ impl fmt::Display for LanceToolManifest {
             f,
             2,
             "timestamp",
-            &format_timestamp(
-                self.manifest.timestamp_nanos,
-                self.raw_manifest.timestamp.is_some(),
-            ),
+            &format_timestamp(self.manifest.timestamp_nanos, self.has_timestamp),
         )?;
         write_kv(f, 2, "tag", &format_optional(self.manifest.tag.as_ref()))?;
         write_kv(
             f,
             2,
             "data_storage_format",
-            &format_data_storage_format(
-                &self.manifest.data_storage_format,
-                self.raw_manifest.data_format.is_some(),
-            ),
+            &format_data_storage_format(&self.manifest.data_storage_format, self.has_data_format),
         )?;
         write_kv(
             f,
@@ -290,7 +308,7 @@ impl fmt::Display for LanceToolManifest {
             f,
             2,
             "index_section_position",
-            &format_optional_usize(self.manifest.index_section),
+            &format_absent_usize(self.manifest.index_section),
         )?;
         write_kv(
             f,
@@ -302,7 +320,7 @@ impl fmt::Display for LanceToolManifest {
             f,
             2,
             "transaction_section_position",
-            &format_optional_usize(self.manifest.transaction_section),
+            &format_absent_usize(self.manifest.transaction_section),
         )?;
 
         write_summary(f, &self.manifest)?;
@@ -400,13 +418,13 @@ fn write_fragment(f: &mut Formatter<'_>, indent: usize, fragment: &Fragment) -> 
         f,
         indent + 2,
         "physical_rows",
-        &format_option_usize(fragment.physical_rows),
+        &format_unknown_usize(fragment.physical_rows),
     )?;
     write_kv(
         f,
         indent + 2,
         "num_rows",
-        &format_option_usize(fragment.num_rows()),
+        &format_unknown_usize(fragment.num_rows()),
     )?;
     write_kv(
         f,
@@ -532,7 +550,7 @@ fn write_deletion_file(
         f,
         indent + 2,
         "num_deleted_rows",
-        &format_option_usize(deletion_file.num_deleted_rows),
+        &format_unknown_usize(deletion_file.num_deleted_rows),
     )?;
     write_kv(
         f,
@@ -608,7 +626,7 @@ fn write_index(f: &mut Formatter<'_>, index: &IndexView) -> fmt::Result {
             write_kv(
                 f,
                 8,
-                "uuid_bytes",
+                "uuid_byte_count",
                 &index
                     .raw
                     .uuid
@@ -852,7 +870,12 @@ fn write_transaction_operation(
                 "merged_generations",
                 &update.merged_generations.len().to_string(),
             )?;
-            write_kv(f, indent, "update_mode", &update.update_mode.to_string())?;
+            write_kv(
+                f,
+                indent,
+                "update_mode",
+                &format_update_mode(update.update_mode),
+            )?;
             write_kv(
                 f,
                 indent,
@@ -1102,13 +1125,13 @@ fn format_option_u64(value: Option<u64>) -> String {
         .unwrap_or_else(|| "absent".to_string())
 }
 
-fn format_option_usize(value: Option<usize>) -> String {
+fn format_unknown_usize(value: Option<usize>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn format_optional_usize(value: Option<usize>) -> String {
+fn format_absent_usize(value: Option<usize>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "absent".to_string())
@@ -1180,12 +1203,21 @@ fn format_feature_flags(flags: u64) -> String {
         .iter()
         .filter_map(|(flag, name)| if flags & flag != 0 { Some(*name) } else { None })
         .collect::<Vec<_>>();
+    // FLAG_UNKNOWN is the first bit after all known feature flags, so all lower
+    // bits are the known-mask. Keep future feature flags below FLAG_UNKNOWN.
     let known_mask = FLAG_UNKNOWN - 1;
     let unknown = flags & !known_mask;
     if unknown != 0 {
         names.push("unknown");
     }
     format!("{} ({})", flags, names.join(", "))
+}
+
+fn format_update_mode(value: i32) -> String {
+    match pb::transaction::UpdateMode::try_from(value) {
+        Ok(mode) => format!("{:?}", mode),
+        Err(_) => value.to_string(),
+    }
 }
 
 fn format_row_id_meta(value: Option<&RowIdMeta>) -> String {
@@ -1264,6 +1296,7 @@ pub(crate) async fn show_table_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::datatypes::Schema;
     use std::path::{Path as FsPath, PathBuf};
 
     #[test]
@@ -1282,6 +1315,71 @@ mod tests {
             infer_dataset_base_from_manifest_path(&path).unwrap(),
             Path::from("dataset")
         );
+    }
+
+    #[test]
+    fn test_infer_dataset_base_from_unrecognized_manifest_paths() {
+        let cases = [
+            "1.manifest",
+            "dataset/_versions/1.lance",
+            "dataset/versions/1.manifest",
+            "_latest.manifest",
+        ];
+        for path in cases {
+            assert_eq!(
+                infer_dataset_base_from_manifest_path(&Path::from(path)),
+                None,
+                "path {path} should not infer a dataset base"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_optional_section_errors() {
+        let manifest = LanceToolManifest {
+            path: Path::from("dataset/_versions/1.manifest"),
+            dataset_base: Some(Path::from("dataset")),
+            has_timestamp: false,
+            has_data_format: true,
+            manifest: empty_manifest(),
+            indices: OptionalSection::Error("index section is corrupt".to_string()),
+            transaction: OptionalSection::Error("transaction section is corrupt".to_string()),
+        };
+
+        let rendered = manifest.to_string();
+
+        assert!(rendered.contains("indices_error: index section is corrupt"));
+        assert!(rendered.contains("transaction_error: transaction section is corrupt"));
+    }
+
+    #[tokio::test]
+    async fn test_external_transaction_error_includes_path() {
+        let object_store = ObjectStore::memory();
+        let mut manifest = empty_manifest();
+        manifest.transaction_file = Some("1.txn".to_string());
+        let manifest_path = Path::from("dataset/_versions/1.manifest");
+
+        let transaction = load_transaction(
+            &object_store,
+            &manifest_path,
+            Some(&Path::from("dataset")),
+            &manifest,
+        )
+        .await;
+
+        let OptionalSection::Error(error) = transaction else {
+            panic!("missing external transaction should render as an error");
+        };
+        assert!(error.contains("dataset/_transactions/1.txn"));
+    }
+
+    #[test]
+    fn test_format_update_mode_names_known_values() {
+        assert_eq!(
+            format_update_mode(pb::transaction::UpdateMode::RewriteRows as i32),
+            "RewriteRows"
+        );
+        assert_eq!(format_update_mode(99), "99");
     }
 
     #[tokio::test]
@@ -1319,6 +1417,9 @@ mod tests {
             }
 
             let rendered = manifest.to_string();
+            let expected_version = format!("  version: {}", manifest.manifest.version);
+            let expected_fragment_count =
+                format!("  fragments: {}", manifest.manifest.fragments.len());
             assert!(
                 rendered.contains("manifest:"),
                 "rendered output missing manifest section for {}",
@@ -1330,11 +1431,25 @@ mod tests {
                 manifest_path.display()
             );
             assert!(
-                rendered.contains("fragments:"),
-                "rendered output missing fragments section for {}",
+                rendered.contains(&expected_version),
+                "rendered output missing version value for {}",
+                manifest_path.display()
+            );
+            assert!(
+                rendered.contains(&expected_fragment_count),
+                "rendered output missing fragment count for {}",
                 manifest_path.display()
             );
         }
+    }
+
+    fn empty_manifest() -> Manifest {
+        Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        )
     }
 
     fn repo_root() -> PathBuf {
