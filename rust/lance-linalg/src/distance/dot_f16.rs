@@ -25,21 +25,31 @@ use half::f16;
 
 use crate::distance::dot::dot;
 
-/// Batched f16 dot product: the raw dot products of one `query` against 16
-/// `candidates`, in order. Every candidate slice must have the same length as
-/// `query`.
+/// Batched f16 dot product: the raw dot products of one `query` against the
+/// first `len` of 16 `candidates`, in order. Every candidate slice must have the
+/// same length as `query`, and `len` must be in `1..=16`.
+///
+/// A batch shorter than 16 is the common case on the beam-search path, so `len`
+/// is not a convenience: it is what stops a one-neighbor flush from doing 16
+/// candidates' worth of work. Lanes `len..16` are returned as `0` rather than
+/// left unspecified, so both the AMX and fallback paths agree exactly on what a
+/// caller that reads past `len` would see.
 ///
 /// Safe to call unconditionally: the caller never needs to know whether AMX is
 /// present. The function panics if any candidate has a different length from
-/// `query`, rather than allowing a malformed batch to reach the FFI kernel.
-/// See the module docs for the accuracy contract.
+/// `query`, or if `len` is out of range, rather than allowing a malformed batch
+/// to reach the FFI kernel. See the module docs for the accuracy contract.
 #[inline]
-pub fn dot_f16_batch_16(query: &[f16], candidates: &[&[f16]; 16]) -> [f32; 16] {
+pub fn dot_f16_batch_16(query: &[f16], candidates: &[&[f16]; 16], len: usize) -> [f32; 16] {
     assert!(
         candidates
             .iter()
             .all(|candidate| candidate.len() == query.len()),
         "all candidate vectors must have the same length as query"
+    );
+    assert!(
+        (1..=16).contains(&len),
+        "batch length must be in 1..=16, got {len}"
     );
     #[cfg(all(
         kernel_support = "amx_fp16",
@@ -50,18 +60,29 @@ pub fn dot_f16_batch_16(query: &[f16], candidates: &[&[f16]; 16]) -> [f32; 16] {
         // AMX only earns its tile-config overhead once there is at least one
         // full 32-wide pass; for tiny dims the fallback is cheaper anyway.
         if query.len() >= 32 && crate::simd::amx_fp16::amx_available() {
-            return unsafe { crate::simd::amx_fp16::dot_f16_batch_16_amx(query, candidates) };
+            return unsafe { crate::simd::amx_fp16::dot_f16_batch_16_amx(query, candidates, len) };
         }
     }
-    dot_f16_batch_16_fallback(query, candidates)
+    dot_f16_batch_16_fallback(query, candidates, len)
 }
 
-/// Fallback for [`dot_f16_batch_16`]: 16 independent [`crate::distance::dot()`]
+/// Fallback for [`dot_f16_batch_16`]: `len` independent [`crate::distance::dot()`]
 /// calls — bit-identical to the per-neighbor `distance()` path (both go through
-/// `f16::dot`). Exposed separately so tests can exercise it regardless of host.
+/// `f16::dot`) — and `0` for the remaining lanes, matching what the kernel
+/// leaves there. Exposed separately so tests can exercise it regardless of host.
 #[inline]
-pub(crate) fn dot_f16_batch_16_fallback(query: &[f16], candidates: &[&[f16]; 16]) -> [f32; 16] {
-    std::array::from_fn(|i| dot(query, candidates[i]))
+pub(crate) fn dot_f16_batch_16_fallback(
+    query: &[f16],
+    candidates: &[&[f16]; 16],
+    len: usize,
+) -> [f32; 16] {
+    std::array::from_fn(|i| {
+        if i < len {
+            dot(query, candidates[i])
+        } else {
+            0.0
+        }
+    })
 }
 
 /// Whether a `dot_f16_batch_16` call would take the AMX-FP16 tile path (given a
@@ -139,7 +160,7 @@ mod tests {
         for &dim in BATCH_DIMS {
             let (query, cands) = make_batch(dim, &mut rng);
             let candidates: [&[f16]; 16] = std::array::from_fn(|i| cands[i].as_slice());
-            let got = dot_f16_batch_16_fallback(&query, &candidates);
+            let got = dot_f16_batch_16_fallback(&query, &candidates, 16);
             for i in 0..16 {
                 assert_close(
                     got[i],
@@ -156,7 +177,7 @@ mod tests {
         for &dim in BATCH_DIMS {
             let (query, cands) = make_batch(dim, &mut rng);
             let candidates: [&[f16]; 16] = std::array::from_fn(|i| cands[i].as_slice());
-            let got = dot_f16_batch_16(&query, &candidates);
+            let got = dot_f16_batch_16(&query, &candidates, 16);
             for i in 0..16 {
                 assert_close(
                     got[i],
@@ -179,7 +200,59 @@ mod tests {
                 query.as_slice()
             }
         });
-        let _ = dot_f16_batch_16(&query, &candidates);
+        let _ = dot_f16_batch_16(&query, &candidates, 16);
+    }
+
+    /// A live lane must be bit-identical whatever `len` the batch was issued at.
+    /// Shortening the batch changes only how many rows are gathered, never a
+    /// row's contents nor the order the tile passes accumulate them, so anything
+    /// less than bit-exact here would mean a staging offset moved with `len` —
+    /// exactly the bug a tolerance would hide. Lanes past `len` must read 0 on
+    /// both paths: dispatch is host-dependent, so a caller must not be able to
+    /// tell which one ran.
+    #[test]
+    fn partial_len_matches_full_batch_and_zeroes_the_rest() {
+        let mut rng = StdRng::seed_from_u64(0x1EE);
+        for &dim in BATCH_DIMS {
+            let (query, cands) = make_batch(dim, &mut rng);
+            let candidates: [&[f16]; 16] = std::array::from_fn(|i| cands[i].as_slice());
+            let full = dot_f16_batch_16(&query, &candidates, 16);
+            let full_fb = dot_f16_batch_16_fallback(&query, &candidates, 16);
+            for len in 1..=16 {
+                let got = dot_f16_batch_16(&query, &candidates, len);
+                let got_fb = dot_f16_batch_16_fallback(&query, &candidates, len);
+                for i in 0..len {
+                    assert_eq!(
+                        got[i].to_bits(),
+                        full[i].to_bits(),
+                        "dim={dim} len={len} i={i}: {} vs {}",
+                        got[i],
+                        full[i]
+                    );
+                    assert_eq!(
+                        got_fb[i].to_bits(),
+                        full_fb[i].to_bits(),
+                        "fb dim={dim} i={i}"
+                    );
+                }
+                for i in len..16 {
+                    assert_eq!(got[i], 0.0, "dim={dim} len={len}: lane {i} must be 0");
+                    assert_eq!(got_fb[i], 0.0, "fb dim={dim} len={len}: lane {i} must be 0");
+                }
+            }
+        }
+    }
+
+    /// `len` is rejected, never clamped: the kernel indexes its staging buffer
+    /// by it, and a caller that meant 16 and passed 17 should hear about it.
+    #[rstest::rstest]
+    #[case::zero(0)]
+    #[case::seventeen(17)]
+    #[should_panic(expected = "batch length must be in 1..=16")]
+    fn rejects_out_of_range_len(#[case] len: usize) {
+        let query = vec![f16::from_f32(1.0); 32];
+        let candidates: [&[f16]; 16] = std::array::from_fn(|_| query.as_slice());
+        let _ = dot_f16_batch_16(&query, &candidates, len);
     }
 
     /// On AMX-FP16 hardware, assert the AMX branch is actually selected (not a
@@ -200,7 +273,8 @@ mod tests {
         for &dim in BATCH_DIMS.iter().filter(|&&d| d >= 32) {
             let (query, cands) = make_batch(dim, &mut rng);
             let candidates: [&[f16]; 16] = std::array::from_fn(|i| cands[i].as_slice());
-            let amx = unsafe { crate::simd::amx_fp16::dot_f16_batch_16_amx(&query, &candidates) };
+            let amx =
+                unsafe { crate::simd::amx_fp16::dot_f16_batch_16_amx(&query, &candidates, 16) };
             for i in 0..16 {
                 let want = ref_dot_f32(&query, &cands[i]);
                 assert_close(amx[i], want, &format!("amx dim={dim} i={i}"));
@@ -209,5 +283,60 @@ mod tests {
             }
         }
         assert!(worst <= REL_TOL, "worst AMX relative error: {worst:.2e}");
+    }
+
+    /// The batch-16 kernel's tile shape, pinned byte for byte.
+    ///
+    /// The shape is the one thing a refactor of `amx_fp16.c` can change with no
+    /// visible symptom until it runs on AMX hardware, where a wrong shape is a
+    /// #UD or wrong results rather than a clean failure. Asserting the
+    /// configuration image directly keeps that a check every host can run,
+    /// whether or not it has AMX.
+    #[cfg(all(
+        kernel_support = "amx_fp16",
+        target_arch = "x86_64",
+        target_os = "linux"
+    ))]
+    #[test]
+    fn search_tile_config_image_is_pinned() {
+        use crate::simd::amx_fp16::{AMX_CFG_SEARCH, tilecfg_image};
+
+        // Image layout per Intel SDM: palette_id, start_row, 14 reserved bytes,
+        // a u16 colsb[16] array, then a u8 rows[16] array.
+        const COLSB: usize = 16;
+        const ROWS: usize = 48;
+
+        let mut want = [0u8; 64];
+        want[0] = 1; // palette_id
+        // C = tmm0: 16 x 1 fp32, fed by three independent (A, B) pairs so three
+        // TDPFP16PS can be in flight at once: A = tmm1/3/5, each 16 x 32 fp16;
+        // B = tmm2/4/6, each 16 x 2 fp16. tmm7 is left unconfigured.
+        for (tmm, colsb) in [
+            (0usize, 4u16),
+            (1, 64),
+            (2, 4),
+            (3, 64),
+            (4, 4),
+            (5, 64),
+            (6, 4),
+        ] {
+            want[COLSB + tmm * 2..COLSB + tmm * 2 + 2].copy_from_slice(&colsb.to_le_bytes());
+            want[ROWS + tmm] = 16;
+        }
+
+        let got = tilecfg_image(AMX_CFG_SEARCH).expect("search config kind must be known");
+        assert_eq!(got, want, "batch-16 tile configuration changed");
+    }
+
+    /// An unknown config kind must be rejected rather than answered with a
+    /// zeroed image: an all-zero (unconfigured) shape #UDs on the first tile op.
+    #[cfg(all(
+        kernel_support = "amx_fp16",
+        target_arch = "x86_64",
+        target_os = "linux"
+    ))]
+    #[test]
+    fn unknown_tile_config_kind_is_rejected() {
+        assert!(crate::simd::amx_fp16::tilecfg_image(-1).is_none());
     }
 }

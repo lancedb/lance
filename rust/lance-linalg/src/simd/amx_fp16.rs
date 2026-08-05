@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! AMX-FP16 accelerated batched f16 x f16 dot product for flat fp16 search.
+//! AMX-FP16 accelerated f16 x f16 dot products.
+//!
+//! One shape: `dot_f16_batch_16_amx`, one query against 16 candidates, for flat
+//! fp16 search. It is named in a plain code span rather than an intra-doc link:
+//! it is `kernel_support = "amx_fp16"`-gated, so a link from these unconditional
+//! module docs is unresolved — and hence a rustdoc error under `-D warnings` —
+//! on any build without the `amx` feature.
 //!
 //! The tile math lives in `amx_fp16.c` (compiled by `build.rs` with a compiler
 //! new enough for `-mamx-fp16`, which sets `kernel_support = "amx_fp16"`). This
-//! module holds the FFI declarations and the runtime safety gate. The safe
-//! public entry point is [`crate::distance::dot_f16::dot_f16_batch_16`].
+//! module holds the FFI declaration and the runtime safety gate. Everything
+//! here is crate-internal; the safe public entry point is
+//! [`crate::distance::dot_f16::dot_f16_batch_16`], and the availability gate is
+//! [`crate::distance::dot_f16::amx_fp16_available`].
 //!
 //! ## Safety gate
 //!
@@ -49,16 +57,53 @@ unsafe extern "C" {
     /// arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA); 0 on success.
     fn lance_amx_fp16_request_perm() -> i32;
 
-    /// out[i] = sum_d f32(query[d]) * f32(candidates[i*stride + d]), i in 0..16.
-    /// `query` / `candidates` are IEEE binary16 bit patterns; `stride >= dim`
-    /// (in halfwords); `out` holds 16 f32. See `amx_fp16.c`.
+    /// out[i] = sum_d f32(query[d]) * f32(candidates[i][d]), i in 0..count;
+    /// out[count..16] = 0. `query` is `dim` IEEE binary16 bit patterns;
+    /// `candidates` is 16 pointers to `dim` of them each, of which only the
+    /// first `count` (1..=16) are read; `out` holds 16 f32. The kernel gathers
+    /// the rows itself, k-block by k-block. See `amx_fp16.c`.
     fn lance_amx_dot_f16_batch_16(
         query: *const u16,
-        candidates: *const u16,
+        candidates: *const *const u16,
+        count: usize,
         dim: usize,
-        stride: usize,
         out: *mut f32,
     );
+
+    /// Writes the 64-byte LDTILECFG image for `cfg_kind` into `out` without
+    /// loading it; 0 on success, -1 for an unknown kind. See `amx_fp16.c`.
+    #[cfg(test)]
+    fn lance_amx_tilecfg_image(cfg_kind: i32, out: *mut u8) -> i32;
+}
+
+/// Config kind for [`tilecfg_image`]: the batch-16 search kernel's tile shape.
+/// Must match `LANCE_AMX_CFG_SEARCH` in `amx_fp16.c`.
+#[cfg(all(
+    test,
+    kernel_support = "amx_fp16",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+pub(crate) const AMX_CFG_SEARCH: i32 = 0;
+
+/// The 64-byte LDTILECFG image a kernel would configure, without loading it.
+/// `None` if `cfg_kind` is not one of the `AMX_CFG_*` constants.
+///
+/// Exists for the tests: a wrong tile shape never surfaces as a clean error —
+/// it is a #UD or silently wrong results — so the shape is pinned directly
+/// rather than inferred from kernel output.
+#[cfg(all(
+    test,
+    kernel_support = "amx_fp16",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+pub(crate) fn tilecfg_image(cfg_kind: i32) -> Option<[u8; 64]> {
+    let mut image = [0u8; 64];
+    // SAFETY: the C side writes exactly `sizeof(lance_amx_tilecfg)` bytes, which
+    // a `_Static_assert` there pins to 64 — the length of `image`.
+    let rc = unsafe { lance_amx_tilecfg_image(cfg_kind, image.as_mut_ptr()) };
+    (rc == 0).then_some(image)
 }
 
 /// True iff AMX-FP16 tile instructions can be executed safely in this process.
@@ -106,54 +151,61 @@ fn detect_amx_fp16() -> bool {
     amx_tile && amx_fp16
 }
 
-/// Batched AMX-FP16 dot product. Gathers the 16 (non-contiguous) candidate
-/// slices into a contiguous `16 x dim` scratch buffer so the tile load can use
-/// a single fixed row stride, then runs the tile kernel. Returns the 16 raw
-/// dot products (`Σ query·candidate`, no `1.0 -` distance wrapping).
+/// Batched AMX-FP16 dot product: one query against the first `len` of 16
+/// candidates. Returns the 16 raw dot products (`Σ query·candidate`, no `1.0 -`
+/// distance wrapping); lanes `len..16` are 0.
 ///
-/// The gather scratch is a reused thread-local buffer, not a fresh allocation
-/// per call: this runs on the hot search path (once per 16-neighbor beam-search
-/// flush), where a per-batch heap allocation (48 KB at dim 1536) would churn the
-/// allocator and erode the tile speedup, especially at high query concurrency.
+/// Hands the kernel 16 pointers rather than a packed `16 x dim` buffer. The
+/// candidates still have to be brought together for a tile load, but the kernel
+/// does it one k-block at a time into 3 KB of stack, which overlaps the copies
+/// with the tile ops; packing all `16 * dim * 2` bytes here first could not
+/// overlap with anything, and at dim 1024 that is 32 KB against a 48 KB L1D.
+/// See the kernel comment in `amx_fp16.c` for the measurements behind this.
+///
+/// `len` is what keeps a partial batch cheap: the tile pass is a fixed cost for
+/// 16 lanes either way, but only `len` rows are gathered.
 ///
 /// # Safety
-/// `amx_available` must have returned `true`. Every candidate slice must have
-/// length `query.len()`.
+/// `amx_available` must have returned `true`. `len` must be in `1..=16` — the
+/// kernel does not clamp it, and a larger value walks its staging buffer off the
+/// end; [`crate::distance::dot_f16::dot_f16_batch_16`] is where that is
+/// rejected. Every candidate slice must have length `query.len()`, and must
+/// outlive the call.
 #[cfg(all(
     kernel_support = "amx_fp16",
     target_arch = "x86_64",
     target_os = "linux"
 ))]
-pub(crate) unsafe fn dot_f16_batch_16_amx(query: &[f16], candidates: &[&[f16]; 16]) -> [f32; 16] {
-    use std::cell::RefCell;
-    thread_local! {
-        static SCRATCH: RefCell<Vec<f16>> = const { RefCell::new(Vec::new()) };
-    }
+pub(crate) unsafe fn dot_f16_batch_16_amx(
+    query: &[f16],
+    candidates: &[&[f16]; 16],
+    len: usize,
+) -> [f32; 16] {
+    debug_assert!((1..=16).contains(&len), "len ({len}) must be in 1..=16");
     let dim = query.len();
-    SCRATCH.with(|cell| {
-        let mut gathered = cell.borrow_mut();
-        gathered.clear();
-        gathered.reserve(16 * dim);
-        for (i, cand) in candidates.iter().enumerate() {
-            debug_assert_eq!(
-                cand.len(),
-                dim,
-                "candidate {i} length must equal query length"
-            );
-            gathered.extend_from_slice(cand);
-        }
-        let mut out = [0f32; 16];
-        // half::f16 is #[repr(transparent)] over u16, so the pointer casts below
-        // reinterpret the identical IEEE binary16 bit patterns the kernel expects.
-        unsafe {
-            lance_amx_dot_f16_batch_16(
-                query.as_ptr() as *const u16,
-                gathered.as_ptr() as *const u16,
-                dim,
-                dim, // stride: rows packed tightly at `dim` halfwords
-                out.as_mut_ptr(),
-            );
-        }
-        out
-    })
+    // half::f16 is #[repr(transparent)] over u16, so the casts below reinterpret
+    // the identical IEEE binary16 bit patterns the kernel expects. All 16 slots
+    // are filled even though the kernel reads only `len` of them: the caller
+    // already holds 16 valid slices, so there is nothing to gain from leaving
+    // the tail of the array undefined.
+    let mut rows = [std::ptr::null::<u16>(); 16];
+    for (i, cand) in candidates.iter().enumerate() {
+        debug_assert_eq!(
+            cand.len(),
+            dim,
+            "candidate {i} length must equal query length"
+        );
+        rows[i] = cand.as_ptr() as *const u16;
+    }
+    let mut out = [0f32; 16];
+    unsafe {
+        lance_amx_dot_f16_batch_16(
+            query.as_ptr() as *const u16,
+            rows.as_ptr(),
+            len,
+            dim,
+            out.as_mut_ptr(),
+        );
+    }
+    out
 }

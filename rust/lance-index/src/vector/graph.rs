@@ -278,6 +278,65 @@ fn process_neighbors_with_look_ahead<F>(
     }
 }
 
+/// Smallest remainder that is worth padding up to 16 and sending through
+/// `distance_batch_16` rather than draining with scalar `distance()` calls.
+/// Overridable with `LANCE_HNSW_BATCH_PAD_MIN`; read once, this is hot-path.
+///
+/// Padding costs a tile pass over 16 rows whatever the batch holds, so the
+/// threshold is where that pass starts beating `k` scalar distance calls — which
+/// depends on how fast the build's scalar f16 kernel is, and is why this is
+/// tunable rather than a constant.
+///
+/// 3 is the default: it is the crossover for a build whose scalar f16 kernel the
+/// compiler leaves unvectorized, which is the case this batching exists to help.
+/// A build with a faster scalar kernel wants a higher value.
+///
+/// Measured end to end rather than in a microbenchmark, because the two disagree.
+/// A single-threaded microbenchmark on an idle machine puts the crossover at
+/// k = 1 for every configuration, since there a padded call's extra memory
+/// traffic is free. Under saturation it is not: on 100M x 1024, 32 physical cores
+/// at 97% utilisation, three rotated rounds, dropping the threshold from 3 to 1
+/// measured 0.999x on the unvectorized build (intervals overlapping) and 0.954x
+/// on a build whose scalar kernel is vectorized (intervals separated). The extra
+/// distances a lower threshold computes have to contend with every other query
+/// for the same cores.
+pub(crate) fn batch16_pad_min() -> usize {
+    static PAD_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAD_MIN.get_or_init(|| {
+        std::env::var("LANCE_HNSW_BATCH_PAD_MIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            // 0 would pad every single-neighbor remainder; 17+ would disable
+            // padding entirely. Both are legitimate as experiments, so only the
+            // unparseable case falls back.
+            .map(|v| v.min(17))
+            .unwrap_or(3)
+    })
+}
+
+/// Whether the fused-kernel arm of `beam_search_loop` lets its 16-wide neighbor
+/// buffer carry across popped nodes (`LANCE_HNSW_BATCH_SPAN=1`) instead of
+/// emptying it at the end of each node.
+///
+/// Off by default: spanning **changes search results**, because a neighbor found
+/// while visiting one node may not reach the candidate heap until after a later
+/// node has been popped, which reorders the traversal. With it off the batched
+/// arm stays equivalent to the unbatched one.
+///
+/// It exists because a per-node buffer is usually far from full — in
+/// steady-state beam search most of a node's neighbors are already visited — so
+/// spanning is what actually keeps the fused kernel fed. Read once; this sits on
+/// the search hot path.
+pub(crate) fn batch16_spans_nodes() -> bool {
+    static SPAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SPAN.get_or_init(|| {
+        matches!(
+            std::env::var("LANCE_HNSW_BATCH_SPAN").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 #[inline]
 fn furthest_distance(results: &BinaryHeap<OrderedNode>) -> OrderedFloat {
     results
@@ -306,10 +365,20 @@ pub(crate) static BEAM_BATCH16_FLUSHES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Test-only instrumentation companion to [`BEAM_BATCH16_FLUSHES`]: number of
-/// non-empty `< 16` remainder drains (the scalar tail). Confirms the remainder
-/// path is exercised, not just the full-batch path.
+/// non-empty sub-threshold remainder drains (the scalar tail). Confirms the
+/// remainder path is exercised, not just the full-batch path.
 #[cfg(test)]
 pub(crate) static BEAM_BATCH16_DRAINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only instrumentation: number of remainders that were padded up to 16 and
+/// sent through [`DistCalculator::distance_batch_16`] instead of drained scalar.
+/// In steady-state beam search most of a node's neighbors are already visited, so
+/// this is the path that carries the bulk of the fused-kernel work; a run where
+/// this stays 0 while [`BEAM_BATCH16_FLUSHES`] is small means the accelerated
+/// kernel is barely being used.
+#[cfg(test)]
+pub(crate) static BEAM_BATCH16_PADDED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Gate for the two counters above. Off by default: the counter `fetch_add`s are
@@ -350,6 +419,72 @@ fn apply_neighbor(
     }
 }
 
+/// Evaluate `len` buffered neighbors in one `distance_batch_16` call and apply
+/// them.
+///
+/// `len` is passed through, so a partial batch only gathers `len` rows: one tile
+/// pass costs the same for 3 useful lanes as for 16, but the gather scales with
+/// the rows staged.
+///
+/// **STALE — measured on the pre-`count` kernel**, which staged all 16 rows
+/// however small the batch. On Granite Rapids at dim=768 (gcc-13.4, scattered
+/// ids), one padded call against `len` scalar `distance()` calls: len=1 1.13x,
+/// len=2 0.88x, len=3 1.98x, len=4 2.30x, len=8 3.40x, len=16 5.70x. Passing
+/// `len` through is precisely what those small-`len` ratios were paying for, so
+/// they need re-measuring end to end.
+///
+/// The slots past `len` are still filled with `ids[0]` rather than left stale:
+/// the sixteen ids need not be distinct -- a calculator resolves each
+/// independently (`get_vector(ids[i])`), so a repeat merely recomputes that row
+/// -- which keeps an implementation that ignores `len` correct instead of
+/// letting it read a `u32` from an earlier flush.
+///
+/// Each neighbor is applied against the `furthest` snapshot taken when it was
+/// *discovered*, not one read at flush time, because the unbatched loop tests a
+/// neighbor against the threshold current at its parent's pop.
+macro_rules! flush_batch16 {
+    ($candidates:ident, $results:ident, $k:expr, $dist_calc:expr, $accepts_result:expr,
+     $batch_ids:ident, $batch_furthest:ident, $batch_len:ident) => {{
+        debug_assert!($batch_len > 0 && $batch_len <= 16);
+        let mut padded = $batch_ids;
+        for slot in padded.iter_mut().skip($batch_len) {
+            *slot = $batch_ids[0];
+        }
+        let mut batch_dists = [0f32; 16];
+        $dist_calc.distance_batch_16(&padded, &mut batch_dists, $batch_len);
+        #[cfg(test)]
+        if $crate::vector::graph::BEAM_BATCH16_COUNT_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if $batch_len == 16 {
+                $crate::vector::graph::BEAM_BATCH16_FLUSHES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                $crate::vector::graph::BEAM_BATCH16_PADDED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        for i in 0..$batch_len {
+            apply_neighbor(
+                &mut $candidates,
+                &mut $results,
+                $k,
+                $batch_furthest[i],
+                &$accepts_result,
+                $batch_ids[i],
+                batch_dists[i].into(),
+            );
+        }
+        // Emptied here rather than by each caller so the macro cannot leave a
+        // stale length behind. One caller — the final flush just before the
+        // traversal `break`s — never reads it again, hence the allow.
+        #[allow(unused_assignments)]
+        {
+            $batch_len = 0;
+        }
+    }};
+}
+
 macro_rules! beam_search_loop {
     (
         $candidates:ident,
@@ -368,11 +503,58 @@ macro_rules! beam_search_loop {
         // original traversal, so they are untouched by this path.
         let use_batch16 = $dist_calc.has_batch_16_kernel();
 
-        while !$candidates.is_empty() {
+        // Opt-in via `LANCE_HNSW_BATCH_SPAN=1`: let the 16-wide buffer carry
+        // across popped nodes instead of being emptied at the end of each one.
+        //
+        // Off by default because it CHANGES RESULTS. A neighbor discovered while
+        // visiting node A may not reach `candidates` until after node B has been
+        // popped, so the traversal order differs from the unbatched loop and
+        // recall shifts rather than matching it exactly. With it off, the buffer
+        // is emptied before the next pop and the arm stays equivalent.
+        //
+        // Worth having because the buffer is per popped node, and in steady-state
+        // beam search most of a node's neighbors are already visited: a per-node
+        // buffer rarely reaches 16, so without spanning most distance work goes
+        // out through the (much smaller) remainder flushes.
+        let span_nodes = use_batch16 && $crate::vector::graph::batch16_spans_nodes();
+        // Read once per search rather than per node: `batch16_pad_min` is behind a
+        // OnceLock, but the call still costs an atomic load.
+        let pad_min = $crate::vector::graph::batch16_pad_min();
+
+        // Buffer state lives outside the loop so that it *can* span nodes. When
+        // `span_nodes` is false it is drained before the next pop, which makes it
+        // behave exactly like a buffer scoped to one node.
+        let mut batch_ids = [0u32; 16];
+        let mut batch_furthest = [OrderedFloat(0.0f32); 16];
+        let mut batch_len = 0usize;
+
+        loop {
+            if $candidates.is_empty() {
+                // Spanning can leave discovered-but-unevaluated neighbors behind,
+                // and their distances may still add candidates, so flush and
+                // re-test instead of exiting on an empty heap.
+                if batch_len == 0 {
+                    break;
+                }
+                flush_batch16!(
+                    $candidates, $results, $k, $dist_calc, $accepts_result,
+                    batch_ids, batch_furthest, batch_len
+                );
+                continue;
+            }
+
             let $current = $candidates.pop().expect("candidates is empty").0;
             let furthest = furthest_distance(&$results);
 
             if $current.dist > furthest && $results.len() == $k {
+                // Don't discard work already discovered: evaluate it so it can
+                // still enter `results`, then stop traversing.
+                if batch_len > 0 {
+                    flush_batch16!(
+                        $candidates, $results, $k, $dist_calc, $accepts_result,
+                        batch_ids, batch_furthest, batch_len
+                    );
+                }
                 break;
             }
 
@@ -385,65 +567,57 @@ macro_rules! beam_search_loop {
                 // exactly where the scalar loop marks it; only the distance
                 // computation and its accept/push consequences are deferred to the
                 // flush.
-                let mut batch_ids = [0u32; 16];
-                let mut batch_len = 0usize;
-
                 let $process_neighbor = |neighbor: u32| {
                     if $visited.contains(neighbor) {
                         return;
                     }
                     $visited.insert(neighbor);
                     batch_ids[batch_len] = neighbor;
+                    batch_furthest[batch_len] = furthest;
                     batch_len += 1;
                     if batch_len == 16 {
-                        let mut batch_dists = [0f32; 16];
-                        $dist_calc.distance_batch_16(&batch_ids, &mut batch_dists);
-                        #[cfg(test)]
-                        if $crate::vector::graph::BEAM_BATCH16_COUNT_ENABLED
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            $crate::vector::graph::BEAM_BATCH16_FLUSHES
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        for i in 0..16 {
-                            apply_neighbor(
-                                &mut $candidates,
-                                &mut $results,
-                                $k,
-                                furthest,
-                                &$accepts_result,
-                                batch_ids[i],
-                                batch_dists[i].into(),
-                            );
-                        }
-                        batch_len = 0;
+                        flush_batch16!(
+                            $candidates, $results, $k, $dist_calc, $accepts_result,
+                            batch_ids, batch_furthest, batch_len
+                        );
                     }
                 };
                 $visit_neighbors
 
-                // Drain the < 16 remainder with scalar `distance` calls (FAISS's
-                // tail loop). `distance_batch_16` needs exactly 16 valid ids, so a
-                // partial buffer cannot use it without padding with bogus ids.
-                #[cfg(test)]
-                if batch_len > 0
-                    && $crate::vector::graph::BEAM_BATCH16_COUNT_ENABLED
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    $crate::vector::graph::BEAM_BATCH16_DRAINS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                for i in 0..batch_len {
-                    let neighbor = batch_ids[i];
-                    let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
-                    apply_neighbor(
-                        &mut $candidates,
-                        &mut $results,
-                        $k,
-                        furthest,
-                        &$accepts_result,
-                        neighbor,
-                        dist,
-                    );
+                if !span_nodes && batch_len > 0 {
+                    // Remainder for this node. Padding to 16 beats the scalar tail
+                    // above a crossover that depends on how fast the scalar f16
+                    // kernel is, i.e. on which compiler built it — see
+                    // `batch16_pad_min`. Below the crossover the gather is not
+                    // amortised, so keep the scalar drain.
+                    if batch_len >= pad_min {
+                        flush_batch16!(
+                            $candidates, $results, $k, $dist_calc, $accepts_result,
+                            batch_ids, batch_furthest, batch_len
+                        );
+                    } else {
+                        #[cfg(test)]
+                        if $crate::vector::graph::BEAM_BATCH16_COUNT_ENABLED
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            $crate::vector::graph::BEAM_BATCH16_DRAINS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        for i in 0..batch_len {
+                            let neighbor = batch_ids[i];
+                            let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
+                            apply_neighbor(
+                                &mut $candidates,
+                                &mut $results,
+                                $k,
+                                batch_furthest[i],
+                                &$accepts_result,
+                                neighbor,
+                                dist,
+                            );
+                        }
+                        batch_len = 0;
+                    }
                 }
             } else {
                 // The pre-batching traversal, unchanged: evaluate each freshly

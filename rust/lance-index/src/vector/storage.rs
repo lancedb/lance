@@ -83,15 +83,27 @@ pub trait DistCalculator {
         false
     }
 
-    /// Compute distances for a batch of exactly 16 ids in one call, writing
-    /// `dists[i]` for `ids[i]`.
+    /// Compute distances for the first `len` of 16 ids in one call, writing
+    /// `dists[i]` for `ids[i]`. `len` must be in `1..=16`.
     ///
-    /// The default implementation issues 16 individual [`Self::distance`] calls,
-    /// so every backend is correct with no behavior change. Backends with a
-    /// batched distance kernel override this to compute all 16 in a single
+    /// `len` controls only *how many distances are computed*. It does not relax
+    /// the requirement on `ids`: **every element of `ids` must be a valid id**,
+    /// including the slots at or after `len`. Implementations are free to
+    /// resolve all 16 before looking at `len` — the flat fp16 override does
+    /// exactly that, and an out-of-range id there panics — so a caller with
+    /// fewer than 16 real ids must fill the rest with some valid id (repeating
+    /// `ids[0]` is what HNSW's `flush_batch16!` does) rather than leaving them
+    /// arbitrary.
+    ///
+    /// Only `dists[..len]` is written; the rest is left as the caller had it.
+    ///
+    /// The default implementation issues `len` individual [`Self::distance`]
+    /// calls, so every backend is correct with no behavior change. Backends with
+    /// a batched distance kernel override this to compute all `len` in a single
     /// fused pass.
-    fn distance_batch_16(&self, ids: &[u32; 16], dists: &mut [f32; 16]) {
-        for (dist, &id) in dists.iter_mut().zip(ids.iter()) {
+    fn distance_batch_16(&self, ids: &[u32; 16], dists: &mut [f32; 16], len: usize) {
+        debug_assert!((1..=16).contains(&len), "len ({len}) must be in 1..=16");
+        for (dist, &id) in dists.iter_mut().zip(ids.iter()).take(len) {
             *dist = self.distance(id);
         }
     }
