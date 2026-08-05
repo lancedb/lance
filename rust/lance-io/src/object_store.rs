@@ -286,6 +286,12 @@ impl ObjectStoreParams {
     }
 }
 
+fn wrapper_allocation_ptr(wrapper: &Arc<dyn WrappingObjectStore>) -> *const () {
+    // Trait object pointers include vtable metadata, which is not stable across codegen units.
+    // Cache identity must follow the Arc allocation instead.
+    Arc::as_ptr(wrapper) as *const ()
+}
+
 // We implement hash for caching
 impl std::hash::Hash for ObjectStoreParams {
     #[allow(deprecated)]
@@ -302,7 +308,7 @@ impl std::hash::Hash for ObjectStoreParams {
             Arc::as_ptr(aws_credentials).hash(state);
         }
         if let Some(wrapper) = &self.object_store_wrapper {
-            Arc::as_ptr(wrapper).hash(state);
+            wrapper_allocation_ptr(wrapper).hash(state);
         }
         if let Some(accessor) = &self.storage_options_accessor {
             accessor.accessor_id().hash(state);
@@ -334,8 +340,14 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
-                == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
+            && self
+                .object_store_wrapper
+                .as_ref()
+                .map(wrapper_allocation_ptr)
+                == other
+                    .object_store_wrapper
+                    .as_ref()
+                    .map(wrapper_allocation_ptr)
             && self
                 .storage_options_accessor
                 .as_ref()
@@ -488,12 +500,15 @@ impl ObjectStore {
             let mut inner = store.clone();
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
+
+            let mut io_tracker = IOTracker::default();
+            meter_store(&mut inner, &mut io_tracker, &store_prefix);
+
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
             }
 
             // Always wrap with IO tracking
-            let io_tracker = IOTracker::default();
             let tracked_store = io_tracker.wrap("", inner);
 
             let store = Self {
@@ -847,7 +862,10 @@ impl ObjectStore {
     ) -> Result<()> {
         if self.is_local() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
-            return super::local::copy_file(from, to);
+            let metrics = self.io_tracker.begin_io("copy");
+            let result = super::local::copy_file(from, to);
+            metrics.record(&result, 0);
+            return result;
         }
         if multipart_copy_fallback {
             // Reuse the reader for both the size lookup (a single cached HEAD)
@@ -911,7 +929,12 @@ impl ObjectStore {
 
         if self.is_local() {
             // The local file system provider needs to delete both files and directories.
-            return super::local::remove_dir_all(&path);
+            // Counted as a single delete request, matching how `delete_stream`
+            // counts one batched request regardless of how many paths it removes.
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = super::local::remove_dir_all(&path);
+            metrics.record(&result, 0);
+            return result;
         }
         let sub_entries = self
             .inner
@@ -1109,7 +1132,7 @@ static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
 impl ObjectStore {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store: Arc<DynObjectStore>,
+        mut store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -1134,13 +1157,15 @@ impl ObjectStore {
                 store_prefix
             }
         };
+        let mut io_tracker = IOTracker::default();
+        meter_store(&mut store, &mut io_tracker, &store_prefix);
+
         let store = match wrapper {
             Some(wrapper) => wrapper.wrap(&store_prefix, store),
             None => store,
         };
 
         // Always wrap with IO tracking
-        let io_tracker = IOTracker::default();
         let tracked_store = io_tracker.wrap("", store);
 
         Self {
@@ -1156,6 +1181,29 @@ impl ObjectStore {
             store_prefix,
         }
     }
+}
+
+/// Wrap `inner` so its operations publish metrics labelled by `store_prefix`,
+/// and label `io_tracker` with the same prefix so the local reads and writes
+/// that bypass `inner` publish under it too.
+///
+/// The two go together on purpose: a store metered on one path but not the other
+/// would report a partial picture that reads like a complete one. Every
+/// constructor that hands an [`ObjectStore`] to a caller must route its `inner`
+/// through here, or through nothing at all.
+#[cfg(feature = "metrics")]
+fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, store_prefix: &str) {
+    use crate::object_store::metrics::ObjectStoreMetricsExt;
+    io_tracker.set_metrics_base(store_prefix);
+    *inner = inner.clone().metered(store_prefix.to_owned());
+}
+
+#[cfg(not(feature = "metrics"))]
+fn meter_store(
+    _inner: &mut Arc<dyn OSObjectStore>,
+    _io_tracker: &mut IOTracker,
+    _store_prefix: &str,
+) {
 }
 
 fn infer_block_size(scheme: &str) -> usize {
@@ -1459,6 +1507,37 @@ mod tests {
         fn called(&self) -> bool {
             self.called.load(Ordering::Relaxed)
         }
+    }
+
+    #[tokio::test]
+    async fn test_wrapper_identity_is_stable_across_tasks() {
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: Arc::new(InMemory::new()),
+        });
+        let initial_params = ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            ..ObjectStoreParams::default()
+        };
+        let task_params = tokio::spawn(async move {
+            ObjectStoreParams {
+                object_store_wrapper: Some(wrapper),
+                ..ObjectStoreParams::default()
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(initial_params, task_params);
+
+        let mut initial_hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&initial_params, &mut initial_hasher);
+        let mut task_hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&task_params, &mut task_hasher);
+        assert_eq!(
+            std::hash::Hasher::finish(&initial_hasher),
+            std::hash::Hasher::finish(&task_hasher)
+        );
     }
 
     #[tokio::test]

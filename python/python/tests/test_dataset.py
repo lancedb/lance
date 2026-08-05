@@ -3,6 +3,7 @@
 
 import base64
 import contextlib
+import importlib
 import os
 import pickle
 import platform
@@ -12,7 +13,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from unittest import mock
 
 import lance
@@ -28,15 +29,23 @@ import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
-from lance.commit import CommitConflictError
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
 
+BaseModel = pytest.importorskip("pydantic").BaseModel
+
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
+
+
+class _InputModel(BaseModel):
+    a: float
+    b: int
+
+
 input_data = [
     # (schema, data)
     (None, pa.table({"a": [1.0, 2.0], "b": [20, 30]})),
@@ -59,6 +68,8 @@ input_data = [
             ).to_batches()
         ),
     ),
+    # Pydantic model instances are auto-converted
+    (None, [_InputModel(a=1.0, b=20), _InputModel(a=2.0, b=30)]),
 ]
 
 
@@ -66,7 +77,138 @@ input_data = [
 def test_input_data(tmp_path: Path, schema, data):
     base_dir = tmp_path / "test"
     dataset = lance.write_dataset(data, base_dir, schema=schema)
-    assert dataset.to_table() == input_data[0][1]
+    expected = input_data[0][1]
+    # Pydantic model instances derive their schema from the model class, so
+    # required (non-Optional) fields are correctly non-nullable -- stricter
+    # than, but castable to, the nullable reference schema below.
+    assert dataset.to_table().cast(expected.schema) == expected
+
+
+def test_from_pydantic_model(tmp_path: Path):
+    class UserRecord(BaseModel):
+        name: str
+        score: float
+
+    data = [UserRecord(name="alice", score=0.9), UserRecord(name="bob", score=0.8)]
+    uri = str(tmp_path / "user_record")
+    ds = lance.LanceDataset.from_pydantic_model(UserRecord, data, uri=uri)
+
+    table = ds.to_table()
+    assert table.num_rows == 2
+    assert table.schema.names == ["name", "score"]
+    assert table.column("name").to_pylist() == ["alice", "bob"]
+    assert table.column("score").to_pylist() == [0.9, 0.8]
+
+
+def test_from_pydantic_model_rejects_non_model_class(tmp_path: Path):
+    uri = str(tmp_path / "not_a_model")
+    with pytest.raises(TypeError, match="BaseModel subclass"):
+        lance.LanceDataset.from_pydantic_model(dict, [{"a": 1}], uri=uri)
+
+
+class _OtherRecord(BaseModel):
+    x: int
+
+
+@pytest.mark.parametrize(
+    "bad_item",
+    [{"name": "eve", "score": 1.0}, _OtherRecord(x=1)],
+    ids=["dict", "different_model"],
+)
+def test_from_pydantic_model_rejects_invalid_item(tmp_path: Path, bad_item):
+    """A dict or an instance of a different model slipped into `data` must be
+    rejected up front with the offending index, rather than either reaching
+    model_to_dict() and raising an opaque AttributeError (dict case) or being
+    silently serialized against the first item's schema (different-model
+    case)."""
+
+    class UserRecord(BaseModel):
+        name: str
+        score: float
+
+    data = [UserRecord(name="alice", score=0.9), bad_item]
+    uri = str(tmp_path / "invalid_item")
+    with pytest.raises(TypeError, match=r"data\[1\]"):
+        lance.LanceDataset.from_pydantic_model(UserRecord, data, uri=uri)
+
+
+@pytest.mark.parametrize(
+    "bad_item",
+    [{"name": "eve"}, _OtherRecord(x=1)],
+    ids=["dict", "different_model"],
+)
+def test_write_dataset_pydantic_list_rejects_invalid_item(tmp_path: Path, bad_item):
+    """Same guard as from_pydantic_model(), but via the plain write_dataset()
+    entry point (the _coerce_reader() Pydantic branch in types.py)."""
+
+    class Record(BaseModel):
+        name: str
+
+    data = [Record(name="alice"), bad_item]
+    uri = str(tmp_path / "invalid_item_write_dataset")
+    with pytest.raises(TypeError, match=r"data\[1\]"):
+        lance.write_dataset(data, uri)
+
+
+def test_from_pydantic_model_rejects_non_list_data(tmp_path: Path):
+    """A generator (or other non-list iterable) must be rejected up front --
+    otherwise it gets drained by item validation and the caller silently
+    writes a 0-row table instead of getting an error."""
+
+    class Record(BaseModel):
+        name: str
+
+    data = (Record(name=n) for n in ["alice", "bob"])
+    uri = str(tmp_path / "generator_input")
+    with pytest.raises(TypeError, match="must be provided as a list"):
+        lance.LanceDataset.from_pydantic_model(Record, data, uri=uri)
+
+
+class _RecordSubclass(_OtherRecord):
+    y: int = 0
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    ["from_pydantic_model", "write_dataset"],
+)
+def test_pydantic_list_rejects_subclass_instance(tmp_path: Path, entry_point):
+    """A subclass instance must not be accepted in place of the exact model
+    class: the schema is derived from the declared model class, but a
+    subclass instance may carry extra/overridden fields that model_to_dict()
+    would then try to serialize against that schema."""
+
+    data = [_OtherRecord(x=1), _RecordSubclass(x=2, y=3)]
+    uri = str(tmp_path / f"subclass_rejected_{entry_point}")
+    with pytest.raises(TypeError, match=r"data\[1\].*exactly"):
+        if entry_point == "from_pydantic_model":
+            lance.LanceDataset.from_pydantic_model(_OtherRecord, data, uri=uri)
+        else:
+            lance.write_dataset(data, uri)
+
+
+def test_write_dataset_pydantic_optional_field_typed_correctly_when_all_none(
+    tmp_path: Path,
+):
+    """Regression test: passing a list of Pydantic instances directly to
+    write_dataset() (not via from_pydantic_model()) must still derive the
+    schema from the model class, not from the batch's row data -- otherwise
+    an Optional field that happens to be None for every row in the batch
+    gets typed as Arrow's literal null type instead of its real type."""
+
+    class Record(BaseModel):
+        name: str
+        tag: Optional[str] = None
+
+    data = [Record(name="alice"), Record(name="bob")]
+    uri = str(tmp_path / "all_none_optional")
+    dataset = lance.write_dataset(data, uri)
+
+    assert dataset.schema.field("tag").type == pa.string()
+    assert dataset.schema.field("tag").nullable is True
+
+    dataset.insert([Record(name="carol", tag="vip")])
+    assert dataset.to_table().column("tag").to_pylist() == [None, None, "vip"]
 
 
 def test_roundtrip_types(tmp_path: Path):
@@ -2867,6 +3009,42 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     check_merge_stats(merge_dict, (0, 350, 0))
 
 
+def test_indexed_merge_insert_deduplicates_cross_batch_candidates(tmp_path: Path):
+    target = pa.table(
+        {
+            "a": [1, 1, 2, 2],
+            "b": [10, 20, 10, 20],
+            "value": [110, 120, 210, 220],
+        }
+    )
+    dataset = lance.write_dataset(target, tmp_path / "dataset")
+    dataset.create_scalar_index("a", "BTREE")
+    dataset.create_scalar_index("b", "BTREE")
+
+    first = pa.RecordBatch.from_pydict(
+        {"a": [1], "b": [10], "value": [901]}, schema=target.schema
+    )
+    # The per-column index probe for this batch also reaches (1, 10), which
+    # was already emitted for the first batch. The exact join filters that
+    # over-match, but the indexed scan must not read the target row twice.
+    second = pa.RecordBatch.from_pydict(
+        {"a": [1, 2], "b": [20, 10], "value": [902, 903]},
+        schema=target.schema,
+    )
+    source = pa.RecordBatchReader.from_batches(target.schema, [first, second])
+
+    stats = dataset.merge_insert(["a", "b"]).when_matched_update_all().execute(source)
+
+    check_merge_stats(stats, (0, 3, 0))
+    assert (
+        dataset.to_table().sort_by([("a", "ascending"), ("b", "ascending")]).to_pydict()
+    ) == {
+        "a": [1, 1, 2, 2],
+        "b": [10, 20, 10, 20],
+        "value": [901, 902, 903, 220],
+    }
+
+
 def test_merge_insert_vector_column(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
@@ -4226,10 +4404,14 @@ def test_custom_commit_lock(tmp_path: Path):
         lance.write_dataset(
             pa.table({"a": range(100)}), tmp_path / "test2", commit_lock=commit_lock
         )
+    assert lance.dataset(tmp_path / "test2").count_rows() == 100
+
+    # Import only after the generic error case to verify users need not import it first.
+    commit_module = importlib.import_module("lance.commit")
 
     @contextlib.contextmanager
     def commit_lock(_version: int):
-        raise CommitConflictError()
+        raise commit_module.CommitConflictError()
 
     with pytest.raises(Exception, match="CommitConflictError"):
         lance.write_dataset(

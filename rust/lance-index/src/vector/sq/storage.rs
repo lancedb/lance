@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use lance_arrow::ArrowFloatType;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::{DistanceType, dot_u8::dot_u8, l2_u8::l2_u8};
 use lance_table::format::SelfDescribingFileReader;
@@ -53,7 +53,7 @@ impl DeepSizeOf for ScalarQuantizationMetadata {
 
 #[async_trait]
 impl QuantizerMetadata for ScalarQuantizationMetadata {
-    async fn load(reader: &PreviousFileReader) -> Result<Self> {
+    async fn load(reader: &V1FileReader) -> Result<Self> {
         let metadata_str = reader
             .schema()
             .metadata
@@ -215,7 +215,7 @@ impl ScalarQuantizationStorage {
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let reader = PreviousFileReader::try_new_self_described(object_store, path, None).await?;
+        let reader = V1FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema
@@ -292,7 +292,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
     /// - *metric_type: metric type of the vectors
     /// - *metadata: scalar quantization metadata
     async fn load_partition(
-        reader: &PreviousFileReader,
+        reader: &V1FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,

@@ -695,15 +695,39 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 write_version_hint(object_store, base_path, manifest.version).await;
                 Ok(location)
             }
-            Err(_) => {
-                // delete the staging manifest
-                match object_store.inner.delete(&staging_path).await {
-                    Ok(_) => {}
-                    Err(ObjectStoreError::NotFound { .. }) => {}
-                    Err(e) => return Err(CommitError::OtherError(e.into())),
+            Err(error) => {
+                // A different recorded path proves this staging manifest lost
+                // the version and is safe to remove. Otherwise, the external
+                // store may have recorded our staging path before its response
+                // was lost, so retain it for outcome verification/finalization.
+                let recorded_location = self
+                    .external_manifest_store
+                    .get_manifest_location(base_path.as_ref(), manifest.version)
+                    .await;
+                if matches!(
+                    &recorded_location,
+                    Ok(location) if location.path != staging_path
+                ) {
+                    match object_store.inner.delete(&staging_path).await {
+                        Ok(()) => {
+                            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
+                        }
+                        Err(ObjectStoreError::NotFound { .. }) => {}
+                        Err(delete_error) => {
+                            warn!(
+                                "Failed to delete losing staging manifest '{}': {}",
+                                staging_path, delete_error
+                            );
+                        }
+                    }
+                    return Err(CommitError::CommitConflict);
                 }
-                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
-                Err(CommitError::CommitConflict {})
+                warn!(
+                    "External manifest commit for version {} failed; retaining staging manifest \
+                     '{}' until the commit outcome is resolved: {}",
+                    manifest.version, staging_path, error
+                );
+                Err(CommitError::CommitConflict)
             }
         }
     }
@@ -712,5 +736,184 @@ impl CommitHandler for ExternalManifestCommitHandler {
         self.external_manifest_store
             .delete(base_path.as_ref())
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
+    use super::*;
+    use crate::format::DataStorageFormat;
+    use crate::io::commit::write_manifest_file_to_path;
+
+    #[derive(Debug, Clone)]
+    struct StoredManifest {
+        path: String,
+        size: u64,
+        e_tag: Option<String>,
+    }
+
+    #[derive(Debug)]
+    struct LostPutResponseStore {
+        manifests: Mutex<HashMap<(String, u64), StoredManifest>>,
+        fail_next_put_response: AtomicBool,
+    }
+
+    impl Default for LostPutResponseStore {
+        fn default() -> Self {
+            Self {
+                manifests: Mutex::new(HashMap::new()),
+                fail_next_put_response: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExternalManifestStore for LostPutResponseStore {
+        async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
+            self.manifests
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .map(|manifest| manifest.path.clone())
+                .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))
+        }
+
+        async fn get_manifest_location(
+            &self,
+            base_uri: &str,
+            version: u64,
+        ) -> Result<ManifestLocation> {
+            let stored = self
+                .manifests
+                .lock()
+                .unwrap()
+                .get(&(base_uri.to_string(), version))
+                .cloned()
+                .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))?;
+            let path = Path::from(stored.path);
+            Ok(ManifestLocation {
+                version,
+                naming_scheme: detect_naming_scheme_from_path(&path)?,
+                path,
+                size: Some(stored.size),
+                e_tag: stored.e_tag,
+            })
+        }
+
+        async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
+            Ok(self
+                .manifests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((stored_base, _), _)| stored_base == base_uri)
+                .max_by_key(|((_, version), _)| *version)
+                .map(|((_, version), manifest)| (*version, manifest.path.clone())))
+        }
+
+        async fn put_if_not_exists(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            e_tag: Option<String>,
+        ) -> Result<()> {
+            let key = (base_uri.to_string(), version);
+            let mut manifests = self.manifests.lock().unwrap();
+            if manifests.contains_key(&key) {
+                return Err(Error::commit_conflict_source(
+                    version,
+                    "manifest already exists".to_string().into(),
+                ));
+            }
+            manifests.insert(
+                key,
+                StoredManifest {
+                    path: path.to_string(),
+                    size,
+                    e_tag,
+                },
+            );
+            drop(manifests);
+            if self.fail_next_put_response.swap(false, Ordering::SeqCst) {
+                Err(Error::io("simulated lost external-store response"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn put_if_exists(
+            &self,
+            base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            e_tag: Option<String>,
+        ) -> Result<()> {
+            let key = (base_uri.to_string(), version);
+            let mut manifests = self.manifests.lock().unwrap();
+            let manifest = manifests
+                .get_mut(&key)
+                .ok_or_else(|| Error::not_found(format!("{base_uri}@{version}")))?;
+            *manifest = StoredManifest {
+                path: path.to_string(),
+                size,
+                e_tag,
+            };
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lost_external_store_response_retains_staging_manifest() {
+        let external_store = Arc::new(LostPutResponseStore::default());
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable)),
+            HashMap::new(),
+        );
+
+        let commit_error = handler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .expect_err("the simulated response loss must be surfaced");
+        assert!(matches!(commit_error, CommitError::CommitConflict));
+
+        let staging_path = Path::from(external_store.get("dataset", 1).await.unwrap());
+        object_store.inner.head(&staging_path).await.unwrap();
+
+        let resolved = handler
+            .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
+            .await
+            .expect("the retained staging manifest must allow finalization");
+        assert_eq!(
+            resolved.path,
+            ManifestNamingScheme::V2.manifest_path(&base_path, 1)
+        );
+        object_store.inner.head(&resolved.path).await.unwrap();
     }
 }

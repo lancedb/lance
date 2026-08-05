@@ -23,6 +23,7 @@ from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
     BoostQuery,
+    DocumentGranularity,
     FullTextOperator,
     MatchQuery,
     MultiMatchQuery,
@@ -1689,6 +1690,136 @@ def test_fts_on_list(tmp_path):
     assert results.num_rows == 6
 
 
+@pytest.mark.parametrize(
+    "list_type",
+    [
+        pa.list_(pa.string()),
+        pa.list_(pa.large_string()),
+        pa.large_list(pa.string()),
+        pa.large_list(pa.large_string()),
+    ],
+)
+def test_fts_on_list_elements(tmp_path, list_type):
+    data = pa.table(
+        {
+            "id": pa.array([0, 1, 2]),
+            "tags": pa.array(
+                [
+                    ["alpha beta", "gamma alpha", None, "", "delta"],
+                    ["beta", "gamma"],
+                    None,
+                ],
+                type=list_type,
+            ),
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+
+    def hits(table):
+        return sorted(zip(table["id"].to_pylist(), table["_doc_index"].to_pylist()))
+
+    list_element = DocumentGranularity.LIST_ELEMENT
+    query = MatchQuery("alpha", "tags", document_granularity=list_element)
+    flat = ds.to_table(full_text_query=query)
+    assert hits(flat) == [(0, [0]), (0, [1])]
+    assert pa.types.is_list(flat.schema.field("_doc_index").type)
+    assert flat.schema.field("_doc_index").type.value_type == pa.uint32()
+    assert hits(
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "delta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [4])]
+
+    ds.create_scalar_index(
+        "tags",
+        "INVERTED",
+        with_position=True,
+        document_granularity=list_element,
+    )
+    ds.create_scalar_index(
+        "tags",
+        IndexConfig(index_type="inverted", parameters={"with_position": True}),
+        document_granularity=list_element,
+    )
+    inferred = ds.to_table(full_text_query=MatchQuery("alpha", "tags"))
+    assert hits(inferred) == [(0, [0]), (0, [1])]
+    with pytest.raises(ValueError, match=r"requested Row.*ListElement"):
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "alpha", "tags", document_granularity=DocumentGranularity.ROW
+            )
+        )
+
+    ds.create_scalar_index("tags", "INVERTED", with_position=True)
+    index_names = {index.name for index in ds.describe_indices()}
+    assert {"tags_idx", "tags_list_element_idx"}.issubset(index_names)
+    row_auto = ds.to_table(full_text_query="alpha")
+    assert row_auto["id"].to_pylist() == [0]
+    assert "_doc_index" not in row_auto.column_names
+    with pytest.raises(ValueError, match=r"ambiguous.*document_granularity"):
+        ds.to_table(full_text_query=MatchQuery("alpha", "tags"))
+    indexed = ds.to_table(full_text_query=query)
+    assert hits(indexed) == [(0, [0]), (0, [1])]
+    assert pa.types.is_list(indexed.schema.field("_doc_index").type)
+    assert indexed.schema.field("_doc_index").type.value_type == pa.uint32()
+    filtered = ds.to_table(full_text_query=query, filter="id = 0", prefilter=True)
+    assert hits(filtered) == [(0, [0]), (0, [1])]
+    assert hits(
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "delta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [4])]
+
+    phrase = ds.to_table(
+        full_text_query=PhraseQuery(
+            "beta gamma", "tags", document_granularity=list_element
+        )
+    )
+    assert phrase.num_rows == 0
+    assert hits(
+        ds.to_table(
+            full_text_query=PhraseQuery(
+                "alpha beta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [0])]
+    row_phrase = ds.to_table(
+        full_text_query=PhraseQuery(
+            "beta gamma",
+            "tags",
+            document_granularity=DocumentGranularity.ROW,
+        )
+    )
+    assert sorted(row_phrase["id"].to_pylist()) == [0, 1]
+    assert "_doc_index" not in row_phrase.column_names
+
+    ds.insert(
+        pa.table(
+            {
+                "id": pa.array([3]),
+                "tags": pa.array([["alpha", "alpha again"]], type=list_type),
+            }
+        )
+    )
+    assert hits(ds.to_table(full_text_query=query)) == [
+        (0, [0]),
+        (0, [1]),
+        (3, [0]),
+        (3, [1]),
+    ]
+
+    with pytest.raises(RuntimeError, match=r"tags\[\*\]"):
+        ds.create_scalar_index(
+            "tags[*]",
+            "INVERTED",
+            document_granularity=list_element,
+        )
+
+
 def test_fts_fuzzy_query(tmp_path):
     data = pa.table(
         {
@@ -2729,6 +2860,54 @@ def test_zonemap_index_remapping(tmp_path: Path):
     assert result.num_rows == 501  # 1000..1500 inclusive
 
 
+def test_zonemap_fsl_column(tmp_path: Path):
+    """Zone map can be created on a FixedSizeList column and accelerates IS NULL."""
+    dim = 8
+    n = 1000
+    rng = np.random.default_rng(42)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    vec_type = pa.list_(pa.float32(), dim)
+    # Every 10th row is null
+    vec_list = [None if i % 10 == 0 else v.tolist() for i, v in enumerate(vectors)]
+    tbl = pa.table({"vec": pa.array(vec_list, type=vec_type), "id": pa.array(range(n))})
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_scalar_index("vec", index_type="ZONEMAP")
+
+    scanner = ds.scanner(filter="vec IS NULL", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+    result = scanner.to_table()
+    assert result.num_rows == 100  # every 10th row is null
+
+
+def test_vector_and_zonemap_on_fsl_column(tmp_path: Path):
+    """Vector index and zone map can coexist on the same FSL column."""
+    dim = 16
+    n = 2000
+    rng = np.random.default_rng(0)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    vec_type = pa.list_(pa.float32(), dim)
+    # Every 20th row is null
+    vec_list = [None if i % 20 == 0 else v.tolist() for i, v in enumerate(vectors)]
+    tbl = pa.table({"vec": pa.array(vec_list, type=vec_type), "id": pa.array(range(n))})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    ds.create_index("vec", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2)
+    ds.create_scalar_index("vec", index_type="ZONEMAP")
+
+    # Vector search still works
+    query = vectors[5]
+    result = ds.scanner(nearest={"column": "vec", "q": query, "k": 10}).to_table()
+    assert result.num_rows == 10
+
+    # IS NULL is zone-map-accelerated
+    scanner = ds.scanner(filter="vec IS NULL", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+    null_result = scanner.to_table()
+    assert null_result.num_rows == 100  # every 20th row is null
+
+
 def test_bloomfilter_index(tmp_path: Path):
     """Test create bloomfilter index"""
     tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
@@ -3344,6 +3523,166 @@ def test_btree_prewarm(tmp_path: Path):
     ds.prewarm_index("id_idx")
     ds.scanner(scan_stats_callback=scan_stats_callback, filter="id>0").to_table()
     assert scan_stats.parts_loaded == 0
+
+
+def test_btree_index_cache_hit_miss_stats(tmp_path: Path):
+    """Cold scan reports index cache misses; warm scan reports hits.
+
+    ScanStatistics.index_cache_{hits,misses} are populated at page-level cache
+    boundaries. On a freshly-loaded dataset the BTree page fetch must be a
+    miss; a second scan against the same in-memory Dataset re-uses the cached
+    page and therefore reports a hit with zero misses.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"val": list(range(1000))})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("val", index_type="BTREE")
+
+    # Reopen so the session cache starts cold. A single-key point lookup on
+    # a small dataset resolves to exactly one BTree page, so cold/warm counts
+    # are deterministic 1/0 and 0/1.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(filter="val = 42", scan_stats_callback=scan_stats_callback).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses == 1
+    assert scan_stats.index_cache_hits == 0
+
+    # Same Dataset, warm cache — no new page loads, only hits.
+    ds.scanner(filter="val = 42", scan_stats_callback=scan_stats_callback).to_table()
+    assert scan_stats.index_cache_hits == 1
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_bitmap_index_cache_hit_miss_stats(tmp_path: Path):
+    """Bitmap Range/IN queries report cold misses and warm hits; a value
+    that is not in the index never reaches the loader and must not count.
+
+    Guards against the ``BitmapIndex::search`` regressions where the
+    ``Range`` / ``IsIn`` branches used to drop the ``MetricsCollector`` (so
+    every lookup was silently ``0/0``), and where an equality on a value
+    absent from ``index_map`` recorded a spurious miss before short-circuiting
+    to the empty result.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"color": ["red", "green", "blue", "yellow"] * 25})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("color", index_type="BITMAP")
+
+    # Reopen so the session cache starts cold.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        filter="color IN ('red', 'blue')", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses == 2
+    assert scan_stats.index_cache_hits == 0
+
+    ds.scanner(
+        filter="color IN ('red', 'blue')", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats.index_cache_hits == 2
+    assert scan_stats.index_cache_misses == 0
+
+    # A value that is not in the index short-circuits before the loader and
+    # must not touch either counter.
+    ds.scanner(
+        filter="color = 'purple'", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats.index_cache_hits == 0
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_phrase_query_cache_hit_miss_stats(tmp_path: Path):
+    """Phrase-query fallback populates ``PositionKey``; that boundary must
+    show up in per-query cache statistics.
+
+    Guards against ``read_positions`` silently using the non-metric
+    ``get_or_insert_with_key`` API — before this fix, a warm phrase query
+    would report zero hits for the phrase-position cache slot even though
+    the loader was skipped.
+
+    The cold path can already record a few hits (``bm25_stats_for_terms``
+    populates ``PostingMetadataKey``, which is then re-read on the
+    posting-list path as a cross-boundary hit), so the cold assertion is
+    ``misses > hits`` rather than a strict zero.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table(
+        {"text": ["quick brown fox jumps over lazy dog" for _ in range(50)]}
+    )
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("text", index_type="INVERTED", with_position=True)
+
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback,
+        full_text_query='"quick brown"',
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses > 0
+    assert scan_stats.index_cache_misses > scan_stats.index_cache_hits
+
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback,
+        full_text_query='"quick brown"',
+    ).to_table()
+    assert scan_stats.index_cache_hits > 0
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_fts_index_cache_hit_miss_stats(tmp_path: Path):
+    """Cold FTS scan reports misses; warm FTS scan reports hits.
+
+    Guards the wrapper-forwarding fix in ``FtsIndexMetrics``: previously the
+    two new cache-hit/miss trait methods had default no-op implementations
+    that swallowed FTS-side events, so cache activity was reported as ``0/0``
+    even for hot inverted-index scans.
+
+    The cold path can still record a few hits when the same cache key is
+    read across boundaries in one query (e.g. ``bm25_stats_for_terms``
+    populates ``PostingMetadataKey`` before ``posting_list`` re-reads it),
+    so the cold assertion is ``misses > hits`` rather than a strict zero.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"fts": ["word" for _ in range(100)]})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("fts", index_type="INVERTED")
+
+    # Reopen so the session cache starts cold.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses > 0
+    assert scan_stats.index_cache_misses > scan_stats.index_cache_hits
+
+    # Same Dataset, warm cache — posting-list / metadata reads must now hit.
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
+    assert scan_stats.index_cache_hits > 0
+    assert scan_stats.index_cache_misses == 0
 
 
 def test_fts_backward_v0_27_0(tmp_path: Path):
@@ -4720,6 +5059,73 @@ def test_ngram_segment_merge_and_commit_from_python(tmp_path):
     )
     assert ds.count_rows("contains(text, 'needle')") == 3
     assert ds.count_rows("text IS NULL") == 1
+
+
+@pytest.mark.parametrize(
+    "label_type",
+    [pa.list_(pa.string()), pa.large_list(pa.string())],
+    ids=["list", "large_list"],
+)
+def test_label_list_segment_index(tmp_path, label_type):
+    rows_per_fragment = 8
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(rows_per_fragment * 4), type=pa.int32()),
+                "labels": pa.array(
+                    [
+                        ["distributed"] if row_id % 2 == 0 else ["other"]
+                        for row_id in range(rows_per_fragment * 4)
+                    ],
+                    type=label_type,
+                ),
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=rows_per_fragment,
+    )
+
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    assert len(fragment_ids) == 4
+
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index(
+            column="labels",
+            index_type="LABEL_LIST",
+            fragment_ids=[fragment_ids[0]],
+        )
+
+    index_name = "labels_segment_idx"
+    segments = [
+        ds.create_index_uncommitted(
+            column="labels",
+            index_type="LABEL_LIST",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    merged_segment = ds.merge_existing_index_segments(segments)
+    ds = ds.commit_existing_index_segments(index_name, "labels", [merged_segment])
+
+    filter_expr = "array_has_any(labels, ['distributed'])"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "labels"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "labels"],
+        use_scalar_index=True,
+    ).to_table()
+
+    assert with_index.equals(without_index)
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
 
 
 def test_zonemap_fragment_ids_parameter_validation(tmp_path):

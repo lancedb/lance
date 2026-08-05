@@ -30,7 +30,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
-    throttle::{AimdThrottleConfig, AimdThrottledStore},
+    throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
 };
 use lance_core::error::{Error, Result};
 
@@ -44,6 +44,7 @@ impl AwsStoreProvider {
         params: &ObjectStoreParams,
         storage_options: &StorageOptions,
         is_s3_express: bool,
+        throttle_state: Option<&AimdThrottleState>,
     ) -> Result<Arc<dyn OSObjectStore>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
@@ -73,9 +74,8 @@ impl AwsStoreProvider {
             s3_storage_options.insert(AmazonS3ConfigKey::S3Express, true.to_string());
         }
 
-        // Compute the metrics label before rewriting the url below, so it
+        // Compute the metrics label before rewriting the URL below so it
         // matches the prefix the registry uses to key this store.
-        #[cfg(feature = "metrics")]
         let store_prefix =
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
 
@@ -95,12 +95,7 @@ impl AwsStoreProvider {
             .with_retry(retry_config)
             .with_region(region);
 
-        #[cfg(feature = "metrics")]
-        {
-            builder = builder.with_http_connector(
-                crate::object_store::metrics::MeteringHttpConnector::new(store_prefix),
-            );
-        }
+        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
 
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
     }
@@ -129,8 +124,7 @@ impl AwsStoreProvider {
         }
 
         let operator = Operator::from_iter::<S3>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
     }
@@ -164,20 +158,36 @@ impl ObjectStoreProvider for AwsStoreProvider {
             .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
             .unwrap_or(false);
 
+        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+        let throttle_state = if throttle_config.is_disabled() {
+            None
+        } else {
+            Some(AimdThrottleState::new(throttle_config)?)
+        };
+
         let inner = if use_opendal {
             // Use OpenDAL implementation
             self.build_opendal_s3_store(&base_path, &storage_options)
                 .await?
         } else {
             // Use default Amazon S3 implementation
-            self.build_amazon_s3_store(&mut base_path, params, &storage_options, is_s3_express)
-                .await?
+            self.build_amazon_s3_store(
+                &mut base_path,
+                params,
+                &storage_options,
+                is_s3_express,
+                throttle_state.as_ref(),
+            )
+            .await?
         };
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let inner = if throttle_config.is_disabled() {
-            inner
+        let inner = if let Some(throttle_state) = throttle_state {
+            Arc::new(AimdThrottledStore::new_with_state(
+                inner,
+                throttle_state,
+                !use_opendal,
+            )) as Arc<dyn OSObjectStore>
         } else {
-            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
+            inner
         };
 
         Ok(ObjectStore {
