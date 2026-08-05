@@ -20,7 +20,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
-use arrow::datatypes::UInt64Type;
+use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::RecordBatch;
 use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array};
 use arrow_array::{
@@ -47,7 +47,7 @@ use lance_index::metrics::{
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
+    DOC_INDEX_COL, DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
@@ -1560,6 +1560,127 @@ async fn test_match_query_tie_is_a_stable_prefix_with_unindexed_rows() {
         assert_eq!(
             compound_fts_results(&dataset, query.clone(), Some(9)).await,
             exhaustive[..9]
+        );
+    }
+}
+
+/// One `(row_id, doc_index, score)` per hit of an element-granularity FTS scan,
+/// in result order.
+async fn element_fts_results(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, u32, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    let doc_indices = batch[DOC_INDEX_COL].as_list::<i32>();
+    (0..batch.num_rows())
+        .map(|row| {
+            let coordinates = doc_indices.value(row);
+            let coordinates = coordinates.as_primitive::<UInt32Type>();
+            assert_eq!(
+                coordinates.len(),
+                1,
+                "a list-element FTS hit carries one coordinate"
+            );
+            (row_ids[row], coordinates.value(0), scores[row])
+        })
+        .collect()
+}
+
+fn tag_lists(rows: &[&[&str]]) -> ArrayRef {
+    let mut builder = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    for row in rows {
+        for value in *row {
+            builder.values().append_value(value);
+        }
+        builder.append(true);
+    }
+    Arc::new(builder.finish())
+}
+
+#[tokio::test]
+async fn test_element_fts_tie_is_a_stable_prefix_with_unindexed_rows() {
+    // Every element of every row holds the same term, so all hits tie on score and
+    // one row_id covers several results. Only `doc_index` separates them, and the
+    // top-k over the union of indexed and flat hits has to sort on it too.
+    let indexed = RecordBatch::try_from_iter(vec![(
+        "tags",
+        tag_lists(&[&["alpha", "alpha", "alpha"], &["alpha", "alpha", "alpha"]]),
+    )])
+    .unwrap();
+    let schema = indexed.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![indexed].into_iter().map(Ok), schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement),
+            true,
+        )
+        .await
+        .unwrap();
+    let appended =
+        RecordBatch::try_from_iter(vec![("tags", tag_lists(&[&["alpha", "alpha", "alpha"]]))])
+            .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let query: FtsQuery = MatchQuery::new("alpha".to_owned())
+        .with_column(Some("tags".to_owned()))
+        .with_document_granularity(DocumentGranularity::ListElement)
+        .into();
+    let exhaustive = element_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(exhaustive.len(), 9, "three elements in each of three rows");
+    let keys = exhaustive
+        .iter()
+        .map(|(row_id, doc_index, _)| (*row_id, *doc_index))
+        .collect::<Vec<_>>();
+    let mut ascending = keys.clone();
+    ascending.sort_unstable();
+    assert_eq!(
+        keys, ascending,
+        "tied element hits must come back by (row_id, doc_index) ASC"
+    );
+
+    for limit in [1, 2, 4, 7] {
+        let limited = element_fts_results(&dataset, query.clone(), Some(limit as i64)).await;
+        assert_eq!(
+            limited,
+            exhaustive[..limit],
+            "top-{limit} must be an ordered prefix of the exhaustive result"
+        );
+    }
+    for _ in 0..5 {
+        assert_eq!(
+            element_fts_results(&dataset, query.clone(), Some(3)).await,
+            exhaustive[..3]
         );
     }
 }
