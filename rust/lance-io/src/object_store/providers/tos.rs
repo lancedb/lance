@@ -10,7 +10,6 @@ use opendal::{Operator, services::Tos};
 use url::Url;
 
 use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
-use crate::object_store::opendal_retry::{FinalizationRetry, store_with_retry};
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -104,7 +103,7 @@ impl TosStoreProvider {
         let operator = Operator::from_iter::<Tos>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create TOS operator: {:?}", e)))?;
 
-        Ok(store_with_retry(operator, FinalizationRetry::Retry))
+        Ok(OpendalStore::new(operator))
     }
 }
 
