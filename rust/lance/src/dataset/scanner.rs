@@ -208,6 +208,41 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     columns.len() == 1
 }
 
+/// The FTS result order: `(score DESC, row_id ASC)`, plus `doc_index ASC` when
+/// the plan carries element coordinates.
+///
+/// A `SortExec` top-k is not stable, so an FTS top-k taken over a union of
+/// independent plans has to sort on the whole key or a tie resolves by batch
+/// arrival order. For list-element granularity one row address covers every
+/// element of that row, and only `doc_index` separates them.
+fn fts_result_sort_exprs(schema: &ArrowSchema) -> Result<LexOrdering> {
+    let ascending = SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+    let mut sort_exprs = vec![
+        PhysicalSortExpr {
+            expr: expressions::col(SCORE_COL, schema)?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        },
+        PhysicalSortExpr {
+            expr: expressions::col(ROW_ID, schema)?,
+            options: ascending,
+        },
+    ];
+    if schema.field_with_name(DOC_INDEX_COL).is_ok() {
+        sort_exprs.push(PhysicalSortExpr {
+            expr: expressions::col(DOC_INDEX_COL, schema)?,
+            options: ascending,
+        });
+    }
+    LexOrdering::new(sort_exprs)
+        .ok_or_else(|| Error::internal("FTS result ordering is unexpectedly empty".to_string()))
+}
+
 fn contains_phrase_query(query: &FtsQuery) -> bool {
     match query {
         FtsQuery::Phrase(_) => true,
@@ -4085,26 +4120,11 @@ impl Scanner {
                     fts_node,
                     schema,
                 )?);
-                let sort_exprs = [
-                    PhysicalSortExpr {
-                        expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
-                        options: SortOptions {
-                            descending: true,
-                            nulls_first: false,
-                        },
-                    },
-                    PhysicalSortExpr {
-                        expr: expressions::col(ROW_ID, fts_node.schema().as_ref())?,
-                        options: SortOptions {
-                            descending: false,
-                            nulls_first: false,
-                        },
-                    },
-                ];
+                let sort_exprs = fts_result_sort_exprs(fts_node.schema().as_ref())?;
 
                 // `params.limit` is the recursive planning contract. Compound
                 // parents pass `None` when they require every candidate.
-                Arc::new(SortExec::new(sort_exprs.into(), fts_node).with_fetch(params.limit))
+                Arc::new(SortExec::new(sort_exprs, fts_node).with_fetch(params.limit))
             }
             FtsQuery::Boolean(query) => {
                 // TODO: rewrite the query for better performance
@@ -4541,26 +4561,11 @@ impl Scanner {
             Partitioning::RoundRobinBatch(1),
         )?);
         // Indexed and flat hits arrive from independent plans, so the top-k over
-        // their union sorts on the full FTS key (score DESC, row_id ASC) rather than
-        // on score alone, which a `SortExec` top-k does not break deterministically.
-        let sort_exprs = [
-            PhysicalSortExpr {
-                expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
-                options: SortOptions {
-                    descending: true,
-                    nulls_first: false,
-                },
-            },
-            PhysicalSortExpr {
-                expr: expressions::col(ROW_ID, plan.schema().as_ref())?,
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            },
-        ];
+        // their union sorts on the full FTS key rather than on score alone, which a
+        // `SortExec` top-k does not break deterministically.
+        let sort_exprs = fts_result_sort_exprs(plan.schema().as_ref())?;
         Ok(Arc::new(
-            SortExec::new(sort_exprs.into(), plan).with_fetch(params.limit),
+            SortExec::new(sort_exprs, plan).with_fetch(params.limit),
         ))
     }
 
