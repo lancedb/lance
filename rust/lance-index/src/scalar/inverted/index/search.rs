@@ -626,11 +626,13 @@ impl InvertedIndex {
             .buffer_unordered(get_num_compute_intensive_cpus().min(32))
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
+        let mut band_truncations = 0;
         while let Some(scored) = parts.try_next().await? {
-            if scored.score_floor_overflow {
+            if scored.band.score_floor_overflow {
                 retries.push((scored.partition_ordinal, scored.part));
                 continue;
             }
+            band_truncations += usize::from(scored.band.band_truncated);
             merge_modern_partition(
                 &mut ranked,
                 limit,
@@ -686,7 +688,7 @@ impl InvertedIndex {
                     })
                     .await?;
                     debug_assert!(
-                        !scored.score_floor_overflow,
+                        !scored.band.score_floor_overflow,
                         "an address-ordered retry cannot overflow its score floor"
                     );
                     Result::Ok(Some(scored))
@@ -697,6 +699,7 @@ impl InvertedIndex {
                 let Some(scored) = scored else {
                     continue;
                 };
+                band_truncations += usize::from(scored.band.band_truncated);
                 merge_modern_partition(
                     &mut ranked,
                     limit,
@@ -708,6 +711,10 @@ impl InvertedIndex {
                 metrics.record_fts_peak_buffered_candidates(ranked.buffered());
                 self.compact_modern_candidates(&mut ranked, limit).await?;
             }
+        }
+
+        if band_truncations > 0 {
+            metrics.record_fts_element_band_truncations(band_truncations);
         }
 
         Ok(ranked.into_vec())

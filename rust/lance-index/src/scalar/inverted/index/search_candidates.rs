@@ -108,7 +108,9 @@ pub(super) fn push_scored_key(
     score: f32,
 ) {
     // A NaN score is never competitive. It has to be rejected before the total
-    // order sees it, because `total_cmp` ranks NaN above every real score.
+    // order sees it, because `total_cmp` ranks NaN above every real score, which
+    // would put it at the top of the result. The WAND collector still admits one
+    // into an under-filled heap, so the two layers are not identical here.
     if score.is_nan() {
         return;
     }
@@ -233,14 +235,33 @@ pub(super) struct LoadedModernPartition {
     pub(super) addresses: Option<ResidentAddressProjection>,
 }
 
+/// What one WAND search had to give up on its retained tie band.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct WandBandStatus {
+    /// See [`Wand::score_floor_overflow`]. When set, the candidates are missing
+    /// part of the partition's k-th-score tie band and must not be merged: the
+    /// partition is searched again with row addresses attached.
+    pub(super) score_floor_overflow: bool,
+    /// See [`Wand::band_truncated`]. A retry cannot improve on it, so it is only
+    /// reported.
+    pub(super) band_truncated: bool,
+}
+
+impl WandBandStatus {
+    pub(super) fn of<S: Scorer, D: WandDocuments>(wand: &Wand<'_, S, D>) -> Self {
+        Self {
+            score_floor_overflow: wand.score_floor_overflow(),
+            band_truncated: wand.band_truncated(),
+        }
+    }
+}
+
 /// Candidates one modern partition contributed to the global merge.
 pub(super) struct ScoredModernPartition {
     pub(super) partition_ordinal: usize,
     pub(super) part: Arc<InvertedPartition>,
     pub(super) candidates: PartitionCandidates<DocId>,
-    /// See [`Wand::score_floor_overflow`]. When set, `candidates` is missing part
-    /// of the partition's k-th-score tie band and must not be merged.
-    pub(super) score_floor_overflow: bool,
+    pub(super) band: WandBandStatus,
 }
 
 /// Load everything the CPU scoring phase needs for one modern partition.
@@ -356,7 +377,7 @@ pub(super) fn score_modern_partition(
         grouped_expansions,
         addresses,
     } = partition;
-    let (candidates, score_floor_overflow) = part.bm25_search_modern(
+    let (candidates, band) = part.bm25_search_modern(
         lengths.as_ref(),
         &visibility,
         addresses.as_ref(),
@@ -375,7 +396,7 @@ pub(super) fn score_modern_partition(
             grouped_expansions,
             candidates,
         },
-        score_floor_overflow,
+        band,
     })
 }
 

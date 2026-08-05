@@ -47,7 +47,8 @@ use lance_index::metrics::{
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
     COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, FREQS_COLLECTED_METRIC,
-    FTS_PEAK_BUFFERED_CANDIDATES_METRIC, FTS_SCORE_FLOOR_OVERFLOWS_METRIC, MetricsCollector,
+    FTS_ELEMENT_BAND_TRUNCATIONS_METRIC, FTS_PEAK_BUFFERED_CANDIDATES_METRIC,
+    FTS_SCORE_FLOOR_OVERFLOWS_METRIC, MetricsCollector,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -1071,6 +1072,7 @@ pub struct FtsIndexMetrics {
     compound_peak_buffered_candidates: Gauge,
     fts_score_floor_overflows: Count,
     fts_peak_buffered_candidates: Gauge,
+    fts_element_band_truncations: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -1104,6 +1106,8 @@ impl FtsIndexMetrics {
                 .new_count(FTS_SCORE_FLOOR_OVERFLOWS_METRIC, partition),
             fts_peak_buffered_candidates: metrics
                 .new_gauge(FTS_PEAK_BUFFERED_CANDIDATES_METRIC, partition),
+            fts_element_band_truncations: metrics
+                .new_count(FTS_ELEMENT_BAND_TRUNCATIONS_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -1184,6 +1188,10 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_fts_peak_buffered_candidates(&self, num_candidates: usize) {
         self.fts_peak_buffered_candidates.set_max(num_candidates);
+    }
+
+    fn record_fts_element_band_truncations(&self, num_truncations: usize) {
+        self.fts_element_band_truncations.add(num_truncations);
     }
 }
 

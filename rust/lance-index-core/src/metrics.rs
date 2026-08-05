@@ -15,6 +15,7 @@ pub const COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "compound_score_floor_ov
 pub const COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "compound_peak_buffered_candidates";
 pub const FTS_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "fts_score_floor_overflows";
 pub const FTS_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "fts_peak_buffered_candidates";
+pub const FTS_ELEMENT_BAND_TRUNCATIONS_METRIC: &str = "fts_element_band_truncations";
 
 /// A trait used by the index to report metrics
 ///
@@ -111,6 +112,10 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record a candidate-buffer high-water mark for the cross-partition FTS merge.
     fn record_fts_peak_buffered_candidates(&self, _num_candidates: usize) {}
+
+    /// Record FTS partitions that filled their retained band while already ordering
+    /// by row address, so the elements of one row fell back to a DocId proxy.
+    fn record_fts_element_band_truncations(&self, _num_truncations: usize) {}
 
     /// Record a candidate-buffer high-water mark for compound FTS.
     fn record_compound_peak_buffered_candidates(&self, _num_candidates: usize) {}

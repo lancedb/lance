@@ -388,9 +388,11 @@ async fn test_fts_topk_tied_scores_bound_the_cross_partition_band() {
         peak > LIMIT,
         "premise: the tie band must actually be exercised, peak {peak}"
     );
+    // Compaction runs between partitions, so the peak is the compacted band
+    // plus whatever the next partition contributed in one go.
     assert!(
         peak <= bound + PER_PARTITION as usize,
-        "the merge band must be compacted back under {bound} between partitions, peak {peak}"
+        "the merge band must be compacted back under {bound} between partitions,              leaving room for one partition's contribution on top, peak {peak}"
     );
 }
 
@@ -432,6 +434,175 @@ async fn test_fts_topk_tied_scores_wider_than_the_collector_buffer() {
     );
     assert_eq!(top5, vec![BASE + 1, BASE + 2, BASE + 3, BASE + 4, BASE + 5]);
     assert_eq!(top3, top5[..3], "top-3 must be a prefix of top-5");
+}
+
+/// Counts reads of the element coordinate columns across every partition.
+#[derive(Default, Debug)]
+struct CoordinateReadCounter {
+    reads: AtomicUsize,
+}
+
+struct CountingCoordinateReader {
+    inner: Arc<dyn IndexReader>,
+    counter: Arc<CoordinateReadCounter>,
+}
+
+#[cfg_attr(coverage, coverage(off))]
+#[async_trait]
+impl IndexReader for CountingCoordinateReader {
+    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+        self.inner.read_record_batch(n, batch_size).await
+    }
+    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
+        self.inner.read_global_buffer(index).await
+    }
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        if projection.is_some_and(|columns| columns.contains(&doc_index_storage_column(0).as_str()))
+        {
+            self.counter.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.read_range(range, projection).await
+    }
+    async fn num_batches(&self, batch_size: u64) -> u32 {
+        self.inner.num_batches(batch_size).await
+    }
+    fn num_rows(&self) -> usize {
+        self.inner.num_rows()
+    }
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        self.inner.schema()
+    }
+}
+
+#[derive(Debug)]
+struct CountingCoordinateStore {
+    inner: Arc<dyn IndexStore>,
+    counter: Arc<CoordinateReadCounter>,
+}
+
+#[cfg_attr(coverage, coverage(off))]
+impl DeepSizeOf for CountingCoordinateStore {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
+}
+
+#[cfg_attr(coverage, coverage(off))]
+#[async_trait]
+impl IndexStore for CountingCoordinateStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn clone_arc(&self) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            counter: self.counter.clone(),
+        })
+    }
+    fn io_parallelism(&self) -> usize {
+        self.inner.io_parallelism()
+    }
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_priority(io_priority),
+            counter: self.counter.clone(),
+        })
+    }
+    async fn new_index_file(
+        &self,
+        name: &str,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
+        self.inner.new_index_file(name, schema).await
+    }
+    async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+        Ok(Arc::new(CountingCoordinateReader {
+            inner: self.inner.open_index_file(name).await?,
+            counter: self.counter.clone(),
+        }))
+    }
+    async fn copy_index_file(
+        &self,
+        name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner.copy_index_file(name, dest_store).await
+    }
+    async fn copy_index_file_to(
+        &self,
+        name: &str,
+        new_name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner
+            .copy_index_file_to(name, new_name, dest_store)
+            .await
+    }
+    async fn rename_index_file(
+        &self,
+        name: &str,
+        new_name: &str,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner.rename_index_file(name, new_name).await
+    }
+    async fn delete_index_file(&self, name: &str) -> Result<()> {
+        self.inner.delete_index_file(name).await
+    }
+    async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
+        self.inner.list_files_with_sizes().await
+    }
+}
+
+#[tokio::test]
+async fn test_element_fts_resolves_coordinates_once_per_partition() {
+    // The merge compacts its tie band after every partition once past the bound,
+    // and each compaction re-resolves the candidates of every partition merged so
+    // far. Resolving coordinates straight from the docs file made that quadratic
+    // in the number of partitions, so the columns are read once and cached.
+    const PARTITIONS: u64 = 8;
+    const PER_PARTITION: u64 = 100;
+    let tmpdir = TempObjDir::default();
+    let inner = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    for partition_id in 0..PARTITIONS {
+        let elements = (0..PER_PARTITION)
+            .map(|element| (partition_id * 1_000 + element, element as u32))
+            .collect::<Vec<_>>();
+        build_tied_element_partition(&inner, partition_id, &elements).await;
+    }
+    write_test_metadata(
+        &inner,
+        (0..PARTITIONS).collect(),
+        InvertedIndexParams::default(),
+    )
+    .await;
+
+    let counter = Arc::new(CoordinateReadCounter::default());
+    let store: Arc<dyn IndexStore> = Arc::new(CountingCoordinateStore {
+        inner: inner.clone(),
+        counter: counter.clone(),
+    });
+    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+
+    let documents = search_alpha_documents(&index, 4).await;
+    assert_eq!(
+        documents,
+        vec![(0, vec![0]), (1, vec![1]), (2, vec![2]), (3, vec![3])],
+        "the exact lowest row_ids, ordered by row_id then doc_index"
+    );
+    let reads = counter.reads.load(Ordering::Relaxed);
+    assert!(
+        reads <= PARTITIONS as usize,
+        "coordinates must be read once per partition, got {reads} reads for {PARTITIONS} partitions"
+    );
 }
 
 #[tokio::test]

@@ -697,7 +697,7 @@ impl InvertedPartition {
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<u64>>> {
         let documents = LegacyWandDocuments::new(docs, mask);
-        let (candidates, score_floor_overflow) = self.bm25_search_with_documents(
+        let (candidates, band) = self.bm25_search_with_documents(
             &documents,
             params,
             operator,
@@ -707,7 +707,7 @@ impl InvertedPartition {
             shared_threshold,
         )?;
         debug_assert!(
-            !score_floor_overflow,
+            !band.score_floor_overflow,
             "legacy postings carry row addresses, so their ties never defer"
         );
         Ok(candidates)
@@ -715,9 +715,8 @@ impl InvertedPartition {
 
     /// Search one modern partition.
     ///
-    /// Returns the candidates plus [`Wand::score_floor_overflow`]: when set, the
-    /// walk could not order its whole k-th-score tie band by row address and the
-    /// caller must retry with `addresses` attached.
+    /// Returns the candidates plus what the walk gave up on its tie band, which
+    /// tells the caller whether to retry the partition with `addresses` attached.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bm25_search_modern(
         &self,
@@ -730,7 +729,7 @@ impl InvertedPartition {
         impact_scorer: Option<Arc<MemBM25Scorer>>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
-    ) -> Result<(Vec<DocCandidate<DocId>>, bool)> {
+    ) -> Result<(Vec<DocCandidate<DocId>>, WandBandStatus)> {
         if visibility.is_all() {
             let documents = ModernWandDocuments::all(lengths).with_addresses(addresses);
             self.bm25_search_with_documents(
@@ -768,22 +767,22 @@ impl InvertedPartition {
         impact_scorer: Option<Arc<MemBM25Scorer>>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
-    ) -> Result<(Vec<DocCandidate<D::Candidate>>, bool)> {
+    ) -> Result<(Vec<DocCandidate<D::Candidate>>, WandBandStatus)> {
         if postings.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), WandBandStatus::default()));
         }
 
         if let Some(scorer) = impact_scorer {
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
             let hits = wand.search(params, metrics)?;
-            Ok((hits, wand.score_floor_overflow()))
+            Ok((hits, WandBandStatus::of(&wand)))
         } else {
             let scorer = IndexBM25Scorer::new(std::iter::once(self));
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
             let hits = wand.search(params, metrics)?;
-            Ok((hits, wand.score_floor_overflow()))
+            Ok((hits, WandBandStatus::of(&wand)))
         }
     }
 

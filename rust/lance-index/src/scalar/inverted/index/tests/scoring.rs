@@ -465,7 +465,7 @@ async fn search_test_impact_partition(
     let documents = partition.docs.modern().unwrap();
     let lengths = documents.lengths().await.unwrap();
     let visibility = documents.visibility(NoFilter.mask(), false).await.unwrap();
-    let (candidates, score_floor_overflow) = partition
+    let (candidates, band) = partition
         .bm25_search_modern(
             lengths.as_ref(),
             &visibility,
@@ -478,7 +478,7 @@ async fn search_test_impact_partition(
             shared_threshold,
         )
         .unwrap();
-    assert!(!score_floor_overflow);
+    assert!(!band.score_floor_overflow);
     candidates
 }
 
