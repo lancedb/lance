@@ -5592,6 +5592,21 @@ class SqlQueryBuilder:
         self._builder = self._builder.with_row_addr(with_row_addr)
         return self
 
+    def blob_handling(
+        self,
+        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
+    ) -> "SqlQueryBuilder":
+        """
+        Control how blob columns are returned by this SQL query.
+
+        - ``"all_binary"`` materializes blob columns as binary values.
+        - ``"blobs_descriptions"`` returns blob descriptors (the default).
+        - ``"all_descriptions"`` returns descriptions for all binary-like
+          columns.
+        """
+        self._builder = self._builder.blob_handling(blob_handling)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
