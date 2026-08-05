@@ -5808,7 +5808,13 @@ class LanceOperation:
         new_schema: pyarrow.Schema
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
-            The fragments that make up the new dataset.
+            The newly written fragments that make up the new dataset. They are
+            assigned fresh ids when the operation is committed, continuing from
+            the highest id the dataset has ever used, so any id they carry is
+            ignored. Since we reassign fragment ids, a fragment with a deletion
+            file is rejected: use :class:`LanceOperation.Delete` to commit
+            deletions, or :class:`LanceOperation.Merge` to change the schema of
+            existing fragments.
         initial_bases: list[DatasetBasePath], optional
             Base paths to register when creating a new dataset (CREATE mode only).
             **Only valid in CREATE mode**. Will raise an error if used with
