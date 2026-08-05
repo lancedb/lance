@@ -321,6 +321,10 @@ impl UpdateJob {
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let (mut new_fragments, _) = write_fragments_internal(
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,

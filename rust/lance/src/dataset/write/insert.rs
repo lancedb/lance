@@ -216,6 +216,7 @@ impl<'a> InsertBuilder<'a> {
         .await?;
 
         let (written_fragments, written_schema) = write_fragments_internal(
+            context.storage_version,
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,

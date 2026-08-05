@@ -1490,6 +1490,7 @@ impl MergeInsertJob {
                 )?;
 
                 let (fragments, _) = write_fragments_internal(
+                    dataset.manifest.data_storage_format.lance_file_format(),
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
                     &dataset.base,
@@ -2271,6 +2272,10 @@ impl MergeInsertJob {
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
+                self.dataset
+                    .manifest
+                    .data_storage_format
+                    .lance_file_format(),
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,

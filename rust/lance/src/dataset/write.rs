@@ -1270,8 +1270,13 @@ pub(super) async fn blob_v2_external_base_resolver(
 /// This is a private variant that takes a `SendableRecordBatchStream` instead
 /// of a reader. We don't expose the stream at our interface because it is a
 /// DataFusion type.
+///
+/// The caller must resolve `storage_version` once for the operation. Operations
+/// that also select a commit format must reuse the same value when committing.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
 pub async fn write_fragments_internal(
+    storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
@@ -1299,7 +1304,6 @@ pub async fn write_fragments_internal(
     validate_external_blob_write_params(&params)?;
     let normalized_converted_schema = prepared_to_logical_blob_schema(&converted_schema)?;
 
-    let storage_version = resolve_storage_version(dataset, &params);
     versions::write_fragments(
         storage_version,
         dataset,
@@ -1311,30 +1315,6 @@ pub async fn write_fragments_internal(
         target_bases_info,
     )
     .await
-}
-
-fn resolve_storage_version(dataset: Option<&Dataset>, params: &WriteParams) -> ConcreteFileVersion {
-    if let Some(dataset) = dataset {
-        match params.mode {
-            WriteMode::Append | WriteMode::Create => {
-                // Use the storage version from the dataset, ignoring any version from the user.
-                dataset.manifest().data_storage_format.lance_file_format()
-            }
-            WriteMode::Overwrite => {
-                // Overwrite, use the schema from the data.  If the user specified
-                // a storage version use that.  Otherwise use the version from the
-                // dataset.
-                params
-                    .data_storage_version
-                    .map(ConcreteFileVersion::from)
-                    .unwrap_or_else(|| dataset.manifest().data_storage_format.lance_file_format())
-            }
-        }
-    } else {
-        // Brand new dataset, use the schema from the data and the storage version
-        // from the user or the default.
-        params.storage_version_or_default()
-    }
 }
 
 pub(super) fn prepare_write_schema(
@@ -2037,6 +2017,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2090,6 +2071,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2151,6 +2133,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2264,6 +2247,7 @@ mod tests {
 
             let object_store = Arc::new(ObjectStore::memory());
             let (fragments, _) = write_fragments_internal(
+                ConcreteFileVersion::from(version),
                 None,
                 object_store,
                 &Path::from("test"),
@@ -2339,6 +2323,7 @@ mod tests {
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
         let (fragments, _) = write_fragments_internal(
+            ConcreteFileVersion::V1,
             None,
             object_store.clone(),
             &base_path,
@@ -3500,6 +3485,7 @@ mod tests {
         };
 
         let result = write_fragments_internal(
+            write_params.storage_version_or_default(),
             None,
             object_store,
             &Path::from("test_empty"),
@@ -3724,6 +3710,7 @@ mod tests {
 
         // Attempt to write data - should fail with IO error due to disk full
         let result = write_fragments_internal(
+            write_params.storage_version_or_default(),
             None,
             object_store,
             &Path::from("test_disk_full"),
