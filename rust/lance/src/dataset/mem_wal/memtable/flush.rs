@@ -103,6 +103,11 @@ impl MemTableFlusher {
         }
     }
 
+    /// The shard these generations belong to.
+    pub(crate) fn shard_id(&self) -> Uuid {
+        self.shard_id
+    }
+
     /// Attach the warmer fired pre-commit for each new generation.
     pub fn with_warmer(mut self, warmer: Option<Arc<dyn SsTableWarmer>>) -> Self {
         self.warmer = warmer;
