@@ -223,18 +223,24 @@ impl CacheKey for RowIdIndexKey {
 #[derive(Debug)]
 pub struct RowIdSequenceKey<'a> {
     pub fragment_id: u64,
-    /// Where the sequence is stored, which identifies which generation of the
-    /// fragment it belongs to. A fragment id alone is not enough: this cache is
-    /// namespaced by dataset URI only (see [`GlobalMetadataCache::for_dataset`])
-    /// and fragment ids restart at 0 both for an overwrite and for a dataset
-    /// dropped and recreated at the same URI, so a reused id would otherwise be
-    /// served the earlier generation's sequence. Rewriting a fragment always
-    /// rewrites its `row_id_meta`, while operations that leave row ids alone
-    /// (deletes, added columns) keep hitting the cache.
+    /// Where the sequence is stored. A fragment id alone is not enough: this
+    /// cache is namespaced by dataset URI only (see
+    /// [`GlobalMetadataCache::for_dataset`]) and fragment ids restart at 0 both
+    /// for an overwrite and for a dataset dropped and recreated at the same URI,
+    /// so a reused id would otherwise be served the earlier generation's
+    /// sequence. The `row_id_meta` is used to differentiate generations of
+    /// dataset fragments.
     ///
-    /// Inline metadata is the fragment's run-encoded sequence, so for those the
-    /// key hashes the value's own bytes. That is the point — identity *is* the
-    /// content — and the encoded form is a handful of bytes per run.
+    /// Any operation that changes which row ids a fragment holds also writes it
+    /// new `row_id_meta`, so generations stay distinct; operations that leave
+    /// row ids alone (deletes, added columns) leave it untouched and keep
+    /// hitting the cache.
+    ///
+    /// For inline metadata the identity of the sequence *is* its encoded bytes,
+    /// so the key uses
+    /// [`InlineRowIds::digest`](lance_table::format::InlineRowIds::digest),
+    /// which those bytes memoize on first use — an array-encoded sequence is
+    /// 8 bytes per row, too much to rehash on every lookup.
     pub row_id_meta: &'a RowIdMeta,
 }
 
@@ -257,7 +263,7 @@ impl CacheKey for RowIdSequenceKey<'_> {
         match self.row_id_meta {
             RowIdMeta::Inline(data) => {
                 builder.write_variant(0);
-                builder.write_bytes(data);
+                builder.write_fixed_bytes(data.digest());
             }
             RowIdMeta::External(file) => {
                 builder.write_variant(1);
@@ -327,7 +333,7 @@ mod tests {
         // restarts fragment ids, so the same id must not resolve to the earlier
         // generation's sequence.
         let cache = LanceCache::with_capacity(4096);
-        let first_generation = RowIdMeta::Inline(write_row_ids(&(0..100).into()));
+        let first_generation = RowIdMeta::Inline(write_row_ids(&(0..100).into()).into());
         let key = RowIdSequenceKey {
             fragment_id: 0,
             row_id_meta: &first_generation,
@@ -337,7 +343,7 @@ mod tests {
             .await;
         assert!(cache.get_with_key(&key).await.is_some());
 
-        let second_generation = RowIdMeta::Inline(write_row_ids(&(100..160).into()));
+        let second_generation = RowIdMeta::Inline(write_row_ids(&(100..160).into()).into());
         assert!(
             cache
                 .get_with_key(&RowIdSequenceKey {
@@ -383,7 +389,7 @@ mod tests {
                 .is_none()
         );
         // An inline sequence never aliases an external one.
-        let inline = RowIdMeta::Inline(write_row_ids(&(0..100).into()));
+        let inline = RowIdMeta::Inline(write_row_ids(&(0..100).into()).into());
         assert!(
             cache
                 .get_with_key(&RowIdSequenceKey {

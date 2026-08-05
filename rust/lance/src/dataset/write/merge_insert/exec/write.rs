@@ -1023,7 +1023,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
                     for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                         let serialized = lance_table::rowids::write_row_ids(&sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                     }
                 }
                 Ok(())
