@@ -2448,7 +2448,6 @@ mod tests {
         },
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
         format::pb21,
-        version::LanceFileVersion,
     };
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
