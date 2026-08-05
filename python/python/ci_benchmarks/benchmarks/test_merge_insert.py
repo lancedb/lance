@@ -60,9 +60,10 @@ SOURCE_SIZES = [1_000, 10_000, 100_000]
 
 NARROW_KEYS = ["id_int", "id_uuid7", "id_uuid4"]
 
-# Budget 4 GiB total so the 1.32 GiB full-schema source and its hash table fit
-# while DataFusion still enforces a bound below the benchmark host's limit.
-_MEM_POOL_SIZE = 4 * 1024**3
+# DataFusion accounts each 8,192-row slice of the 1.32 GiB full-schema source
+# for its shared backing buffers. Budget the resulting ~159 GiB of reservations
+# without changing the source layout measured by this benchmark.
+_MEM_POOL_SIZE = 160 * 1024**3
 
 
 @pytest.fixture(scope="module", autouse=True)

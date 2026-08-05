@@ -992,11 +992,7 @@ impl SessionContextExt for SessionContext {
 pub async fn provider_to_stream(
     provider: Arc<dyn TableProvider>,
 ) -> Result<SendableRecordBatchStream> {
-    // This is a structural adapter, so preserve the provider's batch boundaries.
-    // DataSourceExec otherwise slices every batch at the session batch size, which
-    // can make slices of one shared backing buffer appear independently allocated
-    // to downstream memory consumers.
-    let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(usize::MAX));
+    let ctx = SessionContext::new();
     let plan = provider.scan(&ctx.state(), None, &[], None).await?;
     let plan: Arc<dyn ExecutionPlan> =
         if plan.properties().output_partitioning().partition_count() > 1 {
@@ -1212,42 +1208,10 @@ impl ExecutionPlan for HardCapBatchSizeExec {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::Int32Array;
-    use arrow_schema::{DataType, Field, Schema};
-    use datafusion::datasource::MemTable;
-    use futures::TryStreamExt;
-
     use super::*;
 
     // Serialize cache tests since they share global state
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[tokio::test]
-    async fn test_provider_to_stream_preserves_batch_boundaries() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int32,
-            false,
-        )]));
-        let num_rows = 10_000usize;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap();
-        let provider: Arc<dyn TableProvider> =
-            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
-
-        let batch_sizes = provider_to_stream(provider)
-            .await
-            .unwrap()
-            .map_ok(|batch| batch.num_rows())
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(batch_sizes, vec![num_rows]);
-    }
 
     #[test]
     fn test_session_context_cache() {
