@@ -3489,8 +3489,7 @@ async fn test_fts_phrase_query_normalizes_leading_stop_word_position() {
         ),
     ])
     .unwrap();
-    let initial_reader =
-        RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema().clone());
+    let initial_reader = RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema());
     let mut dataset = Dataset::write(initial_reader, &uri, None).await.unwrap();
     let index_params = InvertedIndexParams::default()
         .with_position(true)
@@ -3512,8 +3511,7 @@ async fn test_fts_phrase_query_normalizes_leading_stop_word_position() {
         ),
     ])
     .unwrap();
-    let appended_reader =
-        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema().clone());
+    let appended_reader = RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema());
     dataset = Dataset::write(
         appended_reader,
         Arc::new(dataset),
