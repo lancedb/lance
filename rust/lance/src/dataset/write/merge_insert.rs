@@ -4170,6 +4170,85 @@ mod tests {
 
     #[rstest::rstest]
     #[tokio::test]
+    async fn test_multi_batch_upsert_preserves_stable_row_ids(
+        #[values(true, false)] use_index: bool,
+    ) {
+        let mut dataset = (*create_test_dataset(
+            "memory://test_multi_batch_upsert_row_ids",
+            LanceFileVersion::default(),
+            true,
+        )
+        .await)
+            .clone();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let initial_keys = [1, 2, 3, 4, 5, 6];
+        let initial_row_ids = get_row_ids_for_keys(&dataset, &initial_keys).await;
+        let initial_row_ids = initial_row_ids
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let updated_keys = [2, 4];
+        let updated_row_ids_before = get_row_ids_for_keys(&dataset, &updated_keys).await;
+
+        // Put inserts in the first source batch and updates in the second. Stable
+        // row-id assignment still relies on the join emitting all updates first.
+        let insert_batch = record_batch!(
+            ("key", UInt32, [7, 8]),
+            ("value", UInt32, [70, 80]),
+            ("filterme", Utf8, ["inserted", "inserted"])
+        )
+        .unwrap();
+        let update_batch = record_batch!(
+            ("key", UInt32, [2, 4]),
+            ("value", UInt32, [20, 40]),
+            ("filterme", Utf8, ["updated", "updated"])
+        )
+        .unwrap();
+        let source_schema = insert_batch.schema();
+        let source = Box::new(RecordBatchIterator::new(
+            [Ok(insert_batch), Ok(update_batch)],
+            source_schema,
+        ));
+
+        let (dataset, stats) = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(use_index)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 2);
+        assert_eq!(stats.num_inserted_rows, 2);
+        let updated_row_ids_after = get_row_ids_for_keys(&dataset, &updated_keys).await;
+        assert_eq!(updated_row_ids_after, updated_row_ids_before);
+
+        let inserted_row_ids = get_row_ids_for_keys(&dataset, &[7, 8]).await;
+        assert!(
+            inserted_row_ids
+                .values()
+                .iter()
+                .all(|row_id| !initial_row_ids.contains(row_id))
+        );
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
     async fn test_row_id_stability_across_update_and_merge_insert(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
