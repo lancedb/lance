@@ -154,6 +154,19 @@ pub trait DistCalculator {
 
 pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
 
+/// Schema-metadata key recording the *source dataset* field ids of a storage file's
+/// covering ("included") columns, comma separated in declaration order.
+///
+/// Arrow fields carry no Lance field id, so a storage file's own schema cannot say
+/// which logical column a covering column came from -- and the ids in the file's Lance
+/// schema are file-local, assigned when the writer was built. Without this, a
+/// distributed merge comparing shards by name and type would accept two shards whose
+/// covering columns share a name and type but belong to different fields (a column
+/// dropped and re-added between shard builds) and concatenate them as one.
+///
+/// Absent when the storage has no covering columns.
+pub const COVERING_FIELD_IDS_KEY: &str = "covering_field_ids";
+
 #[derive(Debug)]
 pub struct QueryScratch {
     pub distances: Vec<f32>,
@@ -403,6 +416,17 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     where
         Self: 'a;
 
+    /// This storage's own column names: the row id, its quantization code
+    /// columns, and any legacy bookkeeping column it carries. Everything else in
+    /// the schema is a covering ("included") column.
+    ///
+    /// Required rather than defaulted on purpose: only the storage knows which of
+    /// its columns are code columns, and a wrong answer here silently mislabels
+    /// covering data (e.g. it would mistake RaBitQ's code columns for covering
+    /// ones). Making it a required associated const means a new storage cannot
+    /// forget to answer.
+    const INTERNAL_COLUMNS: &'static [&'static str];
+
     fn as_any(&self) -> &dyn Any;
 
     fn schema(&self) -> &SchemaRef;
@@ -430,14 +454,9 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     /// Field indices of the "included"/covering columns: the extra columns
     /// stored alongside the row id and quantization code so a covered query can
-    /// skip the take from the base table.
-    ///
-    /// The default is empty (no covering). A storage that supports covering must
-    /// override this, since only it knows which of its columns are quantization
-    /// code columns versus included columns — inferring that generically by name
-    /// is unsafe (e.g. it would mistake RaBitQ's code columns for covering ones).
+    /// skip the take from the base table. Derived from [`Self::INTERNAL_COLUMNS`].
     fn covering_field_indices(&self) -> Vec<usize> {
-        Vec::new()
+        covering_field_indices_excluding(self.schema().as_ref(), Self::INTERNAL_COLUMNS)
     }
 
     /// `[_rowid, <included cols...>]` for the whole storage. Captured while a

@@ -45,12 +45,20 @@ use crate::{
         PART_ID_COLUMN, PQ_CODE_COLUMN,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
-        storage::{DistCalculator, VectorStore, covering_field_indices_excluding},
+        storage::{DistCalculator, VectorStore},
         transform::Transformer,
     },
 };
 
 pub const PQ_METADATA_KEY: &str = "lance:pq";
+
+/// PQ storage's internal (non-covering) column names: the row id, the PQ code column,
+/// and the legacy `__ivf_part_id` column (written by pre-#3606 single-partition
+/// builds; PQ storage drops it at construction, so post-load it is never present and
+/// excluding it is a no-op -- but pre-load classification, e.g. from a raw shard
+/// schema in the distributed merger, needs it). Every other column is a user-declared
+/// covering ("included") column. The single authority for this set.
+pub const PQ_INTERNAL_COLUMNS: &[&str] = &[ROW_ID, PQ_CODE_COLUMN, PART_ID_COLUMN];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
@@ -714,6 +722,9 @@ impl QuantizerStorage for ProductQuantizationStorage {
 impl VectorStore for ProductQuantizationStorage {
     type DistanceCalculator<'a> = PQDistCalculator;
 
+    /// PQ storage is `[_rowid, __pq_code, <included cols...>]`.
+    const INTERNAL_COLUMNS: &'static [&'static str] = PQ_INTERNAL_COLUMNS;
+
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok(std::iter::once(self.batch.clone()))
     }
@@ -724,12 +735,6 @@ impl VectorStore for ProductQuantizationStorage {
 
     fn schema(&self) -> &SchemaRef {
         self.batch.schema_ref()
-    }
-
-    /// PQ storage is `[_rowid, __pq_code, <included cols...>]`, so the covering
-    /// columns are every field except the row id and the PQ code column.
-    fn covering_field_indices(&self) -> Vec<usize> {
-        covering_field_indices_excluding(self.schema().as_ref(), &[ROW_ID, PQ_CODE_COLUMN])
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

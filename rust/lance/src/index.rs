@@ -44,7 +44,8 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{
     FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmResult, FtsPrewarmSegmentStatus,
-    INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb,
+    vector::VectorIndex,
 };
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -133,6 +134,121 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
         covered_fragments |= fragment_bitmap.clone();
     }
 
+    Ok(())
+}
+
+/// Cross-check a segment's declared covering columns (`included_fields`) against the
+/// covering columns physically present in its V3 auxiliary storage file. The read path
+/// trusts the two to agree: `ANNIvfSubIndexExec` declares its output schema from the
+/// manifest's `included_fields` while the per-partition search emits whatever extra
+/// columns the storage carries, so committing a mismatch fails every subsequent query
+/// on the index.
+///
+/// A segment that declares covering columns MUST have a readable V3 auxiliary file at
+/// the standard location -- covering only exists in the V3 format, so an unreadable
+/// aux file means the declaration cannot be true, and committing it would fail every
+/// covered query at read time. Segments declaring no covering tolerate an unreadable
+/// aux file (legacy formats and non-standard layouts fail loudly at index-open time
+/// regardless, and never carry covering columns).
+async fn validate_segment_covering_against_storage(
+    dataset: &Dataset,
+    scheduler: &Arc<ScanScheduler>,
+    segment: &IndexSegment,
+) -> Result<()> {
+    let declared_ids = segment.included_fields();
+    let is_vector = segment
+        .index_details()
+        .type_url
+        .ends_with("VectorIndexDetails");
+    if !is_vector {
+        if !declared_ids.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segment {} declares covering columns (field ids {:?}) but is not \
+                 a vector index segment; covering columns are only supported on vector indexes",
+                segment.uuid(),
+                declared_ids
+            )));
+        }
+        return Ok(());
+    }
+
+    let aux_path = dataset
+        .indices_dir()
+        .join(segment.uuid().to_string())
+        .join(INDEX_AUXILIARY_FILE_NAME);
+    let reader = match scheduler
+        .open_file(&aux_path, &CachedFileSize::unknown())
+        .await
+    {
+        Ok(file_scheduler) => {
+            lance_file::reader::FileReader::try_open(
+                file_scheduler,
+                None,
+                Default::default(),
+                &dataset.metadata_cache.file_metadata_cache(&aux_path),
+                FileReaderOptions::default(),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(e) => {
+            if !declared_ids.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: segment {} declares covering columns (field ids {:?}) but its \
+                     auxiliary storage could not be opened to cross-check them: {}",
+                    segment.uuid(),
+                    declared_ids,
+                    e
+                )));
+            }
+            return Ok(());
+        }
+    };
+
+    // Compare names *and* Arrow types: the ANN plan declares the covered schema from the
+    // dataset fields while storage emits its own physical fields, so a segment carrying the
+    // right column name at a different type would only fail once a covered query ran.
+    let storage_covering: Vec<(String, DataType)> = reader
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| !vector::RESERVED_STORAGE_COLUMNS.contains(field.name.as_str()))
+        .map(|field| (field.name.clone(), field.data_type()))
+        .collect();
+    let declared_covering = declared_ids
+        .iter()
+        .map(|id| {
+            dataset
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.id == *id)
+                .map(|field| (field.name.clone(), field.data_type()))
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "CreateIndex: segment {} declares covering field id {}, which is not a \
+                         top-level field of the dataset schema (covering columns must be \
+                         top-level)",
+                        segment.uuid(),
+                        id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if storage_covering != declared_covering {
+        return Err(Error::invalid_input(format!(
+            "CreateIndex: segment {} declares covering columns {:?} (field ids {:?}) but its \
+             auxiliary storage carries covering columns {:?}; the declaration and the storage \
+             must match exactly, in both name and type",
+            segment.uuid(),
+            declared_covering,
+            declared_ids,
+            storage_covering
+        )));
+    }
     Ok(())
 }
 
@@ -324,7 +440,29 @@ pub(crate) async fn build_index_metadata_from_segments(
         covered_fragments |= segment.fragment_bitmap().clone();
     }
 
+    // Segments agree with each other (above); now each must also agree with the dataset
+    // schema and then with its own storage. Schema staleness is checked first: it reads
+    // only the manifest and explains *why* a segment is unacceptable (a covered subtree
+    // changed since the build), which is a better diagnostic than the storage cross-check's
+    // raw type comparison for the same segment.
     prune_stale_segment_coverage(dataset, field_id, &mut segments, false, false).await?;
+
+    // Now each segment must agree with its own storage, or the committed `included_fields`
+    // misdescribes the index files. One shared scheduler, validations fanned out, so a
+    // many-segment distributed commit pays a handful of parallel round trips instead of N
+    // serial ones.
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    let validations = segments
+        .iter()
+        .map(|segment| validate_segment_covering_against_storage(dataset, &scheduler, segment))
+        .collect::<Vec<_>>();
+    futures::stream::iter(validations)
+        .buffered(dataset.object_store.io_parallelism())
+        .try_collect::<Vec<_>>()
+        .await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
         let included_fields = segment.included_fields().to_vec();
@@ -7706,11 +7844,14 @@ mod tests {
         );
     }
 
-    /// A covering segment's `included_fields` must survive `commit_existing_index_segments`.
-    /// The segment files still hold the payload, so dropping the declaration would silently
-    /// fall covered queries back to a base-table take.
+    /// A segment whose declared `included_fields` disagree with the covering columns
+    /// physically present in its auxiliary storage must be rejected at commit, in both
+    /// directions: a declaration without payload makes every covered query fail at read
+    /// time (the exec declares a column the storage never emits), and payload without a
+    /// declaration is storage the manifest misdescribes.
     #[tokio::test]
-    async fn test_commit_existing_index_segments_preserves_included_fields() {
+    async fn test_commit_existing_index_segments_rejects_covering_storage_desync() {
+        use crate::index::vector::VectorIndexParams;
         use lance_datagen::{BatchCount, RowCount, array};
 
         let test_dir = tempfile::tempdir().unwrap();
@@ -7722,23 +7863,155 @@ mod tests {
                 "vector",
                 array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
             )
-            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
-
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 10,
-                max_rows_per_group: 10,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
         let id_field_id = dataset.schema().field("id").unwrap().id;
-        // A real covered segment: its auxiliary storage physically holds the "id"
-        // payload, which the commit-boundary cross-check verifies.
+
+        // Direction 1: storage built WITHOUT covering, declaration fabricated.
+        let params = VectorIndexParams::ivf_pq(2, 8, 4, lance_linalg::distance::MetricType::L2, 2);
+        let mut plain_segment = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        assert!(plain_segment.included_fields.is_empty());
+        plain_segment.included_fields = vec![id_field_id];
+        let err = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&plain_segment)],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("covering"),
+            "declaring covering absent from storage must fail loudly: {err}"
+        );
+
+        // Direction 2: storage built WITH covering, declaration dropped.
+        let mut covered_params =
+            VectorIndexParams::ivf_pq(2, 8, 4, lance_linalg::distance::MetricType::L2, 2);
+        covered_params.include_columns(vec!["id".to_string()]);
+        let mut covered_segment = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &covered_params)
+            .name("vector_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        assert_eq!(covered_segment.included_fields, vec![id_field_id]);
+        covered_segment.included_fields = Vec::new();
+        let err = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&covered_segment)],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("covering"),
+            "storage carrying undeclared covering columns must fail loudly: {err}"
+        );
+
+        // Sanity: the honest covered segment commits fine, and the declaration survives the
+        // round trip. That matters beyond bookkeeping -- the segment files still hold the
+        // payload, so losing the declaration would silently drop covered queries back to a
+        // base-table take.
+        covered_segment.included_fields = vec![id_field_id];
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&covered_segment)],
+            )
+            .await
+            .unwrap();
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].included_fields, vec![id_field_id]);
+    }
+
+    /// A segment that declares covering columns but has no readable V3 auxiliary
+    /// storage must be rejected at commit: covering only exists in the V3 format, so
+    /// the declaration cannot be true, and committing it would fail every covered
+    /// query at read time.
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_covered_segment_without_storage() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        // A fabricated segment with no auxiliary file at all.
+        let mut seg = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        seg.included_fields = vec![id_field_id];
+
+        let err = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .expect_err("covering declared without readable auxiliary storage must be rejected");
+        assert!(
+            err.to_string().contains("could not be opened"),
+            "expected an unreadable-storage rejection, got: {err}"
+        );
+    }
+
+    /// A segment whose storage carries the declared covering column under the right *name*
+    /// but the wrong Arrow *type* must be rejected at commit. The plan declares the covered
+    /// schema from the dataset field while storage emits its own physical field, so a type
+    /// disagreement would surface later as a query-time schema mismatch.
+    ///
+    /// This state is unreachable through the dataset APIs -- an `alter_columns` cast assigns
+    /// the field a new id, which the top-level-id check already rejects -- so it is reproduced
+    /// the only way it can occur in practice: an externally authored segment, which is exactly
+    /// what `commit_existing_index_segments` accepts.
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_covered_type_mismatch() {
+        use arrow_array::Int64Array;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_file::writer::FileWriterOptions;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        assert_eq!(
+            dataset.schema().field("id").unwrap().data_type(),
+            DataType::Int32
+        );
+
         let mut params = crate::index::vector::VectorIndexParams::ivf_flat(
             1,
             lance_linalg::distance::MetricType::L2,
@@ -7750,23 +8023,47 @@ mod tests {
             .execute_uncommitted()
             .await
             .unwrap();
-        assert_eq!(seg.included_fields, vec![id_field_id]);
+        assert!(!seg.included_fields.is_empty());
 
-        dataset
+        // Replace the segment's auxiliary storage with one carrying `id` as Int64 -- the
+        // covering column under the declared name, but not the dataset's type.
+        let aux_path = dataset
+            .indices_dir()
+            .join(seg.uuid.to_string())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let arrow_schema = arrow_schema::Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let lance_schema = lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap();
+        let mut writer = lance_file::versions::create_writer(
+            lance_file::version::ConcreteFileVersion::V2_1,
+            dataset.object_store.create(&aux_path).await.unwrap(),
+            (&lance_schema).try_into().unwrap(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer
+            .write_batch(
+                &RecordBatch::try_new(
+                    Arc::new(arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![0_i64; 10]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let err = dataset
             .commit_existing_index_segments(
                 "vector_idx",
                 "vector",
                 vec![segment_from_metadata(&seg)],
             )
             .await
-            .unwrap();
-
-        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
-        assert_eq!(committed.len(), 1);
-        assert_eq!(
-            committed[0].included_fields,
-            vec![id_field_id],
-            "committed segment must preserve its covering `included_fields`"
+            .expect_err("covering storage whose column type diverged must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("Int32") && message.contains("Int64"),
+            "rejection must name both the dataset and storage types, got: {message}"
         );
     }
 

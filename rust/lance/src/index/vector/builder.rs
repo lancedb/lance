@@ -42,7 +42,7 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
-use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::storage::{COVERING_FIELD_IDS_KEY, STORAGE_METADATA_KEY};
 use lance_index::vector::transform::Flatten;
 use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader, create_ivf_shuffler};
 use lance_index::vector::v3::subindex::SubIndexType;
@@ -83,6 +83,7 @@ use crate::Dataset;
 use crate::dataset::ProjectionRequest;
 use crate::dataset::index::dataset_format_version;
 use crate::index::append::build_old_data_filter;
+use crate::index::vector::RESERVED_STORAGE_COLUMNS;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::infer_vector_dim;
 
@@ -111,6 +112,36 @@ fn append_covering_by_row_id(
         batch = batch.try_with_column(field.as_ref().clone(), col)?;
     }
     Ok(batch)
+}
+
+/// Drop covering ("included") columns that the index metadata does not declare.
+///
+/// A writer predating `FLAG_COVERED_INDEX_METADATA` can clear `included_fields` while the
+/// auxiliary storage keeps the payload -- the degraded state that flag documents. Existing
+/// partition storage then still carries those columns while freshly scanned rows do not
+/// (the scan projects only what the metadata declares), and `StorageBuilder::build` rejects
+/// the width mismatch, leaving a readable index that can never be merge-optimized again.
+/// The manifest declaration is the source of truth here, exactly as it is on the read path,
+/// so narrow storage down to it rather than widening the fresh side -- widening would
+/// re-materialize a payload the metadata does not advertise.
+///
+/// A no-op in the healthy case: storage and `declared` agree, so nothing is projected away.
+fn drop_undeclared_covering(batch: RecordBatch, declared: &[String]) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let keep: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| {
+            RESERVED_STORAGE_COLUMNS.contains(field.name().as_str())
+                || declared.iter().any(|name| name == field.name())
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    if keep.len() == batch.num_columns() {
+        return Ok(batch);
+    }
+    Ok(batch.project(&keep)?)
 }
 
 /// Build a new centroid array that incorporates the results of partition splits.
@@ -715,6 +746,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             return Err(Error::invalid_input("dataset not set before shuffling"));
         };
 
+        let mut from_precomputed_buffers = false;
         let stream = match self
             .ivf_params
             .as_ref()
@@ -731,6 +763,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             .to_string(),
                     ));
                 }
+                from_precomputed_buffers = true;
                 let uri = to_local_path(uri);
                 // the uri points to data directory,
                 // so need to trim the "data" suffix for reading the dataset
@@ -772,10 +805,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         };
 
-        if let Some((row_id_idx, _)) = stream.schema().column_with_name("row_id") {
-            // When using precomputed shuffle buffers we can't use the column name _rowid
-            // since it is reserved.  So we tolerate `row_id` as well here (and rename it
-            // to _rowid to match the non-precomputed path)
+        // Scoped to the precomputed-buffer path on purpose. Those buffers cannot name a
+        // column `_rowid` (reserved), so they materialize it as `row_id` and it is renamed
+        // back here to match the non-precomputed path. The ordinary scan above already
+        // produces a real `_rowid` via `with_row_id()`, and it now also projects the
+        // covering columns -- so renaming there would rewrite a *user* column named
+        // `row_id` on top of the real one and fail index creation with
+        // `Duplicate field name "_rowid" in schema`.
+        if from_precomputed_buffers
+            && let Some((row_id_idx, _)) = stream.schema().column_with_name("row_id")
+        {
             self.shuffle_data(Some(Self::rename_row_id(stream, row_id_idx)))
                 .await?;
         } else {
@@ -1049,6 +1088,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // Covering builds may re-scan a pruned fragment that still lives in old
         // storage; drop the stale duplicate row ids during the partition read.
         let dedup_existing = !self.include_columns.is_empty();
+        // The covering set this build declares. Existing storage may be WIDER (see
+        // `drop_undeclared_covering`); narrow it so every batch handed to
+        // `StorageBuilder::build` agrees on width.
+        let declared_covering = Arc::new(self.include_columns.clone());
         let partition_adjustment = Arc::new(partition_adjustment);
         let build_iter =
             assign_batches
@@ -1063,6 +1106,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let column = column.clone();
                     let frag_reuse_index = frag_reuse_index.clone();
                     let dedup_existing = dedup_existing;
+                    let declared_covering = declared_covering.clone();
                     let partition_adjustment = partition_adjustment.clone();
                     async move {
                         let (is_affected, split_reader) = match partition_adjustment.as_ref() {
@@ -1119,6 +1163,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             batches.extend(extra);
                             loss += extra_loss;
                         }
+
+                        // Existing storage can carry covering columns this build does not
+                        // declare; narrow before the fresh rows join them below.
+
+                        batches = batches
+                            .into_iter()
+                            .map(|batch| drop_undeclared_covering(batch, &declared_covering))
+                            .collect::<Result<Vec<_>>>()?;
 
                         spawn_cpu(move || {
                             // Apply assign_batch for join operations (splits no
@@ -1365,6 +1417,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .collect()
     }
 
+    /// The *source dataset* field ids of the covering columns, in declaration order.
+    /// Stamped into the storage file (see [`COVERING_FIELD_IDS_KEY`]) so a distributed
+    /// merge can tell shards that cover the same logical fields from shards whose
+    /// covering columns merely share a name and type.
+    fn covering_field_ids(&self) -> Vec<i32> {
+        let Some(ds) = self.dataset.as_ref() else {
+            return Vec::new();
+        };
+        self.include_columns
+            .iter()
+            .filter_map(|name| ds.schema().field(name).map(|field| field.id))
+            .collect()
+    }
+
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
     async fn merge_partitions(
         &mut self,
@@ -1588,6 +1654,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             STORAGE_METADATA_KEY,
             serde_json::to_string(&storage_partition_metadata)?,
         );
+        let covering_field_ids = self.covering_field_ids();
+        if !covering_field_ids.is_empty() {
+            storage_writer.add_schema_metadata(
+                COVERING_FIELD_IDS_KEY,
+                covering_field_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
 
         let index_type_str = index_type_string(S::name().try_into()?, Q::quantization_type());
         if let Some(idx_type) = SupportedIvfIndexType::from_index_type_str(&index_type_str) {

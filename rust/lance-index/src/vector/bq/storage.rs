@@ -65,7 +65,6 @@ use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{
     DistCalculator, DistanceCalculatorOptions, QueryResidual, RabitRawQueryContext, VectorStore,
-    covering_field_indices_excluding,
 };
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
@@ -78,6 +77,25 @@ pub const RABIT_EX_CODE_COLUMN: &str = "__ex_codes";
 /// older versions, which fail with a missing-column error instead of
 /// misinterpreting the bytes.
 pub const RABIT_BLOCKED_EX_CODE_COLUMN: &str = "__blocked_ex_codes";
+/// RaBitQ storage's internal (non-covering) column names: the row id, the binary code
+/// and extended-bit code columns, the per-row factor columns (some present only for
+/// higher `num_bits`), and the legacy `__ivf_part_id` column (left in pre-#3606
+/// single-partition builds; unlike PQ, RaBitQ storage does not drop it at
+/// construction). Every other column is a user-declared covering ("included") column.
+/// The single authority for this set -- the distributed shard merger classifies from
+/// it too, so a new factor column added here is excluded everywhere at once.
+pub const RABIT_INTERNAL_COLUMNS: &[&str] = &[
+    ROW_ID,
+    RABIT_CODE_COLUMN,
+    RABIT_EX_CODE_COLUMN,
+    RABIT_BLOCKED_EX_CODE_COLUMN,
+    ADD_FACTORS_COLUMN,
+    SCALE_FACTORS_COLUMN,
+    ERROR_FACTORS_COLUMN,
+    EX_ADD_FACTORS_COLUMN,
+    EX_SCALE_FACTORS_COLUMN,
+    PART_ID_COLUMN,
+];
 pub const SEGMENT_LENGTH: usize = 4;
 pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
 const RABIT_PRUNE_STATS_ENV: &str = "LANCE_RQ_PRUNE_STATS";
@@ -2042,35 +2060,15 @@ fn accumulate_filtered_distances_into_heap(
 impl VectorStore for RabitQuantizationStorage {
     type DistanceCalculator<'a> = RabitDistCalculator<'a>;
 
+    /// RaBitQ storage is `[_rowid, <code/factor cols...>, <included cols...>]`.
+    const INTERNAL_COLUMNS: &'static [&'static str] = RABIT_INTERNAL_COLUMNS;
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn schema(&self) -> &SchemaRef {
         self.batch.schema_ref()
-    }
-
-    /// RQ storage carries the row id plus many internal columns (the binary codes, the
-    /// extended-bit codes, and the per-row factor columns, some present only for higher
-    /// `num_bits`); the covering ("included") columns are everything else.
-    fn covering_field_indices(&self) -> Vec<usize> {
-        // Every RaBitQ-internal column plus the legacy `__ivf_part_id` column
-        // (left in pre-#3606 single-partition builds; unlike PQ, RaBitQ storage
-        // does not drop it at construction, so it is excluded here). Anything
-        // else is a user-declared covering column.
-        const INTERNAL: &[&str] = &[
-            ROW_ID,
-            RABIT_CODE_COLUMN,
-            RABIT_EX_CODE_COLUMN,
-            RABIT_BLOCKED_EX_CODE_COLUMN,
-            ADD_FACTORS_COLUMN,
-            SCALE_FACTORS_COLUMN,
-            ERROR_FACTORS_COLUMN,
-            EX_ADD_FACTORS_COLUMN,
-            EX_SCALE_FACTORS_COLUMN,
-            PART_ID_COLUMN,
-        ];
-        covering_field_indices_excluding(self.schema().as_ref(), INTERNAL)
     }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send> {

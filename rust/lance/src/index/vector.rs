@@ -71,6 +71,29 @@ use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stag
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
 
+/// Names a user column can never take inside vector index storage: the union of every
+/// storage's exported internal set (row id, partition id, each quantizer's code/factor
+/// columns -- extending any `*_INTERNAL_COLUMNS` const extends this set automatically)
+/// plus the pipeline-transient names that never reach storage (the distance column and
+/// the IVF partition transform's `__centroid_dist`). Used both to reject reserved names
+/// in `include_columns` at create time and to classify which columns of an index
+/// storage schema are covering ("included") payload.
+pub(crate) static RESERVED_STORAGE_COLUMNS: std::sync::LazyLock<
+    std::collections::HashSet<&'static str>,
+> = std::sync::LazyLock::new(|| {
+    lance_index::vector::pq::storage::PQ_INTERNAL_COLUMNS
+        .iter()
+        .chain(lance_index::vector::sq::storage::SQ_INTERNAL_COLUMNS)
+        .chain(lance_index::vector::flat::storage::FLAT_INTERNAL_COLUMNS)
+        .chain(lance_index::vector::bq::storage::RABIT_INTERNAL_COLUMNS)
+        .chain(&[
+            lance_index::vector::DIST_COL,
+            lance_index::vector::CENTROID_DIST_COLUMN,
+        ])
+        .copied()
+        .collect()
+});
+
 /// A materialized snapshot of one logical vector index and all of its segments.
 #[derive(Debug)]
 pub struct LogicalVectorIndex {
@@ -618,6 +641,79 @@ async fn prepare_vector_segment_build(
     Ok((element_type, index_type, ivf_params, shuffler))
 }
 
+/// Validate `include_columns` (covering columns) at the API boundary, before any build.
+/// Rejects non-V3 format, nested/dotted names, the indexed vector column itself, names that
+/// collide with a build pipeline's internal storage/transform columns, duplicates, missing
+/// columns, and blob columns. Shared by the single-node and distributed vector build paths so
+/// the reserved-name list lives in one place. No-op when no covering columns are configured.
+fn validate_include_columns(
+    params: &VectorIndexParams,
+    dataset: &Dataset,
+    column: &str,
+) -> Result<()> {
+    if params.include_columns.is_empty() {
+        return Ok(());
+    }
+
+    // Covering ("included") columns require the V3 index file format: only the V3
+    // covering-aware storages preserve the extra columns row-aligned and report them via
+    // `covering_field_indices`. Every vector index type supports covering at V3, so reject
+    // only legacy/non-V3 builds up front -- otherwise the build silently ignores the option
+    // while `included_fields` still lands in the index metadata, and the search exec then
+    // declares a covered schema the storage cannot emit.
+    if !matches!(params.version, IndexFileVersion::V3) {
+        return Err(Error::invalid_input(format!(
+            "include_columns (covering columns) requires index file version V3, but got {:?}",
+            params.version
+        )));
+    }
+
+    // A covering column is stored inline in the index, row-aligned with the code, and
+    // projected by name from the source batch. Reject columns that cannot satisfy that
+    // contract up front (otherwise the build fails deep in projection, or -- worse --
+    // stores unusable data): nested/dotted paths (the covering gather projects only
+    // top-level names) and blob columns (which store out-of-line descriptors, not inline
+    // data).
+    let mut seen_include = std::collections::HashSet::with_capacity(params.include_columns.len());
+    for name in &params.include_columns {
+        if name.contains('.') {
+            return Err(Error::invalid_input(format!(
+                "include_columns: nested/dotted covering column '{name}' is not supported; only \
+                 top-level columns can be covered"
+            )));
+        }
+        if name == column {
+            return Err(Error::invalid_input(format!(
+                "include_columns: covering column '{name}' is the indexed vector column itself; it \
+                 is stored as the quantization code, not a covered payload"
+            )));
+        }
+        if RESERVED_STORAGE_COLUMNS.contains(&name.as_str()) {
+            return Err(Error::invalid_input(format!(
+                "include_columns: covering column '{name}' collides with a reserved index storage \
+                 column name"
+            )));
+        }
+        if !seen_include.insert(name.as_str()) {
+            return Err(Error::invalid_input(format!(
+                "include_columns: duplicate covering column '{name}'"
+            )));
+        }
+        let field = dataset.schema().field(name).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "include_columns: covering column '{name}' does not exist in the dataset schema"
+            ))
+        })?;
+        if field.is_blob() {
+            return Err(Error::invalid_input(format!(
+                "include_columns: covering column '{name}' is a blob column; blob columns cannot be \
+                 covered by a vector index"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build a Distributed Vector Index for specific fragments
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip(dataset))]
@@ -631,18 +727,15 @@ pub(crate) async fn build_distributed_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
-    // The distributed shard builders and the distributed merger have no covering-column
-    // plumbing: each shard would write storage without the payload while the committed
-    // metadata still advertises `included_fields`, desyncing the two. Reject covering on
-    // this path up front rather than publishing an inconsistent index.
-    if !params.include_columns.is_empty() {
-        return Err(Error::invalid_input(
-            "include_columns (covering columns) are not supported for distributed vector index \
-             builds (precomputed IVF centroids with a fragment subset). Build the covered index \
-             without a fragment restriction / precomputed IVF."
-                .to_string(),
-        ));
-    }
+    // Each shard reuses `IvfIndexBuilder`, which threads `include_columns` through its
+    // projection and per-partition storage exactly like the single-node build (the shard is
+    // just a precomputed-IVF, fragment-filtered build). Validate the covering columns up
+    // front, same as the single-node path, then thread them into each shard builder below so
+    // the segment storage carries the payload the committed `included_fields` advertises.
+    // The cross-shard segment merger carries covering too (`merge_partial_vector_auxiliary_files`
+    // appends the covering fields to each writer's schema and rejects shards whose covering sets
+    // disagree), so both per-segment commit and merged builds are covered.
+    validate_include_columns(params, dataset, column)?;
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -720,6 +813,7 @@ pub(crate) async fn build_distributed_vector_index(
                     frag_reuse_index,
                 )?
                 .with_ivf(ivf_model)
+                .with_include_columns(params.include_columns.clone())
                 .with_fragment_filter(fragment_filter)
                 .with_progress(progress.clone())
                 .build()
@@ -741,6 +835,7 @@ pub(crate) async fn build_distributed_vector_index(
                     frag_reuse_index,
                 )?
                 .with_ivf(ivf_model)
+                .with_include_columns(params.include_columns.clone())
                 .with_fragment_filter(fragment_filter)
                 .with_progress(progress.clone())
                 .build()
@@ -790,6 +885,7 @@ pub(crate) async fn build_distributed_vector_index(
                     // For distributed shards, keep PQ codes in row-major layout.
                     // A single transpose is performed in the distributed merge stage.
                     .with_transpose(false)
+                    .with_include_columns(params.include_columns.clone())
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
                     .build()
@@ -817,6 +913,7 @@ pub(crate) async fn build_distributed_vector_index(
                 (),
                 frag_reuse_index,
             )?
+            .with_include_columns(params.include_columns.clone())
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
             .build()
@@ -845,6 +942,7 @@ pub(crate) async fn build_distributed_vector_index(
                         hnsw_params.clone(),
                         frag_reuse_index,
                     )?
+                    .with_include_columns(params.include_columns.clone())
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
                     .build()
@@ -863,6 +961,7 @@ pub(crate) async fn build_distributed_vector_index(
                         hnsw_params.clone(),
                         frag_reuse_index,
                     )?
+                    .with_include_columns(params.include_columns.clone())
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
                     .build()
@@ -905,6 +1004,7 @@ pub(crate) async fn build_distributed_vector_index(
             // For distributed shards, keep PQ codes in row-major layout.
             // A single transpose is performed in the distributed merge stage.
             .with_transpose(false)
+            .with_include_columns(params.include_columns.clone())
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
             .build()
@@ -936,6 +1036,7 @@ pub(crate) async fn build_distributed_vector_index(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_include_columns(params.include_columns.clone())
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
             .build()
@@ -968,6 +1069,7 @@ pub(crate) async fn build_distributed_vector_index(
             // For distributed shards, keep RQ codes in row-major layout.
             // A single packing pass is performed in the distributed merge stage.
             .with_transpose(false)
+            .with_include_columns(params.include_columns.clone())
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
             .build()
@@ -1056,86 +1158,7 @@ async fn build_vector_index_impl(
     .await?;
     let stages = &params.stages;
 
-    // Covering ("included") columns require the V3 index file format: only the V3
-    // covering-aware storages preserve the extra columns row-aligned and report them via
-    // `covering_field_indices`. Every vector index type supports covering at V3, so reject
-    // only legacy/non-V3 builds up front -- otherwise the build silently ignores the option
-    // while `included_fields` still lands in the index metadata, and the search exec then
-    // declares a covered schema the storage cannot emit.
-    if !params.include_columns.is_empty() && !matches!(params.version, IndexFileVersion::V3) {
-        return Err(Error::invalid_input(format!(
-            "include_columns (covering columns) requires index file version V3, but got {:?}",
-            params.version
-        )));
-    }
-
-    // A covering column is stored inline in the index, row-aligned with the code, and
-    // projected by name from the source batch. Reject columns that cannot satisfy that
-    // contract up front (otherwise the build fails deep in projection, or -- worse --
-    // stores unusable data): nested/dotted paths (the covering gather projects only
-    // top-level names) and blob columns (which store out-of-line descriptors, not inline
-    // data).
-    // Names that collide with a build pipeline's own internal columns. Covering one would
-    // advertise a column in `included_fields` that the storage's `covering_field_indices`
-    // excludes (so a covered query declares a column storage never emits), or fail deep in
-    // the quantizer transform. This check runs before the `match index_type` below, so it
-    // must list the *union* of every pipeline's internal names -- the row id, distance,
-    // partition id, each quantizer's code column, RaBitQ's extended-code and per-row factor
-    // columns, and the IVF partition transform's transient `__centroid_dist`.
-    const RESERVED_STORAGE_COLUMNS: &[&str] = &[
-        lance_core::ROW_ID,
-        lance_index::vector::DIST_COL,
-        lance_index::vector::PART_ID_COLUMN,
-        lance_index::vector::CENTROID_DIST_COLUMN,
-        lance_index::vector::PQ_CODE_COLUMN,
-        lance_index::vector::SQ_CODE_COLUMN,
-        lance_index::vector::flat::storage::FLAT_COLUMN,
-        lance_index::vector::bq::storage::RABIT_CODE_COLUMN,
-        lance_index::vector::bq::storage::RABIT_EX_CODE_COLUMN,
-        lance_index::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN,
-        lance_index::vector::bq::transform::ADD_FACTORS_COLUMN,
-        lance_index::vector::bq::transform::SCALE_FACTORS_COLUMN,
-        lance_index::vector::bq::transform::ERROR_FACTORS_COLUMN,
-        lance_index::vector::bq::transform::EX_ADD_FACTORS_COLUMN,
-        lance_index::vector::bq::transform::EX_SCALE_FACTORS_COLUMN,
-    ];
-    let mut seen_include = std::collections::HashSet::with_capacity(params.include_columns.len());
-    for name in &params.include_columns {
-        if name.contains('.') {
-            return Err(Error::invalid_input(format!(
-                "include_columns: nested/dotted covering column '{name}' is not supported; only \
-                 top-level columns can be covered"
-            )));
-        }
-        if name == column {
-            return Err(Error::invalid_input(format!(
-                "include_columns: covering column '{name}' is the indexed vector column itself; it \
-                 is stored as the quantization code, not a covered payload"
-            )));
-        }
-        if RESERVED_STORAGE_COLUMNS.contains(&name.as_str()) {
-            return Err(Error::invalid_input(format!(
-                "include_columns: covering column '{name}' collides with a reserved index storage \
-                 column name"
-            )));
-        }
-        if !seen_include.insert(name.as_str()) {
-            return Err(Error::invalid_input(format!(
-                "include_columns: duplicate covering column '{name}'"
-            )));
-        }
-        let field = dataset.schema().field(name).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "include_columns: covering column '{name}' does not exist in the dataset schema"
-            ))
-        })?;
-        if field.is_blob() {
-            return Err(Error::invalid_input(format!(
-                "include_columns: covering column '{name}' is a blob column; blob columns cannot be \
-                 covered by a vector index"
-            )));
-        }
-    }
+    validate_include_columns(params, dataset, column)?;
 
     match index_type {
         IndexType::IvfFlat => match element_type {
@@ -2074,6 +2097,11 @@ pub async fn initialize_vector_index(
         })
         .collect::<Result<Vec<_>>>()?;
     params.include_columns(included_columns);
+    // Validate against the TARGET dataset, not the source: the names resolve there, but
+    // the column they resolve to may be a different kind (a blob, a reserved storage name,
+    // a non-V3 build). Without this, the two ordinary build entry points would reject a
+    // covering set that this cross-dataset path silently accepts.
+    validate_include_columns(&params, target_dataset, column_name)?;
 
     let new_uuid = Uuid::new_v4();
     let frag_reuse_index = target_dataset
@@ -2741,6 +2769,97 @@ mod tests {
         }
     }
 
+    /// `initialize_vector_index` re-resolves the source index's covering columns
+    /// against the TARGET schema, so a name that was valid to cover in the source can
+    /// resolve to something that is not coverable in the target. It must run the same
+    /// validation the two ordinary build entry points do, or it silently materializes
+    /// (here) blob descriptor structs as the covered payload.
+    #[tokio::test]
+    async fn test_initialize_vector_index_validates_covering_against_target() {
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
+
+        // Source: `payload` is an ordinary binary column, perfectly coverable.
+        let source_reader = lance_datagen::gen_batch()
+            .col("payload", array::rand_type(&ArrowDataType::LargeBinary))
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 20);
+        params.include_columns(vec!["payload".to_string()]);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vidx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_index = source_dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|i| i.name == "vidx")
+            .unwrap()
+            .clone();
+
+        // Target: same column name, same arrow type -- but declared a blob, so it
+        // stores out-of-line descriptors rather than inline data.
+        let rows = 300usize;
+        let payload: arrow_array::ArrayRef =
+            Arc::new(arrow_array::LargeBinaryArray::from_iter_values(
+                (0..rows).map(|i| format!("v{i}").into_bytes()),
+            ));
+        let vectors: arrow_array::ArrayRef = Arc::new(
+            arrow_array::FixedSizeListArray::try_new_from_values(
+                arrow_array::Float32Array::from(vec![0.5f32; rows * 32]),
+                32,
+            )
+            .unwrap(),
+        );
+        let blob_field = Field::new("payload", ArrowDataType::LargeBinary, true).with_metadata(
+            [(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let target_schema = Arc::new(ArrowSchema::new(vec![
+            blob_field,
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(target_schema.clone(), vec![payload, vectors]).unwrap();
+        let target_reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)], target_schema.clone());
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+        assert!(
+            target_dataset.schema().field("payload").unwrap().is_blob(),
+            "test setup must give the target a blob 'payload', or this test proves nothing"
+        );
+
+        let err = initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            &source_index,
+            &["vector"],
+        )
+        .await
+        .expect_err("covering a blob column in the target must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blob") && msg.contains("payload"),
+            "error should name the offending blob covering column; was: {msg}"
+        );
+    }
+
     /// Copying/importing a covered index into another dataset (initialize) must
     /// rebuild the target storage WITH the covering columns, not just copy the
     /// `included_fields` metadata -- otherwise the target advertises covering
@@ -3110,47 +3229,6 @@ mod tests {
             result.is_ok(),
             "Expected Ok for invalid fragment ids, got {:?}",
             result
-        );
-    }
-
-    /// The distributed build + merge path has no covering-column plumbing, so it must
-    /// reject `include_columns` up front rather than publish an index whose metadata
-    /// advertises columns the shard files do not contain.
-    #[tokio::test]
-    async fn test_build_distributed_rejects_include_columns() {
-        let test_dir = TempStrDir::default();
-        let uri = format!("{}/ds", test_dir.as_str());
-
-        let reader = lance_datagen::gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
-        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
-
-        let mut params = VectorIndexParams::ivf_flat(4, MetricType::L2);
-        params.include_columns(vec!["id".to_string()]);
-
-        let result = build_distributed_vector_index(
-            &dataset,
-            "vector",
-            "vector_dist",
-            Uuid::new_v4(),
-            &params,
-            None,
-            &[0],
-            noop_progress(),
-        )
-        .await;
-
-        assert!(
-            matches!(&result, Err(Error::InvalidInput { .. })),
-            "distributed build must reject include_columns, got {:?}",
-            result
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("include_columns") && msg.contains("distributed"),
-            "error should mention include_columns and the distributed path; got: {msg}"
         );
     }
 

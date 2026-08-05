@@ -31,15 +31,19 @@ use crate::{
     vector::{
         PART_ID_COLUMN, SQ_CODE_COLUMN,
         quantizer::{QuantizerMetadata, QuantizerStorage},
-        storage::{
-            DistCalculator, DistanceCalculatorOptions, QueryResidual, VectorStore,
-            covering_field_indices_excluding,
-        },
+        storage::{DistCalculator, DistanceCalculatorOptions, QueryResidual, VectorStore},
         transform::Transformer,
     },
 };
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
+
+/// SQ storage's internal (non-covering) column names: the row id, the SQ code column,
+/// and the legacy `__ivf_part_id` column (left in pre-#3606 single-partition builds;
+/// unlike PQ, SQ does not drop it at construction). Every other column in an SQ
+/// storage schema is a user-declared covering ("included") column. The single
+/// authority for this set -- the distributed shard merger classifies from it too.
+pub const SQ_INTERNAL_COLUMNS: &[&str] = &[ROW_ID, SQ_CODE_COLUMN, PART_ID_COLUMN];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScalarQuantizationMetadata {
@@ -317,6 +321,9 @@ impl QuantizerStorage for ScalarQuantizationStorage {
 impl VectorStore for ScalarQuantizationStorage {
     type DistanceCalculator<'a> = SQDistCalculator<'a>;
 
+    /// SQ storage is `[_rowid, __sq_code, <included cols...>]`.
+    const INTERNAL_COLUMNS: &'static [&'static str] = SQ_INTERNAL_COLUMNS;
+
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok(self.chunks.iter().map(|c| c.batch.clone()))
     }
@@ -343,17 +350,6 @@ impl VectorStore for ScalarQuantizationStorage {
 
     fn schema(&self) -> &SchemaRef {
         self.chunks[0].schema()
-    }
-
-    /// SQ storage is `[_rowid, __sq_code, <included cols...>]`, so the covering
-    /// columns are every field except the row id, the SQ code column, and the
-    /// legacy `__ivf_part_id` column (left in pre-#3606 single-partition builds;
-    /// unlike PQ, SQ does not drop it at construction, so it is excluded here).
-    fn covering_field_indices(&self) -> Vec<usize> {
-        covering_field_indices_excluding(
-            self.schema().as_ref(),
-            &[ROW_ID, SQ_CODE_COLUMN, PART_ID_COLUMN],
-        )
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

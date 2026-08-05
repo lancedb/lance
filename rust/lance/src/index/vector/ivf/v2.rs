@@ -2373,6 +2373,36 @@ mod tests {
         assert_eq!(capacity.u32, 0);
     }
 
+    /// Vector values laid out as `num_clusters` well-separated clusters: row `r` lands in
+    /// cluster `r % num_clusters`, centred at `cluster * 1000.0` with a tiny per-row offset
+    /// so no two rows coincide.
+    ///
+    /// **The separation is load-bearing, not cosmetic.** `early_pruning` RAISES
+    /// `minimum_nprobes` to the number of centroids within `dists[0] * factor` (7.0 for
+    /// `k` in 2..=10, 81.0 for `k >= 11`). With evenly-spread vectors every centroid
+    /// survives pruning, so `minimum_nprobes` reaches `maximum_nprobes`, `late_search`
+    /// returns at its first guard, and the no-rows shortcut -- and therefore the covered
+    /// recovery path -- is never reached. A test targeting either then passes vacuously
+    /// against a live bug, which has happened repeatedly on this feature. With these
+    /// clusters a query at the origin is ~10^6 times closer to cluster 0 than to any
+    /// other, so pruning yields 1 and unsearched partitions remain.
+    ///
+    /// See also `generate_clustered_batch`, the pre-existing generator used by the
+    /// non-covering partition-split tests; it emits a different schema and is not a
+    /// drop-in substitute here.
+    fn clustered_vector_values(
+        rows: impl IntoIterator<Item = usize>,
+        dim: i32,
+        num_clusters: usize,
+    ) -> Vec<f32> {
+        rows.into_iter()
+            .flat_map(|r| {
+                let center = (r % num_clusters) as f32 * 1000.0;
+                (0..dim as usize).map(move |d| center + (r * dim as usize + d) as f32 * 1e-3)
+            })
+            .collect()
+    }
+
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
         test_uri: &str,
         range: Range<T::Native>,
@@ -3271,12 +3301,7 @@ mod tests {
         // Two well-separated clusters so early pruning keeps minimum_nprobes at 1:
         // the recovery path only fires where the non-covered shortcut would (an
         // all-partitions-searched query returns only found rows on both).
-        let values: Vec<f32> = (0..n)
-            .flat_map(|r| {
-                let center = if r % 2 == 0 { 0.0f32 } else { 1000.0 };
-                (0..dim as usize).map(move |d| center + (r * dim as usize + d) as f32 * 1e-3)
-            })
-            .collect();
+        let values: Vec<f32> = clustered_vector_values(0..n, dim, 2);
         let validity: Vec<bool> = (0..n).map(|i| i >= n_rare).collect();
         let vector = FixedSizeListArray::new(
             Arc::new(Field::new("item", DataType::Float32, true)),
@@ -3393,12 +3418,7 @@ mod tests {
         let cats: Vec<&str> = (0..n).map(|_| "x").collect();
         // Two well-separated clusters so early pruning keeps minimum_nprobes at 1
         // (see test_ivf_covered_recovers_null_vector_prefilter_rows).
-        let values: Vec<f32> = (0..n)
-            .flat_map(|r| {
-                let center = if r % 2 == 0 { 0.0f32 } else { 1000.0 };
-                (0..dim as usize).map(move |d| center + (r * dim as usize + d) as f32 * 1e-3)
-            })
-            .collect();
+        let values: Vec<f32> = clustered_vector_values(0..n, dim, 2);
         let validity: Vec<bool> = (0..n).map(|i| i >= n_null).collect();
         let vector = FixedSizeListArray::new(
             Arc::new(Field::new("item", DataType::Float32, true)),
@@ -3511,8 +3531,13 @@ mod tests {
         ]));
 
         let make_batch = |ids: Vec<i32>, null_rows: &[i32]| {
-            let n = ids.len();
-            let values: Vec<f32> = (0..n * dim as usize).map(|i| i as f32 + 1.0).collect();
+            // Two well-separated clusters. Recovery is only reachable while
+            // `minimum_nprobes < maximum_nprobes`, and `early_pruning` raises the minimum to
+            // the number of centroids within `dists[0] * 7.0` (k = 10). Points strung along
+            // a line leave those centroids only ~7.5x apart -- a margin thin enough that a
+            // different kmeans outcome silently disables the path this test exists to cover.
+            let values: Vec<f32> =
+                clustered_vector_values(ids.iter().map(|id| *id as usize), dim, 2);
             let validity: Vec<bool> = ids.iter().map(|id| !null_rows.contains(id)).collect();
             let vector = FixedSizeListArray::new(
                 Arc::new(Field::new("item", DataType::Float32, true)),
@@ -3634,13 +3659,8 @@ mod tests {
         // Two separated clusters so `early_pruning` leaves an unsearched partition and the
         // late-search shortcut (which arms the covered recovery) is reachable.
         let make_batch = |ids: Vec<i32>| {
-            let values: Vec<f32> = ids
-                .iter()
-                .flat_map(|id| {
-                    let center = if id % 2 == 0 { 0.0f32 } else { 1000.0 };
-                    (0..dim as usize).map(move |d| center + (*id as usize * 4 + d) as f32 * 1e-3)
-                })
-                .collect();
+            let values: Vec<f32> =
+                clustered_vector_values(ids.iter().map(|id| *id as usize), dim, 2);
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
@@ -3750,12 +3770,7 @@ mod tests {
         // hence the covered recovery) reachable -- with evenly spread vectors early pruning
         // raises minimum_nprobes to cover every partition and the shortcut never fires.
         let ids: Vec<i32> = (0..n as i32).collect();
-        let values: Vec<f32> = (0..n)
-            .flat_map(|r| {
-                let center = if r % 2 == 0 { 0.0f32 } else { 1000.0 };
-                (0..dim as usize).map(move |d| center + (r * dim as usize + d) as f32 * 1e-3)
-            })
-            .collect();
+        let values: Vec<f32> = clustered_vector_values(0..n, dim, 2);
         let vector = FixedSizeListArray::new(
             Arc::new(Field::new("item", DataType::Float32, true)),
             dim,
@@ -3843,6 +3858,193 @@ mod tests {
             got,
             (0..n as i32).filter(|id| *id != 1).collect::<Vec<_>>(),
             "every live row must appear exactly once"
+        );
+    }
+
+    /// A covered index whose `included_fields` a pre-feature writer cleared -- the degraded
+    /// state `FLAG_COVERED_INDEX_METADATA` documents -- must stay MAINTAINABLE, not just
+    /// readable. Its auxiliary storage still physically carries the payload while freshly
+    /// scanned rows do not, so combining the two used to fail `StorageBuilder::build`'s width
+    /// check ("mismatched columns while merging vector storage batches: expected
+    /// [_rowid, __pq_code, id], got [_rowid, __pq_code]"), leaving an index that could never
+    /// be merge-optimized again -- recoverable only by dropping and rebuilding it.
+    /// `OptimizeOptions::append()` never hit this because it does not load existing storage.
+    #[tokio::test]
+    async fn test_degraded_covered_index_can_still_be_optimized() {
+        use crate::dataset::WriteDestination;
+        use crate::dataset::transaction::Operation;
+        use arrow_array::{Int32Array, RecordBatchIterator};
+
+        const DIMS: usize = 16;
+        const TOTAL: usize = 256;
+        const NPART: usize = 4;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let make = |lo: i32, hi: i32| {
+            let ids: Vec<i32> = (lo..hi).collect();
+            let values: Vec<f32> =
+                clustered_vector_values(ids.iter().map(|r| *r as usize), DIMS as i32, NPART);
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        DIMS as i32,
+                    ),
+                    true,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(
+                        FixedSizeListArray::try_new_from_values(
+                            Float32Array::from(values),
+                            DIMS as i32,
+                        )
+                        .unwrap(),
+                    ),
+                ],
+            )
+            .unwrap();
+            (schema, batch)
+        };
+
+        let (schema, batch) = make(0, TOTAL as i32);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut params = VectorIndexParams::ivf_pq(NPART, 8, 4, DistanceType::L2, 2);
+        params.include_columns(vec!["id".to_string()]);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Degrade: clear the declaration, leave the payload in the auxiliary file.
+        let mut cleared = dataset.load_indices_by_name("vector_idx").await.unwrap()[0].clone();
+        assert!(!cleared.included_fields.is_empty());
+        cleared.included_fields = Vec::new();
+        let read_version = dataset.manifest.version;
+        let mut dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::CreateIndex {
+                new_indices: vec![cleared],
+                removed_indices: vec![],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Fresh rows land in an unindexed fragment; the merge below must combine them with
+        // the wider existing storage.
+        let (schema2, batch2) = make(TOTAL as i32, TOTAL as i32 + 128);
+        dataset
+            .append(RecordBatchIterator::new([Ok(batch2)], schema2), None)
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .expect("a metadata-degraded covered index must still merge-optimize");
+
+        // The rebuilt storage is narrowed to the declaration, so it no longer carries the
+        // undeclared payload -- and the index still answers queries.
+        let ctx = load_vector_index_context(&dataset, "vector", "vector_idx").await;
+        let storage = ctx.ivf().load_partition_storage(0, None).await.unwrap();
+        assert!(
+            storage.batch().column_by_name("id").is_none(),
+            "merged storage must drop payload the metadata no longer declares"
+        );
+
+        let q = Float32Array::from(vec![0.0f32; DIMS]);
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &q, 5).unwrap();
+        scan.project(&["id"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 5);
+        assert!(batch.column_by_name("id").is_some());
+    }
+
+    /// `row_id` is an ordinary user column name -- `_rowid` is the reserved one -- so it is
+    /// coverable. The `row_id` -> `_rowid` rename exists only for precomputed shuffle buffers
+    /// (which cannot name a column `_rowid`), but it used to run on the ordinary scan path
+    /// too. Once covering started projecting user columns into that scan, covering a column
+    /// named `row_id` renamed it on top of the real `_rowid` from `with_row_id()` and index
+    /// creation died with `Duplicate field name "_rowid" in schema`.
+    #[tokio::test]
+    async fn test_covering_column_named_row_id_is_supported() {
+        use arrow_array::types::Int32Type;
+        use arrow_array::{Int32Array, RecordBatchIterator};
+
+        let dim = 4i32;
+        let n = 128usize;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+        let values: Vec<f32> = (0..n * dim as usize).map(|i| i as f32).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from((0..n as i32).collect::<Vec<_>>())),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://covering_named_row_id",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut params = VectorIndexParams::ivf_flat(2, DistanceType::L2);
+        params.include_columns(vec!["row_id".to_string()]);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect("a covering column named `row_id` must not collide with the virtual _rowid");
+
+        // And the covered payload is served correctly, not confused with the virtual column.
+        let q = Float32Array::from(vec![0.0f32; dim as usize]);
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &q, 5).unwrap();
+        scan.project(&["row_id"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 5);
+        let ids = batch["row_id"].as_primitive::<Int32Type>();
+        let mut got: Vec<i32> = ids.values().to_vec();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![0, 1, 2, 3, 4],
+            "covered `row_id` payload must be the user's values"
         );
     }
 
@@ -4022,17 +4224,54 @@ mod tests {
         );
     }
 
-    /// Same payoff but forcing the BATCH/late-search path: `k` larger than one
-    /// partition makes the initial `minimum_nprobes` sweep under-fill, so
-    /// `late_search` (the run_prepared batch path) fires. Covering must hold there too.
+    /// Same payoff but forcing the BATCH/late-search path: the initial `minimum_nprobes`
+    /// sweep under-fills, so `late_search` (the run_prepared batch path) fires. Covering
+    /// must hold there too.
+    ///
+    /// Uses well-separated clusters, and that is load-bearing: `early_pruning` RAISES
+    /// `minimum_nprobes` to the number of centroids within `dists[0] * factor` (81.0 once
+    /// `k >= 11`). With the evenly-spread unit-sphere data of `generate_test_dataset`
+    /// every centroid survives pruning, so `minimum_nprobes` reaches `maximum_nprobes`,
+    /// `late_search` returns at its first guard, and this test passes without ever
+    /// exercising the path it names.
     #[tokio::test]
     async fn test_ivf_pq_covered_projection_batch_path() {
-        const INDEX_NAME: &str = "vector_idx";
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        use arrow_array::{Int32Array, RecordBatchIterator};
 
-        let mut params = VectorIndexParams::ivf_pq(4, 8, 4, DistanceType::L2, 2);
+        const INDEX_NAME: &str = "vector_idx";
+        const NPART: usize = 4;
+        let dim = 8i32;
+        let n = 512usize;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+        ]));
+        let values: Vec<f32> = clustered_vector_values(0..n, dim, NPART);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from((0..n as i32).collect::<Vec<_>>())),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://covered_batch_path",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut params = VectorIndexParams::ivf_pq(NPART, 8, 4, DistanceType::L2, 2);
         params.include_columns(vec!["id".to_string()]);
         dataset
             .create_index(
@@ -4045,13 +4284,14 @@ mod tests {
             .await
             .unwrap();
 
-        let q = vectors.value(0);
-        let q = q.as_primitive::<Float32Type>();
+        // Query sits on cluster 0, so pruning keeps `minimum_nprobes` at 1 and the other
+        // three partitions are reached only by the late search.
+        let q = Float32Array::from(vec![0.0f32; dim as usize]);
         let mut scan = dataset.scan();
-        // k >> one partition's rows (NUM_ROWS=512 / 4 parts) forces late expansion.
-        scan.nearest("vector", q, 500).unwrap();
+        scan.nearest("vector", &q, 500).unwrap();
         scan.minimum_nprobes(1);
-        scan.maximum_nprobes(4);
+        scan.maximum_nprobes(NPART);
+        scan.with_row_id();
         scan.project(&["id"]).unwrap();
 
         let plan = scan.explain_plan(true).await.unwrap();
@@ -4060,8 +4300,22 @@ mod tests {
             "covered projection ['id'] should not require a TakeExec (batch path); plan:\n{plan}"
         );
         let batch = scan.try_into_batch().await.unwrap();
-        assert!(batch.column_by_name("id").is_some());
-        assert!(batch.num_rows() > 100, "late search should have expanded");
+        // Only the late search can supply rows beyond cluster 0's 128; reaching all 500
+        // proves it ran and that covering survived it.
+        assert_eq!(
+            batch.num_rows(),
+            500,
+            "late search must expand past the single probed partition"
+        );
+        let ids = batch["id"].as_primitive::<arrow_array::types::Int32Type>();
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        for i in 0..ids.len() {
+            assert_eq!(
+                ids.value(i) as u64,
+                row_ids.value(i),
+                "covered payload must stay row-aligned through the batch path"
+            );
+        }
     }
 
     /// A covered query combined with a selective prefilter (scalar index +
@@ -4379,12 +4633,7 @@ mod tests {
         // `max_nprobes <= min_nprobes` holds and `late_search` returns before it can emit the
         // shortcut batch this test needs.
         let ids: Vec<i32> = (0..TOTAL as i32).collect();
-        let values: Vec<f32> = (0..TOTAL)
-            .flat_map(|r| {
-                let center = (r % NPART) as f32 * 1000.0;
-                (0..DIMS).map(move |d| center + (r * DIMS + d) as f32 * 1e-3)
-            })
-            .collect();
+        let values: Vec<f32> = clustered_vector_values(0..TOTAL, DIMS as i32, NPART);
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new(
@@ -4620,40 +4869,6 @@ mod tests {
         for v in ids.values() {
             assert!(*v >= 100, "deleted rows (id < 100) must not be returned");
         }
-    }
-
-    /// Fix 2: under query parallelism > 1 the parallel search branch (which uses
-    /// `search_in_partition`, not the heap merge) must also emit covering
-    /// columns. On a multi-core runner this exercises the parallel path; if the
-    /// session resolves parallelism to 1 it still passes via the sequential path.
-    #[tokio::test]
-    async fn test_ivf_pq_covered_projection_parallel() {
-        const INDEX_NAME: &str = "vector_idx";
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-        let mut params = VectorIndexParams::ivf_pq(4, 8, 4, DistanceType::L2, 2);
-        params.include_columns(vec!["id".to_string()]);
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some(INDEX_NAME.to_string()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        let q = vectors.value(0);
-        let q = q.as_primitive::<Float32Type>();
-        let mut scan = dataset.scan();
-        scan.nearest("vector", q, 10).unwrap();
-        scan.minimum_nprobes(4); // search several partitions...
-        scan.query_parallelism(4); // ...in parallel, forcing the parallel branch
-        scan.project(&["id"]).unwrap();
-        let batch = scan.try_into_batch().await.unwrap();
-        assert!(batch.column_by_name("id").is_some());
     }
 
     /// Fix 3: a covered index with unindexed fragments (rows appended but not
@@ -6217,7 +6432,7 @@ mod tests {
     /// rebuilds the unified output schema from the FIRST shard's covering set and
     /// `concat_batches` combines columns positionally, so without a guard shard B's `id2`
     /// values would be stored under shard A's `id` name -> wrong covered results. Reject with a
-    /// descriptive error instead (AGENTS.md:81).
+    /// descriptive error instead.
     #[tokio::test]
     async fn test_distributed_vector_merge_rejects_mismatched_covering_columns() {
         let test_dir = TempStrDir::default();
@@ -6285,6 +6500,157 @@ mod tests {
         assert!(
             msg.contains("covering") || msg.contains("included"),
             "error should describe the covering-column mismatch; was: {msg}"
+        );
+    }
+
+    /// A merged covered segment must itself be usable as an input to a later merge --
+    /// the hierarchical/incremental distributed workflow. The merger requires every
+    /// covered shard to carry its source field ids, so the merged output has to carry
+    /// them too; otherwise the merger rejects its own product and tells the user to
+    /// rebuild a shard that only the merger can produce.
+    #[tokio::test]
+    async fn test_distributed_covered_merge_output_can_be_merged_again() {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_covered_test_batches();
+        let dataset_uri = format!("{}/distributed_covered_remerge", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments.len() >= 3,
+            "need >= 3 fragments so the second-stage merge has more than one input"
+        );
+        // IVF_FLAT: a merged *PQ* segment stores transposed codes and the merger requires
+        // row-major shards, so PQ cannot be re-merged for reasons unrelated to covering.
+        // FLAT and SQ can, which is where the missing stamp actually bit.
+        let mut params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_global_ivf(&dataset, "vector").await,
+        );
+        params.include_columns(vec!["payload".to_string()]);
+
+        let mut segments = Vec::new();
+        for fragment in fragments.iter() {
+            segments.push(
+                dataset
+                    .create_index_builder(&["vector"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Stage 1: merge the first two shards.
+        let rest = segments.split_off(2);
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        // Stage 2: feed that merged segment back in alongside the remaining shards. This
+        // is the hierarchical workflow the missing stamp used to make impossible.
+        let mut stage_two = vec![merged];
+        stage_two.extend(rest);
+        let remerged = dataset
+            .merge_existing_index_segments(stage_two)
+            .await
+            .expect("a merged covered segment must be mergeable again");
+        assert_eq!(
+            remerged.included_fields,
+            vec![dataset.schema().field("payload").unwrap().id],
+            "the re-merged segment must still declare the covered field"
+        );
+        dataset
+            .commit_existing_index_segments("vec_idx", "vector", vec![remerged])
+            .await
+            .unwrap();
+    }
+
+    /// Same covering column *name and type* across shards, but two different logical
+    /// fields: `payload` is dropped and re-added between the two shard builds, so it
+    /// comes back with a fresh field id. Name+type comparison accepts this and
+    /// `concat_batches` would then stack shard A's values for the dropped field under
+    /// the re-added one -- covered queries over shard A's rows serving the old column.
+    #[tokio::test]
+    async fn test_distributed_vector_merge_rejects_covering_of_different_field_ids() {
+        use crate::dataset::NewColumnTransform;
+
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+
+        let payload = Arc::new(UInt64Array::from_iter_values(0..TWO_FRAG_NUM_ROWS as u64));
+        let values = generate_random_array_with_range(TWO_FRAG_NUM_ROWS * TWO_FRAG_DIM, 0.0..1.0);
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(values),
+                TWO_FRAG_DIM as i32,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::UInt64, true),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![payload, vectors]).unwrap();
+        let dataset_uri = format!("{}/distributed_covered_merge_field_id", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, vec![batch]).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+
+        let (ivf_params, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+        params.include_columns(vec!["payload".to_string()]);
+
+        // Shard A covers `payload` as it exists now.
+        let segment_a = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vec_idx".to_string())
+            .fragments(vec![fragments[0].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let original_field_id = dataset.schema().field("payload").unwrap().id;
+
+        // Drop and re-add `payload`: same name, same type, new field id. The re-add is
+        // metadata-only (AllNulls), so no data file changes and nothing else notices.
+        dataset.drop_columns(&["payload"]).await.unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(arrow_schema::Schema::new(vec![
+                    Field::new("payload", DataType::UInt64, true),
+                ]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let new_field_id = dataset.schema().field("payload").unwrap().id;
+        assert_ne!(
+            original_field_id, new_field_id,
+            "re-adding the column must produce a new field id, or this test proves nothing"
+        );
+
+        let fragments = dataset.get_fragments();
+        let segment_b = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vec_idx".to_string())
+            .fragments(vec![fragments[1].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let err = dataset
+            .merge_existing_index_segments(vec![segment_a, segment_b])
+            .await
+            .expect_err("merging shards covering different field ids must fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("covering") || msg.contains("included"),
+            "error should describe the covering mismatch; was: {msg}"
         );
     }
 
