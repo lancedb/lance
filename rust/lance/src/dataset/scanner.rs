@@ -4232,7 +4232,7 @@ impl Scanner {
             .fragments
             .as_deref()
             .unwrap_or_else(|| self.dataset.fragments());
-        if target_fragments.is_empty() {
+        if self.fragments.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Arc::new(EmptyExec::new(output_schema)));
         }
         let flat_query = MatchQuery::new(query.terms.clone())
@@ -4244,7 +4244,9 @@ impl Scanner {
             Some(index) => {
                 let unindexed_fragments = self
                     .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
-                if unindexed_fragments.len() == target_fragments.len() {
+                if !target_fragments.is_empty()
+                    && unindexed_fragments.len() == target_fragments.len()
+                {
                     if self.fast_search {
                         return Ok(Arc::new(EmptyExec::new(output_schema)));
                     }
@@ -4344,6 +4346,9 @@ impl Scanner {
                 (phrase_plan, flat_phrase_plan)
             }
             None => {
+                if target_fragments.is_empty() {
+                    return Ok(Arc::new(EmptyExec::new(output_schema)));
+                }
                 if self.fast_search {
                     return Ok(Arc::new(EmptyExec::new(output_schema)));
                 }
@@ -4400,7 +4405,7 @@ impl Scanner {
             .fragments
             .as_deref()
             .unwrap_or_else(|| self.dataset.fragments());
-        if target_fragments.is_empty() {
+        if self.fragments.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Arc::new(EmptyExec::new(output_schema)));
         }
 
@@ -4408,7 +4413,9 @@ impl Scanner {
             Some(index) => {
                 let unindexed_fragments = self
                     .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
-                if unindexed_fragments.len() == target_fragments.len() {
+                if !target_fragments.is_empty()
+                    && unindexed_fragments.len() == target_fragments.len()
+                {
                     if self.fast_search {
                         return Ok(Arc::new(EmptyExec::new(output_schema)));
                     }
@@ -4501,6 +4508,9 @@ impl Scanner {
                 (match_plan, flat_match_plan)
             }
             None => {
+                if target_fragments.is_empty() {
+                    return Ok(Arc::new(EmptyExec::new(output_schema)));
+                }
                 if self.fast_search {
                     return Ok(Arc::new(EmptyExec::new(output_schema)));
                 }
