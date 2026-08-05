@@ -12,7 +12,7 @@ use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::overlay::{DataOverlayFile, sort_overlays_newest_last};
+use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -182,7 +182,16 @@ impl DataFile {
 
     pub fn validate(&self, base_path: &Path) -> Result<()> {
         if self.is_legacy_file() {
-            if !self.fields.windows(2).all(|w| w[0] < w[1]) {
+            // A tombstone marks a field superseded by a later data file. It is
+            // not a field id, so it carries no ordering; the live ids around it
+            // must still be sorted and distinct.
+            let live: Vec<i32> = self
+                .fields
+                .iter()
+                .copied()
+                .filter(|field| *field != TOMBSTONE_FIELD_ID)
+                .collect();
+            if !live.windows(2).all(|w| w[0] < w[1]) {
                 return Err(Error::corrupt_file(
                     base_path.clone().join(self.path.clone()),
                     "contained unsorted or duplicate field ids",
