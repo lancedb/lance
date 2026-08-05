@@ -43,6 +43,7 @@ use crate::{
                 ByteStreamSplitDecompressor, ByteStreamSplitEncoder, should_use_bss,
             },
             constant::ConstantDecompressor,
+            delta::DeltaDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
                 FsstPerValueEncoder,
@@ -55,6 +56,7 @@ use crate::{
                 PackedStructVariablePerValueEncoder, VariablePackedStructFieldDecoder,
                 VariablePackedStructFieldKind,
             },
+            range::RangeDecompressor,
             rle::{
                 RleChildDecompressor, RleDecompressor, RleEncoder, RunLengthWidth,
                 rle_encoded_size, select_run_length_width,
@@ -1218,6 +1220,77 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(general_decompressor))
             }
             Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(rle, self)?)),
+            Compression::Range(range) => {
+                if !matches!(range.uncompressed_bits_per_value, 32 | 64) {
+                    return Err(Error::invalid_input(format!(
+                        "Range only supports 32 or 64-bit values, got {}",
+                        range.uncompressed_bits_per_value
+                    )));
+                }
+                if range.uncompressed_bits_per_value == 32 && range.start > u32::MAX as u64 {
+                    return Err(Error::invalid_input(format!(
+                        "Range start {} exceeds u32::MAX",
+                        range.start
+                    )));
+                }
+                if range.step == 0 {
+                    return Err(Error::invalid_input("Range step must be positive"));
+                }
+                Ok(Box::new(RangeDecompressor::new(
+                    range.uncompressed_bits_per_value,
+                    range.start,
+                    range.step,
+                )))
+            }
+            Compression::Delta(delta) => {
+                let bits_per_value = delta.uncompressed_bits_per_value;
+                if !matches!(bits_per_value, 32 | 64) {
+                    return Err(Error::invalid_input(format!(
+                        "Delta only supports 32 or 64-bit values, got {bits_per_value}"
+                    )));
+                }
+                if bits_per_value == 32 && delta.base > u32::MAX as u64 {
+                    return Err(Error::invalid_input(format!(
+                        "Delta base {} exceeds u32::MAX",
+                        delta.base
+                    )));
+                }
+                let child = delta.deltas.as_deref().ok_or_else(|| {
+                    Error::invalid_input("Delta is missing its deltas child encoding")
+                })?;
+                let child_bits = match child.compression.as_ref() {
+                    Some(Compression::Flat(flat)) => flat.bits_per_value,
+                    Some(Compression::Range(range)) => range.uncompressed_bits_per_value,
+                    Some(Compression::InlineBitpacking(bitpacking)) => {
+                        bitpacking.uncompressed_bits_per_value
+                    }
+                    Some(Compression::OutOfLineBitpacking(bitpacking)) => {
+                        bitpacking.uncompressed_bits_per_value
+                    }
+                    Some(other) => {
+                        return Err(Error::invalid_input(format!(
+                            "Delta does not support a {} child",
+                            compression_name(other)
+                        )));
+                    }
+                    None => {
+                        return Err(Error::invalid_input(
+                            "Delta child is missing its compression variant",
+                        ));
+                    }
+                };
+                if child_bits != bits_per_value {
+                    return Err(Error::invalid_input(format!(
+                        "Delta child declares {child_bits}-bit values, expected {bits_per_value}"
+                    )));
+                }
+                let child = self.create_block_decompressor(child)?;
+                Ok(Box::new(DeltaDecompressor::new(
+                    bits_per_value,
+                    delta.base,
+                    child,
+                )))
+            }
             _ => todo!(),
         }
     }
@@ -1390,6 +1463,8 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::FixedSizeList(_) => "fixed-size list",
         Compression::VariablePackedStruct(_) => "variable packed struct",
         Compression::Rle(_) => "rle",
+        Compression::Range(_) => "range",
+        Compression::Delta(_) => "delta",
     }
 }
 
