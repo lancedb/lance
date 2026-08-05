@@ -4239,6 +4239,7 @@ impl Scanner {
             .with_column(Some(column.clone()))
             .with_operator(Operator::And)
             .with_document_granularity(document_granularity);
+        let flat_params = params.clone().with_phrase_slop(Some(query.slop));
 
         let (phrase_plan, flat_phrase_plan) = match &index {
             Some(index) => {
@@ -4255,10 +4256,9 @@ impl Scanner {
                             unindexed_fragments,
                             HashMap::new(),
                             &flat_query,
-                            params,
+                            &flat_params,
                             filter_plan,
                             None,
-                            Some(query.slop),
                         )
                         .await?;
                     return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
@@ -4282,10 +4282,9 @@ impl Scanner {
                                 target_fragments.to_vec(),
                                 HashMap::new(),
                                 &flat_query,
-                                params,
+                                &flat_params,
                                 filter_plan,
                                 None,
-                                Some(query.slop),
                             )
                             .await?;
                         return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
@@ -4333,10 +4332,9 @@ impl Scanner {
                             unindexed_fragments,
                             stale_rows,
                             &flat_query,
-                            params,
+                            &flat_params,
                             filter_plan,
                             shared_scorer,
-                            Some(query.slop),
                         )
                         .await?,
                     )
@@ -4357,10 +4355,9 @@ impl Scanner {
                         target_fragments.to_vec(),
                         HashMap::new(),
                         &flat_query,
-                        params,
+                        &flat_params,
                         filter_plan,
                         None,
-                        Some(query.slop),
                     )
                     .await?;
                 (None, Some(flat_phrase_plan))
@@ -4427,7 +4424,6 @@ impl Scanner {
                             params,
                             filter_plan,
                             None,
-                            None,
                         )
                         .await?;
                     return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
@@ -4453,7 +4449,6 @@ impl Scanner {
                                 query,
                                 params,
                                 filter_plan,
-                                None,
                                 None,
                             )
                             .await?;
@@ -4498,7 +4493,6 @@ impl Scanner {
                             params,
                             filter_plan,
                             shared_scorer,
-                            None,
                         )
                         .await?,
                     )
@@ -4522,7 +4516,6 @@ impl Scanner {
                         query,
                         params,
                         filter_plan,
-                        None,
                         None,
                     )
                     .await?;
@@ -4576,7 +4569,6 @@ impl Scanner {
         params: &FtsSearchParams,
         filter_plan: &ExprFilterPlan,
         shared_scorer: Option<Arc<SharedFtsScorer>>,
-        phrase_slop: Option<u32>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query
             .column
@@ -4666,9 +4658,6 @@ impl Scanner {
         );
         if let Some(shared_scorer) = shared_scorer {
             flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
-        }
-        if let Some(phrase_slop) = phrase_slop {
-            flat_match_plan = flat_match_plan.with_phrase_slop(phrase_slop);
         }
         Ok(Arc::new(flat_match_plan))
     }

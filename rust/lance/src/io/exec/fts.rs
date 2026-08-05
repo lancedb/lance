@@ -2028,11 +2028,6 @@ impl FlatMatchQueryExec {
         self
     }
 
-    pub(crate) fn with_phrase_slop(mut self, phrase_slop: u32) -> Self {
-        self.params = self.params.with_phrase_slop(Some(phrase_slop));
-        self
-    }
-
     pub fn query(&self) -> &MatchQuery {
         &self.query
     }
