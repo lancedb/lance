@@ -768,6 +768,30 @@ mod tests {
         assert_eq!(
             details.compacted_sstables[0].generation, 10,
             "the recorded generation must be unchanged"
+            "the recorded generation must be unchanged"
+        );
+    }
+
+    /// The system index holds the proof the WAL pod retires SSTables against.
+    /// Erasing it through the ordinary index API would leave the table claiming
+    /// nothing was ever compacted while the SSTables are already gone.
+    #[tokio::test]
+    async fn the_mem_wal_system_index_cannot_be_dropped_through_drop_index() {
+        use crate::index::DatasetIndexExt;
+
+        let mut dataset = test_dataset_with_mem_wal().await;
+
+        let err = dataset.drop_index(MEM_WAL_INDEX_NAME).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("system index and cannot be dropped"),
+            "{err}"
+        );
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME),
+            "the system index must survive the refused drop"
         );
     }
 

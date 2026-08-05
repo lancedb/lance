@@ -1500,6 +1500,18 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn drop_index(&mut self, name: &str) -> Result<()> {
+        // The MemWAL system index holds the compaction progress and index
+        // coverage the WAL pod retires SSTables against. Dropping it through the
+        // ordinary index API would erase that proof while the SSTables it
+        // describes are already gone, so it is refused here; disabling MemWAL is
+        // a dedicated operation.
+        if name == MEM_WAL_INDEX_NAME {
+            return Err(Error::invalid_input(format!(
+                "{} is a system index and cannot be dropped through drop_index",
+                MEM_WAL_INDEX_NAME
+            )));
+        }
+
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
             return Err(Error::index_not_found(format!("name={}", name)));

@@ -422,13 +422,21 @@ impl MemWalIndex {
             .and_then(|icp| icp.caught_up_generation_for_shard(shard_id))
     }
 
-    /// Check if an index is fully caught up for a shard.
-    /// Returns true if the index covers all compacted data for the shard.
-    pub fn is_index_caught_up(&self, index_name: &str, shard_id: &Uuid) -> bool {
+    /// Whether an index covers all compacted data for a shard, under **legacy**
+    /// semantics.
+    ///
+    /// A missing `index_catchup` entry is read here as "fully caught up". That
+    /// is only correct for a table without the safe-retirement feature bit. On
+    /// an activated table a missing entry means *unknown*: the index has not
+    /// proved anything, so its SSTables must be retained and a repair
+    /// scheduled. This accessor cannot see the manifest, so it cannot make that
+    /// distinction -- callers must select the semantics from the feature bit,
+    /// and the name says which one they get here.
+    pub fn is_index_caught_up_legacy(&self, index_name: &str, shard_id: &Uuid) -> bool {
         let compacted_gen = self.compacted_generation_for_shard(shard_id).unwrap_or(0);
         let caught_up_gen = self.index_caught_up_generation(index_name, shard_id);
 
-        // If not tracked in index_catchup, assumed fully caught up
+        // Missing means "caught up" only because this is the legacy reading.
         caught_up_gen.is_none_or(|generation| generation >= compacted_gen)
     }
 }

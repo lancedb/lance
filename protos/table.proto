@@ -691,8 +691,12 @@ message IndexCatchupProgress {
   string index_name = 1;
 
   // Per-shard progress: the generation up to which this index covers.
-  // If a shard is not present, the index is assumed to be fully caught up
-  // (i.e., caught_up_generation >= compacted_generation for that shard).
+  //
+  // An absent shard means "fully caught up" ONLY on a legacy table. On a table
+  // with the MemWAL safe-retirement feature bit set it means *unknown*: this
+  // index has proved nothing for that shard, so its SSTables must be retained
+  // and a repair scheduled. The manifest feature bit, not this message, selects
+  // which reading applies.
   repeated CompactedSsTable caught_up_generations = 2;
 }
 
@@ -758,7 +762,12 @@ message MemWalIndexDetails {
   // readers should use SSTable indexes for the gap instead of
   // scanning unindexed data in the base table.
   //
-  // If an index is not present in this list, it is assumed to be fully caught up.
+  // An index absent from this list is "fully caught up" ONLY on a legacy table.
+  // With the MemWAL safe-retirement feature bit set, absence means the index has
+  // proved no coverage, so the SSTables it would need stay live until a repair
+  // records it. Only the dedicated WAL index-repair path may add entries here;
+  // ordinary index operations have their entry removed automatically when they
+  // change an index, since they do not prove what the new index covers.
   repeated IndexCatchupProgress index_catchup = 10;
 
   // Default ShardWriter configuration values for this MemWAL index.
