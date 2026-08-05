@@ -93,6 +93,7 @@ pub mod transaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
+pub(crate) mod versions;
 pub mod write;
 
 pub(crate) use take::row_offsets_to_row_addresses;
@@ -112,8 +113,8 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
-    commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments,
+    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
+    commit_transaction, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -1617,6 +1618,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
+            DEFAULT_COMMIT_RETRY_TIMEOUT,
             self.manifest_location.naming_scheme,
             None,
         )
@@ -2271,15 +2273,15 @@ impl Dataset {
         fn field_names_match(
             fields: &[lance_core::datatypes::Field],
             start: usize,
-            names: &[&str],
+            expected: &arrow_schema::Fields,
         ) -> bool {
             fields
-                .get(start..start + names.len())
+                .get(start..start + expected.len())
                 .is_some_and(|candidate| {
                     candidate
                         .iter()
-                        .zip(names)
-                        .all(|(field, name)| field.name == *name)
+                        .zip(expected.iter())
+                        .all(|(field, expected)| field.name == expected.name().as_str())
                 })
         }
 
@@ -2287,14 +2289,10 @@ impl Dataset {
             fields: &[lance_core::datatypes::Field],
             start: usize,
         ) -> usize {
-            const BLOB_V2_DESCRIPTOR_FIELDS: &[&str] =
-                &["kind", "position", "size", "blob_id", "blob_uri"];
-            const BLOB_V1_DESCRIPTOR_FIELDS: &[&str] = &["position", "size"];
-
-            if field_names_match(fields, start, BLOB_V2_DESCRIPTOR_FIELDS) {
-                BLOB_V2_DESCRIPTOR_FIELDS.len()
-            } else if field_names_match(fields, start, BLOB_V1_DESCRIPTOR_FIELDS) {
-                BLOB_V1_DESCRIPTOR_FIELDS.len()
+            if field_names_match(fields, start, &lance_core::datatypes::BLOB_V2_DESC_FIELDS) {
+                lance_core::datatypes::BLOB_V2_DESC_FIELDS.len()
+            } else if field_names_match(fields, start, &lance_core::datatypes::BLOB_DESC_FIELDS) {
+                lance_core::datatypes::BLOB_DESC_FIELDS.len()
             } else {
                 0
             }

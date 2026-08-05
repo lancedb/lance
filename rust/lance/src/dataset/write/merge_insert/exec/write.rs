@@ -22,7 +22,10 @@ use datafusion::{
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
-use lance_core::{Error, ROW_ADDR, ROW_ID};
+use lance_core::{
+    Error, ROW_ADDR, ROW_ID,
+    datatypes::{BLOB_V2_LOGICAL_TYPE, BlobV2Layout},
+};
 use lance_table::format::RowIdMeta;
 use roaring::RoaringTreemap;
 
@@ -52,46 +55,58 @@ use crate::{
 
 use super::apply_deletions;
 
-fn blob_v2_user_view_schema(
+fn descriptor_to_logical_blob_schema(
     input_schema: arrow_schema::SchemaRef,
     dataset_schema: &lance_core::datatypes::Schema,
-) -> arrow_schema::SchemaRef {
+) -> lance_core::Result<arrow_schema::SchemaRef> {
     let fields = input_schema
         .fields()
         .iter()
-        .map(|field| {
+        .map(|field| -> lance_core::Result<_> {
             let Some(dataset_field) = dataset_schema
                 .field(field.name())
                 .filter(|dataset_field| dataset_field.is_blob_v2())
             else {
-                return field.clone();
+                return Ok(field.clone());
             };
-            let is_descriptor = matches!(
-                field.data_type(),
-                arrow_schema::DataType::Struct(fields)
-                    if fields.iter().any(|child| child.name() == "kind")
-            );
-            if !is_descriptor {
-                return field.clone();
-            }
-            let logical_field = arrow_schema::Field::from(dataset_field);
-            Arc::new(
-                arrow_schema::Field::new(
+            let arrow_schema::DataType::Struct(fields) = field.data_type() else {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 merge input '{}' has non-struct type {}; expected logical or descriptor layout",
                     field.name(),
-                    lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
-                    field.is_nullable(),
-                )
-                .with_metadata(logical_field.metadata().clone()),
-            )
+                    field.data_type()
+                )));
+            };
+            match BlobV2Layout::classify(fields) {
+                Some(BlobV2Layout::Logical) => Ok(field.clone()),
+                Some(BlobV2Layout::Descriptor) => {
+                    let logical_field = arrow_schema::Field::from(dataset_field);
+                    Ok(Arc::new(
+                        arrow_schema::Field::new(
+                            field.name(),
+                            BLOB_V2_LOGICAL_TYPE.clone(),
+                            field.is_nullable(),
+                        )
+                        .with_metadata(logical_field.metadata().clone()),
+                    ))
+                }
+                Some(actual) => Err(Error::invalid_input(format!(
+                    "Blob v2 merge input '{}' has {actual} layout; expected logical or descriptor layout",
+                    field.name()
+                ))),
+                None => Err(Error::invalid_input(format!(
+                    "Blob v2 merge input '{}' has unrecognized layout {fields:?}; expected logical or descriptor layout",
+                    field.name()
+                ))),
+            }
         })
-        .collect::<Vec<_>>();
-    Arc::new(arrow_schema::Schema::new_with_metadata(
+        .collect::<lance_core::Result<Vec<_>>>()?;
+    Ok(Arc::new(arrow_schema::Schema::new_with_metadata(
         fields
             .iter()
             .map(|field| field.as_ref().clone())
             .collect::<Vec<_>>(),
         input_schema.metadata().clone(),
-    ))
+    )))
 }
 
 /// Shared state for merge insert operations to simplify lock management
@@ -931,7 +946,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             .any(|field| field.is_blob_v2());
         let input_stream = if has_blob_v2_columns {
             let input_schema = input_stream.schema();
-            let output_schema = blob_v2_user_view_schema(input_schema, self.dataset.schema());
+            let output_schema =
+                descriptor_to_logical_blob_schema(input_schema, self.dataset.schema())
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
             let dataset = self.dataset.clone();
             let dataset_schema = self.dataset.schema().clone();
             let transformed = input_stream.then(move |batch_result| {
@@ -994,6 +1011,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
+                dataset.manifest.data_storage_format.lance_file_format(),
                 Some(&dataset),
                 dataset.object_store.clone(),
                 &dataset.base,
@@ -1152,6 +1170,27 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 mod tests {
     use super::*;
     use arrow_array::UInt64Array;
+
+    #[test]
+    fn test_descriptor_to_logical_blob_schema_rejects_prepared_layout() {
+        let logical_field = crate::blob::blob_field("blob", true);
+        let dataset_schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![logical_field.clone()]))
+                .unwrap();
+        let prepared_field = arrow_schema::Field::new(
+            "blob",
+            lance_core::datatypes::BLOB_V2_PREPARED_TYPE.clone(),
+            true,
+        )
+        .with_metadata(logical_field.metadata().clone());
+        let input_schema = Arc::new(Schema::new(vec![prepared_field]));
+
+        let error = descriptor_to_logical_blob_schema(input_schema, &dataset_schema).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Blob v2 merge input 'blob' has prepared layout; expected logical or descriptor layout"
+        ));
+    }
 
     #[test]
     fn test_merge_state_duplicate_rowid_detection_fail() {

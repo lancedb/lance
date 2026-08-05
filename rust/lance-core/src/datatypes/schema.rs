@@ -339,17 +339,10 @@ impl Schema {
                 )));
             }
 
-            let column_path = self
-                .field_ancestry_by_id(field.id)
-                .unwrap()
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            if !seen_names.insert(column_path.clone()) {
+            if !seen_names.insert(field.name.as_str()) {
                 return Err(Error::schema(format!(
                     "Duplicate field name \"{}\" in schema:\n {:#?}",
-                    column_path, self
+                    field.name, self
                 )));
             }
         }
@@ -1870,6 +1863,11 @@ mod tests {
             vec!["simple".to_string()]
         );
 
+        assert_eq!(
+            parse_field_path("tags[*]").unwrap(),
+            vec!["tags[*]".to_string()]
+        );
+
         // Quoted field at the end
         assert_eq!(
             parse_field_path("parent.`field.with.dot`").unwrap(),
@@ -1904,6 +1902,22 @@ mod tests {
             format_field_path(&["field`with`backticks"]),
             "`field``with``backticks`"
         );
+    }
+
+    #[test]
+    fn test_validate_top_level_names_without_field_id_lookup() {
+        let mut first = Field::new_arrow("first", DataType::Int32, false).unwrap();
+        first.id = 0;
+        let mut second = Field::new_arrow("second", DataType::Int32, false).unwrap();
+        second.id = 0;
+        let schema = Schema {
+            fields: vec![first, second],
+            metadata: HashMap::new(),
+        };
+
+        let error = schema.validate().unwrap_err();
+        assert!(matches!(&error, Error::Schema { .. }));
+        assert!(error.to_string().contains("Duplicate field id 0"));
     }
 
     #[test]

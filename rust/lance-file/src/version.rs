@@ -318,7 +318,7 @@ mod tests {
                 crate::determine_file_version(&object_store, &path, Some(footer.len()))
                     .await
                     .unwrap(),
-                LanceFileVersion::Legacy
+                ConcreteFileVersion::V1
             );
         }
     }

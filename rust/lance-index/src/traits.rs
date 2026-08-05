@@ -5,6 +5,8 @@ use lance_core::Result;
 
 use lance_table::format::IndexMetadata;
 
+use crate::scalar::inverted::DocumentGranularity;
+
 /// A set of criteria used to filter potential indices to use for a query
 #[derive(Debug, Default)]
 pub struct IndexCriteria<'a> {
@@ -15,6 +17,8 @@ pub struct IndexCriteria<'a> {
     pub has_name: Option<&'a str>,
     /// If true, only consider indices that support FTS
     pub must_support_fts: bool,
+    /// Logical FTS document boundary. FTS lookups default to row documents.
+    pub fts_document_granularity: Option<DocumentGranularity>,
     /// If true, only consider indices that support exact equality
     pub must_support_exact_equality: bool,
 }
@@ -36,6 +40,15 @@ impl<'a> IndexCriteria<'a> {
     /// Only consider indices that support FTS
     pub fn supports_fts(mut self) -> Self {
         self.must_support_fts = true;
+        self
+    }
+
+    /// Select an FTS index with the requested logical document boundary.
+    pub fn with_fts_document_granularity(
+        mut self,
+        document_granularity: DocumentGranularity,
+    ) -> Self {
+        self.fts_document_granularity = Some(document_granularity);
         self
     }
 

@@ -487,6 +487,8 @@ impl Planner {
         };
         if let Ok(n) = value.parse::<i64>() {
             Ok(lit(n))
+        } else if let Ok(n) = value.parse::<u64>() {
+            Ok(lit(n))
         } else {
             value.parse::<f64>().map(lit).map_err(|_| {
                 Error::invalid_input(format!("'{value}' is not supported number value."))
@@ -1185,6 +1187,23 @@ mod tests {
             &BooleanArray::from(vec![
                 false, false, false, false, true, true, false, false, false, false
             ])
+        );
+    }
+
+    #[test]
+    fn test_parse_filter_uint64_literal_above_i64_max() {
+        let value = u64::MAX - 1;
+        let batch = arrow_array::record_batch!(("id", UInt64, [1, value])).unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(&format!("id = {value}")).unwrap();
+        assert_eq!(expr, col("id").eq(lit(value)));
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
         );
     }
 
