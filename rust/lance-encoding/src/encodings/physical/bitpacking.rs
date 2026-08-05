@@ -961,7 +961,7 @@ mod test {
                 block_info: BlockInfo::new(),
             }))
             .unwrap();
-        assert!(payload.as_ref().is_some_and(|payload| payload.len() == 0));
+        assert_eq!(payload.as_ref().map(LanceBuffer::len), Some(0));
 
         let decoded = compressor.decompress(payload, values.len() as u64).unwrap();
         let DataBlock::FixedWidth(decoded) = decoded else {
