@@ -13,7 +13,7 @@ use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
-    RetryConfig,
+    BackoffConfig, RetryConfig,
     azure::{AzureConfigKey, AzureCredential, MicrosoftAzureBuilder},
 };
 use url::Url;
@@ -166,7 +166,11 @@ impl AzureBlobStoreProvider {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
-            backoff: Default::default(),
+            backoff: BackoffConfig {
+                init_backoff: Duration::from_millis(storage_options.client_backoff_init_ms()),
+                max_backoff: Duration::from_millis(storage_options.client_backoff_max_ms()),
+                base: storage_options.client_backoff_base(),
+            },
             max_retries: storage_options.client_max_retries(),
             retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };

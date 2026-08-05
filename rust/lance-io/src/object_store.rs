@@ -1078,6 +1078,48 @@ impl StorageOptions {
             .unwrap_or(180)
     }
 
+    /// Initial backoff duration in milliseconds for RetryConfig
+    pub fn client_backoff_init_ms(&self) -> u64 {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_backoff_init_ms"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .or_else(|| {
+                std::env::var("LANCE_CLIENT_BACKOFF_INIT_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(100)
+    }
+
+    /// Maximum backoff duration in milliseconds for RetryConfig
+    pub fn client_backoff_max_ms(&self) -> u64 {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_backoff_max_ms"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .or_else(|| {
+                std::env::var("LANCE_CLIENT_BACKOFF_MAX_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(15000)
+    }
+
+    /// Exponential base multiplier for RetryConfig backoff
+    pub fn client_backoff_base(&self) -> f64 {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_backoff_base"))
+            .and_then(|(_, value)| value.parse::<f64>().ok())
+            .or_else(|| {
+                std::env::var("LANCE_CLIENT_BACKOFF_BASE")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+            .unwrap_or(2.0)
+    }
+
     pub fn get(&self, key: &str) -> Option<&String> {
         self.0.get(key)
     }

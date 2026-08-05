@@ -107,6 +107,12 @@ pub struct AimdThrottleConfig {
     pub min_backoff_ms: u64,
     /// Maximum backoff in milliseconds between retry attempts.
     pub max_backoff_ms: u64,
+    /// Multiplier for exponential backoff between retry attempts.
+    /// When 1.0 (default), uses flat random backoff between min and max.
+    /// When > 1.0, uses full-jitter exponential backoff:
+    ///   cap = min(max_backoff_ms, min_backoff_ms * multiplier^attempt)
+    ///   sleep = random(min_backoff_ms, cap)
+    pub backoff_multiplier: f64,
 }
 
 impl Default for AimdThrottleConfig {
@@ -121,6 +127,7 @@ impl Default for AimdThrottleConfig {
             max_retries: 3,
             min_backoff_ms: 100,
             max_backoff_ms: 300,
+            backoff_multiplier: 1.0,
         }
     }
 }
@@ -192,6 +199,7 @@ impl AimdThrottleConfig {
     /// | Max retries          | `lance_aimd_max_retries`         | `LANCE_AIMD_MAX_RETRIES`         | 3       |
     /// | Min backoff ms       | `lance_aimd_min_backoff_ms`      | `LANCE_AIMD_MIN_BACKOFF_MS`      | 100     |
     /// | Max backoff ms       | `lance_aimd_max_backoff_ms`      | `LANCE_AIMD_MAX_BACKOFF_MS`      | 300     |
+    /// | Backoff multiplier   | `lance_aimd_backoff_multiplier`  | `LANCE_AIMD_BACKOFF_MULTIPLIER`  | 1.0     |
     pub fn from_storage_options(
         storage_options: Option<&HashMap<String, String>>,
     ) -> lance_core::Result<Self> {
@@ -297,6 +305,13 @@ impl AimdThrottleConfig {
         let max_retries = resolve_usize("lance_aimd_max_retries", storage_options, 3)?;
         let min_backoff_ms = resolve_u64("lance_aimd_min_backoff_ms", storage_options, 100)?;
         let max_backoff_ms = resolve_u64("lance_aimd_max_backoff_ms", storage_options, 300)?;
+        let backoff_multiplier =
+            resolve_f64("lance_aimd_backoff_multiplier", storage_options, 1.0)?;
+        if backoff_multiplier < 1.0 {
+            return Err(lance_core::Error::invalid_input(format!(
+                "lance_aimd_backoff_multiplier must be >= 1.0, got {backoff_multiplier}"
+            )));
+        }
 
         let aimd = AimdConfig::default()
             .with_initial_rate(initial_rate)
@@ -309,6 +324,7 @@ impl AimdThrottleConfig {
             max_retries,
             min_backoff_ms,
             max_backoff_ms,
+            backoff_multiplier,
             ..Self::default()
                 .with_aimd(aimd)
                 .with_burst_capacity(burst_capacity)
@@ -330,6 +346,7 @@ struct OperationThrottle {
     max_retries: usize,
     min_backoff_ms: u64,
     max_backoff_ms: u64,
+    backoff_multiplier: f64,
 }
 
 impl OperationThrottle {
@@ -339,6 +356,7 @@ impl OperationThrottle {
         max_retries: usize,
         min_backoff_ms: u64,
         max_backoff_ms: u64,
+        backoff_multiplier: f64,
     ) -> lance_core::Result<Self> {
         let initial_rate = aimd_config.initial_rate;
         let controller = AimdController::new(aimd_config)?;
@@ -353,6 +371,7 @@ impl OperationThrottle {
             max_retries,
             min_backoff_ms,
             max_backoff_ms,
+            backoff_multiplier,
         })
     }
 
@@ -425,6 +444,26 @@ impl OperationThrottle {
         }
     }
 
+    /// Compute backoff duration in milliseconds for the given retry attempt (0-indexed).
+    ///
+    /// When `backoff_multiplier == 1.0`, returns a uniform random value in
+    /// `[min_backoff_ms, max_backoff_ms]` (flat random).
+    ///
+    /// When `backoff_multiplier > 1.0`, uses AWS-style full jitter:
+    ///   cap = min(max_backoff_ms, min_backoff_ms * multiplier^attempt)
+    ///   sleep = random(min_backoff_ms, cap)
+    fn compute_backoff(&self, attempt: usize) -> u64 {
+        let cap = if self.backoff_multiplier == 1.0 {
+            self.max_backoff_ms
+        } else {
+            let exp = self.min_backoff_ms as f64 * self.backoff_multiplier.powi(attempt as i32);
+            (exp as u64).min(self.max_backoff_ms)
+        };
+        // Ensure cap >= min to avoid empty range
+        let cap = cap.max(self.min_backoff_ms);
+        rand::rng().random_range(self.min_backoff_ms..=cap)
+    }
+
     /// Execute an operation with throttling: acquire token, run, classify result.
     /// On throttle errors, retries up to `max_retries` times with a random
     /// backoff between `min_backoff_ms` and `max_backoff_ms` between attempts.
@@ -465,8 +504,7 @@ impl OperationThrottle {
 
             match &result {
                 Err(err) if is_throttle_error(err) && attempt < self.max_retries => {
-                    let backoff_ms =
-                        rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
+                    let backoff_ms = self.compute_backoff(attempt);
                     debug!(
                         target: TRACE_OBJECT_STORE_THROTTLE,
                         attempt = attempt + 1,
@@ -532,8 +570,7 @@ impl MultipartUpload for ThrottledMultipartUpload {
 
             match &result {
                 Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
-                    let backoff_ms = rand::rng()
-                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
+                    let backoff_ms = self.write.compute_backoff(attempt);
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
@@ -552,8 +589,7 @@ impl MultipartUpload for ThrottledMultipartUpload {
 
             match &result {
                 Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
-                    let backoff_ms = rand::rng()
-                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
+                    let backoff_ms = self.write.compute_backoff(attempt);
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
@@ -614,6 +650,7 @@ impl AimdThrottledStore {
         let max_retries = config.max_retries;
         let min_backoff_ms = config.min_backoff_ms;
         let max_backoff_ms = config.max_backoff_ms;
+        let backoff_multiplier = config.backoff_multiplier;
         Ok(Self {
             target,
             read: Arc::new(OperationThrottle::new(
@@ -622,6 +659,7 @@ impl AimdThrottledStore {
                 max_retries,
                 min_backoff_ms,
                 max_backoff_ms,
+                backoff_multiplier,
             )?),
             write: Arc::new(OperationThrottle::new(
                 config.write,
@@ -629,6 +667,7 @@ impl AimdThrottledStore {
                 max_retries,
                 min_backoff_ms,
                 max_backoff_ms,
+                backoff_multiplier,
             )?),
             delete: Arc::new(OperationThrottle::new(
                 config.delete,
@@ -636,6 +675,7 @@ impl AimdThrottledStore {
                 max_retries,
                 min_backoff_ms,
                 max_backoff_ms,
+                backoff_multiplier,
             )?),
             list: Arc::new(OperationThrottle::new(
                 config.list,
@@ -643,6 +683,7 @@ impl AimdThrottledStore {
                 max_retries,
                 min_backoff_ms,
                 max_backoff_ms,
+                backoff_multiplier,
             )?),
         })
     }
@@ -1710,6 +1751,84 @@ mod tests {
             b"AAAABBBB",
             "Parts were reordered! Got {:?} instead of AAAABBBB.",
             std::str::from_utf8(&bytes).unwrap_or("<non-utf8>"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compute_backoff_flat_when_multiplier_is_one() {
+        let throttle = OperationThrottle::new(
+            AimdConfig::default(),
+            100.0, // burst
+            3,     // max_retries
+            100,   // min_backoff_ms
+            300,   // max_backoff_ms
+            1.0,   // backoff_multiplier
+        )
+        .unwrap();
+
+        for attempt in 0..5 {
+            for _ in 0..50 {
+                let ms = throttle.compute_backoff(attempt);
+                assert!(
+                    (100..=300).contains(&ms),
+                    "flat backoff out of range: {ms} at attempt {attempt}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compute_backoff_exponential_with_multiplier() {
+        let throttle = OperationThrottle::new(
+            AimdConfig::default(),
+            100.0,
+            5,
+            100,   // min_backoff_ms
+            10000, // max_backoff_ms (high ceiling)
+            2.0,   // backoff_multiplier
+        )
+        .unwrap();
+
+        // Expected caps: attempt 0 -> min(10000, 100*2^0) = 100
+        //                attempt 1 -> min(10000, 100*2^1) = 200
+        //                attempt 2 -> min(10000, 100*2^2) = 400
+        //                attempt 3 -> min(10000, 100*2^3) = 800
+        let expected_caps: Vec<u64> = vec![100, 200, 400, 800];
+
+        for (attempt, &expected_cap) in expected_caps.iter().enumerate() {
+            for _ in 0..100 {
+                let ms = throttle.compute_backoff(attempt);
+                assert!(ms >= 100, "backoff {ms} below min at attempt {attempt}");
+                assert!(
+                    ms <= expected_cap,
+                    "backoff {ms} exceeds expected cap {expected_cap} at attempt {attempt}"
+                );
+            }
+        }
+
+        // High attempt should be clamped to max_backoff_ms
+        for _ in 0..50 {
+            let ms = throttle.compute_backoff(20);
+            assert!(
+                (100..=10000).contains(&ms),
+                "high-attempt backoff {ms} out of [100, 10000]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_storage_options_rejects_multiplier_below_one() {
+        let mut opts = HashMap::new();
+        opts.insert(
+            "lance_aimd_backoff_multiplier".to_string(),
+            "0.5".to_string(),
+        );
+        let result = AimdThrottleConfig::from_storage_options(Some(&opts));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("must be >= 1.0"),
+            "Error should mention >= 1.0, got: {err_msg}"
         );
     }
 }
