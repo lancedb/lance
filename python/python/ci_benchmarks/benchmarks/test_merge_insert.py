@@ -24,7 +24,6 @@ the ``merge_insert_base`` tag written by ``datagen/merge_insert.py``.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Callable, Iterable, Optional, Sequence
@@ -61,18 +60,20 @@ SOURCE_SIZES = [1_000, 10_000, 100_000]
 
 NARROW_KEYS = ["id_int", "id_uuid7", "id_uuid4"]
 
-# The full-source v1 hash join reserves its build input once per compute
-# partition. Budget 4 GiB per available CPU so the 1.32 GiB full-schema source
-# and its hash table fit while the module remains deliberately bounded.
-_MEM_POOL_SIZE_PER_CPU = 4 * 1024**3
+# Keep source buffers no larger than DataFusion's default output batch. Otherwise,
+# each sliced batch is charged for the full shared backing buffer by the hash join.
+_SOURCE_BATCH_SIZE = 8192
+
+# Budget 4 GiB total so the 1.32 GiB full-schema source and its hash table fit
+# while DataFusion still enforces a bound below the benchmark host's limit.
+_MEM_POOL_SIZE = 4 * 1024**3
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _merge_insert_mem_pool() -> Iterable[None]:
     """Use a bounded pool large enough for every merge_insert benchmark."""
     with pytest.MonkeyPatch.context() as monkeypatch:
-        pool_size = _MEM_POOL_SIZE_PER_CPU * (os.cpu_count() or 1)
-        monkeypatch.setenv("LANCE_MEM_POOL_SIZE", str(pool_size))
+        monkeypatch.setenv("LANCE_MEM_POOL_SIZE", str(_MEM_POOL_SIZE))
         yield
 
 
@@ -199,27 +200,34 @@ def wide_row_indices(fraction: float) -> np.ndarray:
 
 def wide_source(row_indices: np.ndarray, columns: Sequence[str]) -> pa.Table:
     """A wide source carrying ``id_int`` plus ``columns``."""
-    arrays = [pa.array(row_indices)]
-    names = ["id_int"]
-    for column in columns:
-        names.append(column)
-        if column == "vec":
-            values = np.linspace(
-                1.0,
-                2.0,
-                num=len(row_indices) * WIDE_VECTOR_DIM,
-                dtype=np.float32,
-            )
-            arrays.append(
-                pa.FixedSizeListArray.from_arrays(pa.array(values), WIDE_VECTOR_DIM)
-            )
-        elif WIDE_SCHEMA.field(column).type == pa.string():
-            arrays.append(
-                pa.array([f"updated_{column}_{v}" for v in row_indices], pa.string())
-            )
-        else:
-            arrays.append(pa.array(row_indices + 1))
-    return pa.table(arrays, schema=pa.schema([WIDE_SCHEMA.field(n) for n in names]))
+    names = ["id_int", *columns]
+    schema = pa.schema([WIDE_SCHEMA.field(name) for name in names])
+    batches = []
+    for start in range(0, len(row_indices), _SOURCE_BATCH_SIZE):
+        batch_indices = row_indices[start : start + _SOURCE_BATCH_SIZE]
+        arrays = [pa.array(batch_indices)]
+        for column in columns:
+            if column == "vec":
+                values = np.linspace(
+                    1.0,
+                    2.0,
+                    num=len(batch_indices) * WIDE_VECTOR_DIM,
+                    dtype=np.float32,
+                )
+                arrays.append(
+                    pa.FixedSizeListArray.from_arrays(pa.array(values), WIDE_VECTOR_DIM)
+                )
+            elif WIDE_SCHEMA.field(column).type == pa.string():
+                arrays.append(
+                    pa.array(
+                        [f"updated_{column}_{v}" for v in batch_indices],
+                        pa.string(),
+                    )
+                )
+            else:
+                arrays.append(pa.array(batch_indices + 1))
+        batches.append(pa.record_batch(arrays, schema=schema))
+    return pa.Table.from_batches(batches, schema=schema)
 
 
 # ---------------------------------------------------------------------------
