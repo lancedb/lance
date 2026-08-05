@@ -4469,6 +4469,11 @@ mod tests {
         first.posting_lists.remove(1);
         assert_eq!(first.tokens.len(), first.posting_lists.len());
 
+        // Mimic a token set persisted by a writer from before #7115. Converting the
+        // loaded set for mutation must restore the dense token-id invariant.
+        first.tokens.next_id = 9;
+        first.tokens = std::mem::take(&mut first.tokens).into_mutable();
+
         // `second` contributes a brand-new token absent from `first`. Before the fix,
         // get_or_add returned the stale next_id, indexing past posting_lists.
         let mut second = InnerBuilder::new(1, false, TokenSetFormat::default());

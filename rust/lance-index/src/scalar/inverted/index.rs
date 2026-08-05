@@ -3427,30 +3427,12 @@ impl TokenSet {
     }
 
     pub(crate) fn into_mutable(self) -> Self {
-        let Self {
-            tokens,
-            next_id,
-            total_length,
-        } = self;
-        match tokens {
-            TokenMap::HashMap(_) => Self {
-                tokens,
-                next_id,
-                total_length,
-            },
-            TokenMap::Fst(map) => {
-                let mut mutable = HashMap::new();
-                let mut stream = map.stream();
-                while let Some((token, token_id)) = stream.next() {
-                    mutable.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
-                }
-                Self {
-                    tokens: TokenMap::HashMap(mutable),
-                    next_id,
-                    total_length,
-                }
-            }
-        }
+        let mut mutable = self.into_mut();
+        // Incremental merges add tokens after this conversion. Recompute the allocator
+        // cursor from the dense token ids so stale persisted bookkeeping cannot escape
+        // a format-specific loader and produce an out-of-range posting-list index.
+        mutable.next_id = mutable.tokens.len() as u32;
+        mutable
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
