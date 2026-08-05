@@ -5777,8 +5777,8 @@ class LanceOperation:
             The newly written fragments that make up the new dataset. They are
             assigned fresh ids when the operation is committed, continuing from
             the highest id the dataset has ever used, so any id they carry is
-            ignored. A fragment with a deletion file belongs to the dataset being
-            replaced and is rejected: use :class:`LanceOperation.Delete` to commit
+            ignored. Since we reassign fragment ids, a fragment with a deletion
+            file is rejected: use :class:`LanceOperation.Delete` to commit
             deletions, or :class:`LanceOperation.Merge` to change the schema of
             existing fragments.
         initial_bases: list[DatasetBasePath], optional

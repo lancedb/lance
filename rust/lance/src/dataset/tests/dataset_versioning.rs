@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
@@ -673,8 +674,14 @@ async fn test_overwrite_does_not_reuse_fragment_ids() {
     assert_eq!(fragment_ids(&dataset), vec![3, 4, 5]);
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_overwrite_rejects_fragment_with_deletion_file() {
+async fn test_overwrite_rejects_fragment_with_deletion_file(
+    // Every form of the operation must be rejected: upserting config alongside
+    // the overwrite does not make renumbering the fragment any safer.
+    #[values(None, Some(HashMap::from([("key".to_string(), "value".to_string())])))]
+    config_upsert_values: Option<HashMap<String, String>>,
+) {
     // A deletion file's path embeds the fragment id, so it cannot follow its
     // fragment to the fresh id an overwrite assigns. Such a fragment belongs to
     // the dataset being replaced, so the operation is rejected rather than
@@ -699,7 +706,7 @@ async fn test_overwrite_rejects_fragment_with_deletion_file() {
             Operation::Overwrite {
                 fragments: vec![fragment],
                 schema,
-                config_upsert_values: None,
+                config_upsert_values,
                 initial_bases: None,
             },
             None,

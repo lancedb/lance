@@ -340,10 +340,13 @@ pub enum Operation {
     ///
     /// The fragments are newly written ones and are assigned fresh ids at commit
     /// time, continuing from the dataset's highest id ever used; the ids they
-    /// arrive with are ignored. A fragment carrying a deletion file therefore
-    /// belongs to the dataset being replaced and is rejected: use [`Self::Delete`]
-    /// to commit deletions, or [`Self::Merge`] to change the schema of existing
-    /// fragments.
+    /// arrive with are ignored.
+    ///
+    /// A fragment carrying a deletion file is rejected. A deletion file's path
+    /// embeds the fragment id, so it cannot follow its fragment to the new id:
+    /// minting a fragment and giving it a deletion file are mutually exclusive in
+    /// one transaction. Use [`Self::Delete`] to commit deletions against existing
+    /// fragments, or [`Self::Merge`] to change their schema.
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
@@ -4009,10 +4012,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
-            fragments,
-            schema,
-            config_upsert_values: None,
-            initial_bases: _,
+            fragments, schema, ..
         } => {
             overwrite_fragments_valid(fragments)?;
             // Pass None for manifest because Overwrite replaces all fragments.
