@@ -26,7 +26,7 @@ use lance_core::{Error, Result};
 
 use std::str::FromStr;
 
-use crate::compression::{BlockCompressor, BlockDecompressor};
+use crate::compression::{BlockCompressor, BlockDecompressor, require_block_payload};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
     ProtobufUtils21,
@@ -450,11 +450,12 @@ impl GeneralBlockDecompressor {
 }
 
 impl BlockDecompressor for GeneralBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "General block compression")?;
         let mut decompressed = Vec::new();
         self.compressor.decompress(&data, &mut decompressed)?;
         self.inner
-            .decompress(LanceBuffer::from(decompressed), num_values)
+            .decompress(Some(LanceBuffer::from(decompressed)), num_values)
     }
 }
 
@@ -614,13 +615,26 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
 }
 
 impl BlockCompressor for CompressedBufferEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let encoded = match data {
-            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let (encoded, inner_encoding) = match data {
+            DataBlock::FixedWidth(fixed_width) => (
+                fixed_width.data,
+                ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+            ),
             DataBlock::VariableWidth(variable_width) => {
                 // Wrap VariableEncoder to handle the encoding
                 let encoder = VariableEncoder::default();
-                BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?
+                let (payload, encoding) =
+                    BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?;
+                (
+                    payload.ok_or_else(|| {
+                        Error::internal(
+                            "VariableEncoder returned no payload for general compression"
+                                .to_string(),
+                        )
+                    })?,
+                    encoding,
+                )
             }
             _ => {
                 return Err(Error::invalid_input_source(
@@ -631,18 +645,22 @@ impl BlockCompressor for CompressedBufferEncoder {
 
         let mut compressed = Vec::new();
         self.compressor.compress(&encoded, &mut compressed)?;
-        Ok(LanceBuffer::from(compressed))
+        Ok((
+            Some(LanceBuffer::from(compressed)),
+            ProtobufUtils21::wrapped(self.compressor.config(), inner_encoding)?,
+        ))
     }
 }
 
 impl BlockDecompressor for CompressedBufferEncoder {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Compressed variable block")?;
         let mut decompressed = Vec::new();
         self.compressor.decompress(&data, &mut decompressed)?;
 
         // Delegate to BinaryBlockDecompressor which handles the inline metadata
         let inner_decoder = BinaryBlockDecompressor::default();
-        inner_decoder.decompress(LanceBuffer::from(decompressed), num_values)
+        inner_decoder.decompress(Some(LanceBuffer::from(decompressed)), num_values)
     }
 }
 
