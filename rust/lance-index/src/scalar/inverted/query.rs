@@ -592,8 +592,11 @@ impl FtsQueryNode for MultiMatchQuery {
 }
 
 pub enum Occur {
+    /// The clause may match and contributes its score when it does.
     Should,
+    /// The clause must match and contributes its score.
     Must,
+    /// The clause must not match and never contributes to the score.
     MustNot,
 }
 
@@ -624,8 +627,11 @@ impl From<Occur> for &'static str {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BooleanQuery {
+    /// Optional scoring clauses, at least one of which must match when there are no MUST clauses.
     pub should: Vec<FtsQuery>,
+    /// Required scoring clauses whose scores are summed.
     pub must: Vec<FtsQuery>,
+    /// Prohibited non-scoring clauses.
     pub must_not: Vec<FtsQuery>,
 }
 

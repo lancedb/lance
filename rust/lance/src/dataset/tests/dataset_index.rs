@@ -961,6 +961,171 @@ async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: us
     assert_eq!(limited, exhaustive[..limit]);
 }
 
+fn expected_must_score_sum(left: Vec<(u64, f32)>, right: Vec<(u64, f32)>) -> Vec<(u64, f32)> {
+    let right = right.into_iter().collect::<HashMap<_, _>>();
+    let mut expected = left
+        .into_iter()
+        .filter_map(|(row_id, left_score)| {
+            right
+                .get(&row_id)
+                .map(|right_score| (row_id, left_score + right_score))
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_row_id.cmp(right_row_id))
+    });
+    expected
+}
+
+#[tokio::test]
+async fn test_boolean_must_scores_sum_across_execution_paths() {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "alpha beta delta",
+                "alpha alpha beta delta delta",
+                "alpha delta",
+                "beta delta",
+                "alpha beta beta delta delta delta"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            ["gamma", "gamma gamma", "gamma", "gamma", "other"]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+    const LIMIT: usize = 2;
+
+    let match_query = |term: &str, column: &str, boost: f32| -> FtsQuery {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some(column.to_owned()))
+            .with_boost(boost)
+            .into()
+    };
+
+    let same_column_left = match_query("alpha", "title", 2.0);
+    let same_column_right = match_query("beta", "title", 3.0);
+    let expected = expected_must_score_sum(
+        compound_fts_results(&dataset, same_column_left.clone(), None).await,
+        compound_fts_results(&dataset, same_column_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let same_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, same_column_left.clone()),
+        (Occur::Must, same_column_right.clone()),
+    ])
+    .into();
+    let actual =
+        compound_fts_results(&dataset, same_column_query.clone(), Some(LIMIT as i64)).await;
+    assert_eq!(actual, expected[..LIMIT]);
+    let reversed_same_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, same_column_right),
+        (Occur::Must, same_column_left),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_same_column_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let nested_left = match_query("alpha", "title", 2.0);
+    let nested_middle = match_query("beta", "title", 3.0);
+    let nested_right = match_query("delta", "title", 5.0);
+    let expected = expected_must_score_sum(
+        expected_must_score_sum(
+            compound_fts_results(&dataset, nested_left.clone(), None).await,
+            compound_fts_results(&dataset, nested_middle.clone(), None).await,
+        ),
+        compound_fts_results(&dataset, nested_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let nested_pair: FtsQuery =
+        BooleanQuery::new([(Occur::Must, nested_left), (Occur::Must, nested_middle)]).into();
+    let nested_query: FtsQuery =
+        BooleanQuery::new([(Occur::Must, nested_pair), (Occur::Must, nested_right)]).into();
+    assert_eq!(
+        compound_fts_results(&dataset, nested_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+    let reversed_nested_pair: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("beta", "title", 3.0)),
+        (Occur::Must, match_query("alpha", "title", 2.0)),
+    ])
+    .into();
+    let reversed_nested_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("delta", "title", 5.0)),
+        (Occur::Must, reversed_nested_pair),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_nested_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(same_column_query))
+        .unwrap();
+    scanner.limit(Some(LIMIT as i64), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column MUST should exercise the composable scorer:\n{plan}"
+    );
+
+    let cross_column_left = match_query("alpha", "title", 2.0);
+    let cross_column_right = match_query("gamma", "body", 3.0);
+    let expected = expected_must_score_sum(
+        compound_fts_results(&dataset, cross_column_left.clone(), None).await,
+        compound_fts_results(&dataset, cross_column_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let cross_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, cross_column_left.clone()),
+        (Occur::Must, cross_column_right.clone()),
+    ])
+    .into();
+    let actual =
+        compound_fts_results(&dataset, cross_column_query.clone(), Some(LIMIT as i64)).await;
+    assert_eq!(actual, expected[..LIMIT]);
+    let reversed_cross_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, cross_column_right),
+        (Occur::Must, cross_column_left),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_cross_column_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(cross_column_query))
+        .unwrap();
+    scanner.limit(Some(LIMIT as i64), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("HashJoinExec"),
+        "cross-column MUST should exercise the exact fallback:\n{plan}"
+    );
+}
+
 #[tokio::test]
 async fn test_nested_multimatch_limit_propagation() {
     let batch = arrow_array::record_batch!(

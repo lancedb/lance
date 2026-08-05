@@ -154,7 +154,7 @@ pub enum FtsQueryExpr {
     },
     /// Boolean combination of queries.
     Boolean {
-        /// All MUST clauses must match for a document to be included.
+        /// All MUST clauses must match and contribute to the score.
         must: Vec<Self>,
         /// At least one SHOULD clause should match (adds to score).
         should: Vec<Self>,
@@ -4720,14 +4720,35 @@ mod tests {
         let batch = create_boolean_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
 
+        let rust = FtsQueryExpr::match_query("rust").with_boost(2.0);
+        let programming = FtsQueryExpr::match_query("programming").with_boost(3.0);
+        let rust_score = index
+            .search_query(&rust)
+            .into_iter()
+            .find(|entry| entry.row_position == 0)
+            .unwrap()
+            .score;
+        let programming_score = index
+            .search_query(&programming)
+            .into_iter()
+            .find(|entry| entry.row_position == 0)
+            .unwrap()
+            .score;
         let query = FtsQueryExpr::boolean()
-            .must(FtsQueryExpr::match_query("rust"))
-            .must(FtsQueryExpr::match_query("programming"))
+            .must(rust.clone())
+            .must(programming.clone())
             .build();
 
         let entries = index.search_query(&query);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].row_position, 0);
+        let expected_score = rust_score + programming_score;
+        assert!((entries[0].score - expected_score).abs() < 1e-6);
+
+        let reversed = FtsQueryExpr::boolean().must(programming).must(rust).build();
+        let reversed_entries = index.search_query(&reversed);
+        assert_eq!(reversed_entries.len(), 1);
+        assert!((reversed_entries[0].score - expected_score).abs() < 1e-6);
     }
 
     #[test]

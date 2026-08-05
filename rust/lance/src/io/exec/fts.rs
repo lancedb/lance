@@ -303,6 +303,36 @@ fn batch_scored_document_keys(batch: &RecordBatch) -> Result<Vec<(DocumentKey, f
         .collect())
 }
 
+fn batch_scored_document_keys_sum_scores(batch: &RecordBatch) -> Result<Vec<(DocumentKey, f32)>> {
+    let keys = batch_document_keys(batch)?;
+    let schema = batch.schema();
+    let score_columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() == SCORE_COL)
+        .map(|(index, _)| batch.column(index).as_primitive::<Float32Type>())
+        .collect::<Vec<_>>();
+    if score_columns.is_empty() {
+        return Err(Error::internal(format!(
+            "Boolean MUST result is missing required {SCORE_COL} columns"
+        )));
+    }
+    keys.into_iter()
+        .enumerate()
+        .map(|(row, key)| {
+            let score: f32 = score_columns.iter().map(|scores| scores.value(row)).sum();
+            if !score.is_finite() {
+                return Err(Error::internal(format!(
+                    "Boolean MUST score sum must be finite, got {score} for row_id={}",
+                    key.row_id
+                )));
+            }
+            Ok((key, score))
+        })
+        .collect()
+}
+
 fn document_key_scores_batch(
     schema: SchemaRef,
     values: impl IntoIterator<Item = (DocumentKey, f32)>,
@@ -3088,7 +3118,7 @@ impl ExecutionPlan for BooleanQueryExec {
             if let Some(mut must) = must {
                 while let Some(batch) = must.try_next().await? {
                     let _timer = elapsed_time.timer();
-                    res.extend(batch_scored_document_keys(&batch)?);
+                    res.extend(batch_scored_document_keys_sum_scores(&batch)?);
                 }
             }
 
