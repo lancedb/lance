@@ -497,13 +497,9 @@ mod test {
         let num_rows = 10u64;
         let batch = sequence_batch(0..num_rows as i32);
 
-        // The session is shared across both writes so the metadata cache stays
-        // warm across the overwrite.
-        let session = Arc::new(Session::default());
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             enable_stable_row_ids: true,
-            session: Some(session.clone()),
             ..Default::default()
         };
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -514,26 +510,9 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
 
-        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
-            .await
-            .unwrap();
-        assert_eq!(
-            sequence.iter().collect::<Vec<_>>(),
-            (0..num_rows).collect::<Vec<_>>()
-        );
-
-        // Loading the same fragment again must be served from the cache: the key
-        // discriminates on the row id metadata, which has not changed.
-        let hits_before = session.metadata_cache_stats().await.hits;
-        load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
-            .await
-            .unwrap();
-        assert_eq!(session.metadata_cache_stats().await.hits, hits_before + 1);
-
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
             mode: WriteMode::Overwrite,
-            session: Some(session.clone()),
             ..Default::default()
         };
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
@@ -549,34 +528,70 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
         assert!(index.get(num_rows).is_some());
+    }
 
-        // The new fragment holds the row ids the overwrite wrote, not the ones
-        // cached for the generation it replaced.
+    /// Fragment ids are a high water mark within one dataset, but a dataset
+    /// dropped and recreated at the same URI restarts them at 0 while sharing the
+    /// cache namespace of its predecessor (see #7645). The two generations must
+    /// still be told apart.
+    #[tokio::test]
+    async fn test_row_ids_recreate_at_same_uri() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        // Shared so the cache stays warm across the drop, as it would for a host
+        // that keeps one session open for the lifetime of the process.
+        let session = Arc::new(Session::default());
+        let write = |rows: Range<i32>| {
+            let batch = sequence_batch(rows);
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let params = WriteParams {
+                enable_stable_row_ids: true,
+                session: Some(session.clone()),
+                ..Default::default()
+            };
+            async move {
+                Dataset::write(reader, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let dataset = write(0..100).await;
+        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(sequence.len(), 100);
+
+        // Reloading the unchanged fragment must still hit: keying on contents has
+        // to leave the sequence cacheable, not just make it distinguishable.
+        let hits_before = session.metadata_cache_stats().await.hits;
+        load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(session.metadata_cache_stats().await.hits, hits_before + 1);
+
+        drop(dataset);
+        std::fs::remove_dir_all(tmp_path.as_str()).unwrap();
+
+        // Shorter than the dataset it replaces, so a stale hit is observable: an
+        // equal-length sequence would be byte-identical and harmless.
+        let dataset = write(0..60).await;
+        assert_eq!(dataset.manifest.fragments[0].id, 0);
+
         let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
             .await
             .unwrap();
         assert_eq!(
             sequence.iter().collect::<Vec<_>>(),
-            (num_rows..(2 * num_rows)).collect::<Vec<_>>()
-        );
-
-        // Neither generation displaces the other: the version written before the
-        // overwrite still reads its own sequence out of the same cache.
-        let previous = dataset.checkout_version(1).await.unwrap();
-        let sequence = load_row_id_sequence(&previous, &previous.manifest.fragments[0])
-            .await
-            .unwrap();
-        assert_eq!(
-            sequence.iter().collect::<Vec<_>>(),
-            (0..num_rows).collect::<Vec<_>>()
+            (0..60).collect::<Vec<_>>()
         );
     }
 
     #[tokio::test]
-    async fn test_compaction_after_overwrite() {
-        // Compaction rechunks the row id sequences of the fragments it merges.
-        // If a sequence cached before the overwrite were served for one of them,
-        // the rechunk would hand out ids the fragments do not hold.
+    async fn test_compaction_after_recreate() {
+        // Compaction rechunks the row id sequences of the fragments it merges, so
+        // a sequence cached for a dropped dataset does not just misreport ids, it
+        // writes ids the fragments do not hold back into the manifest.
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
         let tmp_path = &temp_dir;
         let session = Arc::new(Session::default());
@@ -605,9 +620,12 @@ mod test {
             .await
             .unwrap();
 
-        // The overwrite replaces those 100 rows with 60 holding row ids 100..160.
-        write(0..60, WriteMode::Overwrite).await;
-        // A second fragment, so compaction has something to merge.
+        drop(dataset);
+        std::fs::remove_dir_all(tmp_path.as_str()).unwrap();
+
+        // The recreated dataset holds 60 rows in fragment 0, not the 100 cached
+        // above, and a second fragment so compaction has something to merge.
+        write(0..60, WriteMode::Create).await;
         let mut dataset = write(0..100, WriteMode::Append).await;
 
         compact(&mut dataset, 1024).await;
@@ -622,9 +640,9 @@ mod test {
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        // 100..160 from the overwrite, 160..260 from the append. A stale
-        // sequence would put 0..100 back into circulation.
-        assert_eq!(row_ids, (100..260).collect::<HashSet<_>>());
+        // A stale 100-long sequence would rechunk 0..100 onto the 60 rows of
+        // fragment 0 and shift everything after it.
+        assert_eq!(row_ids, (0..160).collect::<HashSet<_>>());
     }
 
     #[tokio::test]

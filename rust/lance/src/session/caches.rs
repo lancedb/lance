@@ -225,11 +225,10 @@ pub struct RowIdSequenceKey<'a> {
     pub fragment_id: u64,
     /// Where the sequence is stored. A fragment id alone is not enough: this
     /// cache is namespaced by dataset URI only (see
-    /// [`GlobalMetadataCache::for_dataset`]) and fragment ids restart at 0 both
-    /// for an overwrite and for a dataset dropped and recreated at the same URI,
-    /// so a reused id would otherwise be served the earlier generation's
-    /// sequence. The `row_id_meta` is used to differentiate generations of
-    /// dataset fragments.
+    /// [`GlobalMetadataCache::for_dataset`]), and a dataset dropped and
+    /// recreated at the same URI restarts fragment ids at 0, so a reused id
+    /// would otherwise be served the earlier generation's sequence (#7645).
+    /// The `row_id_meta` differentiates generations of dataset fragments.
     ///
     /// Any operation that changes which row ids a fragment holds also writes it
     /// new `row_id_meta`, so generations stay distinct; operations that leave
@@ -329,9 +328,8 @@ mod tests {
 
     #[tokio::test]
     async fn row_id_sequence_key_separates_fragment_generations() {
-        // An overwrite, or a dataset dropped and recreated at the same URI,
-        // restarts fragment ids, so the same id must not resolve to the earlier
-        // generation's sequence.
+        // A dataset dropped and recreated at the same URI restarts fragment ids,
+        // so the same id must not resolve to the earlier generation's sequence.
         let cache = LanceCache::with_capacity(4096);
         let first_generation = RowIdMeta::Inline(write_row_ids(&(0..100).into()).into());
         let key = RowIdSequenceKey {
