@@ -1804,6 +1804,7 @@ async fn rewrite_files(
         }
     } else {
         let (frags, _) = write_fragments_internal(
+            dataset.manifest.data_storage_format.lance_file_format(),
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
             &dataset.base,

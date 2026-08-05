@@ -7,10 +7,12 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
-use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::datatypes::{NullabilityComparison, Schema};
 use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_datafusion::utils::StreamingWriteSource;
+use lance_file::version::ConcreteFileVersion;
+#[cfg(test)]
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
@@ -136,7 +138,7 @@ impl<'a> InsertBuilder<'a> {
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
-            .with_storage_format(context.storage_version)
+            .with_exact_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
             .with_object_store(context.object_store.clone())
@@ -214,6 +216,7 @@ impl<'a> InsertBuilder<'a> {
         .await?;
 
         let (written_fragments, written_schema) = write_fragments_internal(
+            context.storage_version,
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -316,13 +319,11 @@ impl<'a> InsertBuilder<'a> {
                 context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
             }
 
-            let schema_cmp_opts = SchemaCompareOptions {
-                compare_dictionary: dataset.manifest.should_use_legacy_format(),
-                compare_nullability: NullabilityComparison::Ignore,
-                allow_missing_if_nullable: true,
-                ignore_field_order: true,
-                ..Default::default()
-            };
+            let version = dataset.manifest.data_storage_format.lance_file_format();
+            let mut schema_cmp_opts = crate::dataset::versions::schema_compare_options(version);
+            schema_cmp_opts.compare_nullability = NullabilityComparison::Ignore;
+            schema_cmp_opts.allow_missing_if_nullable = true;
+            schema_cmp_opts.ignore_field_order = true;
 
             let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
             normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
@@ -416,15 +417,15 @@ impl<'a> InsertBuilder<'a> {
             (WriteMode::Overwrite, WriteDestination::Dataset(dataset)) => {
                 // If overwriting an existing dataset, allow the user to specify but use
                 // the existing version if they don't
-                params.data_storage_version.map(Ok).unwrap_or_else(|| {
-                    let m = dataset.manifest.as_ref();
-                    m.data_storage_format.lance_file_version()
-                })?
+                params
+                    .data_storage_version
+                    .map(ConcreteFileVersion::from)
+                    .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
             }
             (_, WriteDestination::Dataset(dataset)) => {
                 // If appending to an existing dataset, always use the dataset version
                 let m = dataset.manifest.as_ref();
-                m.data_storage_format.lance_file_version()?
+                m.data_storage_format.lance_file_format()
             }
             // Otherwise (no existing dataset) fallback to the default if the user didn't specify
             (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),
@@ -448,7 +449,7 @@ struct WriteContext<'a> {
     object_store: Arc<ObjectStore>,
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
-    storage_version: LanceFileVersion,
+    storage_version: ConcreteFileVersion,
 }
 
 #[cfg(test)]
