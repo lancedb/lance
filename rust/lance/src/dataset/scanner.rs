@@ -4120,6 +4120,10 @@ impl Scanner {
                     fts_node,
                     schema,
                 )?);
+                // The aggregate above groups on `_rowid` alone, collapsing a
+                // row's elements into one `max(_score)`, so its output carries no
+                // coordinate for the sort key to pick up. Element ordering inside a
+                // MultiMatch row is a separate, pre-existing gap.
                 let sort_exprs = fts_result_sort_exprs(fts_node.schema().as_ref())?;
 
                 // `params.limit` is the recursive planning contract. Compound
