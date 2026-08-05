@@ -19,7 +19,7 @@ use lance_core::{
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DeletionFile, DeletionFileType, Manifest},
+    format::{DeletionFile, DeletionFileType, Manifest, RowIdMeta},
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -221,30 +221,42 @@ impl CacheKey for RowIdIndexKey {
 }
 
 #[derive(Debug)]
-pub struct RowIdSequenceKey {
-    pub version: u64,
-    pub fragment_id: u64,
+pub struct RowIdSequenceKey<'a> {
+    pub row_id_meta: &'a RowIdMeta,
 }
 
-impl CacheKey for RowIdSequenceKey {
+impl CacheKey for RowIdSequenceKey<'_> {
     type ValueType = RowIdSequence;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "row_id_sequence/{}/{}",
-            self.version, self.fragment_id
-        ))
+        match self.row_id_meta {
+            RowIdMeta::Inline(data) => Cow::Owned(format!("row_id_sequence/inline/{}", data.len())),
+            RowIdMeta::External(file) => Cow::Owned(format!(
+                "row_id_sequence/external/{}/{}/{}",
+                file.path, file.offset, file.size
+            )),
+        }
     }
     fn type_name() -> &'static str {
         "RowIdSequence"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 2)
+        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.version);
-        builder.write_u64(self.fragment_id);
+        match self.row_id_meta {
+            RowIdMeta::Inline(data) => {
+                builder.write_variant(0);
+                builder.write_bytes(data);
+            }
+            RowIdMeta::External(file) => {
+                builder.write_variant(1);
+                builder.write_str(&file.path);
+                builder.write_u64(file.offset);
+                builder.write_u64(file.size);
+            }
+        }
     }
 }
 

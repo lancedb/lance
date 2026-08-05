@@ -18,27 +18,22 @@ pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
-    // Virtual path to prevent collisions in the cache.
-    match &fragment.row_id_meta {
-        None => Err(Error::internal("Missing row id meta")),
-        Some(RowIdMeta::Inline(data)) => {
+    let row_id_meta = fragment
+        .row_id_meta
+        .as_ref()
+        .ok_or_else(|| Error::internal("Missing row id meta"))?;
+    let key = RowIdSequenceKey { row_id_meta };
+    match row_id_meta {
+        RowIdMeta::Inline(data) => {
             let data = data.clone();
-            let key = RowIdSequenceKey {
-                version: dataset.manifest.version,
-                fragment_id: fragment.id,
-            };
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
                 .await
         }
-        Some(RowIdMeta::External(file_slice)) => {
+        RowIdMeta::External(file_slice) => {
             let file_slice = file_slice.clone();
             let dataset_clone = dataset.clone();
-            let key = RowIdSequenceKey {
-                version: dataset.manifest.version,
-                fragment_id: fragment.id,
-            };
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move {
@@ -593,6 +588,76 @@ mod test {
             .unwrap();
         assert_eq!(result.num_rows(), 1);
         assert_eq!(result["id"].as_primitive::<Int32Type>().value(0), 105);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_sequence_cache_after_uri_recreation() {
+        let session = Arc::new(crate::session::Session::default());
+        let uri = "memory://";
+        let first_batch = sequence_batch(0..1);
+        let mut first = Dataset::write(
+            RecordBatchIterator::new([Ok(first_batch.clone())], first_batch.schema()),
+            uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                session: Some(session.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let first_fragments = first.get_fragments();
+        let first_sequence = load_row_id_sequence(&first, first_fragments[0].metadata())
+            .await
+            .unwrap();
+        assert_eq!(first_sequence.len(), 1);
+
+        let appended_batch = sequence_batch(1..2);
+        first
+            .append(
+                Box::new(RecordBatchIterator::new(
+                    [Ok(appended_batch.clone())],
+                    appended_batch.schema(),
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.manifest.version, 2);
+        let appended_fragments = first.get_fragments();
+        let unchanged_sequence = load_row_id_sequence(&first, appended_fragments[0].metadata())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first_sequence, &unchanged_sequence));
+
+        first
+            .object_store
+            .remove_dir_all(first.base.clone())
+            .await
+            .unwrap();
+
+        let second_batch = sequence_batch(10..12);
+        let second = Dataset::write(
+            RecordBatchIterator::new([Ok(second_batch.clone())], second_batch.schema()),
+            uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                session: Some(session),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let second_fragments = second.get_fragments();
+        assert_eq!(second.manifest.version, 1);
+        assert_eq!(second_fragments[0].fast_physical_rows().unwrap(), 2);
+        assert_eq!(
+            load_row_id_sequence(&second, second_fragments[0].metadata())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
