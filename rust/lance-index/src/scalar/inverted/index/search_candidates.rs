@@ -174,6 +174,11 @@ impl ModernCandidates {
         }
     }
 
+    /// Candidates held for the final selection: the top-k plus the tie band.
+    pub(super) fn buffered(&self) -> usize {
+        self.heap.len() + self.tie_band.len()
+    }
+
     /// The candidates whose addresses have to be resolved: the top-k plus the tie
     /// band. Returning more than `limit` is safe, the final ranking truncates.
     pub(super) fn into_vec(self) -> Vec<ScoredPartitionDoc> {
@@ -185,6 +190,15 @@ impl ModernCandidates {
             .collect::<Vec<_>>();
         candidates.extend(self.tie_band);
         candidates
+    }
+
+    /// Rebuild from candidates already ordered best first, as the exact top-k with
+    /// an empty tie band.
+    pub(super) fn from_ranked(ordered: Vec<ScoredPartitionDoc>) -> Self {
+        Self {
+            heap: ordered.into_iter().map(Reverse).collect(),
+            tie_band: Vec::new(),
+        }
     }
 }
 

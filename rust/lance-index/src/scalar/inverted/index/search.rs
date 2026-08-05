@@ -484,7 +484,7 @@ impl InvertedIndex {
         }
         self.document_projections_resident
             .store(false, Ordering::Release);
-        let resolved = self.resolve_deferred_modern_candidates(ranked).await?;
+        let resolved = self.resolve_deferred_modern_candidates(&ranked).await?;
         Ok(rank_resolved_documents(resolved, limit))
     }
 
@@ -528,7 +528,7 @@ impl InvertedIndex {
         }
         let limit = request.limit;
         let ranked = self.bm25_search_modern_candidates(request).await?;
-        let resolved = self.resolve_deferred_modern_candidates(ranked).await?;
+        let resolved = self.resolve_deferred_modern_candidates(&ranked).await?;
         Ok(rank_resolved_documents(resolved, limit))
     }
 
@@ -639,58 +639,112 @@ impl InvertedIndex {
                 scorer,
                 &mut idf_cache,
             )?;
+            metrics.record_fts_peak_buffered_candidates(ranked.buffered());
+            self.compact_modern_candidates(&mut ranked, limit).await?;
         }
 
-        for (partition_ordinal, part) in retries {
-            let documents = part.docs.modern().cloned().ok_or_else(|| {
-                Error::internal("modern index contains legacy partition documents")
-            })?;
-            // Loading the addresses lets the retry order the tie band exactly, with
-            // a heap bounded by `limit`. It costs no extra read for a partition that
-            // reaches the final top-k, whose addresses are resolved either way.
-            let addresses = documents.address_projection().await?;
-            let Some(mut loaded) = load_modern_partition(
-                partition_ordinal,
-                part,
-                tokens.clone(),
-                params.clone(),
-                operator,
-                mask.clone(),
-                metrics.clone(),
-                impact_scorer.clone(),
-                impact_shared_threshold.clone(),
-            )
-            .await?
-            else {
-                continue;
-            };
-            loaded.addresses = Some(addresses);
-            let retry_params = params.clone();
-            let retry_metrics = metrics.clone();
-            let scored = spawn_cpu(move || {
-                score_modern_partition(
-                    loaded,
-                    retry_params.as_ref(),
-                    operator,
-                    retry_metrics.as_ref(),
-                )
-            })
-            .await?;
-            debug_assert!(
-                !scored.score_floor_overflow,
-                "an address-ordered retry cannot overflow its score floor"
-            );
-            merge_modern_partition(
-                &mut ranked,
-                limit,
-                scored.partition_ordinal,
-                scored.candidates,
-                scorer,
-                &mut idf_cache,
-            )?;
+        if !retries.is_empty() {
+            metrics.record_fts_score_floor_overflows(retries.len());
+            // Retries repeat a partition's posting load and WAND walk, so they run
+            // with the same concurrency as the main pass instead of serially behind
+            // it. A broad tied query can overflow every partition at once.
+            let concurrency = get_num_compute_intensive_cpus().min(32);
+            let mut retried = stream::iter(retries.into_iter().map(|(partition_ordinal, part)| {
+                let tokens = tokens.clone();
+                let params = params.clone();
+                let mask = mask.clone();
+                let metrics = metrics.clone();
+                let impact_scorer = impact_scorer.clone();
+                let impact_shared_threshold = impact_shared_threshold.clone();
+                async move {
+                    let documents = part.docs.modern().cloned().ok_or_else(|| {
+                        Error::internal("modern index contains legacy partition documents")
+                    })?;
+                    // Loading the addresses lets the retry order the tie band
+                    // exactly, with a heap bounded by `limit`. It costs no extra
+                    // read for a partition that reaches the final top-k, whose
+                    // addresses are resolved either way.
+                    let addresses = documents.address_projection().await?;
+                    let Some(mut loaded) = load_modern_partition(
+                        partition_ordinal,
+                        part,
+                        tokens,
+                        params.clone(),
+                        operator,
+                        mask,
+                        metrics.clone(),
+                        impact_scorer,
+                        impact_shared_threshold,
+                    )
+                    .await?
+                    else {
+                        return Result::Ok(None);
+                    };
+                    loaded.addresses = Some(addresses);
+                    let scored = spawn_cpu(move || {
+                        score_modern_partition(loaded, params.as_ref(), operator, metrics.as_ref())
+                    })
+                    .await?;
+                    debug_assert!(
+                        !scored.score_floor_overflow,
+                        "an address-ordered retry cannot overflow its score floor"
+                    );
+                    Result::Ok(Some(scored))
+                }
+            }))
+            .buffer_unordered(concurrency);
+            while let Some(scored) = retried.try_next().await? {
+                let Some(scored) = scored else {
+                    continue;
+                };
+                merge_modern_partition(
+                    &mut ranked,
+                    limit,
+                    scored.partition_ordinal,
+                    scored.candidates,
+                    scorer,
+                    &mut idf_cache,
+                )?;
+                metrics.record_fts_peak_buffered_candidates(ranked.buffered());
+                self.compact_modern_candidates(&mut ranked, limit).await?;
+            }
         }
 
         Ok(ranked.into_vec())
+    }
+
+    /// Keep the cross-partition tie band bounded.
+    ///
+    /// The merge retains every candidate tied at the k-th score, and with enough
+    /// partitions contributing to one tie group that band is the only unbounded
+    /// buffer on this path. Once it passes `limit + SCORE_FLOOR_BUFFER` the merge
+    /// resolves what it holds, keeps the exact top-k by
+    /// `(score DESC, row_id ASC, doc_index ASC)` and starts a fresh band. That is
+    /// still exact: every later candidate is compared against a k-th entry that is
+    /// now the true k-th of everything seen so far.
+    ///
+    /// The resolution costs address reads for partitions that may not survive, so
+    /// it only runs past the bound. A no-tie query never reaches it.
+    async fn compact_modern_candidates(
+        &self,
+        ranked: &mut ModernCandidates,
+        limit: usize,
+    ) -> Result<()> {
+        if ranked.buffered() <= limit.saturating_add(SCORE_FLOOR_BUFFER) {
+            return Ok(());
+        }
+        let candidates = std::mem::take(ranked).into_vec();
+        let resolved = self.resolve_deferred_modern_candidates(&candidates).await?;
+        let mut order = (0..candidates.len()).collect::<Vec<_>>();
+        order.sort_unstable_by(|&left, &right| resolved[right].cmp(&resolved[left]));
+        order.truncate(limit);
+        *ranked = ModernCandidates::from_ranked(
+            order
+                .into_iter()
+                .map(|rank| candidates[rank].clone())
+                .collect(),
+        );
+        Ok(())
     }
 
     fn resolve_resident_modern_candidates(
@@ -744,7 +798,7 @@ impl InvertedIndex {
 
     async fn resolve_deferred_modern_candidates(
         &self,
-        ranked: Vec<ScoredPartitionDoc>,
+        ranked: &[ScoredPartitionDoc],
     ) -> Result<Vec<ScoredDoc>> {
         let mut resolved_documents = ranked
             .iter()

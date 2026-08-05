@@ -13,6 +13,8 @@ pub const COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC: &str =
     "compound_peak_address_resolution_batch_size";
 pub const COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "compound_score_floor_overflows";
 pub const COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "compound_peak_buffered_candidates";
+pub const FTS_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "fts_score_floor_overflows";
+pub const FTS_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "fts_peak_buffered_candidates";
 
 /// A trait used by the index to report metrics
 ///
@@ -102,6 +104,13 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record unresolved score floors that required a resolved-key retry.
     fn record_compound_score_floor_overflows(&self, _num_overflows: usize) {}
+
+    /// Record FTS partitions whose k-th-score tie band outgrew the collector's
+    /// buffer, so the partition was searched again against resolved row addresses.
+    fn record_fts_score_floor_overflows(&self, _num_overflows: usize) {}
+
+    /// Record a candidate-buffer high-water mark for the cross-partition FTS merge.
+    fn record_fts_peak_buffered_candidates(&self, _num_candidates: usize) {}
 
     /// Record a candidate-buffer high-water mark for compound FTS.
     fn record_compound_peak_buffered_candidates(&self, _num_candidates: usize) {}

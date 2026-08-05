@@ -112,25 +112,23 @@ async fn search_alpha(index: &InvertedIndex, limit: usize) -> Vec<u64> {
     search_alpha_with(index, limit, Arc::new(NoFilter)).await
 }
 
-#[tokio::test]
-async fn test_fts_topk_tied_scores_stable_prefix_single_partition() {
-    let (_tmpdir, index) =
-        load_tied_index(&[(0, vec![100, 101, 102, 103, 104, 105, 106, 107])]).await;
-
-    let top3 = search_alpha(&index, 3).await;
-    let top5 = search_alpha(&index, 5).await;
-    let top8 = search_alpha(&index, 8).await;
-    assert_eq!(
-        top3,
-        vec![100, 101, 102],
-        "top-3 must be the lowest 3 row_ids in order"
-    );
-    assert_eq!(top5, vec![100, 101, 102, 103, 104]);
-    assert_eq!(top8, vec![100, 101, 102, 103, 104, 105, 106, 107]);
-    // Stable prefix: a smaller k is an exact ordered prefix of a larger k, so
-    // paginating never duplicates or skips a row.
-    assert_eq!(top3, top5[..3], "top-3 must be a prefix of top-5");
-    assert_eq!(top5, top8[..5], "top-5 must be a prefix of top-8");
+/// Search for "alpha" and return `(row_id, doc_index)` per hit, so an
+/// element-granularity result can be checked down to the element.
+async fn search_alpha_documents(index: &InvertedIndex, limit: usize) -> Vec<(u64, Vec<u32>)> {
+    index
+        .bm25_search_documents(
+            Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(limit))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|document| (document.row_id, document.doc_index))
+        .collect()
 }
 
 #[tokio::test]
@@ -221,6 +219,181 @@ async fn test_fts_topk_tied_scores_survive_a_prefilter() {
     assert_eq!(top3, top5[..3], "top-3 must be a prefix of top-5");
 }
 
+/// Build one element-granularity partition. Each entry is `(row_id, doc_index)`
+/// and is appended in the given order, so `row_ids` indexed by DocId can
+/// disagree with the element coordinates the result must be ordered by.
+async fn build_tied_element_partition(
+    store: &Arc<LanceIndexStore>,
+    partition_id: u64,
+    elements: &[(u64, u32)],
+) {
+    let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
+    builder.docs = DocSet::with_coordinate_rank(1);
+    builder.tokens.add("alpha".to_owned());
+    builder.posting_lists.push(PostingListBuilder::new(false));
+    for (doc_id, &(row_id, doc_index)) in elements.iter().enumerate() {
+        builder.posting_lists[0].add(doc_id as u32, PositionRecorder::Count(1));
+        builder
+            .docs
+            .append_with_doc_index(row_id, 1, &[doc_index])
+            .unwrap();
+    }
+    builder.write(store.as_ref()).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_fts_topk_tied_elements_of_one_row_resolve_by_doc_index() {
+    // Element documents of one row share its address, so the WAND ordering key
+    // ranks the row but not its elements. The winning element is visited after
+    // the heap is full, which a collector that let the address key settle the
+    // tie would drop, and no later sort could bring it back.
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    build_tied_element_partition(&store, 0, &[(100, 1), (100, 2), (100, 0), (50, 0)]).await;
+    write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+
+    let expected = vec![(50, vec![0]), (100, vec![0])];
+    // Cold: the walk defers addresses, so the whole k-th-score band is retained.
+    assert_eq!(search_alpha_documents(&index, 2).await, expected);
+
+    // Prewarmed: the address projection is resident, so the walk ranks by row
+    // address and only the elements of one row stay ambiguous.
+    index.partitions[0]
+        .docs
+        .modern()
+        .unwrap()
+        .prewarm()
+        .await
+        .unwrap();
+    assert!(index.has_resident_document_projections());
+    assert_eq!(search_alpha_documents(&index, 2).await, expected);
+
+    // Stable prefix across k, down to the element.
+    let top4 = search_alpha_documents(&index, 4).await;
+    assert_eq!(
+        top4,
+        vec![
+            (50, vec![0]),
+            (100, vec![0]),
+            (100, vec![1]),
+            (100, vec![2])
+        ]
+    );
+    assert_eq!(top4[..2], expected);
+}
+
+/// Captures the FTS buffer high-water marks the merge reports.
+#[derive(Default)]
+struct FtsBufferMetrics {
+    peak_buffered: AtomicUsize,
+    score_floor_overflows: AtomicUsize,
+}
+
+#[cfg_attr(coverage, coverage(off))]
+impl MetricsCollector for FtsBufferMetrics {
+    fn record_parts_loaded(&self, _num_parts: usize) {}
+    fn record_comparisons(&self, _num_comparisons: usize) {}
+    fn record_index_loads(&self, _num_loads: usize) {}
+    fn record_fts_peak_buffered_candidates(&self, num_candidates: usize) {
+        self.peak_buffered
+            .fetch_max(num_candidates, Ordering::Relaxed);
+    }
+    fn record_fts_score_floor_overflows(&self, num_overflows: usize) {
+        self.score_floor_overflows
+            .fetch_add(num_overflows, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn test_push_scored_key_breaks_legacy_ties_by_row_id() {
+    // The legacy merge holds row addresses, so it settles a score tie on the
+    // spot: a lower row_id evicts the worst tied entry and a higher one loses,
+    // whatever order the candidates arrive in.
+    let mut candidates = BinaryHeap::new();
+    for (row_id, score) in [(20u64, 1.0f32), (10, 1.0), (5, 1.0), (30, 1.0), (15, 0.5)] {
+        push_scored_key(&mut candidates, 2, row_id, score);
+    }
+    let ranked = candidates
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse(doc)| (doc.row_id, doc.score.0))
+        .collect::<Vec<_>>();
+    assert_eq!(ranked, vec![(5, 1.0), (10, 1.0)]);
+}
+
+#[test]
+fn test_push_scored_key_rejects_nan_scores() {
+    // A NaN score is not a rank. `OrderedFloat` compares with `total_cmp`, which
+    // sorts NaN above every real score, so the legacy merge drops it instead of
+    // letting it take the top of the result. Before the tiebreak the same
+    // candidate slipped into an under-filled heap and came back first.
+    let mut candidates = BinaryHeap::new();
+    push_scored_key(&mut candidates, 4, 7, f32::NAN);
+    assert!(candidates.is_empty(), "NaN must never become a candidate");
+
+    push_scored_key(&mut candidates, 4, 1, 1.0);
+    push_scored_key(&mut candidates, 4, 2, f32::NAN);
+    let ranked = candidates
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse(doc)| doc.row_id)
+        .collect::<Vec<_>>();
+    assert_eq!(ranked, vec![1]);
+}
+
+#[tokio::test]
+async fn test_fts_topk_tied_scores_bound_the_cross_partition_band() {
+    // Every document ties, so each partition hands the merge its whole
+    // `limit + SCORE_FLOOR_BUFFER` band. Six of those overrun the merge's own
+    // bound several times over, which is the one buffer on this path that grows
+    // with the number of partitions rather than with `limit`.
+    const PARTITIONS: u64 = 6;
+    const PER_PARTITION: u64 = 100;
+    const LIMIT: usize = 4;
+    let partitions = (0..PARTITIONS)
+        .map(|partition_id| {
+            let base = partition_id * 1_000;
+            (partition_id, (0..PER_PARTITION).map(|d| base + d).collect())
+        })
+        .collect::<Vec<_>>();
+    let (_tmpdir, index) = load_tied_index(&partitions).await;
+
+    let metrics = Arc::new(FtsBufferMetrics::default());
+    let (row_ids, _) = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(LIMIT))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            metrics.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row_ids,
+        vec![0, 1, 2, 3],
+        "compacting the band must not change the exact top-k"
+    );
+
+    let peak = metrics.peak_buffered.load(Ordering::Relaxed);
+    let bound = LIMIT + SCORE_FLOOR_BUFFER;
+    assert!(
+        peak > LIMIT,
+        "premise: the tie band must actually be exercised, peak {peak}"
+    );
+    assert!(
+        peak <= bound + PER_PARTITION as usize,
+        "the merge band must be compacted back under {bound} between partitions, peak {peak}"
+    );
+}
+
 #[tokio::test]
 async fn test_fts_topk_tied_scores_wider_than_the_collector_buffer() {
     // The tie band is far wider than the collector's buffer, and row addresses
@@ -234,7 +407,23 @@ async fn test_fts_topk_tied_scores_wider_than_the_collector_buffer() {
         .collect::<Vec<_>>();
     let (_tmpdir, index) = load_tied_index(&[(0, row_ids)]).await;
 
-    let top3 = search_alpha(&index, 3).await;
+    let metrics = Arc::new(FtsBufferMetrics::default());
+    let (top3, _) = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(3))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            metrics.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics.score_floor_overflows.load(Ordering::Relaxed),
+        1,
+        "the retry must be visible in metrics, not silent extra work"
+    );
     let top5 = search_alpha(&index, 5).await;
     assert_eq!(
         top3,
@@ -243,4 +432,51 @@ async fn test_fts_topk_tied_scores_wider_than_the_collector_buffer() {
     );
     assert_eq!(top5, vec![BASE + 1, BASE + 2, BASE + 3, BASE + 4, BASE + 5]);
     assert_eq!(top3, top5[..3], "top-3 must be a prefix of top-5");
+}
+
+#[tokio::test]
+async fn test_fts_topk_tied_scores_retry_every_overflowed_partition() {
+    // Every partition overflows its tie band at once, which is what a broad
+    // single-term query over quantized doc lengths looks like. All of them are
+    // rescored against resolved addresses, concurrently, and the answer is still
+    // the exact lowest row_ids.
+    const PARTITIONS: u64 = 5;
+    const PER_PARTITION: u64 = 200;
+    const BASE: u64 = 10_000;
+    let partitions = (0..PARTITIONS)
+        .map(|partition_id| {
+            // Row addresses descend with DocId, so the winners sit at the end of
+            // each walk, past the point where the band overflows.
+            let row_ids = (0..PER_PARTITION)
+                .map(|doc_id| BASE + partition_id + (PER_PARTITION - doc_id) * PARTITIONS)
+                .collect::<Vec<_>>();
+            (partition_id, row_ids)
+        })
+        .collect::<Vec<_>>();
+    let (_tmpdir, index) = load_tied_index(&partitions).await;
+
+    let metrics = Arc::new(FtsBufferMetrics::default());
+    let (top5, _) = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(5))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            metrics.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics.score_floor_overflows.load(Ordering::Relaxed),
+        PARTITIONS as usize,
+        "every partition must be retried"
+    );
+    // The lowest addresses are the last DocId of each partition, one per
+    // partition: BASE + partition_id + PARTITIONS.
+    let expected = (0..PARTITIONS)
+        .map(|partition_id| BASE + partition_id + PARTITIONS)
+        .collect::<Vec<_>>();
+    assert_eq!(top5, expected);
+    assert_eq!(search_alpha(&index, 3).await, expected[..3]);
 }
