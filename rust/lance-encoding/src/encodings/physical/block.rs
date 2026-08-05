@@ -141,6 +141,23 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+
+    fn decompress_exact(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+        expected_bytes: usize,
+    ) -> Result<()> {
+        self.decompress(input_buf, output_buf)?;
+        if output_buf.len() != expected_bytes {
+            return Err(Error::invalid_input(format!(
+                "General compression produced {} bytes, expected {expected_bytes}",
+                output_buf.len()
+            )));
+        }
+        Ok(())
+    }
+
     fn config(&self) -> CompressionConfig;
 }
 
