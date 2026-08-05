@@ -221,7 +221,7 @@ impl FixedWidthDataBlock {
 }
 
 #[derive(Debug)]
-pub struct VariableWidthDataBlockBuilder<T: OffsetSizeTrait> {
+struct VariableWidthDataBlockBuilder<T: OffsetSizeTrait> {
     offsets: Vec<T>,
     bytes: Vec<u8>,
 }
@@ -236,28 +236,54 @@ impl<T: OffsetSizeTrait> VariableWidthDataBlockBuilder<T> {
 }
 
 impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<T> {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    fn validate_append(&self, data_block: &DataBlock, selection: &Range<u64>) -> Result<()> {
         let block = data_block.as_variable_width_ref().unwrap();
-        assert!(block.bits_per_offset == T::get_byte_width() as u8 * 8);
+        block.validate_offsets_for_append::<T>(selection)
+    }
+
+    fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        let block = data_block.as_variable_width_ref().unwrap();
+        debug_assert_eq!(block.bits_per_offset, T::get_byte_width() as u8 * 8);
         let offsets = block.offsets.borrow_to_typed_view::<T>();
 
         let start_offset = offsets[selection.start as usize];
         let end_offset = offsets[selection.end as usize];
-        let mut previous_len = self.bytes.len();
+        let selected_data_len = end_offset.as_usize() - start_offset.as_usize();
+        let new_data_len = self
+            .bytes
+            .len()
+            .checked_add(selected_data_len)
+            .ok_or_else(|| {
+                Error::not_supported_source(
+                    "appending variable-width data would overflow usize".into(),
+                )
+            })?;
+        if T::from_usize(new_data_len).is_none() {
+            return Err(Error::not_supported_source(
+                format!(
+                    "appending variable-width data would require {} bytes, which exceeds the \
+                     capacity of {}-bit offsets",
+                    new_data_len,
+                    T::get_byte_width() * 8
+                )
+                .into(),
+            ));
+        }
+        let previous_len = self.bytes.len();
 
         self.bytes
             .extend_from_slice(&block.data[start_offset.as_usize()..end_offset.as_usize()]);
 
         self.offsets.extend(
-            offsets[selection.start as usize..selection.end as usize]
+            offsets[selection.start as usize + 1..=selection.end as usize]
                 .iter()
-                .zip(&offsets[selection.start as usize + 1..=selection.end as usize])
-                .map(|(&current, &next)| {
-                    let this_value_len = next - current;
-                    previous_len += this_value_len.as_usize();
-                    T::from_usize(previous_len).unwrap()
+                .map(|&offset| {
+                    let rebased_offset =
+                        previous_len + (offset.as_usize() - start_offset.as_usize());
+                    T::from_usize(rebased_offset).unwrap()
                 }),
         );
+        Ok(())
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
@@ -286,12 +312,17 @@ impl BitmapDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for BitmapDataBlockBuilder {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    fn validate_append(&self, _data_block: &DataBlock, _selection: &Range<u64>) -> Result<()> {
+        Ok(())
+    }
+
+    fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
         let bitmap_blk = data_block.as_fixed_width_ref().unwrap();
         self.values.append_packed_range(
             selection.start as usize..selection.end as usize,
             &bitmap_blk.data,
         );
+        Ok(())
     }
 
     fn finish(mut self: Box<Self>) -> DataBlock {
@@ -326,12 +357,17 @@ impl FixedWidthDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    fn validate_append(&self, _data_block: &DataBlock, _selection: &Range<u64>) -> Result<()> {
+        Ok(())
+    }
+
+    fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
         let block = data_block.as_fixed_width_ref().unwrap();
         assert_eq!(self.bits_per_value, block.bits_per_value);
         let start = selection.start as usize * self.bytes_per_value as usize;
         let end = selection.end as usize * self.bytes_per_value as usize;
         self.values.extend_from_slice(&block.data[start..end]);
+        Ok(())
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
@@ -357,11 +393,20 @@ impl StructDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for StructDataBlockBuilder {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    fn validate_append(&self, data_block: &DataBlock, selection: &Range<u64>) -> Result<()> {
         let data_block = data_block.as_struct_ref().unwrap();
         for i in 0..self.children.len() {
-            self.children[i].append(&data_block.children[i], selection.clone());
+            self.children[i].validate_append(&data_block.children[i], selection)?;
         }
+        Ok(())
+    }
+
+    fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        let data_block = data_block.as_struct_ref().unwrap();
+        for i in 0..self.children.len() {
+            self.children[i].append_validated(&data_block.children[i], selection.clone())?;
+        }
+        Ok(())
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
@@ -384,8 +429,13 @@ struct AllNullDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for AllNullDataBlockBuilder {
-    fn append(&mut self, _data_block: &DataBlock, selection: Range<u64>) {
+    fn validate_append(&self, _data_block: &DataBlock, _selection: &Range<u64>) -> Result<()> {
+        Ok(())
+    }
+
+    fn append_validated(&mut self, _data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
         self.num_values += selection.end - selection.start;
+        Ok(())
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
@@ -503,10 +553,16 @@ impl FixedSizeListBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    fn validate_append(&self, data_block: &DataBlock, selection: &Range<u64>) -> Result<()> {
         let selection = selection.start * self.dimension..selection.end * self.dimension;
         let fsl = data_block.as_fixed_size_list_ref().unwrap();
-        self.inner.append(fsl.child.as_ref(), selection);
+        self.inner.validate_append(fsl.child.as_ref(), &selection)
+    }
+
+    fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        let selection = selection.start * self.dimension..selection.end * self.dimension;
+        let fsl = data_block.as_fixed_size_list_ref().unwrap();
+        self.inner.append_validated(fsl.child.as_ref(), selection)
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
@@ -534,15 +590,23 @@ impl NullableDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for NullableDataBlockBuilder {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    fn validate_append(&self, data_block: &DataBlock, selection: &Range<u64>) -> Result<()> {
         let nullable = data_block.as_nullable_ref().unwrap();
+        self.inner
+            .validate_append(nullable.data.as_ref(), selection)
+    }
+
+    fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        let nullable = data_block.as_nullable_ref().unwrap();
+        self.inner
+            .append_validated(nullable.data.as_ref(), selection.clone())?;
         let bool_buf = BooleanBuffer::new(
             nullable.nulls.clone().into_buffer(),
             selection.start as usize,
             (selection.end - selection.start) as usize,
         );
         self.validity.append_buffer(&bool_buf);
-        self.inner.append(nullable.data.as_ref(), selection);
+        Ok(())
     }
 
     fn finish(mut self: Box<Self>) -> DataBlock {
@@ -598,6 +662,77 @@ pub struct VariableWidthBlock {
 struct ValidVariableWidthLayout;
 
 impl VariableWidthBlock {
+    fn append_error(&self, selection: &Range<u64>, detail: impl std::fmt::Display) -> Error {
+        Error::corrupt_file_named(
+            "variable width data block",
+            format!(
+                "cannot append offsets for selection {}..{}: {} (num_values: {}, \
+                 bits_per_offset: {}, offsets buffer size: {} bytes, data buffer size: {} bytes)",
+                selection.start,
+                selection.end,
+                detail,
+                self.num_values,
+                self.bits_per_offset,
+                self.offsets.len(),
+                self.data.len(),
+            ),
+        )
+    }
+
+    fn validate_offsets_for_append<T>(&self, selection: &Range<u64>) -> Result<()>
+    where
+        T: OffsetSizeTrait + bytemuck::Pod,
+    {
+        let expected_bits_per_offset = T::get_byte_width() as u8 * 8;
+        if self.bits_per_offset != expected_bits_per_offset {
+            return Err(self.append_error(
+                selection,
+                format!(
+                    "expected {}-bit offsets but found {}-bit offsets",
+                    expected_bits_per_offset, self.bits_per_offset
+                ),
+            ));
+        }
+        let offset_size = std::mem::size_of::<T>();
+        if !self.offsets.len().is_multiple_of(offset_size) {
+            return Err(self.append_error(
+                selection,
+                format!(
+                    "offsets buffer length {} is not a multiple of the {}-byte offset width",
+                    self.offsets.len(),
+                    offset_size
+                ),
+            ));
+        }
+        if selection.start > selection.end || selection.end > self.num_values {
+            return Err(
+                self.append_error(selection, "selection is outside the block's value range")
+            );
+        }
+        let selection_start = usize::try_from(selection.start)
+            .map_err(|_| self.append_error(selection, "selection start does not fit in usize"))?;
+        let selection_end = usize::try_from(selection.end)
+            .map_err(|_| self.append_error(selection, "selection end does not fit in usize"))?;
+        let offsets = self.offsets.borrow_to_typed_view::<T>();
+        if selection_end >= offsets.len() {
+            return Err(self.append_error(
+                selection,
+                format!(
+                    "selection requires offset {} but the buffer holds {} offsets",
+                    selection_end,
+                    offsets.len()
+                ),
+            ));
+        }
+        let selected_offsets = &offsets[selection_start..=selection_end];
+        if let Some(detail) =
+            Self::offset_violation_detail(selected_offsets, self.data.len(), selection_start)
+        {
+            return Err(self.append_error(selection, detail));
+        }
+        Ok(())
+    }
+
     // The offsets buffer comes straight from file bytes, so an unchecked build would
     // let a corrupt file smuggle out-of-bounds offsets into an Arrow array whose
     // consumers then read (or crash on) memory outside the data buffer.  This
@@ -710,24 +845,12 @@ impl VariableWidthBlock {
         let offsets: &[T] = offsets.as_ref();
         let data = self.data.as_ref();
 
-        // A monotonic sequence with a non-negative first offset and an
-        // in-bounds last offset is entirely within [0, data.len()], so the hot
-        // loop only proves monotonicity; everything else is O(1) at the ends.
-        // The `&=` accumulation keeps the loop branchless so it vectorizes.
-        let mut is_monotonic = true;
-        for window in offsets.windows(2) {
-            is_monotonic &= window[0] <= window[1];
-        }
-        let first = offsets[0];
-        let last = offsets[num_offsets - 1];
-        let bounds_ok =
-            first >= T::usize_as(0) && last.to_usize().is_some_and(|last| last <= data.len());
-        if !is_monotonic || !bounds_ok {
-            return Err(self.offset_violation_error::<T>(data_type, offsets));
+        if let Some(detail) = Self::offset_violation_detail(offsets, data.len(), 0) {
+            return Err(self.layout_error(data_type, detail));
         }
 
         if validate_utf8 {
-            let (first, last) = (first.as_usize(), last.as_usize());
+            let (first, last) = (offsets[0].as_usize(), offsets[num_offsets - 1].as_usize());
             let values = std::str::from_utf8(&data[first..last])
                 .map_err(|utf8_err| self.layout_error(data_type, utf8_err))?;
             let mut on_char_boundaries = true;
@@ -750,47 +873,54 @@ impl VariableWidthBlock {
         Ok(ValidVariableWidthLayout)
     }
 
-    /// Cold path: pinpoint the first offending offset for the error message.
-    fn offset_violation_error<T: ArrowNativeType + Ord>(
-        &self,
-        data_type: &DataType,
+    fn offset_violation_detail<T: ArrowNativeType + Ord>(
         offsets: &[T],
-    ) -> Error {
-        let data_size = self.data.len();
-        for (position, window) in offsets.windows(2).enumerate() {
+        data_size: usize,
+        position_base: usize,
+    ) -> Option<String> {
+        // A monotonic sequence with a non-negative first offset and an
+        // in-bounds last offset is entirely within [0, data_size].  Keep this
+        // valid path branchless so it vectorizes, and only rescan on failure.
+        let mut is_monotonic = true;
+        for window in offsets.windows(2) {
+            is_monotonic &= window[0] <= window[1];
+        }
+        let first = offsets[0];
+        let last = offsets[offsets.len() - 1];
+        let bounds_ok =
+            first >= T::usize_as(0) && last.to_usize().is_some_and(|last| last <= data_size);
+        if is_monotonic && bounds_ok {
+            return None;
+        }
+
+        for (relative_position, window) in offsets.windows(2).enumerate() {
             if window[0] > window[1] {
-                return self.layout_error(
-                    data_type,
-                    format!(
-                        "non-monotonic offset at position {}: {:?} > {:?}",
-                        position, window[0], window[1]
-                    ),
-                );
+                let position = position_base + relative_position + 1;
+                return Some(format!(
+                    "non-monotonic offset at position {}: {:?} decreases from {:?}",
+                    position, window[1], window[0]
+                ));
             }
         }
-        for (position, offset) in offsets.iter().enumerate() {
+        for (relative_position, offset) in offsets.iter().enumerate() {
+            let position = position_base + relative_position;
             match offset.to_usize() {
                 None => {
-                    return self.layout_error(
-                        data_type,
-                        format!("negative offset at position {}: {:?}", position, offset),
-                    );
+                    return Some(format!(
+                        "offset at position {} is negative: {:?}",
+                        position, offset
+                    ));
                 }
                 Some(offset) if offset > data_size => {
-                    return self.layout_error(
-                        data_type,
-                        format!(
-                            "offset at position {} out of bounds: {} > {}",
-                            position, offset, data_size
-                        ),
-                    );
+                    return Some(format!(
+                        "offset at position {} is out of bounds: {} > {}",
+                        position, offset, data_size
+                    ));
                 }
                 Some(_) => {}
             }
         }
-        // The fast scan only fails when one of the loops above finds the
-        // culprit; reaching here would be a bug in the fast scan itself.
-        self.layout_error(data_type, "offsets failed validation")
+        Some("offsets failed validation".to_string())
     }
 
     fn into_arrow_checked(self, data_type: DataType) -> Result<ArrayData> {
@@ -956,12 +1086,11 @@ impl DictionaryDataBlock {
         let indices = self.indices.data.borrow_to_typed_slice::<K::Native>();
         let indices = indices.as_ref();
 
-        indices
-            .iter()
-            .map(|idx| idx.to_usize().unwrap() as u64)
-            .for_each(|idx| {
-                data_builder.append(&self.dictionary, idx..idx + 1);
-            });
+        let selections = indices.iter().map(|idx| {
+            let idx = idx.to_usize().unwrap() as u64;
+            idx..idx + 1
+        });
+        data_builder.append_ranges(&self.dictionary, selections)?;
 
         Ok(data_builder.finish())
     }
@@ -1231,7 +1360,7 @@ impl DataBlock {
         }
     }
 
-    pub fn make_builder(&self, estimated_size_bytes: u64) -> Box<dyn DataBlockBuilderImpl> {
+    fn make_builder(&self, estimated_size_bytes: u64) -> Box<dyn DataBlockBuilderImpl> {
         match self {
             Self::FixedWidth(inner) => {
                 if inner.bits_per_value == 1 {
@@ -1840,8 +1969,16 @@ impl From<ArrayRef> for DataBlock {
     }
 }
 
-pub trait DataBlockBuilderImpl: std::fmt::Debug {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>);
+trait DataBlockBuilderImpl: std::fmt::Debug {
+    fn validate_append(&self, data_block: &DataBlock, selection: &Range<u64>) -> Result<()>;
+
+    fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()>;
+
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        self.validate_append(data_block, &selection)?;
+        self.append_validated(data_block, selection)
+    }
+
     fn finish(self: Box<Self>) -> DataBlock;
 }
 
@@ -1866,8 +2003,31 @@ impl DataBlockBuilder {
         self.builder.as_mut().unwrap().as_mut()
     }
 
-    pub fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
-        self.get_builder(data_block).append(data_block, selection);
+    pub fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
+        self.get_builder(data_block).append(data_block, selection)
+    }
+
+    fn append_ranges(
+        &mut self,
+        data_block: &DataBlock,
+        selections: impl IntoIterator<Item = Range<u64>>,
+    ) -> Result<()> {
+        let full_selection = 0..data_block.num_values();
+        let builder = self.get_builder(data_block);
+        builder.validate_append(data_block, &full_selection)?;
+        for selection in selections {
+            if selection.start > selection.end || selection.end > full_selection.end {
+                return Err(Error::corrupt_file_named(
+                    "data block",
+                    format!(
+                        "cannot append selection {}..{} from a block with {} values",
+                        selection.start, selection.end, full_selection.end
+                    ),
+                ));
+            }
+            builder.append_validated(data_block, selection)?;
+        }
+        Ok(())
     }
 
     pub fn finish(self) -> DataBlock {
@@ -1897,8 +2057,8 @@ mod tests {
     use crate::buffer::LanceBuffer;
 
     use super::{
-        AllNullDataBlock, BlockInfo, DataBlock, DictionaryDataBlock, FixedWidthDataBlock,
-        VariableWidthBlock,
+        AllNullDataBlock, BlockInfo, DataBlock, DataBlockBuilder, DictionaryDataBlock,
+        FixedWidthDataBlock, VariableWidthBlock,
     };
 
     use arrow_array::Array;
@@ -2336,6 +2496,53 @@ mod tests {
         assert!(
             message.contains("100000") && message.contains("data buffer size: 14 bytes"),
             "error must report the offending offset and the data buffer size: {message}"
+        );
+    }
+
+    #[rstest]
+    #[case::i32_decreasing(
+        LanceBuffer::reinterpret_vec(vec![0_i32, 5, 2]),
+        32,
+        2,
+        "decreases"
+    )]
+    #[case::i64_decreasing(
+        LanceBuffer::reinterpret_vec(vec![0_i64, 5, 2]),
+        64,
+        2,
+        "decreases"
+    )]
+    #[case::i32_out_of_bounds(
+        LanceBuffer::reinterpret_vec(vec![0_i32, 6]),
+        32,
+        1,
+        "out of bounds"
+    )]
+    fn variable_width_builder_rejects_malformed_offsets(
+        #[case] offsets: LanceBuffer,
+        #[case] bits_per_offset: u8,
+        #[case] num_values: u64,
+        #[case] expected_message: &str,
+    ) {
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::copy_slice(b"abcde"),
+            offsets,
+            bits_per_offset,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        let mut builder = DataBlockBuilder::with_capacity_estimate(5);
+
+        let error = builder
+            .append(&block, 0..num_values)
+            .expect_err("malformed offsets must fail concatenation");
+        assert!(
+            matches!(error, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected message: {error}"
         );
     }
 

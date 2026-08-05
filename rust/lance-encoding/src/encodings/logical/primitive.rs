@@ -629,7 +629,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             Self::extend_levels(level_range.clone(), &mut repbuf, &rep, level_offset);
             Self::extend_levels(level_range.clone(), &mut defbuf, &def, level_offset);
             level_offset += (level_range.end - level_range.start) as usize;
-            data_builder.append(&values, item_range);
+            data_builder.append(&values, item_range)?;
         }
 
         let mut data = data_builder.finish();
@@ -3783,7 +3783,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 };
                 debug_assert_eq!(fixed_data.num_values, task_item.rows_in_buf);
                 let decompressed = decompressor.decompress(fixed_data, task_item.rows_in_buf)?;
-                data_builder.append(&decompressed, 0..task_item.rows_in_buf);
+                data_builder.append(&decompressed, 0..task_item.rows_in_buf)?;
             }
 
             let unraveler = RepDefUnraveler::new(
@@ -3847,7 +3847,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                     unreachable!()
                 };
                 let decompressed = decompressor.decompress(fixed_data, visible_items)?;
-                data_builder.append(&decompressed, 0..visible_items);
+                data_builder.append(&decompressed, 0..visible_items)?;
             }
 
             let repetition = if rep.is_empty() { None } else { Some(rep) };
