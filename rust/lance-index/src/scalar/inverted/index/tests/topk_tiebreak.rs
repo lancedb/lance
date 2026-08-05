@@ -392,7 +392,8 @@ async fn test_fts_topk_tied_scores_bound_the_cross_partition_band() {
     // plus whatever the next partition contributed in one go.
     assert!(
         peak <= bound + PER_PARTITION as usize,
-        "the merge band must be compacted back under {bound} between partitions,              leaving room for one partition's contribution on top, peak {peak}"
+        "the merge band must be compacted back under {bound} between partitions, \
+         leaving room for one partition's contribution on top, peak {peak}"
     );
 }
 
