@@ -2036,7 +2036,7 @@ async fn test_optimize_preserves_fts_overlay_masking() {
     use crate::index::DatasetIndexExt;
     use lance_index::optimize::OptimizeOptions;
 
-    let mut dataset = create_text_dataset().await;
+    let mut dataset = create_text_dataset(false).await;
     build_text_fts_index(&mut dataset).await;
 
     // fragment 0, offset 1 (id=1): "apple banana" -> "cherry mango".
