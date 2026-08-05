@@ -82,6 +82,10 @@ fn validate_compressive_encoding(encoding: &pb21::CompressiveEncoding) -> Result
             }
             Ok(())
         }
+        Some(Compression::Range(_)) => Ok(()),
+        Some(Compression::Delta(delta)) => {
+            validate_compressive_encoding(required(delta.deltas.as_deref(), "delta values")?)
+        }
         None => Err(Error::invalid_input_source(
             "Lance v2.3 compressive encoding is missing its compression variant".into(),
         )),
@@ -337,5 +341,26 @@ mod grammar_tests {
         };
 
         validate_page_layout(&layout).unwrap();
+    }
+
+    #[test]
+    fn accepts_range_and_delta() {
+        let range = CompressiveEncoding {
+            compression: Some(Compression::Range(pb21::Range {
+                uncompressed_bits_per_value: 32,
+                start: 0,
+                step: 1,
+            })),
+        };
+        let delta = CompressiveEncoding {
+            compression: Some(Compression::Delta(Box::new(pb21::Delta {
+                uncompressed_bits_per_value: 32,
+                base: 0,
+                deltas: Some(Box::new(range.clone())),
+            }))),
+        };
+
+        validate_compressive_encoding(&range).unwrap();
+        validate_compressive_encoding(&delta).unwrap();
     }
 }

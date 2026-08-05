@@ -585,6 +585,8 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Flat            | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Variable        | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
+| Range           | ✅ (2.3)              | ❌                       | ❌                         |
+| Delta           | ✅ (2.3)              | ❌                       | ❌                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
@@ -616,6 +618,26 @@ we have passed.
 Constant compression is currently only utilized in a few specialized scenarios such as all-null arrays.
 
 This will likely change in future versions.
+
+### Range
+
+Range is a metadata-only block encoding for unsigned `u32` and `u64` arithmetic sequences. It stores the first
+value and a positive step; the containing block supplies the number of values. Readers compute value `i` as
+`start + step * i` and reject invalid widths or arithmetic overflow.
+
+```protobuf
+%%% proto.message.Range %%%
+```
+
+### Delta
+
+Delta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1` adjacent
+differences. The differences are represented by a child block codec. Delta has a payload exactly when its child
+has one, and readers reconstruct values with checked prefix sums.
+
+```protobuf
+%%% proto.message.Delta %%%
+```
 
 ### Bitpacking
 
