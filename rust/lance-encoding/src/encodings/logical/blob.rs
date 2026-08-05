@@ -13,7 +13,9 @@ use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
-    Error, Result, datatypes::BLOB_V2_DESC_FIELDS, datatypes::Field, error::LanceOptionExt,
+    Error, Result,
+    datatypes::{BLOB_V2_DESC_FIELDS, BlobV2Layout, Field},
+    error::LanceOptionExt,
 };
 
 use crate::{
@@ -259,7 +261,27 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        let struct_arr = array.as_struct();
+        let struct_arr = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "Blob v2 encoder expected StructArray, got {}",
+                        array.data_type()
+                    )
+                    .into(),
+                )
+            })?;
+        if BlobV2Layout::classify(struct_arr.fields()) != Some(BlobV2Layout::Prepared) {
+            let actual = BlobV2Layout::classify(struct_arr.fields())
+                .map(|layout| layout.to_string())
+                .unwrap_or_else(|| format!("unrecognized ({:?})", struct_arr.fields()));
+            return Err(Error::invalid_input_source(
+                format!("Blob v2 encoder expected prepared array layout, got {actual} layout")
+                    .into(),
+            ));
+        }
 
         let kind_col = struct_arr
             .column_by_name("kind")
@@ -429,6 +451,7 @@ mod tests {
         ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field as ArrowField};
+    use lance_core::datatypes::BLOB_V2_LOGICAL_MINIMAL_FIELDS;
 
     #[test]
     fn test_blob_encoder_creation() {
@@ -446,6 +469,51 @@ mod tests {
             create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options);
 
         assert!(encoder.is_ok());
+    }
+
+    #[test]
+    fn test_blob_v2_encoder_rejects_logical_array_layout() {
+        let field = Field::try_from(
+            ArrowField::new(
+                "blob_field",
+                DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+            )])),
+        )
+        .unwrap();
+        let mut column_index = ColumnIndexSequence::default();
+        let options = EncodingOptions::default();
+        let strategy = test_encoding_strategy(TestEncoding::StructuralU32);
+        let mut encoder =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options)
+                .unwrap();
+        let array = Arc::new(
+            StructArray::try_new(
+                BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone(),
+                vec![
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"payload".as_ref())])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                ],
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let mut external_buffers = OutOfLineBuffers::new(0, 8);
+        let Err(error) =
+            encoder.maybe_encode(array, &mut external_buffers, RepDefBuilder::default(), 0, 1)
+        else {
+            panic!("logical array layout unexpectedly reached the descriptor encoder");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("expected prepared array layout, got logical layout")
+        );
     }
 
     #[tokio::test]
