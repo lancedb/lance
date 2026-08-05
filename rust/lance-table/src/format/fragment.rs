@@ -569,6 +569,26 @@ impl Fragment {
             .chain(overlays.iter().map(|overlay| &overlay.data_file))
     }
 
+    /// Mutable counterpart of [`Self::data_files`], for rewriting the fields a
+    /// clone has to normalize (`base_id`) across base and overlay files alike.
+    pub fn data_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
+        // Destructured for the same reason as `data_files`, and so the two
+        // disjoint field borrows are visible to the borrow checker.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter_mut()
+            .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
+    }
+
     pub fn from_json(json: &str) -> Result<Self> {
         let fragment: Self = serde_json::from_str(json)?;
         Ok(fragment)
