@@ -16,7 +16,7 @@ use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
 };
 use arrow_array::{Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
@@ -693,6 +693,17 @@ fn default_probability() -> f64 {
     *DEFAULT_PROBABILITY
 }
 
+/// Schema of the per-zone bloom filter statistics batch.
+static BLOOMFILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("fragment_id", DataType::UInt64, false),
+        Field::new("zone_start", DataType::UInt64, false),
+        Field::new("zone_length", DataType::UInt64, false),
+        Field::new("has_null", DataType::Boolean, false),
+        Field::new("bloom_filter_data", DataType::Binary, false),
+    ]))
+});
+
 // NumberOfItems: 8192 + Probability: 0.00057(1 in 1754) -> NumberOfBytes: 16384(16KiB) + 8 SALT values
 // reference: https://hur.st/bloomfilter/?n=8192&p=&m=16KiB&k=8
 static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
@@ -776,16 +787,6 @@ impl BloomFilterIndexBuilder {
         Ok(())
     }
 
-    fn bloomfilter_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_length", DataType::UInt64, false),
-            Field::new("has_null", DataType::Boolean, false),
-            Field::new("bloom_filter_data", DataType::Binary, false),
-        ]))
-    }
-
     fn bloomfilter_stats_as_batch(
         fragment_ids: Vec<u64>,
         zone_starts: Vec<u64>,
@@ -815,7 +816,7 @@ impl BloomFilterIndexBuilder {
             bloom_filter_data,
         ];
 
-        Ok(RecordBatch::try_new(Self::bloomfilter_schema(), columns)?)
+        Ok(RecordBatch::try_new(BLOOMFILTER_SCHEMA.clone(), columns)?)
     }
 
     /// Serialize the trained bloom filter zone statistics into an index file in
@@ -835,7 +836,7 @@ impl BloomFilterIndexBuilder {
         index_store: &dyn IndexStore,
         max_array_length: usize,
     ) -> Result<Vec<IndexFile>> {
-        let mut file_schema = Self::bloomfilter_schema().as_ref().clone();
+        let mut file_schema = BLOOMFILTER_SCHEMA.as_ref().clone();
         file_schema.metadata.insert(
             BLOOMFILTER_ITEM_META_KEY.to_string(),
             self.params.number_of_items.to_string(),

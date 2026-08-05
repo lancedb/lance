@@ -5,13 +5,13 @@
 //! the corresponding IVF partitions.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;
 use arrow::{array::AsArray, compute::sort_to_indices};
 use arrow_array::{RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::{future::try_join_all, prelude::*};
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::{
@@ -337,6 +337,15 @@ pub fn create_ivf_shuffler(
     }
 }
 
+/// Schema of the partition-offsets sidecar written alongside shuffled data.
+static OFFSETS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![Field::new(
+        "offset",
+        DataType::UInt64,
+        false,
+    )]))
+});
+
 const DEFAULT_SHUFFLE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 
 /// Number of rows per output batch when streaming sorted data via interleave.
@@ -464,11 +473,7 @@ impl Shuffler for TwoFileShuffler {
         let num_partitions = self.num_partitions;
         // No need to write partition ids since we can infer this from offsets
         let schema = data.schema().without_column(PART_ID_COLUMN);
-        let offsets_schema = Arc::new(Schema::new(vec![Field::new(
-            "offset",
-            DataType::UInt64,
-            false,
-        )]));
+        let offsets_schema = OFFSETS_SCHEMA.clone();
         let batch_size_bytes = self.batch_size_bytes;
 
         // Create data file writer
