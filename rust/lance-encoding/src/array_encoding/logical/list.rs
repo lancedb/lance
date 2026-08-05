@@ -958,7 +958,7 @@ impl ListOffsetsEncoder {
             let (data, description) = array.into_buffers();
             Ok(EncodedPage {
                 data,
-                description: PageEncoding::Array(description),
+                description: PageEncoding::Legacy(description),
                 num_rows,
                 column_idx,
                 row_number: 0, // V2.0 encoders do not use

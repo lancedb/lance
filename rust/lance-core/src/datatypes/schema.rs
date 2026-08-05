@@ -726,7 +726,8 @@ impl Schema {
     /// Merge this schema from the other schema.
     ///
     /// After merging, the field IDs from `other` schema will be reassigned,
-    /// following the fields in `self`.
+    /// following the fields in `self`. Schema metadata is combined, with values
+    /// from `self` taking precedence when both schemas contain the same key.
     pub fn merge<S: TryInto<Self, Error = Error>>(&self, other: S) -> Result<Self> {
         let mut other: Self = other.try_into()?;
         other.reset_id();
@@ -747,12 +748,12 @@ impl Schema {
                 merged_fields.push(field.clone());
             }
         }
-        let metadata = self
-            .metadata
-            .iter()
-            .chain(other.metadata.iter())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut metadata = other.metadata;
+        metadata.extend(
+            self.metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         let schema = Self {
             fields: merged_fields,
             metadata,
@@ -1869,6 +1870,11 @@ mod tests {
             vec!["simple".to_string()]
         );
 
+        assert_eq!(
+            parse_field_path("tags[*]").unwrap(),
+            vec!["tags[*]".to_string()]
+        );
+
         // Quoted field at the end
         assert_eq!(
             parse_field_path("parent.`field.with.dot`").unwrap(),
@@ -2333,6 +2339,35 @@ mod tests {
         let field = merged.field("e").unwrap();
         assert_eq!(field.id, 9);
         assert_eq!(merged.max_field_id(), Some(9));
+    }
+
+    #[test]
+    fn test_merge_schema_metadata_preserves_self_values() {
+        let schema = Schema {
+            metadata: HashMap::from([
+                ("shared".to_string(), "left".to_string()),
+                ("left_only".to_string(), "left".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let other = Schema {
+            metadata: HashMap::from([
+                ("shared".to_string(), "right".to_string()),
+                ("right_only".to_string(), "right".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        let merged = schema.merge(&other).unwrap();
+
+        assert_eq!(
+            merged.metadata,
+            HashMap::from([
+                ("shared".to_string(), "left".to_string()),
+                ("left_only".to_string(), "left".to_string()),
+                ("right_only".to_string(), "right".to_string()),
+            ])
+        );
     }
 
     #[test]

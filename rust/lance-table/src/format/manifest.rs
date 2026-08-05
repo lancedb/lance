@@ -554,8 +554,25 @@ impl Manifest {
     }
 }
 
-/// Populate dictionary values stored outside a v1 manifest.
-pub async fn populate_manifest_schema_dictionary(
+/// Populate dictionary values stored outside a V1 manifest.
+///
+/// Other exact file versions store their schema dictionaries inline, so this
+/// is a no-op for those manifests.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_io::traits::Reader;
+/// # use lance_table::format::{Manifest, populate_manifest_schema_dictionaries};
+/// # async fn hydrate_v1_manifest(
+/// #     manifest: &mut Manifest,
+/// #     reader: &dyn Reader,
+/// # ) -> Result<()> {
+/// populate_manifest_schema_dictionaries(manifest, reader).await
+/// # }
+/// ```
+pub async fn populate_manifest_schema_dictionaries(
     manifest: &mut Manifest,
     reader: &dyn Reader,
 ) -> Result<()> {
@@ -1070,7 +1087,7 @@ impl SelfDescribingFileReader for V1FileReader {
             reader.path(),
         )))?;
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
-        populate_manifest_schema_dictionary(&mut manifest, reader.as_ref()).await?;
+        populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
         let schema = manifest.schema;
         let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(

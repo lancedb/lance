@@ -43,7 +43,7 @@ use lance_io::utils::{
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb, populate_manifest_schema_dictionary,
+    pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -113,8 +113,8 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
-    commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments,
+    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
+    commit_transaction, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -773,7 +773,7 @@ impl Dataset {
                 .await;
         }
 
-        populate_manifest_schema_dictionary(&mut manifest, object_reader.as_ref()).await?;
+        populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
 
         Ok(manifest)
     }
@@ -1186,7 +1186,7 @@ impl Dataset {
             } else {
                 self.object_store.open(&location.path).await?
             };
-            populate_manifest_schema_dictionary(&mut manifest, reader.as_ref()).await?;
+            populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
         }
         let manifest_arc = Arc::new(manifest);
         self.metadata_cache
@@ -1618,6 +1618,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
+            DEFAULT_COMMIT_RETRY_TIMEOUT,
             self.manifest_location.naming_scheme,
             None,
         )
@@ -3974,6 +3975,12 @@ impl Default for ManifestWriteConfig {
 impl ManifestWriteConfig {
     pub fn disable_transaction_file(&self) -> bool {
         self.disable_transaction_file
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
+        self.disable_transaction_file = true;
+        self
     }
 }
 

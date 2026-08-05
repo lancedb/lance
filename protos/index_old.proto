@@ -41,6 +41,11 @@ message ZoneMapIndexDetails {
   optional bool use_seeds = 2;
 }
 message InvertedIndexDetails {
+  enum DocumentGranularity {
+    ROW = 0;
+    LIST_ELEMENT = 1;
+  }
+
   message CodeTokenizerConfig {
     // Split one lexical identifier into subwords, e.g. getUserName ->
     // get/user/name.
@@ -84,4 +89,10 @@ message InvertedIndexDetails {
   // configuration used to build the index; absence means there is no
   // code-specific configuration to apply.
   CodeTokenizerConfig code_config = 13;
+  // The logical FTS document boundary. The protobuf default preserves the
+  // legacy row-document behavior when this field is absent.
+  DocumentGranularity document_granularity = 14;
+  // The posting-list payload format. This is separate from index_version,
+  // which identifies the overall inverted-index layout.
+  optional uint32 posting_format_version = 15;
 }

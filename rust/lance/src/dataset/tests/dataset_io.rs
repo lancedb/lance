@@ -1529,6 +1529,42 @@ async fn test_deep_clone(
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
 }
 
+#[tokio::test]
+async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
+    use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let source_uri = source_dir.to_str().unwrap();
+    let target_dir = test_dir.join("target");
+    let target_uri = target_dir.to_str().unwrap();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(32), BatchCount::from(1));
+    let mut source = Dataset::write(
+        data_reader,
+        source_uri,
+        Some(WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let source_transaction_file = source.manifest().transaction_file.clone();
+
+    handler.fail_next(AmbiguousFailure::LandAndConflict);
+    let cloned = source
+        .deep_clone(target_uri, source.version().version, None)
+        .await
+        .expect("readback must identify the deep-clone transaction that landed");
+
+    assert_eq!(cloned.count_rows(None).await.unwrap(), 32);
+    assert_ne!(cloned.manifest().transaction_file, source_transaction_file);
+    assert!(cloned.manifest().transaction_section.is_some());
+}
+
 // Uses an in-memory source store to force a cross-store copy. The in-memory store has
 // known platform-specific quirks on Windows (it reads back empty there; see the note in
 // tests/resource_tests.rs), so this test is gated to non-Windows. The local write side is

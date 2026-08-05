@@ -70,15 +70,3 @@ impl GraphBuilderNode {
         }
     }
 }
-
-#[derive(Debug)]
-pub struct GraphBuilderStats {
-    #[allow(dead_code)]
-    pub num_nodes: usize,
-    #[allow(dead_code)]
-    pub max_edges: usize,
-    #[allow(dead_code)]
-    pub mean_edges: f32,
-    #[allow(dead_code)]
-    pub mean_distance: f32,
-}

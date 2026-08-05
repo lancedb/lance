@@ -10,6 +10,9 @@ pub mod version;
 pub mod versions;
 pub mod writer;
 
+#[cfg(test)]
+mod compatibility_tests;
+
 pub use io::LanceEncodingsIo;
 
 use format::MAGIC;

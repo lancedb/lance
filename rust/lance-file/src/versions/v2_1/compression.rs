@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use lance_core::{Error, Result, datatypes::Field};
 use lance_encoding::{
     compression::{

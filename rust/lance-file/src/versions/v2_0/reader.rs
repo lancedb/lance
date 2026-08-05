@@ -94,7 +94,7 @@ pub fn decode_column(
             );
             Ok(PageInfo {
                 buffer_offsets_and_sizes,
-                encoding: PageEncoding::Array(array_encoding),
+                encoding: PageEncoding::Legacy(array_encoding),
                 num_rows: page.length,
                 priority: page.priority,
             })

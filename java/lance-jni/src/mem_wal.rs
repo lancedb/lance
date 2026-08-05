@@ -41,7 +41,6 @@ use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
 
-use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -49,6 +48,7 @@ use crate::traits::{
     FromJString, IntoJava, export_vec, import_vec, import_vec_from_method, import_vec_to_rust,
 };
 use crate::utils::to_rust_map;
+use crate::{RT, block_on};
 
 const NATIVE_SHARD_WRITER: &str = "nativeShardWriterHandle";
 const NATIVE_LSM_SCANNER: &str = "nativeLsmScannerHandle";
@@ -126,7 +126,7 @@ fn inner_create_shard_writer<'local>(
         Arc::new(guard.inner.clone())
     };
 
-    let writer = RT.block_on(dataset.mem_wal_writer(uuid, writer_config))?;
+    let writer = block_on(dataset.mem_wal_writer(uuid, writer_config))?;
     let blocking = BlockingShardWriter {
         writer,
         shard_id: uuid,
@@ -177,7 +177,7 @@ fn inner_put(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<()> 
 
     let guard =
         unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
-    RT.block_on(guard.writer.put(batches))?;
+    block_on(guard.writer.put(batches))?;
     Ok(())
 }
 
@@ -200,7 +200,7 @@ fn inner_delete(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<(
 
     let guard =
         unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
-    RT.block_on(guard.writer.delete(batches))?;
+    block_on(guard.writer.delete(batches))?;
     Ok(())
 }
 
@@ -236,7 +236,7 @@ fn inner_write_pk_sidecar(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
     let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
-    RT.block_on(write_pk_sidecar(&gen_path, &batches, &pk_refs))?;
+    block_on(write_pk_sidecar(&gen_path, &batches, &pk_refs))?;
     Ok(())
 }
 
@@ -275,7 +275,7 @@ fn inner_memtable_stats<'local>(
     let stats = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
-        RT.block_on(guard.writer.memtable_stats())?
+        block_on(guard.writer.memtable_stats())?
     };
     memtable_stats_to_java(env, &stats)
 }
@@ -306,9 +306,8 @@ fn inner_writer_lsm_scanner<'local>(
         // Capture the active memtable *and* any frozen-awaiting-flush memtables
         // so a concurrent flush rollover cannot hide acknowledged writes from
         // this read-your-writes scanner.
-        let in_memory_memtables = RT.block_on(guard.writer.in_memory_memtable_refs())?;
-        let writer_snapshot = RT
-            .block_on(guard.writer.manifest())?
+        let in_memory_memtables = block_on(guard.writer.in_memory_memtable_refs())?;
+        let writer_snapshot = block_on(guard.writer.manifest())?
             .map(shard_snapshot_from_manifest)
             .unwrap_or_else(|| ShardSnapshot::new(guard.shard_id));
         (
@@ -339,7 +338,7 @@ pub extern "system" fn Java_org_lance_memwal_ShardWriter_releaseNativeShardWrite
 
 fn inner_release_shard_writer(env: &mut JNIEnv, this: JObject) -> Result<()> {
     let blocking: BlockingShardWriter = unsafe { env.take_rust_field(&this, NATIVE_SHARD_WRITER) }?;
-    RT.block_on(blocking.writer.close())?;
+    block_on(blocking.writer.close())?;
     Ok(())
 }
 
@@ -498,7 +497,7 @@ fn inner_scanner_open_stream(env: &mut JNIEnv, this: JObject, stream_addr: jlong
         let scanner = guard.inner.as_ref().ok_or_else(|| {
             Error::runtime_error("LsmScanner is no longer usable because an earlier builder call (e.g. filter) failed; create a new scanner".to_string())
         })?;
-        RT.block_on(scanner.try_into_stream())?
+        block_on(scanner.try_into_stream())?
     };
     let ffi_stream =
         to_ffi_arrow_array_stream(DatasetRecordBatchStream::new(stream), RT.handle().clone())?;
@@ -521,7 +520,7 @@ fn inner_scanner_count_rows(env: &mut JNIEnv, this: JObject) -> Result<u64> {
         .inner
         .as_ref()
         .ok_or_else(|| Error::runtime_error("LsmScanner is no longer usable because an earlier builder call (e.g. filter) failed; create a new scanner".to_string()))?;
-    Ok(RT.block_on(scanner.count_rows())?)
+    Ok(block_on(scanner.count_rows())?)
 }
 
 #[unsafe(no_mangle)]
@@ -648,12 +647,11 @@ fn inner_plan_open_stream(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -
         guard.plan.clone()
     };
     let schema = plan.schema();
-    let batches = RT
-        .block_on(async move {
-            let ctx = SessionContext::new();
-            collect(plan, ctx.task_ctx()).await
-        })
-        .map_err(|e| Error::io_error(format!("Plan execution failed: {}", e)))?;
+    let batches = block_on(async move {
+        let ctx = SessionContext::new();
+        collect(plan, ctx.task_ctx()).await
+    })
+    .map_err(|e| Error::io_error(format!("Plan execution failed: {}", e)))?;
 
     let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
         batches.into_iter().map(Ok),
@@ -813,7 +811,7 @@ fn inner_plan_lookup<'local>(
             env.get_rust_field::<_, _, BlockingLsmPointLookupPlanner>(&this, NATIVE_LOOKUP_PLANNER)
         }?;
         let pk_values = scalar_values_from_pk_value(pk_value.as_ref(), &guard.pk_columns)?;
-        let plan = RT.block_on(guard.planner.plan_lookup(&pk_values, columns.as_deref()))?;
+        let plan = block_on(guard.planner.plan_lookup(&pk_values, columns.as_deref()))?;
         (plan, guard.dataset_schema.clone())
     };
     attach_execution_plan(env, plan, dataset_schema)
@@ -984,7 +982,7 @@ fn inner_plan_search<'local>(
             Arc::new(float32_array.clone()),
             None,
         )?;
-        let plan = RT.block_on(guard.planner.plan_search(
+        let plan = block_on(guard.planner.plan_search(
             &fsl,
             k as usize,
             nprobes as usize,
@@ -1072,7 +1070,7 @@ fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject
     if let Some(config) = writer_config {
         builder = builder.writer_config_defaults(config);
     }
-    RT.block_on(builder.execute())?;
+    block_on(builder.execute())?;
     Ok(())
 }
 
@@ -1091,7 +1089,7 @@ fn inner_mem_wal_index_details<'local>(
     let details = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&jdataset, NATIVE_DATASET) }?;
-        RT.block_on(guard.inner.mem_wal_index_details())?
+        block_on(guard.inner.mem_wal_index_details())?
     };
     match details {
         Some(details) => index_details_to_java(env, &details),

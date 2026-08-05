@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
-use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::blocking_scanner::{ScannerOptions, build_scanner_with_options};
 use crate::dispatcher::{DISPATCHER, DispatcherMessage};
 use crate::error::Result;
 use crate::task_tracker::{TASK_TRACKER, TaskInfo};
+use crate::{RT, block_on};
 use arrow::ffi::FFI_ArrowSchema;
 use jni::JNIEnv;
 use jni::objects::JObject;
@@ -82,7 +82,7 @@ impl AsyncScanner {
             // Will be aborted when real handle is registered
         });
 
-        RT.block_on(async {
+        block_on(async {
             TASK_TRACKER
                 .register(
                     task_id,
@@ -163,7 +163,7 @@ impl AsyncScanner {
         });
 
         // Step 3: Update registration with real handle
-        RT.block_on(async {
+        block_on(async {
             TASK_TRACKER.update_handle(task_id, handle).await;
         });
     }
@@ -323,7 +323,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_nativeCancelTask(
     _j_scanner: JObject,
     task_id: jlong,
 ) {
-    RT.block_on(async {
+    block_on(async {
         TASK_TRACKER.cancel(task_id as u64).await;
     });
 }
@@ -361,7 +361,7 @@ fn inner_import_async_ffi_schema(
     let scanner_guard =
         unsafe { env.get_rust_field::<_, _, AsyncScanner>(j_scanner, NATIVE_ASYNC_SCANNER)? };
 
-    let schema = RT.block_on(scanner_guard.inner.schema())?;
+    let schema = block_on(scanner_guard.inner.schema())?;
     let ffi_schema = FFI_ArrowSchema::try_from(&*schema)?;
     unsafe { std::ptr::write_unaligned(schema_addr as *mut FFI_ArrowSchema, ffi_schema) }
     Ok(())
