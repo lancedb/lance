@@ -1004,10 +1004,14 @@ async fn test_boolean_must_scores_sum_across_execution_paths() {
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
         "memory://",
-        None,
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
     )
     .await
     .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
     create_fragmented_fts_index(&mut dataset, "title", false).await;
     create_fragmented_fts_index(&mut dataset, "body", false).await;
     const LIMIT: usize = 2;
