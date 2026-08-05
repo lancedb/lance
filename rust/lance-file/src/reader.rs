@@ -3168,6 +3168,64 @@ mod tests {
         );
     }
 
+    /// Storage dictionaries expand their values through `DataBlockBuilder`
+    /// before the final Arrow layout validation.  Corrupt dictionary offsets
+    /// must therefore fail at the append boundary instead of reaching a slice
+    /// operation with a decreasing range.
+    #[rstest]
+    #[tokio::test]
+    async fn test_default_reader_rejects_non_monotonic_storage_dictionary_offsets(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+    ) {
+        use arrow_array::StringArray;
+
+        let metadata = HashMap::from([
+            (
+                "lance-encoding:dict-size-ratio".to_string(),
+                "0.99".to_string(),
+            ),
+            (
+                "lance-encoding:dict-values-compression".to_string(),
+                "none".to_string(),
+            ),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("category", DataType::Utf8, false).with_metadata(metadata),
+        ]));
+        let values = (0..300)
+            .map(|index| match index % 3 {
+                0 => "alpha",
+                1 => "beta",
+                _ => "gamma",
+            })
+            .collect::<Vec<_>>();
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(StringArray::from(values))]).unwrap();
+
+        let offsets_tail_pattern = [5_i32, 9, 14]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let error = read_file_with_mutated_bytes(
+            version,
+            batch,
+            &offsets_tail_pattern,
+            4,
+            &2_i32.to_le_bytes(),
+        )
+        .await
+        .expect_err("non-monotonic dictionary offsets must fail the read");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("decreases"),
+            "unexpected message: {error}"
+        );
+    }
+
     /// Same contract as the test above, but for a plain (non-dictionary) string
     /// column: the mini-block chunk stores chunk-relative value offsets that are
     /// used to slice the chunk, so a corrupt tail offset must surface as a typed

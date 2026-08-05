@@ -3987,7 +3987,7 @@ impl DecodeSparseStructuralTask {
                 .as_ref()
                 .ok_or_else(|| Error::internal("Sparse structural chunk cache is empty"))?
                 .1;
-            data_builder.try_append(
+            data_builder.append(
                 values,
                 value_start - chunk_value_start..take_end - chunk_value_start,
             )?;

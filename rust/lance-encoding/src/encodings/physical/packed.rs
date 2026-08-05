@@ -453,15 +453,15 @@ impl FieldAccumulator {
                 builder,
                 empty_value,
                 ..
-            } => builder.try_append(empty_value, 0..1),
+            } => builder.append(empty_value, 0..1),
             Self::Variable32 {
                 builder,
                 empty_value,
-            } => builder.try_append(empty_value, 0..1),
+            } => builder.append(empty_value, 0..1),
             Self::Variable64 {
                 builder,
                 empty_value,
-            } => builder.try_append(empty_value, 0..1),
+            } => builder.append(empty_value, 0..1),
         }
     }
 }
@@ -592,7 +592,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.try_append(&value_block, 0..1)?;
+                        builder.append(&value_block, 0..1)?;
                         cursor = end;
                     }
                     (
@@ -631,7 +631,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.try_append(&value_block, 0..1)?;
+                        builder.append(&value_block, 0..1)?;
                         cursor = value_end;
                     }
                     (
@@ -670,7 +670,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.try_append(&value_block, 0..1)?;
+                        builder.append(&value_block, 0..1)?;
                         cursor = value_end;
                     }
                     _ => {
