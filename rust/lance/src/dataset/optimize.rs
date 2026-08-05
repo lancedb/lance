@@ -111,7 +111,9 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::Error;
-use lance_core::datatypes::{BlobHandling, BlobKind};
+use lance_core::datatypes::{
+    BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_TYPE, BlobHandling, BlobKind, BlobV2Layout,
+};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
@@ -989,6 +991,14 @@ struct BlobV2Descriptor<'a> {
 impl<'a> BlobV2Descriptor<'a> {
     /// Extract the 5 descriptor arrays from a blob v2 descriptor struct array.
     fn try_from_struct(struct_arr: &'a StructArray, column_name: &str) -> Result<Self> {
+        if BlobV2Layout::classify(struct_arr.fields()) != Some(BlobV2Layout::Descriptor) {
+            let actual = BlobV2Layout::classify(struct_arr.fields())
+                .map(|layout| layout.to_string())
+                .unwrap_or_else(|| format!("unrecognized ({:?})", struct_arr.fields()));
+            return Err(Error::invalid_input(format!(
+                "Blob v2 column '{column_name}' has {actual} layout; expected descriptor layout before conversion to logical"
+            )));
+        }
         let kind_col = struct_arr
             .column_by_name("kind")
             .ok_or_else(|| {
@@ -1086,11 +1096,11 @@ fn classify_rows(
     })
 }
 
-/// Build a blob v2 user-view struct array from classification and descriptor.
+/// Convert a blob v2 descriptor into the logical writer representation.
 ///
 /// Reads blob data lazily using row addresses to avoid materializing all blob
 /// payloads in memory at once.
-async fn build_user_view_struct(
+async fn descriptor_to_logical_blob_array(
     dataset: &Arc<Dataset>,
     descriptor: &BlobV2Descriptor<'_>,
     classification: &RowClassification,
@@ -1165,7 +1175,7 @@ async fn build_user_view_struct(
     }
 
     Ok(StructArray::try_new(
-        lance_core::datatypes::BLOB_V2_USER_FIELDS.clone(),
+        BLOB_V2_LOGICAL_FIELDS.clone(),
         vec![
             Arc::new(data_builder.finish()),
             Arc::new(uri_builder.finish()),
@@ -1229,13 +1239,28 @@ pub(crate) async fn transform_blob_v2_batch(
                 ))
             })?;
 
-        // Merge-insert may supply a blob v2 value directly from the source.
-        // Those values are already in the writer's user view and do not refer
-        // to a row in the target dataset, unlike descriptor values from scans.
-        if struct_arr.column_by_name("kind").is_none() {
-            new_columns.push(batch.column(col_idx).clone());
-            new_fields.push(field.clone());
-            continue;
+        match BlobV2Layout::classify(struct_arr.fields()) {
+            // Merge-insert may supply a logical blob v2 value directly from the
+            // source. It does not refer to a row in the target dataset.
+            Some(BlobV2Layout::Logical) => {
+                new_columns.push(batch.column(col_idx).clone());
+                new_fields.push(field.clone());
+                continue;
+            }
+            Some(BlobV2Layout::Descriptor) => {}
+            Some(actual) => {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 column '{}' has {actual} layout; expected logical or descriptor layout during compaction",
+                    field.name()
+                )));
+            }
+            None => {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 column '{}' has unrecognized layout {:?}; expected logical or descriptor layout during compaction",
+                    field.name(),
+                    struct_arr.fields()
+                )));
+            }
         }
 
         let column_name = field.name();
@@ -1243,7 +1268,7 @@ pub(crate) async fn transform_blob_v2_batch(
         let classification = classify_rows(struct_arr, &descriptor, row_addrs, column_name)?;
         let num_rows = struct_arr.len();
 
-        let new_struct = build_user_view_struct(
+        let new_struct = descriptor_to_logical_blob_array(
             dataset,
             &descriptor,
             &classification,
@@ -1263,7 +1288,7 @@ pub(crate) async fn transform_blob_v2_batch(
         new_fields.push(Arc::new(
             arrow_schema::Field::new(
                 field.name(),
-                lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
+                BLOB_V2_LOGICAL_TYPE.clone(),
                 field.is_nullable(),
             )
             .with_metadata(logical_field.metadata().clone()),
@@ -1697,7 +1722,7 @@ async fn rewrite_files(
                         fields.push(Arc::new(
                             arrow_schema::Field::new(
                                 field.name(),
-                                lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
+                                BLOB_V2_LOGICAL_TYPE.clone(),
                                 field.is_nullable(),
                             )
                             .with_metadata(logical_field.metadata().clone()),
