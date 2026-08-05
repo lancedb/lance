@@ -4557,6 +4557,79 @@ mod tests {
         assert_eq!(inserted, 1);
     }
 
+    /// A composite index probe can over-match the exact join key, but a target
+    /// row reached by more than one source batch must still enter the join once.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_deduplicates_cross_batch_candidates() {
+        let initial = record_batch!(
+            ("a", Int32, [1, 1, 2, 2]),
+            ("b", Int32, [10, 20, 10, 20]),
+            ("value", Int32, [100, 200, 300, 400])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["a"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["b"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        let first = record_batch!(
+            ("a", Int32, [1]),
+            ("b", Int32, [10]),
+            ("value", Int32, [901])
+        )
+        .unwrap();
+        // This batch probes `a IN (1, 2) AND b IN (20, 10)`, which reaches
+        // (1, 10) again even though that tuple is not present in this batch.
+        let second = record_batch!(
+            ("a", Int32, [1, 2]),
+            ("b", Int32, [20, 10]),
+            ("value", Int32, [902, 903])
+        )
+        .unwrap();
+
+        let (dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(first), Ok(second)],
+                    schema,
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 3);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+        for (a, b, value) in [(1, 10, 901), (1, 20, 902), (2, 10, 903), (2, 20, 400)] {
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!("a = {a} AND b = {b} AND value = {value}")))
+                    .await
+                    .unwrap(),
+                1,
+            );
+        }
+    }
+
     /// Composite key merge_insert with no scalar index on any join column
     /// must keep working via the full-scan fallback.  Guards against the
     /// indexed path becoming a hard requirement after this optimization.
