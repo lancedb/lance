@@ -4529,31 +4529,32 @@ impl Scanner {
         params: &FtsSearchParams,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let plan = match (indexed_plan, flat_plan) {
-            (Some(match_plan), Some(flat_match_plan)) => {
-                let match_plan = UnionExec::try_new(vec![match_plan, flat_match_plan])?;
-                let match_plan = Arc::new(RepartitionExec::try_new(
-                    match_plan,
-                    Partitioning::RoundRobinBatch(1),
-                )?);
-                let sort_expr = PhysicalSortExpr {
-                    expr: expressions::col(SCORE_COL, match_plan.schema().as_ref())?,
-                    options: SortOptions {
-                        descending: true,
-                        nulls_first: false,
-                    },
-                };
-                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit))
+            (Some(indexed_plan), Some(flat_plan)) => {
+                UnionExec::try_new(vec![indexed_plan, flat_plan])?
             }
-            (Some(match_plan), None) => match_plan,
-            (None, Some(flat_match_plan)) => flat_match_plan,
+            (Some(indexed_plan), None) => return Ok(indexed_plan),
+            (None, Some(flat_plan)) if params.limit.is_none() => return Ok(flat_plan),
+            (None, Some(flat_plan)) => flat_plan,
             (None, None) => {
                 return Err(Error::internal(
                     "FTS leaf planning produced neither an indexed nor a flat plan".to_string(),
                 ));
             }
         };
-
-        Ok(plan)
+        let plan = Arc::new(RepartitionExec::try_new(
+            plan,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        let sort_expr = PhysicalSortExpr {
+            expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        };
+        Ok(Arc::new(
+            SortExec::new([sort_expr].into(), plan).with_fetch(params.limit),
+        ))
     }
 
     /// Plan match query on unindexed fragments
