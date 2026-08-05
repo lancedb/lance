@@ -134,6 +134,12 @@ class CleanupExplanation:
     referenced_branches: List[CleanupReferencedBranch]
     warnings: List[str]
 
+class LanceFileWriteSummary:
+    num_rows: int
+    size_bytes: int
+
+    def __repr__(self) -> str: ...
+
 class LanceFileWriter:
     def __init__(
         self,
@@ -148,7 +154,7 @@ class LanceFileWriter:
         max_page_bytes: Optional[int],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
-    def finish(self) -> int: ...
+    def finish(self) -> LanceFileWriteSummary: ...
     def add_schema_metadata(self, key: str, value: str) -> None: ...
     def add_global_buffer(self, data: bytes) -> int: ...
 
@@ -278,6 +284,23 @@ class LanceColumnStatistics:
     size_bytes: int
 
 class _Session:
+    def __init__(
+        self,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_backend: Optional[str | Dict[str, Any]] = None,
+        metadata_cache_backend: Optional[str | Dict[str, Any]] = None,
+    ) -> None:
+        """Create a Lance session.
+
+        Cache backends may be backend URI strings such as
+        ``"moka://?capacity=1048576"`` or dictionaries such as
+        ``{"kind": "moka", "options": {"capacity": "1048576"}}``.
+        ``index_cache_backend`` is mutually exclusive with
+        ``index_cache_size_bytes``. ``metadata_cache_backend`` is mutually
+        exclusive with ``metadata_cache_size_bytes``.
+        """
+        ...
     def size_bytes(self) -> int: ...
     def index_cache_size_bytes(self) -> int: ...
 

@@ -93,6 +93,11 @@ fn fixed_size_list_equal(a: &FixedSizeListArray, b: &FixedSizeListArray) -> bool
             let vb = b.values().as_primitive::<arrow_array::types::Float16Type>();
             va.values() == vb.values()
         }
+        (DataType::UInt8, DataType::UInt8) => {
+            let va = a.values().as_primitive::<UInt8Type>();
+            let vb = b.values().as_primitive::<UInt8Type>();
+            va.values() == vb.values()
+        }
         _ => false,
     }
 }
@@ -1645,6 +1650,31 @@ mod tests {
         IndexBuildProgress,
         lance_core::Result<()>
     );
+
+    #[test]
+    fn test_uint8_fixed_size_list_compatibility() {
+        let values = (0_u8..16).collect::<Vec<_>>();
+        let reference =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(values.clone()), 8).unwrap();
+        let matching =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(values.clone()), 8).unwrap();
+
+        ensure_fixed_size_list_compatible("IVF centroids", &reference, &matching).unwrap();
+
+        let mut differing_values = values;
+        differing_values[15] = 16;
+        let differing =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(differing_values), 8).unwrap();
+        let error =
+            ensure_fixed_size_list_compatible("IVF centroids", &reference, &differing).unwrap_err();
+
+        assert!(matches!(&error, Error::Index { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("IVF centroids mismatch across shards")
+        );
+    }
 
     async fn write_flat_partial_aux(
         store: &ObjectStore,

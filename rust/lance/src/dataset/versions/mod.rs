@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Dataset write policies that differ across exact Lance file versions.
 //!
 //! File grammar belongs to `lance_file::versions`. This module contains only
@@ -220,22 +223,6 @@ pub async fn open_writer(
             .await
         }
     }
-}
-
-pub async fn open_data_writer(
-    version: ConcreteFileVersion,
-    object_store: &ObjectStore,
-    schema: &Schema,
-    base_dir: &Path,
-) -> Result<Box<dyn write::GenericWriter>> {
-    open_writer(
-        version,
-        object_store,
-        schema,
-        base_dir,
-        WriterOptions::data_file(),
-    )
-    .await
 }
 
 pub async fn open_update_writer(

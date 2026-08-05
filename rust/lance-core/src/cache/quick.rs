@@ -11,10 +11,11 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures::Future;
 
-use super::CacheCodec;
-use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
+use super::backend::{CacheBackend, CacheEntry};
 use super::moka::key_footprint;
+use super::{CacheCodec, InternalCacheKey};
 use crate::Result;
+use crate::deepsize::Context;
 
 #[derive(Clone)]
 struct QuickEntry {
@@ -28,7 +29,7 @@ struct EntryWeighter;
 impl quick_cache::Weighter<InternalCacheKey, QuickEntry> for EntryWeighter {
     fn weight(&self, key: &InternalCacheKey, value: &QuickEntry) -> u64 {
         // Same accounting as the moka backend.
-        (key_footprint(key) + value.size_bytes).max(1) as u64
+        key_footprint(key).saturating_add(value.size_bytes).max(1) as u64
     }
 }
 
@@ -108,8 +109,7 @@ impl CacheBackend for QuickCacheBackend {
         size_bytes: usize,
         _codec: Option<CacheCodec>,
     ) {
-        self.cache
-            .insert(key.clone(), QuickEntry { entry, size_bytes });
+        self.cache.insert(*key, QuickEntry { entry, size_bytes });
     }
 
     async fn get_or_insert<'a>(
@@ -131,24 +131,8 @@ impl CacheBackend for QuickCacheBackend {
         }
     }
 
-    async fn invalidate_prefix(&self, prefix: &str) {
-        let matching: Vec<InternalCacheKey> = self
-            .cache
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, _)| k)
-            .collect();
-        for key in matching {
-            self.cache.remove(&key);
-        }
-    }
-
     async fn clear(&self) {
         self.cache.clear();
-    }
-
-    async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
-        Some(Box::new(self.cache.iter().map(|(key, _)| key)))
     }
 
     async fn num_entries(&self) -> usize {
@@ -165,6 +149,22 @@ impl CacheBackend for QuickCacheBackend {
 
     fn approx_size_bytes(&self) -> usize {
         self.cache.weight() as usize
+    }
+
+    fn deep_size_of_entries(
+        &self,
+        context: &mut Context,
+        size_of_entry: &dyn Fn(&CacheEntry, &mut Context) -> Option<usize>,
+    ) -> Option<usize> {
+        Some(
+            self.cache
+                .iter()
+                .map(|(key, record)| {
+                    key_footprint(&key)
+                        + size_of_entry(&record.entry, context).unwrap_or(record.size_bytes)
+                })
+                .sum(),
+        )
     }
 }
 
@@ -199,6 +199,19 @@ mod tests {
         fn type_name() -> &'static str {
             std::any::type_name::<T>()
         }
+    }
+
+    #[test]
+    fn entry_weight_includes_fixed_key() {
+        let key = InternalCacheKey::from_bytes([0; 16]);
+        let entry = QuickEntry {
+            entry: Arc::new(()),
+            size_bytes: 7,
+        };
+        assert_eq!(
+            quick_cache::Weighter::weight(&EntryWeighter, &key, &entry),
+            23
+        );
     }
 
     #[tokio::test]

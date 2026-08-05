@@ -21,7 +21,7 @@ pub const V2_FORMAT_2_3: &str = "2.3";
 ///
 /// This selector remains separate from [`ConcreteFileVersion`] because `Stable`
 /// and `Next` are release policy rather than persisted identities.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Ord, PartialOrd, Hash)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Ord, PartialOrd)]
 pub enum LanceFileVersion {
     /// The legacy v1 format.
     Legacy,
@@ -47,7 +47,7 @@ impl DeepSizeOf for LanceFileVersion {
 }
 
 impl LanceFileVersion {
-    /// Resolve release selectors to their current exact selector.
+    /// Resolve `Stable` or `Next` to the current exact selector.
     pub fn resolve(&self) -> Self {
         match self {
             Self::Stable => Self::default(),
@@ -58,15 +58,6 @@ impl LanceFileVersion {
 
     pub fn is_unstable(&self) -> bool {
         self >= &Self::Next
-    }
-
-    pub fn try_from_major_minor(major: u32, minor: u32) -> Result<Self> {
-        ConcreteFileVersion::from_data_file_numbers(major, minor).map(Into::into)
-    }
-
-    pub fn to_numbers(&self) -> (u32, u32) {
-        let (major, minor) = ConcreteFileVersion::from(*self).to_data_file_numbers();
-        (major, minor)
     }
 
     pub fn iter_non_legacy() -> impl Iterator<Item = Self> {

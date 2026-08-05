@@ -600,7 +600,7 @@ impl FieldEncoder for StructFieldEncoder {
             let mut header = EncodedColumn::default();
             header.final_pages.push(EncodedPage {
                 data: Vec::new(),
-                description: PageEncoding::Array(pb::ArrayEncoding {
+                description: PageEncoding::Legacy(pb::ArrayEncoding {
                     array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
                         pb::SimpleStruct {},
                     )),

@@ -21,7 +21,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
 use crate::Dataset;
-use crate::blob::normalize_prepared_blob_schema;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
@@ -216,6 +216,7 @@ impl<'a> InsertBuilder<'a> {
         .await?;
 
         let (written_fragments, written_schema) = write_fragments_internal(
+            context.storage_version,
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -324,7 +325,7 @@ impl<'a> InsertBuilder<'a> {
             schema_cmp_opts.allow_missing_if_nullable = true;
             schema_cmp_opts.ignore_field_order = true;
 
-            let normalized_data_schema = normalize_prepared_blob_schema(data_schema)?;
+            let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
             normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
@@ -418,7 +419,7 @@ impl<'a> InsertBuilder<'a> {
                 // the existing version if they don't
                 params
                     .data_storage_version
-                    .map(|version| ConcreteFileVersion::from(version.resolve()))
+                    .map(ConcreteFileVersion::from)
                     .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
             }
             (_, WriteDestination::Dataset(dataset)) => {

@@ -12,7 +12,9 @@ use lance_arrow::{
     BLOB_V2_EXT_NAME,
 };
 use lance_core::datatypes::{NullabilityComparison, OnMissing, OnTypeMismatch};
-use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
+use lance_core::utils::tracing::{
+    AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
+};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
@@ -37,7 +39,7 @@ use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
-use crate::blob::normalize_prepared_blob_schema;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::blob::{
     BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
@@ -454,10 +456,7 @@ impl WriteParams {
     }
 
     pub fn storage_version_or_default(&self) -> ConcreteFileVersion {
-        self.data_storage_version
-            .unwrap_or_default()
-            .resolve()
-            .into()
+        self.data_storage_version.unwrap_or_default().into()
     }
 
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
@@ -767,44 +766,6 @@ where
     Ok(fragments)
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-async fn do_write_fragments(
-    dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
-    base_dir: &Path,
-    schema: &Schema,
-    data: SendableRecordBatchStream,
-    params: WriteParams,
-    storage_version: ConcreteFileVersion,
-    target_bases_info: Option<Vec<TargetBaseInfo>>,
-    seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
-) -> Result<Vec<Fragment>> {
-    versions::write_fragments_direct(
-        storage_version,
-        dataset,
-        object_store,
-        base_dir,
-        schema,
-        data,
-        params,
-        target_bases_info,
-        seed_writers,
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn open_writer_with_options(
-    object_store: &ObjectStore,
-    schema: &Schema,
-    base_dir: &Path,
-    storage_version: ConcreteFileVersion,
-    options: WriterOptions,
-) -> Result<Box<dyn GenericWriter>> {
-    versions::open_writer(storage_version, object_store, schema, base_dir, options).await
-}
-
 /// Flush all seed writers into the given file writer, embedding seed buffers
 /// and schema metadata before `finish()` is called.
 async fn flush_seed_writers(
@@ -863,8 +824,13 @@ pub(crate) async fn cleanup_data_fragments(
             };
 
             let path = file_dir.clone().join(file.path.as_str());
-            if let Err(e) = store.delete(&path).await {
-                log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+            match store.delete(&path).await {
+                Ok(()) => {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = file.path.as_str());
+                }
+                Err(e) => {
+                    log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+                }
             }
 
             // Clean up any blob v2 sidecars that might exist for this data file.
@@ -1304,8 +1270,13 @@ pub(super) async fn blob_v2_external_base_resolver(
 /// This is a private variant that takes a `SendableRecordBatchStream` instead
 /// of a reader. We don't expose the stream at our interface because it is a
 /// DataFusion type.
+///
+/// The caller must resolve `storage_version` once for the operation. Operations
+/// that also select a commit format must reuse the same value when committing.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
 pub async fn write_fragments_internal(
+    storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
@@ -1331,9 +1302,8 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
     validate_external_blob_write_params(&params)?;
-    let normalized_converted_schema = normalize_prepared_blob_schema(&converted_schema)?;
+    let normalized_converted_schema = prepared_to_logical_blob_schema(&converted_schema)?;
 
-    let storage_version = resolve_storage_version(dataset, &params);
     versions::write_fragments(
         storage_version,
         dataset,
@@ -1345,30 +1315,6 @@ pub async fn write_fragments_internal(
         target_bases_info,
     )
     .await
-}
-
-fn resolve_storage_version(dataset: Option<&Dataset>, params: &WriteParams) -> ConcreteFileVersion {
-    if let Some(dataset) = dataset {
-        match params.mode {
-            WriteMode::Append | WriteMode::Create => {
-                // Use the storage version from the dataset, ignoring any version from the user.
-                dataset.manifest().data_storage_format.lance_file_format()
-            }
-            WriteMode::Overwrite => {
-                // Overwrite, use the schema from the data.  If the user specified
-                // a storage version use that.  Otherwise use the version from the
-                // dataset.
-                params
-                    .data_storage_version
-                    .map(|version| ConcreteFileVersion::from(version.resolve()))
-                    .unwrap_or_else(|| dataset.manifest().data_storage_format.lance_file_format())
-            }
-        }
-    } else {
-        // Brand new dataset, use the schema from the data and the storage version
-        // from the user or the default.
-        params.storage_version_or_default()
-    }
 }
 
 pub(super) fn prepare_write_schema(
@@ -1617,13 +1563,6 @@ pub(crate) struct WriterOptions {
 }
 
 impl WriterOptions {
-    pub(super) fn data_file() -> Self {
-        Self {
-            add_data_dir: true,
-            ..Default::default()
-        }
-    }
-
     pub(super) fn update(
         source_store_registry: Arc<ObjectStoreRegistry>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
@@ -2078,6 +2017,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2131,6 +2071,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2192,6 +2133,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2288,8 +2230,7 @@ mod tests {
             LanceFileVersion::Next,
         ];
         for version in versions {
-            let (major, minor) =
-                ConcreteFileVersion::from(version.resolve()).to_data_file_numbers();
+            let (major, minor) = ConcreteFileVersion::from(version).to_data_file_numbers();
             let write_params = WriteParams {
                 data_storage_version: Some(version),
                 // This parameter should be ignored
@@ -2306,6 +2247,7 @@ mod tests {
 
             let object_store = Arc::new(ObjectStore::memory());
             let (fragments, _) = write_fragments_internal(
+                ConcreteFileVersion::from(version),
                 None,
                 object_store,
                 &Path::from("test"),
@@ -2381,6 +2323,7 @@ mod tests {
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
         let (fragments, _) = write_fragments_internal(
+            ConcreteFileVersion::V1,
             None,
             object_store.clone(),
             &base_path,
@@ -2636,11 +2579,11 @@ mod tests {
         let object_store = Arc::new(ObjectStore::memory());
         let base_dir = Path::from("test/bucket2");
 
-        let mut inner_writer = open_writer_with_options(
+        let mut inner_writer = versions::open_writer(
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
             &object_store,
             &schema,
             &base_dir,
-            ConcreteFileVersion::from(LanceFileVersion::Stable.resolve()),
             WriterOptions {
                 add_data_dir: false, // Don't add /data
                 ..Default::default()
@@ -3542,6 +3485,7 @@ mod tests {
         };
 
         let result = write_fragments_internal(
+            write_params.storage_version_or_default(),
             None,
             object_store,
             &Path::from("test_empty"),
@@ -3766,6 +3710,7 @@ mod tests {
 
         // Attempt to write data - should fail with IO error due to disk full
         let result = write_fragments_internal(
+            write_params.storage_version_or_default(),
             None,
             object_store,
             &Path::from("test_disk_full"),
@@ -3947,14 +3892,14 @@ mod tests {
             futures::stream::iter(items),
         ));
 
-        let result = do_write_fragments(
+        let result = versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
             None,
             object_store.clone(),
             &base_dir,
             &schema,
             stream,
             WriteParams::default(),
-            ConcreteFileVersion::V2_1,
             None,
             Vec::new(),
         )
@@ -4005,7 +3950,8 @@ mod tests {
             futures::stream::iter(items),
         ));
 
-        let result = do_write_fragments(
+        let result = versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
             None,
             object_store.clone(),
             &base_dir,
@@ -4015,7 +3961,6 @@ mod tests {
                 max_rows_per_file: 3,
                 ..Default::default()
             },
-            ConcreteFileVersion::V2_1,
             None,
             Vec::new(),
         )
@@ -4233,7 +4178,8 @@ mod tests {
             is_dataset_root: true,
         }];
 
-        let result = do_write_fragments(
+        let result = versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
             None,
             object_store.clone(),
             &base_dir,
@@ -4243,7 +4189,6 @@ mod tests {
                 max_rows_per_file: 3,
                 ..Default::default()
             },
-            ConcreteFileVersion::V2_1,
             Some(target_bases),
             vec![],
         )

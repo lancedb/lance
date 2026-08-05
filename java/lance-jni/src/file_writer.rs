@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::utils::to_rust_map;
 use crate::{
-    JNIEnvExt, RT,
+    JNIEnvExt, block_on,
     error::{Error, Result},
     traits::IntoJava,
 };
@@ -93,7 +93,7 @@ fn inner_open<'local>(
     let data_storage_version_opt = env.get_string_opt(&data_storage_version)?;
     let storage_options = to_rust_map(env, &jmap)?;
 
-    let writer = RT.block_on(async move {
+    let writer = block_on(async move {
         let object_params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_static_options(storage_options),
@@ -140,7 +140,7 @@ pub extern "system" fn Java_org_lance_file_LanceFileWriter_closeNative<'local>(
         }
     };
     if let Some(writer) = writer {
-        match RT.block_on(writer.inner.lock().unwrap().finish()) {
+        match block_on(writer.inner.lock().unwrap().finish()) {
             Ok(_) => {}
             Err(e) => {
                 Error::from(e).throw(&mut env);
@@ -212,6 +212,6 @@ fn inner_write_batch(
     let writer = unsafe { env.get_rust_field::<_, _, BlockingFileWriter>(writer, NATIVE_WRITER) }?;
 
     let mut writer = writer.inner.lock().unwrap();
-    RT.block_on(writer.write_batch(&record_batch))?;
+    block_on(writer.write_batch(&record_batch))?;
     Ok(())
 }

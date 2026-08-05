@@ -57,17 +57,29 @@ struct FileRow<'a> {
     file_type: FileType,
 }
 
-/// Resolve the base URI a file lives under. Files referenced from a shallow
-/// clone carry a `base_id` pointing into `manifest.base_paths`; otherwise they
-/// live under this dataset's own `base_uri`.
-fn resolve_base_uri<'a>(
+struct ResolvedFileBase<'a> {
+    uri: &'a str,
+    is_dataset_root: bool,
+}
+
+/// Resolve the base a file lives under. Files referenced from a shallow clone
+/// carry a `base_id` pointing into `manifest.base_paths`; otherwise they live
+/// under this dataset's own root.
+fn resolve_file_base<'a>(
     manifest: &'a lance_table::format::Manifest,
     base_id: Option<u32>,
     base_uri: &'a str,
-) -> &'a str {
+) -> ResolvedFileBase<'a> {
     base_id
-        .and_then(|id| manifest.base_paths.get(&id).map(|bp| bp.path.as_str()))
-        .unwrap_or(base_uri)
+        .and_then(|id| manifest.base_paths.get(&id))
+        .map(|base_path| ResolvedFileBase {
+            uri: base_path.path.as_str(),
+            is_dataset_root: base_path.is_dataset_root,
+        })
+        .unwrap_or(ResolvedFileBase {
+            uri: base_uri,
+            is_dataset_root: true,
+        })
 }
 
 fn manifest_file_rows<'a>(
@@ -107,11 +119,16 @@ fn manifest_file_rows<'a>(
 
     let data_files = manifest.fragments.iter().flat_map(move |fragment| {
         fragment.files.iter().map(move |data_file| {
-            let effective_base_uri = resolve_base_uri(manifest, data_file.base_id, base_uri);
+            let resolved_base = resolve_file_base(manifest, data_file.base_id, base_uri);
+            let path = if resolved_base.is_dataset_root {
+                Cow::Owned(format!("{}/{}", DATA_DIR, data_file.path))
+            } else {
+                Cow::Borrowed(data_file.path.as_str())
+            };
             FileRow {
                 version: manifest.version,
-                base_uri: Cow::Borrowed(effective_base_uri),
-                path: Cow::Owned(format!("{}/{}", DATA_DIR, data_file.path)),
+                base_uri: Cow::Borrowed(resolved_base.uri),
+                path,
                 file_type: FileType::DataFile,
             }
         })
@@ -120,7 +137,7 @@ fn manifest_file_rows<'a>(
     let deletion_files = manifest.fragments.iter().filter_map(|fragment| {
         fragment.deletion_file.as_ref().map(|del_file| FileRow {
             version: manifest.version,
-            base_uri: Cow::Borrowed(resolve_base_uri(manifest, del_file.base_id, base_uri)),
+            base_uri: Cow::Borrowed(resolve_file_base(manifest, del_file.base_id, base_uri).uri),
             path: Cow::Owned(relative_deletion_file_path(fragment.id, del_file)),
             file_type: FileType::DeletionFile,
         })
@@ -1002,8 +1019,8 @@ mod tests {
         );
     }
 
-    /// Each `DataFile` inside a fragment carries its own `base_id`; the
-    /// emitted `base_uri` must be looked up per file, not per fragment.
+    /// Each `DataFile` inside a fragment carries its own `base_id`; both the
+    /// emitted `base_uri` and relative path must honor that base's layout.
     #[test]
     fn test_manifest_file_rows_per_file_base_id() {
         use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
@@ -1059,7 +1076,7 @@ mod tests {
         );
         base_paths.insert(
             2,
-            BasePath::new(2, "s3://bucket-b/root".to_string(), None, false),
+            BasePath::new(2, "s3://bucket-b/root".to_string(), None, true),
         );
 
         let manifest = Manifest::new(
@@ -1077,7 +1094,7 @@ mod tests {
             .map(|r| (r.path.as_ref(), r.base_uri.as_ref()))
             .collect();
 
-        assert_eq!(by_path.get("data/a.lance"), Some(&"s3://bucket-a/root"));
+        assert_eq!(by_path.get("a.lance"), Some(&"s3://bucket-a/root"));
         assert_eq!(by_path.get("data/b.lance"), Some(&"s3://bucket-b/root"));
         assert_eq!(by_path.get("data/c.lance"), Some(&"memory://main"));
 

@@ -15,12 +15,10 @@ pub mod writer;
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use bytes::Bytes;
 use lance_core::{
-    Error, Result,
+    Result,
     datatypes::{Field, Schema},
 };
-use lance_encoding::encoder::EncodedBatch;
 
 use crate::reader::ReaderProjection;
 
@@ -115,16 +113,4 @@ fn append_physical_fields(
             append_physical_fields(&field.children, field_ids, column_indices, next_column);
         }
     }
-}
-
-pub fn encode_self_described_batch(_batch: &EncodedBatch) -> Result<Bytes> {
-    Err(Error::not_supported(
-        "Lance v1 files use versions::v1::writer::FileWriter".to_string(),
-    ))
-}
-
-pub fn encode_mini_batch(_batch: &EncodedBatch) -> Result<Bytes> {
-    Err(Error::not_supported(
-        "Lance v1 files use versions::v1::writer::FileWriter".to_string(),
-    ))
 }
