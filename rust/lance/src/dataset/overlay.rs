@@ -132,6 +132,32 @@ pub(crate) fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragme
         .collect()
 }
 
+/// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
+/// stale because an overlay committed after the segment was built touches a field the segment
+/// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
+///
+/// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
+/// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
+pub(crate) fn collect_overlay_stale_frags(
+    segment: &IndexMetadata,
+    overlaid_frags: &HashMap<u32, &Fragment>,
+    stale: &mut RoaringBitmap,
+    schema: &Schema,
+) -> Result<()> {
+    let coverage = segment.fragment_bitmap.as_ref();
+    for (&frag_id, fragment) in overlaid_frags {
+        if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
+            continue;
+        }
+        if !stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?
+            .is_empty()
+        {
+            stale.insert(frag_id);
+        }
+    }
+    Ok(())
+}
+
 /// Compute exactly which row offsets within each covered fragment are stale and accumulate them
 /// into `stale` (fragment_id → stale row offsets).
 ///
@@ -1321,6 +1347,41 @@ mod tests {
         let mut fragment = Fragment::new(id);
         fragment.overlays.push(overlay);
         fragment
+    }
+
+    #[test]
+    fn test_collect_frags_missing_bitmap_covers_all() {
+        let schema = flat_test_schema();
+        let fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1, 2], 9));
+        let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
+
+        let mut stale = RoaringBitmap::new();
+        collect_overlay_stale_frags(&segment(vec![3], 1, None), &overlaid, &mut stale, &schema)
+            .unwrap();
+        assert_eq!(stale, bitmap([3]), "missing bitmap must cover fragment 3");
+
+        let mut stale = RoaringBitmap::new();
+        collect_overlay_stale_frags(
+            &segment(vec![3], 1, Some(bitmap([0]))),
+            &overlaid,
+            &mut stale,
+            &schema,
+        )
+        .unwrap();
+        assert!(
+            stale.is_empty(),
+            "fragment absent from bitmap is not covered"
+        );
+
+        let mut stale = RoaringBitmap::new();
+        collect_overlay_stale_frags(
+            &segment(vec![3], 1, Some(bitmap([3]))),
+            &overlaid,
+            &mut stale,
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(stale, bitmap([3]));
     }
 
     #[test]
