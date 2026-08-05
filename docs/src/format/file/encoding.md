@@ -587,6 +587,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
 | Range           | ✅ (2.3)              | ❌                       | ❌                         |
 | Delta           | ✅ (2.3)              | ❌                       | ❌                         |
+| Dictionary      | ✅ (2.3)              | ❌                       | ❌                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
@@ -638,6 +639,21 @@ has one, and readers reconstruct values with checked prefix sums.
 ```protobuf
 %%% proto.message.Delta %%%
 ```
+
+### Block Dictionary
+
+A block dictionary represents unsigned `u32` or `u64` values with a `u32` indices child and a dictionary-items
+child. Both children are concrete block codecs. When either child has a payload, the outer payload is framed as:
+
+```text
+u64 indices_payload_bytes
+u64 items_payload_bytes
+indices payload
+dictionary-items payload
+```
+
+A metadata-only child has a zero framed length. If both children are metadata-only, the dictionary itself has no
+payload. Readers validate the frame boundaries, child widths and cardinalities, and every dictionary index.
 
 ### Bitpacking
 
