@@ -15,7 +15,7 @@ use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    ExecutionSummaryCounts, Scanner,
+    ExecutionSummaryCounts, MaterializationStyle, Scanner,
 };
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
@@ -261,6 +261,8 @@ pub(crate) struct ScannerOptions<'a> {
     pub substrait_filter_obj: JObject<'a>,
     pub filter_obj: JObject<'a>,
     pub batch_size_obj: JObject<'a>,
+    pub batch_size_bytes_obj: JObject<'a>,
+    pub io_buffer_size_obj: JObject<'a>,
     pub limit_obj: JObject<'a>,
     pub offset_obj: JObject<'a>,
     pub query_obj: JObject<'a>,
@@ -269,6 +271,9 @@ pub(crate) struct ScannerOptions<'a> {
     pub with_row_id: jboolean,
     pub with_row_address: jboolean,
     pub batch_readahead: jint,
+    pub fragment_readahead_obj: JObject<'a>,
+    pub scan_in_order: jboolean,
+    pub late_materialization_obj: JObject<'a>,
     pub column_orderings: JObject<'a>,
     pub use_scalar_index: jboolean,
     pub fast_search: jboolean,
@@ -319,6 +324,26 @@ pub(crate) fn build_scanner_with_options<'a>(
     let batch_size_opt = env.get_long_opt(&options.batch_size_obj)?;
     if let Some(batch_size) = batch_size_opt {
         scanner.batch_size(batch_size as usize);
+    }
+
+    let batch_size_bytes_opt = env.get_long_opt(&options.batch_size_bytes_obj)?;
+    if let Some(batch_size_bytes) = batch_size_bytes_opt {
+        let batch_size_bytes = u64::try_from(batch_size_bytes).map_err(|_| {
+            Error::input_error(format!(
+                "batchSizeBytes must be non-negative, got {batch_size_bytes}"
+            ))
+        })?;
+        scanner.batch_size_bytes(batch_size_bytes);
+    }
+
+    let io_buffer_size_opt = env.get_long_opt(&options.io_buffer_size_obj)?;
+    if let Some(io_buffer_size) = io_buffer_size_opt {
+        let io_buffer_size = u64::try_from(io_buffer_size).map_err(|_| {
+            Error::input_error(format!(
+                "ioBufferSize must be non-negative, got {io_buffer_size}"
+            ))
+        })?;
+        scanner.io_buffer_size(io_buffer_size);
     }
 
     let limit_opt = env.get_long_opt(&options.limit_obj)?;
@@ -402,6 +427,47 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     scanner.batch_readahead(options.batch_readahead as usize);
 
+    let fragment_readahead_opt = env.get_int_opt(&options.fragment_readahead_obj)?;
+    if let Some(fragment_readahead) = fragment_readahead_opt {
+        let fragment_readahead = usize::try_from(fragment_readahead).map_err(|_| {
+            Error::input_error(format!(
+                "fragmentReadahead must be greater than 0, got {fragment_readahead}"
+            ))
+        })?;
+        if fragment_readahead == 0 {
+            return Err(Error::input_error(
+                "fragmentReadahead must be greater than 0, got 0".to_string(),
+            ));
+        }
+        scanner.fragment_readahead(fragment_readahead);
+    }
+
+    scanner.scan_in_order(options.scan_in_order == JNI_TRUE);
+
+    env.get_optional(&options.late_materialization_obj, |env, java_obj| {
+        let style_name = env.get_string_from_method(&java_obj, "toRustString")?;
+        let style = match style_name.as_str() {
+            "heuristic" => MaterializationStyle::Heuristic,
+            "all_late" => MaterializationStyle::AllLate,
+            "all_early" => MaterializationStyle::AllEarly,
+            "all_early_except" => {
+                let columns: Vec<String> =
+                    import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
+                        let jstr = JString::from(elem);
+                        Ok(env.get_string(&jstr)?.into())
+                    })?;
+                MaterializationStyle::all_early_except(&columns, dataset.schema())?
+            }
+            other => {
+                return Err(Error::input_error(format!(
+                    "Unsupported materialization style: {other}"
+                )));
+            }
+        };
+        scanner.materialization_style(style);
+        Ok(())
+    })?;
+
     env.get_optional(&options.column_orderings, |env, java_obj| {
         let list = env.get_list(&java_obj)?;
         let mut iter = list.iter(env)?;
@@ -452,6 +518,8 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     substrait_filter_obj: JObject<'local>, // Optional<ByteBuffer>
     filter_obj: JObject<'local>,       // Optional<String>
     batch_size_obj: JObject<'local>,   // Optional<Long>
+    batch_size_bytes_obj: JObject<'local>, // Optional<Long>
+    io_buffer_size_obj: JObject<'local>, // Optional<Long>
     limit_obj: JObject<'local>,        // Optional<Integer>
     offset_obj: JObject<'local>,       // Optional<Integer>
     query_obj: JObject<'local>,        // Optional<Query>
@@ -460,6 +528,9 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     with_row_id: jboolean,             // boolean
     with_row_address: jboolean,        // boolean
     batch_readahead: jint,             // int
+    fragment_readahead_obj: JObject<'local>, // Optional<Integer>
+    scan_in_order: jboolean,           // boolean
+    late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
     column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,        // boolean
     fast_search: jboolean,             // boolean
@@ -479,6 +550,8 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             substrait_filter_obj,
             filter_obj,
             batch_size_obj,
+            batch_size_bytes_obj,
+            io_buffer_size_obj,
             limit_obj,
             offset_obj,
             query_obj,
@@ -487,6 +560,9 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             with_row_id,
             with_row_address,
             batch_readahead,
+            fragment_readahead_obj,
+            scan_in_order,
+            late_materialization_obj,
             column_orderings,
             use_scalar_index,
             fast_search,
@@ -508,6 +584,8 @@ fn inner_create_scanner<'local>(
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
     batch_size_obj: JObject<'local>,
+    batch_size_bytes_obj: JObject<'local>,
+    io_buffer_size_obj: JObject<'local>,
     limit_obj: JObject<'local>,
     offset_obj: JObject<'local>,
     query_obj: JObject<'local>,
@@ -516,6 +594,9 @@ fn inner_create_scanner<'local>(
     with_row_id: jboolean,
     with_row_address: jboolean,
     batch_readahead: jint,
+    fragment_readahead_obj: JObject<'local>,
+    scan_in_order: jboolean,
+    late_materialization_obj: JObject<'local>,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     fast_search: jboolean,
@@ -536,6 +617,8 @@ fn inner_create_scanner<'local>(
         substrait_filter_obj,
         filter_obj,
         batch_size_obj,
+        batch_size_bytes_obj,
+        io_buffer_size_obj,
         limit_obj,
         offset_obj,
         query_obj,
@@ -544,6 +627,9 @@ fn inner_create_scanner<'local>(
         with_row_id,
         with_row_address,
         batch_readahead,
+        fragment_readahead_obj,
+        scan_in_order,
+        late_materialization_obj,
         column_orderings,
         use_scalar_index,
         fast_search,

@@ -13,6 +13,7 @@ use lance_index::scalar::zonemap::ZoneMapIndex;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use roaring::RoaringBitmap;
 
+use super::overlay::{collect_overlay_stale_frags, overlaid_fragments};
 use super::{Dataset, fragment::FileFragment};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
@@ -108,8 +109,9 @@ impl<'a> DatasetStatistics<'a> {
     ///
     /// `None` unless the column's index segments *jointly* cover every live
     /// fragment and the column can be soundly bounded — fragments appended after
-    /// the index was built, or a NaN-bearing column, yield `None`. The disjoint
-    /// segments of a multi-segment index are folded together.
+    /// the index was built, a data overlay committed after a segment was built,
+    /// or a NaN-bearing column all yield `None`. The disjoint segments of a
+    /// multi-segment index are folded together.
     ///
     /// When `Some`, the range is a superset of live values, conservative under
     /// deletion vectors: safe to prune with. See [`ScalarIndex::value_range`].
@@ -157,6 +159,21 @@ impl<'a> DatasetStatistics<'a> {
         }
         if !dataset.fragment_bitmap.as_ref().is_subset(&covered) {
             return Ok(None);
+        }
+
+        // Soundness: a data overlay committed after a segment was built can move a value
+        // outside that segment's summaries without the ZoneMap ever seeing it, so the fold
+        // would no longer bound the live values. There is no way to widen the range without
+        // reading the overlay, so report "unknown" instead.
+        let overlaid = overlaid_fragments(&dataset.manifest.fragments);
+        if !overlaid.is_empty() {
+            let mut stale = RoaringBitmap::new();
+            for idx in &segments {
+                collect_overlay_stale_frags(idx, &overlaid, &mut stale, dataset.schema())?;
+            }
+            if !stale.is_disjoint(dataset.fragment_bitmap.as_ref()) {
+                return Ok(None);
+            }
         }
 
         // Keep the opened indices alive so the `ZoneMapIndex` refs we fold over

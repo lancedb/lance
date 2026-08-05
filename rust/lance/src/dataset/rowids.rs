@@ -246,10 +246,14 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
             let fragment_clone = (*fragment).clone();
             async move {
                 let deletion_vector = if has_deletion_file {
-                    match fragment_clone.get_deletion_vector().await {
-                        Ok(Some(dv)) => dv,
-                        Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
-                    }
+                    fragment_clone
+                        .get_deletion_vector()
+                        .await?
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "fragment_id={fragment_id} has deletion-file metadata but no deletion vector"
+                            ))
+                        })?
                 } else {
                     Arc::new(DeletionVector::default())
                 };
@@ -274,13 +278,15 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder};
+    use crate::dataset::{
+        ReadParams, UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder,
+    };
 
     use super::*;
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
@@ -290,6 +296,7 @@ mod test {
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_io::object_store::ObjectStoreParams;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -385,6 +392,59 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_row_id_index_propagates_deletion_vector_read_error() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let test_uri = temp_dir.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+        let mut dataset = Dataset::write(
+            reader,
+            &routed_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 3").await.unwrap();
+        drop(dataset);
+
+        let failing_store = Arc::new(FailingProxyStore::new());
+        failing_store.fail_when(
+            "get_opts",
+            "_deletions",
+            "injected deletion-vector read failure",
+        );
+        let dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing_store.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let error = get_row_id_index(&dataset).await.unwrap_err();
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected deletion-vector read failure")
+        );
+
+        failing_store.clear_fail_when("get_opts", "_deletions");
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(index.get(2).is_some());
+        assert!(index.get(3).is_none());
+    }
+
+    #[tokio::test]
     async fn test_row_addrs_to_row_ids() {
         let num_rows = 25u64;
         let batch = sequence_batch(0..num_rows as i32);
@@ -459,6 +519,9 @@ mod test {
 
         // Overwriting should NOT reset the row id counter.
         assert_eq!(dataset.manifest().next_row_id, 2 * num_rows);
+        // Nor the fragment id counter: ids are a high water mark, so the
+        // overwritten fragment cannot alias the one it replaced.
+        assert_eq!(dataset.manifest.fragments[0].id, 1);
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());

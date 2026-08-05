@@ -109,9 +109,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "approx"
@@ -2379,11 +2379,10 @@ checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -2489,7 +2488,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3682,7 +3681,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3755,7 +3754,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3798,7 +3797,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -3808,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3848,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3880,7 +3879,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3897,7 +3896,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3906,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3932,7 +3931,6 @@ dependencies = [
  "prost",
  "prost-build",
  "rand 0.9.5",
- "strum",
  "tokio",
  "tracing",
  "xxhash-rust",
@@ -3941,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3972,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -3986,7 +3984,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4056,7 +4054,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4078,7 +4076,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4114,7 +4112,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4152,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4168,7 +4166,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4180,7 +4178,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4229,7 +4227,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4244,7 +4242,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4281,7 +4279,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.1"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -4296,7 +4294,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin 0.9.8",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -6826,9 +6824,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spin"
@@ -6915,28 +6913,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "strum"
-version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
-dependencies = [
- "strum_macros",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "rustversion",
- "syn 2.0.118",
-]
 
 [[package]]
 name = "substrait"

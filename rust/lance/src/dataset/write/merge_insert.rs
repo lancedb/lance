@@ -57,7 +57,7 @@ use crate::{
     dataset::{
         fragment::{FileFragment, FragReadConfig},
         transaction::{Operation, Transaction},
-        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
+        write::merge_insert::logical_plan::MergeInsertPlanner,
     },
     index::DatasetIndexInternalExt,
     io::exec::{
@@ -135,6 +135,7 @@ use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{
     collections::{BTreeMap, HashSet},
+    iter::Peekable,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -147,6 +148,67 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+struct UpdatedRowAddrReconciler<I>
+where
+    I: Iterator<Item = (u64, (usize, usize))>,
+{
+    updated_rows: Peekable<I>,
+}
+
+impl<I> UpdatedRowAddrReconciler<I>
+where
+    I: Iterator<Item = (u64, (usize, usize))>,
+{
+    fn new(updated_rows: I) -> Self {
+        Self {
+            updated_rows: updated_rows.peekable(),
+        }
+    }
+
+    fn reconcile_batch(&mut self, original_row_addrs: &[u64]) -> Result<Vec<(usize, usize)>> {
+        let mut indices = Vec::with_capacity(original_row_addrs.len());
+
+        for (original_offset, original_row_addr) in original_row_addrs.iter().enumerate() {
+            match self.updated_rows.peek().copied() {
+                Some((updated_row_addr, updated_row_index))
+                    if updated_row_addr == *original_row_addr =>
+                {
+                    self.updated_rows.next();
+                    indices.push(updated_row_index);
+                }
+                Some((updated_row_addr, _)) if updated_row_addr < *original_row_addr => {
+                    return Err(Self::missing_row_error(
+                        updated_row_addr,
+                        Some(*original_row_addr),
+                    ));
+                }
+                _ => indices.push((0, original_offset)),
+            }
+        }
+
+        Ok(indices)
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if let Some((updated_row_addr, _)) = self.updated_rows.next() {
+            Err(Self::missing_row_error(updated_row_addr, None))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn missing_row_error(updated_row_addr: u64, next_original_row_addr: Option<u64>) -> Error {
+        let updated_row_addr = RowAddress::from(updated_row_addr);
+        let position = next_original_row_addr.map_or_else(
+            || "no target rows remain".to_string(),
+            |row_addr| format!("next target row address is {}", RowAddress::from(row_addr)),
+        );
+        Error::internal(format!(
+            "Merge insert update row address {updated_row_addr} is missing from the target fragment; {position}"
+        ))
+    }
+}
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -1250,21 +1312,50 @@ impl MergeInsertJob {
                 )?;
 
                 let updated_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-                if Some(updated_rows) == metadata.physical_rows {
-                    // All rows have been updated and there are no deletions. So we
-                    // don't need to merge in existing values.
-                    // Also, because we already sorted by row address, the rows
-                    // will be in the correct order.
+
+                // This function is here to help rustc with lifetimes.
+                fn get_row_addr_iter(
+                    batches: &[RecordBatch],
+                ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send {
+                    batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
+                        // The index in source batches will be one more.
+                        let batch_idx = batch_idx + 1;
+                        let row_addrs = batch
+                            .column_by_name(ROW_ADDR)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap();
+                        row_addrs
+                            .values()
+                            .iter()
+                            .enumerate()
+                            .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
+                    })
+                }
+
+                let has_full_fragment_coverage = metadata.deletion_file.is_none()
+                    && Some(updated_rows) == metadata.physical_rows
+                    && get_row_addr_iter(&batches)
+                        .map(|(row_addr, _)| row_addr)
+                        .eq(RowAddress::address_range(metadata.id as u32).take(updated_rows));
+                if has_full_fragment_coverage {
+                    // Exact, deletion-free coverage can be written directly because the
+                    // batches are sorted by row address.
 
                     let data_storage_version = dataset
                         .manifest()
                         .data_storage_format
                         .lance_file_version()?;
-                    let mut writer = open_writer(
+                    let mut writer = crate::dataset::versions::open_writer(
+                        data_storage_version.into(),
                         &dataset.object_store,
                         &write_schema,
                         &dataset.base,
-                        data_storage_version,
+                        super::WriterOptions {
+                            add_data_dir: true,
+                            ..Default::default()
+                        },
                     )
                     .await?;
 
@@ -1357,28 +1448,8 @@ impl MergeInsertJob {
                         source_batches.push(convert_json_columns(&dropped).map_err(Error::from)?);
                     }
 
-                    // This function is here to help rustc with lifetimes.
-                    fn get_row_addr_iter(
-                        batches: &[RecordBatch],
-                    ) -> impl Iterator<Item = (u64, (usize, usize))> + '_ + Send
-                    {
-                        batches.iter().enumerate().flat_map(|(batch_idx, batch)| {
-                            // The index in source batches will be one more.
-                            let batch_idx = batch_idx + 1;
-                            let row_addrs = batch
-                                .column_by_name(ROW_ADDR)
-                                .unwrap()
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .unwrap();
-                            row_addrs
-                                .values()
-                                .iter()
-                                .enumerate()
-                                .map(move |(offset, row_addr)| (*row_addr, (batch_idx, offset)))
-                        })
-                    }
-                    let mut updated_row_addr_iter = get_row_addr_iter(&batches).peekable();
+                    let mut updated_rows =
+                        UpdatedRowAddrReconciler::new(get_row_addr_iter(&batches));
 
                     while let Some(batch) = updater.next().await? {
                         source_batches[0] =
@@ -1390,34 +1461,13 @@ impl MergeInsertJob {
                             .as_any()
                             .downcast_ref::<UInt64Array>()
                             .unwrap();
-                        let indices = original_row_addrs
-                            .values()
-                            .into_iter()
-                            .enumerate()
-                            .map(|(original_offset, row_addr)| {
-                                match updated_row_addr_iter.peek() {
-                                    Some((updated_row_addr, _))
-                                        if *updated_row_addr == *row_addr =>
-                                    {
-                                        updated_row_addr_iter.next().unwrap().1
-                                    }
-                                    // If we have passed the next updated row address, something went wrong.
-                                    Some((updated_row_addr, _)) => {
-                                        debug_assert!(
-                                        *updated_row_addr > *row_addr,
-                                        "Got updated row address that is not in the original batch"
-                                    );
-                                        (0, original_offset)
-                                    }
-                                    _ => (0, original_offset),
-                                }
-                            })
-                            .collect::<Vec<_>>();
+                        let indices = updated_rows.reconcile_batch(original_row_addrs.values())?;
 
                         let updated_batch = interleave_batches(&source_batches, &indices)?;
 
                         updater.update(updated_batch).await?;
                     }
+                    updated_rows.finish()?;
 
                     let mut updated_fragment = updater.finish().await?;
 
@@ -1486,6 +1536,7 @@ impl MergeInsertJob {
                 )?;
 
                 let (fragments, _) = write_fragments_internal(
+                    dataset.manifest.data_storage_format.lance_file_format(),
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
                     &dataset.base,
@@ -2267,6 +2318,10 @@ impl MergeInsertJob {
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
+                self.dataset
+                    .manifest
+                    .data_storage_format
+                    .lance_file_format(),
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
@@ -3089,6 +3144,74 @@ mod tests {
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    #[test]
+    fn test_updated_row_addr_missing_between_target_rows() {
+        let row_addr = |offset| u64::from(RowAddress::new_from_parts(3, offset));
+        let mut updated_rows = UpdatedRowAddrReconciler::new([(row_addr(1), (1, 0))].into_iter());
+
+        let error = updated_rows
+            .reconcile_batch(&[row_addr(0), row_addr(2)])
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        let message = error.to_string();
+        assert!(message.contains("update row address (3, 1) is missing"));
+        assert!(message.contains("next target row address is (3, 2)"));
+    }
+
+    #[test]
+    fn test_updated_row_addr_missing_after_target_rows() {
+        let row_addr = |offset| u64::from(RowAddress::new_from_parts(7, offset));
+        let mut updated_rows = UpdatedRowAddrReconciler::new([(row_addr(2), (1, 0))].into_iter());
+
+        assert_eq!(
+            updated_rows
+                .reconcile_batch(&[row_addr(0), row_addr(1)])
+                .unwrap(),
+            vec![(0, 0), (0, 1)]
+        );
+        let error = updated_rows.finish().unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        let message = error.to_string();
+        assert!(message.contains("update row address (7, 2) is missing"));
+        assert!(message.contains("no target rows remain"));
+    }
+
+    #[tokio::test]
+    async fn test_updated_row_addr_missing_in_full_fragment_update() {
+        let initial = record_batch!(("value", Int32, [10, 20])).unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+        let row_addr = |offset| u64::from(RowAddress::new_from_parts(fragment_id, offset));
+        let updates = record_batch!(
+            (ROW_ADDR, UInt64, [row_addr(0), row_addr(2)]),
+            ("value", Int32, [100, 200])
+        )
+        .unwrap();
+        let update_stream =
+            RecordBatchStreamAdapter::new(updates.schema(), futures::stream::iter([Ok(updates)]));
+
+        let error = MergeInsertJob::update_fragments(
+            dataset.clone(),
+            Box::pin(update_stream),
+            dataset.manifest().version + 1,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        let message = error.to_string();
+        assert!(message.contains("update row address (0, 2) is missing"));
+        assert!(message.contains("no target rows remain"));
     }
 
     // An update-style merge_insert leaves the source and new fragments with
@@ -4047,6 +4170,85 @@ mod tests {
 
     #[rstest::rstest]
     #[tokio::test]
+    async fn test_multi_batch_upsert_preserves_stable_row_ids(
+        #[values(true, false)] use_index: bool,
+    ) {
+        let mut dataset = (*create_test_dataset(
+            "memory://test_multi_batch_upsert_row_ids",
+            LanceFileVersion::default(),
+            true,
+        )
+        .await)
+            .clone();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let initial_keys = [1, 2, 3, 4, 5, 6];
+        let initial_row_ids = get_row_ids_for_keys(&dataset, &initial_keys).await;
+        let initial_row_ids = initial_row_ids
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let updated_keys = [2, 4];
+        let updated_row_ids_before = get_row_ids_for_keys(&dataset, &updated_keys).await;
+
+        // Put inserts in the first source batch and updates in the second. Stable
+        // row-id assignment still relies on the join emitting all updates first.
+        let insert_batch = record_batch!(
+            ("key", UInt32, [7, 8]),
+            ("value", UInt32, [70, 80]),
+            ("filterme", Utf8, ["inserted", "inserted"])
+        )
+        .unwrap();
+        let update_batch = record_batch!(
+            ("key", UInt32, [2, 4]),
+            ("value", UInt32, [20, 40]),
+            ("filterme", Utf8, ["updated", "updated"])
+        )
+        .unwrap();
+        let source_schema = insert_batch.schema();
+        let source = Box::new(RecordBatchIterator::new(
+            [Ok(insert_batch), Ok(update_batch)],
+            source_schema,
+        ));
+
+        let (dataset, stats) = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(use_index)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 2);
+        assert_eq!(stats.num_inserted_rows, 2);
+        let updated_row_ids_after = get_row_ids_for_keys(&dataset, &updated_keys).await;
+        assert_eq!(updated_row_ids_after, updated_row_ids_before);
+
+        let inserted_row_ids = get_row_ids_for_keys(&dataset, &[7, 8]).await;
+        assert!(
+            inserted_row_ids
+                .values()
+                .iter()
+                .all(|row_id| !initial_row_ids.contains(row_id))
+        );
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
     async fn test_row_id_stability_across_update_and_merge_insert(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
@@ -4546,6 +4748,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inserted, 1);
+    }
+
+    /// A composite index probe can over-match the exact join key, but a target
+    /// row reached by more than one source batch must still enter the join once.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_deduplicates_cross_batch_candidates() {
+        let initial = record_batch!(
+            ("a", Int32, [1, 1, 2, 2]),
+            ("b", Int32, [10, 20, 10, 20]),
+            ("value", Int32, [100, 200, 300, 400])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["a"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["b"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        let first = record_batch!(
+            ("a", Int32, [1]),
+            ("b", Int32, [10]),
+            ("value", Int32, [901])
+        )
+        .unwrap();
+        // This batch probes `a IN (1, 2) AND b IN (20, 10)`, which reaches
+        // (1, 10) again even though that tuple is not present in this batch.
+        let second = record_batch!(
+            ("a", Int32, [1, 2]),
+            ("b", Int32, [20, 10]),
+            ("value", Int32, [902, 903])
+        )
+        .unwrap();
+
+        let (dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(first), Ok(second)],
+                    schema,
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 3);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+        for (a, b, value) in [(1, 10, 901), (1, 20, 902), (2, 10, 903), (2, 20, 400)] {
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!("a = {a} AND b = {b} AND value = {value}")))
+                    .await
+                    .unwrap(),
+                1,
+            );
+        }
     }
 
     /// Composite key merge_insert with no scalar index on any join column
