@@ -89,6 +89,12 @@ impl FailingProxyStore {
             }),
         );
     }
+
+    /// Stop failing calls configured by [`Self::fail_when`].
+    pub fn clear_fail_when(&self, method: &str, path_substr: &str) {
+        let mut policy = self.policy.lock().unwrap();
+        policy.clear_before_policy(&format!("fail_{}_{}", method, path_substr));
+    }
 }
 
 impl WrappingObjectStore for FailingProxyStore {

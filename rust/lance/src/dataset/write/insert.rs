@@ -19,7 +19,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
 use crate::Dataset;
-use crate::blob::normalize_prepared_blob_schema;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
@@ -324,7 +324,7 @@ impl<'a> InsertBuilder<'a> {
                 ..Default::default()
             };
 
-            let normalized_data_schema = normalize_prepared_blob_schema(data_schema)?;
+            let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
             normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 

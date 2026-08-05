@@ -10,6 +10,12 @@ Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](pyth
 - Treat every file format marked unstable as disposable. It may change freely; do not add compatibility code, migrations, fallbacks, or tests for files written by earlier unstable revisions.
 - Evaluate compatibility against the latest released stable version while continuing to honor all stable format contracts. Changes that exist only on the current branch or `main` are not compatibility constraints; do not compromise a cleaner or more complete design to preserve those intermediate states.
 
+### Legacy Compatibility Boundaries
+
+- Treat formats and code paths that current writers no longer emit as frozen compatibility surfaces. Preserve their existing read behavior, but exclude them from new feature design unless legacy support is explicitly required.
+- Implement new features in the current format and write paths. Do not extend legacy writers, retrofit new capabilities into legacy readers, or reuse legacy implementations as the foundation for new code.
+- Avoid refactoring or otherwise modifying legacy code during feature work. If a shared boundary makes a legacy change unavoidable, isolate the change, preserve existing behavior, and add targeted regression coverage using released historical fixtures.
+
 ## Development Commands
 
 ### Rust
@@ -121,6 +127,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 
 ## Pull Requests
 
+- Before creating a PR, search for similar PRs and inspect any PRs linked to the issue being addressed. If a matching PR exists, verify its current status and scope before proceeding to avoid creating duplicate work.
 - PR titles must follow the Conventional Commits specification because `.github/workflows/pr-title.yml` validates the PR title and body with commitlint. Use prefixes like `feat:`, `fix:`, `docs:`, `perf:`, `ci:`, `test:`, `build:`, `style:`, or `chore:`; add a scope when useful.
 - Before creating or updating a PR, run the lint checks for every touched language surface, even when they are expensive. For Rust changes, run `cargo fmt --all` and `cargo clippy --all --tests --benches -- -D warnings`. For Python changes, follow the environment workflow in `python/AGENTS.md` and run `uv run make lint` from `python/`. If a required lint check cannot be run, state the blocker explicitly in the PR summary.
 

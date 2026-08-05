@@ -30,7 +30,7 @@ use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
@@ -276,6 +276,20 @@ impl CacheKey for RTreeCacheKey {
     fn type_name() -> &'static str {
         "RTree"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.rtree-entry-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        match self {
+            Self::Page(page_id) => {
+                builder.write_variant(0);
+                builder.write_u64(*page_id);
+            }
+            Self::Nulls => builder.write_variant(1),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -345,15 +359,19 @@ impl RTreeIndex {
         while let Some(page_idx) = stack.pop() {
             let range = self.page_range(page_idx).await?;
             let is_leaf = range.start < self.metadata.num_items;
-            let batch = self
+            let result = self
                 .index_cache
-                .get_or_insert_with_key(RTreeCacheKey::Page(page_idx), move || async move {
+                .get_or_insert_with_key_hit(RTreeCacheKey::Page(page_idx), move || async move {
                     let batch = self.pages_reader.read_range(range, None).await?;
                     metrics.record_part_load();
                     Ok(RTreeCacheValue(Arc::new(batch)))
                 })
-                .await
-                .map(|v| v.0.clone())?;
+                .await;
+            match &result {
+                Ok((_, true)) => metrics.record_index_cache_hit(),
+                _ => metrics.record_index_cache_miss(),
+            }
+            let batch = result.map(|(v, _)| v.0.clone())?;
 
             let bbox_array =
                 extract_bounding_boxes(batch.column(0).as_ref(), batch.schema().field(0))?;
@@ -381,16 +399,20 @@ impl RTreeIndex {
     }
 
     async fn search_null(&self, metrics: &dyn MetricsCollector) -> Result<RowAddrTreeMap> {
-        let batch = self
+        let result = self
             .index_cache
-            .get_or_insert_with_key(RTreeCacheKey::Nulls, move || async move {
+            .get_or_insert_with_key_hit(RTreeCacheKey::Nulls, move || async move {
                 // Only one row
                 let batch = self.nulls_reader.read_range(0..1, None).await?;
                 metrics.record_part_load();
                 Ok(RTreeCacheValue(Arc::new(batch)))
             })
-            .await
-            .map(|v| v.0.clone())?;
+            .await;
+        match &result {
+            Ok((_, true)) => metrics.record_index_cache_hit(),
+            _ => metrics.record_index_cache_miss(),
+        }
+        let batch = result.map(|(v, _)| v.0.clone())?;
 
         let null_map = match batch.num_rows() {
             0 => RowAddrTreeMap::default(),
