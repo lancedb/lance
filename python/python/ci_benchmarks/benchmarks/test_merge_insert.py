@@ -24,6 +24,7 @@ the ``merge_insert_base`` tag written by ``datagen/merge_insert.py``.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Callable, Iterable, Optional, Sequence
@@ -59,6 +60,20 @@ PLANS = ["v1_indexed", "v2_hash"]
 SOURCE_SIZES = [1_000, 10_000, 100_000]
 
 NARROW_KEYS = ["id_int", "id_uuid7", "id_uuid4"]
+
+# The full-source v1 hash join reserves its build input once per compute
+# partition. Budget 4 GiB per available CPU so the 1.32 GiB full-schema source
+# and its hash table fit while the module remains deliberately bounded.
+_MEM_POOL_SIZE_PER_CPU = 4 * 1024**3
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _merge_insert_mem_pool() -> Iterable[None]:
+    """Use a bounded pool large enough for every merge_insert benchmark."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        pool_size = _MEM_POOL_SIZE_PER_CPU * (os.cpu_count() or 1)
+        monkeypatch.setenv("LANCE_MEM_POOL_SIZE", str(pool_size))
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -364,44 +379,8 @@ def test_upsert_unindexed_baseline(benchmark, narrow: Target, num_rows: int) -> 
 
 # Fractions are of each fragment's rows, which is what decides whether the
 # in-place updater interleaves or rewrites a whole column file.
-ROW_FRACTIONS = [
-    (0.001, "0.1pct"),
-    (0.01, "1pct"),
-    (0.1, "10pct"),
-    (1.0, "100pct"),
-]
-
-
-def _wide_plan_params(
-    fractions: Sequence[tuple[float, str]],
-) -> list[object]:
-    """Pair wide-source fractions with plans, skipping full-source v1."""
-    return [
-        pytest.param(
-            fraction,
-            plan,
-            id=f"{fraction_id}-{plan}",
-            marks=(
-                [
-                    pytest.mark.skip(
-                        reason=(
-                            "v1 indexed merge_insert cannot fit a full-size source "
-                            "in the 150 MiB memory pool; see "
-                            "https://github.com/lance-format/lance/issues/8129"
-                        )
-                    )
-                ]
-                if fraction == 1.0 and uses_index(plan)
-                else []
-            ),
-        )
-        for fraction, fraction_id in fractions
-        for plan in PLANS
-    ]
-
-
-ROW_FRACTION_PLANS = _wide_plan_params(ROW_FRACTIONS)
-PROJECTION_FRACTION_PLANS = _wide_plan_params([(0.01, "1pct"), (1.0, "100pct")])
+ROW_FRACTIONS = [0.001, 0.01, 0.1, 1.0]
+FRACTION_IDS = ["0.1pct", "1pct", "10pct", "100pct"]
 
 # Isolates the two pressures a partial-column update can exert: field count
 # (scalar columns, cheap per field) and byte volume (the vector column).
@@ -435,7 +414,8 @@ def update_subset(
     return job
 
 
-@pytest.mark.parametrize(("fraction", "plan"), ROW_FRACTION_PLANS)
+@pytest.mark.parametrize("plan", PLANS)
+@pytest.mark.parametrize("fraction", ROW_FRACTIONS, ids=FRACTION_IDS)
 def test_update_subset_row_fraction(
     benchmark, wide: Target, fraction: float, plan: str
 ) -> None:
@@ -455,7 +435,8 @@ def test_update_subset_row_fraction(
     )
 
 
-@pytest.mark.parametrize(("fraction", "plan"), PROJECTION_FRACTION_PLANS)
+@pytest.mark.parametrize("plan", PLANS)
+@pytest.mark.parametrize("fraction", [0.01, 1.0], ids=["1pct", "100pct"])
 @pytest.mark.parametrize("projection", list(PROJECTIONS), ids=list(PROJECTIONS))
 def test_update_subset_projection(
     benchmark, wide: Target, projection: str, fraction: float, plan: str
@@ -472,7 +453,8 @@ def test_update_subset_projection(
     )
 
 
-@pytest.mark.parametrize(("fraction", "plan"), PROJECTION_FRACTION_PLANS)
+@pytest.mark.parametrize("plan", PLANS)
+@pytest.mark.parametrize("fraction", [0.01, 1.0], ids=["1pct", "100pct"])
 def test_upsert_wide_full_schema(
     benchmark, wide: Target, fraction: float, plan: str
 ) -> None:
@@ -747,7 +729,8 @@ def test_io_mem_upsert_ratio(
 
 
 @pytest.mark.io_memory_benchmark()
-@pytest.mark.parametrize(("fraction", "plan"), ROW_FRACTION_PLANS)
+@pytest.mark.parametrize("plan", PLANS)
+@pytest.mark.parametrize("fraction", ROW_FRACTIONS, ids=FRACTION_IDS)
 def test_io_mem_update_subset_row_fraction(
     io_mem_benchmark, wide: Target, fraction: float, plan: str
 ) -> None:
