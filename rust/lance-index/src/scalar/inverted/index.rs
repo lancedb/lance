@@ -90,7 +90,9 @@ use crate::scalar::{
     OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery,
     UpdateCriteria,
 };
-use crate::{FtsPrewarmOptions, Index};
+use crate::{
+    FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmPartitionStatus, FtsPrewarmResult, Index,
+};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
@@ -2136,29 +2138,44 @@ fn prewarm_chunk_ranges(
 
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
+        self.prewarm_with_options_result(options).await.map(|_| ())
+    }
+
+    pub async fn prewarm_with_options_result(
+        &self,
+        options: &FtsPrewarmOptions,
+    ) -> Result<FtsPrewarmResult> {
         let mut state = self.prewarm_state.lock().await;
         if state.satisfies(options.with_position)
             && (self.is_legacy() || self.document_projections_resident_now())
         {
-            return Ok(());
+            return Ok(FtsPrewarmResult::fully_resident());
         }
         let with_position = options.with_position || state.positions_ready;
         state.query_ready = false;
         state.positions_ready = false;
         self.document_projections_resident
             .store(false, Ordering::Release);
-        self.prewarm_query_state(with_position).await?;
-        state.query_ready = true;
-        state.positions_ready = with_position;
-        Ok(())
+        let result = self
+            .prewarm_query_state(with_position, options.mode.is_best_effort())
+            .await?;
+        if result.fully_resident {
+            state.query_ready = true;
+            state.positions_ready = with_position;
+        }
+        Ok(result)
     }
 
-    async fn prewarm_query_state(&self, with_position: bool) -> Result<()> {
+    async fn prewarm_query_state(
+        &self,
+        with_position: bool,
+        best_effort: bool,
+    ) -> Result<FtsPrewarmResult> {
         let chunk_concurrency = self.store.io_parallelism().max(1);
         let prewarm_started = Instant::now();
         info!(
             partition_count = self.partitions.len(),
-            with_position, chunk_concurrency, "fts index prewarm started"
+            with_position, best_effort, chunk_concurrency, "fts index prewarm started"
         );
         for part in &self.partitions {
             let partition_started = Instant::now();
@@ -2206,25 +2223,50 @@ impl InvertedIndex {
             );
         }
         self.aggregate_corpus_stats().await?;
-        let query_ready = self.partitions.iter().all(|partition| {
-            partition.docs.query_ready()
-                && partition.inverted_list.modern_posting_validation_ready()
-        });
-        if !query_ready {
-            return Err(Error::internal(
-                "FTS prewarm completed without publishing a query-ready document and posting state"
-                    .to_owned(),
-            ));
+        let diagnostics = self.prewarm_diagnostics();
+        if !diagnostics.fully_resident() {
+            if best_effort {
+                warn!(
+                    partition_count = diagnostics.partition_count,
+                    failing_partition_count = diagnostics.failing_partitions.len(),
+                    diagnostics = %diagnostics,
+                    elapsed_ms = prewarm_started.elapsed().as_millis() as u64,
+                    "fts index prewarm finished with partial residency"
+                );
+                return Ok(FtsPrewarmResult::partial(diagnostics));
+            }
+            return Err(Error::internal(diagnostics.to_string()));
         }
         self.document_projections_resident
             .store(true, Ordering::Release);
         info!(
             partition_count = self.partitions.len(),
-            query_ready,
+            query_ready = true,
             elapsed_ms = prewarm_started.elapsed().as_millis() as u64,
             "fts index prewarm finished"
         );
-        Ok(())
+        Ok(FtsPrewarmResult::fully_resident())
+    }
+
+    fn prewarm_diagnostics(&self) -> FtsPrewarmDiagnostics {
+        let failing_partitions = self
+            .partitions
+            .iter()
+            .filter_map(|partition| {
+                let status = FtsPrewarmPartitionStatus {
+                    partition_id: partition.id(),
+                    documents: partition.docs.prewarm_status(),
+                    posting_validation_ready: partition
+                        .inverted_list
+                        .modern_posting_validation_ready(),
+                };
+                (!status.query_ready()).then_some(status)
+            })
+            .collect();
+        FtsPrewarmDiagnostics {
+            partition_count: self.partitions.len(),
+            failing_partitions,
+        }
     }
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
@@ -11810,6 +11852,103 @@ mod tests {
         prewarmed_row_ids.sort_unstable();
         assert_eq!(prewarmed_row_ids, expected);
         assert_eq!(prewarmed_scores, cold_scores);
+    }
+
+    #[tokio::test]
+    async fn test_strict_modern_prewarm_fails_when_index_cache_cannot_hold_all_partitions() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let params = InvertedIndexParams::default().format_version(InvertedListFormatVersion::V2);
+        let format_version = params.resolved_format_version();
+        let partition_count = 6_u64;
+        let docs_per_partition = 512_u32;
+
+        for partition_id in 0..partition_count {
+            let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+                partition_id,
+                false,
+                TokenSetFormat::default(),
+                format_version,
+                params.posting_block_size(),
+            );
+            builder.tokens.add(format!("token_{partition_id}"));
+            let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                false,
+                format_version.posting_tail_codec(),
+                params.posting_block_size(),
+            );
+            for doc_id in 0..docs_per_partition {
+                posting.add(doc_id, PositionRecorder::Count(1));
+                builder
+                    .docs
+                    .append(partition_id * 1_000_000 + doc_id as u64, 1);
+            }
+            builder.posting_lists.push(posting);
+            builder.write(store.as_ref()).await.unwrap();
+        }
+        write_test_metadata(&store, (0..partition_count).collect(), params).await;
+
+        let cache = Arc::new(LanceCache::with_backend(Arc::new(
+            QuickCacheBackend::with_capacity(8 * 1024),
+        )));
+        let index = InvertedIndex::load(store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let err = index
+            .prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
+            .unwrap_err();
+        let err = err.to_string();
+        assert!(
+            err.contains(
+                "FTS prewarm completed without publishing a query-ready document and posting state"
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(
+            index
+                .partitions
+                .iter()
+                .any(|partition| !partition.docs.query_ready()),
+            "strict prewarm should fail because at least one partition lost query-ready state"
+        );
+        assert!(
+            index
+                .partitions
+                .iter()
+                .all(|partition| partition.inverted_list.modern_posting_validation_ready()),
+            "posting validation should complete; the strict failure should be the final residency postcondition"
+        );
+        assert!(
+            index.partitions.iter().any(|partition| {
+                let docs = partition.docs.modern().unwrap();
+                !docs.projection_resident()
+            }),
+            "at least one modern document projection should be non-resident"
+        );
+
+        let result = index
+            .prewarm_with_options_result(&FtsPrewarmOptions::default().best_effort())
+            .await
+            .unwrap();
+        assert!(!result.fully_resident);
+        let diagnostics = result
+            .diagnostics
+            .expect("best-effort partial prewarm should report diagnostics");
+        assert_eq!(diagnostics.partition_count, partition_count as usize);
+        assert!(!diagnostics.failing_partitions.is_empty());
+        assert!(
+            diagnostics
+                .failing_partitions
+                .iter()
+                .all(|partition| partition.posting_validation_ready),
+            "best-effort should not suppress posting validation failures"
+        );
     }
 
     #[tokio::test]
