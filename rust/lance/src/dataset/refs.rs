@@ -672,6 +672,7 @@ impl Branches<'_> {
     }
 
     /// True when a create, delete, or cleanup holds the branch-name path lease.
+    #[cfg(test)]
     pub(crate) async fn has_branch_path_lease(&self, branch: &str) -> Result<bool> {
         let root_location = self.refs.root()?;
         let path = branch_path_lease_path(&root_location.path, branch);
