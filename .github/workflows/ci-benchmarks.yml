@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# These benchmarks mutate shared GCS datasets, so runs must not overlap.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   bench_regress:
     timeout-minutes: 120

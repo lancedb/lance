@@ -26,7 +26,6 @@ use lance_core::utils::path::LancePathExt;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{
     BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
-    ReaderProjection,
 };
 use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_file::{LanceEncodingsIo, version::LanceFileVersion, versions as file_versions};
@@ -847,7 +846,7 @@ impl LanceFileReader {
         let mut base_projection = None;
         if let Some(columns) = columns {
             base_projection = Some(
-                ReaderProjection::from_column_names(
+                file_versions::reader_projection_from_column_names(
                     file_metadata.version(),
                     &file_metadata.file_schema,
                     &columns.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),

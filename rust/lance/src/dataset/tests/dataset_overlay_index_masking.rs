@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 
+use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
@@ -18,7 +19,8 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::scalar::inverted::InvertedIndexParams;
+use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
+use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use lance_table::format::DataFile;
@@ -186,6 +188,17 @@ fn ids_from_batches(batches: &[RecordBatch]) -> Vec<i32> {
 
 fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
     Arc::new(Int32Array::from_iter(values))
+}
+
+fn string_lists(rows: &[&[&str]]) -> ArrayRef {
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    for row in rows {
+        for value in *row {
+            builder.values().append_value(value);
+        }
+        builder.append(true);
+    }
+    Arc::new(builder.finish())
 }
 
 fn fsl(rows: Vec<Vec<f32>>, dim: i32) -> ArrayRef {
@@ -1013,10 +1026,8 @@ async fn test_fts_overlay_stale_drop_and_new_match() {
     );
 }
 
-/// A phrase query must not return a stale hit for an overlaid FTS-indexed row. Phrase queries
-/// have no flat re-evaluation path, so the fragment is excluded from the indexed phrase search
-/// (like an unindexed fragment) rather than re-scored — the point of this test is that the
-/// pre-overlay phrase hit is dropped, not that the new value is found.
+/// A phrase query must drop stale indexed positions and re-evaluate the current
+/// overlay value on the flat phrase path.
 #[tokio::test]
 async fn test_fts_phrase_overlay_stale_drop() {
     let mut dataset = create_text_dataset().await;
@@ -1043,6 +1054,96 @@ async fn test_fts_phrase_overlay_stale_drop() {
     assert_eq!(
         fts_phrase_ids_matching(&dataset, "apple banana").await,
         Vec::<i32>::new()
+    );
+    assert_eq!(
+        fts_phrase_ids_matching(&dataset, "cherry mango").await,
+        vec![1]
+    );
+}
+
+/// Overlay routing must select FTS segments by both field and document
+/// granularity when Row and ListElement indexes coexist.
+#[tokio::test]
+async fn test_list_element_fts_overlay_uses_exact_index_and_flat_fallback() {
+    let ids = Arc::new(Int32Array::from_iter_values(0..4)) as ArrayRef;
+    let tags = string_lists(&[
+        &["old phrase", "keep"],
+        &["other"],
+        &["new phrase"],
+        &["unrelated"],
+    ]);
+    let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .with_position(true)
+                .document_granularity(DocumentGranularity::ListElement),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let dataset = commit_overlay(
+        dataset,
+        "list_element_text_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+        vec![string_lists(&[&["new phrase", "keep"]])],
+    )
+    .await;
+
+    let list_element_match = |terms: &str| {
+        FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new(terms.to_owned())
+                .with_column(Some("tags".to_owned()))
+                .with_document_granularity(DocumentGranularity::ListElement),
+        ))
+    };
+    let list_element_phrase = |terms: &str| {
+        FullTextSearchQuery::new_query(FtsQuery::Phrase(
+            PhraseQuery::new(terms.to_owned())
+                .with_column(Some("tags".to_owned()))
+                .with_document_granularity(DocumentGranularity::ListElement),
+        ))
+    };
+
+    assert_eq!(
+        fts_ids(&dataset, list_element_match("old")).await,
+        Vec::<i32>::new()
+    );
+    assert_eq!(
+        fts_ids(&dataset, list_element_match("new")).await,
+        vec![0, 2]
+    );
+    assert_eq!(
+        fts_ids(&dataset, list_element_phrase("new phrase")).await,
+        vec![0, 2]
     );
 }
 

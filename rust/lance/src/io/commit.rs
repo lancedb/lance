@@ -20,9 +20,10 @@
 //! alternative to [`CommitHandler`].
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::num::NonZero;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
@@ -58,7 +59,7 @@ use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
 use futures::future::Either;
-use futures::{StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
@@ -75,6 +76,35 @@ mod external_manifest;
 pub mod namespace_manifest;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod s3_test;
+
+/// Wall-clock budget for conflict retry backoff when callers do not override it.
+pub(crate) const DEFAULT_COMMIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
+    Error::too_much_write_contention(format!(
+        "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
+        attempts,
+        retry_timeout.as_secs_f32()
+    ))
+}
+
+pub(crate) fn maybe_timeout<T>(
+    attempt: u32,
+    start: Instant,
+    retry_timeout: Duration,
+    future: impl Future<Output = T>,
+) -> impl Future<Output = Result<T>> {
+    if attempt == 0 {
+        // The first attempt establishes the observed latency used by SlotBackoff.
+        Either::Left(future.map(Ok))
+    } else {
+        let remaining = retry_timeout.saturating_sub(start.elapsed());
+        Either::Right(
+            tokio::time::timeout(remaining, future)
+                .map_err(move |_| timeout_error(retry_timeout, attempt + 1)),
+        )
+    }
+}
 
 /// Read the transaction data from a transaction file.
 pub(crate) async fn read_transaction_file(
@@ -1049,6 +1079,7 @@ pub(crate) async fn do_commit_detached_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
+    retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
@@ -1068,6 +1099,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
+    let start = Instant::now();
     while backoff.attempt() < commit_config.num_retries {
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
@@ -1155,10 +1187,20 @@ pub(crate) async fn do_commit_detached_transaction(
                         ));
                     }
                 }
+                if start.elapsed() > retry_timeout {
+                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
+                }
+                let sleep_fut = tokio::time::sleep(backoff.next_backoff());
+                if let Err(error) =
+                    maybe_timeout(backoff.attempt(), start, retry_timeout, sleep_fut).await
+                {
+                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    return Err(error);
+                }
                 // The inline copy was moved into the failed attempt; rebuild
                 // it for the retry with a new random version.
                 inline_tx = inline_transaction.then(|| pb::Transaction::from(transaction).into());
-                tokio::time::sleep(backoff.next_backoff()).await;
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(
@@ -1213,6 +1255,7 @@ pub(crate) async fn commit_detached_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
+    retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_detached_transaction(
         dataset,
@@ -1221,6 +1264,7 @@ pub(crate) async fn commit_detached_transaction(
         transaction,
         write_config,
         commit_config,
+        retry_timeout,
     )
     .await
 }
@@ -1298,6 +1342,7 @@ pub(crate) async fn commit_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
+    retry_timeout: Duration,
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
@@ -1515,7 +1560,11 @@ pub(crate) async fn commit_transaction(
                         &current_transaction_file,
                     )
                     .await;
-                    tokio::time::sleep(backoff.next_backoff()).await;
+                    if start.elapsed() > retry_timeout {
+                        return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
+                    }
+                    let sleep_fut = tokio::time::sleep(backoff.next_backoff());
+                    maybe_timeout(backoff.attempt(), start, retry_timeout, sleep_fut).await?;
                     continue;
                 } else {
                     break;
@@ -2473,6 +2522,7 @@ mod tests {
             &transaction,
             &write_config,
             &CommitConfig::default(),
+            DEFAULT_COMMIT_RETRY_TIMEOUT,
             dataset.manifest_location.naming_scheme,
             None,
         )

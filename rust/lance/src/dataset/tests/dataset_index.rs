@@ -43,7 +43,7 @@ use lance_index::metrics::{
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
-    InvertedListFormatVersion, SCORE_COL,
+    DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
@@ -903,10 +903,11 @@ async fn create_fragmented_fts_index_with_order(
         .await
         .unwrap();
 
-    let segments = crate::index::scalar::inverted::load_segments(dataset, column)
-        .await
-        .unwrap()
-        .unwrap();
+    let segments =
+        crate::index::scalar::inverted::load_segments(dataset, column, DocumentGranularity::Row)
+            .await
+            .unwrap()
+            .unwrap();
     assert_eq!(segments.len(), fragment_ids.len());
 }
 
@@ -4292,7 +4293,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Verify that the index file uses the same version as the dataset
     assert_eq!(
         index_reader.metadata().version(),
-        dataset_version,
+        dataset_version.into(),
         "Index file should use the same format version as the dataset"
     );
 
@@ -4321,7 +4322,7 @@ async fn test_index_inherits_dataset_file_version() {
 
         assert_eq!(
             aux_reader.metadata().version(),
-            dataset_version,
+            dataset_version.into(),
             "Auxiliary index file should use the same format version as the dataset"
         );
     }
@@ -4400,7 +4401,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Verify that the index file uses V2_0 (not legacy)
     assert_eq!(
         index_reader.metadata().version(),
-        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_0.into(),
         "Index files should never use legacy format, even for legacy datasets"
     );
 }
@@ -4476,7 +4477,7 @@ async fn test_manifest_read_recovers_from_stale_size() {
 async fn test_load_segment_params_full_fidelity() {
     use crate::index::DatasetIndexInternalExt;
     use lance_index::metrics::NoOpMetricsCollector;
-    use lance_index::scalar::inverted::InvertedIndex;
+    use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndex};
 
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
@@ -4498,7 +4499,7 @@ async fn test_load_segment_params_full_fidelity() {
         .await
         .unwrap();
 
-    let segments = crate::index::scalar::load_segments(&dataset, "text")
+    let segments = crate::index::scalar::load_segments(&dataset, "text", DocumentGranularity::Row)
         .await
         .unwrap()
         .expect("FTS index segments");

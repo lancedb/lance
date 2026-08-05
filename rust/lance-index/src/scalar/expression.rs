@@ -843,6 +843,10 @@ pub struct TextQueryParser {
     index_type: String,
     needs_recheck: bool,
     supports_regex: bool,
+    /// The shortest `contains` pattern (in characters, not bytes) the index can
+    /// say anything useful about.  Shorter patterns bypass the index entirely so
+    /// they are answered by a full scan.  Use 0 for indices with no such limit.
+    min_contains_chars: usize,
 }
 
 impl TextQueryParser {
@@ -851,12 +855,14 @@ impl TextQueryParser {
         index_type: String,
         needs_recheck: bool,
         supports_regex: bool,
+        min_contains_chars: usize,
     ) -> Self {
         Self {
             index_name,
             index_type,
             needs_recheck,
             supports_regex,
+            min_contains_chars,
         }
     }
 }
@@ -913,7 +919,16 @@ impl ScalarQueryParser for TextQueryParser {
         };
 
         let query = match func.name() {
-            "contains" if args.len() == 2 => TextQuery::StringContains(pattern),
+            "contains" if args.len() == 2 => {
+                // A pattern shorter than the index's token width produces no
+                // tokens, so the index can only answer "recheck everything".
+                // Leave it to a full scan instead.  The count is in characters
+                // because tokenizers split on characters, not bytes.
+                if pattern.chars().count() < self.min_contains_chars {
+                    return None;
+                }
+                TextQuery::StringContains(pattern)
+            }
             "regexp_like" | "regexp_match" if self.supports_regex => {
                 let pattern = match args.get(2) {
                     Some(flags_expr) => apply_regex_flags(&pattern, flags_expr)?,
@@ -1996,27 +2011,30 @@ fn maybe_column(expr: &Expr) -> Option<&str> {
     }
 }
 
-// Extract the full nested column path from a get_field expression chain
-// For example: get_field(get_field(metadata, "status"), "code") -> "metadata.status.code"
+// Extract the full nested column path from chained or variadic get_field expressions.
+// For example, both get_field(get_field(metadata, "status"), "code") and
+// get_field(metadata, "status", "code") produce "metadata.status.code".
 fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     let mut current_expr = expr;
     let mut parts = Vec::new();
 
-    // Walk up the get_field chain
+    // Walk up the get_field chain. Add variadic arguments in reverse because all
+    // parts are reversed after reaching the base column.
     loop {
         match current_expr {
             Expr::ScalarFunction(udf) if udf.name() == "get_field" => {
-                if udf.args.len() != 2 {
+                if udf.args.len() < 2 {
                     return None;
                 }
-                // Extract the field name from the second argument
-                // The Literal now has two fields: ScalarValue and Option<FieldMetadata>
-                if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = &udf.args[1] {
-                    parts.push(field_name.clone());
-                } else {
-                    return None;
+
+                for field_expr in udf.args[1..].iter().rev() {
+                    if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = field_expr {
+                        parts.push(field_name.clone());
+                    } else {
+                        return None;
+                    }
                 }
-                // Move up to the parent expression
+
                 current_expr = &udf.args[0];
             }
             Expr::Column(col) => {
@@ -2604,7 +2622,7 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_array::Array;
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{Field, Fields, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
@@ -2836,6 +2854,51 @@ mod tests {
             true,
             schema,
         );
+    }
+
+    #[test]
+    fn test_nested_column_index() {
+        let column = "user_profile.basic.age";
+        let index_info = MockIndexInfoProvider::new(vec![(
+            column,
+            ColInfo::new(
+                DataType::Int32,
+                Box::new(SargableQueryParser::new(
+                    format!("{column}_idx"),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new(
+            "user_profile",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "basic",
+                DataType::Struct(Fields::from(vec![Field::new("age", DataType::Int32, true)])),
+                true,
+            )])),
+            true,
+        )]);
+
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner
+            .parse_filter("user_profile.basic.age > 900")
+            .unwrap();
+        let plan = planner
+            .create_filter_plan(filter, &index_info, true)
+            .unwrap();
+        let expected = IndexedExpression::index_query(
+            column.to_string(),
+            format!("{column}_idx"),
+            "BTree".to_string(),
+            Arc::new(SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(900))),
+                Bound::Unbounded,
+            )),
+        );
+
+        assert_eq!(plan.index_query, expected.scalar_query);
+        assert!(plan.refine_expr.is_none());
     }
 
     #[test]

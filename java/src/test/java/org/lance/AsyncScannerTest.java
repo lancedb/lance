@@ -32,6 +32,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
@@ -40,6 +43,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -47,6 +52,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -66,6 +72,29 @@ public class AsyncScannerTest {
     if (dataset != null) {
       dataset.close();
     }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void testNativeScanFailureUsesLanceException() throws Exception {
+    Constructor<AsyncScanner> constructor = AsyncScanner.class.getDeclaredConstructor();
+    constructor.setAccessible(true);
+    AsyncScanner scanner = constructor.newInstance();
+
+    Field pendingTasksField = AsyncScanner.class.getDeclaredField("pendingTasks");
+    pendingTasksField.setAccessible(true);
+    ConcurrentHashMap<Long, CompletableFuture<Long>> pendingTasks =
+        (ConcurrentHashMap<Long, CompletableFuture<Long>>) pendingTasksField.get(scanner);
+    CompletableFuture<Long> pendingTask = new CompletableFuture<>();
+    pendingTasks.put(1L, pendingTask);
+
+    Method failTask = AsyncScanner.class.getDeclaredMethod("failTask", long.class, String.class);
+    failTask.setAccessible(true);
+    failTask.invoke(scanner, 1L, "scan I/O failed");
+
+    CompletionException failure = assertThrows(CompletionException.class, pendingTask::join);
+    assertEquals(LanceException.class, failure.getCause().getClass());
+    assertEquals("scan I/O failed", failure.getCause().getMessage());
   }
 
   /**

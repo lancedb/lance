@@ -657,7 +657,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     fn read_projection(reader: &FileReader) -> Result<Option<ReaderProjection>> {
         S::read_columns()
             .map(|columns| {
-                ReaderProjection::from_column_names(
+                lance_file::versions::reader_projection_from_column_names(
                     reader.metadata().version(),
                     reader.schema(),
                     columns,
@@ -4929,7 +4929,7 @@ mod tests {
         // Projected first on purpose: it then pays any first-touch metadata
         // cost, so the comparison understates rather than flatters the saving.
         let projected_bytes = read_bytes_for(projection.clone()).await;
-        let full_bytes = read_bytes_for(lance_file::reader::ReaderProjection::from_whole_schema(
+        let full_bytes = read_bytes_for(lance_file::versions::reader_projection_from_whole_schema(
             hnsw.reader.schema(),
             hnsw.reader.metadata().version(),
         ))
@@ -4988,7 +4988,7 @@ mod tests {
                 continue;
             }
             let full = read_range(
-                lance_file::reader::ReaderProjection::from_whole_schema(
+                lance_file::versions::reader_projection_from_whole_schema(
                     hnsw.reader.schema(),
                     hnsw.reader.metadata().version(),
                 ),
@@ -5524,7 +5524,7 @@ mod tests {
 
         // Rewrite auxiliary file with PQ codebook inlined into schema metadata.
         let mut metadata = reader.schema().metadata.clone();
-        let projection = lance_file::reader::ReaderProjection::from_whole_schema(
+        let projection = lance_file::versions::reader_projection_from_whole_schema(
             reader.schema(),
             reader.metadata().version(),
         );
