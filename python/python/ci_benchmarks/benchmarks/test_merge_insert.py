@@ -60,10 +60,6 @@ SOURCE_SIZES = [1_000, 10_000, 100_000]
 
 NARROW_KEYS = ["id_int", "id_uuid7", "id_uuid4"]
 
-# Keep source buffers no larger than DataFusion's default output batch. Otherwise,
-# each sliced batch is charged for the full shared backing buffer by the hash join.
-_SOURCE_BATCH_SIZE = 8192
-
 # Budget 4 GiB total so the 1.32 GiB full-schema source and its hash table fit
 # while DataFusion still enforces a bound below the benchmark host's limit.
 _MEM_POOL_SIZE = 4 * 1024**3
@@ -200,34 +196,27 @@ def wide_row_indices(fraction: float) -> np.ndarray:
 
 def wide_source(row_indices: np.ndarray, columns: Sequence[str]) -> pa.Table:
     """A wide source carrying ``id_int`` plus ``columns``."""
-    names = ["id_int", *columns]
-    schema = pa.schema([WIDE_SCHEMA.field(name) for name in names])
-    batches = []
-    for start in range(0, len(row_indices), _SOURCE_BATCH_SIZE):
-        batch_indices = row_indices[start : start + _SOURCE_BATCH_SIZE]
-        arrays = [pa.array(batch_indices)]
-        for column in columns:
-            if column == "vec":
-                values = np.linspace(
-                    1.0,
-                    2.0,
-                    num=len(batch_indices) * WIDE_VECTOR_DIM,
-                    dtype=np.float32,
-                )
-                arrays.append(
-                    pa.FixedSizeListArray.from_arrays(pa.array(values), WIDE_VECTOR_DIM)
-                )
-            elif WIDE_SCHEMA.field(column).type == pa.string():
-                arrays.append(
-                    pa.array(
-                        [f"updated_{column}_{v}" for v in batch_indices],
-                        pa.string(),
-                    )
-                )
-            else:
-                arrays.append(pa.array(batch_indices + 1))
-        batches.append(pa.record_batch(arrays, schema=schema))
-    return pa.Table.from_batches(batches, schema=schema)
+    arrays = [pa.array(row_indices)]
+    names = ["id_int"]
+    for column in columns:
+        names.append(column)
+        if column == "vec":
+            values = np.linspace(
+                1.0,
+                2.0,
+                num=len(row_indices) * WIDE_VECTOR_DIM,
+                dtype=np.float32,
+            )
+            arrays.append(
+                pa.FixedSizeListArray.from_arrays(pa.array(values), WIDE_VECTOR_DIM)
+            )
+        elif WIDE_SCHEMA.field(column).type == pa.string():
+            arrays.append(
+                pa.array([f"updated_{column}_{v}" for v in row_indices], pa.string())
+            )
+        else:
+            arrays.append(pa.array(row_indices + 1))
+    return pa.table(arrays, schema=pa.schema([WIDE_SCHEMA.field(n) for n in names]))
 
 
 # ---------------------------------------------------------------------------
