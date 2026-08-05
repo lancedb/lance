@@ -326,12 +326,12 @@ fn check_struct_validity(data: DataBlock, field_length: usize) -> Result<StructD
 
 #[derive(Debug)]
 pub struct PackedStructVariablePerValueEncoder {
-    strategy: DefaultCompressionStrategy,
+    strategy: Arc<dyn CompressionStrategy>,
     fields: Vec<Field>,
 }
 
 impl PackedStructVariablePerValueEncoder {
-    pub fn new(strategy: DefaultCompressionStrategy, fields: Vec<Field>) -> Self {
+    pub fn new(strategy: Arc<dyn CompressionStrategy>, fields: Vec<Field>) -> Self {
         Self { strategy, fields }
     }
 }
@@ -529,8 +529,8 @@ struct FixedFieldAccumulator {
 }
 
 impl FixedFieldAccumulator {
-    fn append_empty(&mut self) {
-        self.builder.append(&self.empty_value, 0..1);
+    fn append_empty(&mut self) -> Result<()> {
+        self.builder.append(&self.empty_value, 0..1)
     }
 
     fn new(bits_per_value: u64, num_values: u64) -> Result<Self> {
@@ -705,7 +705,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        fixed_accumulator.builder.append(&value_block, 0..1);
+                        fixed_accumulator.builder.append(&value_block, 0..1)?;
                         cursor = end;
                     }
                     (
@@ -984,11 +984,9 @@ impl FixedPerValueDecompressor for PackedStructFixedPerValueDecompressor {
 mod tests {
     use super::*;
     use crate::{
+        compression::CompressionStrategy,
         compression::DefaultDecompressionStrategy,
         compression_config::CompressionParams,
-        constants::PACKED_STRUCT_META_KEY,
-        compression::CompressionStrategy,
-        compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy},
         constants::{
             PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
         },
@@ -1468,9 +1466,9 @@ mod tests {
         let data_block = DataBlock::Struct(struct_block);
 
         let compression_strategy =
-            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
+            test_compression_strategy(TestEncoding::StructuralU32, CompressionParams::default());
         let compressor = CompressionStrategy::create_per_value(
-            &compression_strategy,
+            compression_strategy.as_ref(),
             &struct_field,
             &data_block,
         )?;
@@ -1533,7 +1531,7 @@ mod tests {
         ]));
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_u32_structural_encodings()
             .with_expected_encoding("packed_struct");
 
         check_round_trip_encoding_of_data(vec![array], &test_cases, meta).await;
@@ -1569,40 +1567,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn fixed_per_value_packed_struct_requires_v23() {
-        let arrow_fields: Fields = vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("value", DataType::Int64, false),
-        ]
-        .into();
-        let arrow_struct = ArrowField::new("item", DataType::Struct(arrow_fields), false);
-        let struct_field = Field::try_from(&arrow_struct).unwrap();
-
-        let id_block = fixed_i32_block_from_array(Int32Array::from(vec![1, 2, 3, 4]));
-        let value_block = fixed_block_from_array(Int64Array::from(vec![10, 20, 30, 40]));
-
-        let struct_block = StructDataBlock {
-            children: vec![
-                DataBlock::FixedWidth(id_block),
-                DataBlock::FixedWidth(value_block),
-            ],
-            block_info: BlockInfo::new(),
-            validity: None,
-        };
-
-        let data_block = DataBlock::Struct(struct_block);
-
-        let compression_strategy =
-            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
-        let compressor = CompressionStrategy::create_per_value(
-            &compression_strategy,
-            &struct_field,
-            &data_block,
-        );
-
-        assert!(matches!(compressor, Err(Error::NotSupported { .. })));
     }
 }

@@ -770,6 +770,27 @@ pub fn try_variable_packed_struct_per_value(
     ))))
 }
 
+/// Encode all packed structs with the exact strategy recursively.
+pub fn try_packed_struct_per_value(
+    strategy: Arc<dyn CompressionStrategy>,
+    field: &Field,
+    data: &DataBlock,
+) -> Result<Option<Box<dyn PerValueCompressor>>> {
+    let Some(has_variable_child) = validate_packed_struct(field, data)? else {
+        return Ok(None);
+    };
+    if has_variable_child {
+        return Ok(Some(Box::new(PackedStructVariablePerValueEncoder::new(
+            strategy,
+            field.children.clone(),
+        ))));
+    }
+
+    Ok(Some(Box::new(PackedStructFixedPerValueEncoder::new(
+        field.children.clone(),
+    ))))
+}
+
 /// Encode variable-width values directly, with FSST or per-value compression
 /// when applicable.
 pub fn try_variable_width_per_value(
@@ -881,122 +902,6 @@ pub fn try_raw_block(data: &DataBlock) -> Option<(Box<dyn BlockCompressor>, Comp
             ),
         )),
         _ => None,
-    }
-
-fn create_per_value(
-    field: &Field,
-    data: &DataBlock,
-) -> Result<Box<dyn PerValueCompressor>> {
-    let field_params = self.get_merged_field_params(field);
-
-        match data {
-            DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
-            DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
-            DataBlock::Struct(struct_block) => {
-                if field.children.len() != struct_block.children.len() {
-                    return Err(Error::invalid_input(
-                        "Struct field metadata does not match data block children",
-                    ));
-                }
-                let has_variable_child = struct_block.has_variable_width_child();
-                if has_variable_child {
-                    if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::not_supported_source("Variable packed struct encoding requires Lance file version 2.2 or later".into()));
-                    }
-                    Ok(Box::new(PackedStructVariablePerValueEncoder::new(
-                        self.clone(),
-                        field.children.clone(),
-                    )))
-                } else {
-                    if self.version < LanceFileVersion::V2_3 {
-                        return Err(Error::not_supported_source("Fixed-Width per-value packed struct encoding requires Lance file version 2.3 or later".into()));
-                    }
-                    Ok(Box::new(PackedStructFixedPerValueEncoder::new(
-                        field.children.clone(),
-                    )))
-                }
-            }
-            DataBlock::VariableWidth(variable_width) => {
-                let compression = field_params.compression.as_deref();
-                // Check for explicit "none" compression
-                if compression == Some("none") {
-                    return Ok(Box::new(VariableEncoder::default()));
-                }
-    match data {
-        DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
-        DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
-        DataBlock::Struct(struct_block) => {
-            if field.children.len() != struct_block.children.len() {
-                return Err(Error::invalid_input(
-                    "Struct field metadata does not match data block children",
-                ));
-            }
-            let has_variable_child = struct_block.has_variable_width_child();
-            if has_variable_child {
-                if self.version < LanceFileVersion::V2_2 {
-                    return Err(Error::not_supported_source("Variable packed struct encoding requires Lance file version 2.2 or later".into()));
-                }
-                Ok(Box::new(PackedStructVariablePerValueEncoder::new(
-                    self.clone(),
-                    field.children.clone(),
-                )))
-            } else {
-                Ok(Box::new(PackedStructFixedPerValueEncoder::new(
-                    field.children.clone(),
-                )))
-            }
-        }
-        DataBlock::VariableWidth(variable_width) => {
-            let compression = field_params.compression.as_deref();
-            // Check for explicit "none" compression
-            if compression == Some("none") {
-                return Ok(Box::new(VariableEncoder::default()));
-            }
-
-            let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
-            let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
-
-            // If values are very large then use block compression on a per-value basis
-            //
-            // TODO: Could maybe use median here
-
-            let per_value_requested =
-                compression.is_some_and(|compression| compression != "fsst");
-
-            if (max_len > 32 * 1024 || per_value_requested)
-                && data_size >= FSST_LEAST_INPUT_SIZE as u64
-            {
-                return Ok(Box::new(CompressedBufferEncoder::default()));
-            }
-
-            if variable_width.bits_per_offset == 32 || variable_width.bits_per_offset == 64 {
-                let variable_compression = Box::new(VariableEncoder::default());
-                let use_fsst = compression == Some("fsst")
-                    || (compression.is_none()
-                    && !matches!(
-                                field.data_type(),
-                                DataType::Binary | DataType::LargeBinary
-                            )
-                    && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
-                    && data_size >= FSST_LEAST_INPUT_SIZE as u64);
-
-                // Use FSST if explicitly requested or if data characteristics warrant it.
-                if use_fsst {
-                    Ok(Box::new(FsstPerValueEncoder::new(variable_compression)))
-                } else {
-                    Ok(variable_compression)
-                }
-            } else {
-                panic!(
-                    "Does not support MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.",
-                    variable_width.bits_per_offset
-                );
-            }
-        }
-        _ => unreachable!(
-            "Per-value compression not yet supported for block type: {}",
-            data.name()
-        ),
     }
 }
 
