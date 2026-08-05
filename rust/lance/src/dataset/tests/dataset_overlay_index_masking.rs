@@ -1434,3 +1434,401 @@ async fn bench_index_query_overlay_overhead() {
         println!("{num_vec_overlays:>12}  {ann_ms:>10.1}");
     }
 }
+
+async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("age", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(ids.clone())),
+            Arc::new(Int32Array::from_iter_values(ids.map(|v| v * 10))),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+// `OptimizeIndices` merges an index's delta segments without re-reading data overlays, so the
+// merged segment carries the old segments' pre-overlay entries. What keeps those entries masked
+// is that the merge stamps the new segment with the *oldest* merged segment's `dataset_version`
+// rather than the current one, leaving the mask's version gate
+// (`overlay.committed_version > segment.dataset_version`) on.
+//
+// That invariant is easy to break by accident -- stamping the current version un-masks every
+// carried-over entry -- and nothing else asserts it end to end. The following tests pin it down
+// for each index type.
+
+/// Scalar (BTree, Bitmap, ZoneMap): a range query over the indexed column after an overlay +
+/// optimize must still drop the stale value and surface the overlaid one.
+///
+/// ZoneMap is the case worth having: it ignores `OldIndexDataFilter`, so nothing scrubs the
+/// pre-overlay zone summaries out of the merged segment. Breaking the version gate shows up here
+/// as a false *negative* -- the stale zone prunes the overlaid value -- rather than the resurfaced
+/// stale entry the other two produce.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[case::zonemap(IndexType::ZoneMap)]
+#[tokio::test]
+async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: IndexType) {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::BuiltinIndexType;
+
+    let params = match index_type {
+        IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+        IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+        _ => ScalarIndexParams::default(),
+    };
+    let mut dataset = create_base_dataset().await;
+    dataset
+        .create_index(&["age"], index_type, None, &params, true)
+        .await
+        .unwrap();
+
+    // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_opt",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Masking works before optimize.
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    // Append an unindexed fragment so the merge does real work, then merge all deltas.
+    append_age_fragment(&mut dataset, 12..18).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: the stale age=10 entry stays dropped and the overlaid age=999 value stays
+    // visible, because the merged segment kept the old segment's `dataset_version`.
+    assert_eq!(
+        ids_matching(&dataset, "age = 10").await,
+        Vec::<i32>::new(),
+        "stale index entry age=10 for id=1 resurfaced after optimize"
+    );
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await,
+        vec![1],
+        "overlaid value age=999 dropped after optimize"
+    );
+    // A row untouched by the overlay is unaffected.
+    assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+}
+
+/// ZoneMap seed path: an *unindexed* fragment carrying an overlay gets folded into the merged
+/// segment from its data file's seed buffer. A seed is a zone summary captured while the base
+/// data file was written, so it describes pre-overlay values -- the merged segment ends up
+/// holding zones that never saw the overlay.
+///
+/// That is only safe because the merge keeps the old `dataset_version`, so the mask still covers
+/// those rows. Stamp the current version (or teach the seed path to claim freshness) and the
+/// overlaid value becomes unfindable, since its stale zone prunes it.
+///
+/// `name` is Utf8, for which seeds are on by default (`default_use_seeds`).
+#[tokio::test]
+async fn test_optimize_seed_path_respects_overlay() {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::BuiltinIndexType;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("name", DataType::Utf8, true),
+    ]));
+    let names: Vec<String> = (0..12).map(|i| format!("n{i:02}")).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..12)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 6,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["name"],
+            IndexType::ZoneMap,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Append fragment 2. The index already exists, so the write emits a zone-map seed buffer
+    // into the new data file.
+    let appended: Vec<String> = (12..18).map(|i| format!("n{i:02}")).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(12..18)),
+            Arc::new(StringArray::from(appended)),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Overlay fragment 2, offset 1 (id=13): "n13" -> "zzz", well outside the seed's zone range.
+    let mut dataset = commit_overlay(
+        dataset,
+        "name_seed",
+        2,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("zzz")]))],
+    )
+    .await;
+
+    // Fragment 2 is unindexed, so the overlaid value is visible via the flat path.
+    assert_eq!(ids_matching(&dataset, "name = 'zzz'").await, vec![13]);
+    assert_eq!(
+        ids_matching(&dataset, "name = 'n13'").await,
+        Vec::<i32>::new()
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ids_matching(&dataset, "name = 'zzz'").await,
+        vec![13],
+        "overlaid value dropped after optimize: the merged segment took pre-overlay zones \
+         from fragment 2's seed buffer"
+    );
+    assert_eq!(
+        ids_matching(&dataset, "name = 'n13'").await,
+        Vec::<i32>::new(),
+        "stale pre-overlay value resurfaced after optimize"
+    );
+    // Rows the overlay never touched keep working through the index.
+    assert_eq!(ids_matching(&dataset, "name = 'n14'").await, vec![14]);
+    assert_eq!(ids_matching(&dataset, "name = 'n03'").await, vec![3]);
+}
+
+/// `DatasetStatistics::column_value_range` folds ZoneMap summaries into a global `[min, max]`
+/// that callers may prune with, so it must be a superset of the live values. An overlay can
+/// move a value outside the summarised range, and the ZoneMap never saw it.
+#[tokio::test]
+async fn test_column_value_range_none_under_overlay() {
+    use crate::index::DatasetIndexExt;
+    use datafusion::scalar::ScalarValue;
+    use lance_index::scalar::BuiltinIndexType;
+
+    let mut dataset = create_base_dataset().await;
+    dataset
+        .create_index(
+            &["age"],
+            IndexType::ZoneMap,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        dataset
+            .statistics()
+            .column_value_range("age")
+            .await
+            .unwrap(),
+        Some((ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(110))))
+    );
+
+    // age 10 -> 999 on fragment 0, committed after the index: 999 is outside [0, 110].
+    let dataset = commit_overlay(
+        dataset,
+        "age_range",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    assert_eq!(
+        dataset
+            .statistics()
+            .column_value_range("age")
+            .await
+            .unwrap(),
+        None,
+        "ZoneMap range must not be reported once an overlay may have moved a value outside it"
+    );
+}
+
+/// FTS: after an overlay replaces a row's text and the index is optimized, searching for the old
+/// terms must not return the stale row, and the new terms must find it.
+#[tokio::test]
+async fn test_optimize_preserves_fts_overlay_masking() {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = create_text_dataset().await;
+    build_text_fts_index(&mut dataset).await;
+
+    // fragment 0, offset 1 (id=1): "apple banana" -> "cherry mango".
+    let mut dataset = commit_overlay(
+        dataset,
+        "text_opt",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    // Masking works before optimize: id=1 no longer matches "banana"/"apple".
+    assert_eq!(fts_ids_matching(&dataset, "banana").await, vec![3]);
+    assert_eq!(fts_ids_matching(&dataset, "apple").await, vec![0]);
+
+    // Append an unindexed fragment of new text, then merge all deltas.
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(12..18)),
+            Arc::new(StringArray::from(vec![
+                "kiwi", "melon", "date", "guava", "papaya", "lychee",
+            ])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: id=1's stale "apple"/"banana" postings stay dropped.
+    assert_eq!(
+        fts_ids_matching(&dataset, "banana").await,
+        vec![3],
+        "stale FTS posting for id=1 (banana) resurfaced after optimize"
+    );
+    assert_eq!(
+        fts_ids_matching(&dataset, "apple").await,
+        vec![0],
+        "stale FTS posting for id=1 (apple) resurfaced after optimize"
+    );
+    // The overlaid terms are found via the flat path.
+    assert!(fts_ids_matching(&dataset, "cherry").await.contains(&1));
+    assert!(fts_ids_matching(&dataset, "mango").await.contains(&1));
+}
+
+/// Vector (IVF): after an overlay moves a row's vector and the index is optimized, the ANN must
+/// not resurface the stale vector, and the moved-onto-query row is found by flat re-scoring.
+#[tokio::test]
+async fn test_optimize_preserves_vector_overlay_masking() {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+
+    // Overlay on fragment 1 moves id=35 away from the query and id=40 onto it.
+    let mut dataset = create_vector_overlay_dataset(false).await;
+
+    // Masking works before optimize.
+    let before = vector_query_ids(&dataset, 3, false).await;
+    assert!(
+        !before.contains(&35),
+        "pre-optimize id=35 should be dropped: {before:?}"
+    );
+    assert!(
+        before.contains(&40),
+        "pre-optimize id=40 should be found: {before:?}"
+    );
+
+    // Append an unindexed fragment of far vectors, then merge all deltas.
+    let far_vecs: Vec<Vec<f32>> = (0..32)
+        .map(|i| {
+            let mut v = vec![0.0_f32; VEC_DIM as usize];
+            v[1] = (i + 200) as f32;
+            v
+        })
+        .collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                VEC_DIM,
+            ),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(64..96)),
+            fsl(far_vecs, VEC_DIM),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: id=35's stale vector stays dropped and id=40 is still found via re-scoring.
+    let after = vector_query_ids(&dataset, 3, false).await;
+    assert!(
+        !after.contains(&35),
+        "stale index vector for id=35 resurfaced after optimize: {after:?}"
+    );
+    assert!(
+        after.contains(&40),
+        "overlaid vector for id=40 dropped after optimize: {after:?}"
+    );
+}
