@@ -222,22 +222,6 @@ pub async fn open_writer(
     }
 }
 
-pub async fn open_data_writer(
-    version: ConcreteFileVersion,
-    object_store: &ObjectStore,
-    schema: &Schema,
-    base_dir: &Path,
-) -> Result<Box<dyn write::GenericWriter>> {
-    open_writer(
-        version,
-        object_store,
-        schema,
-        base_dir,
-        WriterOptions::data_file(),
-    )
-    .await
-}
-
 pub async fn open_update_writer(
     version: ConcreteFileVersion,
     dataset: &Dataset,

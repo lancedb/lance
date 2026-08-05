@@ -691,7 +691,7 @@ mod tests {
         assert!(!fragment.files.is_empty());
         fragment.files.iter().for_each(|f| {
             let (major_version, minor_version) =
-                ConcreteFileVersion::from(file_version.resolve()).to_data_file_numbers();
+                ConcreteFileVersion::from(file_version).to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
@@ -724,7 +724,7 @@ mod tests {
         assert!(!fragment.is_empty());
         fragment[0].files.iter().for_each(|f| {
             let (major_version, minor_version) =
-                ConcreteFileVersion::from(file_version.resolve()).to_data_file_numbers();
+                ConcreteFileVersion::from(file_version).to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })

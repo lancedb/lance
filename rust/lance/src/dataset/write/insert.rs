@@ -418,7 +418,7 @@ impl<'a> InsertBuilder<'a> {
                 // the existing version if they don't
                 params
                     .data_storage_version
-                    .map(|version| ConcreteFileVersion::from(version.resolve()))
+                    .map(ConcreteFileVersion::from)
                     .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
             }
             (_, WriteDestination::Dataset(dataset)) => {

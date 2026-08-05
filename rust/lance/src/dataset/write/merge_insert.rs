@@ -1260,11 +1260,15 @@ impl MergeInsertJob {
                         .manifest()
                         .data_storage_format
                         .lance_file_version()?;
-                    let mut writer = crate::dataset::versions::open_data_writer(
+                    let mut writer = crate::dataset::versions::open_writer(
                         data_storage_version.into(),
                         &dataset.object_store,
                         &write_schema,
                         &dataset.base,
+                        super::WriterOptions {
+                            add_data_dir: true,
+                            ..Default::default()
+                        },
                     )
                     .await?;
 
