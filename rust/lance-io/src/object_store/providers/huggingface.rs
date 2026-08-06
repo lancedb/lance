@@ -14,7 +14,7 @@ use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::parse_hf_repo_id;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions, read_dir::opendal::OpendalDirLister,
 };
 use lance_core::error::{Error, Result};
 
@@ -138,7 +138,7 @@ fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<Stri
     Ok(config_map)
 }
 
-fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
+fn build_hf_operator(config_map: HashMap<String, String>) -> Result<Operator> {
     let repo_type = config_map
         .get("repo_type")
         .ok_or_else(|| Error::invalid_input("Huggingface repo_type is required"))?;
@@ -164,7 +164,7 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
         Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
     })?;
 
-    Ok(OpendalStore::new(operator))
+    Ok(operator)
 }
 
 #[async_trait::async_trait]
@@ -188,20 +188,28 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         }
 
         let accessor = params.get_accessor();
-        let inner: Arc<dyn OSObjectStore> =
+        let (inner, paginated_lister): (Arc<dyn OSObjectStore>, _) =
             if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
-                Arc::new(
+                let store = Arc::new(
                     DynamicOpenDalStore::new(
                         format!("hf:{}", base_path),
                         base_options,
                         accessor,
                         normalize_hf_config,
-                        build_hf_store,
+                        build_hf_operator,
                     )
                     .with_protected_keys(["repo_type", "repo_id"]),
+                );
+                (
+                    store.clone(),
+                    Some(OpendalDirLister::for_dynamic_store(store)),
                 )
             } else {
-                Arc::new(build_hf_store(normalize_hf_config(&base_options)?)?)
+                let operator = build_hf_operator(normalize_hf_config(&base_options)?)?;
+                (
+                    Arc::new(OpendalStore::new(operator.clone())),
+                    OpendalDirLister::for_operator(operator),
+                )
             };
 
         Ok(ObjectStore {
@@ -216,6 +224,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            paginated_lister,
         })
     }
 
@@ -427,7 +436,7 @@ mod tests {
             ),
             accessor,
             normalize_hf_config,
-            build_hf_store,
+            build_hf_operator,
         );
 
         let current_store = store

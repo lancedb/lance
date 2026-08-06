@@ -43,6 +43,8 @@ use rand::Rng;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use super::read_dir::{DirCursor, DirPage, PaginatedDirLister};
+
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
 ///
@@ -63,24 +65,37 @@ use tracing::{debug, warn};
 pub fn is_throttle_error(err: &object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
     if let object_store::Error::Generic { source, .. } = err {
-        let message = source.to_string();
-        let lowercase = message.to_ascii_lowercase();
-        lowercase.contains("retries, max_retries")
-            || lowercase.contains("serverbusy")
-            || lowercase.contains("server busy")
-            || lowercase.contains("egress is over the account limit")
-            || lowercase.contains("http 429")
-            || lowercase.contains("status code: 429")
-            || lowercase.contains("429 too many requests")
-            || lowercase.contains("too many requests")
-            || lowercase.contains("slowdown")
-            || lowercase.contains("please reduce your request rate")
-            || lowercase.contains("rate limit")
-            || lowercase.contains("throttling")
-            || lowercase.contains("throttled")
+        message_is_throttle(&source.to_string())
     } else {
         false
     }
+}
+
+/// Whether a Lance error came back from a throttled request.
+///
+/// Lance renders the error it wrapped, so the same heuristic applies whether the request
+/// went through `object_store` or through OpenDAL.
+fn is_throttle_error_lance(err: &lance_core::Error) -> bool {
+    message_is_throttle(&err.to_string())
+}
+
+fn message_is_throttle(message: &str) -> bool {
+    let lowercase = message.to_ascii_lowercase();
+    lowercase.contains("retries, max_retries")
+        || lowercase.contains("serverbusy")
+        || lowercase.contains("server busy")
+        || lowercase.contains("egress is over the account limit")
+        || lowercase.contains("http 429")
+        || lowercase.contains("status code: 429")
+        || lowercase.contains("429 too many requests")
+        || lowercase.contains("too many requests")
+        || lowercase.contains("slowdown")
+        || lowercase.contains("please reduce your request rate")
+        || lowercase.contains("rate limit")
+        // OpenDAL renders `ErrorKind::RateLimited` without a separator.
+        || lowercase.contains("ratelimited")
+        || lowercase.contains("throttling")
+        || lowercase.contains("throttled")
 }
 
 /// Configuration for the AIMD-throttled ObjectStore wrapper.
@@ -433,12 +448,27 @@ impl OperationThrottle {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = OSResult<T>>,
     {
+        self.throttled_with(is_throttle_error, f).await
+    }
+
+    /// [`Self::throttled`] for operations that report a different error type, such as the
+    /// paginated listing API.
+    async fn throttled_with<T, E, F, Fut>(
+        &self,
+        is_throttled: fn(&E) -> bool,
+        f: F,
+    ) -> std::result::Result<T, E>
+    where
+        E: Display,
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    {
         for attempt in 0..=self.max_retries {
             self.acquire_token().await;
             let result = f().await;
             let outcome = match &result {
                 Ok(_) => RequestOutcome::Success,
-                Err(err) if is_throttle_error(err) => {
+                Err(err) if is_throttled(err) => {
                     debug!(
                         target: TRACE_OBJECT_STORE_THROTTLE,
                         error = %err,
@@ -464,7 +494,7 @@ impl OperationThrottle {
             self.update_bucket_rate(new_rate).await;
 
             match &result {
-                Err(err) if is_throttle_error(err) && attempt < self.max_retries => {
+                Err(err) if is_throttled(err) && attempt < self.max_retries => {
                     let backoff_ms =
                         rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
                     debug!(
@@ -646,6 +676,67 @@ impl AimdThrottledStore {
             )?),
         })
     }
+
+    /// Put a paginated lister on the same list budget as this store.
+    pub fn wrap_paginated(
+        &self,
+        inner: Arc<dyn PaginatedDirLister>,
+    ) -> Arc<dyn PaginatedDirLister> {
+        Arc::new(ThrottledDirLister {
+            inner,
+            throttle: self.list.clone(),
+        })
+    }
+}
+
+/// A store paired with the paginated lister that shares its rate limits.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+type StoreWithLister = (Arc<dyn ObjectStore>, Option<Arc<dyn PaginatedDirLister>>);
+
+/// Apply AIMD throttling to a store and to the lister that shares its list budget.
+///
+/// [`crate::object_store::ObjectStore::read_dir_page`] goes to the lister rather than
+/// through the store, so both have to be wrapped for list requests to be counted once
+/// against one rate.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) fn with_throttling(
+    config: AimdThrottleConfig,
+    store: Arc<dyn ObjectStore>,
+    lister: Option<Arc<dyn PaginatedDirLister>>,
+) -> lance_core::Result<StoreWithLister> {
+    if config.is_disabled() {
+        return Ok((store, lister));
+    }
+    let store = Arc::new(AimdThrottledStore::new(store, config)?);
+    let lister = lister.map(|lister| store.wrap_paginated(lister));
+    Ok((store, lister))
+}
+
+/// A [`PaginatedDirLister`] whose requests draw on a store's list token bucket.
+#[derive(Debug)]
+struct ThrottledDirLister {
+    inner: Arc<dyn PaginatedDirLister>,
+    throttle: Arc<OperationThrottle>,
+}
+
+// Throttling only adds waiting, so every semantic of the lister it wraps has to reach the
+// listing unchanged; the lint keeps a method added to the trait from silently falling back to
+// its default here.
+#[async_trait]
+#[deny(clippy::missing_trait_methods)]
+impl PaginatedDirLister for ThrottledDirLister {
+    async fn list_page(
+        &self,
+        prefix: Option<&str>,
+        resume: Option<&DirCursor>,
+        limit: Option<usize>,
+    ) -> lance_core::Result<DirPage> {
+        self.throttle
+            .throttled_with(is_throttle_error_lance, || {
+                self.inner.list_page(prefix, resume, limit)
+            })
+            .await
+    }
 }
 
 #[async_trait]
@@ -809,6 +900,112 @@ mod tests {
             source: "not found".into(),
         };
         assert!(!is_throttle_error(&err));
+    }
+
+    /// A listing error reaches the throttle as a Lance error that has rendered whatever it
+    /// wrapped, so the classification has to survive the conversion.
+    #[test]
+    fn test_wrapped_throttle_errors_are_recognized() {
+        let wrapped = lance_core::Error::from(make_generic_error(THROTTLE_ERROR_RESPONSE));
+        assert!(is_throttle_error_lance(&wrapped));
+        assert!(!is_throttle_error_lance(&lance_core::Error::from(
+            make_generic_error("Access denied")
+        )));
+        // OpenDAL errors arrive as text rather than as an `object_store::Error`.
+        assert!(is_throttle_error_lance(&lance_core::Error::io(
+            "failed to list 'db/': RateLimited (temporary) at list"
+        )));
+    }
+
+    use super::super::read_dir::{DirEntry, DirEntryKind};
+
+    /// One page of a fixed directory, counting the requests that reached it.
+    #[derive(Debug, Default)]
+    struct CountingDirLister {
+        calls: AtomicUsize,
+        fail_with: Option<String>,
+    }
+
+    #[async_trait]
+    impl PaginatedDirLister for CountingDirLister {
+        async fn list_page(
+            &self,
+            _prefix: Option<&str>,
+            _resume: Option<&DirCursor>,
+            _limit: Option<usize>,
+        ) -> lance_core::Result<DirPage> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.fail_with {
+                Some(message) => Err(lance_core::Error::io(message.clone())),
+                None => Ok(DirPage {
+                    entries: vec![DirEntry {
+                        name: "child".to_string(),
+                        kind: DirEntryKind::Directory,
+                    }],
+                    next: None,
+                }),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_paginated_lister_acquires_a_token_before_listing() {
+        let lister = Arc::new(CountingDirLister::default());
+        let throttled = AimdThrottledStore::new(
+            Arc::new(InMemory::new()) as Arc<dyn ObjectStore>,
+            list_start_throttle_config(),
+        )
+        .unwrap();
+        let throttled_lister = throttled.wrap_paginated(lister.clone());
+
+        let mut page = Box::pin(throttled_lister.list_page(Some("prefix/"), None, Some(10)));
+        // With rate=10 tokens/s and burst_capacity=0, the token acquisition sleeps for
+        // 100 ms. A 50 ms timeout must expire before that.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut page)
+                .await
+                .is_err()
+        );
+        assert_eq!(lister.calls.load(Ordering::SeqCst), 0);
+
+        let page = tokio::time::timeout(std::time::Duration::from_millis(300), page)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(lister.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paginated_lister_throttle_errors_decrease_rate() {
+        let lister = Arc::new(CountingDirLister {
+            calls: AtomicUsize::new(0),
+            fail_with: Some(THROTTLE_ERROR_RESPONSE.to_string()),
+        });
+        let mut config = AimdThrottleConfig::default().with_list_aimd(
+            AimdConfig::default()
+                .with_initial_rate(100.0)
+                .with_decrease_factor(0.5)
+                .with_window_duration(std::time::Duration::from_millis(1)),
+        );
+        config.max_retries = 1;
+        config.min_backoff_ms = 0;
+        config.max_backoff_ms = 0;
+        let throttled =
+            AimdThrottledStore::new(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, config)
+                .unwrap();
+        let throttled_lister = throttled.wrap_paginated(lister.clone());
+
+        assert!(
+            throttled_lister
+                .list_page(Some("prefix/"), None, None)
+                .await
+                .is_err()
+        );
+
+        // The request was retried once, and the throttle response pushed the rate down.
+        assert_eq!(lister.calls.load(Ordering::SeqCst), 2);
+        assert!(throttled.list.controller.current_rate() < 100.0);
     }
 
     #[tokio::test]

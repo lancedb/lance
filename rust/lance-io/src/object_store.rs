@@ -43,6 +43,7 @@ mod list_retry;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod providers;
+pub(crate) mod read_dir;
 pub mod storage_options;
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -85,6 +86,9 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+pub use read_dir::{
+    DirCursor, DirEntry, DirEntryKind, DirListing, DirPage, PaginatedDirLister, ReadDirOptions,
+};
 pub use storage_options::{
     BASE_SCOPED_OPTION_PREFIX, BaseScopedStorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
     LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY, StorageOptionsAccessor,
@@ -156,6 +160,9 @@ pub struct ObjectStore {
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
+    /// The backend's paginated listing API, when it has one. `None` means
+    /// [`Self::read_dir_stream`] has to list a directory in full to page through it.
+    pub(crate) paginated_lister: Option<Arc<dyn PaginatedDirLister>>,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -180,6 +187,22 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+
+    /// Wrap the paginated directory lister that goes with the store, if it has one.
+    ///
+    /// [`ObjectStore::read_dir_page`] pushes the resume position into the backend's own
+    /// listing API, which is reachable only through the lister and not through
+    /// [`OSObjectStore`]. A wrapper that has to observe every list request needs to
+    /// implement this as well as [`Self::wrap`]; the default leaves the lister alone, and
+    /// those requests do not reach the wrapper.
+    fn wrap_paginated(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn PaginatedDirLister>,
+    ) -> Arc<dyn PaginatedDirLister> {
+        let _ = store_prefix;
+        original
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +225,16 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
         self.wrappers
             .iter()
             .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
+    }
+
+    fn wrap_paginated(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn PaginatedDirLister>,
+    ) -> Arc<dyn PaginatedDirLister> {
+        self.wrappers.iter().fold(original, |acc, wrapper| {
+            wrapper.wrap_paginated(store_prefix, acc)
+        })
     }
 }
 
@@ -519,6 +552,8 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
+                // Type-erased on the way in, so there is no telling if it can paginate.
+                paginated_lister: None,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -876,6 +911,9 @@ impl ObjectStore {
     }
 
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
+    ///
+    /// This enumerates the whole prefix before it returns, however many children it holds.
+    /// Use [`Self::read_dir_page`] to page through a directory instead.
     pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
@@ -1166,6 +1204,8 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            // Type-erased on the way in, so there is no telling if it can paginate.
+            paginated_lister: None,
         }
     }
 }
@@ -1471,6 +1511,84 @@ mod tests {
         fn called(&self) -> bool {
             self.called.load(Ordering::Relaxed)
         }
+    }
+
+    /// A lister that exists only to be wrapped.
+    #[derive(Debug)]
+    struct StubLister;
+
+    #[async_trait]
+    impl PaginatedDirLister for StubLister {
+        async fn list_page(
+            &self,
+            _prefix: Option<&str>,
+            _resume: Option<&DirCursor>,
+            _limit: Option<usize>,
+        ) -> Result<DirPage> {
+            unimplemented!("this lister exists to be wrapped, not to list")
+        }
+    }
+
+    /// Records the listers it was handed, and leaves the store alone.
+    #[derive(Debug)]
+    struct PaginatedTestWrapper {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl WrappingObjectStore for PaginatedTestWrapper {
+        fn wrap(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn OSObjectStore>,
+        ) -> Arc<dyn OSObjectStore> {
+            original
+        }
+
+        fn wrap_paginated(
+            &self,
+            store_prefix: &str,
+            original: Arc<dyn PaginatedDirLister>,
+        ) -> Arc<dyn PaginatedDirLister> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}@{store_prefix}", self.name));
+            original
+        }
+    }
+
+    #[test]
+    fn test_chained_wrappers_wrap_the_paginated_lister_in_order() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chain = ChainedWrappingObjectStore::new(vec![
+            Arc::new(PaginatedTestWrapper {
+                name: "first",
+                log: log.clone(),
+            }),
+            Arc::new(PaginatedTestWrapper {
+                name: "second",
+                log: log.clone(),
+            }),
+        ]);
+
+        chain.wrap_paginated("memory", Arc::new(StubLister));
+
+        assert_eq!(*log.lock().unwrap(), vec!["first@memory", "second@memory"]);
+    }
+
+    /// A wrapper that only implements `wrap` keeps working; its listers just go unwrapped.
+    #[test]
+    fn test_wrappers_leave_the_paginated_lister_alone_by_default() {
+        let wrapper = TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: Arc::new(InMemory::new()),
+        };
+        let lister: Arc<dyn PaginatedDirLister> = Arc::new(StubLister);
+
+        let wrapped = wrapper.wrap_paginated("memory", lister.clone());
+
+        assert!(Arc::ptr_eq(&wrapped, &lister));
     }
 
     #[tokio::test]
