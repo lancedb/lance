@@ -188,6 +188,21 @@ impl ExternalBaseResolver {
     }
 }
 
+fn arrow_field_contains_blob_v2(field: &ArrowField) -> bool {
+    if field.is_blob_v2() {
+        return true;
+    }
+    match field.data_type() {
+        ArrowDataType::Struct(children) => children
+            .iter()
+            .any(|child| arrow_field_contains_blob_v2(child)),
+        ArrowDataType::List(child) | ArrowDataType::LargeList(child) => {
+            arrow_field_contains_blob_v2(child)
+        }
+        _ => false,
+    }
+}
+
 fn collect_external_blob_uris(
     field: &ArrowField,
     array: &ArrayRef,
@@ -195,6 +210,9 @@ fn collect_external_blob_uris(
     field_path: &str,
     external_uris: &mut Vec<(String, String)>,
 ) -> Result<()> {
+    if !arrow_field_contains_blob_v2(field) {
+        return Ok(());
+    }
     if array.len() != selected_rows.len() {
         return Err(Error::internal(format!(
             "Blob field '{}' row count {} did not match selection length {}",

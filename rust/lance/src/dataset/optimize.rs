@@ -107,7 +107,9 @@ use arrow_array::{
     Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+use arrow_schema::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
+};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
@@ -1256,133 +1258,296 @@ async fn descriptor_to_logical_blob_array(
 
 fn transformed_arrow_field(field: &LanceField, data_type: ArrowDataType) -> Arc<ArrowField> {
     let arrow_field = ArrowField::from(field);
+    arrow_field_with_data_type(&arrow_field, data_type)
+}
+
+fn arrow_field_with_data_type(field: &ArrowField, data_type: ArrowDataType) -> Arc<ArrowField> {
     Arc::new(
-        ArrowField::new(arrow_field.name(), data_type, arrow_field.is_nullable())
-            .with_metadata(arrow_field.metadata().clone()),
+        ArrowField::new(field.name(), data_type, field.is_nullable())
+            .with_metadata(field.metadata().clone()),
     )
 }
 
-fn transform_blob_v2_array<'a>(
-    dataset: &'a Arc<Dataset>,
-    field: &'a LanceField,
-    array: ArrayRef,
-    row_addrs: Arc<[u64]>,
-) -> BoxFuture<'a, Result<(ArrayRef, Arc<ArrowField>)>> {
-    async move {
-        if field.is_blob_v2() {
-            let struct_arr = array.as_struct();
-            return match BlobV2Layout::classify(struct_arr.fields()) {
-                Some(BlobV2Layout::Logical) => {
-                    let output_field = transformed_arrow_field(field, array.data_type().clone());
-                    Ok((array, output_field))
-                }
-                Some(BlobV2Layout::Descriptor) => {
-                    let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, &field.name)?;
-                    let classification = classify_rows(struct_arr, &descriptor, &field.name)?;
-                    let logical = descriptor_to_logical_blob_array(
-                        dataset,
-                        u32::try_from(field.id).map_err(|_| {
-                            Error::internal(format!(
-                                "Blob v2 field id {} for '{}' does not fit in u32",
-                                field.id, field.name
-                            ))
-                        })?,
-                        struct_arr,
-                        &descriptor,
-                        &classification,
-                        row_addrs.as_ref(),
-                        &field.name,
-                    )
-                    .await?;
-                    Ok((
-                        Arc::new(logical) as ArrayRef,
-                        transformed_arrow_field(field, BLOB_V2_LOGICAL_TYPE.clone()),
-                    ))
-                }
-                Some(actual) => Err(Error::invalid_input(format!(
-                    "Blob v2 field '{}' has {actual} layout; expected logical or descriptor layout during rewrite",
-                    field.name
-                ))),
-                None => Err(Error::invalid_input(format!(
-                    "Blob v2 field '{}' has unrecognized layout {:?}; expected logical or descriptor layout during rewrite",
-                    field.name,
-                    struct_arr.fields()
-                ))),
-            };
-        }
+fn field_contains_blob_v2(field: &LanceField) -> bool {
+    field.is_blob_v2() || field.children.iter().any(field_contains_blob_v2)
+}
 
-        match field.data_type() {
-            ArrowDataType::Struct(_) => {
-                let struct_arr = array.as_struct().normalize_slicing()?;
-                let parent_nulls = struct_arr.nulls().cloned();
-                let struct_arr = struct_arr.pushdown_nulls()?;
-                if field.children.len() != struct_arr.num_columns() {
-                    return Err(Error::internal(format!(
-                        "Struct field '{}' expected {} children during blob rewrite, got {}",
-                        field.name,
-                        field.children.len(),
-                        struct_arr.num_columns()
-                    )));
-                }
-                let mut child_arrays = Vec::with_capacity(field.children.len());
-                let mut child_fields = Vec::with_capacity(field.children.len());
-                for (child_field, child_array) in
-                    field.children.iter().zip(struct_arr.columns())
-                {
-                    let (child_array, child_field) = transform_blob_v2_array(
-                        dataset,
-                        child_field,
-                        child_array.clone(),
-                        row_addrs.clone(),
-                    )
-                    .await?;
-                    child_arrays.push(child_array);
-                    child_fields.push(child_field);
-                }
-                let struct_array = StructArray::try_new(
-                    child_fields.clone().into(),
-                    child_arrays,
-                    parent_nulls,
-                )?;
-                let output_field = transformed_arrow_field(
-                    field,
-                    ArrowDataType::Struct(child_fields.into()),
-                );
-                Ok((Arc::new(struct_array), output_field))
-            }
-            ArrowDataType::List(_) => {
-                transform_blob_v2_list_array::<i32>(
-                    dataset,
-                    field,
-                    array.as_list::<i32>(),
-                    row_addrs,
-                )
-                .await
-            }
-            ArrowDataType::LargeList(_) => {
-                transform_blob_v2_list_array::<i64>(
-                    dataset,
-                    field,
-                    array.as_list::<i64>(),
-                    row_addrs,
-                )
-                .await
-            }
-            _ => {
-                let output_field = transformed_arrow_field(field, array.data_type().clone());
-                Ok((array, output_field))
-            }
+enum BlobV2FieldRewritePlan {
+    Passthrough {
+        output_field: Arc<ArrowField>,
+    },
+    Blob {
+        field_id: u32,
+        field_name: String,
+        output_field: Arc<ArrowField>,
+    },
+    Struct {
+        field_name: String,
+        output_field: Arc<ArrowField>,
+        children: Vec<Self>,
+    },
+    List {
+        field_name: String,
+        output_field: Arc<ArrowField>,
+        child: Box<Self>,
+    },
+    LargeList {
+        field_name: String,
+        output_field: Arc<ArrowField>,
+        child: Box<Self>,
+    },
+}
+
+impl BlobV2FieldRewritePlan {
+    fn passthrough(field: &ArrowField) -> Self {
+        Self::Passthrough {
+            output_field: Arc::new(field.clone()),
         }
     }
-    .boxed()
+
+    fn try_new(field: &LanceField, input_field: &ArrowField) -> Result<Self> {
+        if !field_contains_blob_v2(field) {
+            return Ok(Self::passthrough(input_field));
+        }
+
+        if field.is_blob_v2() {
+            let field_id = u32::try_from(field.id).map_err(|_| {
+                Error::internal(format!(
+                    "Blob v2 field id {} for '{}' does not fit in u32",
+                    field.id, field.name
+                ))
+            })?;
+            let ArrowDataType::Struct(input_children) = input_field.data_type() else {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 field '{}' has non-struct input type {:?}",
+                    field.name,
+                    input_field.data_type()
+                )));
+            };
+            let output_field = match BlobV2Layout::classify(input_children) {
+                Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
+                Some(BlobV2Layout::Descriptor) => {
+                    transformed_arrow_field(field, BLOB_V2_LOGICAL_TYPE.clone())
+                }
+                Some(actual) => {
+                    return Err(Error::invalid_input(format!(
+                        "Blob v2 field '{}' has {actual} input layout; expected logical or descriptor layout during rewrite",
+                        field.name
+                    )));
+                }
+                None => {
+                    return Err(Error::invalid_input(format!(
+                        "Blob v2 field '{}' has unrecognized input layout {:?}; expected logical or descriptor layout during rewrite",
+                        field.name, input_children
+                    )));
+                }
+            };
+            return Ok(Self::Blob {
+                field_id,
+                field_name: field.name.clone(),
+                output_field,
+            });
+        }
+
+        match (field.data_type(), input_field.data_type()) {
+            (ArrowDataType::Struct(_), ArrowDataType::Struct(input_children)) => {
+                if field.children.len() != input_children.len() {
+                    return Err(Error::internal(format!(
+                        "Struct field '{}' expected {} children in blob rewrite plan, got {}",
+                        field.name,
+                        field.children.len(),
+                        input_children.len()
+                    )));
+                }
+                let children = field
+                    .children
+                    .iter()
+                    .zip(input_children.iter())
+                    .map(|(child, input_child)| Self::try_new(child, input_child))
+                    .collect::<Result<Vec<_>>>()?;
+                let output_children = children
+                    .iter()
+                    .map(|child| child.output_field().clone())
+                    .collect::<Vec<_>>();
+                Ok(Self::Struct {
+                    field_name: field.name.clone(),
+                    output_field: arrow_field_with_data_type(
+                        input_field,
+                        ArrowDataType::Struct(output_children.into()),
+                    ),
+                    children,
+                })
+            }
+            (ArrowDataType::List(_), ArrowDataType::List(input_child)) => {
+                let child = field.children.first().ok_or_else(|| {
+                    Error::internal(format!(
+                        "List field '{}' is missing its child in blob rewrite plan",
+                        field.name
+                    ))
+                })?;
+                let child = Box::new(Self::try_new(child, input_child)?);
+                Ok(Self::List {
+                    field_name: field.name.clone(),
+                    output_field: arrow_field_with_data_type(
+                        input_field,
+                        ArrowDataType::List(child.output_field().clone()),
+                    ),
+                    child,
+                })
+            }
+            (ArrowDataType::LargeList(_), ArrowDataType::LargeList(input_child)) => {
+                let child = field.children.first().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Large list field '{}' is missing its child in blob rewrite plan",
+                        field.name
+                    ))
+                })?;
+                let child = Box::new(Self::try_new(child, input_child)?);
+                Ok(Self::LargeList {
+                    field_name: field.name.clone(),
+                    output_field: arrow_field_with_data_type(
+                        input_field,
+                        ArrowDataType::LargeList(child.output_field().clone()),
+                    ),
+                    child,
+                })
+            }
+            (logical_type, input_type) => Err(Error::invalid_input(format!(
+                "Field '{}' contains blob v2 descendants but logical type {:?} and input type {:?} do not form a supported rewrite container",
+                field.name, logical_type, input_type
+            ))),
+        }
+    }
+
+    fn output_field(&self) -> &Arc<ArrowField> {
+        match self {
+            Self::Passthrough { output_field }
+            | Self::Blob { output_field, .. }
+            | Self::Struct { output_field, .. }
+            | Self::List { output_field, .. }
+            | Self::LargeList { output_field, .. } => output_field,
+        }
+    }
+
+    fn transform<'a>(
+        &'a self,
+        dataset: &'a Arc<Dataset>,
+        array: ArrayRef,
+        row_addrs: Arc<[u64]>,
+    ) -> BoxFuture<'a, Result<ArrayRef>> {
+        async move {
+            match self {
+                Self::Passthrough { .. } => Ok(array),
+                Self::Blob {
+                    field_id,
+                    field_name,
+                    ..
+                } => {
+                    let struct_arr = array.as_struct();
+                    match BlobV2Layout::classify(struct_arr.fields()) {
+                        Some(BlobV2Layout::Logical) => Ok(array),
+                        Some(BlobV2Layout::Descriptor) => {
+                            let descriptor =
+                                BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
+                            let classification =
+                                classify_rows(struct_arr, &descriptor, field_name)?;
+                            let logical = descriptor_to_logical_blob_array(
+                                dataset,
+                                *field_id,
+                                struct_arr,
+                                &descriptor,
+                                &classification,
+                                row_addrs.as_ref(),
+                                field_name,
+                            )
+                            .await?;
+                            Ok(Arc::new(logical) as ArrayRef)
+                        }
+                        Some(actual) => Err(Error::invalid_input(format!(
+                            "Blob v2 field '{}' has {actual} layout; expected logical or descriptor layout during rewrite",
+                            field_name
+                        ))),
+                        None => Err(Error::invalid_input(format!(
+                            "Blob v2 field '{}' has unrecognized layout {:?}; expected logical or descriptor layout during rewrite",
+                            field_name,
+                            struct_arr.fields()
+                        ))),
+                    }
+                }
+                Self::Struct {
+                    field_name,
+                    output_field,
+                    children,
+                } => {
+                    let struct_arr = array.as_struct().normalize_slicing()?;
+                    let parent_nulls = struct_arr.nulls().cloned();
+                    let struct_arr = struct_arr.pushdown_nulls()?;
+                    if children.len() != struct_arr.num_columns() {
+                        return Err(Error::internal(format!(
+                            "Struct field '{}' expected {} children during blob rewrite, got {}",
+                            field_name,
+                            children.len(),
+                            struct_arr.num_columns()
+                        )));
+                    }
+                    let mut child_arrays = Vec::with_capacity(children.len());
+                    for (child, child_array) in children.iter().zip(struct_arr.columns()) {
+                        child_arrays.push(
+                            child
+                                .transform(dataset, child_array.clone(), row_addrs.clone())
+                                .await?,
+                        );
+                    }
+                    let ArrowDataType::Struct(output_fields) = output_field.data_type() else {
+                        return Err(Error::internal(format!(
+                            "Struct field '{}' rewrite plan has non-struct output type {:?}",
+                            field_name,
+                            output_field.data_type()
+                        )));
+                    };
+                    Ok(Arc::new(StructArray::try_new(
+                        output_fields.clone(),
+                        child_arrays,
+                        parent_nulls,
+                    )?) as ArrayRef)
+                }
+                Self::List {
+                    field_name, child, ..
+                } => {
+                    transform_blob_v2_list_array::<i32>(
+                        dataset,
+                        field_name,
+                        child,
+                        array.as_list::<i32>(),
+                        row_addrs,
+                    )
+                    .await
+                }
+                Self::LargeList {
+                    field_name, child, ..
+                } => {
+                    transform_blob_v2_list_array::<i64>(
+                        dataset,
+                        field_name,
+                        child,
+                        array.as_list::<i64>(),
+                        row_addrs,
+                    )
+                    .await
+                }
+            }
+        }
+        .boxed()
+    }
 }
 
 async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     dataset: &Arc<Dataset>,
-    field: &LanceField,
+    field_name: &str,
+    child: &BlobV2FieldRewritePlan,
     list_array: &GenericListArray<O>,
     row_addrs: Arc<[u64]>,
-) -> Result<(ArrayRef, Arc<ArrowField>)> {
+) -> Result<ArrayRef> {
     let list_array = if list_array.null_count() > 0 {
         list_array.filter_garbage_nulls()
     } else {
@@ -1394,7 +1559,7 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     if values_end < values_start {
         return Err(Error::internal(format!(
             "List field '{}' has invalid offsets during blob rewrite",
-            field.name
+            field_name
         )));
     }
 
@@ -1408,13 +1573,13 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
         if end < start {
             return Err(Error::internal(format!(
                 "List field '{}' has decreasing offsets during blob rewrite",
-                field.name
+                field_name
             )));
         }
         let row_addr = row_addrs.get(row_idx).copied().ok_or_else(|| {
             Error::internal(format!(
                 "List field '{}' row address count {} did not match row count {}",
-                field.name,
+                field_name,
                 row_addrs.len(),
                 list_array.len()
             ))
@@ -1423,24 +1588,99 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
         normalized_offsets.push(O::usize_as(end - values_start));
     }
 
-    let child = field.children.first().ok_or_else(|| {
-        Error::internal(format!(
-            "List field '{}' missing child during blob rewrite",
-            field.name
-        ))
-    })?;
     let values = list_array.values().slice(values_start, values_len);
-    let (values, child_field) =
-        transform_blob_v2_array(dataset, child, values, Arc::<[u64]>::from(child_row_addrs))
-            .await?;
+    let values = child
+        .transform(dataset, values, Arc::<[u64]>::from(child_row_addrs))
+        .await?;
     let list_array = GenericListArray::<O>::try_new(
-        child_field,
+        child.output_field().clone(),
         OffsetBuffer::new(ScalarBuffer::from(normalized_offsets)),
         values,
         list_array.nulls().cloned(),
     )?;
-    let output_field = transformed_arrow_field(field, list_array.data_type().clone());
-    Ok((Arc::new(list_array), output_field))
+    Ok(Arc::new(list_array))
+}
+
+struct BlobV2BatchRewritePlan {
+    row_addr_idx: usize,
+    columns: Vec<(usize, BlobV2FieldRewritePlan)>,
+    output_schema: SchemaRef,
+}
+
+impl BlobV2BatchRewritePlan {
+    fn try_new(
+        schema: &lance_core::datatypes::Schema,
+        input_schema: &ArrowSchema,
+        keep_row_addr: bool,
+    ) -> Result<Self> {
+        let row_addr_idx = input_schema
+            .column_with_name(lance_core::ROW_ADDR)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "_rowaddr column missing from batch for blob v2 compaction, columns: {:?}",
+                    input_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name())
+                        .collect::<Vec<_>>()
+                ))
+            })?
+            .0;
+        let mut columns = Vec::with_capacity(input_schema.fields().len());
+        let mut output_fields = Vec::with_capacity(input_schema.fields().len());
+        for (column_idx, input_field) in input_schema.fields().iter().enumerate() {
+            if input_field.name() == lance_core::ROW_ADDR && !keep_row_addr {
+                continue;
+            }
+            let field_plan = if let Some(field) = schema.field(input_field.name()) {
+                BlobV2FieldRewritePlan::try_new(field, input_field)?
+            } else {
+                BlobV2FieldRewritePlan::passthrough(input_field)
+            };
+            output_fields.push(field_plan.output_field().as_ref().clone());
+            columns.push((column_idx, field_plan));
+        }
+
+        Ok(Self {
+            row_addr_idx,
+            columns,
+            output_schema: Arc::new(ArrowSchema::new_with_metadata(
+                output_fields,
+                input_schema.metadata().clone(),
+            )),
+        })
+    }
+
+    async fn transform_batch(
+        &self,
+        dataset: &Arc<Dataset>,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        let row_addrs: Arc<[u64]> = batch
+            .column(self.row_addr_idx)
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .into();
+        let mut output_columns = Vec::with_capacity(self.columns.len());
+        for (column_idx, field_plan) in &self.columns {
+            output_columns.push(
+                field_plan
+                    .transform(
+                        dataset,
+                        batch.column(*column_idx).clone(),
+                        row_addrs.clone(),
+                    )
+                    .await?,
+            );
+        }
+        Ok(RecordBatch::try_new(
+            self.output_schema.clone(),
+            output_columns,
+        )?)
+    }
 }
 
 pub(crate) async fn transform_blob_v2_batch(
@@ -1449,64 +1689,8 @@ pub(crate) async fn transform_blob_v2_batch(
     batch: RecordBatch,
     keep_row_addr: bool,
 ) -> Result<RecordBatch> {
-    let row_addr_idx = batch
-        .schema()
-        .column_with_name(lance_core::ROW_ADDR)
-        .ok_or_else(|| {
-            Error::internal(format!(
-                "_rowaddr column missing from batch for blob v2 compaction, columns: {:?}",
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name())
-                    .collect::<Vec<_>>()
-            ))
-        })?
-        .0;
-    let row_addrs: Arc<[u64]> = batch
-        .column(row_addr_idx)
-        .as_primitive::<UInt64Type>()
-        .values()
-        .iter()
-        .copied()
-        .collect::<Vec<_>>()
-        .into();
-
-    let mut new_columns: Vec<Arc<dyn Array>> = Vec::new();
-    let mut new_fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
-
-    let batch_schema = batch.schema();
-    for (col_idx, field) in batch_schema.fields().iter().enumerate() {
-        if field.name() == lance_core::ROW_ADDR && !keep_row_addr {
-            continue;
-        }
-
-        let Some(lance_field) = schema.field(field.name()) else {
-            new_columns.push(batch.column(col_idx).clone());
-            new_fields.push(field.clone());
-            continue;
-        };
-        let (new_column, new_field) = transform_blob_v2_array(
-            dataset,
-            lance_field,
-            batch.column(col_idx).clone(),
-            row_addrs.clone(),
-        )
-        .await?;
-        new_columns.push(new_column);
-        new_fields.push(new_field);
-    }
-
-    let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
-        new_fields
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect::<Vec<_>>(),
-        batch_schema.metadata().clone(),
-    ));
-
-    Ok(RecordBatch::try_new(new_schema, new_columns)?)
+    let plan = BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr)?;
+    plan.transform_batch(dataset, batch).await
 }
 
 /// Build a scan reader for rewrite and optionally capture row IDs.
@@ -1902,46 +2086,23 @@ async fn rewrite_files(
 
         if has_blob_v2_columns {
             let dataset_arc = Arc::new(dataset.as_ref().clone());
-            let dataset_schema = dataset.schema().clone();
+            let rewrite_plan = Arc::new(BlobV2BatchRewritePlan::try_new(
+                dataset.schema(),
+                schema.as_ref(),
+                false,
+            )?);
+            let transformed_schema = rewrite_plan.output_schema.clone();
             let transformed = reader_with_progress.then(move |batch_result| {
                 let dataset = dataset_arc.clone();
-                let schema = dataset_schema.clone();
+                let rewrite_plan = rewrite_plan.clone();
                 async move {
                     let batch = batch_result?;
-                    transform_blob_v2_batch(&dataset, &schema, batch, false)
+                    rewrite_plan
+                        .transform_batch(&dataset, batch)
                         .await
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
                 }
             });
-            let transformed_schema = {
-                let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
-                for field in schema.fields().iter() {
-                    if field.name() == lance_core::ROW_ADDR {
-                        continue;
-                    }
-                    let lance_field = dataset.schema().field(field.name());
-                    if let Some(lance_field) = lance_field.filter(|f| f.is_blob_v2()) {
-                        let logical_field = arrow_schema::Field::from(lance_field);
-                        fields.push(Arc::new(
-                            arrow_schema::Field::new(
-                                field.name(),
-                                BLOB_V2_LOGICAL_TYPE.clone(),
-                                field.is_nullable(),
-                            )
-                            .with_metadata(logical_field.metadata().clone()),
-                        ));
-                    } else {
-                        fields.push(field.clone());
-                    }
-                }
-                Arc::new(arrow_schema::Schema::new_with_metadata(
-                    fields
-                        .iter()
-                        .map(|f| f.as_ref().clone())
-                        .collect::<Vec<_>>(),
-                    schema.metadata().clone(),
-                ))
-            };
             reader = Some(Box::pin(RecordBatchStreamAdapter::new(
                 transformed_schema,
                 transformed,
@@ -7810,6 +7971,58 @@ mod tests {
         let mut after = read_blob_bytes_by_index(&Arc::new(dataset), "blob").await;
         after.sort_by_key(|(id, _)| *id);
         assert_eq!(after, expected);
+    }
+
+    #[test]
+    fn test_blob_v2_rewrite_plan_skips_non_blob_list_subtree() {
+        let items_field = Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        );
+        let info_field = Field::new(
+            "info",
+            DataType::Struct(
+                vec![
+                    Arc::new(items_field),
+                    Arc::new(crate::blob_field("blob", true)),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let logical_arrow_schema = Schema::new(vec![info_field]);
+        let logical_schema =
+            lance_core::datatypes::Schema::try_from(&logical_arrow_schema).unwrap();
+        let mut input_schema = logical_schema.clone();
+        input_schema.fields[0].unload_blobs_recursive();
+        let input_field = Field::from(&input_schema.fields[0]);
+
+        let plan =
+            BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field).unwrap();
+        let BlobV2FieldRewritePlan::Struct { children, .. } = &plan else {
+            panic!("nested blob field should produce a struct rewrite plan");
+        };
+        assert!(matches!(
+            children[0],
+            BlobV2FieldRewritePlan::Passthrough { .. }
+        ));
+        assert!(matches!(children[1], BlobV2FieldRewritePlan::Blob { .. }));
+
+        let DataType::Struct(output_children) = plan.output_field().data_type() else {
+            panic!("nested blob rewrite plan should declare a struct output");
+        };
+        let DataType::Struct(input_children) = input_field.data_type() else {
+            panic!("nested blob input should be a struct");
+        };
+        assert_eq!(output_children[0], input_children[0]);
+        let DataType::Struct(blob_children) = output_children[1].data_type() else {
+            panic!("blob rewrite plan should declare a struct blob output");
+        };
+        assert_eq!(
+            BlobV2Layout::classify(blob_children),
+            Some(BlobV2Layout::Logical)
+        );
     }
 
     #[tokio::test]

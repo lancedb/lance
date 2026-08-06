@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import json
 import pickle
 import random
 import re
@@ -86,6 +87,44 @@ def test_blob_compaction(tmp_path: Path):
     blob_files = dataset.take_blobs("blob", indices=[0, 1])
     contents = [blob_files[0].readall(), blob_files[1].readall()]
     assert contents == blobs
+
+
+def test_blob_compaction_with_nested_json_sibling(tmp_path: Path):
+    dataset_uri = tmp_path / "nested_blob_json"
+    info_fields = [lance.blob_field("blob"), pa.field("meta", pa.json_())]
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("info", pa.struct(info_fields)),
+        ]
+    )
+    for index, row_id in enumerate([1, 2]):
+        info = pa.StructArray.from_arrays(
+            [
+                lance.blob_array([f"blob-{row_id}".encode()]),
+                pa.array([json.dumps({"row": row_id})], type=pa.json_()),
+            ],
+            fields=info_fields,
+        )
+        lance.write_dataset(
+            pa.Table.from_arrays([pa.array([row_id]), info], schema=schema),
+            dataset_uri,
+            mode="create" if index == 0 else "append",
+            data_storage_version="2.2",
+        )
+
+    dataset = lance.dataset(dataset_uri)
+    dataset.optimize.compact_files(num_threads=1)
+
+    assert len(dataset.get_fragments()) == 1
+    assert [data for _, data in dataset.read_blobs("info.blob", indices=[0, 1])] == [
+        b"blob-1",
+        b"blob-2",
+    ]
+    assert [
+        json.loads(value)
+        for value in dataset.to_table(columns=["info.meta"])["info.meta"].to_pylist()
+    ] == [{"row": 1}, {"row": 2}]
 
 
 @pytest.mark.parametrize("storage_version", ["2.0", "2.1", "2.2"])
