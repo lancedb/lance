@@ -3952,6 +3952,11 @@ mod tests {
         );
         let expected_rows = fragments[0].physical_rows().await.unwrap() as u64
             + fragments[1].physical_rows().await.unwrap() as u64;
+        let expected_physical_fragments = fragments
+            .iter()
+            .take(2)
+            .map(|fragment| fragment.id() as u32)
+            .collect();
 
         let (ivf_params, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
         let params = VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
@@ -3977,6 +3982,11 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            crate::index::vector::details::physical_fragment_bitmap(&merged_segment),
+            Some(expected_physical_fragments),
+            "a merged segment must retain every input's physical fragment coverage"
+        );
         dataset
             .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged_segment])
             .await

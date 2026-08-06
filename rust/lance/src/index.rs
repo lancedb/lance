@@ -64,8 +64,8 @@ use serde_json::json;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 use vector::details::{
-    derive_vector_index_type, infer_missing_vector_details, needs_vector_details_inference,
-    vector_details_as_json,
+    derive_vector_index_type, infer_missing_vector_details, merged_physical_fragment_bitmap,
+    needs_vector_details_inference, vector_details_as_json, with_physical_fragment_bitmap,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
@@ -132,14 +132,14 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     Ok(())
 }
 
-pub(crate) fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
+fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
     field_ids.insert(field.id);
     for child in &field.children {
         collect_subtree_field_ids(child, field_ids);
     }
 }
 
-pub(crate) fn fragment_field_paths<'a>(
+fn fragment_field_paths<'a>(
     fragment: &'a Fragment,
     indexed_field_ids: &HashSet<i32>,
 ) -> HashMap<i32, &'a str> {
@@ -1947,13 +1947,21 @@ impl DatasetIndexExt for Dataset {
             };
 
             let last_idx = deltas.last().expect("Delta indices should not be empty");
+            let physical_fragment_bitmap = merged_physical_fragment_bitmap(
+                res.removed_indices.iter().copied(),
+                &res.new_fragment_bitmap,
+            );
+            let new_index_details = with_physical_fragment_bitmap(
+                res.new_index_details,
+                physical_fragment_bitmap.as_ref(),
+            )?;
             let new_idx = IndexMetadata {
                 uuid: res.new_uuid,
                 name: last_idx.name.clone(), // Keep the same name
                 fields: last_idx.fields.clone(),
                 dataset_version: res.new_dataset_version,
                 fragment_bitmap: Some(res.new_fragment_bitmap),
-                index_details: Some(Arc::new(res.new_index_details)),
+                index_details: Some(Arc::new(new_index_details)),
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // New merged index file locates in the cloned dataset.

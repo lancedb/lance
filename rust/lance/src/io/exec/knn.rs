@@ -63,9 +63,10 @@ use uuid::Uuid;
 use lance_select::RowAddrMask;
 
 use crate::dataset::Dataset;
+use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
+use crate::index::vector::details::physical_fragment_bitmap;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
-use crate::index::{DatasetIndexInternalExt, collect_subtree_field_ids, fragment_field_paths};
 use crate::{Error, Result};
 use lance_arrow::*;
 
@@ -1596,9 +1597,8 @@ impl PreFilter for SegmentPreFilter {
 }
 
 /// Return whether a segment can still physically contain rows from a fragment it no
-/// longer owns.  Append-only deltas have disjoint bitmaps too, so the bitmap alone is
-/// not enough: compare indexed data files with the snapshot used to build the segment.
-async fn segment_needs_ownership_filter(dataset: &Dataset, index: &IndexMetadata) -> bool {
+/// longer owns.
+fn segment_needs_ownership_filter(dataset: &Dataset, index: &IndexMetadata) -> bool {
     let Some(owned_fragments) = index.fragment_bitmap.as_ref() else {
         return false;
     };
@@ -1610,45 +1610,14 @@ async fn segment_needs_ownership_filter(dataset: &Dataset, index: &IndexMetadata
         return false;
     }
 
-    let historical = match dataset.checkout_version(index.dataset_version).await {
-        Ok(historical) => historical,
-        Err(error) => {
-            // Old manifests may have been cleaned up.  Restrict conservatively so a
-            // missing historical snapshot cannot make stale index rows visible again.
-            log::debug!(
-                "Could not inspect dataset version {} for index segment {}: {}. Applying the segment ownership filter conservatively.",
-                index.dataset_version,
-                index.uuid,
-                error
-            );
-            return true;
-        }
+    let Some(physical_fragments) = physical_fragment_bitmap(index) else {
+        // Legacy vector segments do not record immutable physical coverage. A
+        // missing current fragment may be append-only or may still have stale
+        // rows in this segment, so filter conservatively for correctness.
+        return true;
     };
-
-    let mut indexed_field_ids = HashSet::new();
-    for field_id in &index.fields {
-        if let Some(field) = dataset.schema().field_by_id(*field_id) {
-            collect_subtree_field_ids(field, &mut indexed_field_ids);
-        }
-    }
-    let current_fragments = dataset
-        .fragments()
-        .iter()
-        .map(|fragment| (fragment.id as u32, fragment))
-        .collect::<HashMap<_, _>>();
-
-    historical.fragments().iter().any(|historical_fragment| {
-        let fragment_id = historical_fragment.id as u32;
-        if owned_fragments.contains(fragment_id) {
-            return false;
-        }
-        current_fragments
-            .get(&fragment_id)
-            .is_some_and(|current_fragment| {
-                fragment_field_paths(historical_fragment, &indexed_field_ids)
-                    != fragment_field_paths(current_fragment, &indexed_field_ids)
-            })
-    })
+    let unowned_physical_fragments = physical_fragments - owned_fragments;
+    unowned_physical_fragments.intersection_len(&dataset.fragment_bitmap) > 0
 }
 
 async fn prefilter_for_segment(
@@ -1656,7 +1625,7 @@ async fn prefilter_for_segment(
     index: &IndexMetadata,
     base: Arc<DatasetPreFilter>,
 ) -> Result<Arc<dyn PreFilter>> {
-    if !segment_needs_ownership_filter(dataset.as_ref(), index).await {
+    if !segment_needs_ownership_filter(dataset.as_ref(), index) {
         return Ok(base);
     }
 
@@ -3000,26 +2969,27 @@ mod tests {
             )
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
         assert_eq!(second.schema(), first_schema);
-        dataset = Dataset::write(
-            second,
-            "memory://",
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        dataset.append(second, None).await.unwrap();
         let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
         let dataset = Arc::new(dataset);
+        let old_details = crate::index::vector::details::with_physical_fragment_bitmap(
+            crate::index::vector_index_details_default(),
+            Some(&first_fragments),
+        )
+        .unwrap();
+        let new_details = crate::index::vector::details::with_physical_fragment_bitmap(
+            crate::index::vector_index_details_default(),
+            Some(&appended_fragments),
+        )
+        .unwrap();
 
         let old_segment = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![field_id],
             name: "vector_idx".to_string(),
             dataset_version: first_version,
-            fragment_bitmap: Some(first_fragments),
-            index_details: None,
+            fragment_bitmap: Some(first_fragments.clone()),
+            index_details: Some(Arc::new(old_details)),
             index_version: 0,
             created_at: None,
             base_id: None,
@@ -3030,16 +3000,43 @@ mod tests {
             fields: vec![field_id],
             name: "vector_idx".to_string(),
             dataset_version: dataset.manifest.version,
-            fragment_bitmap: Some(appended_fragments),
-            index_details: None,
+            fragment_bitmap: Some(appended_fragments.clone()),
+            index_details: Some(Arc::new(new_details)),
             index_version: 0,
             created_at: None,
             base_id: None,
             files: None,
         };
         assert!(
-            !segment_needs_ownership_filter(dataset.as_ref(), &old_segment).await,
+            !segment_needs_ownership_filter(dataset.as_ref(), &old_segment),
             "append-only data must not look like an in-place fragment update"
+        );
+
+        let merged_physical_fragments = &first_fragments | &appended_fragments;
+        let merged_details = crate::index::vector::details::with_physical_fragment_bitmap(
+            crate::index::vector_index_details_default(),
+            Some(&merged_physical_fragments),
+        )
+        .unwrap();
+        let merged_with_pruned_later_fragment = IndexMetadata {
+            index_details: Some(Arc::new(merged_details)),
+            ..old_segment.clone()
+        };
+        assert_eq!(
+            physical_fragment_bitmap(&merged_with_pruned_later_fragment),
+            Some(merged_physical_fragments.clone())
+        );
+        assert!(
+            !appended_fragments.is_empty(),
+            "the append fixture must create at least one new fragment"
+        );
+        assert!(
+            appended_fragments.intersection_len(&dataset.fragment_bitmap) > 0,
+            "the appended fragments must remain live in the current dataset"
+        );
+        assert!(
+            segment_needs_ownership_filter(dataset.as_ref(), &merged_with_pruned_later_fragment),
+            "a merged segment must retain the physical coverage of every input"
         );
         let base = Arc::new(DatasetPreFilter::new(
             dataset.clone(),

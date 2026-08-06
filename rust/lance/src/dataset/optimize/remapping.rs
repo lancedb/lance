@@ -8,6 +8,7 @@ use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::vector::details::with_physical_fragment_bitmap;
 use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -356,7 +357,13 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             fields: curr_index_meta.fields.clone(),
             dataset_version: new_dataset_version,
             fragment_bitmap: bitmap_after_remap,
-            index_details: curr_index_meta.index_details.clone(),
+            index_details: curr_index_meta
+                .index_details
+                .as_deref()
+                .cloned()
+                .map(|details| with_physical_fragment_bitmap(details, None))
+                .transpose()?
+                .map(Arc::new),
             index_version: curr_index_meta.index_version,
             created_at: curr_index_meta.created_at,
             base_id: None,
@@ -368,7 +375,10 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             fields: curr_index_meta.fields.clone(),
             dataset_version: new_dataset_version,
             fragment_bitmap: bitmap_after_remap,
-            index_details: Some(Arc::new(remapped_index.index_details)),
+            index_details: Some(Arc::new(with_physical_fragment_bitmap(
+                remapped_index.index_details,
+                None,
+            )?)),
             index_version: remapped_index.index_version as i32,
             created_at: curr_index_meta.created_at,
             base_id: None,

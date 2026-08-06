@@ -2586,6 +2586,11 @@ mod tests {
             dataset.fragment_bitmap.as_ref(),
             "the compatible merge must preserve exact fragment coverage"
         );
+        assert_eq!(
+            crate::index::vector::details::physical_fragment_bitmap(&merged[0]),
+            Some(dataset.fragment_bitmap.as_ref().clone()),
+            "the compatible merge must preserve physical fragment coverage"
+        );
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@
 
 use super::{
     LogicalIvfView, derive_hnsw_params,
+    details::{merged_physical_fragment_bitmap, with_physical_fragment_bitmap},
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
@@ -2387,6 +2388,7 @@ pub(crate) async fn merge_segments_with_progress(
         })?;
         fragment_bitmap |= source_fragment_bitmap.clone();
     }
+    let physical_fragment_bitmap = merged_physical_fragment_bitmap(&segments, &fragment_bitmap);
 
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
@@ -2404,7 +2406,10 @@ pub(crate) async fn merge_segments_with_progress(
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
         fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(crate::index::vector_index_details_default())),
+        index_details: Some(Arc::new(with_physical_fragment_bitmap(
+            crate::index::vector_index_details_default(),
+            physical_fragment_bitmap.as_ref(),
+        )?)),
         index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,

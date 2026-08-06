@@ -14,6 +14,7 @@ use crate::{
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
+            details::with_physical_fragment_bitmap,
         },
         vector_index_details, vector_index_details_default,
     },
@@ -592,21 +593,27 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
+        let fragment_bitmap = if train {
+            match &self.fragments {
+                Some(fragment_ids) => fragment_ids.iter().collect(),
+                None => self.dataset.fragment_bitmap.as_ref().clone(),
+            }
+        } else {
+            // Empty bitmap for untrained indices
+            roaring::RoaringBitmap::new()
+        };
+        let index_details = with_physical_fragment_bitmap(
+            created_index.index_details,
+            Some(&fragment_bitmap),
+        )?;
+
         Ok(IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: if train {
-                match &self.fragments {
-                    Some(fragment_ids) => Some(fragment_ids.iter().collect()),
-                    None => Some(self.dataset.fragment_bitmap.as_ref().clone()),
-                }
-            } else {
-                // Empty bitmap for untrained indices
-                Some(roaring::RoaringBitmap::new())
-            },
-            index_details: Some(Arc::new(created_index.index_details)),
+            fragment_bitmap: Some(fragment_bitmap),
+            index_details: Some(Arc::new(index_details)),
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
