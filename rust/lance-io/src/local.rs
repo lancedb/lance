@@ -3,9 +3,11 @@
 
 //! Optimized local I/Os
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{ErrorKind, Read, SeekFrom};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 // TODO: Clean up windows/unix stuff
@@ -16,6 +18,7 @@ use std::os::windows::fs::FileExt;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -49,20 +52,110 @@ pub fn remove_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove a directory only if it is empty.
-pub(crate) fn remove_empty_dir(path: &Path) -> Result<()> {
-    let local_path = to_local_path(path);
-    match std::fs::remove_dir(local_path) {
-        Ok(()) => Ok(()),
-        Err(err)
-            if matches!(
+/// Remove eligible empty directories below `root` without following symbolic links.
+pub(crate) fn remove_empty_dirs(
+    root: &Path,
+    retained_dirs: &HashSet<Path>,
+    verified_dirs: &HashSet<Path>,
+    unmodified_since: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let root_path = PathBuf::from(to_local_path(root));
+    let root_metadata = match std::fs::symlink_metadata(&root_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(Error::from(err)),
+    };
+    if !root_metadata.file_type().is_dir() {
+        return Ok(());
+    }
+    let canonical_root = std::fs::canonicalize(&root_path)?;
+
+    let mut pending_dirs = vec![(root_path, root.clone(), None::<Path>)];
+    let mut discovered_dirs = Vec::new();
+    let mut file_bearing_roots = HashSet::new();
+    while let Some((local_dir, object_store_dir, index_root)) = pending_dirs.pop() {
+        let entries = match std::fs::read_dir(&local_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(Error::from(err)),
+        };
+        for entry in entries {
+            let entry = entry?;
+            // DirEntry::file_type does not follow symbolic links. Non-directories, including
+            // symlinks, remain in place and prevent their parent from being removed as empty.
+            if !entry.file_type()?.is_dir() {
+                if let Some(index_root) = &index_root {
+                    file_bearing_roots.insert(index_root.clone());
+                }
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let child = object_store_dir.clone().join(name);
+            if retained_dirs.contains(&child) {
+                continue;
+            }
+            let local_child = entry.path();
+            let index_root = index_root.clone().unwrap_or_else(|| child.clone());
+            discovered_dirs.push((local_child.clone(), child.clone(), index_root.clone()));
+            pending_dirs.push((local_child, child, Some(index_root)));
+        }
+    }
+
+    discovered_dirs.sort_unstable_by_key(|(_, path, _)| std::cmp::Reverse(path.parts_count()));
+    let mut first_error = None;
+    for (local_dir, object_store_dir, index_root) in discovered_dirs {
+        if file_bearing_roots.contains(&index_root) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&local_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => metadata,
+            Ok(_) => continue,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                first_error.get_or_insert_with(|| Error::from(err));
+                continue;
+            }
+        };
+        let is_verified = verified_dirs.contains(&object_store_dir);
+        let is_old_enough = unmodified_since.is_none_or(|threshold| {
+            metadata
+                .modified()
+                .ok()
+                .map(DateTime::<Utc>::from)
+                .is_some_and(|modified| modified < threshold)
+        });
+        if !is_verified && !is_old_enough {
+            continue;
+        }
+
+        // Canonicalization rejects any directory reached through a symlink outside the supplied
+        // root. Removing the canonical path also avoids trusting prefixes returned by an object
+        // store listing.
+        let canonical_dir = match std::fs::canonicalize(&local_dir) {
+            Ok(path) if path != canonical_root && path.starts_with(&canonical_root) => path,
+            Ok(_) => continue,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                first_error.get_or_insert_with(|| Error::from(err));
+                continue;
+            }
+        };
+        if let Err(err) = std::fs::remove_dir(canonical_dir)
+            && !matches!(
                 err.kind(),
                 ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
-            ) =>
+            )
         {
-            Ok(())
+            first_error.get_or_insert_with(|| Error::from(err));
         }
-        Err(err) => Err(Error::from(err)),
+    }
+
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
     }
 }
 

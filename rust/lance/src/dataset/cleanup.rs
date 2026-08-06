@@ -621,85 +621,6 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
-    async fn find_empty_unreferenced_index_dirs(
-        &self,
-        inspection: &CleanupInspection,
-    ) -> HashSet<Path> {
-        // Rediscover empty directories left by a previous interrupted cleanup. Only inspect the
-        // dataset's index subtree, and never descend into an index referenced by a retained
-        // manifest.
-        let indices_dir = self.dataset.indices_dir();
-        let index_listing = match self
-            .dataset
-            .object_store
-            .list_with_delimiter(Some(&indices_dir))
-            .await
-        {
-            Ok(listing) => listing,
-            Err(Error::NotFound { .. }) => return HashSet::new(),
-            Err(error) => {
-                warn!(
-                    path = indices_dir.as_ref(),
-                    error = %error,
-                    "Failed to discover empty index directories"
-                );
-                return HashSet::new();
-            }
-        };
-
-        stream::iter(index_listing.common_prefixes)
-            .filter(|index_dir| {
-                future::ready(
-                    index_dir.filename().is_some_and(|uuid| {
-                        !inspection.referenced_files.index_uuids.contains(uuid)
-                    }),
-                )
-            })
-            .map(|index_dir| self.find_empty_index_subtree(index_dir))
-            .buffer_unordered(self.dataset.object_store.io_parallelism())
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
-    async fn find_empty_index_subtree(&self, index_dir: Path) -> Vec<Path> {
-        let mut pending_dirs = vec![index_dir];
-        let mut empty_dirs = Vec::new();
-
-        while let Some(dir_path) = pending_dirs.pop() {
-            let listing = match self
-                .dataset
-                .object_store
-                .list_with_delimiter(Some(&dir_path))
-                .await
-            {
-                Ok(listing) => listing,
-                Err(Error::NotFound { .. }) => continue,
-                Err(error) => {
-                    warn!(
-                        path = dir_path.as_ref(),
-                        error = %error,
-                        "Failed to inspect index directory for empty-directory cleanup"
-                    );
-                    return Vec::new();
-                }
-            };
-
-            if !listing.objects.is_empty() {
-                // A file anywhere in an unreferenced tree may belong to an operation in progress.
-                // Normal file cleanup will add its parent directories if the file is safe to
-                // delete; otherwise preserve this entire tree, including empty descendants.
-                return Vec::new();
-            }
-            empty_dirs.push(dir_path);
-            pending_dirs.extend(listing.common_prefixes);
-        }
-
-        empty_dirs
-    }
-
     #[instrument(
         level = "debug",
         skip_all,
@@ -722,12 +643,14 @@ impl<'a> CleanupTask<'a> {
             self.dataset.object_store.scheme(),
             "file" | "file+uring" | "file-object-store"
         );
-        let index_dirs_to_remove = Mutex::new(if deletes_files && removes_empty_dirs {
-            self.find_empty_unreferenced_index_dirs(&inspection).await
-        } else {
-            HashSet::new()
-        });
         let indices_dir = self.dataset.indices_dir();
+        let retained_index_dirs = inspection
+            .referenced_files
+            .index_uuids
+            .iter()
+            .map(|uuid| indices_dir.clone().join(uuid.as_str()))
+            .collect::<HashSet<_>>();
+        let index_dirs_to_remove = Mutex::new(HashSet::new());
         let candidate_file_limit = self.action.candidate_file_limit();
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
@@ -853,25 +776,23 @@ impl<'a> CleanupTask<'a> {
                 .try_for_each(|_| future::ready(Ok(())))
                 .await?;
 
-            let mut index_dirs = index_dirs_to_remove
-                .into_inner()
-                .unwrap()
-                .into_iter()
-                .collect::<Vec<_>>();
-            index_dirs.sort_unstable_by_key(|path| std::cmp::Reverse(path.parts_count()));
-            for dir_path in index_dirs {
-                if let Err(error) = self
+            if removes_empty_dirs
+                && let Err(error) = self
                     .dataset
                     .object_store
-                    .remove_empty_dir(dir_path.clone())
+                    .remove_empty_dirs(
+                        indices_dir.clone(),
+                        retained_index_dirs,
+                        index_dirs_to_remove.into_inner().unwrap(),
+                        (!self.policy.delete_unverified).then_some(verification_threshold),
+                    )
                     .await
-                {
-                    warn!(
-                        path = dir_path.as_ref(),
-                        error = %error,
-                        "Failed to remove empty index directory"
-                    );
-                }
+            {
+                warn!(
+                    path = indices_dir.as_ref(),
+                    error = %error,
+                    "Failed to remove empty index directories"
+                );
             }
         } else {
             // Drain the stream to populate stats, but do not call remove_stream.
@@ -1697,6 +1618,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use rstest::rstest;
     use uuid::Uuid;
 
     #[derive(Debug)]
@@ -2883,7 +2805,10 @@ mod tests {
             .await
             .unwrap();
 
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now + TimeDelta::try_days(10).unwrap().to_std().unwrap());
         let in_progress_uuid = Uuid::new_v4();
         write_dummy_index_artifact(&dataset, in_progress_uuid)
             .await
@@ -2904,6 +2829,59 @@ mod tests {
         assert!(fixture.local_index_dir(referenced_uuid).exists());
         assert!(fixture.local_index_dir(in_progress_uuid).exists());
         assert!(in_progress_empty_dir.exists());
+    }
+
+    #[rstest]
+    #[case::default_policy(false, true)]
+    #[case::delete_unverified(true, false)]
+    #[tokio::test]
+    async fn cleanup_applies_unverified_policy_to_fresh_empty_index_directory(
+        #[case] delete_unverified: bool,
+        #[case] should_preserve: bool,
+    ) {
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now);
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let in_progress_dir = fixture.local_index_dir(Uuid::new_v4());
+        std::fs::create_dir_all(&in_progress_dir).unwrap();
+
+        fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(7).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(in_progress_dir.exists(), should_preserve);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_does_not_remove_empty_directory_through_index_symlink() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_empty_dir = outside.path().join("must_remain");
+        std::fs::create_dir_all(&outside_empty_dir).unwrap();
+
+        let link_path = fixture.local_index_dir(Uuid::new_v4());
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link_path).unwrap();
+
+        fixture
+            .run_cleanup_with_override(utc_now(), Some(true), None)
+            .await
+            .unwrap();
+
+        assert!(outside_empty_dir.exists());
+        assert!(link_path.is_symlink());
     }
 
     #[tokio::test]

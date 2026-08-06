@@ -4,7 +4,7 @@
 //! Extend [object_store::ObjectStore] functionalities
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -953,30 +953,49 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// Remove a materialized directory if it is empty.
+    /// Remove eligible materialized empty directories below a local root.
     ///
     /// This is a no-op for object stores, which do not materialize directories.
-    /// A missing or non-empty local directory is also left unchanged.
+    /// Traversal does not follow symbolic links. Directories in `retained_dirs` and their
+    /// descendants are preserved. Other directories are removed only if they are empty and
+    /// either appear in `verified_dirs` or predate `unmodified_since`. Passing `None` for
+    /// `unmodified_since` disables the age check.
     ///
     /// ```
+    /// # use std::collections::HashSet;
+    /// # use chrono::Utc;
     /// # use lance_core::Result;
     /// # use lance_io::object_store::ObjectStore;
-    /// # async fn remove_stale_index_dir(store: &ObjectStore) -> Result<()> {
+    /// # async fn remove_stale_index_dirs(store: &ObjectStore) -> Result<()> {
     /// store
-    ///     .remove_empty_dir("dataset/_indices/stale-index")
+    ///     .remove_empty_dirs(
+    ///         "dataset/_indices",
+    ///         HashSet::new(),
+    ///         HashSet::new(),
+    ///         Some(Utc::now()),
+    ///     )
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn remove_empty_dir(&self, dir_path: impl Into<Path>) -> Result<()> {
+    pub async fn remove_empty_dirs(
+        &self,
+        root_path: impl Into<Path>,
+        retained_dirs: HashSet<Path>,
+        verified_dirs: HashSet<Path>,
+        unmodified_since: Option<DateTime<Utc>>,
+    ) -> Result<()> {
         if !self.is_local() && self.scheme != "file-object-store" {
             return Ok(());
         }
 
-        let path = dir_path.into();
-        let path = Path::parse(&path)?;
+        let path = Path::parse(root_path.into())?;
         let metrics = self.io_tracker.begin_io("delete");
-        let result = super::local::remove_empty_dir(&path);
+        let result = tokio::task::spawn_blocking(move || {
+            super::local::remove_empty_dirs(&path, &retained_dirs, &verified_dirs, unmodified_since)
+        })
+        .await
+        .map_err(|error| Error::io(format!("empty-directory cleanup task failed: {error}")))?;
         metrics.record(&result, 0);
         result
     }
@@ -1515,14 +1534,20 @@ mod tests {
     #[case("file")]
     #[case("file-object-store")]
     #[tokio::test]
-    async fn test_remove_empty_directory(#[case] scheme: &str) {
+    async fn test_remove_empty_directories(#[case] scheme: &str) {
         let path = TempStdDir::default();
-        create_dir_all(path.join("empty")).unwrap();
+        create_dir_all(path.join("stale")).unwrap();
+        create_dir_all(path.join("nested_stale").join("child")).unwrap();
+        create_dir_all(path.join("retained").join("child")).unwrap();
         write_to_file(
-            path.join("not_empty").join("test_file").to_str().unwrap(),
+            path.join("file_bearing")
+                .join("test_file")
+                .to_str()
+                .unwrap(),
             "keep",
         )
         .unwrap();
+        create_dir_all(path.join("file_bearing").join("empty_child")).unwrap();
 
         let file_url = Url::from_directory_path(&path).unwrap();
         let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
@@ -1530,20 +1555,40 @@ mod tests {
         let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
 
         store
-            .remove_empty_dir(base.clone().join("empty"))
-            .await
-            .unwrap();
-        store
-            .remove_empty_dir(base.clone().join("not_empty"))
-            .await
-            .unwrap();
-        store
-            .remove_empty_dir(base.clone().join("missing"))
+            .remove_empty_dirs(
+                base.clone(),
+                HashSet::from([base.clone().join("retained")]),
+                HashSet::new(),
+                Some(
+                    DateTime::<Utc>::from(std::time::SystemTime::now())
+                        + chrono::TimeDelta::try_days(1).unwrap(),
+                ),
+            )
             .await
             .unwrap();
 
-        assert!(!path.join("empty").exists());
-        assert!(path.join("not_empty").exists());
+        assert!(!path.join("stale").exists());
+        assert!(!path.join("nested_stale").exists());
+        assert!(path.join("retained").join("child").exists());
+        assert!(path.join("file_bearing").join("empty_child").exists());
+
+        create_dir_all(path.join("fresh")).unwrap();
+        create_dir_all(path.join("verified")).unwrap();
+        store
+            .remove_empty_dirs(
+                base.clone(),
+                HashSet::from([base.clone().join("retained")]),
+                HashSet::from([base.clone().join("verified")]),
+                Some(
+                    DateTime::<Utc>::from(std::time::SystemTime::now())
+                        - chrono::TimeDelta::try_days(7).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(path.join("fresh").exists());
+        assert!(!path.join("verified").exists());
     }
 
     #[derive(Debug)]
