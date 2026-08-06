@@ -1241,6 +1241,24 @@ impl IndexStore {
         self.btree_indexes.is_empty() && self.hnsw_indexes.is_empty() && self.fts_indexes.is_empty()
     }
 
+    /// Name every index this memtable carries, for diagnostics.
+    ///
+    /// Answers "is my fresh-tier vector search brute-force" — an absent
+    /// name is the whole explanation, and there is no other way to see it
+    /// from outside. Sorted so repeated calls compare cleanly; `HashMap`
+    /// iteration order alone would not.
+    pub fn index_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .btree_indexes
+            .keys()
+            .chain(self.hnsw_indexes.keys())
+            .chain(self.fts_indexes.keys())
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Get the total number of indexes.
     pub fn len(&self) -> usize {
         self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()

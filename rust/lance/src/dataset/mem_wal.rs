@@ -102,6 +102,7 @@ pub use sharding::{
     evaluate_sharding_spec_with_source_columns,
 };
 pub use wal::{BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, WalTailer};
+pub use write::SealFence;
 pub use write::ShardWriter;
 pub use write::ShardWriterConfig;
 pub use write::WriteResult;
