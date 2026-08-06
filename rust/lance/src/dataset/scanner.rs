@@ -4566,7 +4566,7 @@ impl Scanner {
         )?);
         // A `SortExec` top-k is not stable, so it sorts on the full FTS key rather
         // than on score alone. Both inputs need that: the union interleaves two
-        // independent plans, and a flat-only scan arrives in fragment order.
+        // independent plans, and a flat-only scan interleaves its fragments.
         let sort_exprs = fts_result_sort_exprs(plan.schema().as_ref())?;
         Ok(Arc::new(
             SortExec::new(sort_exprs, plan).with_fetch(params.limit),
