@@ -421,7 +421,7 @@ async fn do_commit_new_dataset(
                 (!transaction_file.is_empty()).then_some(transaction_file.clone());
             let mut new_frags = new_manifest.fragments.as_ref().clone();
             for f in &mut new_frags {
-                for df in f.data_files_mut() {
+                for df in f.all_data_files_mut() {
                     df.base_id = None;
                 }
                 if let Some(d) = f.deletion_file.as_mut() {

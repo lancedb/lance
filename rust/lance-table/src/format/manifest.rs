@@ -250,7 +250,7 @@ impl Manifest {
             .iter()
             .map(|fragment| {
                 let mut cloned_fragment = fragment.clone();
-                for file in cloned_fragment.data_files_mut() {
+                for file in cloned_fragment.all_data_files_mut() {
                     if file.base_id.is_none() {
                         file.base_id = Some(ref_base_id);
                     }

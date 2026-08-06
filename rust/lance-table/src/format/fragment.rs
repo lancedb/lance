@@ -550,8 +550,9 @@ impl Fragment {
     /// Every data file this fragment references: the base files plus the data
     /// file of each overlay.
     ///
-    /// Prefer this over `files`, which omits overlays.
-    pub fn data_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
+    /// Prefer this over `files`, which is the base files only and so omits
+    /// overlays.
+    pub fn all_data_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
         // Destructured on purpose: a new field here fails to compile until
         // someone decides whether it references files.
         let Self {
@@ -569,10 +570,10 @@ impl Fragment {
             .chain(overlays.iter().map(|overlay| &overlay.data_file))
     }
 
-    /// Mutable counterpart of [`Self::data_files`], for rewriting the fields a
-    /// clone has to normalize (`base_id`) across base and overlay files alike.
-    pub fn data_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
-        // Destructured for the same reason as `data_files`, and so the two
+    /// Mutable counterpart of [`Self::all_data_files`], for rewriting the fields
+    /// a clone has to normalize (`base_id`) across base and overlay files alike.
+    pub fn all_data_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
+        // Destructured for the same reason as `all_data_files`, and so the two
         // disjoint field borrows are visible to the borrow checker.
         let Self {
             id: _,
