@@ -1536,8 +1536,11 @@ mod tests {
     #[tokio::test]
     async fn test_remove_empty_directories(#[case] scheme: &str) {
         let path = TempStdDir::default();
-        create_dir_all(path.join("stale")).unwrap();
-        create_dir_all(path.join("nested_stale").join("child")).unwrap();
+        let stale_dir = path.join("stale");
+        let nested_stale_dir = path.join("nested_stale");
+        let nested_stale_child = nested_stale_dir.join("child");
+        create_dir_all(&stale_dir).unwrap();
+        create_dir_all(&nested_stale_child).unwrap();
         create_dir_all(path.join("retained").join("child")).unwrap();
         write_to_file(
             path.join("file_bearing")
@@ -1554,15 +1557,29 @@ mod tests {
         url.set_path(file_url.path());
         let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
 
+        #[cfg(unix)]
+        let unmodified_since = {
+            let old_modified_time =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+            for directory in [&stale_dir, &nested_stale_dir, &nested_stale_child] {
+                std::fs::File::open(directory)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(old_modified_time))
+                    .unwrap();
+            }
+            DateTime::<Utc>::from(std::time::SystemTime::now())
+                - chrono::TimeDelta::try_days(7).unwrap()
+        };
+        #[cfg(not(unix))]
+        let unmodified_since = DateTime::<Utc>::from(std::time::SystemTime::now())
+            + chrono::TimeDelta::try_days(1).unwrap();
+
         store
             .remove_empty_dirs(
                 base.clone(),
                 HashSet::from([base.clone().join("retained")]),
                 HashSet::new(),
-                Some(
-                    DateTime::<Utc>::from(std::time::SystemTime::now())
-                        + chrono::TimeDelta::try_days(1).unwrap(),
-                ),
+                Some(unmodified_since),
             )
             .await
             .unwrap();

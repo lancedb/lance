@@ -73,6 +73,7 @@ pub(crate) fn remove_empty_dirs(
     let mut pending_dirs = vec![(root_path, root.clone(), None::<Path>)];
     let mut discovered_dirs = Vec::new();
     let mut file_bearing_roots = HashSet::new();
+    let mut first_error = None;
     while let Some((local_dir, object_store_dir, index_root)) = pending_dirs.pop() {
         let entries = match std::fs::read_dir(&local_dir) {
             Ok(entries) => entries,
@@ -98,34 +99,47 @@ pub(crate) fn remove_empty_dirs(
             }
             let local_child = entry.path();
             let index_root = index_root.clone().unwrap_or_else(|| child.clone());
-            discovered_dirs.push((local_child.clone(), child.clone(), index_root.clone()));
+            // Removing a child changes its parent's mtime, so capture age eligibility before
+            // deepest-first deletion starts.
+            let is_old_enough = match std::fs::symlink_metadata(&local_child) {
+                Ok(metadata) => unmodified_since.is_none_or(|threshold| {
+                    metadata
+                        .modified()
+                        .ok()
+                        .map(DateTime::<Utc>::from)
+                        .is_some_and(|modified| modified < threshold)
+                }),
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    first_error.get_or_insert_with(|| Error::from(err));
+                    false
+                }
+            };
+            discovered_dirs.push((
+                local_child.clone(),
+                child.clone(),
+                index_root.clone(),
+                is_old_enough,
+            ));
             pending_dirs.push((local_child, child, Some(index_root)));
         }
     }
 
-    discovered_dirs.sort_unstable_by_key(|(_, path, _)| std::cmp::Reverse(path.parts_count()));
-    let mut first_error = None;
-    for (local_dir, object_store_dir, index_root) in discovered_dirs {
+    discovered_dirs.sort_unstable_by_key(|(_, path, _, _)| std::cmp::Reverse(path.parts_count()));
+    for (local_dir, object_store_dir, index_root, is_old_enough) in discovered_dirs {
         if file_bearing_roots.contains(&index_root) {
             continue;
         }
-        let metadata = match std::fs::symlink_metadata(&local_dir) {
-            Ok(metadata) if metadata.file_type().is_dir() => metadata,
+        match std::fs::symlink_metadata(&local_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
             Ok(_) => continue,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
             Err(err) => {
                 first_error.get_or_insert_with(|| Error::from(err));
                 continue;
             }
-        };
+        }
         let is_verified = verified_dirs.contains(&object_store_dir);
-        let is_old_enough = unmodified_since.is_none_or(|threshold| {
-            metadata
-                .modified()
-                .ok()
-                .map(DateTime::<Utc>::from)
-                .is_some_and(|modified| modified < threshold)
-        });
         if !is_verified && !is_old_enough {
             continue;
         }
