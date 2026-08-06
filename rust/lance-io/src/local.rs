@@ -68,6 +68,24 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Await a filesystem operation running on a blocking thread, flattening the
+/// join and IO errors into a single `object_store` error.
+///
+/// Deliberately not written as `handle.await?` at the call sites: a `JoinError`
+/// means the operation panicked, and short-circuiting on it would skip the
+/// caller's metrics recording for exactly the failure worth counting.
+pub(crate) async fn join_local_io<T>(
+    handle: tokio::task::JoinHandle<std::io::Result<T>>,
+) -> object_store::Result<T> {
+    match handle.await {
+        Ok(result) => result.map_err(|err| object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: err.into(),
+        }),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Object reader for local file system.
 #[derive(Debug)]
 pub struct LocalObjectReader {
@@ -165,14 +183,13 @@ impl Reader for LocalObjectReader {
             let file = self.file.clone();
             self.size
                 .get_or_try_init(|| async move {
-                    let metadata = tokio::task::spawn_blocking(move || {
-                        file.metadata().map_err(|err| object_store::Error::Generic {
-                            store: "LocalFileSystem",
-                            source: err.into(),
-                        })
-                    })
-                    .await??;
-                    Ok(metadata.len() as usize)
+                    // The metadata lookup is this reader's equivalent of the HEAD
+                    // request a cloud reader makes to learn the object size.
+                    let metrics = self.io_tracker.begin_io("head");
+                    let result =
+                        join_local_io(tokio::task::spawn_blocking(move || file.metadata())).await;
+                    metrics.record(&result, 0);
+                    Ok(result?.len() as usize)
                 })
                 .await
                 .cloned()
@@ -189,7 +206,8 @@ impl Reader for LocalObjectReader {
         let range_u64 = (range.start as u64)..(range.end as u64);
 
         Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
+            let metrics = io_tracker.begin_io("get");
+            let result = join_local_io(tokio::task::spawn_blocking(move || {
                 let mut buf = BytesMut::with_capacity(range.len());
                 // Safety: `buf` is set with appropriate capacity above. It is
                 // written to below and we check all data is initialized at that point.
@@ -200,13 +218,10 @@ impl Reader for LocalObjectReader {
                 read_exact_at(file, buf.as_mut(), range.start as u64)?;
 
                 Ok(buf.freeze())
-            })
-            .await?
-            .map_err(|err: std::io::Error| object_store::Error::Generic {
-                store: "LocalFileSystem",
-                source: err.into(),
-            });
+            }))
+            .await;
 
+            metrics.record(&result, num_bytes);
             if result.is_ok() {
                 io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
             }
@@ -223,17 +238,16 @@ impl Reader for LocalObjectReader {
             let io_tracker = self.io_tracker.clone();
             let path = self.path.clone();
 
-            let result = tokio::task::spawn_blocking(move || {
+            let metrics = io_tracker.begin_io("get");
+            let result = join_local_io(tokio::task::spawn_blocking(move || {
                 let mut buf = Vec::new();
                 file.read_to_end(buf.as_mut())?;
                 Ok(Bytes::from(buf))
-            })
-            .await?
-            .map_err(|err: std::io::Error| object_store::Error::Generic {
-                store: "LocalFileSystem",
-                source: err.into(),
-            });
+            }))
+            .await;
 
+            let num_bytes = result.as_ref().map_or(0, |bytes| bytes.len() as u64);
+            metrics.record(&result, num_bytes);
             if let Ok(bytes) = &result {
                 io_tracker.record_read("get_all", path, bytes.len() as u64, None);
             }

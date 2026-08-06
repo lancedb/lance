@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 pub use super::index::{
     BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, HnswIndexConfig, IndexStore, MemIndexConfig,
-    validate_index_configs,
+    MemIndexKind, validate_index_configs,
 };
 pub use super::memtable::CacheConfig;
 pub use super::memtable::MemTable;
@@ -2501,10 +2501,16 @@ impl ShardWriter {
         }
     }
 
-    /// Seal the active memtable so it's queued for L0 flush. No-op when
-    /// the active memtable is empty. Errors in WAL-only mode or if this
-    /// writer has been fenced by a successor. Pair with
-    /// [`Self::wait_for_flush_drain`] to wait for the queued flush.
+    /// Seal the active memtable so it's queued for L0 flush. Errors in
+    /// WAL-only mode or if this writer has been fenced by a successor.
+    ///
+    /// The returned [`SealFence`] is what makes a *bounded* wait possible:
+    /// a caller that needs "everything written before my seal is in L0"
+    /// awaits [`SealFence::wait`], which covers the flushes outstanding at
+    /// seal time and nothing else. [`Self::wait_for_flush_drain`] instead
+    /// loops until the frozen set is *empty*, re-collecting it each round,
+    /// so it also waits on every memtable frozen *while it waits*. Under
+    /// sustained writes that set may never empty.
     ///
     /// Beyond test setup where deterministic flush points are required,
     /// this is the primary lever for callers that need to drive flushes
@@ -2514,7 +2520,7 @@ impl ShardWriter {
     /// the next epoch starts with no replayable entries from the old
     /// layout.
     #[instrument(name = "sw_force_seal_active", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
-    pub async fn force_seal_active(&self) -> Result<()> {
+    pub async fn force_seal_active(&self) -> Result<SealFence> {
         match &self.mode {
             WriterMode::MemTable {
                 state,
@@ -2524,11 +2530,28 @@ impl ShardWriter {
                 self.check_fenced().await?;
                 self.wal_flusher.check_poisoned()?;
                 let mut state = state.write().await;
-                if state.memtable.batch_count() == 0 {
-                    return Ok(());
-                }
-                writer_state.freeze_memtable(&mut state)?;
-                Ok(())
+                let sealed_generation = if state.memtable.batch_count() == 0 {
+                    None
+                } else {
+                    let generation = state.memtable.generation();
+                    writer_state.freeze_memtable(&mut state)?;
+                    Some(generation)
+                };
+                // Capture the outstanding set under the same lock that froze,
+                // so no freeze can slip between the two and widen the fence.
+                // It covers more than the generation just sealed: a
+                // size/interval trigger freezes generations asynchronously, so
+                // an empty active memtable does *not* mean every pre-call write
+                // already reached L0. Watchers are popped as flushes settle, so
+                // whatever remains here is exactly what is still owed.
+                Ok(SealFence {
+                    sealed_generation,
+                    watchers: state
+                        .frozen_flush_watchers
+                        .iter()
+                        .map(|(_, w)| w.clone())
+                        .collect(),
+                })
             }
             WriterMode::WalOnly { .. } => Err(Error::invalid_input(
                 "force_seal_active not available in WAL-only mode (no MemTable)",
@@ -2542,12 +2565,10 @@ impl ShardWriter {
     /// want everything-on-disk. Errors in WAL-only mode, or if any
     /// awaited flush reports `DurabilityResult::Failed`.
     ///
-    /// Useful in tests for deterministic post-flush assertions, and in
-    /// production wherever a caller needs a synchronous fence after
-    /// [`Self::force_seal_active`] — e.g. trimming memtable residency
-    /// across shards in a multi-table WAL writer, or ensuring the WAL
-    /// is fully drained to Lance storage before rolling to a new
-    /// format/epoch.
+    /// Useful in tests for deterministic post-flush assertions. In
+    /// production prefer [`SealFence::wait`] from the seal itself: this
+    /// drains the queue to empty, including memtables frozen after the
+    /// call, so under sustained writes it may not return.
     #[instrument(name = "sw_wait_for_flush_drain", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn wait_for_flush_drain(&self) -> Result<()> {
         let state_lock = match &self.mode {
@@ -2833,6 +2854,52 @@ pub struct MemTableStats {
 pub struct WalStats {
     /// Next WAL entry position to be used.
     pub next_wal_entry_position: u64,
+}
+
+/// The L0 flushes outstanding when [`ShardWriter::force_seal_active`]
+/// returned — the exact predicate for "everything written before that call
+/// is in L0".
+///
+/// The set is fixed at seal time, so [`Self::wait`] is bounded no matter how
+/// many memtables freeze while it waits, and each entry reports the outcome of
+/// its own flush. That is why the fence is a captured watcher set and not a
+/// generation number compared against `ShardManifest::current_generation`: the
+/// manifest advances to `generation + 1` on every committed flush without
+/// checking for a gap, so a later generation's success moves it past a
+/// generation that failed and never reached L0 — the watermark would report
+/// durability that does not exist.
+#[derive(Debug)]
+pub struct SealFence {
+    sealed_generation: Option<u64>,
+    watchers: Vec<DurabilityWatcher>,
+}
+
+impl SealFence {
+    /// The generation the seal froze, or `None` when the active memtable
+    /// was empty (a no-op seal). Independent of what the fence covers: an
+    /// empty active memtable says nothing about generations frozen earlier
+    /// and still awaiting flush, which the fence still waits on.
+    pub fn sealed_generation(&self) -> Option<u64> {
+        self.sealed_generation
+    }
+
+    /// Block until every flush this fence covers has landed in L0.
+    ///
+    /// Errors if any of them reports `DurabilityResult::Failed`, or if the
+    /// flush handler exited without reporting.
+    pub async fn wait(self) -> Result<()> {
+        for mut watcher in self.watchers {
+            match watcher.await_value().await {
+                Some(durability) => durability.into_result()?,
+                None => {
+                    return Err(Error::io(
+                        "MemTable flush handler exited before reporting completion",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The oldest store that still owes the WAL an append, or `None` when everything
@@ -6900,8 +6967,9 @@ mod tests {
             .put(vec![create_test_batch(&schema, 0, 10)])
             .await
             .unwrap();
-        writer.force_seal_active().await.unwrap();
-        writer.wait_for_flush_drain().await.unwrap();
+        let fence = writer.force_seal_active().await.unwrap();
+        assert_eq!(fence.sealed_generation(), Some(initial_gen));
+        fence.wait().await.unwrap();
 
         let stats = writer.memtable_stats().await.unwrap();
         assert_eq!(stats.generation, initial_gen + 1);
@@ -6915,6 +6983,127 @@ mod tests {
         assert_eq!(manifest.sstables.len(), flushed_before + 1);
 
         writer.close().await.unwrap();
+    }
+
+    /// Durable writes so `put` returns only once the row is indexed and
+    /// WAL-durable. Both fence tests tear the background tasks down before
+    /// freezing, and a freeze still owing an index apply or a WAL append
+    /// would dispatch onto a closed channel and poison the writer.
+    fn seal_fence_test_config(shard_id: Uuid) -> ShardWriterConfig {
+        ShardWriterConfig {
+            shard_id,
+            shard_spec_id: 0,
+            durable_write: true,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        }
+    }
+
+    /// An empty active memtable does not mean every pre-call write is in
+    /// L0: a size/interval trigger swaps generation N for an empty N+1
+    /// while N's flush is still in flight. The seal must fence that
+    /// generation anyway — reporting "nothing sealed, nothing to wait for"
+    /// lets a caller acknowledge a flush that has not happened.
+    #[tokio::test]
+    async fn test_force_seal_active_fences_pending_generation_when_active_is_empty() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            seal_fence_test_config(Uuid::new_v4()),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // Stop the flush tasks, then freeze by hand: this is the post-rotation
+        // state held still — generation N frozen and unflushed, N+1 active and
+        // empty.
+        writer.task_executor.shutdown_all().await.unwrap();
+        let pending_generation = match &writer.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                ..
+            } => {
+                let mut state = state.write().await;
+                writer_state.freeze_memtable(&mut state).unwrap() - 1
+            }
+            WriterMode::WalOnly { .. } => unreachable!("opened in memtable mode"),
+        };
+
+        let fence = writer.force_seal_active().await.unwrap();
+        assert_eq!(
+            fence.sealed_generation(),
+            None,
+            "the active memtable was empty, so this seal froze nothing"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), fence.wait())
+                .await
+                .is_err(),
+            "generation {pending_generation} is still awaiting flush; the fence must not be satisfied"
+        );
+    }
+
+    /// The fence is tied to each flush's own outcome, never to
+    /// `ShardManifest::current_generation`. The manifest advances to
+    /// `generation + 1` on every committed flush without checking for a gap,
+    /// so a later generation's success moves it past one that failed — a
+    /// watermark comparison would report durability that does not exist.
+    #[tokio::test]
+    async fn test_force_seal_active_fence_ignores_manifest_generation_advance() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            seal_fence_test_config(Uuid::new_v4()),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // No flush task, so the sealed generation never reaches L0.
+        writer.task_executor.shutdown_all().await.unwrap();
+        let fence = writer.force_seal_active().await.unwrap();
+        let sealed = fence
+            .sealed_generation()
+            .expect("the active memtable held rows");
+
+        // Advance the manifest past the sealed generation, as a later
+        // generation's successful flush would.
+        writer
+            .manifest_store
+            .commit_update(writer.epoch(), |current| ShardManifest {
+                version: current.version + 1,
+                current_generation: sealed + 2,
+                ..current.clone()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), fence.wait())
+                .await
+                .is_err(),
+            "generation {sealed} never reached L0; a manifest advance past it must not satisfy its fence"
+        );
     }
 
     /// `abort` tears down the background flush tasks WITHOUT flushing —

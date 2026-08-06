@@ -97,8 +97,16 @@ impl BoundingBox {
     }
 
     pub fn add_rect(&mut self, rect: &impl RectTrait<T = f64>) {
-        self.add_coord(&rect.min());
-        self.add_coord(&rect.max());
+        let min = rect.min();
+        let max = rect.max();
+
+        // Empty bounding boxes use inverted bounds, so they are the identity for a union.
+        if min.x() > max.x() || min.y() > max.y() {
+            return;
+        }
+
+        self.add_coord(&min);
+        self.add_coord(&max);
     }
 
     pub fn add_polygon(&mut self, polygon: &impl PolygonTrait<T = f64>) {
@@ -330,4 +338,31 @@ fn impl_total_bounds<'a>(arr: &'a impl GeoArrowArrayAccessor<'a>) -> ArrowResult
     }
 
     Ok(bbox)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_empty_rect_is_noop() {
+        let valid = BoundingBox::new_with_coords(&[
+            geo_types::coord! { x: -1.0, y: -2.0 },
+            geo_types::coord! { x: 3.0, y: 4.0 },
+        ]);
+        let empty = BoundingBox::new();
+
+        let mut valid_then_empty = valid;
+        valid_then_empty.add_rect(&empty);
+
+        let mut empty_then_valid = empty;
+        empty_then_valid.add_rect(&valid);
+
+        for bbox in [valid_then_empty, empty_then_valid] {
+            assert_eq!(bbox.minx(), -1.0);
+            assert_eq!(bbox.miny(), -2.0);
+            assert_eq!(bbox.maxx(), 3.0);
+            assert_eq!(bbox.maxy(), 4.0);
+        }
+    }
 }

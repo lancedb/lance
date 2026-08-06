@@ -3,8 +3,8 @@
 
 //! LSM Scanner builder.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
@@ -19,6 +19,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
 use lance_core::{Error, Result, is_system_column};
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
@@ -56,9 +57,15 @@ struct LsmVectorQuery {
 /// If `filter` is a point-lookup shape on `pk_col` — `pk = lit` (either
 /// operand order) or `pk IN (lit, …)` — return the literal key values. Any
 /// other shape returns `None`, so the scanner falls through to the general
-/// scan plan. Type coercion is left to the lookup path (an exact-type literal
-/// takes the fast BTree path; a coercible one falls back internally).
-fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>> {
+/// scan plan. `IN` keys are normalized to `pk_type` only for deduplication;
+/// the first original literal is retained so the lookup path still chooses
+/// between its exact-type fast path and coercing fallback. A literal that
+/// cannot be normalized routes the expression through the general scan.
+fn extract_pk_point_keys(
+    filter: &Expr,
+    pk_col: &str,
+    pk_type: &DataType,
+) -> Option<Vec<ScalarValue>> {
     match filter {
         Expr::BinaryExpr(b) if matches!(b.op, Operator::Eq) => {
             match (b.left.as_ref(), b.right.as_ref()) {
@@ -79,11 +86,15 @@ fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>
                 return None;
             }
             let mut vals = Vec::with_capacity(in_list.list.len());
+            let mut seen = HashSet::with_capacity(in_list.list.len());
             for e in &in_list.list {
                 let Expr::Literal(lit, _) = e else {
                     return None; // a non-literal IN element → not a point lookup
                 };
-                vals.push(lit.clone());
+                let identity = safe_coerce_scalar(lit, pk_type)?;
+                if seen.insert(identity) {
+                    vals.push(lit.clone());
+                }
             }
             (!vals.is_empty()).then_some(vals)
         }
@@ -629,9 +640,6 @@ impl LsmScanner {
             )
         })?;
         let base_schema = self.schema();
-        base_schema.field_with_name(&column).map_err(|_| {
-            Error::invalid_input(format!("Column '{}' not found in schema", column))
-        })?;
         let query_limit = query
             .limit
             .map(|limit| {
@@ -701,7 +709,9 @@ impl LsmScanner {
             && !self.with_row_address
             && !self.projection_has_system_columns()
             && let Some(filter) = &self.filter
-            && let Some(keys) = extract_pk_point_keys(filter, &self.pk_columns[0])
+            && let Ok(pk_field) = base_schema.field_with_name(&self.pk_columns[0])
+            && let Some(keys) =
+                extract_pk_point_keys(filter, &self.pk_columns[0], pk_field.data_type())
         {
             let mut planner =
                 LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema);
@@ -919,6 +929,12 @@ impl std::fmt::Debug for LsmScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Int32Array, ListArray, StringArray, StructArray, UInt32Array};
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{Field, Fields};
+    use lance_index::scalar::inverted::{DOC_INDEX_COL, DocumentGranularity, InvertedIndexParams};
+
+    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
     #[test]
     fn test_lsm_scanner_builder() {
@@ -932,6 +948,22 @@ mod tests {
         // so just test the type construction
         assert_eq!(pk_columns.len(), 1);
         assert!(shard_snapshots.is_empty());
+    }
+
+    #[test]
+    fn point_lookup_extraction_requires_normalizable_literals() {
+        use datafusion::prelude::{col, lit};
+
+        let filters = [
+            col("id").in_list(vec![lit(1i32), lit("not an integer")], false),
+            col("id").in_list(vec![lit(1i32), col("other")], false),
+        ];
+        for filter in filters {
+            assert!(
+                extract_pk_point_keys(&filter, "id", &DataType::Int32).is_none(),
+                "unsupported point-lookup filter must use the scan path: {filter}"
+            );
+        }
     }
 
     #[test]
@@ -1830,6 +1862,103 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn full_text_search_supports_nested_list_element_path() {
+        let doc_fields = Fields::from(vec![Field::new("content", DataType::Utf8, true)]);
+        let doc_values = StructArray::new(
+            doc_fields.clone(),
+            vec![Arc::new(StringArray::from(vec!["alpha", "beta", "alpha"]))],
+            None,
+        );
+        let doc_item = Arc::new(Field::new("item", DataType::Struct(doc_fields), true));
+        let docs = ListArray::new(
+            doc_item.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 3])),
+            Arc::new(doc_values),
+            None,
+        );
+        let group_fields = Fields::from(vec![Field::new("docs", DataType::List(doc_item), true)]);
+        let group_values = StructArray::new(group_fields.clone(), vec![Arc::new(docs)], None);
+        let group_item = Arc::new(Field::new("item", DataType::Struct(group_fields), true));
+        let groups = ListArray::new(
+            group_item,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+            Arc::new(group_values),
+            None,
+        );
+        let schema = pk_schema_with(Field::new("groups", groups.data_type().clone(), true));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![7])), Arc::new(groups)],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes
+            .add_fts_with_params(
+                "content_list_element_fts".to_string(),
+                1,
+                "groups.docs.content".to_string(),
+                InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
+            )
+            .unwrap();
+        let (batch_position, row_offset, _) = batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, row_offset, Some(batch_position))
+            .unwrap();
+
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            "memory://nested_fts",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: Arc::new(indexes),
+                    schema,
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        )
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new("alpha".to_string())
+                .with_column("groups.docs.content".to_string())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let coordinates = batch[DOC_INDEX_COL]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let mut hits = (0..batch.num_rows())
+            .map(|row| {
+                let coordinate = coordinates
+                    .value(row)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec();
+                (ids.value(row), coordinate)
+            })
+            .collect::<Vec<_>>();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![(7, vec![0, 0]), (7, vec![1, 1])]);
+    }
+
     /// Empty search results must still preserve the execution plan schema.
     #[tokio::test]
     async fn try_into_batch_empty_fts_keeps_score_schema() {
@@ -1975,6 +2104,48 @@ mod tests {
             "pk IN (..) must route"
         );
         assert_eq!(count(plan).await, 2);
+
+        // Duplicate literals retain predicate semantics: each matching row is
+        // emitted once, including when a limit would otherwise hide a distinct
+        // match behind the duplicate.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(1i32), lit(2i32)], false))
+            .limit(Some(2), None)
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![1, 2]);
+
+        // Distinct literal types can coerce to the same primary-key value and
+        // must share one deduplication identity before the limit is applied.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(1i64), lit(2i32)], false))
+            .limit(Some(2), None)
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![1, 2]);
+
+        // Coercible literals use the per-key fallback and must have the same
+        // set semantics as exact-type keys.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i64), lit(1i64), lit(3i64)], false))
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![1, 3]);
+
+        // NULL literals cannot match, and duplicate NULLs must not affect the
+        // non-NULL matches.
+        let null = lit(ScalarValue::Int32(None));
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![null.clone(), lit(2i32), null], false))
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![2]);
 
         // A range filter is NOT a point lookup → falls through to the scan path.
         let plan = scanner()

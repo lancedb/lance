@@ -260,7 +260,9 @@ async fn test_query_date(#[case] data_type: DataType) {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value < current_date()").await;
-            test_filter(&original, &ds, "value > DATE '2024-01-01'").await;
+            // Mid-range literal: rand_type samples dates from the fixed range
+            // [2023-01-01, 2024-01-01), so this splits the generated values
+            test_filter(&original, &ds, "value > DATE '2023-07-01'").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
         })
@@ -295,7 +297,9 @@ async fn test_query_timestamp(#[case] data_type: DataType) {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value < current_timestamp()").await;
-            test_filter(&original, &ds, "value > TIMESTAMP '2024-01-01 00:00:00'").await;
+            // Mid-range literal: rand_type samples timestamps from the fixed range
+            // [2023-01-01, 2024-01-01), so this splits the generated values
+            test_filter(&original, &ds, "value > TIMESTAMP '2023-07-01 00:00:00'").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
         })

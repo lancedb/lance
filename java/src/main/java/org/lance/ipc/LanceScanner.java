@@ -14,6 +14,7 @@
 package org.lance.ipc;
 
 import org.lance.Dataset;
+import org.lance.LanceException;
 import org.lance.LockManager;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -65,6 +66,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
             options.getSubstraitFilter(),
             options.getFilter(),
             options.getBatchSize(),
+            options.getBatchSizeBytes(),
+            options.getIoBufferSize(),
             options.getLimit(),
             options.getOffset(),
             options.getNearest(),
@@ -73,6 +76,9 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
             options.isWithRowId(),
             options.isWithRowAddress(),
             options.getBatchReadahead(),
+            options.getFragmentReadahead(),
+            options.isScanInOrder(),
+            options.getLateMaterialization(),
             options.getColumnOrderings(),
             options.isUseScalarIndex(),
             options.isFastSearch(),
@@ -94,6 +100,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       Optional<ByteBuffer> substraitFilter,
       Optional<String> filter,
       Optional<Long> batchSize,
+      Optional<Long> batchSizeBytes,
+      Optional<Long> ioBufferSize,
       Optional<Long> limit,
       Optional<Long> offset,
       Optional<Query> query,
@@ -102,6 +110,9 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
+      Optional<Integer> fragmentReadahead,
+      boolean scanInOrder,
+      Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
       boolean fastSearch,
@@ -140,8 +151,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
         openStream(s.memoryAddress());
         return Data.importArrayStream(allocator, s);
       } catch (IOException e) {
-        // TODO: handle IO exception?
-        throw new RuntimeException(e);
+        throw new LanceException("Failed to open scan stream", e);
       }
     }
   }

@@ -73,3 +73,51 @@ def test_fragment_write_with_session(tmp_path: Path):
     # explicit session is rejected.
     with pytest.raises(ValueError, match="not the destination dataset's own session"):
         write_fragments(append_data, ds, mode="append", session=lance.Session())
+
+
+def test_cache_backend_uri_config():
+    session = lance.Session(index_cache_backend="moka://?capacity=1048576")
+
+    assert session.index_cache_size_bytes() == 0
+
+
+def test_cache_backend_dict_config():
+    session = lance.Session(
+        index_cache_backend={
+            "kind": "MOKA",
+            "options": {"capacity": "1048576"},
+        },
+    )
+
+    assert session.index_cache_size_bytes() == 0
+
+
+def test_cache_backend_rejects_size_and_backend():
+    with pytest.raises(
+        ValueError,
+        match="index_cache_size_bytes and index_cache_backend are mutually exclusive",
+    ):
+        lance.Session(
+            index_cache_size_bytes=1024,
+            index_cache_backend="moka://?capacity=1048576",
+        )
+
+
+def test_cache_backend_rejects_unknown_dict_key():
+    with pytest.raises(ValueError, match="unknown dict key"):
+        lance.Session(
+            index_cache_backend={
+                "kind": "moka",
+                "capacity": "1048576",
+            },
+        )
+
+
+def test_cache_backend_rejects_moka_without_capacity():
+    with pytest.raises(ValueError, match="capacity is required"):
+        lance.Session(index_cache_backend="moka://")
+
+
+def test_cache_backend_rejects_moka_empty_capacity():
+    with pytest.raises(ValueError, match="capacity must not be empty"):
+        lance.Session(index_cache_backend="moka://?capacity=")

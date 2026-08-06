@@ -13,6 +13,7 @@
  */
 package org.lance.index.scalar;
 
+import org.lance.DocumentGranularity;
 import org.lance.util.JsonUtils;
 
 import com.google.common.base.Preconditions;
@@ -56,6 +57,7 @@ public final class InvertedIndexParams {
     private Integer blockSize = 128;
     private Boolean skipMerge;
     private Integer formatVersion;
+    private DocumentGranularity documentGranularity = DocumentGranularity.ROW;
 
     /**
      * Configure the base tokenizer.
@@ -282,6 +284,21 @@ public final class InvertedIndexParams {
       return this;
     }
 
+    /**
+     * Configure the unit treated as one FTS document.
+     *
+     * <p>{@link DocumentGranularity#LIST_ELEMENT} uses each element of the deepest list on the
+     * indexed field path as one document. The default is {@link DocumentGranularity#ROW}.
+     *
+     * @param documentGranularity document boundary semantics
+     * @return this builder
+     */
+    public Builder documentGranularity(DocumentGranularity documentGranularity) {
+      this.documentGranularity =
+          Objects.requireNonNull(documentGranularity, "documentGranularity must not be null");
+      return this;
+    }
+
     /** Build a {@link ScalarIndexParams} instance for an inverted index. */
     public ScalarIndexParams build() {
       if (formatVersion != null) {
@@ -342,6 +359,7 @@ public final class InvertedIndexParams {
       if (formatVersion != null) {
         params.put("format_version", formatVersion);
       }
+      params.put("document_granularity", documentGranularity.toRustString());
 
       String json = JsonUtils.toJson(params);
       return ScalarIndexParams.create(INDEX_TYPE, json);

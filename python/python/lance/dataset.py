@@ -9,6 +9,7 @@ import json
 import operator
 import os
 import random
+import re
 import time
 import uuid
 import warnings
@@ -44,6 +45,9 @@ from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
+    _is_pydantic_base_model_class,
+    _validate_pydantic_list,
+    model_to_dict,
     torch,
 )
 from .dependencies import numpy as np
@@ -70,7 +74,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .query import FullTextQuery
+from .query import DocumentGranularity, FullTextQuery
 from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -239,14 +243,6 @@ def _is_null_blob_description(description: Any) -> bool:
         return False
     if description.keys() == {"position", "size"}:
         return description["position"] == 1 and description["size"] == 0
-    if description.keys() == {"kind", "position", "size", "blob_id", "blob_uri"}:
-        return (
-            description["kind"] == 0
-            and description["position"] == 0
-            and description["size"] == 0
-            and description["blob_id"] == 0
-            and description["blob_uri"] == ""
-        )
     return False
 
 
@@ -854,6 +850,55 @@ class LanceDataset(pa.dataset.Dataset):
             base_store_params=base_store_params,
         )
 
+    @classmethod
+    def from_pydantic_model(
+        cls,
+        model_class,
+        data,
+        uri: Optional[Union[str, Path]] = None,
+        mode: str = "create",
+        **kwargs,
+    ) -> "LanceDataset":
+        """Create a LanceDataset from a Pydantic model class and a list of instances.
+
+        The table name is inferred from the model class name converted to snake_case.
+        The schema is inferred from the model class's field annotations, not from
+        the data, so optional fields are typed correctly even if every value in a
+        given batch happens to be None.
+
+        Parameters
+        ----------
+        model_class : type
+            A Pydantic BaseModel subclass.
+        data : list
+            A list of Pydantic model instances.
+        uri : str or Path, optional
+            The URI to write the dataset to. If not provided, the model class name
+            converted to snake_case is used as the path.
+        mode : str, optional
+            The write mode. One of "create", "overwrite", or "append".
+        **kwargs
+            Additional arguments passed to write_dataset().
+        """
+        if not _is_pydantic_base_model_class(model_class):
+            raise TypeError(
+                f"`model_class` must be a Pydantic BaseModel subclass, "
+                f"got {model_class!r}"
+            )
+        _validate_pydantic_list(data, model_class)
+        if not data:
+            raise ValueError(
+                "`data` must be a non-empty list of Pydantic model instances."
+            )
+        if uri is None:
+            uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
+        from .pydantic import pydantic_to_schema
+
+        dicts = [model_to_dict(item) for item in data]
+        schema = pydantic_to_schema(model_class)
+        table = pa.Table.from_pylist(dicts, schema=schema)
+        return write_dataset(table, uri, mode=mode, **kwargs)
+
     def __reduce__(self):
         return type(self).__deserialize__, (
             self.uri,
@@ -1201,12 +1246,14 @@ class LanceDataset(pa.dataset.Dataset):
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
-            smaller than this size.  Note: this can be overridden by
-            ``batch_size_bytes`` or by a dataset-level ``batch_size_bytes``
-            configured via ``FileReaderOptions``.
+            smaller than this size. If a byte limit is also configured, both
+            limits apply and the one reached first determines the batch size.
         batch_size_bytes: int, default None
             If set, the scanner will produce batches whose total size in bytes
-            is approximately this value, overriding the row-based ``batch_size``.
+            is approximately this value. If ``batch_size`` is also set, both
+            limits apply and the one reached first determines the batch size.
+            This cannot be combined with ``strict_batch_size=True`` because
+            strict row batching can merge batches beyond the byte limit.
             This can also be configured at the dataset level via
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
@@ -1284,6 +1331,10 @@ class LanceDataset(pa.dataset.Dataset):
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
             re-raised.
+        strict_batch_size: bool, default False
+            If True, all batches except the last batch will have exactly
+            ``batch_size`` rows. This cannot be combined with a byte limit,
+            including one configured through ``FileReaderOptions``.
         include_deleted_rows: bool, default False
             If True, then rows that have been deleted, but are still present in the
             fragment, will be returned.  These rows will have the _rowid column set
@@ -3206,8 +3257,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         column = column[0]
         lance_field = self._ds.lance_schema.field_case_insensitive(column)
-        if lance_field is None:
-            raise KeyError(f"{column} not found in schema")
 
         if isinstance(index_type, str):
             index_type = index_type.upper()
@@ -3230,6 +3279,12 @@ class LanceDataset(pa.dataset.Dataset):
                     )
                 )
 
+            if lance_field is None:
+                if index_type in ["INVERTED", "FTS"]:
+                    # Rust resolves public FTS paths through intervening list layers.
+                    return column, index_type, index_type
+                raise KeyError(f"{column} not found in schema")
+
             field = lance_field.to_arrow()
 
             field_type = field.type
@@ -3237,7 +3292,7 @@ class LanceDataset(pa.dataset.Dataset):
             if hasattr(field_type, "storage_type"):
                 field_type = field_type.storage_type
 
-            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
+            if index_type in ["BTREE", "BITMAP"]:
                 if (
                     not pa.types.is_integer(field_type)
                     and not pa.types.is_floating(field_type)
@@ -3248,12 +3303,16 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
-                        f"BTREE/BITMAP/ZONEMAP index column {column} must be int",
+                        f"BTREE/BITMAP index column {column} must be int",
                         ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
-                if not pa.types.is_list(field_type):
-                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+                if not (
+                    pa.types.is_list(field_type) or pa.types.is_large_list(field_type)
+                ):
+                    raise TypeError(
+                        f"LABEL_LIST index column {column} must be a list or large list"
+                    )
             elif index_type == "NGRAM":
                 if not pa.types.is_string(field_type) and not pa.types.is_large_string(
                     field_type
@@ -3283,7 +3342,12 @@ class LanceDataset(pa.dataset.Dataset):
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
-            config = json.dumps(index_type.parameters)
+            if lance_field is None and logical_index_type not in ["INVERTED", "FTS"]:
+                raise KeyError(f"{column} not found in schema")
+            parameters = dict(index_type.parameters)
+            if logical_index_type in ["INVERTED", "FTS"]:
+                parameters["document_granularity"] = kwargs["document_granularity"]
+            config = json.dumps(parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
             return column, "scalar", logical_index_type
         else:
@@ -3311,6 +3375,7 @@ class LanceDataset(pa.dataset.Dataset):
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     @classmethod
@@ -3325,6 +3390,7 @@ class LanceDataset(pa.dataset.Dataset):
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     def create_scalar_index(
@@ -3350,6 +3416,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         format_version: Optional[Union[int, str]] = None,
+        document_granularity: DocumentGranularity = DocumentGranularity.ROW,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -3463,6 +3530,11 @@ class LanceDataset(pa.dataset.Dataset):
             otherwise writes v2 for text analysis with ``block_size=128`` and
             v3 for code analysis or ``block_size=256``.
 
+        document_granularity: DocumentGranularity, default ROW
+            This is for the ``INVERTED`` / ``FTS`` index. ``ROW`` treats all
+            selected text in one dataset row as one document. ``LIST_ELEMENT``
+            treats each element of the deepest list on ``column`` as one document.
+
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
@@ -3556,6 +3628,11 @@ class LanceDataset(pa.dataset.Dataset):
         ``MaterializeIndex`` operator.
 
         """
+        if not isinstance(document_granularity, DocumentGranularity):
+            raise TypeError(
+                "document_granularity must be a lance.query.DocumentGranularity"
+            )
+        kwargs["document_granularity"] = document_granularity.value
         column, index_type, logical_index_type = self._prepare_scalar_index_request(
             column, index_type, kwargs
         )
@@ -3577,7 +3654,6 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["progress_callback"] = progress_callback
         if format_version is not None:
             kwargs["format_version"] = format_version
-
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def _create_index_impl(
@@ -4281,10 +4357,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar,
-        and BLOOMFILTER scalar index construction. Unlike
-        :meth:`create_index`, this method does not publish the index into the
-        dataset manifest. Instead, it writes one segment under
+        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        Unlike :meth:`create_index`, this method does not publish the index into
+        the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
@@ -4298,10 +4373,11 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, and BLOOMFILTER segments may
-        be merged with :meth:`merge_existing_index_segments` before commit.
-        NGRAM segments built before a deferred compaction must be merged before
-        commit so their postings can be rebuilt against current row addresses.
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
+        LABEL_LIST segments may be merged with
+        :meth:`merge_existing_index_segments` before commit. NGRAM segments
+        built before a deferred compaction must be merged before commit so
+        their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
@@ -5516,6 +5592,21 @@ class SqlQueryBuilder:
         self._builder = self._builder.with_row_addr(with_row_addr)
         return self
 
+    def blob_handling(
+        self,
+        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
+    ) -> "SqlQueryBuilder":
+        """
+        Control how blob columns are returned by this SQL query.
+
+        - ``"all_binary"`` materializes blob columns as binary values.
+        - ``"blobs_descriptions"`` returns blob descriptors (the default).
+        - ``"all_descriptions"`` returns descriptions for all binary-like
+          columns.
+        """
+        self._builder = self._builder.blob_handling(blob_handling)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
@@ -5717,7 +5808,13 @@ class LanceOperation:
         new_schema: pyarrow.Schema
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
-            The fragments that make up the new dataset.
+            The newly written fragments that make up the new dataset. They are
+            assigned fresh ids when the operation is committed, continuing from
+            the highest id the dataset has ever used, so any id they carry is
+            ignored. Since we reassign fragment ids, a fragment with a deletion
+            file is rejected: use :class:`LanceOperation.Delete` to commit
+            deletions, or :class:`LanceOperation.Merge` to change the schema of
+            existing fragments.
         initial_bases: list[DatasetBasePath], optional
             Base paths to register when creating a new dataset (CREATE mode only).
             **Only valid in CREATE mode**. Will raise an error if used with
@@ -6310,9 +6407,8 @@ class ScannerBuilder:
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set the maximum number of rows per batch.
 
-        Note: this can be overridden by ``batch_size_bytes`` or by a
-        dataset-level ``batch_size_bytes`` configured via
-        ``FileReaderOptions``.
+        If a byte limit is also configured, both limits apply and the one
+        reached first determines the batch size.
         """
         self._batch_size = batch_size
         return self
@@ -6321,7 +6417,8 @@ class ScannerBuilder:
         """Set the target batch size in bytes.
 
         When set, the scanner will produce batches whose total size in bytes
-        is approximately this value, overriding the row-based ``batch_size``.
+        is approximately this value. If ``batch_size`` is also set, both
+        limits apply and the one reached first determines the batch size.
 
         This can also be configured at the dataset level via
         ``FileReaderOptions``.  A scanner-level setting takes precedence
@@ -6700,6 +6797,9 @@ class ScannerBuilder:
         If this is true then small batches will need to be merged together
         which will require a data copy and incur a (typically very small)
         performance penalty.
+
+        This cannot be combined with ``batch_size_bytes`` because merging
+        batches to the strict row count can exceed the byte limit.
         """
         self._strict_batch_size = strict_batch_size
         return self
@@ -6991,6 +7091,7 @@ class DatasetOptimizer:
             Literal["reencode", "try_binary_copy", "force_binary_copy"]
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
+        max_source_fragments: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7021,7 +7122,8 @@ class DatasetOptimizer:
         ``lance.compaction.defer_index_remap``,
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
-        ``lance.compaction.binary_copy_read_batch_bytes``.
+        ``lance.compaction.binary_copy_read_batch_bytes``,
+        ``lance.compaction.max_source_fragments``.
 
         Parameters
         ----------
@@ -7074,6 +7176,12 @@ class DatasetOptimizer:
             The batch size in bytes for reading during binary copy operations.
             Controls how much data is read at once when performing binary copy.
             Defaults to 16MB.
+        max_source_fragments: int, optional
+            Maximum number of source fragments to compact in a single run.
+            Compaction tasks are included until adding the next task would
+            exceed this limit, allowing compaction to proceed incrementally.
+            Fragments are processed oldest first. If not specified, uses the
+            manifest config value, or applies no limit.
 
         Returns
         -------
@@ -7097,6 +7205,7 @@ class DatasetOptimizer:
                 batch_size=batch_size,
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
+                max_source_fragments=max_source_fragments,
             ).items()
             if v is not None
         }
@@ -7180,7 +7289,7 @@ class Tags:
         """
         return self._ds.tags()
 
-    def get_version(self, tag: str) -> Optional[int]:
+    def get_version(self, tag: str) -> int:
         """
         Get the version of a specific tag by name.
 
@@ -7191,8 +7300,13 @@ class Tags:
 
         Returns
         -------
-        int or None
-            The version number of the tag if it exists, otherwise None.
+        int
+            The version number of the tag.
+
+        Raises
+        ------
+        ValueError
+            If the tag does not exist. Use :meth:`list` to check for presence.
         """
         return self._ds.get_version(tag)
 

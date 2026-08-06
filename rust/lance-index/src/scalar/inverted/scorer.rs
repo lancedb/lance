@@ -164,24 +164,20 @@ pub struct IndexBM25Scorer<'a> {
 }
 
 impl<'a> IndexBM25Scorer<'a> {
-    /// Sync constructor. Reads each partition's cached `total_tokens` via
-    /// `LazyDocSet::total_tokens_cached()`; callers must have already
-    /// populated it (via `ensure_loaded`, `ensure_num_tokens_loaded`, or
-    /// `total_tokens_num`). Panics with a clear message otherwise — this
-    /// is the wand-scoring path where the contract is statically known.
+    /// Sync constructor.  Query setup populates immutable partition stats
+    /// before entering the CPU-only WAND executor.
     pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
         let partitions = partitions.collect::<Vec<_>>();
-        let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
-        let total_tokens: u64 = partitions
+        let stats = partitions
             .iter()
-            .map(|p| {
-                p.docs.total_tokens_cached().expect(
-                    "IndexBM25Scorer::new requires each partition's total_tokens to be \
-                     cached; call `ensure_loaded` / `ensure_num_tokens_loaded` / \
-                     `total_tokens_num` first",
+            .map(|partition| {
+                partition.docs.cached_stats().expect(
+                    "IndexBM25Scorer::new requires partition stats to be loaded before WAND",
                 )
             })
-            .sum();
+            .collect::<Vec<_>>();
+        let num_docs = stats.iter().map(|stats| stats.num_docs).sum();
+        let total_tokens: u64 = stats.iter().map(|stats| stats.total_tokens).sum();
         let avgdl = total_tokens as f32 / num_docs as f32;
         Self {
             partitions,

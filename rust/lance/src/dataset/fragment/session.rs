@@ -89,7 +89,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ADDR;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_encoding::version::LanceFileVersion;
+    use lance_file::version::LanceFileVersion;
     use rstest::rstest;
     use std::sync::Arc;
 
