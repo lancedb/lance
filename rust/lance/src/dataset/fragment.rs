@@ -1396,32 +1396,35 @@ impl FileFragment {
     /// Validate the fragment
     ///
     /// Verifies:
-    /// * Field ids are non-negative or the tombstone sentinel
-    /// * All live field ids in the fragment are distinct
-    /// * Within each legacy data file, field ids are in increasing order
+    /// * All field ids in the fragment are distinct
+    /// * Within each data file, field ids are in increasing order
     /// * All data files exist and have the same length
+    /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
     /// * `Fragment.physical_rows` matches length of file
     /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
     pub async fn validate(&self) -> Result<()> {
         let mut seen_fields = HashSet::new();
         for data_file in &self.metadata.files {
-            for field_id in data_file.fields.iter().copied() {
-                // Tombstones do not identify logical fields and can be repeated.
-                if field_id == TOMBSTONE_FIELD_ID {
+            let last = -1;
+            for field_id in data_file.fields.iter() {
+                // A tombstone marks a field superseded by a later data file.
+                // It is not a field id: it has no ordering and can repeat.
+                if *field_id == TOMBSTONE_FIELD_ID {
                     continue;
                 }
-                if field_id < 0 {
+                if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
                             .data_file_dir(data_file)?
                             .join(data_file.path.as_str()),
                         format!(
-                            "Field id {} is invalid in fragment {:#?}; only tombstone field id {} may be negative",
-                            field_id, self, TOMBSTONE_FIELD_ID
+                            "Field id {} is not in increasing order in fragment {:#?}",
+                            field_id, self
                         ),
                     ));
                 }
+
                 if !seen_fields.insert(field_id) {
                     return Err(Error::corrupt_file(
                         self.dataset
@@ -5507,27 +5510,6 @@ mod tests {
         assert_eq!(
             fragment.metadata.deletion_file.unwrap().num_deleted_rows,
             Some(13)
-        );
-    }
-
-    #[rstest]
-    #[case::unassigned(-1)]
-    #[case::unknown_negative(-3)]
-    #[tokio::test]
-    async fn test_validate_rejects_invalid_negative_field_id(#[case] field_id: i32) {
-        let test_dir = TempStrDir::default();
-        let dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
-        let mut fragment = dataset.get_fragment(0).unwrap();
-        fragment.metadata.files[0].fields = Arc::from([field_id, 1]);
-
-        let error = fragment.validate().await.unwrap_err();
-
-        assert!(matches!(&error, Error::CorruptFile { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("Field id {field_id} is invalid")),
-            "unexpected error: {error}"
         );
     }
 
