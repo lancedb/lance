@@ -16,7 +16,7 @@ use lance_table::rowids::{RowIdSequence, read_row_ids, write_row_ids};
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyRange, PyRangeMethods, PyTuple};
 use pyo3::{IntoPyObjectExt, intern};
 
 use crate::error::PythonErrorExt;
@@ -68,9 +68,17 @@ impl PyRowIdSequence {
         self.0.len() as usize
     }
 
-    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyRowIdSequenceIterator>> {
-        let row_ids: Vec<u64> = self.0.iter().collect();
-        Py::new(py, PyRowIdSequenceIterator(row_ids.into_iter()))
+    fn __iter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyRowIdSequenceIterator>> {
+        let len = slf.borrow().0.len() as usize;
+        Py::new(
+            slf.py(),
+            PyRowIdSequenceIterator {
+                sequence: slf.clone().unbind(),
+                offset: 0,
+                len,
+                buffer: Vec::new().into_iter(),
+            },
+        )
     }
 
     fn __repr__(&self) -> String {
@@ -117,8 +125,23 @@ impl PyRowIdSequence {
     }
 }
 
+/// Row ids buffered per refill while iterating.
+///
+/// A borrowing iterator cannot be held by a `#[pyclass]`, and stepping through
+/// `RowIdSequence::get` is quadratic because segment lengths are recomputed on
+/// each call. Buffering slices keeps the memory held during iteration constant
+/// while amortizing the segment walk over a whole chunk.
+const ITER_CHUNK_LEN: usize = 1024;
+
 #[pyclass(name = "RowIdSequenceIterator", module = "lance.fragment")]
-pub struct PyRowIdSequenceIterator(std::vec::IntoIter<u64>);
+pub struct PyRowIdSequenceIterator {
+    sequence: Py<PyRowIdSequence>,
+    /// Offset of the next row id to buffer.
+    offset: usize,
+    /// Length of the sequence, which is immutable once constructed.
+    len: usize,
+    buffer: std::vec::IntoIter<u64>,
+}
 
 #[pymethods]
 impl PyRowIdSequenceIterator {
@@ -126,8 +149,25 @@ impl PyRowIdSequenceIterator {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<u64> {
-        slf.0.next()
+    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> Option<u64> {
+        if let Some(row_id) = slf.buffer.next() {
+            return Some(row_id);
+        }
+        if slf.offset >= slf.len {
+            return None;
+        }
+
+        let chunk_len = ITER_CHUNK_LEN.min(slf.len - slf.offset);
+        let sequence = slf.sequence.clone_ref(py);
+        let buffer: Vec<u64> = sequence
+            .borrow(py)
+            .0
+            .slice(slf.offset, chunk_len)
+            .iter()
+            .collect();
+        slf.offset += chunk_len;
+        slf.buffer = buffer.into_iter();
+        slf.buffer.next()
     }
 }
 
@@ -136,29 +176,22 @@ impl PyRowIdSequenceIterator {
 /// Returns `None` for anything else, including strided and descending ranges,
 /// which are handled by the general iterable path.
 fn contiguous_range(ob: &Bound<'_, PyAny>) -> PyResult<Option<Range<u64>>> {
-    let py = ob.py();
-    let range_type = PyModule::import(py, "builtins")?.getattr("range")?;
-    if !ob.is_instance(&range_type)? {
+    let Ok(range) = ob.cast::<PyRange>() else {
+        return Ok(None);
+    };
+    // Bounds are read as `isize`. A range reaching past that is well beyond any
+    // dataset's row count, so it falls through to the element-wise path, which
+    // reads each value as a u64, rather than failing.
+    let (Ok(start), Ok(stop), Ok(step)) = (range.start(), range.stop(), range.step()) else {
+        return Ok(None);
+    };
+    if step != 1 {
         return Ok(None);
     }
-    if ob.getattr("step")?.extract::<i64>()? != 1 {
-        return Ok(None);
-    }
-
-    // Row ids span the whole u64 domain, so the bounds are read as i128 to
-    // distinguish "negative" from "too large" rather than overflowing.
-    let start = ob.getattr("start")?.extract::<i128>()?;
-    let stop = ob.getattr("stop")?.extract::<i128>()?;
     if start < 0 {
         return Err(PyValueError::new_err(format!(
             "Row ids must be non-negative, but the range starts at {}",
             start
-        )));
-    }
-    if stop > u64::MAX as i128 + 1 {
-        return Err(PyValueError::new_err(format!(
-            "Row ids must fit in a uint64, but the range ends at {}",
-            stop
         )));
     }
     if stop <= start {

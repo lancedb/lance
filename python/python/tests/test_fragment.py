@@ -1012,6 +1012,27 @@ def test_row_id_sequence_empty(row_ids):
     assert sequence.to_pyarrow() == pa.array([], type=pa.uint64())
 
 
+@pytest.mark.parametrize("num_rows", [1023, 1024, 1025, 4100])
+def test_row_id_sequence_iterates_across_buffer_refills(num_rows):
+    # Iteration refills a fixed-size buffer rather than materializing the whole
+    # sequence, so lengths either side of that boundary must all round-trip.
+    row_ids = list(range(0, num_rows * 2, 2))
+    sequence = RowIdSequence(row_ids)
+
+    assert list(sequence) == row_ids
+    # A second pass must start over rather than resume a spent buffer.
+    assert list(sequence) == row_ids
+
+
+def test_row_id_sequence_from_range_above_isize():
+    # Range bounds are read as isize; beyond that the values are read one at a
+    # time instead, which must still cover the whole uint64 row id domain.
+    start = 2**63
+    sequence = RowIdSequence(range(start, start + 3))
+
+    assert list(sequence) == [start, start + 1, start + 2]
+
+
 def test_row_id_sequence_unsorted_round_trips():
     sequence = RowIdSequence([12, 11, 10])
 
