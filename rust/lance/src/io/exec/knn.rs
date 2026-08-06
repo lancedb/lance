@@ -56,7 +56,6 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
-use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use tokio::sync::Notify;
