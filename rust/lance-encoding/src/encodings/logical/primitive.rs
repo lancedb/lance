@@ -106,6 +106,32 @@ const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
+const DEFAULT_LARGE_DICT_VALUES_COMPRESSION: &str = "zstd";
+
+/// Pick the default compression for a dictionary values buffer.
+///
+/// The buffer is compressed with a single call, so LZ4 cannot be used once it
+/// exceeds `LZ4_MAX_INPUT_SIZE`. Zstd has no such limit and compresses this kind
+/// of buffer better anyway, so fall back to it rather than failing the write.
+fn default_dict_values_compression(dict_values_size: u64) -> &'static str {
+    if dict_values_size > lz4_max_input_size() {
+        DEFAULT_LARGE_DICT_VALUES_COMPRESSION
+    } else {
+        DEFAULT_DICT_VALUES_COMPRESSION
+    }
+}
+
+const fn lz4_max_input_size() -> u64 {
+    #[cfg(feature = "lz4")]
+    {
+        crate::encodings::physical::block::LZ4_MAX_INPUT_SIZE as u64
+    }
+    // Without the lz4 feature the default below is never selected anyway.
+    #[cfg(not(feature = "lz4"))]
+    {
+        u64::MAX
+    }
+}
 
 struct PageLoadTask {
     decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
@@ -5418,6 +5444,7 @@ impl PrimitiveStructuralEncoder {
         field_metadata: &HashMap<String, String>,
         env_compression: Option<String>,
         env_compression_level: Option<String>,
+        dict_values_size: u64,
     ) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
 
@@ -5425,7 +5452,7 @@ impl PrimitiveStructuralEncoder {
             .get(DICT_VALUES_COMPRESSION_META_KEY)
             .cloned()
             .or(env_compression)
-            .unwrap_or_else(|| DEFAULT_DICT_VALUES_COMPRESSION.to_string());
+            .unwrap_or_else(|| default_dict_values_compression(dict_values_size).to_string());
         metadata.insert(COMPRESSION_META_KEY.to_string(), compression);
 
         if let Some(compression_level) = field_metadata
@@ -5439,7 +5466,7 @@ impl PrimitiveStructuralEncoder {
         metadata
     }
 
-    fn build_dict_values_compressor_field(field: &Field) -> Result<Field> {
+    fn build_dict_values_compressor_field(field: &Field, dict_values_size: u64) -> Result<Field> {
         // This is an internal synthetic field used only to feed metadata into
         // `create_block_compressor` for dictionary values. The concrete type/name here
         // are not semantically meaningful; we rely on explicit metadata below to control
@@ -5449,6 +5476,7 @@ impl PrimitiveStructuralEncoder {
             &field.metadata,
             env::var(DICT_VALUES_COMPRESSION_ENV_VAR).ok(),
             env::var(DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR).ok(),
+            dict_values_size,
         );
         Ok(dict_values_field)
     }
@@ -5538,7 +5566,8 @@ impl PrimitiveStructuralEncoder {
 
         if let Some(dictionary_data) = dictionary_data {
             let num_dictionary_items = dictionary_data.num_values();
-            let dict_values_field = Self::build_dict_values_compressor_field(field)?;
+            let dict_values_field =
+                Self::build_dict_values_compressor_field(field, dictionary_data.data_size())?;
 
             let (compressor, dictionary_encoding) = compression_strategy
                 .create_block_compressor(&dict_values_field, &dictionary_data)?;
@@ -8943,9 +8972,55 @@ mod tests {
             &HashMap::new(),
             None,
             None,
+            1024,
         );
         assert_eq!(metadata.get(COMPRESSION_META_KEY), Some(&"lz4".to_string()),);
         assert!(!metadata.contains_key(COMPRESSION_LEVEL_META_KEY));
+    }
+
+    /// Dictionary values are compressed with a single LZ4 call, which fails above
+    /// `LZ4_MAX_INPUT_SIZE`. Oversized buffers must fall back to zstd instead.
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn test_resolve_dict_values_compression_metadata_large_falls_back_to_zstd() {
+        let over = super::lz4_max_input_size() + 1;
+        let metadata = PrimitiveStructuralEncoder::resolve_dict_values_compression_metadata(
+            &HashMap::new(),
+            None,
+            None,
+            over,
+        );
+        assert_eq!(
+            metadata.get(COMPRESSION_META_KEY),
+            Some(&"zstd".to_string()),
+        );
+
+        // Exactly at the limit LZ4 is still valid, so the default is unchanged.
+        let at_limit = PrimitiveStructuralEncoder::resolve_dict_values_compression_metadata(
+            &HashMap::new(),
+            None,
+            None,
+            super::lz4_max_input_size(),
+        );
+        assert_eq!(at_limit.get(COMPRESSION_META_KEY), Some(&"lz4".to_string()),);
+    }
+
+    /// An explicit request must win even when the buffer is too large for LZ4, so
+    /// that the failure is reported rather than silently changing the user's choice.
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn test_resolve_dict_values_compression_metadata_large_respects_explicit_request() {
+        let field_metadata = HashMap::from([(
+            DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+            "lz4".to_string(),
+        )]);
+        let metadata = PrimitiveStructuralEncoder::resolve_dict_values_compression_metadata(
+            &field_metadata,
+            None,
+            None,
+            super::lz4_max_input_size() + 1,
+        );
+        assert_eq!(metadata.get(COMPRESSION_META_KEY), Some(&"lz4".to_string()),);
     }
 
     #[test]
@@ -8964,6 +9039,7 @@ mod tests {
             &field_metadata,
             Some("zstd".to_string()),
             Some("3".to_string()),
+            1024,
         );
         assert_eq!(
             metadata.get(COMPRESSION_META_KEY),
@@ -8981,6 +9057,7 @@ mod tests {
             &HashMap::new(),
             Some("zstd".to_string()),
             Some("9".to_string()),
+            1024,
         );
         assert_eq!(
             metadata.get(COMPRESSION_META_KEY),
