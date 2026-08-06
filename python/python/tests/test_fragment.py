@@ -22,7 +22,7 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter
-from lance.fragment import RowIdMeta, write_fragments
+from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
 
@@ -488,6 +488,12 @@ def _row_ids_by_id(dataset: LanceDataset) -> dict[int, int]:
     return dict(zip(table["id"].to_pylist(), table["_rowid"].to_pylist()))
 
 
+def _field_id(dataset: LanceDataset, name: str) -> int:
+    return next(
+        field.id() for field in dataset.lance_schema.fields() if field.name() == name
+    )
+
+
 def test_external_update_preserves_stable_row_ids(tmp_path: Path):
     dataset = write_dataset(
         pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]}),
@@ -496,17 +502,21 @@ def test_external_update_preserves_stable_row_ids(tmp_path: Path):
         enable_stable_row_ids=True,
     )
     row_ids_before = _row_ids_by_id(dataset)
+    value_field_id = _field_id(dataset, "value")
+    dataset.create_scalar_index("value", "BTREE")
+    dataset = lance.dataset(tmp_path)
 
     updated_fragment = dataset.get_fragments()[0].delete("id = 2")
     assert updated_fragment is not None
     new_fragments = list(
         write_fragments(pa.table({"id": [2], "value": [99]}), tmp_path)
     )
-    new_fragments[0].row_id_meta = RowIdMeta.from_ids([row_ids_before[2]])
     operation = LanceOperation.Update(
         updated_fragments=[updated_fragment],
         new_fragments=new_fragments,
+        fields_modified=[value_field_id],
         update_mode="rewrite_rows",
+        preserved_row_ids=[[row_ids_before[2]]],
     )
 
     updated_dataset = LanceDataset.commit(
@@ -522,24 +532,27 @@ def test_external_update_preserves_stable_row_ids(tmp_path: Path):
         )
     )
     assert values_by_id[2] == 99
+    assert updated_dataset.to_table(filter="value = 99").num_rows == 1
+    assert updated_dataset.to_table(filter="value = 20").num_rows == 0
 
-
-def test_row_id_meta_rejects_duplicate_ids():
-    with pytest.raises(ValueError, match="row_ids must be unique"):
-        RowIdMeta.from_ids([7, 7])
+    committed_operation = updated_dataset.read_transaction(
+        updated_dataset.version
+    ).operation
+    assert committed_operation.preserved_row_ids == [[row_ids_before[2]]]
+    assert committed_operation.fields_for_preserving_frag_bitmap == [value_field_id]
 
 
 @pytest.mark.parametrize(
-    ("row_id_case", "error"),
+    ("row_id_case", "error_type", "error"),
     [
-        ("duplicate", "duplicate supplied row_id"),
-        ("unknown", "does not identify a live row replaced"),
-        ("not_replaced", "does not identify a live row replaced"),
-        ("deleted", "does not identify a live row replaced"),
+        ("duplicate", ValueError, "preserved_row_ids contains duplicate row_id"),
+        ("unknown", OSError, "does not identify a live row replaced"),
+        ("not_replaced", OSError, "does not identify a live row replaced"),
+        ("deleted", OSError, "does not identify a live row replaced"),
     ],
 )
 def test_external_update_rejects_invalid_stable_row_ids(
-    tmp_path: Path, row_id_case: str, error: str
+    tmp_path: Path, row_id_case: str, error_type: type[Exception], error: str
 ):
     dataset = write_dataset(
         pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]}),
@@ -548,6 +561,7 @@ def test_external_update_rejects_invalid_stable_row_ids(
         enable_stable_row_ids=True,
     )
     row_ids = _row_ids_by_id(dataset)
+    value_field_id = _field_id(dataset, "value")
     if row_id_case == "deleted":
         dataset.delete("id = 4")
         dataset = lance.dataset(tmp_path)
@@ -561,8 +575,7 @@ def test_external_update_rejects_invalid_stable_row_ids(
         new_fragments.extend(
             write_fragments(pa.table({"id": [20], "value": [100]}), tmp_path)
         )
-        for fragment in new_fragments:
-            fragment.row_id_meta = RowIdMeta.from_ids([row_ids[2]])
+        preserved_row_ids = [[row_ids[2]], [row_ids[2]]]
     else:
         replacement = pa.table({"id": [2], "value": [99]})
         if row_id_case == "unknown":
@@ -572,15 +585,84 @@ def test_external_update_rejects_invalid_stable_row_ids(
         else:
             preserved_row_ids = [row_ids[4]]
         new_fragments = list(write_fragments(replacement, tmp_path))
-        new_fragments[0].row_id_meta = RowIdMeta.from_ids(preserved_row_ids)
+        preserved_row_ids = [preserved_row_ids]
     operation = LanceOperation.Update(
         updated_fragments=[updated_fragment],
         new_fragments=new_fragments,
+        fields_modified=[value_field_id],
         update_mode="rewrite_rows",
+        preserved_row_ids=preserved_row_ids,
     )
 
-    with pytest.raises(OSError, match=error):
+    with pytest.raises(error_type, match=error):
         LanceDataset.commit(tmp_path, operation, read_version=dataset.version)
+
+
+def test_external_update_requires_modified_fields_for_preserved_row_ids(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"id": [1], "value": [10]}),
+        tmp_path,
+        enable_stable_row_ids=True,
+    )
+    row_id = _row_ids_by_id(dataset)[1]
+    fragment_id = dataset.get_fragments()[0].fragment_id
+    new_fragments = list(
+        write_fragments(pa.table({"id": [1], "value": [20]}), tmp_path)
+    )
+    operation = LanceOperation.Update(
+        removed_fragment_ids=[fragment_id],
+        new_fragments=new_fragments,
+        preserved_row_ids=[[row_id]],
+    )
+
+    with pytest.raises(ValueError, match="requires fields_modified"):
+        LanceDataset.commit(tmp_path, operation, read_version=dataset.version)
+
+
+def test_external_update_validates_preserved_row_id_fragment_count(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"id": [1]}),
+        tmp_path,
+        enable_stable_row_ids=True,
+    )
+    new_fragments = list(write_fragments(pa.table({"id": [1]}), tmp_path))
+    operation = LanceOperation.Update(
+        removed_fragment_ids=[dataset.get_fragments()[0].fragment_id],
+        new_fragments=new_fragments,
+        fields_modified=[_field_id(dataset, "id")],
+        preserved_row_ids=[],
+    )
+
+    with pytest.raises(ValueError, match="one entry per new fragment"):
+        LanceDataset.commit(tmp_path, operation, read_version=dataset.version)
+
+
+def test_external_update_validates_non_monotonic_source_row_ids(tmp_path: Path):
+    row_count = 256
+    dataset = write_dataset(
+        pa.table({"id": list(range(row_count))}),
+        tmp_path,
+        max_rows_per_file=row_count,
+        enable_stable_row_ids=True,
+    )
+    row_ids_by_id = _row_ids_by_id(dataset)
+    field_id = _field_id(dataset, "id")
+
+    for ids in (list(reversed(range(row_count))), list(range(row_count))):
+        new_fragments = list(
+            write_fragments(
+                pa.table({"id": ids}), tmp_path, max_rows_per_file=row_count
+            )
+        )
+        operation = LanceOperation.Update(
+            removed_fragment_ids=[dataset.get_fragments()[0].fragment_id],
+            new_fragments=new_fragments,
+            fields_modified=[field_id],
+            preserved_row_ids=[[row_ids_by_id[row_id] for row_id in ids]],
+        )
+        dataset = LanceDataset.commit(tmp_path, operation, read_version=dataset.version)
+
+    assert _row_ids_by_id(dataset) == row_ids_by_id
 
 
 def test_deletion_file_with_base_id_serialization():

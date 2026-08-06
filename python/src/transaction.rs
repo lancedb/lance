@@ -12,13 +12,14 @@ use lance::dataset::transaction::{
 };
 use lance::datatypes::Schema;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
-use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata, RowIdMeta};
+use lance_table::rowids::{RowIdSequence, read_row_ids, write_row_ids};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -347,6 +348,141 @@ impl FromPyObject<'_, '_> for PyUpdateMode {
     }
 }
 
+fn encode_preserved_row_ids(
+    new_fragments: &mut [Fragment],
+    preserved_row_ids: Option<Vec<Option<Vec<u64>>>>,
+    fields_modified: &[u32],
+    fields_for_preserving_frag_bitmap: &mut Vec<u32>,
+    update_mode: &mut Option<UpdateMode>,
+) -> PyResult<()> {
+    let Some(preserved_row_ids) = preserved_row_ids else {
+        if let Some(fragment) = new_fragments
+            .iter()
+            .find(|fragment| fragment.row_id_meta.is_some())
+        {
+            return Err(PyValueError::new_err(format!(
+                "Update.new_fragments[fragment_id={}] sets row_id_meta directly; pass stable row IDs through preserved_row_ids instead",
+                fragment.id
+            )));
+        }
+        return Ok(());
+    };
+
+    if preserved_row_ids.len() != new_fragments.len() {
+        return Err(PyValueError::new_err(format!(
+            "preserved_row_ids must have one entry per new fragment: got {} entries for {} fragments",
+            preserved_row_ids.len(),
+            new_fragments.len()
+        )));
+    }
+
+    let has_preserved_row_ids = preserved_row_ids
+        .iter()
+        .flatten()
+        .any(|row_ids| !row_ids.is_empty());
+    if !has_preserved_row_ids {
+        if let Some(fragment) = new_fragments
+            .iter()
+            .find(|fragment| fragment.row_id_meta.is_some())
+        {
+            return Err(PyValueError::new_err(format!(
+                "Update.new_fragments[fragment_id={}] sets row_id_meta directly, but preserved_row_ids contains no IDs",
+                fragment.id
+            )));
+        }
+        return Ok(());
+    }
+
+    match update_mode {
+        None => *update_mode = Some(UpdateMode::RewriteRows),
+        Some(UpdateMode::RewriteRows) => {}
+        Some(UpdateMode::RewriteColumns) => {
+            return Err(PyValueError::new_err(
+                "preserved_row_ids is only valid for update_mode='rewrite_rows'",
+            ));
+        }
+    }
+
+    if fields_modified.is_empty() && fields_for_preserving_frag_bitmap.is_empty() {
+        return Err(PyValueError::new_err(
+            "preserved_row_ids requires fields_modified to list every field whose values may change, so scalar-index coverage remains correct",
+        ));
+    }
+    fields_for_preserving_frag_bitmap.extend_from_slice(fields_modified);
+    fields_for_preserving_frag_bitmap.sort_unstable();
+    fields_for_preserving_frag_bitmap.dedup();
+
+    let mut unique_row_ids = HashSet::new();
+    for (fragment, row_ids) in new_fragments.iter_mut().zip(preserved_row_ids) {
+        let Some(row_ids) = row_ids else {
+            if fragment.row_id_meta.is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "Update.new_fragments[fragment_id={}] sets row_id_meta directly, but its preserved_row_ids entry is None",
+                    fragment.id
+                )));
+            }
+            continue;
+        };
+        if row_ids.is_empty() {
+            if fragment.row_id_meta.is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "Update.new_fragments[fragment_id={}] sets row_id_meta directly, but its preserved_row_ids entry is empty",
+                    fragment.id
+                )));
+            }
+            continue;
+        }
+
+        let physical_rows = fragment.physical_rows.ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "Update new fragment {} does not specify physical_rows",
+                fragment.id
+            ))
+        })?;
+        if row_ids.len() > physical_rows {
+            return Err(PyValueError::new_err(format!(
+                "preserved_row_ids for fragment {} contains {} IDs for {} physical rows",
+                fragment.id,
+                row_ids.len(),
+                physical_rows
+            )));
+        }
+        for row_id in &row_ids {
+            if !unique_row_ids.insert(*row_id) {
+                return Err(PyValueError::new_err(format!(
+                    "preserved_row_ids contains duplicate row_id={row_id}"
+                )));
+            }
+        }
+
+        if let Some(row_id_meta) = &fragment.row_id_meta {
+            let RowIdMeta::Inline(data) = row_id_meta else {
+                return Err(PyValueError::new_err(format!(
+                    "Update new fragment {} uses external row ID metadata; pass inline values through preserved_row_ids instead",
+                    fragment.id
+                )));
+            };
+            let encoded_row_ids = read_row_ids(data).map_err(|error| {
+                PyValueError::new_err(format!(
+                    "Update new fragment {} has invalid row ID metadata: {error}",
+                    fragment.id
+                ))
+            })?;
+            if !encoded_row_ids.iter().eq(row_ids.iter().copied()) {
+                return Err(PyValueError::new_err(format!(
+                    "Update new fragment {} has row_id_meta that does not match preserved_row_ids",
+                    fragment.id
+                )));
+            }
+        } else {
+            let sequence = RowIdSequence::from(row_ids.as_slice());
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence)));
+        }
+    }
+
+    Ok(())
+}
+
 impl FromPyObject<'_, '_> for PyLance<Operation> {
     type Error = PyErr;
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
@@ -398,20 +534,31 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
 
                 let updated_fragments = extract_vec(&ob.getattr("updated_fragments")?)?;
 
-                let new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
+                let mut new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
 
-                let fields_modified = ob.getattr("fields_modified")?.extract()?;
+                let fields_modified: Vec<u32> = ob.getattr("fields_modified")?.extract()?;
 
-                let fields_for_preserving_frag_bitmap = ob
+                let mut fields_for_preserving_frag_bitmap = ob
                     .getattr("fields_for_preserving_frag_bitmap")?
                     .extract()
                     .unwrap_or_default();
 
-                let update_mode = ob
+                let mut update_mode = ob
                     .getattr("update_mode")?
                     .extract::<PyUpdateMode>()
                     .ok()
                     .map(|py_mode| py_mode.0);
+
+                let preserved_row_ids = ob
+                    .getattr("preserved_row_ids")?
+                    .extract::<Option<Vec<Option<Vec<u64>>>>>()?;
+                encode_preserved_row_ids(
+                    &mut new_fragments,
+                    preserved_row_ids,
+                    &fields_modified,
+                    &mut fields_for_preserving_frag_bitmap,
+                    &mut update_mode,
+                )?;
 
                 let op = Operation::Update {
                     removed_fragment_ids,
@@ -585,6 +732,29 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
+                let preserved_row_ids = new_fragments
+                    .iter()
+                    .map(|fragment| match &fragment.row_id_meta {
+                        Some(RowIdMeta::Inline(data)) => read_row_ids(data)
+                            .map(|sequence| Some(sequence.iter().collect::<Vec<_>>()))
+                            .map_err(|error| {
+                                PyValueError::new_err(format!(
+                                    "Update new fragment {} has invalid row ID metadata: {error}",
+                                    fragment.id
+                                ))
+                            }),
+                        Some(RowIdMeta::External(_)) => Err(PyValueError::new_err(format!(
+                            "Update new fragment {} uses external row ID metadata that cannot be represented as preserved_row_ids",
+                            fragment.id
+                        ))),
+                        None => Ok(None),
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                let preserved_row_ids = if preserved_row_ids.iter().any(Option::is_some) {
+                    Some(preserved_row_ids)
+                } else {
+                    None
+                };
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
                 let fields_modified = fields_modified.into_pyobject(py)?;
                 let fields_for_preserving_frag_bitmap =
@@ -608,6 +778,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_modified,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
+                    preserved_row_ids,
                 ))
             }
             Operation::DataReplacement { replacements } => {

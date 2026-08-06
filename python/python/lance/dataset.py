@@ -5988,12 +5988,21 @@ class LanceOperation:
         new_fragments: list[FragmentMetadata]
             The fragments that contain the new rows.
         fields_modified: list[int]
-            If any fields are modified in updated_fragments, then they must be
-            listed here so those fragments can be removed from indices covering
-            those fields.
+            The field IDs whose values may change. They must be listed so
+            fragments can be removed from scalar-index coverage where needed.
+            This is required when ``preserved_row_ids`` contains IDs.
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        preserved_row_ids: list[list[int] | None] | None
+            Stable row IDs to preserve, positionally aligned with
+            ``new_fragments``. IDs in each entry must follow the physical row
+            order of that fragment; if an entry is shorter than the fragment,
+            its remaining trailing rows receive fresh IDs. Use ``None`` for a
+            fragment whose rows all need fresh IDs. Rust encodes and validates
+            these values when the operation is committed. For example,
+            ``preserved_row_ids=[[7, 11], None]`` preserves two rewritten rows in
+            the first fragment and allocates new IDs for the second fragment.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6006,6 +6015,7 @@ class LanceOperation:
             default_factory=list
         )
         update_mode: str = ""
+        preserved_row_ids: Optional[List[Optional[List[int]]]] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)

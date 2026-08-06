@@ -44,6 +44,8 @@ async fn validate_preserved_update_row_ids(dataset: &Dataset, operation: &Operat
         removed_fragment_ids,
         updated_fragments,
         new_fragments,
+        fields_for_preserving_frag_bitmap,
+        update_mode,
         ..
     } = operation
     else {
@@ -60,6 +62,31 @@ async fn validate_preserved_update_row_ids(dataset: &Dataset, operation: &Operat
         return Err(Error::invalid_input(
             "Update new_fragments cannot supply row IDs for a dataset without stable row IDs",
         ));
+    }
+    if !matches!(
+        update_mode,
+        Some(crate::dataset::transaction::UpdateMode::RewriteRows)
+    ) {
+        return Err(Error::invalid_input(
+            "Update new_fragments can preserve row IDs only when update_mode is RewriteRows",
+        ));
+    }
+    if fields_for_preserving_frag_bitmap.is_empty() {
+        return Err(Error::invalid_input(
+            "Update new_fragments that preserve row IDs must list every potentially modified field in fields_for_preserving_frag_bitmap",
+        ));
+    }
+    for field_id in fields_for_preserving_frag_bitmap {
+        let schema_field_id = i32::try_from(*field_id).map_err(|_| {
+            Error::invalid_input(format!(
+                "Update fields_for_preserving_frag_bitmap contains field_id={field_id}, which exceeds the supported field ID range"
+            ))
+        })?;
+        if dataset.schema().field_by_id(schema_field_id).is_none() {
+            return Err(Error::invalid_input(format!(
+                "Update fields_for_preserving_frag_bitmap contains field_id={field_id}, which does not exist in the dataset schema"
+            )));
+        }
     }
 
     let mut supplied_row_ids = HashSet::new();
@@ -123,9 +150,6 @@ async fn validate_preserved_update_row_ids(dataset: &Dataset, operation: &Operat
             continue;
         };
         let sequence = load_row_id_sequence(dataset, source_fragment.metadata()).await?;
-        let Some(row_id_range) = sequence.row_id_range() else {
-            continue;
-        };
         let source_deletions = source_fragment.get_deletion_vector().await?;
         let replacement_deletions = if removed_fragment_ids.contains(&fragment_id) {
             None
@@ -138,17 +162,12 @@ async fn validate_preserved_update_row_ids(dataset: &Dataset, operation: &Operat
                 .await?
         };
 
-        let mut candidate_row_ids = Vec::with_capacity(unresolved_row_ids.len());
-        candidate_row_ids.extend(
-            unresolved_row_ids
-                .iter()
-                .filter(|row_id| row_id_range.contains(row_id))
-                .copied(),
-        );
-        for row_id in candidate_row_ids {
-            let Some(position) = sequence.position(row_id) else {
+        // Scan each source sequence once. Looking up every supplied ID in the
+        // sequence separately becomes quadratic for array-encoded row IDs.
+        for (position, row_id) in sequence.iter().enumerate() {
+            if !unresolved_row_ids.contains(&row_id) {
                 continue;
-            };
+            }
             let position = u32::try_from(position).map_err(|_| {
                 Error::invalid_input(format!(
                     "row_id={row_id} has physical position {position}, which exceeds the supported row offset range"
@@ -166,6 +185,9 @@ async fn validate_preserved_update_row_ids(dataset: &Dataset, operation: &Operat
                     .is_some_and(|deletions| deletions.contains(position));
             if is_replaced {
                 unresolved_row_ids.remove(&row_id);
+                if unresolved_row_ids.is_empty() {
+                    break;
+                }
             }
         }
     }

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -32,7 +31,6 @@ use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
 };
 use lance_table::io::deletion::deletion_file_path;
-use lance_table::rowids::{RowIdSequence, write_row_ids};
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
 use pyo3::types::PyTuple;
@@ -676,21 +674,6 @@ pub struct PyRowDatasetVersionMeta(pub RowDatasetVersionMeta);
 
 #[pymethods]
 impl PyRowIdMeta {
-    /// Create inline row ID metadata without exposing its serialized format.
-    #[staticmethod]
-    pub fn from_ids(row_ids: Vec<u64>) -> PyResult<Self> {
-        let mut unique_row_ids = HashSet::with_capacity(row_ids.len());
-        for row_id in &row_ids {
-            if !unique_row_ids.insert(*row_id) {
-                return Err(PyValueError::new_err(format!(
-                    "row_ids must be unique, but row_id={row_id} appears more than once"
-                )));
-            }
-        }
-        let sequence = RowIdSequence::from(row_ids.as_slice());
-        Ok(Self(RowIdMeta::Inline(write_row_ids(&sequence))))
-    }
-
     fn asdict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         pythonize::pythonize(py, &self.0)
             .map(|b| b.unbind())

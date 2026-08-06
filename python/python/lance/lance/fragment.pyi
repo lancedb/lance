@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Literal, Optional, Sequence
+from typing import Literal, Optional
 
 class DeletionFile:
     """
@@ -90,31 +90,6 @@ class DeletionFile:
     def __reduce__(self) -> tuple: ...
 
 class RowIdMeta:
-    @classmethod
-    def from_ids(row_ids: Sequence[int]) -> RowIdMeta:
-        """Create metadata for a sequence of existing stable row IDs.
-
-        Attach the result to newly written fragment metadata supplied to
-        ``LanceOperation.Update`` to preserve the logical IDs of rewritten rows.
-        Commit rejects duplicate IDs and IDs that are not live rows replaced by
-        the update.
-
-        Parameters
-        ----------
-        row_ids : Sequence[int]
-            Stable row IDs in the same order as rows in the fragment.
-
-        Returns
-        -------
-        RowIdMeta
-
-        Examples
-        --------
-        >>> from lance.fragment import RowIdMeta
-        >>> row_id_meta = RowIdMeta.from_ids([7, 11])
-        """
-        ...
-
     def json(self) -> str:
         """Get a JSON representation of the row id metadata.
 
