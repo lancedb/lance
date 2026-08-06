@@ -10,12 +10,14 @@
 //! - [`BloomFilterGuardExec`]: Guards child execution with bloom filter check
 //! - [`CoalesceFirstExec`]: Returns first non-empty result with short-circuit
 //! - [`PkBlockFilterExec`]: Drops rows whose PK was superseded by a newer generation (the cross-generation block-list)
+//! - [`SchemaRelabelExec`]: Re-labels batches to an exact schema (the storage/logical nullability boundary)
 
 mod bloom_guard;
 mod coalesce_first;
 mod generation_tag;
 mod pk;
 mod pk_block_filter;
+mod schema_relabel;
 
 pub use bloom_guard::{BloomFilterGuardExec, compute_pk_hash_from_scalars};
 pub use coalesce_first::CoalesceFirstExec;
@@ -25,3 +27,4 @@ pub use pk::{
     validate_pk_types,
 };
 pub use pk_block_filter::PkBlockFilterExec;
+pub use schema_relabel::SchemaRelabelExec;

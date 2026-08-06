@@ -74,6 +74,52 @@ pub fn tombstone_field() -> ArrowField {
     ArrowField::new(TOMBSTONE, DataType::Boolean, false)
 }
 
+/// Derive a shard's **storage schema** from its **logical schema** by making
+/// every top-level field nullable except the primary key and `_tombstone`.
+///
+/// A shard carries two schemas. The *logical* schema is the base table's, as
+/// the caller declared it: it is the contract [`write::ShardWriter::put`]
+/// validates input against, and the schema the scan path narrows back to at its
+/// output boundary. The *storage* schema is what the memtable, WAL entries, and
+/// SSTables physically hold — it exists because a tombstone carries the primary
+/// key and null in every other column, so the storage tier must permit a null
+/// wherever the base table does not. This mirrors the logical/physical split
+/// `SchemaAdapter` already applies to JSON and view types in
+/// `crate::dataset::utils`.
+///
+/// Top-level only: Arrow validates nullability just at the top level of a
+/// `RecordBatch`, so a null `FixedSizeList` or `Struct` needs no change to its
+/// child fields — they stay exactly as the caller declared them, and a vector
+/// column's item field gains no validity layer.
+///
+/// The primary key is excluded because [`lance_core::datatypes::Schema`]
+/// requires PK fields and their ancestors to be non-nullable, and a tombstone
+/// always carries a real key. `_tombstone` is excluded because the write path
+/// always populates it.
+///
+/// Idempotent: relaxing an already-relaxed schema is a no-op.
+pub fn relax_non_pk_nullability(logical: &ArrowSchema, pk_columns: &[String]) -> Arc<ArrowSchema> {
+    let fields: Vec<ArrowField> = logical
+        .fields()
+        .iter()
+        .map(|field| {
+            let keep = field.is_nullable()
+                || field.name() == TOMBSTONE
+                || pk_columns.iter().any(|c| c == field.name());
+            let field = field.as_ref().clone();
+            if keep {
+                field
+            } else {
+                field.with_nullable(true)
+            }
+        })
+        .collect();
+    Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        logical.metadata().clone(),
+    ))
+}
+
 /// Extend a base schema with the trailing `_tombstone` column to form the
 /// mem_wal memtable/generation schema.
 ///
@@ -104,3 +150,95 @@ pub use wal::{BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, W
 pub use write::ShardWriter;
 pub use write::ShardWriterConfig;
 pub use write::WriteResult;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::Fields;
+
+    fn logical() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("count", DataType::Int64, false),
+            ArrowField::new("note", DataType::Utf8, true),
+        ])
+    }
+
+    #[test]
+    fn relax_widens_every_non_pk_field_and_leaves_the_key_alone() {
+        let relaxed = relax_non_pk_nullability(&logical(), &["id".to_string()]);
+
+        assert!(
+            !relaxed.field(0).is_nullable(),
+            "the primary key stays strict"
+        );
+        assert!(
+            relaxed.field(1).is_nullable(),
+            "`count` must accept a tombstone null"
+        );
+        assert!(
+            relaxed.field(2).is_nullable(),
+            "already-nullable is untouched"
+        );
+    }
+
+    #[test]
+    fn relax_leaves_nested_fields_exactly_as_declared() {
+        // Arrow validates nullability only at the top level of a RecordBatch, so
+        // a null struct/vector needs no change below the top — and a vector
+        // column's item field must not gain a validity layer.
+        let item = Arc::new(ArrowField::new("item", DataType::Float32, false));
+        let child = ArrowField::new("a", DataType::Int32, false);
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("vector", DataType::FixedSizeList(item.clone(), 4), false),
+            ArrowField::new("s", DataType::Struct(Fields::from(vec![child])), false),
+        ]);
+
+        let relaxed = relax_non_pk_nullability(&schema, &["id".to_string()]);
+
+        assert!(relaxed.field(1).is_nullable());
+        match relaxed.field(1).data_type() {
+            DataType::FixedSizeList(f, _) => assert!(!f.is_nullable(), "item field untouched"),
+            other => panic!("expected FixedSizeList, got {other:?}"),
+        }
+        match relaxed.field(2).data_type() {
+            DataType::Struct(fields) => assert!(!fields[0].is_nullable(), "child field untouched"),
+            other => panic!("expected Struct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relax_keeps_tombstone_non_nullable_and_is_idempotent() {
+        let pk = ["id".to_string()];
+        let once = relax_non_pk_nullability(&schema_with_tombstone(&logical()), &pk);
+        let twice = relax_non_pk_nullability(&once, &pk);
+
+        let tombstone = once.field_with_name(TOMBSTONE).unwrap();
+        assert!(
+            !tombstone.is_nullable(),
+            "the write path always populates _tombstone"
+        );
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn relax_preserves_schema_and_field_metadata() {
+        // The `lance-schema:unenforced-primary-key` marker rides on field
+        // metadata, so losing it here would silently drop the shard's PK.
+        let marked = ArrowField::new("count", DataType::Int64, false)
+            .with_metadata([("k".to_string(), "v".to_string())].into());
+        let schema = ArrowSchema::new_with_metadata(
+            vec![ArrowField::new("id", DataType::Int32, false), marked],
+            [("s".to_string(), "m".to_string())].into(),
+        );
+
+        let relaxed = relax_non_pk_nullability(&schema, &["id".to_string()]);
+
+        assert_eq!(relaxed.metadata().get("s").map(String::as_str), Some("m"));
+        assert_eq!(
+            relaxed.field(1).metadata().get("k").map(String::as_str),
+            Some("v")
+        );
+    }
+}

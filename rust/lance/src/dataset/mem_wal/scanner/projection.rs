@@ -25,6 +25,8 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
 use lance_core::{ROW_ADDR, ROW_ID, Result, is_system_column};
 
+use super::exec::SchemaRelabelExec;
+
 /// Column name for distance in vector search results.
 pub const DISTANCE_COLUMN: &str = "_distance";
 
@@ -189,9 +191,33 @@ pub fn null_columns(
     Ok(Arc::new(projection_exec))
 }
 
+/// Force `plan` to report exactly `target_schema`, re-labeling its batches when
+/// the plan's own schema differs.
+///
+/// DataFusion derives a `ProjectionExec`'s field nullability from its
+/// expressions (`Column::nullable(input_schema)`), not from the schema the
+/// planner asked for, so a projection alone cannot pin this down. It matters
+/// because a shard's storage tier widens non-PK columns to nullable while the
+/// base-table arm keeps the base table's nullability, and `CoalesceFirstExec`
+/// and `concat_batches` both require exact schema equality.
+///
+/// A no-op when the schemas already agree.
+pub(super) fn force_schema(
+    plan: Arc<dyn ExecutionPlan>,
+    target_schema: &SchemaRef,
+) -> Arc<dyn ExecutionPlan> {
+    if plan.schema() == *target_schema {
+        return plan;
+    }
+    Arc::new(SchemaRelabelExec::new(plan, target_schema.clone()))
+}
+
 /// Wrap `plan` to emit exactly `target_schema`. Source columns are
 /// forwarded by name; system / `_distance` cols missing from the source
 /// are NULL-filled. Other missing columns are an internal error.
+///
+/// The result reports `target_schema` exactly, including nullability — see
+/// [`force_schema`].
 pub fn project_to_canonical(
     plan: Arc<dyn ExecutionPlan>,
     target_schema: &SchemaRef,
@@ -222,7 +248,7 @@ pub fn project_to_canonical(
     let projection_exec = ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
         lance_core::Error::internal(format!("Failed to build canonical ProjectionExec: {}", e))
     })?;
-    Ok(Arc::new(projection_exec))
+    Ok(force_schema(Arc::new(projection_exec), target_schema))
 }
 
 #[cfg(test)]

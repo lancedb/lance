@@ -27,15 +27,15 @@ use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
 use tracing::instrument;
 
-use crate::dataset::mem_wal::TOMBSTONE;
 use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
+use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
 use super::projection::{
-    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
@@ -321,7 +321,7 @@ impl LsmPointLookupPlanner {
     ) -> Result<RecordBatch> {
         let canonical =
             canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
-        let target = carry_schema(&canonical);
+        let target = carry_schema(&canonical, &self.pk_columns);
         let mut out: Vec<RecordBatch> = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(b) = self.lookup_keep_tombstone(key, projection).await? {
@@ -728,7 +728,7 @@ impl LsmPointLookupPlanner {
         // Output carries `_tombstone` (canonical + the marker) so it survives
         // the union/coalesce to the post-coalesce filter; base / legacy sources
         // that lack the column get a synthesized `false`.
-        project_to_carry(scan, &target)
+        project_to_carry(scan, &target, &self.pk_columns)
     }
 
     /// Create an empty execution plan with the canonical output schema.
@@ -756,11 +756,21 @@ fn cols_with_tombstone(cols: &[String], present: bool) -> Vec<String> {
     out
 }
 
-/// Carry schema = canonical output + a trailing non-nullable `_tombstone`
-/// Boolean. Non-nullable so the base arm's synthesized `Literal(false)` matches
-/// the WAL arms' real column under `CoalesceFirstExec`'s exact-schema check.
-fn carry_schema(canonical: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<Arc<Field>> = canonical.fields().iter().cloned().collect();
+/// Carry schema = canonical output, widened to the shard's storage nullability,
+/// plus a trailing non-nullable `_tombstone` Boolean.
+///
+/// Widened because tombstone rows are still in flight at this point — they are
+/// only dropped after `CoalesceFirstExec` picks a winner (see
+/// [`filter_tombstones_after_coalesce`]), and a tombstone carries null in every
+/// non-PK column. Narrowing back to the base table's nullability happens on the
+/// far side of that filter.
+///
+/// `_tombstone` itself stays non-nullable so the base arm's synthesized
+/// `Literal(false)` matches the WAL arms' real column under
+/// `CoalesceFirstExec`'s exact-schema check.
+fn carry_schema(canonical: &SchemaRef, pk_columns: &[String]) -> SchemaRef {
+    let relaxed = relax_non_pk_nullability(canonical, pk_columns);
+    let mut fields: Vec<Arc<Field>> = relaxed.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(TOMBSTONE, DataType::Boolean, false)));
     Arc::new(Schema::new(fields))
 }
@@ -772,9 +782,10 @@ fn carry_schema(canonical: &SchemaRef) -> SchemaRef {
 fn project_to_carry(
     plan: Arc<dyn ExecutionPlan>,
     canonical: &SchemaRef,
+    pk_columns: &[String],
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let input = plan.schema();
-    let carry = carry_schema(canonical);
+    let carry = carry_schema(canonical, pk_columns);
     let mut project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
         Vec::with_capacity(carry.fields().len());
     for field in carry.fields() {
@@ -798,11 +809,12 @@ fn project_to_carry(
         };
         project_exprs.push((expr, name.clone()));
     }
-    Ok(Arc::new(
-        ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
-            lance_core::Error::internal(format!("Failed to build carry ProjectionExec: {}", e))
-        })?,
-    ))
+    let projected = Arc::new(ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+        lance_core::Error::internal(format!("Failed to build carry ProjectionExec: {}", e))
+    })?);
+    // Every arm must land on exactly `carry`, or `CoalesceFirstExec` panics on
+    // the nullability difference between the base arm and the WAL arms.
+    Ok(force_schema(projected, &carry))
 }
 
 /// Drop tombstone rows after `CoalesceFirstExec` has already picked the newest
