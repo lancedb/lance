@@ -15,7 +15,6 @@ use super::{
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
-use crate::index::append::build_coverage_filter;
 use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
@@ -568,40 +567,29 @@ fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
     }
 }
 
-/// Pair every segment with the rows it may still contribute when this optimize pass
-/// copies its data into the new index.
+/// Pair every segment with the coverage that decides which of its rows this optimize
+/// pass may still copy into the new index.
 ///
-/// Building a filter costs a row-id sequence load under stable row ids, so it is
-/// skipped when the pass only appends a delta and never reads existing rows, and
-/// when any segment predates fragment bitmaps and its coverage is therefore unknown.
-async fn existing_index_sources(
+/// A segment that predates fragment bitmaps has unknown coverage, so it keeps every
+/// row it holds. Turning coverage into a filter is deferred to the first partition
+/// that actually reads the segment, because under stable row ids it costs a row-id
+/// sequence load per covered fragment and most passes only append a delta.
+fn existing_index_sources(
     dataset: &Dataset,
     logical_index: &LogicalIvfView<'_>,
-    options: &OptimizeOptions,
-) -> Result<Vec<ExistingIndex>> {
-    let segments = logical_index.segments().collect::<Vec<_>>();
-    let reads_existing_rows = options.num_indices_to_merge != Some(0) || options.retrain;
-    let all_have_bitmaps = segments
-        .iter()
-        .all(|(metadata, _)| metadata.fragment_bitmap.is_some());
-    if !reads_existing_rows || !all_have_bitmaps {
-        return Ok(segments
-            .into_iter()
-            .map(|(_, index)| ExistingIndex::unfiltered(index.clone()))
-            .collect());
-    }
-
-    let mut sources = Vec::with_capacity(segments.len());
-    for (metadata, index) in segments {
-        let effective = metadata
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
-            .unwrap_or_default();
-        sources.push(ExistingIndex {
-            index: index.clone(),
-            old_data_filter: Some(Arc::new(build_coverage_filter(dataset, &effective).await?)),
-        });
-    }
-    Ok(sources)
+) -> Vec<ExistingIndex> {
+    logical_index
+        .segments()
+        .map(|(metadata, index)| {
+            let (Some(effective), Some(deleted)) = (
+                metadata.effective_fragment_bitmap(&dataset.fragment_bitmap),
+                metadata.deleted_fragment_bitmap(&dataset.fragment_bitmap),
+            ) else {
+                return ExistingIndex::unfiltered(index.clone());
+            };
+            ExistingIndex::with_coverage(index.clone(), dataset.clone(), effective, deleted)
+        })
+        .collect()
 }
 
 // TODO: move to `lance-index` crate.
@@ -626,7 +614,7 @@ pub(crate) async fn optimize_vector_indices(
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
-        let sources = existing_index_sources(&dataset, logical_index, options).await?;
+        let sources = existing_index_sources(&dataset, logical_index);
         return optimize_vector_indices_v2(&dataset, unindexed, vector_column, &sources, options)
             .await;
     }
@@ -4771,6 +4759,7 @@ mod tests {
     use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::VECTOR_INDEX_VERSION;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::OldIndexDataFilter;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
@@ -4788,6 +4777,117 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    /// Building a merge filter loads a row-id sequence per covered fragment under
+    /// stable row ids, and an optimize pass that only appends a delta reads no existing
+    /// row at all. Such a pass must therefore build no filter, and a pass that does
+    /// merge must build one and reuse it across partitions.
+    #[tokio::test]
+    async fn test_optimize_builds_merge_filters_only_when_merging() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let make_batch = || {
+            gen_batch()
+                .col(
+                    "vector",
+                    array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)),
+                )
+                .into_batch_rows(RowCount::from(256))
+                .unwrap()
+        };
+        let batch = make_batch();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // A single partition keeps `check_partition_adjustment` from selecting a split
+        // or a join, which would legitimately merge every segment.
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(make_batch())], schema),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        let ivf_view = logical_index.as_ivf().unwrap();
+        let new_data = |fragments| async {
+            let mut scanner = dataset.scan();
+            scanner
+                .with_fragments(fragments)
+                .with_row_id()
+                .project(&["vector"])
+                .unwrap();
+            scanner.try_into_stream().await.unwrap()
+        };
+        let unindexed = dataset.unindexed_fragments("vector_idx").await.unwrap();
+        assert_eq!(
+            unindexed.len(),
+            1,
+            "the appended fragment must be unindexed"
+        );
+
+        // `ExistingIndex` shares its coverage behind an `Arc`, so the sources handed to
+        // the builder report what the builder actually did with them.
+        let sources = existing_index_sources(&dataset, &ivf_view);
+        optimize_vector_indices_v2(
+            &dataset,
+            Some(new_data(unindexed.clone()).await),
+            "vector",
+            &sources,
+            &OptimizeOptions::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sources.iter().all(|source| !source.filter_is_built()),
+            "a delta append reads no existing row, so it must build no filter"
+        );
+
+        let sources = existing_index_sources(&dataset, &ivf_view);
+        optimize_vector_indices_v2(
+            &dataset,
+            Some(new_data(unindexed).await),
+            "vector",
+            &sources,
+            &OptimizeOptions::merge(1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sources.iter().all(|source| source.filter_is_built()),
+            "a merge reads existing rows, so it must build a filter per merged segment"
+        );
+        assert!(
+            matches!(
+                sources[0].old_data_filter().await.unwrap(),
+                Some(OldIndexDataFilter::RowIds(_))
+            ),
+            "a stable-row-id segment must filter on exact row-id membership"
+        );
+    }
 
     #[test]
     fn test_shared_quantizer_model_compares_skipped_payloads() {

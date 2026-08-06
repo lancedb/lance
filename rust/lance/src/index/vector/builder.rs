@@ -76,11 +76,14 @@ use lance_table::format::IndexFile;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
+use roaring::RoaringBitmap;
+use tokio::sync::OnceCell;
 use tracing::{Level, instrument, span};
 
 use crate::Dataset;
 use crate::dataset::ProjectionRequest;
 use crate::dataset::index::dataset_format_version;
+use crate::index::append::build_old_data_filter;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::infer_vector_dim;
 
@@ -123,17 +126,28 @@ fn apply_centroid_splits(
 /// An index segment an optimize pass reads existing rows from, paired with the rows
 /// that segment is still allowed to contribute.
 ///
-/// A segment's index file keeps every row it was built with, but the fragments it
-/// covers can shrink afterwards: an in-place column update rewrites the data and
-/// prunes the fragment from the segment's bitmap while the row keeps its address.
-/// Copying such a row into a merged segment would duplicate it, because the merged
-/// coverage also spans the fresh copy's fragment and nothing downstream can tell the
-/// two apart. `old_data_filter` is `None` when the segment's coverage is unchanged,
-/// in which case all of its rows are kept.
+/// A segment's index file keeps every row it was built with, but the rows it may still
+/// contribute shrink afterwards: an update rewrites a row and either prunes its
+/// fragment from the segment's bitmap (in-place column rewrite) or deletion-marks the
+/// old physical row while the rewritten copy reuses its stable row id. Copying such a
+/// row into a merged segment would duplicate it, because the merged coverage also spans
+/// the fresh copy and nothing downstream can tell the two apart.
+///
+/// The filter is resolved on first use rather than up front: under stable row ids
+/// building it loads every covered fragment's row-id sequence, and the common optimize
+/// pass appends a delta without reading a single existing row.
 #[derive(Clone)]
 pub struct ExistingIndex {
     pub index: Arc<dyn VectorIndex>,
-    pub old_data_filter: Option<Arc<OldIndexDataFilter>>,
+    coverage: Option<Arc<SegmentCoverage>>,
+}
+
+/// The inputs [`ExistingIndex::old_data_filter`] needs, plus the filter once built.
+struct SegmentCoverage {
+    dataset: Dataset,
+    effective_frags: RoaringBitmap,
+    deleted_frags: RoaringBitmap,
+    filter: OnceCell<Option<OldIndexDataFilter>>,
 }
 
 impl ExistingIndex {
@@ -141,8 +155,54 @@ impl ExistingIndex {
     pub fn unfiltered(index: Arc<dyn VectorIndex>) -> Self {
         Self {
             index,
-            old_data_filter: None,
+            coverage: None,
         }
+    }
+
+    /// An existing index that may only contribute rows still live in `effective_frags`.
+    pub fn with_coverage(
+        index: Arc<dyn VectorIndex>,
+        dataset: Dataset,
+        effective_frags: RoaringBitmap,
+        deleted_frags: RoaringBitmap,
+    ) -> Self {
+        Self {
+            index,
+            coverage: Some(Arc::new(SegmentCoverage {
+                dataset,
+                effective_frags,
+                deleted_frags,
+                filter: OnceCell::new(),
+            })),
+        }
+    }
+
+    /// Whether the filter has already been built. A pass that reads no existing rows
+    /// must never pay for one.
+    #[cfg(test)]
+    pub(crate) fn filter_is_built(&self) -> bool {
+        self.coverage
+            .as_deref()
+            .is_some_and(|coverage| coverage.filter.initialized())
+    }
+
+    /// The filter to apply to this segment's stored rows, or `None` when every row it
+    /// holds is still valid. Built once and shared by all partitions.
+    pub(crate) async fn old_data_filter(&self) -> Result<Option<&OldIndexDataFilter>> {
+        let Some(coverage) = self.coverage.as_deref() else {
+            return Ok(None);
+        };
+        let filter = coverage
+            .filter
+            .get_or_try_init(|| {
+                build_old_data_filter(
+                    &coverage.dataset,
+                    &coverage.effective_frags,
+                    &coverage.deleted_frags,
+                )
+            })
+            .await?;
+        Ok(filter.as_ref())
     }
 }
 
@@ -1077,6 +1137,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 continue;
             }
 
+            // Resolved before the partition is decoded: partitions are built
+            // concurrently, so whichever one builds the filter would otherwise hold a
+            // decoded partition per in-flight task while the rest wait on it.
+            let old_data_filter = source.old_data_filter().await?;
+
             let part_storage = existing_index.load_partition_storage(part_id, None).await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
@@ -1118,10 +1183,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 _ => {}
             }
 
-            // Drop rows this segment no longer covers. They are physically still in
-            // its index file, and the merged segment's coverage spans their fragments
+            // Drop rows this segment may no longer contribute. They are physically
+            // still in its index file, and the merged segment covers their live copies
             // again, so keeping them would emit the same row twice.
-            if let Some(filter) = source.old_data_filter.as_ref() {
+            if let Some(filter) = old_data_filter {
                 for batch in part_batches.iter_mut() {
                     let keep = filter.filter_row_ids(batch[ROW_ID].as_primitive::<UInt64Type>());
                     if keep.true_count() < batch.num_rows() {
@@ -2094,11 +2159,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let mut reader = index
                 .partition_reader(part_idx, false, &NoOpMetricsCollector)
                 .await?;
+            let old_data_filter = source.old_data_filter().await?;
             while let Some(batch) = reader.try_next().await? {
                 let batch_row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                match source.old_data_filter.as_ref() {
-                    // Rows the segment no longer covers must not be reassigned to a
-                    // partition; their live copy is contributed by another source.
+                match old_data_filter {
+                    // Rows the segment may no longer contribute must not be reassigned
+                    // to a partition; their live copy comes from another source.
                     Some(filter) => row_ids.extend(
                         batch_row_ids
                             .values()
