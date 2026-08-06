@@ -68,17 +68,9 @@ impl PyRowIdSequence {
         self.0.len() as usize
     }
 
-    fn __iter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyRowIdSequenceIterator>> {
-        let len = slf.borrow().0.len() as usize;
-        Py::new(
-            slf.py(),
-            PyRowIdSequenceIterator {
-                sequence: slf.clone().unbind(),
-                offset: 0,
-                len,
-                buffer: Vec::new().into_iter(),
-            },
-        )
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyRowIdSequenceIterator>> {
+        let row_ids: Vec<u64> = self.0.iter().collect();
+        Py::new(py, PyRowIdSequenceIterator(row_ids.into_iter()))
     }
 
     fn __repr__(&self) -> String {
@@ -125,23 +117,17 @@ impl PyRowIdSequence {
     }
 }
 
-/// Row ids buffered per refill while iterating.
+/// The row ids are materialized up front because `RowIdSequence::iter` borrows
+/// the sequence and a `#[pyclass]` cannot hold a borrowing iterator.
 ///
-/// A borrowing iterator cannot be held by a `#[pyclass]`, and stepping through
-/// `RowIdSequence::get` is quadratic because segment lengths are recomputed on
-/// each call. Buffering slices keeps the memory held during iteration constant
-/// while amortizing the segment walk over a whole chunk.
-const ITER_CHUNK_LEN: usize = 1024;
-
+/// Refilling a bounded buffer from `RowIdSequence::slice` looks like the way to
+/// avoid that, but it is quadratic: slicing takes an absolute offset, and for
+/// the gapped `RangeWithHoles` and `RangeWithBitmap` encodings the slice skips
+/// its prefix one element at a time. Making iteration both lazy and linear
+/// needs a forward cursor over the private segments, which belongs in
+/// `lance-table` rather than here. Bulk callers should use `to_pyarrow`.
 #[pyclass(name = "RowIdSequenceIterator", module = "lance.fragment")]
-pub struct PyRowIdSequenceIterator {
-    sequence: Py<PyRowIdSequence>,
-    /// Offset of the next row id to buffer.
-    offset: usize,
-    /// Length of the sequence, which is immutable once constructed.
-    len: usize,
-    buffer: std::vec::IntoIter<u64>,
-}
+pub struct PyRowIdSequenceIterator(std::vec::IntoIter<u64>);
 
 #[pymethods]
 impl PyRowIdSequenceIterator {
@@ -149,25 +135,8 @@ impl PyRowIdSequenceIterator {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> Option<u64> {
-        if let Some(row_id) = slf.buffer.next() {
-            return Some(row_id);
-        }
-        if slf.offset >= slf.len {
-            return None;
-        }
-
-        let chunk_len = ITER_CHUNK_LEN.min(slf.len - slf.offset);
-        let sequence = slf.sequence.clone_ref(py);
-        let buffer: Vec<u64> = sequence
-            .borrow(py)
-            .0
-            .slice(slf.offset, chunk_len)
-            .iter()
-            .collect();
-        slf.offset += chunk_len;
-        slf.buffer = buffer.into_iter();
-        slf.buffer.next()
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<u64> {
+        slf.0.next()
     }
 }
 

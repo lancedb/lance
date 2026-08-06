@@ -1012,15 +1012,21 @@ def test_row_id_sequence_empty(row_ids):
     assert sequence.to_pyarrow() == pa.array([], type=pa.uint64())
 
 
-@pytest.mark.parametrize("num_rows", [1023, 1024, 1025, 4100])
-def test_row_id_sequence_iterates_across_buffer_refills(num_rows):
-    # Iteration refills a fixed-size buffer rather than materializing the whole
-    # sequence, so lengths either side of that boundary must all round-trip.
-    row_ids = list(range(0, num_rows * 2, 2))
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param(list(range(4100)), id="contiguous"),
+        pytest.param(list(range(0, 8200, 2)), id="gapped"),
+        pytest.param(list(range(4100))[::-1], id="unsorted"),
+    ],
+)
+def test_row_id_sequence_iterates_large_sequences(row_ids):
+    # Each shape picks a different segment encoding, so all of them have to
+    # round-trip through iteration.
     sequence = RowIdSequence(row_ids)
 
     assert list(sequence) == row_ids
-    # A second pass must start over rather than resume a spent buffer.
+    # Each call must hand back a fresh iterator rather than a spent one.
     assert list(sequence) == row_ids
 
 
