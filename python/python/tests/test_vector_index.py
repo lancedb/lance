@@ -1961,6 +1961,70 @@ def test_optimize_indices(indexed_dataset):
     assert stats["num_indices"] == 2
 
 
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_segment_ownership_filter_precedes_partition_topk(
+    tmp_path, enable_stable_row_ids
+):
+    ndim = 4
+
+    def table(ids, value):
+        vectors = np.full((len(ids), ndim), value, dtype=np.float32)
+        return pa.table(
+            {
+                "id": pa.array(ids, type=pa.int64()),
+                "vector": pa.FixedSizeListArray.from_arrays(
+                    pa.array(vectors.reshape(-1), type=pa.float32()), ndim
+                ),
+            }
+        )
+
+    dataset = lance.write_dataset(
+        table(range(20), 1.0),
+        tmp_path,
+        mode="create",
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    dataset = lance.write_dataset(
+        table(range(100, 120), 0.0), dataset.uri, mode="append"
+    )
+    dataset = dataset.create_index(
+        "vector", index_type="IVF_FLAT", metric="l2", num_partitions=1
+    )
+
+    fragment = dataset.get_fragment(1)
+    row_ids = fragment.to_table(columns=["id"], with_row_id=True)["_rowid"].to_pylist()
+    update_data = pa.table(
+        {
+            "_rowid": pa.array(row_ids, type=pa.uint64()),
+            "vector": pa.array(
+                [[10.0] * ndim] * len(row_ids), type=pa.list_(pa.float32(), ndim)
+            ),
+        }
+    )
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Update(
+            updated_fragments=[updated_fragment], fields_modified=fields_modified
+        ),
+        read_version=dataset.version,
+    )
+    dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    dataset = lance.dataset(dataset.uri)
+
+    result = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": np.zeros(ndim, dtype=np.float32),
+            "k": 5,
+        },
+    )
+
+    assert all(row_id < 20 for row_id in result["id"].to_pylist())
+    assert result["_distance"].to_pylist() == pytest.approx([4.0] * 5)
+
+
 @pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()

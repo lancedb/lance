@@ -132,14 +132,14 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     Ok(())
 }
 
-fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
+pub(crate) fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
     field_ids.insert(field.id);
     for child in &field.children {
         collect_subtree_field_ids(child, field_ids);
     }
 }
 
-fn fragment_field_paths<'a>(
+pub(crate) fn fragment_field_paths<'a>(
     fragment: &'a Fragment,
     indexed_field_ids: &HashSet<i32>,
 ) -> HashMap<i32, &'a str> {
