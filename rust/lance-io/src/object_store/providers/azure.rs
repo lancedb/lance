@@ -14,7 +14,7 @@ use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
     RetryConfig,
-    azure::{AzureConfigKey, AzureCredential, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, AzureCredential, MicrosoftAzure, MicrosoftAzureBuilder},
 };
 use url::Url;
 
@@ -22,9 +22,45 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
+    read_dir::{native::NativeDirLister, opendal::OpendalDirLister},
+    throttle::{AimdThrottleConfig, AimdThrottleState, cloud_http_connector, with_throttling},
 };
 use lance_core::error::{Error, Result};
+
+/// Host suffixes only a hierarchical account is addressed by: the ADLS Gen2 endpoint, and
+/// Fabric's, whose OneLake is built on ADLS Gen2 whichever of its endpoints it is reached
+/// through.
+const HIERARCHICAL_HOST_SUFFIXES: &[&str] = &["dfs.core.windows.net", "fabric.microsoft.com"];
+
+/// Storage options that ask for Fabric's endpoint, which `object_store` also sets itself from
+/// a Fabric URL.
+const FABRIC_ENDPOINT_OPTIONS: &[&str] = &["azure_use_fabric_endpoint", "use_fabric_endpoint"];
+
+/// Whether the account being addressed has a hierarchical namespace: ADLS Gen2, or the OneLake
+/// built on it.
+///
+/// Such an account orders each directory level by child name rather than by whole key, so a
+/// sibling whose name extends another's comes back the other way round from a flat namespace:
+/// `foo` before `foo-bar`, where a flat namespace compares the keys `foo/` and `foo-bar/` and
+/// puts `foo-bar` first, `-` sorting before `/`. The OpenDAL-backed store resumes a listing
+/// from a key, which only reaches the rest of a directory on a store that sorts by key, so a
+/// hierarchical account gets no lister there. The native store resumes from a continuation
+/// token, which needs no order, so this does not apply to it.
+///
+/// This reads the spelling rather than the endpoint. The blob endpoint serves a hierarchical
+/// account too, so a `blob.core.windows.net` host proves nothing either way; `abfss` and
+/// Fabric, on the other hand, are only used to reach one.
+fn has_hierarchical_namespace(base_path: &Url, storage_options: &StorageOptions) -> bool {
+    base_path.scheme() == "abfss"
+        || base_path.host_str().is_some_and(|host| {
+            HIERARCHICAL_HOST_SUFFIXES
+                .iter()
+                .any(|suffix| host.ends_with(suffix))
+        })
+        || FABRIC_ENDPOINT_OPTIONS
+            .iter()
+            .any(|key| storage_options.0.get(*key).is_some_and(|set| set == "true"))
+}
 
 #[derive(Default, Debug)]
 pub struct AzureBlobStoreProvider;
@@ -148,22 +184,15 @@ impl AzureBlobStoreProvider {
         }
     }
 
-    async fn build_opendal_azure_store(
-        &self,
-        base_path: &Url,
-        storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
-        let operator = Self::build_opendal_operator(base_path, storage_options)?;
-        Ok(Arc::new(OpendalStore::new(operator)))
-    }
-
     async fn build_microsoft_azure_store(
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
         throttle_state: Option<&AimdThrottleState>,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+        // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
+        // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
+    ) -> Result<Arc<MicrosoftAzure>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -190,7 +219,7 @@ impl AzureBlobStoreProvider {
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
         builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 
     fn calculate_object_store_prefix_with_env(
@@ -262,29 +291,35 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             Some(AimdThrottleState::new(throttle_config)?)
         };
 
-        let inner: Arc<dyn OSObjectStore> = if use_opendal {
+        let (inner, paginated_lister) = if use_opendal {
             // OpenDAL Azure intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
-            self.build_opendal_azure_store(&base_path, &storage_options)
-                .await?
-        } else {
-            self.build_microsoft_azure_store(
-                &base_path,
-                &storage_options,
-                accessor,
-                throttle_state.as_ref(),
+            let operator = Self::build_opendal_operator(&base_path, &storage_options)?;
+            // OpenDAL resumes a listing from a key, which a hierarchical account does not
+            // order its levels by, so such an account keeps the full listing it has today.
+            // The native store below resumes from a continuation token and needs no order.
+            let lister = OpendalDirLister::for_operator(operator.clone())
+                .filter(|_| !has_hierarchical_namespace(&base_path, &storage_options));
+            (
+                Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>,
+                lister,
             )
-            .await?
-        };
-        let inner = if let Some(throttle_state) = throttle_state {
-            Arc::new(AimdThrottledStore::new_with_state(
-                inner,
-                throttle_state,
-                !use_opendal,
-            )) as Arc<dyn OSObjectStore>
         } else {
-            inner
+            let store = self
+                .build_microsoft_azure_store(
+                    &base_path,
+                    &storage_options,
+                    accessor,
+                    throttle_state.as_ref(),
+                )
+                .await?;
+            (
+                store.clone() as Arc<dyn OSObjectStore>,
+                Some(NativeDirLister::for_store(store)),
+            )
         };
+        let (inner, paginated_lister) =
+            with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
             inner,
@@ -298,6 +333,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            paginated_lister,
         })
     }
 
@@ -553,6 +589,32 @@ mod tests {
         assert_eq!(prefix, "abfss$myfs@myaccount");
     }
 
+    /// A hierarchical account lists each directory level by child name rather than by key,
+    /// and the ones that can be recognised are recognised from how they are addressed rather
+    /// than from the endpoint that serves them.
+    #[rstest::rstest]
+    #[case::blob("az://container@account.blob.core.windows.net/data", &[], true)]
+    #[case::container_only("az://container/data", &[], true)]
+    #[case::adls_gen2("abfss://fs@account.dfs.core.windows.net/data", &[], false)]
+    #[case::adls_gen2_over_az("az://container@account.dfs.core.windows.net/data", &[], false)]
+    #[case::onelake("abfss://workspace@onelake.dfs.fabric.microsoft.com/data", &[], false)]
+    #[case::fabric_option("az://container/data", &[("use_fabric_endpoint", "true")], false)]
+    #[case::fabric_option_off("az://container/data", &[("use_fabric_endpoint", "false")], true)]
+    fn test_only_a_flat_namespace_is_paged(
+        #[case] url: &str,
+        #[case] options: &[(&str, &str)],
+        #[case] expected: bool,
+    ) {
+        let url = Url::parse(url).unwrap();
+        let options = StorageOptions(
+            options
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        );
+        assert_eq!(!has_hierarchical_namespace(&url, &options), expected);
+    }
+
     #[tokio::test]
     async fn test_abfss_default_uses_microsoft_builder() {
         use crate::object_store::StorageOptionsAccessor;
@@ -578,6 +640,29 @@ mod tests {
             "abfss:// without use_opendal should use MicrosoftAzureBuilder, got: {}",
             inner_desc
         );
+        assert!(
+            store.paginated_lister.is_some(),
+            "the native store pages an ADLS Gen2 account by continuation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_blob_container_is_paged() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("az://container@testaccount.blob.core.windows.net/data").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), "testaccount".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(url, &params).await.unwrap();
+        assert!(store.paginated_lister.is_some());
     }
 
     #[tokio::test]
