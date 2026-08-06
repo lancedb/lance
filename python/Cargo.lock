@@ -2765,7 +2765,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3764,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3833,7 +3833,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3854,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrayref",
  "paste",
@@ -3863,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3900,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3934,7 +3934,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3952,7 +3952,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3989,7 +3989,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4021,7 +4021,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4035,7 +4035,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4104,7 +4104,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4164,7 +4164,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4177,7 +4177,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4223,7 +4223,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4262,7 +4262,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "jieba-rs",
  "lindera",
@@ -5475,7 +5475,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "6.1.0-rc.2"
+version = "6.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
