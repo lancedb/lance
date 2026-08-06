@@ -1,0 +1,96 @@
+name: Check doc links
+
+# Checking external links is inherently noisy: third-party sites rate-limit
+# automated clients, reject non-browser user agents, and go down temporarily.
+# Blocking pull requests on that trades a lot of false failures for very little
+# signal, so this runs on a schedule and reports findings in a single tracking
+# issue instead of failing anyone's build.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  REPORT_TITLE: "Docs link checker report"
+
+jobs:
+  link-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check links
+        id: lychee
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          # Restricted to http(s) on purpose. Relative links resolve against
+          # the assembled multi-repo site (docs/make-full-website.sh pulls
+          # docs/src/format/catalog, format/namespace, integrations/spark and
+          # friends from other repositories), so they cannot be verified from
+          # this checkout alone and would report as broken on every run.
+          #
+          # crates.io answers automated clients with 403/404 no matter the user
+          # agent, so it is excluded rather than reported every day.
+          args: >-
+            --scheme https
+            --scheme http
+            --no-progress
+            --max-retries 3
+            --timeout 20
+            --exclude '^https://crates\.io/'
+            'docs/src/**/*.md'
+          format: markdown
+          output: ./lychee/out.md
+          jobSummary: true
+          # The report, not a red build, is the signal this job exists to
+          # produce. A genuine job failure still surfaces on its own.
+          fail: false
+
+      - name: Find existing report issue
+        id: report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label documentation --limit 100 --json number,title \
+            --jq "[.[] | select(.title == \"$REPORT_TITLE\") | .number] | first // empty")
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Compose report
+        if: steps.lychee.outputs.exit_code != 0
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "Broken documentation links found by [\`$GITHUB_WORKFLOW\`]($run_url)."
+            echo
+            echo "This issue is rewritten by every scheduled run and closed automatically once all links resolve."
+            echo
+            echo "Entries can be false positives: some sites rate-limit or block automated clients while working fine in a browser. Confirm before editing the docs, and add persistent offenders to \`--exclude\` in \`.github/workflows/docs-link-check.yml\`."
+            echo
+            cat ./lychee/out.md
+          } > ./lychee/issue.md
+
+      - name: Report broken links
+        if: steps.lychee.outputs.exit_code != 0
+        uses: peter-evans/create-issue-from-file@fca9117c27cdc29c6c4db3b86c48e4115a786710 # v6.0.0
+        with:
+          # Empty on the first failing run, which creates the issue; afterwards
+          # the same issue is updated in place.
+          issue-number: ${{ steps.report.outputs.number }}
+          title: ${{ env.REPORT_TITLE }}
+          content-filepath: ./lychee/issue.md
+          labels: documentation
+
+      - name: Close report issue once links are healthy
+        if: steps.lychee.outputs.exit_code == 0 && steps.report.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh issue close "${{ steps.report.outputs.number }}" --repo "$GITHUB_REPOSITORY" \
+            --comment "All documentation links resolved in [the latest run]($run_url)."
