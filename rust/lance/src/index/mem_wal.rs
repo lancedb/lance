@@ -702,6 +702,7 @@ mod tests {
                 version,
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                    activate_safe_retirement: false,
                 },
                 None,
             ))
@@ -767,7 +768,6 @@ mod tests {
         .unwrap();
         assert_eq!(
             details.compacted_sstables[0].generation, 10,
-            "the recorded generation must be unchanged"
             "the recorded generation must be unchanged"
         );
     }
