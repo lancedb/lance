@@ -9,12 +9,13 @@ use super::{
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
-    builder::{IvfIndexBuilder, index_type_string},
+    builder::{ExistingIndex, IvfIndexBuilder, index_type_string},
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::append::build_coverage_filter;
 use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
@@ -567,6 +568,42 @@ fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
     }
 }
 
+/// Pair every segment with the rows it may still contribute when this optimize pass
+/// copies its data into the new index.
+///
+/// Building a filter costs a row-id sequence load under stable row ids, so it is
+/// skipped when the pass only appends a delta and never reads existing rows, and
+/// when any segment predates fragment bitmaps and its coverage is therefore unknown.
+async fn existing_index_sources(
+    dataset: &Dataset,
+    logical_index: &LogicalIvfView<'_>,
+    options: &OptimizeOptions,
+) -> Result<Vec<ExistingIndex>> {
+    let segments = logical_index.segments().collect::<Vec<_>>();
+    let reads_existing_rows = options.num_indices_to_merge != Some(0) || options.retrain;
+    let all_have_bitmaps = segments
+        .iter()
+        .all(|(metadata, _)| metadata.fragment_bitmap.is_some());
+    if !reads_existing_rows || !all_have_bitmaps {
+        return Ok(segments
+            .into_iter()
+            .map(|(_, index)| ExistingIndex::unfiltered(index.clone()))
+            .collect());
+    }
+
+    let mut sources = Vec::with_capacity(segments.len());
+    for (metadata, index) in segments {
+        let effective = metadata
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap_or_default();
+        sources.push(ExistingIndex {
+            index: index.clone(),
+            old_data_filter: Some(Arc::new(build_coverage_filter(dataset, &effective).await?)),
+        });
+    }
+    Ok(sources)
+}
+
 // TODO: move to `lance-index` crate.
 ///
 /// Returns (new_uuid, num_indices_merged, files)
@@ -589,14 +626,9 @@ pub(crate) async fn optimize_vector_indices(
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
-        return optimize_vector_indices_v2(
-            &dataset,
-            unindexed,
-            vector_column,
-            &existing_indices,
-            options,
-        )
-        .await;
+        let sources = existing_index_sources(&dataset, logical_index, options).await?;
+        return optimize_vector_indices_v2(&dataset, unindexed, vector_column, &sources, options)
+            .await;
     }
 
     let new_uuid = Uuid::new_v4();
@@ -665,7 +697,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn VectorIndex>],
+    existing_indices: &[ExistingIndex],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     // Sanity check the indices
@@ -678,11 +710,12 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let new_uuid = Uuid::new_v4();
     let index_dir = dataset.indices_dir().join(new_uuid.to_string());
-    let ivf_model = existing_indices[0].ivf_model();
-    let quantizer = existing_indices[0].quantizer();
-    let distance_type = existing_indices[0].metric_type();
+    let reference_index = &existing_indices[0].index;
+    let ivf_model = reference_index.ivf_model();
+    let quantizer = reference_index.quantizer();
+    let distance_type = reference_index.metric_type();
     let num_partitions = ivf_model.num_partitions();
-    let index_type = existing_indices[0].sub_index_type();
+    let index_type = reference_index.sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
     let format_version = dataset_format_version(dataset);
@@ -708,7 +741,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
+                .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -726,7 +759,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
+                .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -747,7 +780,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -767,7 +800,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -787,7 +820,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -806,7 +839,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -821,13 +854,13 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    derive_hnsw_params(existing_indices[0].as_ref()),
+                    derive_hnsw_params(reference_index.as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
+                .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -839,13 +872,13 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    derive_hnsw_params(existing_indices[0].as_ref()),
+                    derive_hnsw_params(reference_index.as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
+                .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -860,13 +893,13 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                derive_hnsw_params(existing_indices[0].as_ref()),
+                derive_hnsw_params(reference_index.as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -880,13 +913,13 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                derive_hnsw_params(existing_indices[0].as_ref()),
+                derive_hnsw_params(reference_index.as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
