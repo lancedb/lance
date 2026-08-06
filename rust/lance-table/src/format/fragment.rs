@@ -547,12 +547,13 @@ impl Fragment {
         }
     }
 
-    /// Every data file this fragment references: the base files plus the data
-    /// file of each overlay.
+    /// Every Lance-format file this fragment references: the base data files
+    /// plus the data file of each overlay. The fragment's other referenced
+    /// files (deletion files, external row-id files) are not in this format.
     ///
-    /// Prefer this over `files`, which is the base files only and so omits
+    /// Prefer this over `files`, which is the base data files only and so omits
     /// overlays.
-    pub fn all_data_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
+    pub fn referenced_lance_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
         // Destructured on purpose: a new field here fails to compile until
         // someone decides whether it references files.
         let Self {
@@ -570,11 +571,12 @@ impl Fragment {
             .chain(overlays.iter().map(|overlay| &overlay.data_file))
     }
 
-    /// Mutable counterpart of [`Self::all_data_files`], for rewriting the fields
-    /// a clone has to normalize (`base_id`) across base and overlay files alike.
-    pub fn all_data_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
-        // Destructured for the same reason as `all_data_files`, and so the two
-        // disjoint field borrows are visible to the borrow checker.
+    /// Mutable counterpart of [`Self::referenced_lance_files`], for rewriting
+    /// the fields a clone has to normalize (`base_id`) across base and overlay
+    /// files alike.
+    pub fn referenced_lance_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
+        // Destructured for the same reason as `referenced_lance_files`, and so
+        // the two disjoint field borrows are visible to the borrow checker.
         let Self {
             id: _,
             files,

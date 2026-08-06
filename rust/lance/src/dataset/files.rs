@@ -112,7 +112,7 @@ fn manifest_file_rows<'a>(
     for fragment in manifest.fragments.iter() {
         // Precount with the same accessor as the iterator below, or `exact_size`
         // drifts.
-        files += fragment.all_data_files().count();
+        files += fragment.referenced_lance_files().count();
 
         if fragment.deletion_file.is_some() {
             files += 1;
@@ -120,7 +120,7 @@ fn manifest_file_rows<'a>(
     }
 
     let data_files = manifest.fragments.iter().flat_map(move |fragment| {
-        fragment.all_data_files().map(move |data_file| {
+        fragment.referenced_lance_files().map(move |data_file| {
             let resolved_base = resolve_file_base(manifest, data_file.base_id, base_uri);
             let path = if resolved_base.is_dataset_root {
                 Cow::Owned(format!("{}/{}", DATA_DIR, data_file.path))

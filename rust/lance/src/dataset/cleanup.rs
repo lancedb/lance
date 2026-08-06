@@ -594,7 +594,7 @@ impl<'a> CleanupTask<'a> {
         };
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.all_data_files() {
+            for file in fragment.referenced_lance_files() {
                 let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
@@ -1147,7 +1147,7 @@ impl<'a> CleanupTask<'a> {
         let mut is_referenced = false;
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.all_data_files() {
+            for file in fragment.referenced_lance_files() {
                 if let Some(base_id) = file.base_id {
                     let base_path = manifest.base_paths.get(&base_id);
                     if let Some(base_path) = base_path
