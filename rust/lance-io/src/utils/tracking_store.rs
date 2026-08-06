@@ -27,9 +27,9 @@ use object_store::{
     Result as OSResult, UploadPart,
 };
 
-use crate::object_store::WrappingObjectStore;
 #[cfg(feature = "metrics")]
 use crate::object_store::metrics::{InFlightGuard, record_outcome};
+use crate::object_store::{PaginatedDirLister, WrappingObjectStore};
 
 #[derive(Debug, Default, Clone)]
 pub struct IOTracker {
@@ -182,6 +182,16 @@ impl IoMetricsGuard {
 impl WrappingObjectStore for IOTracker {
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(IoTrackingStore::new(target, self.stats.clone()))
+    }
+
+    // A pushed-down listing records itself against the store's tracker, so it is already
+    // counted without passing through here.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn PaginatedDirLister>,
+    ) -> Option<Arc<dyn PaginatedDirLister>> {
+        Some(original)
     }
 }
 

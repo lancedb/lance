@@ -53,7 +53,9 @@ test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true
 mock_instant.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+# `net` for the in-process list emulator's listener.
+tokio = { workspace = true, features = ["test-util", "net"] }
+axum = { workspace = true }
 tracing-mock = { workspace = true }
 metrics-util = { workspace = true }
 

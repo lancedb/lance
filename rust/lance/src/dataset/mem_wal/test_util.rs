@@ -89,6 +89,15 @@ impl WrappingObjectStore for FailingWrapper {
             controls: self.controls.clone(),
         })
     }
+
+    // Injects behaviour into every request, so a listing must not go around it.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn lance_io::object_store::PaginatedDirLister>,
+    ) -> Option<Arc<dyn lance_io::object_store::PaginatedDirLister>> {
+        None
+    }
 }
 
 /// Delegates everything to `inner`, failing WAL-entry PUTs per [`FailControls`].

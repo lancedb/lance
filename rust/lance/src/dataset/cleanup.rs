@@ -1640,6 +1640,15 @@ mod tests {
         ) -> Arc<dyn object_store::ObjectStore> {
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
         }
+
+        // Injects behaviour into every request, so a listing must not go around it.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn lance_io::object_store::PaginatedDirLister>,
+        ) -> Option<Arc<dyn lance_io::object_store::PaginatedDirLister>> {
+            None
+        }
     }
 
     impl MockObjectStore {
