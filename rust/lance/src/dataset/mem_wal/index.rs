@@ -460,22 +460,6 @@ impl MemIndexConfig {
     }
 }
 
-/// Whether the MemWAL can maintain an index of this protobuf type.
-///
-/// A necessary but *not* sufficient condition: the type url does not carry the
-/// column, so every vector index sub-type maps to [`MemIndexKind::Hnsw`] here
-/// regardless of whether its column is the `FixedSizeList<Float32>` the memtable
-/// HNSW needs. Filtering a maintained set on this alone can commit an index that
-/// every shard-writer open then rejects, leaving the table unwritable.
-///
-/// Use
-/// [`validate_maintained_indexes`](super::validate_maintained_indexes) to decide
-/// what to commit; it resolves each index against the dataset schema and applies
-/// the writer's own rules.
-pub fn is_maintainable_index_type(type_url: &str) -> bool {
-    MemIndexKind::from_type_url(type_url).is_some()
-}
-
 /// Shared by the detection and writer paths so both report the same thing.
 pub(crate) fn unsupported_index_type(type_url: &str) -> Error {
     Error::invalid_input(format!(
@@ -1341,7 +1325,6 @@ mod tests {
         #[case] expected: Option<MemIndexKind>,
     ) {
         assert_eq!(MemIndexKind::from_type_url(type_url), expected);
-        assert_eq!(is_maintainable_index_type(type_url), expected.is_some());
     }
 
     /// `ALL` is hand-maintained, so a kind left out of it stops resolving.

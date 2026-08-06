@@ -668,9 +668,9 @@ impl DatasetMemWalExt for Dataset {
 
 /// Build the in-memory index configurations for `index_names`.
 ///
-/// Shared by [`DatasetMemWalExt::mem_wal_writer`], which opens a shard writer
-/// with the result, and [`validate_maintained_indexes`], which only checks it.
-/// Both go through here so a set that validates is a set the writer can build.
+/// Shared by [`DatasetMemWalExt::mem_wal_writer`] and
+/// [`validate_maintained_indexes`], so a set that validates is one the writer
+/// can build.
 async fn build_index_configs(
     dataset: &Dataset,
     index_names: &[String],
@@ -704,9 +704,8 @@ async fn build_index_configs(
         let kind = MemIndexKind::from_type_url(type_url)
             .ok_or_else(|| unsupported_index_type(type_url))?;
 
-        // Exhaustive: a new kind must be built here, or callers filtering on
-        // `is_maintainable_index_type` would admit an index this writer
-        // cannot open, failing every memtable claim.
+        // Exhaustive: a new kind must be built here, or a maintained set could
+        // name an index this writer cannot open, failing every memtable claim.
         index_configs.push(match kind {
             MemIndexKind::BTree => {
                 MemIndexConfig::btree_from_metadata(&index_meta, dataset.schema())?
@@ -723,35 +722,25 @@ async fn build_index_configs(
 
 /// Whether the MemWAL can maintain `index_names` on `dataset`.
 ///
-/// [`is_maintainable_index_type`](super::is_maintainable_index_type) inspects
-/// only an index's protobuf type url, which cannot answer this on its own: every
-/// vector index sub-type maps to [`MemIndexKind::Hnsw`], but the memtable's HNSW
-/// needs a `FixedSizeList<Float32>` column. Committing an index that fails that
-/// rule into `maintained_indexes` leaves a table whose every shard-writer open
-/// fails — so the type url admits sets that are unwritable.
+/// Applies the same rules [`ShardWriter::open`] does, so a set that passes here
+/// is a set the writer can open. Call it before committing a maintained set: a
+/// type url alone cannot decide this — every vector sub-type maps to
+/// [`MemIndexKind::Hnsw`], but the memtable's HNSW needs a
+/// `FixedSizeList<Float32>` column — and committing an index that fails leaves
+/// a table whose every shard-writer open fails.
 ///
-/// This resolves each index against the dataset schema and applies the same
-/// rules [`ShardWriter::open`] does, so a set that passes here is a set the
-/// writer can open. Call it before committing a maintained set, whether that set
-/// was named explicitly or taken from the dataset's own indexes.
+/// All-or-nothing: it reports the first index it cannot maintain rather than
+/// returning a usable subset, so a caller inferring a set surfaces the error
+/// instead of dropping an index it believes is maintained.
 ///
-/// All-or-nothing by design: it reports the first index that cannot be
-/// maintained rather than returning a usable subset. A caller that would
-/// otherwise infer a set should surface that error and let the user name the
-/// indexes explicitly — silently dropping one leaves an index the caller
-/// believes is maintained and the writer never touches.
-///
-/// Reads each vector index to inherit its distance type, so the cost scales with
-/// the number of vector indexes named.
+/// Opens each vector index to inherit its distance type.
 pub async fn validate_maintained_indexes(dataset: &Dataset, index_names: &[String]) -> Result<()> {
-    // Build params never affect validation — it reads an index's name, column,
-    // and field id, never its HNSW tuning — so the writer's params are not
-    // needed to reach the same verdict.
+    // Validation reads an index's name, column, and field id, never its HNSW
+    // tuning, so the writer's build params are not needed here.
     let index_configs = build_index_configs(dataset, index_names, &HashMap::new()).await?;
 
-    // Validate against the shard schema, base + `_tombstone`, exactly as
-    // `ShardWriter::open` extends it: field ids and the primary key resolve
-    // against that schema, not the base one.
+    // The shard schema is base + `_tombstone`, as `ShardWriter::open` extends
+    // it; field ids and the primary key resolve against that, not the base.
     let base_schema: ArrowSchema = dataset.schema().into();
     let schema = schema_with_tombstone(&base_schema);
     let lance_schema = LanceSchema::try_from(schema.as_ref())?;
@@ -919,11 +908,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_maintained_indexes_rejects_non_f32_vector_column() {
-        // A vector index over `FixedSizeList<Float64>` is a perfectly valid
-        // durable index, and it carries the same `VectorIndexDetails` type url
-        // every vector index does — so the type url alone admits it. The memtable
-        // HNSW needs Float32, so committing it as maintained would leave a table
-        // whose every shard-writer open fails.
+        // A `FixedSizeList<Float64>` vector index is a valid durable index whose
+        // type url resolves to `Hnsw` like any other, but the memtable HNSW needs
+        // Float32 — so committing it would leave the table unwritable.
         let tmp = tempfile::tempdir().unwrap();
         let uri = format!("{}/base", tmp.path().to_str().unwrap());
         let dataset = dataset_with_vector_index(&uri, DataType::Float64).await;
@@ -935,11 +922,12 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        assert!(
-            super::super::is_maintainable_index_type(
+        assert_eq!(
+            MemIndexKind::from_type_url(
                 index_meta.index_details.as_ref().unwrap().type_url.as_str()
             ),
-            "the type url cannot see the column type, so it admits this index"
+            Some(MemIndexKind::Hnsw),
+            "the type url cannot see the column type"
         );
 
         let error = validate_maintained_indexes(&dataset, &["vector_idx".to_string()])
