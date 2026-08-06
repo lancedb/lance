@@ -171,9 +171,96 @@ mod tests {
     use arrow_array::RecordBatchIterator;
     use arrow_array::types::Int32Type;
     use arrow_schema::Schema as ArrowSchema;
-    use lance_table::format::{Fragment, RowIdMeta};
+    use lance_table::format::{Fragment, RowIdMeta, pb};
     use lance_table::rowids::version::RowDatasetVersionSequence;
     use lance_table::rowids::write_row_ids;
+    use prost::Message;
+    use rstest::rstest;
+
+    fn encode_segments(segments: Vec<pb::u64_segment::Segment>) -> Vec<u8> {
+        pb::RowIdSequence {
+            segments: segments
+                .into_iter()
+                .map(|segment| pb::U64Segment {
+                    segment: Some(segment),
+                })
+                .collect(),
+        }
+        .encode_to_vec()
+    }
+
+    fn range_segment(start: u64, end: u64) -> pb::u64_segment::Segment {
+        pb::u64_segment::Segment::Range(pb::u64_segment::Range { start, end })
+    }
+
+    fn empty_encoded_array() -> pb::EncodedU64Array {
+        pb::EncodedU64Array {
+            array: Some(pb::encoded_u64_array::Array::U64Array(
+                pb::encoded_u64_array::U64Array { values: Vec::new() },
+            )),
+        }
+    }
+
+    fn empty_array_segment() -> pb::u64_segment::Segment {
+        pb::u64_segment::Segment::Array(empty_encoded_array())
+    }
+
+    fn empty_sorted_array_segment() -> pb::u64_segment::Segment {
+        pb::u64_segment::Segment::SortedArray(empty_encoded_array())
+    }
+
+    fn empty_range_with_holes_segment() -> pb::u64_segment::Segment {
+        pb::u64_segment::Segment::RangeWithHoles(pb::u64_segment::RangeWithHoles {
+            start: 0,
+            end: 0,
+            holes: Some(empty_encoded_array()),
+        })
+    }
+
+    fn empty_range_with_bitmap_segment() -> pb::u64_segment::Segment {
+        pb::u64_segment::Segment::RangeWithBitmap(pb::u64_segment::RangeWithBitmap {
+            start: 0,
+            end: 0,
+            bitmap: Vec::new(),
+        })
+    }
+
+    /// Two `Range` segments that each fit a `usize` but whose lengths sum past `u64`.
+    /// Decoding accepts them, so `validate()` must report corruption rather than
+    /// overflowing while measuring the sequence.
+    #[tokio::test]
+    async fn test_validate_rejects_row_id_count_overflow() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = validation_fixture(&temp_dir).await;
+        let encoded = encode_segments(vec![range_segment(0, u64::MAX), range_segment(0, u64::MAX)]);
+        edit_fragments(&mut dataset, |fragments| {
+            fragments[1].row_id_meta = Some(RowIdMeta::Inline(encoded));
+        });
+
+        assert_invalid(&dataset, "total length exceeding u64::MAX").await;
+    }
+
+    /// An empty segment carries no minimum or maximum, and decoding accepts an empty
+    /// encoding of every variant. Neither the cardinality check nor the `next_row_id`
+    /// bound may unwind on one.
+    #[rstest]
+    #[case::array(empty_array_segment())]
+    #[case::sorted_array(empty_sorted_array_segment())]
+    #[case::range_with_holes(empty_range_with_holes_segment())]
+    #[case::range_with_bitmap(empty_range_with_bitmap_segment())]
+    #[tokio::test]
+    async fn test_validate_tolerates_empty_segment(#[case] empty: pb::u64_segment::Segment) {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = validation_fixture(&temp_dir).await;
+        // Ten ids across two segments matches the fragment's ten physical rows, and the
+        // ids stay clear of fragment 0's, so this dataset is well-formed.
+        let encoded = encode_segments(vec![range_segment(10, 20), empty]);
+        edit_fragments(&mut dataset, |fragments| {
+            fragments[1].row_id_meta = Some(RowIdMeta::Inline(encoded));
+        });
+
+        dataset.validate().await.unwrap();
+    }
 
     /// Write a two-fragment dataset with stable row ids to `uri`, then reopen it with a
     /// fresh session so the row id sequence cache is empty. Tests that doctor a
