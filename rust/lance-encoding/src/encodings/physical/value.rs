@@ -610,6 +610,15 @@ impl MiniBlockDecompressor for ValueDecompressor {
         assert_eq!(lists.num_values(), num_values);
         Ok(lists)
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 struct FslDecompressorValidityBuilder {
@@ -737,6 +746,15 @@ impl FixedPerValueDecompressor for ValueDecompressor {
 
     fn bits_per_value(&self) -> u64 {
         self.bits_per_value
+    }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
     }
 }
 
@@ -1080,6 +1098,11 @@ mod tests {
         let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
 
         let num_values = data.num_values;
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_values),
+            None,
+            "nullable FSL output uses multiple buffers and requires the fallback estimate"
+        );
         let decompressed =
             FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
 
