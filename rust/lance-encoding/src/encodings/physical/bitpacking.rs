@@ -326,6 +326,12 @@ impl MiniBlockDecompressor for InlineBitpacking {
             _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
         }
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        num_values
+            .checked_mul(self.uncompressed_bit_width)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl BlockDecompressor for InlineBitpacking {

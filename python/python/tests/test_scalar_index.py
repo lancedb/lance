@@ -2860,6 +2860,54 @@ def test_zonemap_index_remapping(tmp_path: Path):
     assert result.num_rows == 501  # 1000..1500 inclusive
 
 
+def test_zonemap_fsl_column(tmp_path: Path):
+    """Zone map can be created on a FixedSizeList column and accelerates IS NULL."""
+    dim = 8
+    n = 1000
+    rng = np.random.default_rng(42)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    vec_type = pa.list_(pa.float32(), dim)
+    # Every 10th row is null
+    vec_list = [None if i % 10 == 0 else v.tolist() for i, v in enumerate(vectors)]
+    tbl = pa.table({"vec": pa.array(vec_list, type=vec_type), "id": pa.array(range(n))})
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_scalar_index("vec", index_type="ZONEMAP")
+
+    scanner = ds.scanner(filter="vec IS NULL", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+    result = scanner.to_table()
+    assert result.num_rows == 100  # every 10th row is null
+
+
+def test_vector_and_zonemap_on_fsl_column(tmp_path: Path):
+    """Vector index and zone map can coexist on the same FSL column."""
+    dim = 16
+    n = 2000
+    rng = np.random.default_rng(0)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    vec_type = pa.list_(pa.float32(), dim)
+    # Every 20th row is null
+    vec_list = [None if i % 20 == 0 else v.tolist() for i, v in enumerate(vectors)]
+    tbl = pa.table({"vec": pa.array(vec_list, type=vec_type), "id": pa.array(range(n))})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    ds.create_index("vec", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2)
+    ds.create_scalar_index("vec", index_type="ZONEMAP")
+
+    # Vector search still works
+    query = vectors[5]
+    result = ds.scanner(nearest={"column": "vec", "q": query, "k": 10}).to_table()
+    assert result.num_rows == 10
+
+    # IS NULL is zone-map-accelerated
+    scanner = ds.scanner(filter="vec IS NULL", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+    null_result = scanner.to_table()
+    assert null_result.num_rows == 100  # every 20th row is null
+
+
 def test_bloomfilter_index(tmp_path: Path):
     """Test create bloomfilter index"""
     tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])

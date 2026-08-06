@@ -2277,8 +2277,13 @@ def test_deletion_file(tmp_path: Path):
     assert re.match(
         "_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file.path(0)
     )
-    operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
+    # Delete, not Overwrite: the deletion file belongs to fragment 0 of this
+    # dataset, and an overwrite's fragments are newly written ones that get fresh
+    # ids, which a deletion file cannot follow.
+    operation = lance.LanceOperation.Delete([new_fragment], [], "a < 10")
+    dataset = lance.LanceDataset.commit(
+        base_dir, operation, read_version=dataset.version
+    )
     assert dataset.count_rows() == 90
 
 
@@ -3007,6 +3012,42 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 350
     check_merge_stats(merge_dict, (0, 350, 0))
+
+
+def test_indexed_merge_insert_deduplicates_cross_batch_candidates(tmp_path: Path):
+    target = pa.table(
+        {
+            "a": [1, 1, 2, 2],
+            "b": [10, 20, 10, 20],
+            "value": [110, 120, 210, 220],
+        }
+    )
+    dataset = lance.write_dataset(target, tmp_path / "dataset")
+    dataset.create_scalar_index("a", "BTREE")
+    dataset.create_scalar_index("b", "BTREE")
+
+    first = pa.RecordBatch.from_pydict(
+        {"a": [1], "b": [10], "value": [901]}, schema=target.schema
+    )
+    # The per-column index probe for this batch also reaches (1, 10), which
+    # was already emitted for the first batch. The exact join filters that
+    # over-match, but the indexed scan must not read the target row twice.
+    second = pa.RecordBatch.from_pydict(
+        {"a": [1, 2], "b": [20, 10], "value": [902, 903]},
+        schema=target.schema,
+    )
+    source = pa.RecordBatchReader.from_batches(target.schema, [first, second])
+
+    stats = dataset.merge_insert(["a", "b"]).when_matched_update_all().execute(source)
+
+    check_merge_stats(stats, (0, 3, 0))
+    assert (
+        dataset.to_table().sort_by([("a", "ascending"), ("b", "ascending")]).to_pydict()
+    ) == {
+        "a": [1, 1, 2, 2],
+        "b": [10, 20, 10, 20],
+        "value": [901, 902, 903, 220],
+    }
 
 
 def test_merge_insert_vector_column(tmp_path: Path):

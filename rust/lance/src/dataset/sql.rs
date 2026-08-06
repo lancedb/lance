@@ -9,6 +9,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
+use lance_core::datatypes::BlobHandling;
 use lance_datafusion::udf::register_functions;
 use std::sync::Arc;
 
@@ -29,6 +30,9 @@ pub struct SqlQueryBuilder {
 
     /// If true, the query result will include the internal row address
     pub(crate) with_row_addr: bool,
+
+    /// Override how blob columns are materialized for this query.
+    pub(crate) blob_handling: Option<BlobHandling>,
 }
 
 impl SqlQueryBuilder {
@@ -39,6 +43,7 @@ impl SqlQueryBuilder {
             table_name: "dataset".to_string(),
             with_row_id: false,
             with_row_addr: false,
+            blob_handling: None,
         }
     }
 
@@ -65,18 +70,24 @@ impl SqlQueryBuilder {
         self
     }
 
+    /// Override how blob columns are materialized for this query.
+    ///
+    /// When unset, the underlying dataset scan uses its default
+    /// [`BlobHandling::BlobsDescriptions`] policy.
+    pub fn blob_handling(mut self, blob_handling: BlobHandling) -> Self {
+        self.blob_handling = Some(blob_handling);
+        self
+    }
+
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
         let ctx = SessionContext::new();
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
-        ctx.register_table(
-            self.table_name,
-            Arc::new(LanceTableProvider::new(
-                self.dataset.clone(),
-                row_id,
-                row_addr,
-            )),
-        )?;
+        let mut provider = LanceTableProvider::new(self.dataset.clone(), row_id, row_addr);
+        if let Some(blob_handling) = self.blob_handling {
+            provider = provider.with_blob_handling(blob_handling);
+        }
+        ctx.register_table(self.table_name, Arc::new(provider))?;
         register_functions(&ctx);
         let df = ctx.sql(&self.sql).await?;
         Ok(SqlQuery::new(df))
@@ -123,10 +134,12 @@ impl SqlQuery {
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, assert_string_matches};
+    use crate::{BlobArrayBuilder, blob_field};
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::Dataset;
+    use crate::dataset::write::WriteParams;
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
@@ -135,7 +148,9 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_core::datatypes::BlobHandling;
     use lance_datagen::{array, gen_batch};
+    use lance_file::version::LanceFileVersion;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -184,6 +199,75 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 4);
         assert_true!(results.column(2).as_primitive::<UInt64Type>().value(0) > 100);
         assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
+    }
+
+    #[tokio::test]
+    async fn test_sql_blob_all_binary() {
+        let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"foo").unwrap();
+        blobs.push_bytes(b"bar").unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://test_sql_blob_all_binary",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let batches = dataset
+            .sql("SELECT blob FROM dataset")
+            .blob_handling(BlobHandling::AllBinary)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let blobs = batches[0].column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+
+        // Expressions over the blob column require the planner to see the
+        // materialized LargeBinary type instead of the blob descriptor struct.
+        let batches = dataset
+            .sql("SELECT blob = X'666f6f' FROM dataset")
+            .blob_handling(BlobHandling::AllBinary)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let is_foo = batches[0].column(0).as_boolean();
+        assert!(is_foo.value(0));
+        assert!(!is_foo.value(1));
+
+        let batches = dataset
+            .sql("SELECT blob, _rowid, _rowaddr FROM dataset")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .blob_handling(BlobHandling::AllBinary)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        let blobs = batch.column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+        let row_ids = batch.column(1).as_primitive::<UInt64Type>();
+        assert_eq!(row_ids.value(0), 0);
+        assert_eq!(row_ids.value(1), 1);
+        let row_addrs = batch.column(2).as_primitive::<UInt64Type>();
+        assert_eq!(row_addrs.value(0), 0);
+        assert_eq!(row_addrs.value(1), 1);
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 //! Builders and file-level writer helpers for Lance blob v2 columns.
 //!
 //! Logical blob input uses `Struct<data: LargeBinary?, uri: Utf8?>`. File-level blob
-//! descriptors use a physical writer-side struct with `kind`, `blob_id`, and range fields.
+//! preparation produces a kind-aware writer intermediate with `blob_id` and range fields.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -21,14 +21,17 @@ use arrow_array::{
     types::{UInt8Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::NullBufferBuilder;
-use arrow_schema::{DataType, Field, Fields};
+use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, FieldExt,
 };
 use lance_core::{
-    datatypes::{BlobKind, Field as LanceField, Schema as LanceSchema},
+    datatypes::{
+        BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
+        BlobV2Layout, Field as LanceField, Schema as LanceSchema,
+    },
     utils::blob::blob_path,
 };
 use lance_io::{
@@ -112,27 +115,10 @@ pub fn blob_field_with_options(name: &str, nullable: bool, options: BlobFieldOpt
     }
     Field::new(
         name,
-        DataType::Struct(
-            vec![
-                Field::new("data", DataType::LargeBinary, true),
-                Field::new("uri", DataType::Utf8, true),
-            ]
-            .into(),
-        ),
+        DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
         nullable,
     )
     .with_metadata(metadata)
-}
-
-fn prepared_blob_child_fields() -> Fields {
-    Fields::from(vec![
-        Field::new("kind", DataType::UInt8, true),
-        Field::new("data", DataType::LargeBinary, true),
-        Field::new("uri", DataType::Utf8, true),
-        Field::new("blob_id", DataType::UInt32, true),
-        Field::new("blob_size", DataType::UInt64, true),
-        Field::new("position", DataType::UInt64, true),
-    ])
 }
 
 fn prepared_blob_field_with_metadata(
@@ -140,97 +126,68 @@ fn prepared_blob_field_with_metadata(
     nullable: bool,
     metadata: HashMap<String, String>,
 ) -> Field {
-    Field::new(
-        name,
-        DataType::Struct(prepared_blob_child_fields()),
-        nullable,
-    )
-    .with_metadata(metadata)
+    Field::new(name, BLOB_V2_PREPARED_TYPE.clone(), nullable).with_metadata(metadata)
 }
 
 fn logical_blob_lance_children() -> Result<Vec<LanceField>> {
-    [
-        Field::new("data", DataType::LargeBinary, true),
-        Field::new("uri", DataType::Utf8, true),
-    ]
-    .iter()
-    .map(LanceField::try_from)
-    .collect()
+    BLOB_V2_LOGICAL_MINIMAL_FIELDS
+        .iter()
+        .map(|field| LanceField::try_from(field.as_ref()))
+        .collect()
 }
 
-fn field_matches(field: &Field, name: &str, data_type: &DataType, nullable: bool) -> bool {
-    field.name() == name && field.data_type() == data_type && field.is_nullable() == nullable
+pub(crate) fn blob_v2_layout(field: &Field) -> Option<BlobV2Layout> {
+    if !field.is_blob_v2() {
+        return None;
+    }
+    let DataType::Struct(fields) = field.data_type() else {
+        return None;
+    };
+    BlobV2Layout::classify(fields)
 }
 
-fn blob_v2_shape_error(field: &Field) -> Error {
+pub(crate) fn blob_v2_shape_error(field: &Field, expected: &[BlobV2Layout]) -> Error {
+    let expected = expected
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let actual = match field.data_type() {
+        DataType::Struct(fields) => BlobV2Layout::classify(fields)
+            .map(|layout| format!("{layout} layout"))
+            .unwrap_or_else(|| format!("unrecognized layout {fields:?}")),
+        data_type => format!("non-struct type {data_type}"),
+    };
     Error::invalid_input(format!(
-        "Blob v2 field '{}' must use either logical struct<data: LargeBinary?, uri: Utf8?> \
-         with optional position/size UInt64 fields or prepared struct<kind: UInt8?, data: \
-         LargeBinary?, uri: Utf8?, blob_id: UInt32?, blob_size: UInt64?, position: UInt64?>",
-        field.name()
+        "Blob v2 field '{}' has {actual}; expected {expected} layout",
+        field.name(),
     ))
 }
 
-/// Returns true when `field` is the writer-side prepared blob v2 struct.
-pub(crate) fn is_prepared_blob_v2_field(field: &Field) -> bool {
-    if !field.is_blob_v2() {
-        return false;
-    }
-    let DataType::Struct(fields) = field.data_type() else {
-        return false;
-    };
-    let expected = prepared_blob_child_fields();
-    fields.len() == expected.len()
-        && fields
-            .iter()
-            .zip(expected.iter())
-            .all(|(actual, expected)| actual.as_ref() == expected.as_ref())
-}
-
-/// Returns true when `field` is the logical blob v2 input struct.
-pub(crate) fn is_logical_blob_v2_field(field: &Field) -> bool {
-    if !field.is_blob_v2() {
-        return false;
-    }
-    let DataType::Struct(fields) = field.data_type() else {
-        return false;
-    };
-    match fields.len() {
-        2 => {
-            field_matches(fields[0].as_ref(), "data", &DataType::LargeBinary, true)
-                && field_matches(fields[1].as_ref(), "uri", &DataType::Utf8, true)
-        }
-        4 => {
-            field_matches(fields[0].as_ref(), "data", &DataType::LargeBinary, true)
-                && field_matches(fields[1].as_ref(), "uri", &DataType::Utf8, true)
-                && fields[2].name() == "position"
-                && fields[2].data_type() == &DataType::UInt64
-                && fields[3].name() == "size"
-                && fields[3].data_type() == &DataType::UInt64
-        }
-        _ => false,
-    }
-}
-
-fn normalize_prepared_blob_lance_field(field: &LanceField) -> Result<LanceField> {
+fn prepared_to_logical_blob_lance_field(field: &LanceField) -> Result<LanceField> {
     if field.is_blob_v2() {
         let arrow_field = Field::from(field);
-        if is_prepared_blob_v2_field(&arrow_field) {
-            let mut normalized = field.clone();
-            let mut logical_children = logical_blob_lance_children()?;
-            for (logical_child, prepared_child) in
-                logical_children.iter_mut().zip(field.children.iter())
-            {
-                logical_child.id = prepared_child.id;
-                logical_child.parent_id = field.id;
+        match blob_v2_layout(&arrow_field) {
+            Some(BlobV2Layout::Prepared) => {
+                let mut normalized = field.clone();
+                let mut logical_children = logical_blob_lance_children()?;
+                for (logical_child, prepared_child) in
+                    logical_children.iter_mut().zip(field.children.iter())
+                {
+                    logical_child.id = prepared_child.id;
+                    logical_child.parent_id = field.id;
+                }
+                normalized.children = logical_children;
+                return Ok(normalized);
             }
-            normalized.children = logical_children;
-            return Ok(normalized);
+            Some(BlobV2Layout::Logical) => return Ok(field.clone()),
+            _ => {
+                return Err(blob_v2_shape_error(
+                    &arrow_field,
+                    &[BlobV2Layout::Logical, BlobV2Layout::Prepared],
+                ));
+            }
         }
-        if is_logical_blob_v2_field(&arrow_field) {
-            return Ok(field.clone());
-        }
-        return Err(blob_v2_shape_error(&arrow_field));
     }
 
     if field.children.is_empty() {
@@ -240,7 +197,7 @@ fn normalize_prepared_blob_lance_field(field: &LanceField) -> Result<LanceField>
     let normalized_children = field
         .children
         .iter()
-        .map(normalize_prepared_blob_lance_field)
+        .map(prepared_to_logical_blob_lance_field)
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LanceField {
@@ -249,11 +206,11 @@ fn normalize_prepared_blob_lance_field(field: &LanceField) -> Result<LanceField>
     })
 }
 
-pub(crate) fn normalize_prepared_blob_schema(schema: &LanceSchema) -> Result<LanceSchema> {
+pub(crate) fn prepared_to_logical_blob_schema(schema: &LanceSchema) -> Result<LanceSchema> {
     let fields = schema
         .fields
         .iter()
-        .map(normalize_prepared_blob_lance_field)
+        .map(prepared_to_logical_blob_lance_field)
         .collect::<Result<Vec<_>>>()?;
     Ok(LanceSchema {
         fields,
@@ -331,14 +288,23 @@ fn validate_range(offset: u64, size: u64, object_size: u64, label: &str) -> Resu
 }
 
 fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result<()> {
-    if !is_prepared_blob_v2_field(field) {
-        return Err(blob_v2_shape_error(field));
+    if blob_v2_layout(field) != Some(BlobV2Layout::Prepared) {
+        return Err(blob_v2_shape_error(field, &[BlobV2Layout::Prepared]));
     }
 
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
         .ok_or_else(|| Error::invalid_input("Prepared blob column was not a struct array"))?;
+    if BlobV2Layout::classify(struct_arr.fields()) != Some(BlobV2Layout::Prepared) {
+        let actual = BlobV2Layout::classify(struct_arr.fields())
+            .map(|layout| layout.to_string())
+            .unwrap_or_else(|| format!("unrecognized ({:?})", struct_arr.fields()));
+        return Err(Error::invalid_input(format!(
+            "Prepared blob column '{}' has {actual} array layout; expected prepared layout",
+            field.name()
+        )));
+    }
     let kind_col = struct_arr
         .column_by_name("kind")
         .ok_or_else(|| Error::invalid_input("Prepared blob struct missing `kind` field"))?
@@ -465,7 +431,7 @@ pub struct BlobRange {
     pub size: u64,
 }
 
-/// A physical blob descriptor row.
+/// A kind-aware row used to build the writer-prepared blob representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobDescriptor {
     /// A null blob row.
@@ -489,19 +455,22 @@ pub enum BlobDescriptor {
     },
 }
 
-/// A physical blob descriptor column ready to be included in a [`RecordBatch`](arrow_array::RecordBatch).
+/// A writer-prepared blob column ready to be included in a [`RecordBatch`](arrow_array::RecordBatch).
+///
+/// Despite the legacy type name, its Arrow representation is
+/// [`BlobV2Layout::Prepared`], not the descriptor stored in a Lance file.
 pub struct BlobDescriptorColumn {
     field: Field,
     array: ArrayRef,
 }
 
 impl BlobDescriptorColumn {
-    /// Return the Arrow field for the descriptor column.
+    /// Return the Arrow field for the prepared column.
     pub fn field(&self) -> &Field {
         &self.field
     }
 
-    /// Return the Arrow array for the descriptor column.
+    /// Return the Arrow array for the prepared column.
     pub fn array(&self) -> &ArrayRef {
         &self.array
     }
@@ -512,9 +481,9 @@ impl BlobDescriptorColumn {
     }
 }
 
-/// Builds physical blob descriptors for one blob v2 column.
+/// Builds the writer-prepared representation for one blob v2 column.
 ///
-/// This builder only produces the writer-side descriptor struct array. It does not allocate blob ids,
+/// This builder only produces the writer-prepared struct array. It does not allocate blob ids,
 /// choose sidecar paths, write blob objects, or commit data files.
 pub struct BlobDescriptorArrayBuilder {
     field: Field,
@@ -606,12 +575,12 @@ impl BlobDescriptorArrayBuilder {
         self.push(BlobDescriptor::Null)
     }
 
-    /// Return the descriptor Arrow field for this blob column.
+    /// Return the prepared Arrow field for this blob column.
     pub fn field(&self) -> &Field {
         &self.field
     }
 
-    /// Finish this column and return the writer-side descriptor struct array.
+    /// Finish this column and return the writer-prepared struct array.
     pub fn finish(self) -> Result<BlobDescriptorColumn> {
         let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(self.values.len());
         let mut data_builder = LargeBinaryBuilder::with_capacity(self.values.len(), 0);
@@ -682,7 +651,7 @@ impl BlobDescriptorArrayBuilder {
         }
 
         let array = Arc::new(StructArray::try_new(
-            prepared_blob_child_fields(),
+            BLOB_V2_PREPARED_FIELDS.clone(),
             vec![
                 Arc::new(kind_builder.finish()),
                 Arc::new(data_builder.finish()),
@@ -1057,11 +1026,7 @@ impl BlobArrayBuilder {
         let validity = self.validity.finish();
 
         let struct_array = StructArray::try_new(
-            vec![
-                Field::new("data", DataType::LargeBinary, true),
-                Field::new("uri", DataType::Utf8, true),
-            ]
-            .into(),
+            BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone(),
             vec![data as ArrayRef, uri as ArrayRef],
             validity,
         )?;
@@ -1265,7 +1230,7 @@ mod tests {
         writer.push_null().unwrap();
 
         let column = writer.finish().unwrap();
-        assert!(is_prepared_blob_v2_field(column.field()));
+        assert_eq!(blob_v2_layout(column.field()), Some(BlobV2Layout::Prepared));
         let struct_arr = column.array().as_struct();
         let kinds = struct_arr
             .column_by_name("kind")
@@ -1307,7 +1272,7 @@ mod tests {
         ] {
             let array = Arc::new(
                 StructArray::try_new(
-                    prepared_blob_child_fields(),
+                    BLOB_V2_PREPARED_FIELDS.clone(),
                     vec![
                         Arc::new(arrow_array::UInt8Array::from(vec![kind as u8])) as ArrayRef,
                         Arc::new(arrow_array::LargeBinaryArray::from_iter([None::<&[u8]>])),
@@ -1327,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_prepared_blob_schema_preserves_non_blob_fields() {
+    fn test_prepared_to_logical_blob_schema_preserves_non_blob_fields() {
         let mut metadata = HashMap::new();
         metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
         let prepared_field = prepared_blob_field_with_metadata("blob", true, metadata);
@@ -1344,7 +1309,7 @@ mod tests {
         let dictionary_values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
         schema.fields[0].set_dictionary_values(&dictionary_values);
 
-        let normalized = normalize_prepared_blob_schema(&schema).unwrap();
+        let normalized = prepared_to_logical_blob_schema(&schema).unwrap();
 
         assert_eq!(normalized.fields[0].id, 42);
         assert_eq!(

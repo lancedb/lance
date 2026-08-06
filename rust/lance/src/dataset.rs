@@ -93,6 +93,7 @@ pub mod transaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
+pub(crate) mod versions;
 pub mod write;
 
 pub(crate) use take::row_offsets_to_row_addresses;
@@ -2272,15 +2273,15 @@ impl Dataset {
         fn field_names_match(
             fields: &[lance_core::datatypes::Field],
             start: usize,
-            names: &[&str],
+            expected: &arrow_schema::Fields,
         ) -> bool {
             fields
-                .get(start..start + names.len())
+                .get(start..start + expected.len())
                 .is_some_and(|candidate| {
                     candidate
                         .iter()
-                        .zip(names)
-                        .all(|(field, name)| field.name == *name)
+                        .zip(expected.iter())
+                        .all(|(field, expected)| field.name == expected.name().as_str())
                 })
         }
 
@@ -2288,14 +2289,10 @@ impl Dataset {
             fields: &[lance_core::datatypes::Field],
             start: usize,
         ) -> usize {
-            const BLOB_V2_DESCRIPTOR_FIELDS: &[&str] =
-                &["kind", "position", "size", "blob_id", "blob_uri"];
-            const BLOB_V1_DESCRIPTOR_FIELDS: &[&str] = &["position", "size"];
-
-            if field_names_match(fields, start, BLOB_V2_DESCRIPTOR_FIELDS) {
-                BLOB_V2_DESCRIPTOR_FIELDS.len()
-            } else if field_names_match(fields, start, BLOB_V1_DESCRIPTOR_FIELDS) {
-                BLOB_V1_DESCRIPTOR_FIELDS.len()
+            if field_names_match(fields, start, &lance_core::datatypes::BLOB_V2_DESC_FIELDS) {
+                lance_core::datatypes::BLOB_V2_DESC_FIELDS.len()
+            } else if field_names_match(fields, start, &lance_core::datatypes::BLOB_DESC_FIELDS) {
+                lance_core::datatypes::BLOB_DESC_FIELDS.len()
             } else {
                 0
             }
@@ -3993,7 +3990,7 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
-    mut transaction: Option<&Transaction>,
+    transaction: Option<lance_table::format::Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
@@ -4019,7 +4016,7 @@ pub(crate) async fn write_manifest_file(
             object_store,
             write_manifest_file_to_path,
             naming_scheme,
-            transaction.take().map(|tx| tx.into()),
+            transaction,
         )
         .await
 }

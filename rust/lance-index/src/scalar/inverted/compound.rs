@@ -1182,8 +1182,7 @@ impl ComposableScorer for DisjunctionScorer<'_> {
     }
 }
 
-/// Intersection scorer preserving the existing Boolean MUST score contract:
-/// all children filter membership, while the first MUST child supplies score.
+/// Intersection scorer that requires and scores every Boolean MUST child.
 pub(super) struct RequiredConjunctionScorer<'a> {
     children: Vec<BoxScorer<'a>>,
     current: Option<u64>,
@@ -1289,7 +1288,11 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
                 "FTS conjunction score requested for an unconfirmed document",
             ));
         }
-        self.children[0].score()
+        let mut score = 0.0_f32;
+        for child in &mut self.children {
+            score += child.score()?;
+        }
+        checked_score(score, "FTS conjunction")
     }
 
     fn advance_shallow(&mut self, target: u64) -> Result<u64> {
@@ -1302,13 +1305,25 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
     }
 
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
-        self.children[0].score_bounds(up_to)
+        let mut bounds = ScoreBounds::ZERO;
+        for child in &mut self.children {
+            bounds = bounds.add(child.score_bounds(up_to)?);
+        }
+        Ok(bounds)
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
-        // Only the first MUST child contributes score. The remaining children
-        // are exact membership filters and must never be score-pruned.
-        self.children[0].set_min_competitive_score(min_score)
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        // Propagating the full conjunction floor to one child is unsafe because
+        // individually sub-threshold MUST scores may sum to a competitive hit.
+        if self.children.len() == 1 {
+            self.children[0].set_min_competitive_score(min_score)?;
+        }
+        Ok(())
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -1323,7 +1338,9 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
     }
 
     fn scores_non_negative(&self) -> bool {
-        self.children[0].scores_non_negative()
+        self.children
+            .iter()
+            .all(|child| child.scores_non_negative())
     }
 }
 
@@ -2455,7 +2472,30 @@ mod tests {
     }
 
     #[test]
-    fn boolean_and_dismax_preserve_exact_scores_and_order() {
+    fn required_conjunction_uses_all_must_scores_for_competitive_bounds() {
+        let left = Box::new(
+            MaterializedScorer::try_new(rows(&[(1, 3.0), (3, 1.0)]))
+                .unwrap()
+                .with_block_size(1),
+        );
+        let right = Box::new(
+            MaterializedScorer::try_new(rows(&[(1, 30.0), (3, 10.0)]))
+                .unwrap()
+                .with_block_size(1),
+        );
+        let mut scorer = RequiredConjunctionScorer::try_new(vec![left, right]).unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(10.0);
+
+        let results = TopKCollector::with_competitive_score(10, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(1, 33.0), (3, 11.0)]));
+    }
+
+    #[test]
+    fn boolean_sums_all_matching_clause_scores() {
         let must = vec![
             materialized(&[(1, 3.0), (2, 2.0), (3, 1.0)]),
             materialized(&[(1, 30.0), (3, 10.0)]),
@@ -2471,7 +2511,7 @@ mod tests {
             results,
             vec![ScoredRow {
                 row_id: 3,
-                score: 7.0
+                score: 17.0
             }]
         );
 

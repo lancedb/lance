@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 pub use super::index::{
     BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, HnswIndexConfig, IndexStore, MemIndexConfig,
-    validate_index_configs,
+    MemIndexKind, validate_index_configs,
 };
 pub use super::memtable::CacheConfig;
 pub use super::memtable::MemTable;

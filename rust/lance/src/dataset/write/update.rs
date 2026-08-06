@@ -320,18 +320,17 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let version = self
-            .dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_version()?;
         let (mut new_fragments, _) = write_fragments_internal(
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
-            WriteParams::with_storage_version(version),
+            WriteParams::default(),
             None, // TODO: support multiple bases for update
         )
         .await?;
@@ -1353,6 +1352,21 @@ mod tests {
             "the address-domain index must not cover the rewritten fragment"
         );
 
+        // Regression for https://github.com/lance-format/lance/issues/8278: a later
+        // update must find rows moved out of the address-domain index's coverage.
+        let second_update = UpdateBuilder::new(dataset)
+            .update_where(query)
+            .unwrap()
+            .set("category", "-2")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(second_update.rows_updated, expected_rows as u64);
+        let dataset = second_update.new_dataset;
+
         let after = dataset
             .scan()
             .filter(query)
@@ -1361,6 +1375,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.num_rows(), expected_rows);
+
+        let updated = dataset
+            .scan()
+            .filter("category = -2")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(updated.num_rows(), expected_rows);
     }
 
     /// Regression test for https://github.com/lance-format/lance/issues/8076

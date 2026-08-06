@@ -3292,7 +3292,7 @@ class LanceDataset(pa.dataset.Dataset):
             if hasattr(field_type, "storage_type"):
                 field_type = field_type.storage_type
 
-            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
+            if index_type in ["BTREE", "BITMAP"]:
                 if (
                     not pa.types.is_integer(field_type)
                     and not pa.types.is_floating(field_type)
@@ -3303,7 +3303,7 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
-                        f"BTREE/BITMAP/ZONEMAP index column {column} must be int",
+                        f"BTREE/BITMAP index column {column} must be int",
                         ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
@@ -5592,6 +5592,21 @@ class SqlQueryBuilder:
         self._builder = self._builder.with_row_addr(with_row_addr)
         return self
 
+    def blob_handling(
+        self,
+        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
+    ) -> "SqlQueryBuilder":
+        """
+        Control how blob columns are returned by this SQL query.
+
+        - ``"all_binary"`` materializes blob columns as binary values.
+        - ``"blobs_descriptions"`` returns blob descriptors (the default).
+        - ``"all_descriptions"`` returns descriptions for all binary-like
+          columns.
+        """
+        self._builder = self._builder.blob_handling(blob_handling)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
@@ -5793,7 +5808,13 @@ class LanceOperation:
         new_schema: pyarrow.Schema
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
-            The fragments that make up the new dataset.
+            The newly written fragments that make up the new dataset. They are
+            assigned fresh ids when the operation is committed, continuing from
+            the highest id the dataset has ever used, so any id they carry is
+            ignored. Since we reassign fragment ids, a fragment with a deletion
+            file is rejected: use :class:`LanceOperation.Delete` to commit
+            deletions, or :class:`LanceOperation.Merge` to change the schema of
+            existing fragments.
         initial_bases: list[DatasetBasePath], optional
             Base paths to register when creating a new dataset (CREATE mode only).
             **Only valid in CREATE mode**. Will raise an error if used with

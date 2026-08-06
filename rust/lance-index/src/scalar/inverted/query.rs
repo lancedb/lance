@@ -592,8 +592,11 @@ impl FtsQueryNode for MultiMatchQuery {
 }
 
 pub enum Occur {
+    /// The clause may match and contributes its score when it does.
     Should,
+    /// The clause must match and contributes its score.
     Must,
+    /// The clause must not match and never contributes to the score.
     MustNot,
 }
 
@@ -624,8 +627,11 @@ impl From<Occur> for &'static str {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BooleanQuery {
+    /// Optional scoring clauses, at least one of which must match when there are no MUST clauses.
     pub should: Vec<FtsQuery>,
+    /// Required scoring clauses whose scores are summed.
     pub must: Vec<FtsQuery>,
+    /// Prohibited non-scoring clauses.
     pub must_not: Vec<FtsQuery>,
 }
 
@@ -842,6 +848,13 @@ pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>)
     while let Some(token) = stream.next() {
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
+    }
+    if let Some(first_position) = positions.first().copied() {
+        // Phrase positions are relative to the first retained query token. This preserves gaps
+        // between retained tokens without requiring documents to contain filtered leading terms.
+        for position in &mut positions {
+            *position -= first_position;
+        }
     }
     Tokens::with_positions(tokens, positions, token_type)
 }

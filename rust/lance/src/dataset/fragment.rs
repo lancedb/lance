@@ -48,6 +48,7 @@ use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_vers
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
@@ -1407,6 +1408,11 @@ impl FileFragment {
         for data_file in &self.metadata.files {
             let last = -1;
             for field_id in data_file.fields.iter() {
+                // A tombstone marks a field superseded by a later data file.
+                // It is not a field id: it has no ordering and can repeat.
+                if *field_id == TOMBSTONE_FIELD_ID {
+                    continue;
+                }
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
@@ -5526,48 +5532,64 @@ mod tests {
                 assert_eq!(dataset.count_rows(None).await.unwrap(), 195);
             }
 
-            let fragment = &mut dataset.get_fragment(0).unwrap();
-            let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
             let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "double_i",
                 DataType::Int32,
                 true,
             )]));
-            while let Some(batch) = updater.next().await.unwrap() {
-                let input_col = batch.column_by_name("i").unwrap();
-                let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
-                let batch = RecordBatch::try_new(
-                    new_schema.clone(),
-                    vec![Arc::new(result_col) as ArrayRef],
-                )
-                .unwrap();
-                updater.update(batch).await.unwrap();
-            }
-            let new_fragment = updater.finish().await.unwrap();
+            // Merge keeps the fragment list intact, so every fragment gets the new
+            // column. Fragment 0 is the one carrying the deletions.
+            let fragment_ids = dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as usize)
+                .collect::<Vec<_>>();
+            let mut merged_fragments = Vec::new();
+            for fragment_id in fragment_ids {
+                let fragment = &mut dataset.get_fragment(fragment_id).unwrap();
+                let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
+                while let Some(batch) = updater.next().await.unwrap() {
+                    let input_col = batch.column_by_name("i").unwrap();
+                    let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
+                    let batch = RecordBatch::try_new(
+                        new_schema.clone(),
+                        vec![Arc::new(result_col) as ArrayRef],
+                    )
+                    .unwrap();
+                    updater.update(batch).await.unwrap();
+                }
+                let new_fragment = updater.finish().await.unwrap();
 
-            assert_eq!(new_fragment.files.len(), 2);
+                assert_eq!(new_fragment.files.len(), 2);
+                merged_fragments.push(new_fragment);
+            }
 
             // Scan again
             let mut full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
             full_schema.set_field_id(None);
             let before_version = dataset.version().version;
 
-            let op = Operation::Overwrite {
-                fragments: vec![new_fragment],
+            let op = Operation::Merge {
+                fragments: merged_fragments,
                 schema: full_schema.clone(),
-                config_upsert_values: None,
-                initial_bases: None,
             };
 
-            let dataset =
-                Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
-                    .await
-                    .unwrap();
+            let dataset = Dataset::commit(
+                test_uri,
+                op,
+                Some(before_version),
+                None,
+                None,
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
 
-            // We only kept the first fragment of 40 rows
             assert_eq!(
                 dataset.count_rows(None).await.unwrap(),
-                if with_delete { 35 } else { 40 }
+                if with_delete { 195 } else { 200 }
             );
             assert_eq!(dataset.version().version, before_version + 1);
             dataset.validate().await.unwrap();
