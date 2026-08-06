@@ -127,12 +127,21 @@ class RowIdSequence:
     """
     The stable row ids of the rows in a single fragment, in fragment order.
 
-    Row ids must be unique within a dataset; duplicates are rejected. Use this
-    to attach pre-existing row ids to a fragment when assembling a transaction
-    manually, so that rewritten rows keep their identity::
+    Use this to attach pre-existing row ids to a fragment when assembling a
+    transaction manually, so that rewritten rows keep their identity::
 
         sequence = RowIdSequence([7, 12])
         fragment = FragmentMetadata(..., row_id_meta=sequence.to_inline_metadata())
+
+    Warning
+    -------
+    Only duplicates within this sequence are rejected. Row ids must also be
+    unique across the dataset, and Lance does not re-check that when
+    committing, so the caller owns it. Supply only row ids that already exist
+    and are being relocated by the same transaction, which must also remove
+    every earlier occurrence of them. Do not supply unused row ids: a sequence
+    covering all of a fragment's rows leaves the dataset's row id allocator
+    untouched, so a later append will hand the same id out again.
 
     Parameters
     ----------

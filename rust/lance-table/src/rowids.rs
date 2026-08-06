@@ -119,13 +119,16 @@ impl RowIdSequence {
         Self::default()
     }
 
-    /// Build a sequence from row ids, rejecting duplicates.
+    /// Build a sequence from row ids, rejecting duplicates within the sequence.
     ///
-    /// Row ids must be unique. The segment encodings represent a sorted run as
-    /// a range plus its holes, so a repeated value would be silently encoded as
-    /// a shorter sequence with a spurious hole. Callers assembling a sequence
-    /// from untrusted input should use this instead of the infallible `From`
-    /// conversions, which assume uniqueness.
+    /// The segment encodings represent a sorted run as a range plus its holes,
+    /// so a repeated value would be silently encoded as a shorter sequence with
+    /// a spurious hole. Callers assembling a sequence from untrusted input
+    /// should use this instead of the infallible `From` conversions, which
+    /// assume uniqueness.
+    ///
+    /// Row ids must also be unique across the dataset. That is not checked
+    /// here, and commit does not re-check it either.
     pub fn try_from_iter(row_ids: impl IntoIterator<Item = u64>) -> Result<Self> {
         let row_ids: Vec<u64> = row_ids.into_iter().collect();
         if row_ids.is_empty() {
