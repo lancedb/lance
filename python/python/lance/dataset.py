@@ -5993,8 +5993,15 @@ class LanceOperation:
             The ids of the fragments that have been removed entirely.
         updated_fragments: list[FragmentMetadata]
             The fragments that have been updated with new deletion vectors.
+            These are used as given, so pass back the metadata read from the
+            dataset rather than a freshly constructed object, or the fragment
+            loses its row id and version metadata.
         new_fragments: list[FragmentMetadata]
-            The fragments that contain the new rows.
+            The fragments that contain the new rows. On a dataset that uses
+            stable row ids, set ``row_id_meta`` on these to carry the ids of
+            rewritten rows over; see :class:`lance.fragment.RowIdSequence`. The
+            created-at and last-updated-at version metadata are derived during
+            the commit and should be left as None.
         fields_modified: list[int]
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
