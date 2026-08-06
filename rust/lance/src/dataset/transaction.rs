@@ -2404,6 +2404,22 @@ impl Transaction {
                     .cloned()
                     .collect();
 
+                // A replacement changes what its rows read as, so stamp them
+                // updated. Without this, get_updated_rows never reports them and
+                // an incremental consumer skips them for good.
+                if next_row_id.is_some() {
+                    let new_version = current_manifest.map_or(1, |m| m.version + 1);
+                    for fragment in final_fragments
+                        .iter_mut()
+                        .filter(|f| fragments_changed.contains(&f.id))
+                    {
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                            fragment,
+                            new_version,
+                        )?;
+                    }
+                }
+
                 Self::prune_updated_fields_from_indices(
                     &mut final_indices,
                     &modified_fragments,
