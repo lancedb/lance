@@ -2041,6 +2041,11 @@ def test_no_stale_duplicate_after_partial_column_update(tmp_path):
 
     # KNN near the NEW value via the default vector search (searches all
     # segments). The updated row must appear EXACTLY ONCE.
+    #
+    # This pins the filtering only. With a single partition the late search
+    # returns before the shared budget is consulted, so the accounting half of
+    # the fix is pinned by the Rust unit test
+    # `test_unowned_row_does_not_fill_the_shared_budget` instead.
     q = np.array(new_vec, dtype=np.float32)
     res = ds.to_table(
         columns=["id"],
@@ -2052,6 +2057,10 @@ def test_no_stale_duplicate_after_partial_column_update(tmp_path):
         f"updated row id=10000 returned {len(dupes)} times "
         f"(stale index segment not masked); rowids={res['_rowid'].tolist()}"
     )
+    # A mask that over-restricts would drop the old segment wholesale and still
+    # satisfy the assertion above, so pin the full result set too.
+    assert len(res) == 10, f"expected a full top-10, got {len(res)} rows"
+    assert res["id"].is_unique, f"duplicate ids in result: {res['id'].tolist()}"
 
 
 @pytest.mark.skip(reason="retrain is deprecated")
