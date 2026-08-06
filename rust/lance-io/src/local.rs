@@ -49,6 +49,23 @@ pub fn remove_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove a directory only if it is empty.
+pub(crate) fn remove_empty_dir(path: &Path) -> Result<()> {
+    let local_path = to_local_path(path);
+    match std::fs::remove_dir(local_path) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(Error::from(err)),
+    }
+}
+
 /// Copy a file from one location to another, supporting cross-filesystem copies.
 ///
 /// Unlike hard links, this function works across filesystem boundaries.

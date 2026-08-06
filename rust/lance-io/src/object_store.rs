@@ -953,6 +953,34 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// Remove a materialized directory if it is empty.
+    ///
+    /// This is a no-op for object stores, which do not materialize directories.
+    /// A missing or non-empty local directory is also left unchanged.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # async fn remove_stale_index_dir(store: &ObjectStore) -> Result<()> {
+    /// store
+    ///     .remove_empty_dir("dataset/_indices/stale-index")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn remove_empty_dir(&self, dir_path: impl Into<Path>) -> Result<()> {
+        if !self.is_local() && self.scheme != "file-object-store" {
+            return Ok(());
+        }
+
+        let path = dir_path.into();
+        let path = Path::parse(&path)?;
+        let metrics = self.io_tracker.begin_io("delete");
+        let result = super::local::remove_empty_dir(&path);
+        metrics.record(&result, 0);
+        result
+    }
+
     pub fn remove_stream<'a>(
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
@@ -1481,6 +1509,41 @@ mod tests {
             .unwrap();
 
         assert!(!path.join("foo").exists());
+    }
+
+    #[rstest]
+    #[case("file")]
+    #[case("file-object-store")]
+    #[tokio::test]
+    async fn test_remove_empty_directory(#[case] scheme: &str) {
+        let path = TempStdDir::default();
+        create_dir_all(path.join("empty")).unwrap();
+        write_to_file(
+            path.join("not_empty").join("test_file").to_str().unwrap(),
+            "keep",
+        )
+        .unwrap();
+
+        let file_url = Url::from_directory_path(&path).unwrap();
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        url.set_path(file_url.path());
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
+
+        store
+            .remove_empty_dir(base.clone().join("empty"))
+            .await
+            .unwrap();
+        store
+            .remove_empty_dir(base.clone().join("not_empty"))
+            .await
+            .unwrap();
+        store
+            .remove_empty_dir(base.clone().join("missing"))
+            .await
+            .unwrap();
+
+        assert!(!path.join("empty").exists());
+        assert!(path.join("not_empty").exists());
     }
 
     #[derive(Debug)]

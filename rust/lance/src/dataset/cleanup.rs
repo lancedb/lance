@@ -69,7 +69,7 @@ use std::{
 };
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{Span, debug, info, instrument};
+use tracing::{Span, debug, info, instrument, warn};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -638,7 +638,13 @@ impl<'a> CleanupTask<'a> {
         inspection: CleanupInspection,
     ) -> Result<CleanupRunResult> {
         let cleanup_result = Mutex::new(CleanupRunResult::default());
+        let index_dirs_to_remove = Mutex::new(HashSet::new());
         let deletes_files = self.action.deletes_files();
+        let removes_empty_dirs = matches!(
+            self.dataset.object_store.scheme(),
+            "file" | "file+uring" | "file-object-store"
+        );
+        let indices_dir = self.dataset.indices_dir();
         let candidate_file_limit = self.action.candidate_file_limit();
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
@@ -729,6 +735,17 @@ impl<'a> CleanupTask<'a> {
                 .lock()
                 .unwrap()
                 .record_file(&file, candidate_file_limit, self.track_removed_manifests);
+            if deletes_files && removes_empty_dirs && matches!(file.kind, CleanupFileKind::Index) {
+                let mut parent = file.path.parent();
+                let mut index_dirs = index_dirs_to_remove.lock().unwrap();
+                while let Some(dir_path) = parent {
+                    if dir_path == indices_dir || !dir_path.prefix_matches(&indices_dir) {
+                        break;
+                    }
+                    index_dirs.insert(dir_path.clone());
+                    parent = dir_path.parent();
+                }
+            }
             Ok(file.path)
         });
 
@@ -752,6 +769,27 @@ impl<'a> CleanupTask<'a> {
                 .remove_stream(paths_to_delete)
                 .try_for_each(|_| future::ready(Ok(())))
                 .await?;
+
+            let mut index_dirs = index_dirs_to_remove
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>();
+            index_dirs.sort_unstable_by_key(|path| std::cmp::Reverse(path.parts_count()));
+            for dir_path in index_dirs {
+                if let Err(error) = self
+                    .dataset
+                    .object_store
+                    .remove_empty_dir(dir_path.clone())
+                    .await
+                {
+                    warn!(
+                        path = dir_path.as_ref(),
+                        error = %error,
+                        "Failed to remove empty index directory"
+                    );
+                }
+            }
         } else {
             // Drain the stream to populate stats, but do not call remove_stream.
             all_paths_to_remove
@@ -1642,7 +1680,7 @@ mod tests {
     struct MockDatasetFixture {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
-        _tmpdir: TempStrDir,
+        tmpdir: TempStrDir,
         dataset_path: String,
         mock_store: Arc<MockObjectStore>,
     }
@@ -1662,10 +1700,17 @@ mod tests {
             };
             let dataset_path = format!("file-object-store://{path_prefix}{tmpdir_path}/my_db");
             Ok(Self {
-                _tmpdir: tmpdir,
+                tmpdir,
                 dataset_path,
                 mock_store: Arc::new(MockObjectStore::new()),
             })
+        }
+
+        fn local_index_dir(&self, uuid: Uuid) -> std::path::PathBuf {
+            std::path::Path::new(self.tmpdir.as_str())
+                .join("my_db")
+                .join(crate::dataset::INDICES_DIR)
+                .join(uuid.to_string())
         }
 
         fn os_params(&self) -> ObjectStoreParams {
@@ -2773,6 +2818,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed.index_files_removed, 2);
+        assert!(!fixture.local_index_dir(seg_a).exists());
         assert!(
             !dataset
                 .object_store
@@ -2843,6 +2889,8 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.index_files_removed, 4);
+        assert!(!fixture.local_index_dir(staging_uuid).exists());
+        assert!(!fixture.local_index_dir(built_segment_uuid).exists());
         assert!(
             !dataset
                 .object_store
