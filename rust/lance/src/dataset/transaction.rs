@@ -2404,6 +2404,22 @@ impl Transaction {
                     .cloned()
                     .collect();
 
+                // A replacement changes what its rows read as, so stamp them
+                // updated. Without this, get_updated_rows never reports them and
+                // an incremental consumer skips them for good.
+                if next_row_id.is_some() {
+                    let new_version = current_manifest.map_or(1, |m| m.version + 1);
+                    for fragment in final_fragments
+                        .iter_mut()
+                        .filter(|f| fragments_changed.contains(&f.id))
+                    {
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                            fragment,
+                            new_version,
+                        )?;
+                    }
+                }
+
                 Self::prune_updated_fields_from_indices(
                     &mut final_indices,
                     &modified_fragments,
@@ -3254,7 +3270,7 @@ impl Transaction {
                         let combined_sequence = RowIdSequence::from(row_ids.as_slice());
 
                         let serialized = write_row_ids(&combined_sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                         *next_row_id += remaining_rows;
                     }
                     Ordering::Greater => {
@@ -3270,7 +3286,7 @@ impl Transaction {
                 let sequence = RowIdSequence::from(row_ids);
                 // TODO: write to a separate file if large. Possibly share a file with other fragments.
                 let serialized = write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                 *next_row_id += physical_rows;
             }
         }
@@ -4626,7 +4642,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50),
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4659,7 +4675,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50), // More physical rows than existing row IDs
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4695,7 +4711,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50), // Less physical rows than existing row IDs
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4734,7 +4750,7 @@ mod tests {
             Fragment {
                 id: 2,
                 physical_rows: Some(25), // Partial existing row IDs
-                row_id_meta: Some(RowIdMeta::Inline(serialized)),
+                row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
@@ -5292,7 +5308,7 @@ mod tests {
     #[test]
     fn test_partial_rewrite_skips_fragment_with_no_version_meta() {
         let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let data_file = DataFile::new(
             "data.lance",
@@ -5670,7 +5686,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         let row_ids = RowIdSequence::from([100u64, 101, 102, 103, 104].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let prev_fragment = Fragment {
             id: 0,
@@ -5746,7 +5762,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         let row_ids = RowIdSequence::from([200u64, 201, 202, 203, 204].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let uniform_v1 = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
         let meta_v1 = RowDatasetVersionMeta::from_sequence(&uniform_v1).unwrap();
@@ -5907,7 +5923,7 @@ mod tests {
             files: vec![mk_file("existing.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0).into())),
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -5930,7 +5946,7 @@ mod tests {
             files: vec![mk_file("new.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1).into())),
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -5993,7 +6009,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
@@ -6007,7 +6023,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6050,7 +6066,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq).into())),
                 physical_rows: Some(2),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
@@ -6062,7 +6078,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
@@ -6078,7 +6094,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6120,7 +6136,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
@@ -6135,7 +6151,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6180,7 +6196,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
@@ -6194,7 +6210,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(4),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6228,7 +6244,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6240,7 +6256,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6269,7 +6285,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6311,7 +6327,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(RowDatasetVersionMeta::Inline(Arc::from(
                 vec![0xFFu8; 8].as_slice(),
@@ -6325,7 +6341,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6367,7 +6383,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
@@ -6388,7 +6404,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
@@ -6403,7 +6419,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6442,7 +6458,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
             last_updated_at_version_meta: None,
@@ -6455,7 +6471,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6504,7 +6520,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
@@ -6519,7 +6535,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6567,7 +6583,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
@@ -6579,7 +6595,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
@@ -6595,7 +6611,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,

@@ -13,7 +13,7 @@ use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder};
 use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
-use lance_core::ROW_ADDR;
+use lance_core::{ROW_ADDR, ROW_LAST_UPDATED_AT_VERSION};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
@@ -28,7 +28,7 @@ use arrow_array::RecordBatch;
 use arrow_array::{Array, LargeBinaryArray, StructArray};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray,
-    types::Int32Type,
+    types::{Int32Type, UInt64Type},
 };
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_arrow::BLOB_META_KEY;
@@ -2139,6 +2139,87 @@ async fn test_merge_insert_flat_index_stable_row_id_multiple_indexes() {
         covered("col2_idx"),
         vec![0],
         "col2 index is also invalidated even though col2 was not changed (see TODO)"
+    );
+}
+
+#[tokio::test]
+async fn test_data_replacement_advances_row_lineage() {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "value",
+        DataType::Int32,
+        true,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let replacement = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20]))],
+    )
+    .unwrap();
+    let object_writer = dataset
+        .object_store
+        .create(&Path::from("data/lineage_replacement.lance"))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_1::create_writer(
+        object_writer,
+        schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let frag = dataset.get_fragment(0).unwrap();
+    let mut new_data_file = frag.data_file_for_field(0).unwrap().clone();
+    new_data_file.path = "lineage_replacement.lance".to_string();
+
+    let read_version = dataset.version().version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, new_data_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.version().version, 2);
+
+    // The rows read differently now, so their last-updated stamp has to name
+    // the version that changed them or get_updated_rows will never see them.
+    let batch = dataset
+        .scan()
+        .project(&["value", ROW_LAST_UPDATED_AT_VERSION])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        batch["value"].as_primitive::<Int32Type>().values(),
+        &[10, 20]
+    );
+    assert_eq!(
+        batch[ROW_LAST_UPDATED_AT_VERSION]
+            .as_primitive::<UInt64Type>()
+            .values(),
+        &[2, 2]
     );
 }
 

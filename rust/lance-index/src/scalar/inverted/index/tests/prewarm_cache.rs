@@ -671,3 +671,96 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_strict_modern_prewarm_fails_when_index_cache_cannot_hold_all_partitions() {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default().format_version(InvertedListFormatVersion::V2);
+    let format_version = params.resolved_format_version();
+    let partition_count = 6_u64;
+    let docs_per_partition = 512_u32;
+
+    for partition_id in 0..partition_count {
+        let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+            partition_id,
+            false,
+            TokenSetFormat::default(),
+            format_version,
+            params.posting_block_size(),
+        );
+        builder.tokens.add(format!("token_{partition_id}"));
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            false,
+            format_version.posting_tail_codec(),
+            params.posting_block_size(),
+        );
+        for doc_id in 0..docs_per_partition {
+            posting.add(doc_id, PositionRecorder::Count(1));
+            builder
+                .docs
+                .append(partition_id * 1_000_000 + doc_id as u64, 1);
+        }
+        builder.posting_lists.push(posting);
+        builder.write(store.as_ref()).await.unwrap();
+    }
+    write_test_metadata(&store, (0..partition_count).collect(), params).await;
+
+    let cache = Arc::new(LanceCache::with_backend(Arc::new(
+        QuickCacheBackend::with_capacity(8 * 1024),
+    )));
+    let index = InvertedIndex::load(store, None, cache.as_ref())
+        .await
+        .unwrap();
+
+    let err = index
+        .prewarm_with_options(&FtsPrewarmOptions::default())
+        .await
+        .unwrap_err();
+    let err = err.to_string();
+    assert!(err.contains("partition(s) are not fully resident"));
+    assert!(err.contains("resident row-address projection"));
+    assert!(
+        index
+            .partitions
+            .iter()
+            .any(|partition| !partition.docs.query_ready()),
+        "strict prewarm should fail because at least one partition lost query-ready state"
+    );
+    assert!(
+        index
+            .partitions
+            .iter()
+            .all(|partition| partition.inverted_list.modern_posting_validation_ready()),
+        "posting validation should complete; the strict failure should be the final residency postcondition"
+    );
+    assert!(
+        index.partitions.iter().any(|partition| {
+            let docs = partition.docs.modern().unwrap();
+            !docs.projection_resident()
+        }),
+        "at least one modern document projection should be non-resident"
+    );
+
+    let result = index
+        .prewarm_with_options_result(&FtsPrewarmOptions::default().best_effort())
+        .await
+        .unwrap();
+    assert!(!result.fully_resident);
+    let diagnostics = result
+        .diagnostics
+        .expect("best-effort partial prewarm should report diagnostics");
+    assert_eq!(diagnostics.partition_count, partition_count as usize);
+    assert!(!diagnostics.failing_partitions.is_empty());
+    assert!(
+        diagnostics
+            .failing_partitions
+            .iter()
+            .all(|partition| partition.posting_validation_ready),
+        "best-effort should not suppress posting validation failures"
+    );
+}

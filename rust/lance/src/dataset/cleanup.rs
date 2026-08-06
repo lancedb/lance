@@ -69,7 +69,7 @@ use std::{
 };
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{Span, debug, info, instrument};
+use tracing::{Span, debug, info, instrument, warn};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -594,7 +594,7 @@ impl<'a> CleanupTask<'a> {
         };
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.files.iter() {
+            for file in fragment.referenced_lance_files() {
                 let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
@@ -639,6 +639,18 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<CleanupRunResult> {
         let cleanup_result = Mutex::new(CleanupRunResult::default());
         let deletes_files = self.action.deletes_files();
+        let removes_empty_dirs = matches!(
+            self.dataset.object_store.scheme(),
+            "file" | "file+uring" | "file-object-store"
+        );
+        let indices_dir = self.dataset.indices_dir();
+        let retained_index_dirs = inspection
+            .referenced_files
+            .index_uuids
+            .iter()
+            .map(|uuid| indices_dir.clone().join(uuid.as_str()))
+            .collect::<HashSet<_>>();
+        let index_dirs_to_remove = Mutex::new(HashSet::new());
         let candidate_file_limit = self.action.candidate_file_limit();
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
@@ -729,6 +741,17 @@ impl<'a> CleanupTask<'a> {
                 .lock()
                 .unwrap()
                 .record_file(&file, candidate_file_limit, self.track_removed_manifests);
+            if deletes_files && removes_empty_dirs && matches!(file.kind, CleanupFileKind::Index) {
+                let mut parent = file.path.parent();
+                let mut index_dirs = index_dirs_to_remove.lock().unwrap();
+                while let Some(dir_path) = parent {
+                    if dir_path == indices_dir || !dir_path.prefix_matches(&indices_dir) {
+                        break;
+                    }
+                    index_dirs.insert(dir_path.clone());
+                    parent = dir_path.parent();
+                }
+            }
             Ok(file.path)
         });
 
@@ -752,6 +775,25 @@ impl<'a> CleanupTask<'a> {
                 .remove_stream(paths_to_delete)
                 .try_for_each(|_| future::ready(Ok(())))
                 .await?;
+
+            if removes_empty_dirs
+                && let Err(error) = self
+                    .dataset
+                    .object_store
+                    .remove_empty_dirs(
+                        indices_dir.clone(),
+                        retained_index_dirs,
+                        index_dirs_to_remove.into_inner().unwrap(),
+                        (!self.policy.delete_unverified).then_some(verification_threshold),
+                    )
+                    .await
+            {
+                warn!(
+                    path = indices_dir.as_ref(),
+                    error = %error,
+                    "Failed to remove empty index directories"
+                );
+            }
         } else {
             // Drain the stream to populate stats, but do not call remove_stream.
             all_paths_to_remove
@@ -1147,7 +1189,7 @@ impl<'a> CleanupTask<'a> {
         let mut is_referenced = false;
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.files.iter() {
+            for file in fragment.referenced_lance_files() {
                 if let Some(base_id) = file.base_id {
                     let base_path = manifest.base_paths.get(&base_id);
                     if let Some(base_path) = base_path
@@ -1576,6 +1618,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use rstest::rstest;
     use uuid::Uuid;
 
     #[derive(Debug)]
@@ -1642,7 +1685,7 @@ mod tests {
     struct MockDatasetFixture {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
-        _tmpdir: TempStrDir,
+        tmpdir: TempStrDir,
         dataset_path: String,
         mock_store: Arc<MockObjectStore>,
     }
@@ -1662,10 +1705,17 @@ mod tests {
             };
             let dataset_path = format!("file-object-store://{path_prefix}{tmpdir_path}/my_db");
             Ok(Self {
-                _tmpdir: tmpdir,
+                tmpdir,
                 dataset_path,
                 mock_store: Arc::new(MockObjectStore::new()),
             })
+        }
+
+        fn local_index_dir(&self, uuid: Uuid) -> std::path::PathBuf {
+            std::path::Path::new(self.tmpdir.as_str())
+                .join("my_db")
+                .join(crate::dataset::INDICES_DIR)
+                .join(uuid.to_string())
         }
 
         fn os_params(&self) -> ObjectStoreParams {
@@ -2700,6 +2750,147 @@ mod tests {
         assert_gt!(removed.deletion_files_removed, 0);
     }
 
+    /// A branch reaches its parent's files through `base_id`, and
+    /// `retain_branch_lineage_files` promotes those into the parent's keep set. An
+    /// overlay inherited that way must be promoted too, or the parent deletes a
+    /// file the branch still reads.
+    #[tokio::test]
+    async fn lineage_retention_covers_inherited_overlay_files() {
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // Give the parent an overlay, then branch from it: `shallow_clone` stamps
+        // the overlay's `base_id` so the branch resolves it against the parent.
+        let mut dataset = fixture.open().await.unwrap();
+        let mut fragments: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        let mut overlay_file = fragments[0].files[0].clone();
+        overlay_file.path = "overlay.lance".to_string();
+        fragments[0].overlays = vec![DataOverlayFile {
+            data_file: overlay_file,
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: dataset.manifest.version,
+        }];
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Overwrite {
+                fragments,
+                schema: dataset.schema().clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let branch = fixture
+            .create_branch_and_load(&mut dataset, "child", (None, None))
+            .await
+            .unwrap();
+        let branch_fragments = branch.get_fragments();
+        let inherited = &branch_fragments[0].metadata().overlays[0].data_file;
+        assert!(
+            inherited.base_id.is_some(),
+            "the branch must reach the parent's overlay through base_id"
+        );
+
+        // The parent's cleanup walks the branch's manifest and must promote that
+        // overlay out of `verified_files`.
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+            CleanupAction::Execute,
+        );
+        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let referenced_branches = task.find_referenced_branches().await.unwrap();
+        let inspection = task
+            .retain_branch_lineage_files(inspection, &referenced_branches, &HashSet::new())
+            .await
+            .unwrap();
+
+        let overlay_path = Path::from("data/overlay.lance");
+        assert!(
+            inspection
+                .referenced_files
+                .data_paths
+                .contains(&overlay_path),
+            "the inherited overlay must be promoted into the parent's keep set"
+        );
+    }
+
+    /// A keep set built from `fragment.files` alone omits overlay data files, so
+    /// cleanup would delete live data.
+    #[tokio::test]
+    async fn keep_set_covers_referenced_overlay_files() {
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // The overlay file need not exist: the keep set comes from manifest
+        // metadata alone.
+        let mut dataset = fixture.open().await.unwrap();
+        let mut fragments: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        let mut overlay_file = fragments[0].files[0].clone();
+        overlay_file.path = "overlay.lance".to_string();
+        fragments[0].overlays = vec![DataOverlayFile {
+            data_file: overlay_file,
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: dataset.manifest.version,
+        }];
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Overwrite {
+                fragments,
+                schema: dataset.schema().clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+            CleanupAction::Execute,
+        );
+        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let kept: HashSet<&Path> = inspection
+            .referenced_files
+            .data_paths
+            .iter()
+            .chain(inspection.verified_files.data_paths.iter())
+            .collect();
+
+        let overlay_path = Path::from("data/overlay.lance");
+        assert!(
+            kept.contains(&overlay_path),
+            "the overlay's data file must be in the keep set, got {kept:?}"
+        );
+    }
+
     #[tokio::test]
     async fn dont_clean_index_data_files() {
         // Indexes have .lance files in them that are not referenced
@@ -2719,6 +2910,119 @@ mod tests {
         let after_count = fixture.count_files().await.unwrap();
 
         assert_eq!(before_count, after_count);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_preexisting_empty_index_directories() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+        let stale_uuid = Uuid::new_v4();
+        let nested_stale_uuid = Uuid::new_v4();
+        let referenced_uuid = Uuid::new_v4();
+
+        std::fs::create_dir_all(fixture.local_index_dir(stale_uuid)).unwrap();
+        std::fs::create_dir_all(
+            fixture
+                .local_index_dir(nested_stale_uuid)
+                .join("empty_nested_dir"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(fixture.local_index_dir(referenced_uuid)).unwrap();
+
+        let referenced_index = dummy_index_metadata(&dataset, field_id, referenced_uuid, [0_u32]);
+        let create_index_tx = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![referenced_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(create_index_tx, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now + TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        let in_progress_uuid = Uuid::new_v4();
+        write_dummy_index_artifact(&dataset, in_progress_uuid)
+            .await
+            .unwrap();
+        let in_progress_empty_dir = fixture
+            .local_index_dir(in_progress_uuid)
+            .join("empty_in_progress_dir");
+        std::fs::create_dir_all(&in_progress_empty_dir).unwrap();
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.index_files_removed, 0);
+        assert!(!fixture.local_index_dir(stale_uuid).exists());
+        assert!(!fixture.local_index_dir(nested_stale_uuid).exists());
+        assert!(fixture.local_index_dir(referenced_uuid).exists());
+        assert!(fixture.local_index_dir(in_progress_uuid).exists());
+        assert!(in_progress_empty_dir.exists());
+    }
+
+    #[rstest]
+    #[case::default_policy(false, true)]
+    #[case::delete_unverified(true, false)]
+    #[tokio::test]
+    async fn cleanup_applies_unverified_policy_to_fresh_empty_index_directory(
+        #[case] delete_unverified: bool,
+        #[case] should_preserve: bool,
+    ) {
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now);
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let in_progress_dir = fixture.local_index_dir(Uuid::new_v4());
+        std::fs::create_dir_all(&in_progress_dir).unwrap();
+
+        fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(7).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(in_progress_dir.exists(), should_preserve);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_does_not_remove_empty_directory_through_index_symlink() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_empty_dir = outside.path().join("must_remain");
+        std::fs::create_dir_all(&outside_empty_dir).unwrap();
+
+        let link_path = fixture.local_index_dir(Uuid::new_v4());
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link_path).unwrap();
+
+        fixture
+            .run_cleanup_with_override(utc_now(), Some(true), None)
+            .await
+            .unwrap();
+
+        assert!(outside_empty_dir.exists());
+        assert!(link_path.is_symlink());
     }
 
     #[tokio::test]
@@ -2773,6 +3077,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed.index_files_removed, 2);
+        assert!(!fixture.local_index_dir(seg_a).exists());
         assert!(
             !dataset
                 .object_store
@@ -2843,6 +3148,8 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.index_files_removed, 4);
+        assert!(!fixture.local_index_dir(staging_uuid).exists());
+        assert!(!fixture.local_index_dir(built_segment_uuid).exists());
         assert!(
             !dataset
                 .object_store

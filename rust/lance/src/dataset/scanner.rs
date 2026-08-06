@@ -5666,8 +5666,8 @@ impl Scanner {
         )?))
     }
 
-    /// Here we use a full text search as a post-filter.  Any rows that
-    /// do not contain at least one query token are removed.
+    /// Here we use a full text search as a post-filter. Rows are retained
+    /// according to the match query's token operator.
     ///
     /// Only valid (currently) for match queries.
     async fn flat_fts_filter(

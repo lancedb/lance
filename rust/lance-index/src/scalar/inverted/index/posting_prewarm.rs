@@ -4,6 +4,62 @@
 use super::*;
 
 impl PostingListReader {
+    pub(super) async fn prewarm_residency_status(
+        &self,
+        with_position: bool,
+    ) -> (bool, Option<bool>) {
+        let postings_resident = self.postings_resident_now().await;
+        let positions_resident = if with_position {
+            Some(self.positions_resident_now().await)
+        } else {
+            None
+        };
+        (postings_resident, positions_resident)
+    }
+
+    async fn postings_resident_now(&self) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+
+        let mut seen_groups = BTreeSet::new();
+        for token_id in 0..self.len() as u32 {
+            if let Some((start, end)) = self.group_range_for_token(token_id) {
+                if seen_groups.insert((start, end))
+                    && self
+                        .index_cache
+                        .get_with_key(&posting_list_group_cache_key(start, end, self.has_impacts))
+                        .await
+                        .is_none()
+                {
+                    return false;
+                }
+            } else if self
+                .index_cache
+                .get_with_key(&posting_list_cache_key(token_id, self.has_impacts))
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn positions_resident_now(&self) -> bool {
+        for token_id in 0..self.len() as u32 {
+            if self
+                .index_cache
+                .get_with_key(&PositionKey { token_id })
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Build posting lists for one chunk's token range from `chunk_batch`, rebasing
     /// global offsets to chunk-local rows. Returns `(global token_id, PostingList)`
     /// pairs identical to the whole-file path, only bounded to one chunk.

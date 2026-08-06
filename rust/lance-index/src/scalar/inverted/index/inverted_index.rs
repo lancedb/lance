@@ -456,29 +456,47 @@ impl Index for InvertedIndex {
 
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
+        self.prewarm_with_options_result(options).await.map(|_| ())
+    }
+
+    pub async fn prewarm_with_options_result(
+        &self,
+        options: &FtsPrewarmOptions,
+    ) -> Result<FtsPrewarmResult> {
         let mut state = self.prewarm_state.lock().await;
         if state.satisfies(options.with_position)
-            && (self.is_legacy() || self.document_projections_resident_now())
+            && self
+                .prewarm_diagnostics(options.with_position)
+                .await
+                .fully_resident()
         {
-            return Ok(());
+            return Ok(FtsPrewarmResult::fully_resident());
         }
         let with_position = options.with_position || state.positions_ready;
         state.query_ready = false;
         state.positions_ready = false;
         self.document_projections_resident
             .store(false, Ordering::Release);
-        self.prewarm_query_state(with_position).await?;
-        state.query_ready = true;
-        state.positions_ready = with_position;
-        Ok(())
+        let result = self
+            .prewarm_query_state(with_position, options.mode.is_best_effort())
+            .await?;
+        if result.fully_resident {
+            state.query_ready = true;
+            state.positions_ready = with_position;
+        }
+        Ok(result)
     }
 
-    async fn prewarm_query_state(&self, with_position: bool) -> Result<()> {
+    async fn prewarm_query_state(
+        &self,
+        with_position: bool,
+        best_effort: bool,
+    ) -> Result<FtsPrewarmResult> {
         let chunk_concurrency = self.store.io_parallelism().max(1);
         let prewarm_started = Instant::now();
         info!(
             partition_count = self.partitions.len(),
-            with_position, chunk_concurrency, "fts index prewarm started"
+            with_position, best_effort, chunk_concurrency, "fts index prewarm started"
         );
         for part in &self.partitions {
             let partition_started = Instant::now();
@@ -526,25 +544,65 @@ impl InvertedIndex {
             );
         }
         self.aggregate_corpus_stats().await?;
-        let query_ready = self.partitions.iter().all(|partition| {
-            partition.docs.query_ready()
-                && partition.inverted_list.modern_posting_validation_ready()
-        });
-        if !query_ready {
-            return Err(Error::internal(
-                "FTS prewarm completed without publishing a query-ready document and posting state"
-                    .to_owned(),
-            ));
+        let diagnostics = self.prewarm_diagnostics(with_position).await;
+        if !diagnostics.fully_resident() {
+            if best_effort {
+                warn!(
+                    partition_count = diagnostics.partition_count,
+                    failing_partition_count = diagnostics.failing_partitions.len(),
+                    diagnostics = %diagnostics,
+                    elapsed_ms = prewarm_started.elapsed().as_millis() as u64,
+                    "fts index prewarm finished with partial residency"
+                );
+                return Ok(FtsPrewarmResult::partial(diagnostics));
+            }
+            return Err(Error::internal(diagnostics.to_string()));
         }
         self.document_projections_resident
             .store(true, Ordering::Release);
         info!(
             partition_count = self.partitions.len(),
-            query_ready,
+            query_ready = true,
             elapsed_ms = prewarm_started.elapsed().as_millis() as u64,
             "fts index prewarm finished"
         );
-        Ok(())
+        Ok(FtsPrewarmResult::fully_resident())
+    }
+
+    pub async fn prewarm_residency_result(&self, with_position: bool) -> FtsPrewarmResult {
+        let diagnostics = self.prewarm_diagnostics(with_position).await;
+        if diagnostics.fully_resident() {
+            FtsPrewarmResult::fully_resident()
+        } else {
+            FtsPrewarmResult::partial(diagnostics)
+        }
+    }
+
+    async fn prewarm_diagnostics(&self, with_position: bool) -> FtsPrewarmDiagnostics {
+        let statuses = futures::future::join_all(self.partitions.iter().map(|partition| async {
+            let (posting_resident, position_resident) = partition
+                .inverted_list
+                .prewarm_residency_status(with_position)
+                .await;
+            FtsPrewarmPartitionStatus {
+                segment_id: None,
+                partition_id: partition.id(),
+                documents: partition.docs.prewarm_status(),
+                posting_validation_ready: partition.inverted_list.modern_posting_validation_ready(),
+                posting_resident,
+                position_resident,
+            }
+        }))
+        .await;
+        let failing_partitions = statuses
+            .into_iter()
+            .filter(|status| !status.query_ready())
+            .collect();
+        FtsPrewarmDiagnostics {
+            partition_count: self.partitions.len(),
+            failing_segments: Vec::new(),
+            failing_partitions,
+        }
     }
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {

@@ -2,6 +2,79 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use async_trait::async_trait;
+use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey};
+use std::future::Future;
+use std::pin::Pin;
+
+#[derive(Debug)]
+struct RejectPositionsCacheBackend {
+    inner: QuickCacheBackend,
+}
+
+impl RejectPositionsCacheBackend {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: QuickCacheBackend::with_capacity(capacity),
+        }
+    }
+
+    fn rejects(codec: Option<&CacheCodec>) -> bool {
+        codec.is_some_and(|codec| codec.type_id() == "lance.fts.Positions")
+    }
+}
+
+#[async_trait]
+impl CacheBackend for RejectPositionsCacheBackend {
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        self.inner.get(key, codec).await
+    }
+
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        codec: Option<CacheCodec>,
+    ) {
+        if Self::rejects(codec.as_ref()) {
+            return;
+        }
+        self.inner.insert(key, entry, size_bytes, codec).await;
+    }
+
+    async fn get_or_insert<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+        codec: Option<CacheCodec>,
+    ) -> Result<(CacheEntry, bool)> {
+        if Self::rejects(codec.as_ref()) {
+            return loader.await.map(|(entry, _)| (entry, false));
+        }
+        self.inner.get_or_insert(key, loader, codec).await
+    }
+
+    async fn clear(&self) {
+        self.inner.clear().await;
+    }
+
+    async fn num_entries(&self) -> usize {
+        self.inner.num_entries().await
+    }
+
+    async fn size_bytes(&self) -> usize {
+        self.inner.size_bytes().await
+    }
+
+    fn approx_num_entries(&self) -> usize {
+        self.inner.approx_num_entries()
+    }
+
+    fn approx_size_bytes(&self) -> usize {
+        self.inner.approx_size_bytes()
+    }
+}
 
 #[tokio::test]
 async fn test_prewarm_with_positions_populates_separate_position_cache() {
@@ -136,6 +209,68 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
             .is_some(),
         "re-prewarm after eviction must preserve the strongest requested mode"
     );
+}
+
+#[tokio::test]
+async fn test_best_effort_prewarm_reports_missing_requested_positions() {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+
+    let params = InvertedIndexParams::default()
+        .with_position(true)
+        .format_version(InvertedListFormatVersion::V2);
+    let format_version = params.resolved_format_version();
+    let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+        0,
+        true,
+        TokenSetFormat::default(),
+        format_version,
+        params.posting_block_size(),
+    );
+    builder.tokens.add("alpha".to_owned());
+    builder.tokens.add("beta".to_owned());
+    for token_id in 0..2 {
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            true,
+            format_version.posting_tail_codec(),
+            params.posting_block_size(),
+        );
+        posting.add(0, PositionRecorder::Position(vec![token_id].into()));
+        builder.posting_lists.push(posting);
+    }
+    builder.docs.append(100, 2);
+    builder.write(store.as_ref()).await.unwrap();
+    write_test_metadata(&store, vec![0], params).await;
+
+    let cache = Arc::new(LanceCache::with_backend(Arc::new(
+        RejectPositionsCacheBackend::new(1 << 20),
+    )));
+    let index = InvertedIndex::load(store, None, cache.as_ref())
+        .await
+        .unwrap();
+
+    let result = index
+        .prewarm_with_options_result(&FtsPrewarmOptions::new().with_position(true).best_effort())
+        .await
+        .unwrap();
+    assert!(
+        !result.fully_resident,
+        "prewarm must not report full residency when requested positions were rejected"
+    );
+    let diagnostics = result
+        .diagnostics
+        .expect("missing requested positions should produce diagnostics");
+    assert_eq!(diagnostics.partition_count, 1);
+    assert_eq!(diagnostics.failing_partitions.len(), 1);
+    let partition = &diagnostics.failing_partitions[0];
+    assert!(partition.documents.query_ready());
+    assert!(partition.posting_validation_ready);
+    assert!(partition.posting_resident);
+    assert_eq!(partition.position_resident, Some(false));
 }
 
 #[tokio::test]

@@ -93,6 +93,7 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 }
 
 pub use api::{DatasetMemWalExt, InitializeMemWalBuilder};
+pub use index::{MemIndexKind, is_maintainable_index_type};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
 pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};
@@ -101,6 +102,7 @@ pub use sharding::{
     evaluate_sharding_spec_with_source_columns,
 };
 pub use wal::{BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, WalTailer};
+pub use write::SealFence;
 pub use write::ShardWriter;
 pub use write::ShardWriterConfig;
 pub use write::WriteResult;

@@ -1185,9 +1185,39 @@ impl ComposableScorer for DisjunctionScorer<'_> {
 /// Intersection scorer that requires and scores every Boolean MUST child.
 pub(super) struct RequiredConjunctionScorer<'a> {
     children: Vec<BoxScorer<'a>>,
+    /// Child indices sorted by approximation cost, omitted when query order is
+    /// already cheapest-first. `children` remains in query order so scoring and
+    /// score-bound arithmetic stay bit-for-bit stable.
+    approximation_order: Option<Vec<usize>>,
     current: Option<u64>,
     confirmed_doc: Option<u64>,
     confirmed: bool,
+}
+
+fn align_conjunction_children(
+    children: &mut [BoxScorer<'_>],
+    mut target: u64,
+    child_index: impl Fn(usize) -> usize,
+) -> Result<Option<u64>> {
+    loop {
+        for position in 0..children.len() {
+            let child = &mut children[child_index(position)];
+            if child.doc().is_none_or(|doc| doc < target) {
+                let Some(doc) = child.advance(target)? else {
+                    return Ok(None);
+                };
+                target = target.max(doc);
+            }
+        }
+        let min_doc = children.iter().filter_map(|child| child.doc()).min();
+        let max_doc = children.iter().filter_map(|child| child.doc()).max();
+        if min_doc == max_doc {
+            return Ok(min_doc);
+        }
+        target = max_doc.ok_or_else(|| {
+            Error::internal("FTS conjunction lost a child while aligning scorers")
+        })?;
+    }
 }
 
 impl<'a> RequiredConjunctionScorer<'a> {
@@ -1197,8 +1227,19 @@ impl<'a> RequiredConjunctionScorer<'a> {
                 "FTS conjunction scorer requires at least one child",
             ));
         }
+        let approximation_order = if children
+            .windows(2)
+            .all(|pair| pair[0].cost() <= pair[1].cost())
+        {
+            None
+        } else {
+            let mut order = (0..children.len()).collect::<Vec<_>>();
+            order.sort_by_key(|&index| (children[index].cost(), index));
+            Some(order)
+        };
         Ok(Self {
             children,
+            approximation_order,
             current: None,
             confirmed_doc: None,
             confirmed: false,
@@ -1206,29 +1247,16 @@ impl<'a> RequiredConjunctionScorer<'a> {
     }
 
     fn align(&mut self, target: u64) -> Result<Option<u64>> {
-        let mut target = target;
-        loop {
-            for child in &mut self.children {
-                if child.doc().is_none_or(|doc| doc < target) {
-                    let Some(doc) = child.advance(target)? else {
-                        self.current = None;
-                        return Ok(None);
-                    };
-                    target = target.max(doc);
-                }
-            }
-            let min_doc = self.children.iter().filter_map(|child| child.doc()).min();
-            let max_doc = self.children.iter().filter_map(|child| child.doc()).max();
-            if min_doc == max_doc {
-                self.current = min_doc;
-                self.confirmed_doc = None;
-                self.confirmed = false;
-                return Ok(self.current);
-            }
-            target = max_doc.ok_or_else(|| {
-                Error::internal("FTS conjunction lost a child while aligning scorers")
-            })?;
+        self.current = if let Some(order) = &self.approximation_order {
+            align_conjunction_children(&mut self.children, target, |position| order[position])?
+        } else {
+            align_conjunction_children(&mut self.children, target, |position| position)?
+        };
+        if self.current.is_some() {
+            self.confirmed_doc = None;
+            self.confirmed = false;
         }
+        Ok(self.current)
     }
 
     fn ensure_confirmed(&mut self) -> Result<bool> {
@@ -2289,6 +2317,8 @@ async fn compound_search_impl(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
@@ -2458,6 +2488,68 @@ mod tests {
         }
     }
 
+    struct CountingScorer {
+        inner: MaterializedScorer,
+        cost: usize,
+        advance_calls: Arc<AtomicUsize>,
+    }
+
+    impl ComposableScorer for CountingScorer {
+        fn doc(&self) -> Option<u64> {
+            self.inner.doc()
+        }
+
+        fn next(&mut self) -> Result<Option<u64>> {
+            self.inner.next()
+        }
+
+        fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+            self.advance_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.advance(target)
+        }
+
+        fn cost(&self) -> usize {
+            self.cost
+        }
+
+        fn score(&mut self) -> Result<f32> {
+            self.inner.score()
+        }
+
+        fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+            self.inner.advance_shallow(target)
+        }
+
+        fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+            self.inner.score_bounds(up_to)
+        }
+
+        fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+            self.inner.set_min_competitive_score(min_score)
+        }
+
+        fn matches(&mut self) -> Result<bool> {
+            self.inner.matches()
+        }
+
+        fn scores_non_negative(&self) -> bool {
+            self.inner.scores_non_negative()
+        }
+    }
+
+    fn counting(
+        values: &[(u64, f32)],
+        cost: usize,
+    ) -> (Box<dyn ComposableScorer>, Arc<AtomicUsize>) {
+        let advance_calls = Arc::new(AtomicUsize::new(0));
+        let scorer = CountingScorer {
+            inner: MaterializedScorer::try_new(rows(values)).unwrap(),
+            cost,
+            advance_calls: advance_calls.clone(),
+        };
+        (Box::new(scorer), advance_calls)
+    }
+
     #[test]
     fn collector_confirms_two_phase_matches_without_a_cost_hint() {
         let mut scorer = TwoPhaseScorer {
@@ -2492,6 +2584,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(results, rows(&[(1, 33.0), (3, 11.0)]));
+    }
+
+    #[test]
+    fn required_conjunction_aligns_cheapest_clause_first() {
+        let dense_rows = (0..=100).map(|row_id| (row_id, 1.0)).collect::<Vec<_>>();
+        let (dense, dense_advance_calls) = counting(&dense_rows, 101);
+        let (rare, rare_advance_calls) = counting(&[(50, 1.0)], 1);
+        let mut scorer = RequiredConjunctionScorer::try_new(vec![dense, rare]).unwrap();
+        assert_eq!(scorer.approximation_order.as_deref(), Some(&[1, 0][..]));
+
+        assert_eq!(scorer.next().unwrap(), Some(50));
+        assert_eq!(scorer.next().unwrap(), None);
+        assert_eq!(dense_advance_calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(rare_advance_calls.load(AtomicOrdering::Relaxed), 2);
+
+        let (rare, _) = counting(&[(50, 1.0)], 1);
+        let (dense, _) = counting(&dense_rows, 101);
+        let scorer = RequiredConjunctionScorer::try_new(vec![rare, dense]).unwrap();
+        assert!(scorer.approximation_order.is_none());
+    }
+
+    #[test]
+    fn required_conjunction_preserves_query_score_order() {
+        let (large, _) = counting(&[(0, 16_777_216.0)], 3);
+        let (first_small, _) = counting(&[(0, 1.0)], 1);
+        let (second_small, _) = counting(&[(0, 1.0)], 2);
+        let mut scorer =
+            RequiredConjunctionScorer::try_new(vec![large, first_small, second_small]).unwrap();
+
+        assert_eq!(scorer.next().unwrap(), Some(0));
+        assert_eq!(scorer.score().unwrap(), 16_777_216.0);
     }
 
     #[test]

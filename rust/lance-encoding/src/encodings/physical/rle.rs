@@ -1556,6 +1556,12 @@ impl MiniBlockDecompressor for RleDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         self.decode_data(data, num_values, true)
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl BlockDecompressor for RleDecompressor {

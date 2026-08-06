@@ -90,7 +90,9 @@ use crate::scalar::{
     OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery,
     UpdateCriteria,
 };
-use crate::{FtsPrewarmOptions, Index};
+use crate::{
+    FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmPartitionStatus, FtsPrewarmResult, Index,
+};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
