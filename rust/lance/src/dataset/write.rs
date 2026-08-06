@@ -1566,10 +1566,12 @@ impl WriterOptions {
     pub(super) fn update(
         source_store_registry: Arc<ObjectStoreRegistry>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+        allow_external_blob_outside_bases: bool,
     ) -> Self {
         Self {
             add_data_dir: true,
             external_base_resolver,
+            allow_external_blob_outside_bases,
             source_store_registry,
             ..Default::default()
         }

@@ -657,6 +657,99 @@ def test_fragment_update_columns_with_blob_v2(tmp_path):
     assert result["payload"].to_pylist() == [b"one", b"NEW", b"", None]
 
 
+def test_fragment_update_columns_with_nested_blob_v2(tmp_path):
+    def info_array(names, payloads):
+        fields = [pa.field("name", pa.string()), lance.blob_field("blob")]
+        return pa.StructArray.from_arrays(
+            [pa.array(names), lance.blob_array(payloads)], fields=fields
+        )
+
+    dataset_uri = tmp_path / "test_dataset_update_columns_nested_blob_v2"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([1, 2]),
+                "info": info_array(["a", "b"], [b"one", b"two"]),
+            }
+        ),
+        dataset_uri,
+        data_storage_version="2.2",
+    )
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "info": info_array(["B"], [b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+        ),
+        read_version=dataset.version,
+    )
+
+    info = updated_dataset.to_table(blob_handling="all_binary")["info"].combine_chunks()
+    assert info.field("name").to_pylist() == ["a", "B"]
+    assert info.field("blob").to_pylist() == [b"one", b"NEW"]
+
+
+def test_fragment_update_columns_preserves_external_blob_v2(tmp_path):
+    dataset_uri = tmp_path / "test_dataset_update_columns_external_blob_v2"
+    external = tmp_path / "existing-payload.bin"
+    external.write_bytes(b"outside")
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([1, 2]),
+                "payload": lance.blob_array([external.as_uri(), b"two"]),
+            }
+        ),
+        dataset_uri,
+        data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
+    )
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "payload": lance.blob_array([b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+        ),
+        read_version=dataset.version,
+    )
+
+    result = updated_dataset.to_table(blob_handling="all_binary")
+    assert result["payload"].to_pylist() == [b"outside", b"NEW"]
+
+    new_external = tmp_path / "new-payload.bin"
+    new_external.write_bytes(b"new outside")
+    with pytest.raises(ValueError, match="outside registered external bases"):
+        updated_dataset.get_fragment(0).update_columns(
+            pa.table(
+                {
+                    "id": pa.array([2]),
+                    "payload": lance.blob_array([new_external.as_uri()]),
+                }
+            ),
+            left_on="id",
+        )
+
+
 def test_fragment_update_columns_with_nulls(tmp_path):
     """Test fragment update columns with null values."""
     # Create initial dataset

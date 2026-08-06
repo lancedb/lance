@@ -229,6 +229,7 @@ pub async fn open_update_writer(
     version: ConcreteFileVersion,
     dataset: &Dataset,
     schema: &Schema,
+    allow_external_blob_outside_bases: bool,
 ) -> Result<Box<dyn write::GenericWriter>> {
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -242,7 +243,11 @@ pub async fn open_update_writer(
         &dataset.object_store,
         schema,
         &dataset.base,
-        WriterOptions::update(dataset.session.store_registry(), external_base_resolver),
+        WriterOptions::update(
+            dataset.session.store_registry(),
+            external_base_resolver,
+            allow_external_blob_outside_bases,
+        ),
     )
     .await
 }
