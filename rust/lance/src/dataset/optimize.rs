@@ -1120,8 +1120,8 @@ async fn descriptor_to_logical_blob_array(
             row_addrs.len()
         )));
     }
-    let blob_data = if classification.data_blob_indices.is_empty() {
-        None
+    let blob_files = if classification.data_blob_indices.is_empty() {
+        Vec::new()
     } else {
         let indices = classification
             .data_blob_indices
@@ -1143,20 +1143,44 @@ async fn descriptor_to_logical_blob_array(
             .iter()
             .map(|index| row_addrs[*index])
             .collect::<Vec<_>>();
-        Some(
-            super::blob::materialize_blob_v2_descriptors(
-                dataset,
-                blob_field_id,
-                descriptions,
-                &data_row_addrs,
-            )
-            .await?,
+        super::blob::collect_blob_v2_descriptor_files(
+            dataset,
+            blob_field_id,
+            descriptions,
+            &data_row_addrs,
         )
+        .await?
     };
 
+    let data_capacity =
+        classification
+            .data_blob_indices
+            .iter()
+            .try_fold(0usize, |data_capacity, row_idx| {
+                if descriptor.size_col.is_null(*row_idx) {
+                    return Err(Error::internal(format!(
+                        "Non-null blob row {} in field '{}' is missing its size",
+                        row_idx, field_name
+                    )));
+                }
+                let size = usize::try_from(descriptor.size_col.value(*row_idx)).map_err(|_| {
+                    Error::internal(format!(
+                        "Blob size {} at row {} in field '{}' does not fit in usize",
+                        descriptor.size_col.value(*row_idx),
+                        row_idx,
+                        field_name
+                    ))
+                })?;
+                data_capacity.checked_add(size).ok_or_else(|| {
+                    Error::internal(format!(
+                        "Total blob size in field '{}' exceeds usize",
+                        field_name
+                    ))
+                })
+            })?;
+
     let num_rows = struct_arr.len();
-    let data_values = blob_data.as_ref().map(|data| data.as_binary::<i64>());
-    let mut data_builder = LargeBinaryBuilder::with_capacity(num_rows, 0);
+    let mut data_builder = LargeBinaryBuilder::with_capacity(num_rows, data_capacity);
     let mut uri_builder = StringBuilder::with_capacity(num_rows, 0);
     let mut out_position_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(num_rows);
     let mut out_size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(num_rows);
@@ -1199,21 +1223,18 @@ async fn descriptor_to_logical_blob_array(
                 }
             }
             RowClass::DataBlob => {
-                let data_values = data_values.as_ref().ok_or_else(|| {
-                    Error::internal(format!(
-                        "Non-null blob row {} in field '{}' produced no materialized data",
-                        i, field_name
-                    ))
-                })?;
-                if data_values.is_null(blob_file_idx) {
-                    return Err(Error::internal(format!(
-                        "Non-null blob row {} in field '{}' resolved to null",
-                        i, field_name
-                    )));
-                }
-                let data = data_values.value(blob_file_idx);
+                let blob_file = blob_files
+                    .get(blob_file_idx)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "Non-null blob row {} in field '{}' resolved to null",
+                            i, field_name
+                        ))
+                    })?;
+                let data = blob_file.read().await?;
                 blob_file_idx += 1;
-                data_builder.append_value(data);
+                data_builder.append_value(data.as_ref());
                 uri_builder.append_null();
                 out_position_builder.append_null();
                 out_size_builder.append_null();

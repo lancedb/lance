@@ -3156,6 +3156,16 @@ async fn collect_blob_files_v2(
     descriptions: &StructArray,
     row_addrs: &arrow::array::PrimitiveArray<UInt64Type>,
 ) -> Result<Vec<Option<BlobFile>>> {
+    collect_blob_v2_descriptor_files(dataset, blob_field_id, descriptions, row_addrs.values()).await
+}
+
+/// Resolve blob v2 descriptors to lazy handles without materializing their payloads.
+pub(super) async fn collect_blob_v2_descriptor_files(
+    dataset: &Arc<Dataset>,
+    blob_field_id: u32,
+    descriptions: &StructArray,
+    row_addrs: &[u64],
+) -> Result<Vec<Option<BlobFile>>> {
     if descriptions.len() != row_addrs.len() {
         return Err(Error::internal(format!(
             "Blob descriptor count {} did not match row address count {}",
@@ -3166,7 +3176,7 @@ async fn collect_blob_files_v2(
     let columns = BlobV2DescriptorColumns::new(descriptions);
     let mut files = Vec::with_capacity(row_addrs.len());
     let mut read_context = BlobV2ReadContext::new(dataset, blob_field_id);
-    for (selection_index, row_addr) in row_addrs.values().iter().enumerate() {
+    for (selection_index, row_addr) in row_addrs.iter().enumerate() {
         files.push(
             read_context
                 .collect_file(&columns, selection_index, *row_addr)
@@ -3438,7 +3448,7 @@ async fn materialize_blob_v2_list_array<O: OffsetSizeTrait>(
     Ok(Arc::new(list_array))
 }
 
-pub(super) async fn materialize_blob_v2_descriptors(
+async fn materialize_blob_v2_descriptors(
     dataset: &Arc<Dataset>,
     blob_field_id: u32,
     descriptions: &StructArray,
