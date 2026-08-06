@@ -2656,6 +2656,47 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert dataset.to_table().sort_by("a") == expected
 
 
+@pytest.mark.parametrize("container", ["struct", "list"])
+def test_merge_insert_subcols_preserves_nested_blob(tmp_path: Path, container: str):
+    blob_field = lance.blob_field("blob")
+    blob_values = lance.blob_array([b"one", b"two"])
+    if container == "struct":
+        nested_values = pa.StructArray.from_arrays(
+            [blob_values],
+            fields=[blob_field],
+        )
+        expected_nested = [{"blob": b"one"}, {"blob": b"two"}]
+    else:
+        nested_values = pa.ListArray.from_arrays(
+            pa.array([0, 1, 2], type=pa.int32()),
+            blob_values,
+            type=pa.list_(blob_field),
+        )
+        expected_nested = [[b"one"], [b"two"]]
+
+    dataset_uri = tmp_path / f"partial_nested_blob_{container}"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([1, 2]),
+                "nested": nested_values,
+                "other": pa.array([10, 20]),
+            }
+        ),
+        dataset_uri,
+        data_storage_version="2.2",
+    )
+    source = pa.table({"id": pa.array([2]), "other": pa.array([200])})
+
+    dataset.merge_insert("id").when_matched_update_all().execute(source)
+
+    result = (
+        lance.dataset(dataset_uri).to_table(blob_handling="all_binary").sort_by("id")
+    )
+    assert result["other"].to_pylist() == [10, 200]
+    assert result["nested"].to_pylist() == expected_nested
+
+
 def test_merge_insert_full_fragment_rewrite_json_e2e(tmp_path: Path):
     """End-to-end test: merge_insert with JSON columns where ALL rows are updated.
 

@@ -1601,14 +1601,14 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     Ok(Arc::new(list_array))
 }
 
-struct BlobV2BatchRewritePlan {
+pub(crate) struct BlobV2BatchRewritePlan {
     row_addr_idx: usize,
     columns: Vec<(usize, BlobV2FieldRewritePlan)>,
     output_schema: SchemaRef,
 }
 
 impl BlobV2BatchRewritePlan {
-    fn try_new(
+    pub(crate) fn try_new(
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
         keep_row_addr: bool,
@@ -1617,7 +1617,7 @@ impl BlobV2BatchRewritePlan {
             .column_with_name(lance_core::ROW_ADDR)
             .ok_or_else(|| {
                 Error::internal(format!(
-                    "_rowaddr column missing from batch for blob v2 compaction, columns: {:?}",
+                    "_rowaddr column missing from batch for blob v2 rewrite, columns: {:?}",
                     input_schema
                         .fields()
                         .iter()
@@ -1651,7 +1651,11 @@ impl BlobV2BatchRewritePlan {
         })
     }
 
-    async fn transform_batch(
+    pub(crate) fn output_schema(&self) -> &SchemaRef {
+        &self.output_schema
+    }
+
+    pub(crate) async fn transform_batch(
         &self,
         dataset: &Arc<Dataset>,
         batch: RecordBatch,
