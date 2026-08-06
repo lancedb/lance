@@ -1708,11 +1708,7 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
                     }
                     // Base data files and data-overlay files share the
                     // `data/{key}.lance` namespace; both must be kept.
-                    let data_files = fragment
-                        .files
-                        .iter()
-                        .chain(fragment.overlays.iter().map(|overlay| &overlay.data_file));
-                    for file in data_files {
+                    for file in fragment.referenced_lance_files() {
                         // External-base files resolve outside this root; the
                         // top-level `base_paths` guard only inspects the latest
                         // manifest, so re-check per fragment across all present
