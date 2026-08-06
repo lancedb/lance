@@ -11,6 +11,11 @@ on:
         description: "Tag to publish (e.g., v1.0.0)"
         required: true
         type: string
+      already_published:
+        description: "Comma-separated crates to skip when resuming a partial publish"
+        required: false
+        type: string
+        default: ""
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
@@ -93,10 +98,20 @@ jobs:
         if: steps.check_version.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          ALREADY_PUBLISHED: ${{ inputs.already_published }}
         run: |
+          EXCLUDE_ARGS=()
+          IFS=',' read -ra PACKAGES <<< "$ALREADY_PUBLISHED"
+          for package in "${PACKAGES[@]}"; do
+            if [[ -n "$package" ]]; then
+              EXCLUDE_ARGS+=(--exclude "$package")
+            fi
+          done
+
           cargo publish --workspace \
             --exclude lance-arrow-stats \
             --exclude lance-arrow-scalar \
+            "${EXCLUDE_ARGS[@]}" \
             --all-features
   report-failure:
     name: Report Workflow Failure
