@@ -645,11 +645,11 @@ impl<'a> CleanupTask<'a> {
 
         let is_not_found_err = |e: &Error| matches!(e, Error::NotFound { .. });
         // Build stream for a managed subtree
-        let build_listing_stream = |dir: Path| {
+        let build_listing_stream = |dir: Path, unmodified_since| {
             let inspection_ref = &inspection;
             self.dataset
                 .object_store
-                .read_dir_all(&dir, inspection.earliest_retained_manifest_time)
+                .read_dir_all(&dir, unmodified_since)
                 .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
                 .or_else(|e| {
                     // If the directory doesn't exist then we can just return an empty stream.
@@ -676,12 +676,17 @@ impl<'a> CleanupTask<'a> {
         };
 
         // Restrict scanning to Lance-managed subtrees for safety and performance.
+        let unmodified_since = inspection.earliest_retained_manifest_time;
         let streams = vec![
-            build_listing_stream(self.dataset.versions_dir()),
-            build_listing_stream(self.dataset.transactions_dir()),
-            build_listing_stream(self.dataset.data_dir()),
-            build_listing_stream(self.dataset.indices_dir()),
-            build_listing_stream(self.dataset.deletions_dir()),
+            build_listing_stream(self.dataset.versions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.data_dir(), unmodified_since),
+            // Index UUIDs from manifests being removed are proof that their files are
+            // safe to delete. Scan every index artifact while that proof is available;
+            // a retained-manifest cutoff can otherwise skip newer artifacts and lose
+            // the proof when the old manifests are removed by this cleanup pass.
+            build_listing_stream(self.dataset.indices_dir(), None),
+            build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
         ];
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
@@ -2812,6 +2817,96 @@ mod tests {
                         .join(seg_c.to_string())
                         .join("index.idx")
                 )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_recent_replaced_index_with_short_retention() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let field_id = dataset.schema().field("indexable").unwrap().id;
+        let old_uuid = Uuid::new_v4();
+        let current_uuid = Uuid::new_v4();
+
+        let old_index = dummy_index_metadata(&dataset, field_id, old_uuid, [0_u32, 1]);
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![old_index.clone()],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        MockClock::set_system_time(TimeDelta::try_minutes(1).unwrap().to_std().unwrap());
+        let current_index = dummy_index_metadata(&dataset, field_id, current_uuid, [0_u32, 1]);
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![current_index],
+                        removed_indices: vec![old_index],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Model index artifacts whose storage timestamp is newer than the retained
+        // manifest. UUID verification must not be hidden by the manifest cutoff.
+        MockClock::set_system_time(TimeDelta::try_minutes(2).unwrap().to_std().unwrap());
+        write_dummy_index_artifact(&dataset, old_uuid)
+            .await
+            .unwrap();
+        write_dummy_index_artifact(&dataset, current_uuid)
+            .await
+            .unwrap();
+
+        let short_retention = TimeDelta::try_seconds(30).unwrap();
+        let removed = fixture
+            .run_cleanup(utc_now() - short_retention)
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 3);
+        assert_eq!(removed.index_files_removed, 2);
+
+        let old_index_file = dataset
+            .indices_dir()
+            .join(old_uuid.to_string())
+            .join("index.idx");
+        let current_index_file = dataset
+            .indices_dir()
+            .join(current_uuid.to_string())
+            .join("index.idx");
+        assert!(
+            !dataset
+                .object_store
+                .as_ref()
+                .exists(&old_index_file)
+                .await
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .exists(&current_index_file)
                 .await
                 .unwrap()
         );
