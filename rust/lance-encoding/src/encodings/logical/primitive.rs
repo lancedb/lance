@@ -40,6 +40,7 @@ use lance_core::{
 use log::{debug, trace};
 
 use crate::encodings::logical::primitive::miniblock::MiniBlockChunk;
+use crate::encodings::physical::binary::variable_encoded_size;
 use crate::encodings::physical::rle::{RleDecompressor, RleRuns};
 use crate::utils::bytepack::ByteUnpacker;
 use crate::{
@@ -107,26 +108,45 @@ const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
 const DEFAULT_LARGE_DICT_VALUES_COMPRESSION: &str = "zstd";
+const UNCOMPRESSED_DICT_VALUES_COMPRESSION: &str = "none";
 
 /// Pick the default compression for a dictionary values buffer.
 ///
-/// The buffer is compressed with a single call, so LZ4 cannot be used once it
-/// exceeds `LZ4_MAX_INPUT_SIZE`. Zstd has no such limit and compresses this kind
-/// of buffer better anyway, so fall back to it rather than failing the write.
-fn default_dict_values_compression(dict_values_size: u64) -> &'static str {
-    if dict_values_size > lz4_max_input_size() {
+/// The buffer is compressed with a single call, so LZ4 cannot be used once the
+/// serialized block exceeds `LZ4_MAX_INPUT_SIZE`. Prefer zstd in that case: it has
+/// no comparable input limit and compresses these buffers better in practice. If
+/// this build has no zstd support, fall back to storing the values uncompressed
+/// rather than failing the write.
+fn default_dict_values_compression(serialized_size: u64) -> &'static str {
+    if serialized_size <= lz4_max_input_size() {
+        return DEFAULT_DICT_VALUES_COMPRESSION;
+    }
+    if cfg!(feature = "zstd") {
         DEFAULT_LARGE_DICT_VALUES_COMPRESSION
     } else {
-        DEFAULT_DICT_VALUES_COMPRESSION
+        UNCOMPRESSED_DICT_VALUES_COMPRESSION
     }
 }
 
+/// The number of bytes `block` occupies once serialized for general compression.
+///
+/// `CompressedBufferEncoder` compresses this serialized form, not the raw block, so
+/// codec input limits must be checked against this rather than `data_size()`.
+fn dict_values_serialized_size(block: &DataBlock) -> u64 {
+    match block {
+        DataBlock::VariableWidth(variable_width) => variable_encoded_size(variable_width),
+        // Fixed-width blocks are compressed as-is.
+        other => other.data_size(),
+    }
+}
+
+/// The largest serialized block a single LZ4 call accepts, or `u64::MAX` when this
+/// build has no LZ4 support (in which case the LZ4 default is never selected).
 const fn lz4_max_input_size() -> u64 {
     #[cfg(feature = "lz4")]
     {
         crate::encodings::physical::block::LZ4_MAX_INPUT_SIZE as u64
     }
-    // Without the lz4 feature the default below is never selected anyway.
     #[cfg(not(feature = "lz4"))]
     {
         u64::MAX
@@ -5566,8 +5586,10 @@ impl PrimitiveStructuralEncoder {
 
         if let Some(dictionary_data) = dictionary_data {
             let num_dictionary_items = dictionary_data.num_values();
-            let dict_values_field =
-                Self::build_dict_values_compressor_field(field, dictionary_data.data_size())?;
+            let dict_values_field = Self::build_dict_values_compressor_field(
+                field,
+                dict_values_serialized_size(&dictionary_data),
+            )?;
 
             let (compressor, dictionary_encoding) = compression_strategy
                 .create_block_compressor(&dict_values_field, &dictionary_data)?;
@@ -8979,7 +9001,8 @@ mod tests {
     }
 
     /// Dictionary values are compressed with a single LZ4 call, which fails above
-    /// `LZ4_MAX_INPUT_SIZE`. Oversized buffers must fall back to zstd instead.
+    /// `LZ4_MAX_INPUT_SIZE`. Oversized buffers must fall back to a codec that can
+    /// handle them instead of failing the write.
     #[cfg(feature = "lz4")]
     #[test]
     fn test_resolve_dict_values_compression_metadata_large_falls_back_to_zstd() {
@@ -8990,9 +9013,15 @@ mod tests {
             None,
             over,
         );
+        let expected = if cfg!(feature = "zstd") {
+            "zstd"
+        } else {
+            "none"
+        };
         assert_eq!(
             metadata.get(COMPRESSION_META_KEY),
-            Some(&"zstd".to_string()),
+            Some(&expected.to_string()),
+            "oversized dictionary values must not default to a codec that cannot encode them"
         );
 
         // Exactly at the limit LZ4 is still valid, so the default is unchanged.
@@ -9003,6 +9032,29 @@ mod tests {
             super::lz4_max_input_size(),
         );
         assert_eq!(at_limit.get(COMPRESSION_META_KEY), Some(&"lz4".to_string()),);
+    }
+
+    /// The LZ4 limit applies to the serialized block, which carries a header beyond
+    /// `data_size()`. A block just under the limit still serializes past it and must
+    /// not be handed to LZ4.
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn test_dict_values_serialized_size_accounts_for_header() {
+        use crate::data::VariableWidthBlock;
+
+        // Two 64-bit offsets, so the serialized form adds 16 header bytes.
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            bits_per_offset: 64,
+            data: LanceBuffer::empty(),
+            offsets: LanceBuffer::reinterpret_vec(vec![0u64, 0u64]),
+            num_values: 1,
+            block_info: BlockInfo::new(),
+        });
+        assert_eq!(
+            super::dict_values_serialized_size(&block),
+            block.data_size() + 16,
+            "serialized size must include the header VariableEncoder prepends"
+        );
     }
 
     /// An explicit request must win even when the buffer is too large for LZ4, so
