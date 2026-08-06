@@ -462,9 +462,16 @@ impl MemIndexConfig {
 
 /// Whether the MemWAL can maintain an index of this protobuf type.
 ///
-/// Opening a shard writer rejects anything outside this set, which makes the
-/// table unwritable — so filter on this before committing a maintained set,
-/// not at claim time.
+/// A necessary but *not* sufficient condition: the type url does not carry the
+/// column, so every vector index sub-type maps to [`MemIndexKind::Hnsw`] here
+/// regardless of whether its column is the `FixedSizeList<Float32>` the memtable
+/// HNSW needs. Filtering a maintained set on this alone can commit an index that
+/// every shard-writer open then rejects, leaving the table unwritable.
+///
+/// Use
+/// [`validate_maintained_indexes`](super::validate_maintained_indexes) to decide
+/// what to commit; it resolves each index against the dataset schema and applies
+/// the writer's own rules.
 pub fn is_maintainable_index_type(type_url: &str) -> bool {
     MemIndexKind::from_type_url(type_url).is_some()
 }
