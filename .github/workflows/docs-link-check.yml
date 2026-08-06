@@ -10,19 +10,43 @@ on:
     - cron: "0 7 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write
+# The report lives in one repository-global issue, so runs must not overlap: a
+# lookup racing a create produces duplicate issues, and a healthy run closing
+# the issue while a failing run only rewrites its body would leave a broken
+# report closed. The group is deliberately ref-independent so that a manual
+# dispatch serializes against the scheduled run.
+concurrency:
+  group: docs-link-check
+  cancel-in-progress: false
+
+permissions: {}
 
 env:
   REPORT_TITLE: "Docs link checker report"
 
 jobs:
-  link-check:
+  scan:
+    name: Scan links
     runs-on: ubuntu-24.04
+    # lychee-action is pinned by SHA, but its wrapper downloads the lychee
+    # release tarball at run time without verifying a digest, and hands the
+    # resulting binary a GitHub token. Release assets remain replaceable, so
+    # that binary is confined to a job whose token can only read public
+    # content; everything that writes runs in the report job below.
+    permissions:
+      contents: read
+    outputs:
+      exit_code: ${{ steps.lychee.outputs.exit_code }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # workflow_dispatch can run from any ref, but the report is
+          # repository-global. Always measure the default branch so a manual
+          # run from a topic branch cannot close a report that main warrants,
+          # or overwrite it with branch-only findings.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Check links
         id: lychee
@@ -47,22 +71,68 @@ jobs:
           format: markdown
           output: ./lychee/out.md
           jobSummary: true
-          # The report, not a red build, is the signal this job exists to
-          # produce. A genuine job failure still surfaces on its own.
+          # The report, not a red build, is the signal for broken links. The
+          # report job below still fails the run if the check itself breaks.
           fail: false
+
+      - name: Upload report
+        if: steps.lychee.outputs.exit_code == 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: link-report
+          path: ./lychee/out.md
+          retention-days: 7
+
+  report:
+    name: Update report issue
+    needs: scan
+    runs-on: ubuntu-24.04
+    # Deliberately no checkout: this job needs the report artifact and the
+    # issues API, not the repository contents.
+    permissions:
+      issues: write
+    env:
+      EXIT_CODE: ${{ needs.scan.outputs.exit_code }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Classify checker result
+        # lychee exits 0 when every link resolves and 2 when links fail.
+        # Anything else (1 runtime, 3 bad config) means the check never
+        # produced a link verdict, which must surface as a failed run rather
+        # than be published as "broken documentation links".
+        run: |
+          case "$EXIT_CODE" in
+            0|2)
+              echo "lychee exit code $EXIT_CODE"
+              ;;
+            *)
+              echo "::error::lychee exited with '$EXIT_CODE': the link check did not complete. Leaving the report issue untouched."
+              exit 1
+              ;;
+          esac
 
       - name: Find existing report issue
         id: report
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Matched on title alone, and through search rather than a listing:
+        # the issue action applies labels in a separate call after creating the
+        # issue, so a label filter misses a half-created report, and this
+        # repository has far more open issues than one listing page holds.
         run: |
           number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --label documentation --limit 100 --json number,title \
+            --search "in:title \"$REPORT_TITLE\" author:app/github-actions" \
+            --limit 50 --json number,title \
             --jq "[.[] | select(.title == \"$REPORT_TITLE\") | .number] | first // empty")
           echo "number=$number" >> "$GITHUB_OUTPUT"
 
+      - name: Download report
+        if: env.EXIT_CODE == 2
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: link-report
+          path: ./lychee
+
       - name: Compose report
-        if: steps.lychee.outputs.exit_code != 0
+        if: env.EXIT_CODE == 2
         run: |
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           {
@@ -76,7 +146,7 @@ jobs:
           } > ./lychee/issue.md
 
       - name: Report broken links
-        if: steps.lychee.outputs.exit_code != 0
+        if: env.EXIT_CODE == 2
         uses: peter-evans/create-issue-from-file@fca9117c27cdc29c6c4db3b86c48e4115a786710 # v6.0.0
         with:
           # Empty on the first failing run, which creates the issue; afterwards
@@ -87,10 +157,10 @@ jobs:
           labels: documentation
 
       - name: Close report issue once links are healthy
-        if: steps.lychee.outputs.exit_code == 0 && steps.report.outputs.number != ''
+        if: env.EXIT_CODE == 0 && steps.report.outputs.number != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.report.outputs.number }}
         run: |
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          gh issue close "${{ steps.report.outputs.number }}" --repo "$GITHUB_REPOSITORY" \
+          gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --comment "All documentation links resolved in [the latest run]($run_url)."
