@@ -617,6 +617,46 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
     assert result["name"][2] == "Chase"  # id=3 should have name Chase
 
 
+def test_fragment_update_columns_with_blob_v2(tmp_path):
+    data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4]),
+            "payload": lance.blob_array([b"one", b"two", b"", None]),
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_blob_v2"
+    dataset = lance.write_dataset(
+        data,
+        dataset_uri,
+        data_storage_version="2.2",
+    )
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "payload": lance.blob_array([b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+
+    operation = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        operation,
+        read_version=dataset.version,
+    )
+
+    result = updated_dataset.to_table(blob_handling="all_binary")
+    assert result["id"].to_pylist() == [1, 2, 3, 4]
+    assert result["payload"].to_pylist() == [b"one", b"NEW", b"", None]
+
+
 def test_fragment_update_columns_with_nulls(tmp_path):
     """Test fragment update columns with null values."""
     # Create initial dataset

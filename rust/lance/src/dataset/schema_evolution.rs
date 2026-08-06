@@ -536,7 +536,7 @@ async fn add_columns_impl(
         }
 
         let mut updater = match fragment
-            .updater(read_columns_ref, schemas.clone(), batch_size)
+            .updater(read_columns_ref, schemas.clone(), batch_size, None)
             .await
         {
             Ok(updater) => updater,
@@ -614,7 +614,7 @@ async fn add_columns_from_stream(
     let mut last_seen_batch: Option<RecordBatch> = None;
     for fragment in fragments {
         let mut updater = match fragment
-            .updater::<String>(Some(&[]), schemas.clone(), batch_size)
+            .updater::<String>(Some(&[]), schemas.clone(), batch_size, None)
             .await
         {
             Ok(updater) => updater,
