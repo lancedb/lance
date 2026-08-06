@@ -556,6 +556,51 @@ impl Fragment {
         }
     }
 
+    /// Every Lance-format file this fragment references: the base data files
+    /// plus the data file of each overlay. The fragment's other referenced
+    /// files (deletion files, external row-id files) are not in this format.
+    ///
+    /// Prefer this over `files`, which is the base data files only and so omits
+    /// overlays.
+    pub fn referenced_lance_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
+        // Destructured on purpose: a new field here fails to compile until
+        // someone decides whether it references files.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter()
+            .chain(overlays.iter().map(|overlay| &overlay.data_file))
+    }
+
+    /// Mutable counterpart of [`Self::referenced_lance_files`], for rewriting
+    /// the fields a clone has to normalize (`base_id`) across base and overlay
+    /// files alike.
+    pub fn referenced_lance_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
+        // Destructured for the same reason as `referenced_lance_files`, and so
+        // the two disjoint field borrows are visible to the borrow checker.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter_mut()
+            .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
+    }
+
     pub fn from_json(json: &str) -> Result<Self> {
         let fragment: Self = serde_json::from_str(json)?;
         Ok(fragment)
