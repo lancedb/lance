@@ -27,8 +27,10 @@ use lance_core::datatypes::Schema;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use lance_encoding::version::LanceFileVersion;
-use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::version::LanceFileVersion;
+use lance_file::versions;
+use lance_file::writer::FileWriterOptions;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
@@ -1134,23 +1136,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let storage_path = self.index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.clone().join(INDEX_FILE_NAME);
 
-        let writer_options = FileWriterOptions {
-            format_version: Some(self.format_version),
-            ..Default::default()
-        };
+        let file_version = ConcreteFileVersion::from(self.format_version);
+        let writer_options = FileWriterOptions::default();
         let mut storage_writer = if is_flat {
             None
         } else {
             let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
             fields.extend(quantizer.extra_fields());
             let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
-            Some(FileWriter::try_new(
+            Some(versions::create_writer(
+                file_version,
                 self.store.create(&storage_path).await?,
                 storage_schema,
                 writer_options.clone(),
             )?)
         };
-        let mut index_writer = FileWriter::try_new(
+        let mut index_writer = versions::create_writer(
+            file_version,
             self.store.create(&index_path).await?,
             S::schema().as_ref().try_into()?,
             writer_options.clone(),
@@ -1218,7 +1220,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                     if storage_writer.is_none() {
                         let storage_schema: Schema = batch.schema_ref().as_ref().try_into()?;
-                        storage_writer = Some(FileWriter::try_new(
+                        storage_writer = Some(versions::create_writer(
+                            file_version,
                             self.store.create(&storage_path).await?,
                             storage_schema,
                             writer_options.clone(),
@@ -1286,7 +1289,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 ),
             ]);
             let storage_schema: Schema = (&flat_schema).try_into()?;
-            storage_writer = Some(FileWriter::try_new(
+            storage_writer = Some(versions::create_writer(
+                file_version,
                 self.store.create(&storage_path).await?,
                 storage_schema,
                 writer_options.clone(),

@@ -20,9 +20,11 @@ use lance_core::{
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::version::LanceFileVersion;
+use lance_file::versions;
+use lance_file::writer::FileWriterOptions;
 use lance_io::{
     ReadBatchParams,
     object_store::ObjectStore,
@@ -122,13 +124,11 @@ impl Shuffler for IvfShuffler {
                 let format_version = self.format_version;
                 async move {
                     let writer = object_store.create(&part_path).await?;
-                    let file_writer = FileWriter::try_new(
+                    let file_writer = versions::create_writer(
+                        ConcreteFileVersion::from(format_version),
                         writer,
                         lance_core::datatypes::Schema::try_from(&schema)?,
-                        FileWriterOptions {
-                            format_version: Some(format_version),
-                            ..Default::default()
-                        },
+                        FileWriterOptions::default(),
                     )?
                     .with_page_metadata_spill(object_store.clone(), spill_path);
                     Result::Ok(file_writer)
@@ -475,7 +475,7 @@ impl Shuffler for TwoFileShuffler {
         let data_path = self.output_dir.clone().join("shuffle_data.lance");
         let spill_path = self.output_dir.clone().join("shuffle_data.spill");
         let writer = self.object_store.create(&data_path).await?;
-        let mut file_writer = FileWriter::try_new(
+        let mut file_writer = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&schema)?,
             Default::default(),
@@ -486,7 +486,7 @@ impl Shuffler for TwoFileShuffler {
         let offsets_path = self.output_dir.clone().join("shuffle_offsets.lance");
         let spill_path = self.output_dir.clone().join("shuffle_offsets.spill");
         let writer = self.object_store.create(&offsets_path).await?;
-        let mut offsets_writer = FileWriter::try_new(
+        let mut offsets_writer = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(offsets_schema.as_ref())?,
             Default::default(),
@@ -577,8 +577,8 @@ impl Shuffler for TwoFileShuffler {
 /// Returns `(total_rows_written, per_partition_row_counts)`.
 async fn flush_shuffle_batch(
     accumulated: Vec<RecordBatch>,
-    file_writer: &mut FileWriter,
-    offsets_writer: &mut FileWriter,
+    file_writer: &mut versions::v2_1::Writer,
+    offsets_writer: &mut versions::v2_1::Writer,
     offsets_schema: Arc<Schema>,
     num_partitions: usize,
     global_row_count: u64,

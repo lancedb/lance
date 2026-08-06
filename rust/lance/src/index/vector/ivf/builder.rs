@@ -217,7 +217,8 @@ pub async fn write_vector_storage(
         data.boxed()
     };
 
-    let mut writer = lance_file::writer::FileWriter::new_lazy(writer, FileWriterOptions::default());
+    let mut writer =
+        lance_file::versions::v2_1::create_lazy_writer(writer, FileWriterOptions::default());
     let mut transformed_stream = data
         .map_ok(move |batch| {
             let ivf_transformer = ivf_transformer.clone();

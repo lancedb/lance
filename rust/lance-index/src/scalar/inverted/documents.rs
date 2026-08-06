@@ -25,7 +25,10 @@ use tokio::sync::OnceCell;
 
 use crate::scalar::{IndexReader, IndexStore, RowIdRemapper};
 
-use super::index::{DocSet, NUM_TOKEN_COL, dequantize_doc_length, quantize_doc_length};
+use super::index::{
+    DocSet, NUM_TOKEN_COL, dequantize_doc_length, doc_index_storage_column,
+    document_coordinate_rank, quantize_doc_length,
+};
 
 /// Schema metadata key persisted in every modern `docs.lance` partition.
 pub(super) const TOTAL_TOKENS_KEY: &str = "total_tokens";
@@ -473,7 +476,7 @@ impl ResidentAddressProjection {
         }
     }
 
-    fn address(&self, doc_id: DocId) -> Option<u64> {
+    pub(super) fn address(&self, doc_id: DocId) -> Option<u64> {
         if self
             .projection
             .live_docs
@@ -568,6 +571,7 @@ pub(super) struct PartitionDocuments {
     partition_id: u64,
     index_cache: WeakLanceCache,
     num_docs: usize,
+    coordinate_rank: usize,
     persisted_total_tokens: Option<u64>,
     quantized_scoring: bool,
     remapper: Option<Arc<dyn RowIdRemapper>>,
@@ -600,6 +604,13 @@ impl PartitionDocumentStore {
         match self {
             Self::Legacy(docs) => docs.len(),
             Self::Modern(docs) => docs.len(),
+        }
+    }
+
+    pub(crate) fn coordinate_rank(&self) -> usize {
+        match self {
+            Self::Legacy(docs) => docs.coordinate_rank(),
+            Self::Modern(docs) => docs.coordinate_rank(),
         }
     }
 
@@ -664,6 +675,7 @@ impl std::fmt::Debug for PartitionDocuments {
         f.debug_struct("PartitionDocuments")
             .field("path", &self.path)
             .field("num_docs", &self.num_docs)
+            .field("coordinate_rank", &self.coordinate_rank)
             .field("persisted_total_tokens", &self.persisted_total_tokens)
             .field("lengths_loaded", &self.lengths.initialized())
             .field("projection_loaded", &self.projection.initialized())
@@ -715,12 +727,15 @@ impl PartitionDocuments {
                 })
             })
             .transpose()?;
+        let coordinate_rank =
+            document_coordinate_rank(&arrow_schema::Schema::from(reader.schema()));
         Ok(Self {
             store,
             path,
             partition_id,
             index_cache,
             num_docs,
+            coordinate_rank,
             persisted_total_tokens,
             quantized_scoring,
             remapper,
@@ -733,6 +748,10 @@ impl PartitionDocuments {
 
     pub(crate) fn len(&self) -> usize {
         self.num_docs
+    }
+
+    pub(crate) fn coordinate_rank(&self) -> usize {
+        self.coordinate_rank
     }
 
     #[cfg(test)]
@@ -866,7 +885,7 @@ impl PartitionDocuments {
         self.lengths.get().cloned()
     }
 
-    fn resident_address_projection(&self) -> Option<ResidentAddressProjection> {
+    pub(super) fn resident_address_projection(&self) -> Option<ResidentAddressProjection> {
         let projection = self.projection.get()?.clone();
         let shared_addresses = match &projection.addresses {
             AddressValues::Shared { .. } => self.shared_addresses.load().upgrade(),
@@ -963,6 +982,77 @@ impl PartitionDocuments {
         Ok(doc_ids
             .iter()
             .map(|doc_id| row_ids.value(doc_id.as_usize()))
+            .collect())
+    }
+
+    /// Resolve final global top-k DocIds to their logical FTS document keys.
+    pub(crate) async fn resolve_document_keys(
+        &self,
+        doc_ids: &[DocId],
+    ) -> Result<Vec<(u64, Vec<u32>)>> {
+        let row_ids = self.resolve_addresses(doc_ids).await?;
+        if self.coordinate_rank == 0 {
+            return Ok(row_ids
+                .into_iter()
+                .map(|row_id| (row_id, Vec::new()))
+                .collect());
+        }
+
+        let ranges = doc_ids
+            .iter()
+            .map(|doc_id| {
+                let index = doc_id.as_usize();
+                index..index + 1
+            })
+            .collect::<Vec<_>>();
+        let coordinate_names = (0..self.coordinate_rank)
+            .map(doc_index_storage_column)
+            .collect::<Vec<_>>();
+        let projection = coordinate_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let batch = self
+            .reader()
+            .await?
+            .read_ranges(&ranges, Some(&projection))
+            .await?;
+        if batch.num_rows() != row_ids.len() {
+            return Err(corrupt_docs(
+                &self.path,
+                format!(
+                    "document coordinate projection returned {} rows for {} candidates",
+                    batch.num_rows(),
+                    row_ids.len()
+                ),
+            ));
+        }
+        let coordinate_columns = coordinate_names
+            .iter()
+            .map(|name| {
+                let column = required_u32_column(&batch, name, &self.path)?;
+                if column.null_count() != 0 {
+                    return Err(corrupt_docs(
+                        &self.path,
+                        format!("document coordinate column {name} contains null values"),
+                    ));
+                }
+                Ok(column)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(row_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, row_id)| {
+                (
+                    row_id,
+                    coordinate_columns
+                        .iter()
+                        .map(|column| column.value(index))
+                        .collect(),
+                )
+            })
             .collect())
     }
 

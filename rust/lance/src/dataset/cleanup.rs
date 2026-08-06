@@ -720,17 +720,35 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest =
-            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        let manifest_and_indexes = async {
+            let manifest =
+                read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            let indexes =
+                read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+            Ok::<_, Error>((manifest, indexes))
+        }
+        .await;
+        let (manifest, indexes) = match manifest_and_indexes {
+            Ok(manifest_and_indexes) => manifest_and_indexes,
+            Err(error) if location.version < self.read_version && error.is_not_found() => {
+                // Another cleanup may remove an old manifest after this cleanup lists it.
+                // The current manifest is never safe to skip because it anchors our snapshot.
+                debug!(
+                    manifest_version = location.version,
+                    read_version = self.read_version,
+                    manifest_path = %location.path,
+                    "Skipping old manifest removed by concurrent cleanup"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
-        let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -773,7 +791,7 @@ impl<'a> CleanupTask<'a> {
         };
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.files.iter() {
+            for file in fragment.referenced_lance_files() {
                 let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
@@ -1326,7 +1344,7 @@ impl<'a> CleanupTask<'a> {
         let mut is_referenced = false;
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.files.iter() {
+            for file in fragment.referenced_lance_files() {
                 if let Some(base_id) = file.base_id {
                     let base_path = manifest.base_paths.get(&base_id);
                     if let Some(base_path) = base_path
@@ -2458,6 +2476,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_ignores_old_manifest_removed_after_listing() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let old_manifest = dataset
+            .commit_handler
+            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .try_filter(|location| future::ready(location.version == 1))
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        dataset
+            .object_store
+            .delete(&old_manifest.path)
+            .await
+            .unwrap();
+
+        let cleanup = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default().build(),
+            CleanupAction::Execute,
+        );
+        cleanup
+            .process_manifest_file(
+                old_manifest,
+                &Mutex::new(CleanupInspection::default()),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn explain_cleanup_does_not_delete_files() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -3069,6 +3123,147 @@ mod tests {
         assert_gt!(removed.transaction_files_removed, 0);
         assert_gt!(removed.index_files_removed, 0);
         assert_gt!(removed.deletion_files_removed, 0);
+    }
+
+    /// A branch reaches its parent's files through `base_id`, and
+    /// `retain_branch_lineage_files` promotes those into the parent's keep set. An
+    /// overlay inherited that way must be promoted too, or the parent deletes a
+    /// file the branch still reads.
+    #[tokio::test]
+    async fn lineage_retention_covers_inherited_overlay_files() {
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // Give the parent an overlay, then branch from it: `shallow_clone` stamps
+        // the overlay's `base_id` so the branch resolves it against the parent.
+        let mut dataset = fixture.open().await.unwrap();
+        let mut fragments: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        let mut overlay_file = fragments[0].files[0].clone();
+        overlay_file.path = "overlay.lance".to_string();
+        fragments[0].overlays = vec![DataOverlayFile {
+            data_file: overlay_file,
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: dataset.manifest.version,
+        }];
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Overwrite {
+                fragments,
+                schema: dataset.schema().clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let branch = fixture
+            .create_branch_and_load(&mut dataset, "child", (None, None))
+            .await
+            .unwrap();
+        let branch_fragments = branch.get_fragments();
+        let inherited = &branch_fragments[0].metadata().overlays[0].data_file;
+        assert!(
+            inherited.base_id.is_some(),
+            "the branch must reach the parent's overlay through base_id"
+        );
+
+        // The parent's cleanup walks the branch's manifest and must promote that
+        // overlay out of `verified_files`.
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+            CleanupAction::Execute,
+        );
+        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let referenced_branches = task.find_referenced_branches().await.unwrap();
+        let inspection = task
+            .retain_branch_lineage_files(inspection, &referenced_branches, &HashSet::new())
+            .await
+            .unwrap();
+
+        let overlay_path = Path::from("data/overlay.lance");
+        assert!(
+            inspection
+                .referenced_files
+                .data_paths
+                .contains(&overlay_path),
+            "the inherited overlay must be promoted into the parent's keep set"
+        );
+    }
+
+    /// A keep set built from `fragment.files` alone omits overlay data files, so
+    /// cleanup would delete live data.
+    #[tokio::test]
+    async fn keep_set_covers_referenced_overlay_files() {
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // The overlay file need not exist: the keep set comes from manifest
+        // metadata alone.
+        let mut dataset = fixture.open().await.unwrap();
+        let mut fragments: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        let mut overlay_file = fragments[0].files[0].clone();
+        overlay_file.path = "overlay.lance".to_string();
+        fragments[0].overlays = vec![DataOverlayFile {
+            data_file: overlay_file,
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: dataset.manifest.version,
+        }];
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Overwrite {
+                fragments,
+                schema: dataset.schema().clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+            CleanupAction::Execute,
+        );
+        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let kept: HashSet<&Path> = inspection
+            .referenced_files
+            .data_paths
+            .iter()
+            .chain(inspection.verified_files.data_paths.iter())
+            .collect();
+
+        let overlay_path = Path::from("data/overlay.lance");
+        assert!(
+            kept.contains(&overlay_path),
+            "the overlay's data file must be in the keep set, got {kept:?}"
+        );
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ use super::{
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
     index::{PositionStreamCodec, dequantize_doc_length},
     query::Operator,
-    scorer::{K1, bm25_doc_weight_with_norm, idf},
+    scorer::{K1, MemBM25Scorer, bm25_doc_weight_with_norm, idf},
 };
 use super::{
     CompressedPostingList, DocSet, PostingList, RawDocInfo,
@@ -4358,6 +4358,312 @@ impl<'a> PositionCursor<'a> {
 
     fn advance_next(&mut self) {
         self.index = self.index.saturating_add(1).min(self.len());
+    }
+}
+
+/// Incremental posting-backed scorer used by compound FTS.
+///
+/// Unlike [`Wand::search`], this cursor does not own a top-k heap. It exposes
+/// exact candidates and conservative block bounds to the compound collector,
+/// which owns the only competitive score for the whole scorer tree.
+pub(super) struct WandCursor<'a, D: WandDocuments> {
+    wand: Wand<'a, Arc<MemBM25Scorer>, D>,
+    phrase_slop: Option<u32>,
+    wand_factor: f32,
+    cost: usize,
+    current_doc: Option<DocInfo>,
+    current_document_key: Option<u64>,
+    current_score: f32,
+    confirmation: Option<bool>,
+    shallow: Option<(u64, u64, f32)>,
+    comparisons: usize,
+    metrics_recorded: bool,
+    metrics: &'a dyn MetricsCollector,
+}
+
+impl<'a, D: WandDocuments> WandCursor<'a, D> {
+    pub(super) fn new(
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Self {
+        let cost = match operator {
+            Operator::And => postings.iter().map(PostingIterator::cost).min(),
+            Operator::Or => Some(
+                postings
+                    .iter()
+                    .map(PostingIterator::cost)
+                    .fold(0, usize::saturating_add),
+            ),
+        }
+        .unwrap_or_default();
+        Self {
+            wand: Wand::new(operator, postings.into_iter(), documents, scorer),
+            phrase_slop: params.phrase_slop,
+            wand_factor: params.wand_factor,
+            cost,
+            current_doc: None,
+            current_document_key: None,
+            current_score: 0.0,
+            confirmation: None,
+            shallow: None,
+            comparisons: 0,
+            metrics_recorded: false,
+            metrics,
+        }
+    }
+
+    pub(super) fn doc(&self) -> Option<u64> {
+        self.current_doc.map(|doc| doc.doc_id())
+    }
+
+    pub(super) fn document_key(&self) -> Option<u64> {
+        self.current_document_key
+    }
+
+    fn clear_current(&mut self) {
+        self.current_doc = None;
+        self.current_document_key = None;
+        self.current_score = 0.0;
+        self.confirmation = None;
+        self.shallow = None;
+    }
+
+    fn record_metrics(&mut self) {
+        if !self.metrics_recorded {
+            self.metrics.record_comparisons(self.comparisons);
+            self.metrics_recorded = true;
+        }
+    }
+
+    fn position_next(&mut self) -> Result<Option<u64>> {
+        loop {
+            let Some((doc, mut score)) = self.wand.next()? else {
+                self.clear_current();
+                self.record_metrics();
+                return Ok(None);
+            };
+            self.comparisons += 1;
+            let doc_id = doc.doc_id();
+            let Some(document_key) = self.wand.documents.document_key(&doc) else {
+                if self.wand.operator == Operator::Or {
+                    self.wand.push_back_leads(doc_id.saturating_add(1));
+                }
+                continue;
+            };
+            let doc_length = self.wand.documents.doc_length(&doc);
+            if self.wand.operator == Operator::Or {
+                self.wand
+                    .advance_all_tail(doc_id, Some(doc_length), Some(&mut score));
+            } else {
+                self.wand.advance_all_tail(doc_id, None, None);
+                score = self.wand.score(doc_length);
+            }
+            self.current_doc = Some(doc);
+            self.current_document_key = Some(document_key);
+            self.current_score = score;
+            self.confirmation = self.phrase_slop.is_none().then_some(true);
+            self.shallow = None;
+            return Ok(Some(doc_id));
+        }
+    }
+
+    pub(super) fn next(&mut self) -> Result<Option<u64>> {
+        if let Some(doc) = self.current_doc
+            && self.wand.operator == Operator::Or
+        {
+            self.wand.push_back_leads(doc.doc_id().saturating_add(1));
+        }
+        self.clear_current();
+        self.position_next()
+    }
+
+    pub(super) fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.doc().is_some_and(|doc| doc >= target) {
+            return Ok(self.doc());
+        }
+        self.clear_current();
+        self.wand.seek(target);
+        self.position_next()
+    }
+
+    pub(super) fn cost(&self) -> usize {
+        self.cost
+    }
+
+    pub(super) fn current_score(&self) -> Result<f32> {
+        self.current_doc
+            .map(|_| self.current_score)
+            .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))
+    }
+
+    pub(super) fn matches(&mut self) -> Result<bool> {
+        let Some(_) = self.current_doc else {
+            return Ok(false);
+        };
+        if let Some(confirmed) = self.confirmation {
+            return Ok(confirmed);
+        }
+        let phrase_slop = self.phrase_slop.ok_or_else(|| {
+            Error::internal("posting FTS scorer requires phrase slop for position confirmation")
+        })?;
+        let confirmed = self.wand.check_positions(phrase_slop as i32)?;
+        self.confirmation = Some(confirmed);
+        Ok(confirmed)
+    }
+
+    pub(super) fn match_cost(&self) -> Option<f32> {
+        self.phrase_slop.map(|_| self.wand.num_terms.max(1) as f32)
+    }
+
+    pub(super) fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let (up_to, upper) = self.wand.compound_shallow_bound(target);
+        self.shallow = Some((target, up_to, upper));
+        Ok(up_to)
+    }
+
+    pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
+        let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
+            Error::internal("score bound requires advance_shallow on the posting FTS scorer")
+        })?;
+        if up_to < target || up_to > shallow_up_to {
+            return Err(Error::internal(format!(
+                "posting FTS score bound up_to={up_to} is outside shallow range [{target}, {shallow_up_to}]"
+            )));
+        }
+        Ok(upper)
+    }
+
+    pub(super) fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        let threshold = next_down_f32(min_score) * self.wand_factor;
+        if threshold > self.wand.threshold {
+            self.wand.threshold = threshold;
+        }
+        Ok(())
+    }
+}
+
+impl<D: WandDocuments> Drop for WandCursor<'_, D> {
+    fn drop(&mut self) {
+        self.record_metrics();
+    }
+}
+
+impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
+    fn seek(&mut self, target: u64) {
+        self.up_to = None;
+        self.and_max_score = f32::INFINITY;
+        self.and_last_doc = None;
+        if self.operator == Operator::And {
+            for posting in &mut self.lead {
+                if posting.doc().is_some_and(|doc| doc.doc_id() < target) {
+                    posting.next(target);
+                }
+            }
+            return;
+        }
+
+        let mut postings = std::mem::take(&mut self.head)
+            .into_vec()
+            .into_iter()
+            .map(|posting| posting.posting)
+            .chain(self.lead.drain(..))
+            .chain(
+                std::mem::take(&mut self.tail)
+                    .into_vec()
+                    .into_iter()
+                    .map(|posting| posting.posting),
+            )
+            .collect::<Vec<_>>();
+        self.tail_max_score = 0.0;
+        for posting in &mut postings {
+            if posting.doc().is_some_and(|doc| doc.doc_id() < target) {
+                posting.next(target);
+            }
+        }
+        self.head = postings
+            .into_iter()
+            .filter(|posting| posting.doc().is_some())
+            .map(HeadPosting::new)
+            .collect();
+    }
+
+    fn compound_shallow_bound(&mut self, target: u64) -> (u64, f32) {
+        if self.operator == Operator::Or {
+            self.update_max_scores(target);
+            return (
+                self.up_to.unwrap_or(TERMINATED_DOC_ID),
+                conservative_score_sum(
+                    self.lead
+                        .iter()
+                        .map(|posting| posting.window_max_score(self.up_to, &self.scorer))
+                        .chain(self.head.iter().map(|posting| {
+                            posting.posting.window_max_score(self.up_to, &self.scorer)
+                        }))
+                        .chain(self.tail.iter().map(|posting| posting.upper_bound)),
+                ),
+            );
+        }
+
+        let mut up_to = TERMINATED_DOC_ID;
+        for posting in &mut self.lead {
+            posting.shallow_next(target);
+            up_to = up_to.min(Self::posting_block_up_to(posting, target));
+        }
+        let upper = conservative_score_sum(
+            self.lead
+                .iter()
+                .map(|posting| posting.block_max_score(&self.scorer)),
+        );
+        (up_to, upper)
+    }
+}
+
+fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
+    let exact = scores.map(f64::from).sum::<f64>();
+    let rounded = exact as f32;
+    if f64::from(rounded) < exact {
+        next_up_f32(rounded)
+    } else {
+        rounded
+    }
+}
+
+fn next_up_f32(value: f32) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+    if value == 0.0 {
+        return f32::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f32::from_bits(bits + 1)
+    } else {
+        f32::from_bits(bits - 1)
+    }
+}
+
+fn next_down_f32(value: f32) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+    if value == 0.0 {
+        return f32::from_bits((1_u32 << 31) | 1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f32::from_bits(bits - 1)
+    } else {
+        f32::from_bits(bits + 1)
     }
 }
 

@@ -5,7 +5,7 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::import_vec_to_rust;
 use crate::traits::{FromJString, IntoJava};
-use crate::{Error, JNIEnvExt, RT};
+use crate::{Error, JNIEnvExt, block_on};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValueGen};
@@ -77,7 +77,7 @@ fn inner_merge_insert<'local>(
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
         let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
 
-        RT.block_on(async move { merge_insert_job.execute_reader(source_stream).await })?
+        block_on(async move { merge_insert_job.execute_reader(source_stream).await })?
     };
 
     MergeResult(

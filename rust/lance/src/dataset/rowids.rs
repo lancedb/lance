@@ -5,7 +5,7 @@ use super::Dataset;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
     format::{Fragment, RowIdMeta},
@@ -94,20 +94,22 @@ pub async fn get_row_id_index(
 /// deletions are tracked by the deletion vector and do not compact the sequence,
 /// so a physical offset indexes the sequence directly (see [`RowIdIndex`], which
 /// maps ids to `start_address + position` and filters deletions separately).
-/// Addresses that point at deleted rows have no live counterpart and are dropped,
-/// which is correct: those rows are not part of the answer.
+/// Addresses that no longer have a live counterpart are dropped, which is correct:
+/// those rows are not part of the answer. That covers both a deleted row and a
+/// whole fragment that a maintenance operation replaced — an address-domain index
+/// is not remapped by compaction or `update` (neither the zone map nor the bloom
+/// filter index supports remap), so its results outlive the fragments they address.
+/// The replacement fragments are absent from the index's fragment bitmap, so the
+/// scanner routes them to a full scan and no match is lost.
 pub(crate) async fn translate_addr_treemap_to_row_ids(
     dataset: &Dataset,
     addrs: &RowAddrTreeMap,
 ) -> Result<RowAddrTreeMap> {
     let mut row_ids = RowAddrTreeMap::new();
     for (fragment_id, selection) in addrs.iter() {
-        let file_fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
-            Error::internal(format!(
-                "fragment {fragment_id} referenced by an address-domain index result \
-                 was not found in the dataset"
-            ))
-        })?;
+        let Some(file_fragment) = dataset.get_fragment(*fragment_id as usize) else {
+            continue;
+        };
         let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
 
         match selection {
@@ -159,6 +161,33 @@ pub async fn row_addrs_to_row_ids(
     dataset: &Dataset,
     addrs: impl IntoIterator<Item = Option<u64>>,
 ) -> Result<Vec<Option<u64>>> {
+    row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Include).await
+}
+
+/// Resolve physical row addresses to stable row ids only for live physical slots.
+///
+/// When stable row ids are enabled, missing fragments, out-of-range offsets,
+/// deleted physical slots, and `None` inputs yield `None`. This prevents a
+/// deleted slot's stable id from selecting a replacement row written by an
+/// update. Without stable row ids, the input is returned unchanged.
+pub(crate) async fn live_row_addrs_to_row_ids(
+    dataset: &Dataset,
+    addrs: impl IntoIterator<Item = Option<u64>>,
+) -> Result<Vec<Option<u64>>> {
+    row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Exclude).await
+}
+
+#[derive(Clone, Copy)]
+enum DeletedRowBehavior {
+    Include,
+    Exclude,
+}
+
+async fn row_addrs_to_row_ids_impl(
+    dataset: &Dataset,
+    addrs: impl IntoIterator<Item = Option<u64>>,
+    deleted_row_behavior: DeletedRowBehavior,
+) -> Result<Vec<Option<u64>>> {
     let addrs: Vec<Option<u64>> = addrs.into_iter().collect();
     if !dataset.manifest.uses_stable_row_ids() {
         return Ok(addrs);
@@ -169,7 +198,7 @@ pub async fn row_addrs_to_row_ids(
     for (position, addr) in addrs.iter().enumerate() {
         if let Some(addr) = addr {
             positions_by_fragment
-                .entry((addr >> 32) as u32)
+                .entry(RowAddress::from(*addr).fragment_id())
                 .or_default()
                 .push(position);
         }
@@ -181,8 +210,18 @@ pub async fn row_addrs_to_row_ids(
             continue;
         };
         let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+        let deletion_vector = match deleted_row_behavior {
+            DeletedRowBehavior::Include => None,
+            DeletedRowBehavior::Exclude => fragment.get_deletion_vector().await?,
+        };
         for position in positions {
-            let offset = addrs[position].expect("grouped from Some") as u32;
+            let offset = RowAddress::from(addrs[position].expect("grouped from Some")).row_offset();
+            if deletion_vector
+                .as_ref()
+                .is_some_and(|deletions| deletions.contains(offset))
+            {
+                continue;
+            }
             ids[position] = sequence.get(offset as usize);
         }
     }
@@ -207,10 +246,14 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
             let fragment_clone = (*fragment).clone();
             async move {
                 let deletion_vector = if has_deletion_file {
-                    match fragment_clone.get_deletion_vector().await {
-                        Ok(Some(dv)) => dv,
-                        Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
-                    }
+                    fragment_clone
+                        .get_deletion_vector()
+                        .await?
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "fragment_id={fragment_id} has deletion-file metadata but no deletion vector"
+                            ))
+                        })?
                 } else {
                     Arc::new(DeletionVector::default())
                 };
@@ -235,13 +278,15 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder};
+    use crate::dataset::{
+        ReadParams, UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder,
+    };
 
     use super::*;
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
@@ -251,6 +296,7 @@ mod test {
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_io::object_store::ObjectStoreParams;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -346,6 +392,59 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_row_id_index_propagates_deletion_vector_read_error() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let test_uri = temp_dir.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+        let mut dataset = Dataset::write(
+            reader,
+            &routed_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 3").await.unwrap();
+        drop(dataset);
+
+        let failing_store = Arc::new(FailingProxyStore::new());
+        failing_store.fail_when(
+            "get_opts",
+            "_deletions",
+            "injected deletion-vector read failure",
+        );
+        let dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing_store.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let error = get_row_id_index(&dataset).await.unwrap_err();
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected deletion-vector read failure")
+        );
+
+        failing_store.clear_fail_when("get_opts", "_deletions");
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(index.get(2).is_some());
+        assert!(index.get(3).is_none());
+    }
+
+    #[tokio::test]
     async fn test_row_addrs_to_row_ids() {
         let num_rows = 25u64;
         let batch = sequence_batch(0..num_rows as i32);
@@ -420,6 +519,9 @@ mod test {
 
         // Overwriting should NOT reset the row id counter.
         assert_eq!(dataset.manifest().next_row_id, 2 * num_rows);
+        // Nor the fragment id counter: ids are a high water mark, so the
+        // overwritten fragment cannot alias the one it replaced.
+        assert_eq!(dataset.manifest.fragments[0].id, 1);
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());

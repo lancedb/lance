@@ -10,8 +10,9 @@ use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
-use lance_file::writer::FileWriterOptions;
+use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
+use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
@@ -22,7 +23,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::utils::SchemaAdapter;
-use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases_with_primary};
+use crate::dataset::write::validate_and_resolve_target_bases_with_primary;
 use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
@@ -113,7 +114,18 @@ impl<'a> FragmentCreateBuilder<'a> {
         // the single-fragment create path must do the same or the raw UTF-8 string bytes
         // would be written into a column whose schema declares JSONB, corrupting reads.
         let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);
-        self.write_impl(stream, schema, id).await
+        let version = self
+            .write_params
+            .map(|params| params.storage_version_or_default())
+            .unwrap_or_else(|| ConcreteFileVersion::from(LanceFileVersion::Stable));
+        crate::dataset::versions::write_fragment(
+            version,
+            self,
+            stream,
+            schema,
+            id.unwrap_or_default(),
+        )
+        .await
     }
 
     /// Write multi fragment which separated by max_rows_per_file.
@@ -125,12 +137,16 @@ impl<'a> FragmentCreateBuilder<'a> {
         self.write_fragments_v2_impl(stream, schema).await
     }
 
-    async fn write_v2_impl(
+    pub(crate) async fn write_current_impl<F>(
         &self,
+        create_writer: F,
         stream: SendableRecordBatchStream,
         schema: Schema,
         id: u64,
-    ) -> Result<Fragment> {
+    ) -> Result<Fragment>
+    where
+        F: FnOnce(Box<dyn Writer>, Schema, String) -> Result<(FileWriter, DataFile)>,
+    {
         let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
         let progress = params.progress.as_ref();
 
@@ -147,17 +163,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let mut writer = lance_file::writer::FileWriter::try_new(
-            obj_writer,
-            schema,
-            FileWriterOptions {
-                format_version: params.data_storage_version,
-                ..Default::default()
-            },
-        )?;
-
-        let data_file =
-            DataFile::new_unstarted(filename, ConcreteFileVersion::from(writer.version()));
+        let (mut writer, data_file) = create_writer(obj_writer, schema, filename)?;
         fragment.files.push(data_file);
 
         progress.begin(&fragment).await?;
@@ -209,7 +215,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
-        let version = params.data_storage_version.unwrap_or_default();
+        let version = params.storage_version_or_default();
         let needs_existing_dataset = params.target_base_names_or_paths.is_some()
             || params.target_bases.is_some()
             || params.target_all_bases.is_some()
@@ -240,35 +246,27 @@ impl<'a> FragmentCreateBuilder<'a> {
         } else {
             None
         };
-        do_write_fragments(
+        crate::dataset::versions::write_fragments_direct(
+            version,
             existing_dataset.as_ref(),
             object_store,
             &base_path,
             &schema,
             stream,
             params,
-            version,
             target_bases_info,
             Vec::new(),
         )
         .await
     }
 
-    async fn write_impl(
+    pub(crate) async fn write_v1_impl(
         &self,
         stream: SendableRecordBatchStream,
         schema: Schema,
-        id: Option<u64>,
+        id: u64,
     ) -> Result<Fragment> {
-        let id = id.unwrap_or_default();
-
         let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
-
-        let storage_version = params.storage_version_or_default();
-
-        if storage_version != LanceFileVersion::Legacy {
-            return self.write_v2_impl(stream, schema, id).await;
-        }
         let progress = params.progress.as_ref();
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;

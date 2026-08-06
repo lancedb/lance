@@ -11,9 +11,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use object_store::{Error as OSError, ObjectStore, Result as OSResult, path::Path};
 use object_store::{MultipartUpload, ObjectStoreExt};
-use rand::Rng;
+use object_store::{ObjectStore, Result as OSResult, path::Path};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 
@@ -21,7 +20,7 @@ use lance_core::{Error, Result};
 use tracing::Instrument;
 
 use crate::traits::Writer;
-use crate::utils::tracking_store::IOTracker;
+use crate::utils::tracking_store::{IOTracker, IoMetricsGuard};
 use tokio::runtime::Handle;
 
 /// Start at 5MB.
@@ -34,16 +33,6 @@ fn max_upload_parallelism() -> usize {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(10)
-    })
-}
-
-fn max_conn_reset_retries() -> u16 {
-    static MAX_CONN_RESET_RETRIES: OnceLock<u16> = OnceLock::new();
-    *MAX_CONN_RESET_RETRIES.get_or_init(|| {
-        std::env::var("LANCE_CONN_RESET_RETRIES")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(20)
     })
 }
 
@@ -94,7 +83,6 @@ pub struct ObjectWriter {
     state: UploadState,
     path: Arc<Path>,
     cursor: usize,
-    connection_resets: u16,
     buffer: Vec<u8>,
     // TODO: use constant size to support R2
     use_constant_size_upload_parts: bool,
@@ -116,7 +104,7 @@ enum UploadState {
     InProgress {
         part_idx: u16,
         upload: Box<dyn MultipartUpload>,
-        futures: JoinSet<std::result::Result<(), UploadPutError>>,
+        futures: JoinSet<OSResult<()>>,
     },
     /// The writer is in the process of uploading data in a single PUT request.
     /// This happens when shutdown is called before the buffer is full.
@@ -178,7 +166,6 @@ impl ObjectWriter {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
             path: Arc::new(path.clone()),
-            connection_resets: 0,
             buffer: Vec::with_capacity(initial_upload_size()),
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
         })
@@ -202,25 +189,12 @@ impl ObjectWriter {
     fn put_part(
         upload: &mut dyn MultipartUpload,
         buffer: Bytes,
-        part_idx: u16,
-        sleep: Option<std::time::Duration>,
-    ) -> BoxFuture<'static, std::result::Result<(), UploadPutError>> {
+    ) -> BoxFuture<'static, OSResult<()>> {
         log::debug!(
             "MultipartUpload submitting part with {} bytes",
             buffer.len()
         );
-        let fut = upload.put_part(buffer.clone().into());
-        Box::pin(async move {
-            if let Some(sleep) = sleep {
-                tokio::time::sleep(sleep).await;
-            }
-            fut.await.map_err(|source| UploadPutError {
-                part_idx,
-                buffer,
-                source,
-            })?;
-            Ok(())
-        })
+        upload.put_part(buffer.into())
     }
 
     fn poll_tasks(
@@ -240,7 +214,7 @@ impl ObjectWriter {
                             0,
                             mut_self.use_constant_size_upload_parts,
                         );
-                        futures.spawn(Self::put_part(upload.as_mut(), data, 0, None));
+                        futures.spawn(Self::put_part(upload.as_mut(), data));
 
                         mut_self.state = UploadState::InProgress {
                             part_idx: 1, // We just used 0
@@ -251,43 +225,12 @@ impl ObjectWriter {
                     Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
                     Poll::Pending => break,
                 },
-                UploadState::InProgress {
-                    upload, futures, ..
-                } => {
+                UploadState::InProgress { futures, .. } => {
                     while let Poll::Ready(Some(res)) = futures.poll_join_next(cx) {
                         match res {
                             Ok(Ok(())) => {}
                             Err(err) => return Err(std::io::Error::other(err)),
-                            Ok(Err(err)) if should_retry_upload_put(&err.source) => {
-                                if mut_self.connection_resets < max_conn_reset_retries() {
-                                    // Retry, but only up to max_conn_reset_retries of them.
-                                    mut_self.connection_resets += 1;
-
-                                    // Resubmit with random jitter
-                                    let sleep_time_ms = rand::rng().random_range(2_000..8_000);
-                                    let sleep_time =
-                                        std::time::Duration::from_millis(sleep_time_ms);
-
-                                    futures.spawn(Self::put_part(
-                                        upload.as_mut(),
-                                        err.buffer,
-                                        err.part_idx,
-                                        Some(sleep_time),
-                                    ));
-                                } else {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::ConnectionReset,
-                                        Box::new(ConnectionResetError {
-                                            message: format!(
-                                                "Hit max retries ({}) for retryable upload error",
-                                                max_conn_reset_retries()
-                                            ),
-                                            source: Box::new(err.source),
-                                        }),
-                                    ));
-                                }
-                            }
-                            Ok(Err(err)) => return Err(err.source.into()),
+                            Ok(Err(err)) => return Err(err.into()),
                         }
                     }
                     break;
@@ -333,38 +276,6 @@ impl Drop for ObjectWriter {
     }
 }
 
-/// Returned error from trying to upload a part.
-/// Has the part_idx and buffer so we can pass
-/// them to the retry logic.
-struct UploadPutError {
-    part_idx: u16,
-    buffer: Bytes,
-    source: OSError,
-}
-
-fn should_retry_upload_put(source: &OSError) -> bool {
-    let OSError::Generic { source, .. } = source else {
-        return false;
-    };
-
-    let message = source.to_string().to_ascii_lowercase();
-    message.contains("connection reset by peer") || message.contains("requesttimeout")
-}
-
-#[derive(Debug)]
-struct ConnectionResetError {
-    message: String,
-    source: Box<dyn std::error::Error + Send + Sync>,
-}
-
-impl std::error::Error for ConnectionResetError {}
-
-impl std::fmt::Display for ConnectionResetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.message, self.source)
-    }
-}
-
 impl AsyncWrite for ObjectWriter {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -405,8 +316,7 @@ impl AsyncWrite for ObjectWriter {
                         mut_self.use_constant_size_upload_parts,
                     );
                     futures.spawn(
-                        Self::put_part(upload.as_mut(), data, *part_idx, None)
-                            .instrument(tracing::Span::current()),
+                        Self::put_part(upload.as_mut(), data).instrument(tracing::Span::current()),
                     );
                     *part_idx += 1;
                 }
@@ -465,16 +375,14 @@ impl AsyncWrite for ObjectWriter {
                     self.state.started_to_putting_single(path, part);
                 }
                 UploadState::InProgress {
-                    upload,
-                    futures,
-                    part_idx,
+                    upload, futures, ..
                 } => {
                     // Flush final batch
                     if !mut_self.buffer.is_empty() && futures.len() < max_upload_parallelism() {
                         // We can just use `take` since we don't need the buffer anymore.
                         let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
                         futures.spawn(
-                            Self::put_part(upload.as_mut(), data, *part_idx, None)
+                            Self::put_part(upload.as_mut(), data)
                                 .instrument(tracing::Span::current()),
                         );
                         // We need to go back to beginning of loop to poll the
@@ -522,7 +430,7 @@ pub struct LocalWriter {
 
 #[derive(Default)]
 enum LocalWriteState {
-    Writing(WritingState),
+    Writing(Box<WritingState>),
     Finishing {
         size: usize,
         future: BoxFuture<'static, Result<WriteResult>>,
@@ -538,6 +446,10 @@ struct WritingState {
     /// Temp path that auto-deletes on drop. Set to `None` after `persist()`.
     temp_path: tempfile::TempPath,
     io_tracker: Arc<IOTracker>,
+    /// The whole file is reported as a single `put`, so this covers everything
+    /// from opening the file to it being durable under its final path. A writer
+    /// dropped before `persist()` records nothing, like an aborted upload.
+    metrics: IoMetricsGuard,
 }
 
 impl LocalWriter {
@@ -549,12 +461,13 @@ impl LocalWriter {
     ) -> Self {
         Self {
             path,
-            state: LocalWriteState::Writing(WritingState {
+            state: LocalWriteState::Writing(Box::new(WritingState {
                 writer: tokio::io::BufWriter::new(file),
                 cursor: 0,
                 temp_path,
+                metrics: io_tracker.begin_io("put"),
                 io_tracker,
-            }),
+            })),
         }
     }
 
@@ -574,9 +487,10 @@ impl LocalWriter {
         final_path: Path,
         size: usize,
         io_tracker: Arc<IOTracker>,
+        metrics: IoMetricsGuard,
     ) -> Result<WriteResult> {
         let local_path = crate::local::to_local_path(&final_path);
-        let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
+        let persisted = tokio::task::spawn_blocking(move || -> Result<String> {
             temp_path.persist(&local_path).map_err(|e| {
                 Error::io(format!(
                     "failed to persist temp file to {}: {}",
@@ -590,7 +504,11 @@ impl LocalWriter {
             Ok(get_etag(&metadata))
         })
         .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
+        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))
+        .and_then(|e_tag| e_tag);
+
+        metrics.record(&persisted, size as u64);
+        let e_tag = persisted?;
 
         io_tracker.record_write("put", final_path, size as u64);
 
@@ -655,6 +573,7 @@ impl AsyncWrite for LocalWriter {
                             mut_self.path.clone(),
                             size,
                             state.io_tracker,
+                            state.metrics,
                         )),
                     };
                 }
@@ -858,35 +777,6 @@ mod tests {
         );
         let mid = INITIAL_UPLOAD_STEP * 8; // 40MB, in range
         assert_eq!(clamp_initial_upload_size(mid), (mid, false));
-    }
-
-    #[test]
-    fn should_retry_upload_put_detects_transient_errors() {
-        let request_timeout = OSError::Generic {
-            store: "S3",
-            source: Box::new(io::Error::other(
-                "Server returned non-2xx status code: 400 Bad Request: \
-                 <Error><Code>RequestTimeout</Code><Message>Your socket connection to the server \
-                 was not read from or written to within the timeout period. Idle connections will \
-                 be closed.</Message></Error>",
-            )),
-        };
-        assert!(should_retry_upload_put(&request_timeout));
-
-        let connection_reset = OSError::Generic {
-            store: "S3",
-            source: Box::new(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "connection reset by peer",
-            )),
-        };
-        assert!(should_retry_upload_put(&connection_reset));
-
-        let not_retryable = OSError::Generic {
-            store: "S3",
-            source: Box::new(io::Error::other("access denied")),
-        };
-        assert!(!should_retry_upload_put(&not_retryable));
     }
 
     #[test]

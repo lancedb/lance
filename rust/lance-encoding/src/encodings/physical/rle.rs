@@ -1556,6 +1556,12 @@ impl MiniBlockDecompressor for RleDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         self.decode_data(data, num_values, true)
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl BlockDecompressor for RleDecompressor {
@@ -3014,7 +3020,6 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_rle_encoding_verification() {
         use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-        use crate::version::LanceFileVersion;
         use arrow_array::{Array, Int32Array};
         use lance_datagen::{ArrayGenerator, RowCount};
         use std::collections::HashMap;
@@ -3022,7 +3027,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("rle")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Test both explicit metadata and automatic selection
         // 1. Test with explicit RLE threshold metadata (also disable BSS)

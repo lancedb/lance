@@ -1040,6 +1040,52 @@ impl DirectoryNamespace {
         Ok(Some(manifest_ns.clone()))
     }
 
+    /// Lazily open the `__manifest` dataset (read-only) into the read cell.
+    ///
+    /// `manifest_ns` is populated at construction only if `__manifest` already
+    /// existed then. A manifest created afterwards -- e.g. by another
+    /// connection's write, since Phalanx caches a connection per db and the
+    /// first op on a fresh db is usually a read -- would otherwise stay
+    /// invisible to this connection's reads forever, so describe/list/exists
+    /// report "not found" for a table that is in fact registered. Re-open on
+    /// demand so reads self-heal once the manifest exists. Idempotent and cheap
+    /// once the cell is populated; unlike `manifest_ns_for_write` it never
+    /// creates the manifest.
+    async fn ensure_read_manifest(&self) -> Result<()> {
+        if !self.manifest_enabled
+            || self.manifest_ns.get().is_some()
+            || self.write_manifest_ns.get().is_some()
+        {
+            return Ok(());
+        }
+        match self
+            .manifest_ns
+            .get_or_try_init(|| async {
+                manifest::ManifestNamespace::open_from_directory(
+                    self.root.clone(),
+                    self.storage_options.clone(),
+                    self.session.clone(),
+                    self.object_store.clone(),
+                    self.base_path.clone(),
+                    self.dir_listing_enabled,
+                    self.inline_optimization_enabled,
+                    self.commit_retries,
+                )
+                .await
+                .map(Arc::new)
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Manifest still doesn't exist: leave the cell empty so a later read
+            // retries once it does. A genuinely absent table is still reported
+            // not-found by the callers' existing `manifest_ns_for_read() == None`
+            // branch, exactly as before.
+            Err(e) if manifest::ManifestNamespace::is_not_found_load_error(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     fn child_namespace_requires_manifest_error(&self) -> Error {
         if self.manifest_enabled {
             NamespaceError::NamespaceNotFound {
@@ -1947,6 +1993,19 @@ impl DirectoryNamespace {
         let skip_manifest_for_root = self.dir_listing_enabled
             && is_root_level
             && !self.dir_listing_to_manifest_migration_enabled;
+        // Self-heal the manifest wherever it can be authoritative: a child table
+        // (no dir-listing fallback), a manifest-only namespace, or migration mode
+        // (manifest-first -- it can hold registered_table -> external .lance
+        // aliases that dir-listing cannot resolve, so a reader built before
+        // __manifest must re-probe to see them). The bypass -- skipping the probe
+        // -- applies ONLY to migration-disabled directory-backed root reads,
+        // which are served entirely from the directory listing.
+        if is_child_table
+            || !self.dir_listing_enabled
+            || self.dir_listing_to_manifest_migration_enabled
+        {
+            self.ensure_read_manifest().await?;
+        }
         if let Some(manifest_ns) = self.manifest_ns_for_read()
             && !skip_manifest_for_root
         {
@@ -3174,6 +3233,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
         self.record_op("list_namespaces");
+        self.ensure_read_manifest().await?;
         if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.list_namespaces(request).await;
         }
@@ -3190,6 +3250,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
         self.record_op("describe_namespace");
+        self.ensure_read_manifest().await?;
         if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.describe_namespace(request).await;
         }
@@ -3250,6 +3311,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
         self.record_op("namespace_exists");
+        self.ensure_read_manifest().await?;
         if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.namespace_exists(request).await;
         }
@@ -3269,6 +3331,18 @@ impl LanceNamespace for DirectoryNamespace {
                 message: "Namespace ID is required".to_string(),
             })
         })?;
+
+        // Self-heal the manifest wherever it can be authoritative: a child
+        // namespace, a manifest-only namespace, or migration mode (which merges
+        // manifest entries -- including registered aliases -- into the root
+        // listing). The bypass applies only to migration-disabled directory-backed
+        // root lists.
+        if !namespace_id.is_empty()
+            || !self.dir_listing_enabled
+            || self.dir_listing_to_manifest_migration_enabled
+        {
+            self.ensure_read_manifest().await?;
+        }
 
         // For child namespaces, always delegate to manifest (if enabled)
         if !namespace_id.is_empty() {
@@ -3357,6 +3431,14 @@ impl LanceNamespace for DirectoryNamespace {
         let skip_manifest_for_root = self.dir_listing_enabled
             && is_root_level
             && !self.dir_listing_to_manifest_migration_enabled;
+        // Child table, manifest-only, or migration mode (see describe_table_impl).
+        // Only a migration-disabled directory-backed root read bypasses the probe.
+        if is_child_table
+            || !self.dir_listing_enabled
+            || self.dir_listing_to_manifest_migration_enabled
+        {
+            self.ensure_read_manifest().await?;
+        }
         if let Some(manifest_ns) = self.manifest_ns_for_read()
             && !skip_manifest_for_root
         {
@@ -9550,6 +9632,139 @@ mod tests {
         assert!(response.location.is_some());
     }
 
+    /// Regression: a connection built before `__manifest` exists must still
+    /// resolve a child-namespaced table that a *different* connection registers
+    /// afterwards. Phalanx caches one DirectoryNamespace per db and the first op
+    /// on a fresh db is usually a read, so without a self-healing read path the
+    /// cached reader pins an empty manifest cell and every describe/exists/list
+    /// on the table reports "not found" forever -- even though `create_table`
+    /// reports it already exists. This is the geneva `__system$geneva_jobs`
+    /// open->create->open livelock.
+    #[tokio::test]
+    async fn test_read_self_heals_after_manifest_created_by_other_connection() {
+        let temp_dir = TempStdDir::default();
+        let root = temp_dir.to_str().unwrap();
+
+        // Reader is built while no `__manifest` exists yet -> its read cell is
+        // empty and, before the fix, stays empty forever.
+        let reader = DirectoryNamespaceBuilder::new(root).build().await.unwrap();
+
+        // A *separate* connection creates the child namespace + table, which
+        // lazily creates `__manifest` and registers the entry.
+        let writer = DirectoryNamespaceBuilder::new(root).build().await.unwrap();
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        writer.create_namespace(create_ns_req).await.unwrap();
+        let ipc_data = create_test_ipc_data(&create_test_schema());
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        writer
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // The reader, though built before the manifest existed, must now resolve
+        // the table on every read path (was TableNotFound before the fix).
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        let resp = reader
+            .describe_table(describe_req)
+            .await
+            .expect("describe_table must resolve a table registered after build");
+        assert!(resp.location.is_some());
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        reader
+            .table_exists(exists_req)
+            .await
+            .expect("table_exists must resolve a table registered after build");
+
+        let list_req = ListTablesRequest {
+            id: Some(vec!["test_ns".to_string()]),
+            ..Default::default()
+        };
+        let tables = reader.list_tables(list_req).await.unwrap().tables;
+        assert_eq!(tables, vec!["table1".to_string()]);
+    }
+
+    /// Migration mode promises manifest-first lookup even at the root, so a
+    /// reader built before `__manifest` existed must still resolve a
+    /// manifest-only alias (`registered_table` -> `external_table.lance`) that
+    /// dir-listing cannot produce. Before the read path self-healed in migration
+    /// mode, the root gate bypassed the manifest probe and fell back to
+    /// dir-listing, which sees `external_table` but never `registered_table` ->
+    /// permanent TableNotFound for every registration made after build.
+    #[tokio::test]
+    async fn test_migration_root_read_self_heals_registered_alias() {
+        use lance_namespace::models::RegisterTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        // Reader built while the root is empty -> no `__manifest`, read cell
+        // empty (and, before the fix, frozen empty forever).
+        let reader = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // A separate connection writes an external dataset and registers it in
+        // the manifest under a *different* logical name -- an alias dir-listing
+        // cannot resolve. This is what lazily creates `__manifest`.
+        let writer = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        let ipc_data = create_test_ipc_data(&create_test_schema());
+        let table_uri = format!("{}/external_table.lance", temp_path);
+        let cursor = Cursor::new(ipc_data);
+        let stream_reader = StreamReader::try_new(cursor, None).unwrap();
+        let batches: Vec<_> = stream_reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let schema = batches[0].schema();
+        let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
+        let batch_reader = RecordBatchIterator::new(batch_results, schema);
+        Dataset::write(Box::new(batch_reader), &table_uri, None)
+            .await
+            .unwrap();
+        let mut register_req = RegisterTableRequest::new("external_table.lance".to_string());
+        register_req.id = Some(vec!["registered_table".to_string()]);
+        writer.register_table(register_req).await.unwrap();
+
+        // The reader, built before `__manifest` existed, must now resolve the
+        // manifest-only alias on every read path.
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["registered_table".to_string()]);
+        reader
+            .describe_table(describe_req)
+            .await
+            .expect("describe_table must resolve a manifest alias registered after build");
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["registered_table".to_string()]);
+        reader
+            .table_exists(exists_req)
+            .await
+            .expect("table_exists must resolve a manifest alias registered after build");
+
+        let list_req = ListTablesRequest {
+            id: Some(vec![]),
+            ..Default::default()
+        };
+        let tables = reader.list_tables(list_req).await.unwrap().tables;
+        assert!(
+            tables.contains(&"registered_table".to_string()),
+            "list_tables must include the manifest alias registered after build, got {:?}",
+            tables
+        );
+    }
+
     #[tokio::test]
     async fn test_multiple_tables_in_child_namespace() {
         let (namespace, _temp_dir) = create_test_namespace().await;
@@ -14329,9 +14544,13 @@ mod tests {
             .await
             .unwrap();
 
-        // table_exists first checks __manifest (which on local FS uses the
-        // version hint and does no list call), then falls back to the table
-        // directory (one list_with_delimiter on test_table.lance).
+        // In migration mode the manifest is authoritative, so table_exists first
+        // probes __manifest via ensure_read_manifest() to self-heal any
+        // manifest-registered aliases (why the gate now admits this mode). Here
+        // the table is dir-only and __manifest does not exist yet, so that probe
+        // costs one list to confirm absence; the table-directory fallback is the
+        // second. (When __manifest exists the probe uses the version hint and
+        // adds no list, so a real self-heal is free.)
         listing_count.store(0, Ordering::SeqCst);
 
         let mut exists_req = TableExistsRequest::new();
@@ -14340,13 +14559,14 @@ mod tests {
 
         let count = listing_count.load(Ordering::SeqCst);
         assert_eq!(
-            count, 1,
-            "Expected exactly 1 listing call for table_exists with migration mode \
-             (table directory fallback; manifest reload uses the version hint), but got {}",
+            count, 2,
+            "Expected 2 listing calls for table_exists with migration mode \
+             (absent-__manifest probe + table directory fallback), but got {}",
             count
         );
 
-        // describe_table follows the same path when the table is not yet registered in __manifest.
+        // describe_table follows the same path: an ensure_read_manifest() probe
+        // of the (absent) __manifest, then the table-directory fallback.
         listing_count.store(0, Ordering::SeqCst);
 
         let mut describe_req = DescribeTableRequest::new();
@@ -14355,9 +14575,9 @@ mod tests {
 
         let count = listing_count.load(Ordering::SeqCst);
         assert_eq!(
-            count, 1,
-            "Expected exactly 1 listing call for describe_table with migration mode \
-             (table directory fallback; manifest reload uses the version hint), but got {}",
+            count, 2,
+            "Expected 2 listing calls for describe_table with migration mode \
+             (absent-__manifest probe + table directory fallback), but got {}",
             count
         );
     }

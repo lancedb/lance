@@ -2931,7 +2931,7 @@ mod tests {
             .await
             .unwrap();
         let arrow_schema = ArrowSchema::new(vec![Field::new("dummy", ArrowDataType::Int32, true)]);
-        let mut v2w = lance_file::writer::FileWriter::try_new(
+        let mut v2w = lance_file::versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap(),
             FileWriterOptions::default(),

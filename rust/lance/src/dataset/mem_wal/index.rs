@@ -35,7 +35,6 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::pbold;
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
@@ -126,6 +125,28 @@ pub fn validate_index_configs(
 ) -> Result<()> {
     for config in configs {
         let column = config.column();
+        if let MemIndexConfig::Fts(config) = config {
+            let resolved = crate::index::scalar::inverted::resolve_fts_field(
+                lance_schema,
+                column,
+                config.params.get_document_granularity(),
+            )
+            .map_err(|error| {
+                Error::invalid_input(format!(
+                    "FTS index '{}' is invalid for field path '{}': {error}",
+                    config.name, column
+                ))
+            })?;
+            if resolved.final_field_id != config.field_id {
+                return Err(Error::invalid_input(format!(
+                    "index '{}' is configured with field_id {} but its field path '{}' has \
+                     final field_id {} in the shard schema",
+                    config.name, config.field_id, column, resolved.final_field_id,
+                )));
+            }
+            continue;
+        }
+
         let field = schema.field_with_name(column).map_err(|_| {
             Error::invalid_input(format!(
                 "index '{}' is configured on column '{}', which is not in the shard schema; \
@@ -146,20 +167,7 @@ pub fn validate_index_configs(
             // accepts any column type the schema can hold. Existence is the
             // only precondition.
             MemIndexConfig::BTree(_) => {}
-            MemIndexConfig::Fts(_) => {
-                if !matches!(
-                    field.data_type(),
-                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-                ) {
-                    return Err(Error::invalid_input(format!(
-                        "FTS index '{}' requires a Utf8, LargeUtf8, or Utf8View column; \
-                         column '{}' is {:?}",
-                        config.name(),
-                        column,
-                        field.data_type()
-                    )));
-                }
-            }
+            MemIndexConfig::Fts(_) => unreachable!("FTS configs are validated by schema path"),
             MemIndexConfig::Hnsw(_) => match field.data_type() {
                 DataType::FixedSizeList(item, dim) => {
                     if item.data_type() != &DataType::Float32 {
@@ -201,7 +209,14 @@ pub fn validate_index_configs(
         // reject any `field_id` that does not name the resolved column.
         let resolved_field_id = lance_schema
             .field(column)
-            .expect("column resolved in the Arrow schema is present in the Lance schema")
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "index '{}' is configured on column '{}', which is present in the Arrow \
+                     schema but absent from the Lance schema",
+                    config.name(),
+                    column,
+                ))
+            })?
             .id;
         if resolved_field_id != config.field_id() {
             return Err(Error::invalid_input(format!(
@@ -259,9 +274,53 @@ fn is_encodable_pk_type(data_type: &DataType) -> bool {
     )
 }
 
-/// Configuration for an index in MemWAL.
+/// The index kinds a MemTable can maintain — the registry of MemWAL index
+/// support. Data-free because indexes are identified by type url before any
+/// [`MemIndexConfig`] exists.
 ///
-/// Each variant contains all the configuration needed for that index type.
+/// Adding a variant is a compile error in [`details_suffix`](Self::details_suffix),
+/// `MemIndexConfig::kind`, and `Dataset::mem_wal_writer` until each handles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemIndexKind {
+    /// BTree index for scalar fields (point lookups, range queries).
+    BTree,
+    /// HNSW vector index built incrementally, queryable while building.
+    Hnsw,
+    /// Full-text search index.
+    Fts,
+}
+
+impl MemIndexKind {
+    /// Every maintainable kind. A kind missing here is never detected, so it
+    /// goes unmaintained rather than reaching a memtable that cannot build it.
+    pub const ALL: &'static [Self] = &[Self::BTree, Self::Hnsw, Self::Fts];
+
+    /// Suffix of the protobuf details message identifying this kind.
+    ///
+    /// Only the suffix: the prefix varies by dataset version
+    /// (`/lance.table.`, `/lance.index.pb.`, and the `type.googleapis.com/`
+    /// form MemWAL flush once wrote), and all must resolve.
+    pub const fn details_suffix(self) -> &'static str {
+        match self {
+            Self::BTree => "BTreeIndexDetails",
+            Self::Hnsw => "VectorIndexDetails",
+            Self::Fts => "InvertedIndexDetails",
+        }
+    }
+
+    /// The kind a base-table index of this protobuf type maps to, or `None`
+    /// when a memtable cannot maintain it.
+    pub fn from_type_url(type_url: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| type_url.ends_with(kind.details_suffix()))
+    }
+}
+
+/// Configuration for an index in MemWAL. Pairs 1:1 with [`MemIndexKind`] via
+/// [`kind`](Self::kind).
+///
 /// `Hnsw` is boxed because `HnswBuildParams` is small but the variant may
 /// grow with future config (e.g. shard-specific tuning).
 #[derive(Debug, Clone)]
@@ -275,6 +334,16 @@ pub enum MemIndexConfig {
 }
 
 impl MemIndexConfig {
+    /// The kind this config builds. Links the config enum to the registry, so
+    /// a new variant must declare its kind.
+    pub const fn kind(&self) -> MemIndexKind {
+        match self {
+            Self::BTree(_) => MemIndexKind::BTree,
+            Self::Hnsw(_) => MemIndexKind::Hnsw,
+            Self::Fts(_) => MemIndexKind::Fts,
+        }
+    }
+
     /// Get the index name.
     pub fn name(&self) -> &str {
         match self {
@@ -314,29 +383,37 @@ impl MemIndexConfig {
 
     /// Create an FTS index config from base table IndexMetadata.
     pub fn fts_from_metadata(index_meta: &IndexMetadata, schema: &LanceSchema) -> Result<Self> {
-        let (field_id, column) = Self::extract_field_info(index_meta, schema)?;
+        let (field_id, _) = Self::extract_field_info(index_meta, schema)?;
 
         // Extract InvertedIndexParams from index_details if available
-        let params = if let Some(details_any) = &index_meta.index_details {
-            let details = pbold::InvertedIndexDetails::decode(details_any.value.as_slice())
-                .map_err(|err| {
-                    Error::io(format!(
-                        "failed to decode InvertedIndexDetails for MemWAL FTS index '{}': {}",
-                        index_meta.name, err
-                    ))
-                })?;
-            InvertedIndexParams::try_from(&details)?
+        let details = if let Some(details_any) = &index_meta.index_details {
+            pbold::InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|err| {
+                Error::io(format!(
+                    "failed to decode InvertedIndexDetails for MemWAL FTS index '{}': {}",
+                    index_meta.name, err
+                ))
+            })?
         } else {
-            InvertedIndexParams::default()
+            pbold::InvertedIndexDetails::default()
         };
-        let params = params.format_version(Self::fts_format_version_from_metadata(index_meta)?);
-
-        Ok(Self::Fts(FtsIndexConfig::try_with_params(
-            index_meta.name.clone(),
+        let details =
+            crate::index::scalar::inverted::normalize_inverted_details(index_meta, details)?;
+        let params = InvertedIndexParams::try_from(&details)?;
+        let resolved = crate::index::scalar::inverted::resolve_fts_field_by_id(
+            schema,
             field_id,
-            column,
-            params,
-        )?))
+            params.get_document_granularity(),
+        )?;
+
+        Ok(Self::Fts(
+            FtsIndexConfig::try_with_params(
+                index_meta.name.clone(),
+                field_id,
+                resolved.canonical_path.clone(),
+                params,
+            )?
+            .with_resolved_field(resolved),
+        ))
     }
 
     /// Create an HNSW vector index config.
@@ -363,38 +440,6 @@ impl MemIndexConfig {
         ))
     }
 
-    /// Detect index type from protobuf type_url.
-    pub fn detect_index_type(type_url: &str) -> Result<&'static str> {
-        if type_url.ends_with("BTreeIndexDetails") {
-            Ok("btree")
-        } else if type_url.ends_with("InvertedIndexDetails") {
-            Ok("fts")
-        } else if type_url.ends_with("VectorIndexDetails") {
-            Ok("vector")
-        } else {
-            Err(Error::invalid_input(format!(
-                "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
-                type_url
-            )))
-        }
-    }
-
-    fn fts_format_version_from_metadata(
-        index_meta: &IndexMetadata,
-    ) -> Result<InvertedListFormatVersion> {
-        match index_meta.index_version {
-            // Legacy Arrow FTS indexes did not use the v1/v2 metadata values, but
-            // the maintained-index path can only write the modern format.
-            0 | 1 => Ok(InvertedListFormatVersion::V1),
-            2 => Ok(InvertedListFormatVersion::V2),
-            3 => Ok(InvertedListFormatVersion::V3),
-            version => Err(Error::invalid_input(format!(
-                "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, or 3",
-                index_meta.name, version
-            ))),
-        }
-    }
-
     /// Extract field ID and column name from index metadata.
     fn extract_field_info(
         index_meta: &IndexMetadata,
@@ -413,6 +458,23 @@ impl MemIndexConfig {
 
         Ok((*field_id, column))
     }
+}
+
+/// Whether the MemWAL can maintain an index of this protobuf type.
+///
+/// Opening a shard writer rejects anything outside this set, which makes the
+/// table unwritable — so filter on this before committing a maintained set,
+/// not at claim time.
+pub fn is_maintainable_index_type(type_url: &str) -> bool {
+    MemIndexKind::from_type_url(type_url).is_some()
+}
+
+/// Shared by the detection and writer paths so both report the same thing.
+pub(crate) fn unsupported_index_type(type_url: &str) -> Error {
+    Error::invalid_input(format!(
+        "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
+        type_url
+    ))
 }
 
 /// Registry managing all in-memory indexes for a MemTable.
@@ -546,11 +608,19 @@ impl IndexStore {
                     registry.hnsw_indexes.insert(c.name.clone(), index);
                 }
                 MemIndexConfig::Fts(c) => {
-                    let index = FtsMemIndex::try_with_params(
-                        c.field_id,
-                        c.column.clone(),
-                        c.params.clone(),
-                    )?;
+                    let index = match c.resolved_field.as_deref() {
+                        Some(resolved) => FtsMemIndex::try_with_resolved_field(
+                            c.field_id,
+                            c.column.clone(),
+                            c.params.clone(),
+                            resolved.clone(),
+                        )?,
+                        None => FtsMemIndex::try_with_params(
+                            c.field_id,
+                            c.column.clone(),
+                            c.params.clone(),
+                        )?,
+                    };
                     registry.fts_indexes.insert(c.name.clone(), index);
                 }
             }
@@ -1097,9 +1167,20 @@ impl IndexStore {
     /// Searches through all FTS indexes to find one matching the field_id.
     /// Use this for column-to-index resolution (column → field_id → index).
     pub fn get_fts_by_field_id(&self, field_id: i32) -> Option<&FtsMemIndex> {
-        self.fts_indexes
-            .values()
-            .find(|idx| idx.field_id() == field_id)
+        self.get_fts_by_field_id_and_granularity(
+            field_id,
+            lance_index::scalar::inverted::DocumentGranularity::Row,
+        )
+    }
+
+    pub fn get_fts_by_field_id_and_granularity(
+        &self,
+        field_id: i32,
+        document_granularity: lance_index::scalar::inverted::DocumentGranularity,
+    ) -> Option<&FtsMemIndex> {
+        self.fts_indexes.values().find(|idx| {
+            idx.field_id() == field_id && idx.document_granularity() == document_granularity
+        })
     }
 
     /// Get a BTree index by column name.
@@ -1119,14 +1200,63 @@ impl IndexStore {
 
     /// Get an FTS index by column name.
     pub fn get_fts_by_column(&self, column: &str) -> Option<&FtsMemIndex> {
-        self.fts_indexes
+        self.get_fts_by_column_and_granularity(
+            column,
+            lance_index::scalar::inverted::DocumentGranularity::Row,
+        )
+    }
+
+    pub fn get_fts_by_column_and_granularity(
+        &self,
+        column: &str,
+        document_granularity: lance_index::scalar::inverted::DocumentGranularity,
+    ) -> Option<&FtsMemIndex> {
+        self.fts_indexes.values().find(|idx| {
+            idx.column_name() == column && idx.document_granularity() == document_granularity
+        })
+    }
+
+    /// Return the distinct persisted document granularities for FTS indexes on
+    /// `column`, ordered from row to list-element.
+    pub fn fts_document_granularities_by_column(
+        &self,
+        column: &str,
+    ) -> Vec<lance_index::scalar::inverted::DocumentGranularity> {
+        let mut granularities = self
+            .fts_indexes
             .values()
-            .find(|idx| idx.column_name() == column)
+            .filter(|index| index.column_name() == column)
+            .map(|index| index.document_granularity())
+            .collect::<Vec<_>>();
+        granularities.sort_by_key(|document_granularity| match document_granularity {
+            lance_index::scalar::inverted::DocumentGranularity::Row => 0,
+            lance_index::scalar::inverted::DocumentGranularity::ListElement => 1,
+        });
+        granularities.dedup();
+        granularities
     }
 
     /// Check if the registry has any indexes.
     pub fn is_empty(&self) -> bool {
         self.btree_indexes.is_empty() && self.hnsw_indexes.is_empty() && self.fts_indexes.is_empty()
+    }
+
+    /// Name every index this memtable carries, for diagnostics.
+    ///
+    /// Answers "is my fresh-tier vector search brute-force" — an absent
+    /// name is the whole explanation, and there is no other way to see it
+    /// from outside. Sorted so repeated calls compare cleanly; `HashMap`
+    /// iteration order alone would not.
+    pub fn index_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .btree_indexes
+            .keys()
+            .chain(self.hnsw_indexes.keys())
+            .chain(self.fts_indexes.keys())
+            .cloned()
+            .collect();
+        out.sort();
+        out
     }
 
     /// Get the total number of indexes.
@@ -1171,27 +1301,61 @@ impl IndexStore {
 mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use log::warn;
+    use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    use lance_index::scalar::inverted::InvertedListFormatVersion;
     use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
 
-    /// Check if an index type is supported and log warning if not.
-    fn check_index_type_supported(index_type: &str) -> bool {
-        match index_type.to_lowercase().as_str() {
-            "btree" | "scalar" => true,
-            "hnsw" | "vector" => true,
-            "fts" | "inverted" | "fulltext" => true,
-            _ => {
-                warn!(
-                    "Index type '{}' is not supported for MemWAL. \
-                     Supported types: btree, hnsw, fts. Skipping.",
-                    index_type
-                );
-                false
-            }
+    /// Matching is on the message-name suffix, not the whole url: `Any::from_msg`
+    /// emits the package (`/lance.table.`, `/lance.index.pb.`), while MemWAL flush
+    /// used to hand-write a `type.googleapis.com/` url that existing datasets
+    /// still carry.
+    #[rstest]
+    #[case::btree("/lance.table.BTreeIndexDetails", Some(MemIndexKind::BTree))]
+    #[case::fts("/lance.table.InvertedIndexDetails", Some(MemIndexKind::Fts))]
+    #[case::fts_legacy("/lance.index.pb.InvertedIndexDetails", Some(MemIndexKind::Fts))]
+    #[case::vector("/lance.index.pb.VectorIndexDetails", Some(MemIndexKind::Hnsw))]
+    // What MemWAL flush wrote before it switched to `Any::from_msg`.
+    #[case::vector_legacy_flush(
+        "type.googleapis.com/lance.index.VectorIndexDetails",
+        Some(MemIndexKind::Hnsw)
+    )]
+    #[case::bitmap("/lance.table.BitmapIndexDetails", None)]
+    #[case::label_list("/lance.table.LabelListIndexDetails", None)]
+    #[case::ngram("/lance.table.NGramIndexDetails", None)]
+    #[case::zone_map("/lance.table.ZoneMapIndexDetails", None)]
+    #[case::bloom_filter("/lance.index.pb.BloomFilterIndexDetails", None)]
+    #[case::json("/lance.index.pb.JsonIndexDetails", None)]
+    #[case::fm("/lance.index.pb.FMIndexDetails", None)]
+    #[case::absent("", None)]
+    fn type_urls_resolve_to_the_kind_the_writer_builds(
+        #[case] type_url: &str,
+        #[case] expected: Option<MemIndexKind>,
+    ) {
+        assert_eq!(MemIndexKind::from_type_url(type_url), expected);
+        assert_eq!(is_maintainable_index_type(type_url), expected.is_some());
+    }
+
+    /// `ALL` is hand-maintained, so a kind left out of it stops resolving.
+    #[test]
+    fn every_kind_is_registered_and_uniquely_identified() {
+        for kind in MemIndexKind::ALL {
+            assert_eq!(
+                MemIndexKind::from_type_url(&format!("/lance.table.{}", kind.details_suffix())),
+                Some(*kind),
+                "{kind:?} does not resolve from its own suffix",
+            );
         }
+        let suffixes: std::collections::HashSet<_> = MemIndexKind::ALL
+            .iter()
+            .map(|k| k.details_suffix())
+            .collect();
+        assert_eq!(
+            suffixes.len(),
+            MemIndexKind::ALL.len(),
+            "two kinds share a details suffix, so one can never be resolved",
+        );
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1234,9 +1398,7 @@ mod tests {
     }
 
     fn fts_index_metadata(index_version: i32) -> IndexMetadata {
-        let details =
-            pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
-        fts_index_metadata_with_details(index_version, Some(details))
+        fts_index_metadata_with_details(index_version, None)
     }
 
     fn fts_index_metadata_with_details(
@@ -1547,15 +1709,41 @@ mod tests {
     }
 
     #[test]
-    fn test_check_index_type_supported() {
-        assert!(check_index_type_supported("btree"));
-        assert!(check_index_type_supported("BTree"));
-        assert!(check_index_type_supported("hnsw"));
-        assert!(check_index_type_supported("vector"));
-        assert!(check_index_type_supported("fts"));
-        assert!(check_index_type_supported("inverted"));
+    fn fts_registry_routes_row_and_element_targets_independently() {
+        let mut registry = IndexStore::new();
+        registry
+            .add_fts_with_params(
+                "tags_idx".to_string(),
+                1,
+                "tags".to_string(),
+                InvertedIndexParams::default(),
+            )
+            .unwrap();
+        registry
+            .add_fts_with_params(
+                "tags_element_idx".to_string(),
+                1,
+                "tags".to_string(),
+                InvertedIndexParams::default().document_granularity(
+                    lance_index::scalar::inverted::DocumentGranularity::ListElement,
+                ),
+            )
+            .unwrap();
 
-        assert!(!check_index_type_supported("unknown"));
+        assert_eq!(
+            registry.get_fts_by_column("tags").unwrap().column_name(),
+            "tags"
+        );
+        assert_eq!(
+            registry
+                .get_fts_by_column_and_granularity(
+                    "tags",
+                    lance_index::scalar::inverted::DocumentGranularity::ListElement,
+                )
+                .unwrap()
+                .column_name(),
+            "tags"
+        );
     }
 
     #[test]
@@ -1598,13 +1786,60 @@ mod tests {
     }
 
     #[test]
+    fn fts_from_metadata_accepts_element_document_v3_capability() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let tags = schema.field("tags").unwrap();
+        for (block_size, expected_format_version) in [
+            (128, InvertedListFormatVersion::V2),
+            (256, InvertedListFormatVersion::V3),
+        ] {
+            let params = InvertedIndexParams::default()
+                .block_size(block_size)
+                .unwrap()
+                .document_granularity(
+                    lance_index::scalar::inverted::DocumentGranularity::ListElement,
+                );
+            let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
+            let mut metadata = fts_index_metadata_with_details(3, Some(details));
+            metadata.fields = vec![tags.id];
+            let config = MemIndexConfig::fts_from_metadata(&metadata, &schema).unwrap();
+
+            let MemIndexConfig::Fts(config) = config else {
+                unreachable!("fts metadata should create an FTS config")
+            };
+            assert_eq!(config.field_id, tags.id);
+            assert_eq!(config.column, "tags");
+            assert_eq!(
+                config.params.get_document_granularity(),
+                lance_index::scalar::inverted::DocumentGranularity::ListElement
+            );
+            assert_eq!(
+                config.params.resolved_format_version(),
+                expected_format_version
+            );
+        }
+    }
+
+    #[test]
     fn fts_from_metadata_accepts_v3_with_legacy_block_size() {
         let arrow_schema = create_test_schema();
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut legacy_details =
+            pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+        legacy_details.posting_format_version = None;
 
         for metadata in [
-            fts_index_metadata_with_details(3, None),
             fts_index_metadata(3),
+            fts_index_metadata_with_details(3, Some(legacy_details)),
         ] {
             let config = MemIndexConfig::fts_from_metadata(&metadata, &schema).unwrap();
             let MemIndexConfig::Fts(config) = config else {
@@ -1704,10 +1939,10 @@ mod tests {
     )), None)]
     #[case::fts_non_utf8(MemIndexConfig::Fts(FtsIndexConfig::new(
         "idx".into(), 0, "id".into(),
-    )), Some("requires a Utf8, LargeUtf8, or Utf8View column"))]
+    )), Some("must resolve to Utf8, LargeUtf8, Utf8View, or JSON"))]
     #[case::fts_missing_column(MemIndexConfig::Fts(FtsIndexConfig::new(
         "idx".into(), 9, "nope".into(),
-    )), Some("not in the shard schema"))]
+    )), Some("does not exist in the dataset schema"))]
     #[case::hnsw_ok(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
         "idx".into(), 2, "vector".into(), DistanceType::L2,
     ))), None)]
@@ -1739,6 +1974,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_validate_nested_fts_index_config() {
+        let content_fields = Fields::from(vec![Field::new("content", DataType::Utf8, true)]);
+        let doc_item = Arc::new(Field::new("item", DataType::Struct(content_fields), true));
+        let group_fields = Fields::from(vec![Field::new("docs", DataType::List(doc_item), true)]);
+        let group_item = Arc::new(Field::new("item", DataType::Struct(group_fields), true));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "groups",
+            DataType::List(group_item),
+            true,
+        )]));
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let resolved = crate::index::scalar::inverted::resolve_fts_field(
+            &lance_schema,
+            "groups.docs.content",
+            lance_index::scalar::inverted::DocumentGranularity::ListElement,
+        )
+        .unwrap();
+
+        let params = InvertedIndexParams::default()
+            .document_granularity(lance_index::scalar::inverted::DocumentGranularity::ListElement);
+        let config = MemIndexConfig::Fts(FtsIndexConfig::with_params(
+            "idx".into(),
+            resolved.final_field_id,
+            "groups.docs.content".into(),
+            params.clone(),
+        ));
+        validate_index_configs(&[config], &schema, &lance_schema, &[]).unwrap();
+
+        let wrong_field_id = MemIndexConfig::Fts(FtsIndexConfig::with_params(
+            "idx".into(),
+            resolved.final_field_id + 1,
+            "groups.docs.content".into(),
+            params,
+        ));
+        let error =
+            validate_index_configs(&[wrong_field_id], &schema, &lance_schema, &[]).unwrap_err();
+        assert!(error.to_string().contains("final field_id"), "{error}");
+    }
+
+    #[test]
+    fn test_validate_index_configs_rejects_diverged_lance_schema() {
+        let arrow_schema = ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&ArrowSchema::new(vec![Field::new(
+            "other",
+            DataType::Int32,
+            false,
+        )]))
+        .expect("test Lance schema must be valid");
+        let config = MemIndexConfig::BTree(BTreeIndexConfig {
+            name: "idx".into(),
+            field_id: 0,
+            column: "id".into(),
+        });
+
+        let error = validate_index_configs(&[config], &arrow_schema, &lance_schema, &[])
+            .expect_err("diverged Arrow and Lance schemas must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("index 'idx'"),
+            "error must name the index: {message}"
+        );
+        assert!(
+            message.contains("column 'id'"),
+            "error must name the column: {message}"
+        );
+        assert!(
+            message.contains("absent from the Lance schema"),
+            "error must explain the schema divergence: {message}"
+        );
     }
 
     /// A composite PK builds an order-preserving encoded key, so its columns must

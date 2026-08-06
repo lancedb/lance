@@ -1,15 +1,112 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    str::FromStr,
+};
 
+use lance_arrow::DataTypeExt;
+use lance_core::datatypes::Field;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 
-pub use lance_encoding::version::{
-    LEGACY_FORMAT_VERSION, LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2,
-    V2_FORMAT_2_3,
-};
+pub const LEGACY_FORMAT_VERSION: &str = "0.1";
+pub const V2_FORMAT_2_0: &str = "2.0";
+pub const V2_FORMAT_2_1: &str = "2.1";
+pub const V2_FORMAT_2_2: &str = "2.2";
+pub const V2_FORMAT_2_3: &str = "2.3";
+
+/// A caller-facing Lance file-version request.
+///
+/// This selector remains separate from [`ConcreteFileVersion`] because `Stable`
+/// and `Next` are release policy rather than persisted identities.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Ord, PartialOrd)]
+pub enum LanceFileVersion {
+    /// The legacy v1 format.
+    Legacy,
+    /// Exact v2.0.
+    V2_0,
+    /// Exact v2.1 and the current default.
+    #[default]
+    V2_1,
+    /// The latest stable release.
+    Stable,
+    /// Exact v2.2.
+    V2_2,
+    /// The latest unstable release.
+    Next,
+    /// Exact v2.3.
+    V2_3,
+}
+
+impl DeepSizeOf for LanceFileVersion {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
+impl LanceFileVersion {
+    /// Resolve `Stable` or `Next` to the current exact selector.
+    pub fn resolve(&self) -> Self {
+        match self {
+            Self::Stable => Self::default(),
+            Self::Next => Self::V2_3,
+            _ => *self,
+        }
+    }
+
+    pub fn is_unstable(&self) -> bool {
+        self >= &Self::Next
+    }
+
+    pub fn iter_non_legacy() -> impl Iterator<Item = Self> {
+        [Self::V2_0, Self::V2_1, Self::V2_2, Self::V2_3].into_iter()
+    }
+
+    pub fn support_add_sub_column(&self) -> bool {
+        self > &Self::V2_1
+    }
+
+    pub fn support_remove_sub_column(&self, field: &Field) -> bool {
+        if self <= &Self::V2_1 {
+            field.data_type().is_struct()
+        } else {
+            field.data_type().is_nested()
+        }
+    }
+}
+
+impl Display for LanceFileVersion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Legacy => LEGACY_FORMAT_VERSION,
+            Self::V2_0 => V2_FORMAT_2_0,
+            Self::V2_1 => V2_FORMAT_2_1,
+            Self::V2_2 => V2_FORMAT_2_2,
+            Self::V2_3 => V2_FORMAT_2_3,
+            Self::Stable => "stable",
+            Self::Next => "next",
+        })
+    }
+}
+
+impl FromStr for LanceFileVersion {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_lowercase().as_str() {
+            LEGACY_FORMAT_VERSION | "legacy" => Ok(Self::Legacy),
+            V2_FORMAT_2_0 | "0.3" => Ok(Self::V2_0),
+            V2_FORMAT_2_1 => Ok(Self::V2_1),
+            V2_FORMAT_2_2 => Ok(Self::V2_2),
+            V2_FORMAT_2_3 => Ok(Self::V2_3),
+            "stable" => Ok(Self::Stable),
+            "next" => Ok(Self::Next),
+            _ => Err(unknown_version(value)),
+        }
+    }
+}
 
 /// The exact persisted identity of a Lance file format.
 ///
@@ -318,7 +415,7 @@ mod tests {
                 crate::determine_file_version(&object_store, &path, Some(footer.len()))
                     .await
                     .unwrap(),
-                LanceFileVersion::Legacy
+                ConcreteFileVersion::V1
             );
         }
     }

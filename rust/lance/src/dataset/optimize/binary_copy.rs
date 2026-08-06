@@ -10,11 +10,10 @@ use crate::datatypes::Schema;
 use lance_arrow::DataTypeExt;
 use lance_core::Error;
 use lance_encoding::decoder::{ColumnInfo, PageEncoding, PageInfo as DecPageInfo};
-use lance_encoding::version::LanceFileVersion;
-use lance_file::format::pbfile;
 use lance_file::reader::FileReader as LFReader;
 use lance_file::version::ConcreteFileVersion;
-use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::version::LanceFileVersion;
+use lance_file::writer::FileWriterOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Writer;
 use lance_table::format::{DataFile, Fragment};
@@ -515,9 +514,7 @@ pub async fn rewrite_files_binary_copy(
 ///
 /// This function does not manually craft the footer. Instead it:
 /// - Pads the current `ObjectWriter` position to a 64‑byte boundary (required for v2_1+ readers).
-/// - Converts the collected per‑column info (`final_cols`) into `ColumnMetadata`.
-/// - Constructs a `lance_file::writer::FileWriter` with the active `schema`, column metadata,
-///   and `total_rows_in_current`.
+/// - Initializes a `lance_file::writer::FileWriter` from the collected column metadata.
 /// - Calls `FileWriter::finish()` to emit column metadata, offset tables, global buffers
 ///   (schema descriptor), version, and to close the writer.
 ///
@@ -538,68 +535,16 @@ async fn flush_footer(
     let pos = writer.tell().await? as u64;
     let _new_pos = apply_alignment_padding(writer.as_mut(), pos, version).await?;
 
-    let mut col_metadatas = Vec::with_capacity(final_cols.len());
-    for col in final_cols {
-        let pages = col
-            .page_infos
-            .iter()
-            .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
-                let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
-                    .buffer_offsets_and_sizes
-                    .as_ref()
-                    .iter()
-                    .cloned()
-                    .unzip();
-                Ok(pbfile::column_metadata::Page {
-                    buffer_offsets,
-                    buffer_sizes,
-                    encoding: Some(pbfile::Encoding {
-                        location: Some(pbfile::encoding::Location::Direct(
-                            pbfile::DirectEncoding {
-                                encoding: encoded_encoding,
-                            },
-                        )),
-                    }),
-                    length: page_info.num_rows,
-                    priority: page_info.priority,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
-            col.buffer_offsets_and_sizes.iter().cloned().unzip();
-        let encoded_col_encoding = Any::from_msg(&col.encoding)?.encode_to_vec();
-        let column = pbfile::ColumnMetadata {
-            pages,
-            buffer_offsets,
-            buffer_sizes,
-            encoding: Some(pbfile::Encoding {
-                location: Some(pbfile::encoding::Location::Direct(pbfile::DirectEncoding {
-                    encoding: encoded_col_encoding,
-                })),
-            }),
-        };
-        col_metadatas.push(column);
-    }
-    let mut file_writer = FileWriter::new_lazy(
+    let mut file_writer = lance_file::versions::create_lazy_writer(
+        ConcreteFileVersion::from(version),
         writer,
-        FileWriterOptions {
-            format_version: Some(version),
-            ..Default::default()
-        },
-    );
-    file_writer.initialize_with_external_metadata(
+        FileWriterOptions::default(),
+    )?;
+    file_writer.initialize_with_external_columns(
         schema.clone(),
-        col_metadatas,
+        final_cols,
         total_rows_in_current,
-    );
+    )?;
     file_writer.finish().await?;
     Ok(())
 }

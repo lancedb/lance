@@ -12,8 +12,10 @@ use futures::TryStreamExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_encoding::version::LanceFileVersion;
-use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions, ReaderProjection};
+use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::version::LanceFileVersion;
+use lance_file::versions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -230,13 +232,16 @@ impl IndexReader for CurrentIndexReader {
             )));
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
+            versions::reader_projection_from_column_names(
                 self.0.metadata().version(),
                 self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
         let batches = self
             .0
@@ -268,13 +273,16 @@ impl IndexReader for CurrentIndexReader {
             return empty_batch();
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
+            versions::reader_projection_from_column_names(
                 self.0.metadata().version(),
                 self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
         // `DecodeBatchScheduler::schedule_ranges` requires sorted,
         // non-overlapping ranges; sort internally and permute the
@@ -346,13 +354,16 @@ impl IndexReader for CurrentIndexReader {
             )));
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
+            versions::reader_projection_from_column_names(
                 self.0.metadata().version(),
                 self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
         self.0
             .read_stream_projected(
@@ -408,13 +419,11 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_file_path(name)?;
         let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
-        let writer = current_writer::FileWriter::try_new(
+        let writer = versions::create_writer(
+            ConcreteFileVersion::from(self.format_version),
             writer,
             schema,
-            current_writer::FileWriterOptions {
-                format_version: Some(self.format_version),
-                ..Default::default()
-            },
+            current_writer::FileWriterOptions::default(),
         )?;
         Ok(Box::new(LanceIndexWriter {
             path: name.to_string(),
