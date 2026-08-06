@@ -22,7 +22,7 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter
-from lance.fragment import write_fragments
+from lance.fragment import RowIdMeta, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
 
@@ -481,6 +481,106 @@ def test_fragment_metadata_pickle(tmp_path: Path, enable_stable_row_ids: bool):
     assert frag_meta.physical_rows == json_round_trip.physical_rows
     if enable_stable_row_ids:
         assert json_round_trip.row_id_meta is not None
+
+
+def _row_ids_by_id(dataset: LanceDataset) -> dict[int, int]:
+    table = dataset.to_table(columns=["id"], with_row_id=True)
+    return dict(zip(table["id"].to_pylist(), table["_rowid"].to_pylist()))
+
+
+def test_external_update_preserves_stable_row_ids(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]}),
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=True,
+    )
+    row_ids_before = _row_ids_by_id(dataset)
+
+    updated_fragment = dataset.get_fragments()[0].delete("id = 2")
+    assert updated_fragment is not None
+    new_fragments = list(
+        write_fragments(pa.table({"id": [2], "value": [99]}), tmp_path)
+    )
+    new_fragments[0].row_id_meta = RowIdMeta.from_ids([row_ids_before[2]])
+    operation = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        new_fragments=new_fragments,
+        update_mode="rewrite_rows",
+    )
+
+    updated_dataset = LanceDataset.commit(
+        tmp_path, operation, read_version=dataset.version
+    )
+
+    assert _row_ids_by_id(updated_dataset) == row_ids_before
+    updated_table = updated_dataset.to_table()
+    values_by_id = dict(
+        zip(
+            updated_table["id"].to_pylist(),
+            updated_table["value"].to_pylist(),
+        )
+    )
+    assert values_by_id[2] == 99
+
+
+def test_row_id_meta_rejects_duplicate_ids():
+    with pytest.raises(ValueError, match="row_ids must be unique"):
+        RowIdMeta.from_ids([7, 7])
+
+
+@pytest.mark.parametrize(
+    ("row_id_case", "error"),
+    [
+        ("duplicate", "duplicate supplied row_id"),
+        ("unknown", "does not identify a live row replaced"),
+        ("not_replaced", "does not identify a live row replaced"),
+        ("deleted", "does not identify a live row replaced"),
+    ],
+)
+def test_external_update_rejects_invalid_stable_row_ids(
+    tmp_path: Path, row_id_case: str, error: str
+):
+    dataset = write_dataset(
+        pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]}),
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=True,
+    )
+    row_ids = _row_ids_by_id(dataset)
+    if row_id_case == "deleted":
+        dataset.delete("id = 4")
+        dataset = lance.dataset(tmp_path)
+
+    updated_fragment = dataset.get_fragments()[0].delete("id = 2")
+    assert updated_fragment is not None
+    if row_id_case == "duplicate":
+        new_fragments = list(
+            write_fragments(pa.table({"id": [2], "value": [99]}), tmp_path)
+        )
+        new_fragments.extend(
+            write_fragments(pa.table({"id": [20], "value": [100]}), tmp_path)
+        )
+        for fragment in new_fragments:
+            fragment.row_id_meta = RowIdMeta.from_ids([row_ids[2]])
+    else:
+        replacement = pa.table({"id": [2], "value": [99]})
+        if row_id_case == "unknown":
+            preserved_row_ids = [max(row_ids.values()) + 100]
+        elif row_id_case == "not_replaced":
+            preserved_row_ids = [row_ids[3]]
+        else:
+            preserved_row_ids = [row_ids[4]]
+        new_fragments = list(write_fragments(replacement, tmp_path))
+        new_fragments[0].row_id_meta = RowIdMeta.from_ids(preserved_row_ids)
+    operation = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        new_fragments=new_fragments,
+        update_mode="rewrite_rows",
+    )
+
+    with pytest.raises(OSError, match=error):
+        LanceDataset.commit(tmp_path, operation, read_version=dataset.version)
 
 
 def test_deletion_file_with_base_id_serialization():

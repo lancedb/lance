@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,8 +9,9 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
-    format::{DataStorageFormat, is_detached_version},
+    format::{DataStorageFormat, RowIdMeta, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
+    rowids::read_row_ids,
 };
 
 use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
@@ -20,7 +21,9 @@ use crate::{
         ManifestWriteConfig, ReadParams,
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
+        fragment::FileFragment,
         refs::Refs,
+        rowids::load_row_id_sequence,
         transaction::{Operation, Transaction},
     },
     session::Session,
@@ -31,6 +34,152 @@ use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
+
+/// Validate row IDs attached to new fragments in an Update before building a manifest.
+///
+/// A preserved ID must identify a live row that this same operation removes. Otherwise
+/// the new fragment would either resurrect a deleted ID or duplicate an unchanged row.
+async fn validate_preserved_update_row_ids(dataset: &Dataset, operation: &Operation) -> Result<()> {
+    let Operation::Update {
+        removed_fragment_ids,
+        updated_fragments,
+        new_fragments,
+        ..
+    } = operation
+    else {
+        return Ok(());
+    };
+
+    let has_row_id_meta = new_fragments
+        .iter()
+        .any(|fragment| fragment.row_id_meta.is_some());
+    if !has_row_id_meta {
+        return Ok(());
+    }
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::invalid_input(
+            "Update new_fragments cannot supply row IDs for a dataset without stable row IDs",
+        ));
+    }
+
+    let mut supplied_row_ids = HashSet::new();
+    for fragment in new_fragments {
+        let Some(row_id_meta) = &fragment.row_id_meta else {
+            continue;
+        };
+        let RowIdMeta::Inline(data) = row_id_meta else {
+            return Err(Error::invalid_input(format!(
+                "Update new fragment {} uses external row ID metadata; only inline row ID metadata is supported",
+                fragment.id
+            )));
+        };
+        let sequence = read_row_ids(data).map_err(|error| {
+            Error::invalid_input(format!(
+                "Update new fragment {} has invalid row ID metadata: {}",
+                fragment.id, error
+            ))
+        })?;
+        let physical_rows = fragment.physical_rows.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Update new fragment {} does not specify physical_rows",
+                fragment.id
+            ))
+        })?;
+        if sequence.len() > physical_rows as u64 {
+            return Err(Error::invalid_input(format!(
+                "Update new fragment {} supplies {} row IDs for {} physical rows",
+                fragment.id,
+                sequence.len(),
+                physical_rows
+            )));
+        }
+        for row_id in sequence.iter() {
+            if !supplied_row_ids.insert(row_id) {
+                return Err(Error::invalid_input(format!(
+                    "Update new_fragments contain duplicate supplied row_id={row_id}"
+                )));
+            }
+        }
+    }
+
+    if supplied_row_ids.is_empty() {
+        return Ok(());
+    }
+
+    let removed_fragment_ids: HashSet<u64> = removed_fragment_ids.iter().copied().collect();
+    let updated_fragments: HashMap<u64, _> = updated_fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect();
+    let affected_fragment_ids: HashSet<u64> = removed_fragment_ids
+        .iter()
+        .copied()
+        .chain(updated_fragments.keys().copied())
+        .collect();
+    let mut unresolved_row_ids = supplied_row_ids;
+
+    for fragment_id in affected_fragment_ids {
+        let Some(source_fragment) = dataset.get_fragment(fragment_id as usize) else {
+            continue;
+        };
+        let sequence = load_row_id_sequence(dataset, source_fragment.metadata()).await?;
+        let Some(row_id_range) = sequence.row_id_range() else {
+            continue;
+        };
+        let source_deletions = source_fragment.get_deletion_vector().await?;
+        let replacement_deletions = if removed_fragment_ids.contains(&fragment_id) {
+            None
+        } else {
+            let Some(updated_fragment) = updated_fragments.get(&fragment_id) else {
+                continue;
+            };
+            FileFragment::new(Arc::new(dataset.clone()), (*updated_fragment).clone())
+                .get_deletion_vector()
+                .await?
+        };
+
+        let mut candidate_row_ids = Vec::with_capacity(unresolved_row_ids.len());
+        candidate_row_ids.extend(
+            unresolved_row_ids
+                .iter()
+                .filter(|row_id| row_id_range.contains(row_id))
+                .copied(),
+        );
+        for row_id in candidate_row_ids {
+            let Some(position) = sequence.position(row_id) else {
+                continue;
+            };
+            let position = u32::try_from(position).map_err(|_| {
+                Error::invalid_input(format!(
+                    "row_id={row_id} has physical position {position}, which exceeds the supported row offset range"
+                ))
+            })?;
+            if source_deletions
+                .as_ref()
+                .is_some_and(|deletions| deletions.contains(position))
+            {
+                continue;
+            }
+            let is_replaced = removed_fragment_ids.contains(&fragment_id)
+                || replacement_deletions
+                    .as_ref()
+                    .is_some_and(|deletions| deletions.contains(position));
+            if is_replaced {
+                unresolved_row_ids.remove(&row_id);
+            }
+        }
+    }
+
+    if let Some(row_id) = unresolved_row_ids.iter().min() {
+        return Err(Error::invalid_input(format!(
+            "Update new_fragments contain row_id={row_id}, but it does not identify a live row replaced by this operation in dataset version {} ({} supplied row ID(s) were unresolved)",
+            dataset.manifest.version,
+            unresolved_row_ids.len()
+        )));
+    }
+
+    Ok(())
+}
 
 /// Create a new commit from a [`Transaction`].
 ///
@@ -364,6 +513,7 @@ impl<'a> CommitBuilder<'a> {
         // Validate the operation before proceeding with the commit
         // This ensures that operations like Merge have proper validation for data integrity
         if let Some(dataset) = dest.dataset() {
+            validate_preserved_update_row_ids(dataset, &transaction.operation).await?;
             validate_operation(Some(&dataset.manifest), &transaction.operation)?;
         } else {
             validate_operation(None, &transaction.operation)?;

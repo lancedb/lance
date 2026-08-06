@@ -107,6 +107,18 @@ impl RowIdSequence {
         self.0.iter().flat_map(|segment| segment.iter())
     }
 
+    /// Return the physical position of a row ID in this sequence.
+    pub fn position(&self, row_id: u64) -> Option<usize> {
+        let mut sequence_offset = 0;
+        for segment in &self.0 {
+            if let Some(segment_offset) = segment.position(row_id) {
+                return Some(sequence_offset + segment_offset);
+            }
+            sequence_offset += segment.len();
+        }
+        None
+    }
+
     pub fn len(&self) -> u64 {
         self.0.iter().map(|segment| segment.len() as u64).sum()
     }
@@ -782,6 +794,20 @@ mod test {
 
         let iter = sequence.iter();
         assert_eq!(iter.collect::<Vec<_>>(), (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_row_id_sequence_position() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(10..13),
+            U64Segment::SortedArray(vec![4, 8].into()),
+            U64Segment::Array(vec![20, 5].into()),
+        ]);
+
+        assert_eq!(sequence.position(10), Some(0));
+        assert_eq!(sequence.position(8), Some(4));
+        assert_eq!(sequence.position(5), Some(6));
+        assert_eq!(sequence.position(99), None);
     }
 
     #[test]
