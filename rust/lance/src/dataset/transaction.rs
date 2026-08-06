@@ -1919,10 +1919,6 @@ impl Transaction {
         Ok((manifest, indices))
     }
 
-    /// Create a new manifest from the current manifest and the transaction.
-    ///
-    /// `current_manifest` should only be None if the dataset does not yet exist.
-
     /// Preconditions for the one-way migration to safe retirement.
     ///
     /// Activation is one-way because returning to legacy semantics -- where a
@@ -1994,7 +1990,7 @@ impl Transaction {
     /// Dropping coverage is always safe -- missing coverage schedules a repair
     /// and retains SSTables. Wrongly *keeping* it is not.
     fn apply_mem_wal_index_coverage(
-        final_indices: &mut Vec<IndexMetadata>,
+        final_indices: &mut [IndexMetadata],
         segments_before: &LogicalIndexSegments,
         advances: &[IndexCatchupAdvance],
         safe_retirement_enabled: bool,
@@ -2028,10 +2024,11 @@ impl Transaction {
 
         // Nothing has ever been compacted, so no index can be behind and there is
         // no coverage to invalidate. Bail before doing any work.
-        if details.compacted_sstables.is_empty() && details.index_catchup.is_empty() {
-            if advances.is_empty() {
-                return Ok(());
-            }
+        if details.compacted_sstables.is_empty()
+            && details.index_catchup.is_empty()
+            && advances.is_empty()
+        {
+            return Ok(());
         }
 
         // --- invalidate coverage the transaction changed but did not prove ---
@@ -2172,6 +2169,9 @@ impl Transaction {
         Ok(())
     }
 
+    /// Create a new manifest from the current manifest and the transaction.
+    ///
+    /// `current_manifest` should only be None if the dataset does not yet exist.
     pub(crate) fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
