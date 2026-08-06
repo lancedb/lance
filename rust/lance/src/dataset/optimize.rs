@@ -272,6 +272,9 @@ pub struct CompactionOptions {
     /// the total size of the source fragments' data and overlay files. When
     /// set, tasks are included in the plan until adding the next task would
     /// exceed this limit.
+    /// Blob v2 payloads live in separate blob files and are not counted, so
+    /// this is not a cap on total compaction I/O for datasets with blob
+    /// columns.
     /// Defaults to `None` (no limit).
     pub max_source_bytes: Option<u64>,
     /// Maximum number of data overlay files a fragment may carry before it is

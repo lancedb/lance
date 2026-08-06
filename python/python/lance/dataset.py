@@ -7174,7 +7174,9 @@ class DatasetOptimizer:
             Maximum number of source bytes to compact in a single run,
             measured as the total size of the source fragments' data and
             overlay files. Tasks are included until adding the next task
-            would exceed this limit.
+            would exceed this limit. Blob v2 payloads live in separate
+            blob files and are not counted, so this is not a cap on total
+            compaction I/O for datasets with blob columns.
 
         Returns
         -------
