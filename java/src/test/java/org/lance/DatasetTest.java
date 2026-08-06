@@ -2153,6 +2153,13 @@ public class DatasetTest {
 
         assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
         assertEquals("index1", desc.getSegments().get(0).name());
+        assertTrue(
+            desc.getSegments().get(0).getSizeBytes().orElse(0L) > 0,
+            "segment size should be positive");
+        assertEquals(
+            desc.getSegments().get(0).getSizeBytes(),
+            desc.getTotalSizeBytes(),
+            "single-segment size should equal the logical index size");
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");
@@ -2165,6 +2172,8 @@ public class DatasetTest {
               indexDesc.getSegments(),
               "segments alias should match metadata");
           assertNotNull(indexDesc.getDetailsJson(), "Details JSON should not be null");
+          assertTrue(
+              indexDesc.getTotalSizeBytes().orElse(0L) > 0, "total index size should be positive");
         }
       }
     }
