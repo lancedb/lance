@@ -39,7 +39,9 @@ use crate::blob::{
     is_logical_blob_v2_field, is_prepared_blob_v2_field, validate_prepared_blob_array,
 };
 use arrow_array::StructArray;
-use lance_core::datatypes::{BlobKind, BlobVersion, Field as LanceField, Schema, parse_field_path};
+use lance_core::datatypes::{
+    BlobKind, BlobVersion, Field as LanceField, Schema, format_field_path_minimal,
+};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
@@ -1720,17 +1722,15 @@ impl Default for ReadBlobsOptions {
 #[derive(Debug, Clone)]
 pub struct ReadBlobsBuilder {
     dataset: Arc<Dataset>,
-    column: String,
     blob_field_id: u32,
     selection: ReadBlobsSelection,
     options: ReadBlobsOptions,
 }
 
 impl ReadBlobsBuilder {
-    pub(crate) fn new(dataset: Arc<Dataset>, column: String, blob_field_id: u32) -> Self {
+    pub(crate) fn new(dataset: Arc<Dataset>, blob_field_id: u32) -> Self {
         Self {
             dataset,
-            column,
             blob_field_id,
             selection: ReadBlobsSelection::None,
             options: ReadBlobsOptions::default(),
@@ -1776,7 +1776,6 @@ impl ReadBlobsBuilder {
         let collected = collect_blob_selection_for_selection(
             &self.dataset,
             self.blob_field_id,
-            &self.column,
             &self.selection,
         )
         .await?;
@@ -1907,7 +1906,6 @@ impl ReadBlobRangesBuilder {
         let mut selections = collect_blob_selection_for_selection(
             &self.inner.dataset,
             self.inner.blob_field_id,
-            &self.inner.column,
             &row_selection,
         )
         .await?;
@@ -2690,7 +2688,6 @@ pub(super) async fn take_blobs(
     let collected = collect_blob_selection_for_selection(
         dataset,
         blob_field_id,
-        column,
         &ReadBlobsSelection::RowIds(row_ids.to_vec()),
     )
     .await?;
@@ -2713,10 +2710,21 @@ pub async fn take_blobs_by_addresses(
     column: &str,
 ) -> Result<Vec<Option<BlobFile>>> {
     let blob_field_id = validate_blob_column(dataset, column)?;
+    take_blobs_by_field_id(dataset, row_addrs, blob_field_id).await
+}
+
+/// Take [BlobFile] by row addresses, for a blob column identified by its field id.
+///
+/// Callers that already hold the field id should use this rather than a column
+/// name: the id is stable across renames and needs no field-path escaping.
+pub(super) async fn take_blobs_by_field_id(
+    dataset: &Arc<Dataset>,
+    row_addrs: &[u64],
+    blob_field_id: u32,
+) -> Result<Vec<Option<BlobFile>>> {
     let collected = collect_blob_selection_for_selection(
         dataset,
         blob_field_id,
-        column,
         &ReadBlobsSelection::RowAddresses(row_addrs.to_vec()),
     )
     .await?;
@@ -2740,13 +2748,43 @@ pub(super) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Resu
     Ok(blob_field.id as u32)
 }
 
+/// The names from the schema root down to the blob column, unescaped.
+///
+/// Blob columns are addressed by field id, but reading a descriptor batch still
+/// means walking into it by name, and errors are clearer with the whole path.
+fn blob_column_path(dataset: &Arc<Dataset>, blob_field_id: u32) -> Result<Vec<String>> {
+    let schema = dataset.schema();
+    schema
+        .field_ancestry_by_id(blob_field_id as i32)
+        .map(|ancestry| ancestry.iter().map(|field| field.name.clone()).collect())
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "Blob field id {} is not present in the dataset schema",
+                blob_field_id
+            ))
+        })
+}
+
+/// Render a [`blob_column_path`] for display, quoting segments where needed.
+fn display_blob_column_path(column_path: &[String]) -> String {
+    let segments = column_path.iter().map(String::as_str).collect::<Vec<_>>();
+    format_field_path_minimal(&segments)
+}
+
+/// Project just the blob column, keeping its descriptor children.
+fn blob_column_projection(dataset: &Arc<Dataset>, blob_field_id: u32) -> Schema {
+    dataset
+        .schema()
+        .project_by_ids(&[blob_field_id as i32], true)
+}
+
 /// Load blob descriptor rows for a stable-row-id selection.
 async fn take_blob_descriptions_by_row_ids(
     dataset: &Arc<Dataset>,
     row_ids: &[u64],
-    column: &str,
+    blob_field_id: u32,
 ) -> Result<RecordBatch> {
-    let projection = dataset.schema().project(&[column])?;
+    let projection = blob_column_projection(dataset, blob_field_id);
     dataset
         .take_builder(row_ids, projection)?
         .with_missing_row_policy(MissingRowPolicy::Error)
@@ -2759,9 +2797,9 @@ async fn take_blob_descriptions_by_row_ids(
 async fn take_blob_descriptions_by_row_addresses(
     dataset: &Arc<Dataset>,
     row_addrs: &[u64],
-    column: &str,
+    blob_field_id: u32,
 ) -> Result<RecordBatch> {
-    let projection = dataset.schema().project(&[column])?;
+    let projection = blob_column_projection(dataset, blob_field_id);
     let projection_request = ProjectionRequest::from(projection);
     let projection_plan = Arc::new(projection_request.into_projection_plan(dataset.clone())?);
     TakeBuilder::try_new_from_addresses(dataset.clone(), row_addrs.to_vec(), projection_plan)?
@@ -2774,9 +2812,9 @@ async fn take_blob_descriptions_by_row_addresses(
 async fn collect_blob_selection_for_selection(
     dataset: &Arc<Dataset>,
     blob_field_id: u32,
-    column: &str,
     selection: &ReadBlobsSelection,
 ) -> Result<Vec<ResolvedBlobSelection>> {
+    let column_path = blob_column_path(dataset, blob_field_id)?;
     let description_and_addr = match selection {
         ReadBlobsSelection::None => {
             return Err(Error::invalid_input(
@@ -2784,16 +2822,16 @@ async fn collect_blob_selection_for_selection(
             ));
         }
         ReadBlobsSelection::RowIds(row_ids) => {
-            take_blob_descriptions_by_row_ids(dataset, row_ids, column).await?
+            take_blob_descriptions_by_row_ids(dataset, row_ids, blob_field_id).await?
         }
         ReadBlobsSelection::RowIndices(row_indices) => {
             let row_addrs =
                 super::take::row_offsets_to_row_addresses(&dataset.get_fragments(), row_indices)
                     .await?;
-            take_blob_descriptions_by_row_addresses(dataset, &row_addrs, column).await?
+            take_blob_descriptions_by_row_addresses(dataset, &row_addrs, blob_field_id).await?
         }
         ReadBlobsSelection::RowAddresses(row_addrs) => {
-            take_blob_descriptions_by_row_addresses(dataset, row_addrs, column).await?
+            take_blob_descriptions_by_row_addresses(dataset, row_addrs, blob_field_id).await?
         }
     };
 
@@ -2801,7 +2839,7 @@ async fn collect_blob_selection_for_selection(
         return Ok(Vec::new());
     }
 
-    let descriptions = leaf_descriptor_struct(&description_and_addr, column)?;
+    let descriptions = leaf_descriptor_struct(&description_and_addr, &column_path)?;
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
 
     let files = match blob_version_from_descriptions(descriptions)? {
@@ -2830,11 +2868,13 @@ async fn collect_blob_selection_for_selection(
         .collect())
 }
 
-/// Walk into the descriptor `RecordBatch` at `column` and return the leaf
-/// descriptor `StructArray`, descending through nested struct children for
-/// dotted paths.
-fn leaf_descriptor_struct<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a StructArray> {
-    let current = leaf_descriptor_array(batch, column)?;
+/// Walk into the descriptor `RecordBatch` at `column_path` and return the leaf
+/// descriptor `StructArray`, descending through nested struct children.
+fn leaf_descriptor_struct<'a>(
+    batch: &'a RecordBatch,
+    column_path: &[String],
+) -> Result<&'a StructArray> {
+    let current = leaf_descriptor_array(batch, column_path)?;
     current
         .as_any()
         .downcast_ref::<StructArray>()
@@ -2842,7 +2882,7 @@ fn leaf_descriptor_struct<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'
             Error::invalid_input_source(
                 format!(
                     "Blob column '{}' expected descriptor struct but got {}",
-                    column,
+                    display_blob_column_path(column_path),
                     current.data_type()
                 )
                 .into(),
@@ -2850,18 +2890,25 @@ fn leaf_descriptor_struct<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'
         })
 }
 
-fn leaf_descriptor_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a dyn Array> {
-    let path = parse_field_path(column)?;
+fn leaf_descriptor_array<'a>(
+    batch: &'a RecordBatch,
+    column_path: &[String],
+) -> Result<&'a dyn Array> {
+    let Some((root, rest)) = column_path.split_first() else {
+        return Err(Error::internal(
+            "Blob column path was empty in descriptor batch".to_string(),
+        ));
+    };
     let mut current: &dyn Array = batch
-        .column_by_name(&path[0])
+        .column_by_name(root)
         .ok_or_else(|| {
             Error::invalid_input(format!(
                 "Blob column '{}' was not found in descriptor batch",
-                column
+                display_blob_column_path(column_path)
             ))
         })?
         .as_ref();
-    for segment in &path[1..] {
+    for segment in rest {
         let struct_array = current
             .as_any()
             .downcast_ref::<StructArray>()
@@ -2869,7 +2916,7 @@ fn leaf_descriptor_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a
                 Error::invalid_input_source(
                     format!(
                         "Blob column path '{}' expected struct before segment '{}' but got {}",
-                        column,
+                        display_blob_column_path(column_path),
                         segment,
                         current.data_type()
                     )
@@ -2881,7 +2928,8 @@ fn leaf_descriptor_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Blob column path '{}' missing segment '{}'",
-                    column, segment
+                    display_blob_column_path(column_path),
+                    segment
                 ))
             })?
             .as_ref();

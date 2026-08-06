@@ -1120,6 +1120,7 @@ async fn build_user_view_struct(
     dataset: &Arc<Dataset>,
     descriptor: &BlobV2Descriptor<'_>,
     classification: &RowClassification,
+    blob_field_id: u32,
     column_name: &str,
     num_rows: usize,
     null_buffer: Option<NullBuffer>,
@@ -1127,7 +1128,7 @@ async fn build_user_view_struct(
     let blob_files = if classification.blob_read_addrs.is_empty() {
         Vec::new()
     } else {
-        super::blob::take_blobs_by_addresses(dataset, &classification.blob_read_addrs, column_name)
+        super::blob::take_blobs_by_field_id(dataset, &classification.blob_read_addrs, blob_field_id)
             .await?
     };
 
@@ -1251,15 +1252,13 @@ fn transformed_blob_v2_field(
 }
 
 /// Rewrite a blob v2 descriptor column, or a struct containing one, into the
-/// writer's user view. `column_path` is the dotted path to `array` in the dataset
-/// schema, which is how blob payloads are addressed when they are read back.
+/// writer's user view.
 fn transform_blob_v2_column<'a>(
     dataset: &'a Arc<Dataset>,
     lance_field: &'a lance_core::datatypes::Field,
     arrow_field: &'a Arc<arrow_schema::Field>,
     array: ArrayRef,
     row_addrs: &'a arrow::array::UInt64Array,
-    column_path: String,
 ) -> BoxFuture<'a, Result<(ArrayRef, Arc<arrow_schema::Field>)>> {
     async move {
         // Blob payloads are addressed by row address, so a blob v2 leaf can only be
@@ -1268,7 +1267,7 @@ fn transform_blob_v2_column<'a>(
             return Err(Error::not_supported(format!(
                 "Compacting a blob v2 column nested under '{}' of type {}; \
                  only struct nesting is supported",
-                column_path,
+                dataset.schema().field_path_minimal(lance_field.id)?,
                 array.data_type()
             )));
         };
@@ -1286,7 +1285,6 @@ fn transform_blob_v2_column<'a>(
                             child_field,
                             child_array,
                             row_addrs,
-                            format!("{column_path}.{}", child_field.name()),
                         )
                         .await?;
                         new_children.push(new_child);
@@ -1321,12 +1319,15 @@ fn transform_blob_v2_column<'a>(
             return Ok((array.clone(), arrow_field.clone()));
         }
 
+        // Only for error context; the payload read below addresses the column by id.
+        let column_path = dataset.schema().field_path_minimal(lance_field.id)?;
         let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, &column_path)?;
         let classification = classify_rows(struct_arr, &descriptor, row_addrs, &column_path)?;
         let new_struct = build_user_view_struct(
             dataset,
             &descriptor,
             &classification,
+            lance_field.id as u32,
             &column_path,
             struct_arr.len(),
             struct_arr.nulls().cloned(),
@@ -1403,15 +1404,9 @@ pub(crate) async fn transform_blob_v2_batch(
         let column = batch.column(col_idx).clone();
         match schema.field(field.name()) {
             Some(lance_field) if contains_blob_v2(lance_field) => {
-                let (new_column, new_field) = transform_blob_v2_column(
-                    dataset,
-                    lance_field,
-                    field,
-                    column,
-                    row_addrs,
-                    field.name().clone(),
-                )
-                .await?;
+                let (new_column, new_field) =
+                    transform_blob_v2_column(dataset, lance_field, field, column, row_addrs)
+                        .await?;
                 new_columns.push(new_column);
                 new_fields.push(new_field);
             }
@@ -8059,8 +8054,15 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::plain("payload", "asset.payload")]
+    #[case::dotted("payload.with.dot", "asset.`payload.with.dot`")]
+    #[case::backticked("payload`quote", "asset.`payload``quote`")]
     #[tokio::test]
-    async fn test_compact_blob_v2_struct_nested_column() {
+    async fn test_compact_blob_v2_struct_nested_column(
+        #[case] leaf_name: &str,
+        #[case] leaf_path: &str,
+    ) {
         use crate::BlobArrayBuilder;
         use arrow_array::StringArray;
         use lance_core::utils::tempfile::TempDir;
@@ -8082,7 +8084,7 @@ mod tests {
             }
         }
 
-        let payload_field = crate::blob_field("payload", true);
+        let payload_field = crate::blob_field(leaf_name, true);
         let asset_fields = vec![Field::new("mime", DataType::Utf8, true), payload_field];
         let asset_array: ArrayRef = Arc::new(
             StructArray::try_new(
@@ -8156,7 +8158,7 @@ mod tests {
         assert!((0..mime.len()).all(|i| mime.value(i) == "image/png"));
 
         let blobs = dataset
-            .take_blobs_by_indices(&[0, 1, 2], "asset.payload")
+            .take_blobs_by_indices(&[0, 1, 2], leaf_path)
             .await
             .unwrap();
         let mut actual = Vec::with_capacity(blobs.len());

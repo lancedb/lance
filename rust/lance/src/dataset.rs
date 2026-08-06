@@ -1848,11 +1848,7 @@ impl Dataset {
     pub fn read_blobs(self: &Arc<Self>, column: impl AsRef<str>) -> Result<ReadBlobsBuilder> {
         let column = column.as_ref();
         let blob_field_id = blob::validate_blob_column(self, column)?;
-        Ok(ReadBlobsBuilder::new(
-            self.clone(),
-            column.to_string(),
-            blob_field_id,
-        ))
+        Ok(ReadBlobsBuilder::new(self.clone(), blob_field_id))
     }
 
     /// Create a planned reader for row-specific blob-local byte ranges.
