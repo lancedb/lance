@@ -4564,9 +4564,9 @@ impl Scanner {
             plan,
             Partitioning::RoundRobinBatch(1),
         )?);
-        // Indexed and flat hits arrive from independent plans, so the top-k over
-        // their union sorts on the full FTS key rather than on score alone, which a
-        // `SortExec` top-k does not break deterministically.
+        // A `SortExec` top-k is not stable, so it sorts on the full FTS key rather
+        // than on score alone. Both inputs need that: the union interleaves two
+        // independent plans, and a flat-only scan arrives in fragment order.
         let sort_exprs = fts_result_sort_exprs(plan.schema().as_ref())?;
         Ok(Arc::new(
             SortExec::new(sort_exprs, plan).with_fetch(params.limit),

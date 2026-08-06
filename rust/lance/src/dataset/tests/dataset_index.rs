@@ -1564,6 +1564,60 @@ async fn test_match_query_tie_is_a_stable_prefix_with_unindexed_rows() {
     }
 }
 
+#[tokio::test]
+async fn test_match_query_tie_is_a_stable_prefix_without_an_index() {
+    // With no FTS index every hit is scored on the flat path, and the leaf top-k is
+    // a `SortExec` over a scan that carries no ranking of its own. Only the sort key
+    // decides which of the tied rows survive the fetch.
+    const NUM_ROWS: usize = 64;
+    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; NUM_ROWS])).unwrap();
+    let schema = batch.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 8,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 8);
+
+    let query: FtsQuery = MatchQuery::new("common".to_owned())
+        .with_column(Some("text".to_owned()))
+        .into();
+    // An unlimited flat plan has no top-k above it, so this is a source of the tied
+    // hits, not of their order.
+    let mut expected = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(expected.len(), NUM_ROWS);
+    let top_score = expected[0].1;
+    assert!(
+        expected
+            .iter()
+            .all(|(_, score)| (score - top_score).abs() < 1e-6),
+        "premise: every document must tie on score"
+    );
+    expected.sort_unstable_by_key(|(row_id, _)| *row_id);
+
+    for limit in [1, 9, 33] {
+        let limited = compound_fts_results(&dataset, query.clone(), Some(limit as i64)).await;
+        assert_eq!(
+            limited,
+            expected[..limit],
+            "top-{limit} must be the lowest tied row_ids, in row_id order"
+        );
+    }
+    // The eight fragments feed the sort concurrently, so repeat the query to check
+    // the result does not depend on the order they arrive in.
+    for _ in 0..5 {
+        assert_eq!(
+            compound_fts_results(&dataset, query.clone(), Some(5)).await,
+            expected[..5]
+        );
+    }
+}
+
 /// One `(row_id, doc_index, score)` per hit of an element-granularity FTS scan,
 /// in result order.
 async fn element_fts_results(
