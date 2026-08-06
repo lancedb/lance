@@ -27,12 +27,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class VectorIndexTest {
@@ -309,6 +312,106 @@ public class VectorIndexTest {
         assertTrue(
             indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
+      }
+    }
+  }
+
+  /**
+   * {@code includeColumns} must be a defensive, unmodifiable copy: mutating the list the caller
+   * passed to the builder (or the list the getter returns) must not change the params, so the JNI
+   * read at build time sees exactly what was requested.
+   */
+  @Test
+  public void testIncludeColumnsIsDefensivelyCopied() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+    List<String> cols = new ArrayList<>();
+    cols.add("i");
+    VectorIndexParams params = new VectorIndexParams.Builder(ivf).setIncludeColumns(cols).build();
+
+    // Mutating the caller's list after build must not affect the params.
+    cols.add("s");
+    cols.clear();
+    assertEquals(
+        Collections.singletonList("i"),
+        params.getIncludeColumns(),
+        "include columns must be a defensive copy, unaffected by caller mutation");
+
+    // The returned list must be unmodifiable.
+    assertThrows(UnsupportedOperationException.class, () -> params.getIncludeColumns().add("x"));
+  }
+
+  /**
+   * {@code Index.includedFields} must be a defensive, unmodifiable copy, matching {@code
+   * VectorIndexParams.includeColumns}: mutating the caller's list (or the list the getter returns)
+   * must not change the value object -- equals/hashCode would silently drift, and a later JNI
+   * commit would read mutated covering metadata while the index files still carry the payload.
+   */
+  @Test
+  public void testIndexIncludedFieldsIsDefensivelyCopied() {
+    List<Integer> ids = new ArrayList<>();
+    ids.add(3);
+    Index index =
+        Index.builder()
+            .uuid(UUID.randomUUID())
+            .fields(Collections.singletonList(0))
+            .name("covered_idx")
+            .datasetVersion(1L)
+            .indexVersion(0)
+            .includedFields(ids)
+            .build();
+
+    // Mutating the caller's list after build must not affect the index.
+    ids.add(7);
+    ids.clear();
+    assertEquals(
+        Collections.singletonList(3),
+        index.includedFields(),
+        "included fields must be a defensive copy, unaffected by caller mutation");
+
+    // The returned list must be unmodifiable.
+    assertThrows(UnsupportedOperationException.class, () -> index.includedFields().add(9));
+  }
+
+  /**
+   * A covered ("included") column set on {@link VectorIndexParams} must be threaded through the JNI
+   * create path into the built index's metadata, so the committed index reports the covered field
+   * id. Without the wiring the index would build but silently carry no covering columns.
+   */
+  @Test
+  public void testCreateIvfFlatIndexWithCoveringColumns(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("ivf_flat_covering"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+
+        // Cover the non-vector "i" column so a projection of it is answered from the index.
+        VectorIndexParams vectorIndexParams =
+            new VectorIndexParams.Builder(ivf)
+                .setDistanceType(DistanceType.L2)
+                .setIncludeColumns(Collections.singletonList("i"))
+                .build();
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_FLAT,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        Index covered =
+            dataset.getIndexes().stream()
+                .filter(idx -> TestVectorDataset.indexName.equals(idx.name()))
+                .findFirst()
+                .orElse(null);
+        assertNotNull(covered, "Expected covered IVF_FLAT index to be present");
+        assertEquals(
+            1,
+            covered.includedFields().size(),
+            "index should report exactly the one covering column that was requested; was "
+                + covered.includedFields());
       }
     }
   }

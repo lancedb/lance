@@ -542,6 +542,10 @@ async fn do_load_shuffled_vectors(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        // Correct, not a gap: pre-shuffled vector files never carry covering ("included")
+        // columns, so an empty declaration matches what this segment's storage actually holds.
+        // Making this path build covering segments means threading them through the shuffle,
+        // not populating this field.
         included_fields: Vec::new(),
     };
     ds.commit_existing_index_segments(index_name, column, vec![metadata])
@@ -625,6 +629,9 @@ pub struct PyIndexSegmentDescription {
     /// The id of the dataset base path that stores this segment
     /// (None when the segment is stored in the dataset's default base path)
     pub base_id: Option<i64>,
+    /// The ids of the covering ("included") fields whose values are co-located in
+    /// this segment's storage. Empty for segments without covering columns.
+    pub included_fields: Vec<i32>,
 }
 
 impl PyIndexSegmentDescription {
@@ -644,19 +651,21 @@ impl PyIndexSegmentDescription {
             created_at: segment.created_at,
             size_bytes,
             base_id: segment.base_id.map(|id| id as i64),
+            included_fields: segment.included_fields.clone(),
         }
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?})",
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?}, included_fields={:?})",
             self.uuid,
             self.dataset_version_at_last_update,
             self.fragment_ids,
             self.index_version,
             self.created_at,
             self.size_bytes,
-            self.base_id
+            self.base_id,
+            self.included_fields
         )
     }
 }
@@ -678,6 +687,12 @@ pub struct PyIndexDescription {
     pub num_rows_indexed: u64,
     /// The details of the index
     pub details: PyJson,
+    /// The ids of the covering ("included") fields the index co-locates alongside
+    /// its key fields, so covered queries can skip the base-table take. Empty for
+    /// indexes without covering columns. All segments of one index share the set.
+    pub included_fields: Vec<i32>,
+    /// The resolved names of `included_fields` in the current schema.
+    pub included_field_names: Vec<String>,
     /// The segments of the index
     pub segments: Vec<PyIndexSegmentDescription>,
     /// The total size in bytes of all files across all segments
@@ -698,10 +713,26 @@ impl PyIndexDescription {
             })
             .collect();
 
-        let segments = index
+        let segments: Vec<PyIndexSegmentDescription> = index
             .metadata()
             .iter()
             .map(PyIndexSegmentDescription::from_metadata)
+            .collect();
+
+        // All segments of one logical index declare the same covering columns
+        // (enforced at every commit boundary), so the first segment is authoritative.
+        let included_fields = segments
+            .first()
+            .map(|segment| segment.included_fields.clone())
+            .unwrap_or_default();
+        let included_field_names = included_fields
+            .iter()
+            .map(|field| {
+                dataset
+                    .schema()
+                    .field_path_minimal(*field)
+                    .unwrap_or_else(|_| "<unknown>".to_string())
+            })
             .collect();
 
         let details = index.details().unwrap_or_else(|_| "{}".to_string());
@@ -711,6 +742,8 @@ impl PyIndexDescription {
             fields: index.field_ids().to_vec(),
             field_names,
             index_type: index.index_type().to_string(),
+            included_fields,
+            included_field_names,
             segments,
             type_url: index.type_url().to_string(),
             num_rows_indexed: index.rows_indexed(),

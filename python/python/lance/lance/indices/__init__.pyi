@@ -79,6 +79,7 @@ class IndexSegmentDescription:
     created_at: Optional[datetime]
     size_bytes: Optional[int]
     base_id: Optional[int]
+    included_fields: list[int]
 
     def __repr__(self) -> str: ...
 
@@ -89,6 +90,8 @@ class IndexDescription:
     num_rows_indexed: int
     fields: list[int]
     field_names: list[str]
+    included_fields: list[int]
+    included_field_names: list[str]
     segments: list[IndexSegmentDescription]
     details: dict
     total_size_bytes: Optional[int]

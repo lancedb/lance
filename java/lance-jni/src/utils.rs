@@ -24,7 +24,7 @@ use lance_linalg::distance::DistanceType;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
-use crate::traits::FromJObjectWithEnv;
+use crate::traits::{FromJObjectWithEnv, import_vec_from_method};
 use lance_index::vector::{ApproxMode, Query};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -487,13 +487,22 @@ pub fn get_vector_index_params(
                 stages.push(StageParams::RQ(rq_params));
             }
 
+            // Covering ("included") columns: names of extra dataset columns stored inline in
+            // the index. Empty when absent. The core validates them when the index is built.
+            let include_columns: Vec<String> = import_vec_from_method(
+                env,
+                &vector_index_params_obj,
+                "getIncludeColumns",
+                |env, elem| Ok(env.get_string(&JString::from(elem))?.into()),
+            )?;
+
             Ok(VectorIndexParams {
                 metric_type: distance_type,
                 stages,
                 version: IndexFileVersion::V3,
                 skip_transpose: false,
                 runtime_hints: Default::default(),
-                include_columns: Vec::new(),
+                include_columns,
             })
         },
     )?;

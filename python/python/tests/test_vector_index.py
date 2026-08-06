@@ -309,6 +309,43 @@ def test_ann(indexed_dataset):
     run(indexed_dataset)
 
 
+def test_create_index_with_included_columns(tmp_path):
+    """A covered ("included") column passed to create_index is threaded through the
+    PyO3 boundary into the built index's metadata, so the committed index reports the
+    covered field id. Without the wiring the index builds but carries no covering
+    columns."""
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    def field_id(name):
+        for field in dataset.lance_schema.fields():
+            if field.name() == name:
+                return field.id()
+        raise KeyError(name)
+
+    price_id = field_id("price")
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        include_columns=["price"],
+    )
+
+    # The CreateIndex transaction carries the built index's metadata, including the
+    # covered field ids.
+    created_index = dataset.get_transactions(1)[0].operation.new_indices[0]
+    assert created_index.included_fields == [price_id]
+
+    # The covering state is also visible through the index descriptions, so users
+    # can see which columns an index covers without replaying transactions.
+    desc = dataset.describe_indices()[0]
+    assert desc.included_fields == [price_id]
+    assert desc.included_field_names == ["price"]
+    assert desc.segments[0].included_fields == [price_id]
+
+
 def test_create_index_progress_callback_vector(tmp_path):
     ds = _make_sample_dataset_base(tmp_path, "vector_progress", 1500, 128)
     recorder = ProgressRecorder()

@@ -3700,6 +3700,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
+        include_columns: Optional[List[str]] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
@@ -4028,6 +4029,9 @@ class LanceDataset(pa.dataset.Dataset):
         if rabitq_model is not None:
             kwargs["rabitq_model"] = rabitq_model
 
+        if include_columns is not None:
+            kwargs["include_columns"] = include_columns
+
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
         if fragment_ids is not None:
@@ -4088,6 +4092,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        include_columns: Optional[List[str]] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ) -> LanceDataset:
@@ -4157,6 +4162,12 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
             created without training, which can be populated later.
+        include_columns : List[str], optional
+            Names of extra dataset columns to cover ("include") in a vector index.
+            Their values are stored inline in the index so a query projecting only
+            covered columns is answered from the index without a take from the base
+            table. Each must be a top-level, non-key column; the columns are
+            validated by the core when the index is built. Vector indexes only.
         fragment_ids : List[int], optional
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
@@ -4323,6 +4334,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            include_columns=include_columns,
             require_commit=True,
             **kwargs,
         )
@@ -4361,6 +4373,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
+        include_columns: Optional[List[str]] = None,
         **kwargs,
     ) -> Index:
         """
@@ -4469,6 +4482,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             rabitq_model=rabitq_model,
+            include_columns=include_columns,
             require_commit=False,
             **kwargs,
         )
