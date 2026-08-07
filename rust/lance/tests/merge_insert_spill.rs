@@ -19,6 +19,8 @@ use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 
 const MEM_POOL_SIZE: u64 = 16 * 1024 * 1024;
+const LARGE_ROW_MEM_POOL_SIZE: u64 = 512 * 1024 * 1024;
+const LARGE_PAYLOAD_BYTES: u64 = 30 * 1024 * 1024;
 const NUM_ROWS: u64 = 8192;
 
 #[tokio::test]
@@ -76,5 +78,66 @@ async fn test_indexed_merge_insert_spills_wide_source() {
             .await
             .unwrap(),
         NUM_ROWS as usize
+    );
+
+    unsafe {
+        std::env::set_var("LANCE_MEM_POOL_SIZE", LARGE_ROW_MEM_POOL_SIZE.to_string());
+    }
+
+    // The rechunk target is a batching threshold, not a row-size validity
+    // limit. A single 30 MiB payload must remain valid when it fits the actual
+    // execution pool.
+    let large_target = gen_batch()
+        .with_seed(Seed::from(3))
+        .col("id", array::step::<arrow_array::types::UInt64Type>())
+        .col(
+            "payload",
+            array::rand_utf8(ByteCount::from(LARGE_PAYLOAD_BYTES), false),
+        )
+        .col("updated", array::fill::<arrow_array::types::UInt32Type>(0))
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut large_dataset = Dataset::write(large_target, "memory://", None)
+        .await
+        .unwrap();
+    large_dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let large_source: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
+        gen_batch()
+            .with_seed(Seed::from(4))
+            .col("id", array::step::<arrow_array::types::UInt64Type>())
+            .col(
+                "payload",
+                array::rand_utf8(ByteCount::from(LARGE_PAYLOAD_BYTES), false),
+            )
+            .col("updated", array::fill::<arrow_array::types::UInt32Type>(1))
+            .into_reader_rows(RowCount::from(1), BatchCount::from(1)),
+    );
+    let (large_dataset, large_stats) =
+        MergeInsertBuilder::try_new(Arc::new(large_dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(large_source)
+            .await
+            .unwrap();
+
+    assert_eq!(large_stats.num_updated_rows, 1);
+    assert_eq!(
+        large_dataset
+            .count_rows(Some("updated = 1".to_string()))
+            .await
+            .unwrap(),
+        1
     );
 }

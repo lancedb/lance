@@ -1104,7 +1104,9 @@ impl ExecutionPlan for StrictBatchSizeExec {
 /// batch actually needs to be sliced — batches that are already within the
 /// target range pass through at zero cost.
 ///
-/// If a single row exceeds `max_bytes`, execution fails with an error.
+/// An indivisible row larger than `max_bytes` passes through as a single-row
+/// batch. The downstream operator's memory pool remains the source of truth for
+/// whether that row can be processed safely.
 #[derive(Clone, Debug)]
 pub struct HardCapBatchSizeExec {
     input: Arc<dyn ExecutionPlan>,
@@ -1164,22 +1166,7 @@ impl ExecutionPlan for HardCapBatchSizeExec {
             0,
             max_bytes,
         );
-        // Check that no single-row batch exceeds the limit.
-        let validated = rechunked.map(move |result| {
-            let batch = result?;
-            if batch.num_rows() == 1 && batch.get_array_memory_size() > max_bytes {
-                return Err(DataFusionError::External(Box::new(Error::invalid_input(
-                    format!(
-                        "a single row is {} bytes which exceeds the maximum allowed batch \
-                         size of {} bytes",
-                        batch.get_array_memory_size(),
-                        max_bytes,
-                    ),
-                ))));
-            }
-            Ok(batch)
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, validated)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rechunked)))
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {

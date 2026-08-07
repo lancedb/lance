@@ -1051,6 +1051,50 @@ impl MergeInsertJob {
             SchemaComparison::Subschema => true,
         };
 
+        // The sort-merge join groups source rows by key. FirstSeen still needs
+        // equal-key rows in their original encounter order, so add a temporary
+        // ordinal before the source is replayed or sorted.
+        let source_ordinal_column =
+            (self.params.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen).then(|| {
+                let mut name = "__merge_source_ordinal".to_string();
+                while schema.column_with_name(&name).is_some() {
+                    name.push('_');
+                }
+                name
+            });
+        let source = if let Some(source_ordinal_column) = source_ordinal_column.as_ref() {
+            let ordinal_field = Field::new(source_ordinal_column, DataType::UInt64, false);
+            let ordinal_schema = Arc::new(schema.as_ref().try_with_column(ordinal_field.clone())?);
+            let mut next_ordinal = 0_u64;
+            let source_with_ordinal = source.map(move |batch| {
+                let batch = batch?;
+                let num_rows = u64::try_from(batch.num_rows()).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "merge-insert source batch row count {} exceeds u64::MAX",
+                        batch.num_rows()
+                    ))
+                })?;
+                let end_ordinal = next_ordinal.checked_add(num_rows).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "merge-insert source ordinal overflow at {} with batch row count {}",
+                        next_ordinal,
+                        batch.num_rows()
+                    ))
+                })?;
+                let ordinals = Arc::new(UInt64Array::from_iter_values(next_ordinal..end_ordinal));
+                next_ordinal = end_ordinal;
+                batch
+                    .try_with_column(ordinal_field.clone(), ordinals)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))
+            });
+            Box::pin(RecordBatchStreamAdapter::new(
+                ordinal_schema,
+                source_with_ordinal,
+            )) as SendableRecordBatchStream
+        } else {
+            source
+        };
+
         // 1 - Make the one-shot source replayable for the index probe and the
         //     final join. Keep only a small, pool-relative buffer in memory;
         //     larger sources spill to disk.
@@ -1225,7 +1269,7 @@ impl MergeInsertJob {
         // capping oversized batches so the sorts and the join can spill within
         // the configured fair memory pool.
         let sort_options = vec![SortOptions::default(); on_keys.len()];
-        let source_ordering = on_keys
+        let mut source_ordering = on_keys
             .iter()
             .zip(sort_options.iter())
             .map(|((source_key, _), options)| PhysicalSortExpr {
@@ -1233,6 +1277,15 @@ impl MergeInsertJob {
                 options: *options,
             })
             .collect::<Vec<_>>();
+        if let Some(source_ordinal_column) = source_ordinal_column.as_ref() {
+            source_ordering.push(PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema(
+                    source_ordinal_column,
+                    source_input.schema().as_ref(),
+                )?),
+                options: SortOptions::default(),
+            });
+        }
         let target_ordering = on_keys
             .iter()
             .zip(sort_options.iter())
@@ -1249,7 +1302,7 @@ impl MergeInsertJob {
         let target = Arc::new(HardCapBatchSizeExec::new(target, max_batch_bytes));
         let source_input = Arc::new(SortExec::new(source_ordering, source_input));
         let target = Arc::new(SortExec::new(target_ordering, target));
-        let joined = Arc::new(SortMergeJoinExec::try_new(
+        let joined: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
             source_input,
             target,
             on_keys,
@@ -1258,6 +1311,15 @@ impl MergeInsertJob {
             sort_options,
             null_equality,
         )?);
+        let joined = if let Some(source_ordinal_column) = source_ordinal_column {
+            let output_schema = joined
+                .schema()
+                .as_ref()
+                .without_column(&source_ordinal_column);
+            Arc::new(project(joined, &output_schema)?) as Arc<dyn ExecutionPlan>
+        } else {
+            joined
+        };
         execute_plan(joined, execution_options)
     }
 
@@ -9346,30 +9408,36 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .unwrap();
         }
 
-        // Split distinct duplicate values across batches to verify that FirstSeen
-        // preserves source order across the entire stream. On the v2 path, also
-        // verify that NULL keys remain distinct under SQL equality.
-        let (first, second, expected_inserted) = if with_index {
-            (
-                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(1)])).unwrap(),
-                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(2)])).unwrap(),
-                1,
+        // Exercise enough indexed duplicates to force the source sort to
+        // rearrange keys. The first 64 rows contain each key exactly once, so
+        // their values are the expected FirstSeen winners after the sort.
+        let (source_batches, expected_inserted, expected_updated, expected_skipped) = if with_index
+        {
+            let ids = (0..4096).map(|row| (row * 37) % 64).collect::<Vec<i32>>();
+            let values = (0..4096).collect::<Vec<i32>>();
+            let source = RecordBatch::try_new(
+                initial.schema(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(Int32Array::from(values)),
+                ],
             )
+            .unwrap();
+            (vec![Ok(source)], 63, 1, 4096 - 64)
         } else {
-            (
-                record_batch!(
-                    ("id", Int32, [Some(108), None]),
-                    ("value", Int32, [Some(1), Some(3)])
-                )
-                .unwrap(),
-                record_batch!(
-                    ("id", Int32, [Some(108), None]),
-                    ("value", Int32, [Some(2), Some(4)])
-                )
-                .unwrap(),
-                3,
+            let first = record_batch!(
+                ("id", Int32, [Some(108), None]),
+                ("value", Int32, [Some(1), Some(3)])
             )
+            .unwrap();
+            let second = record_batch!(
+                ("id", Int32, [Some(108), None]),
+                ("value", Int32, [Some(2), Some(4)])
+            )
+            .unwrap();
+            (vec![Ok(first), Ok(second)], 3, 0, 1)
         };
+        let source_schema = source_batches[0].as_ref().unwrap().schema();
 
         let (dataset, stats) =
             MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
@@ -9380,15 +9448,33 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .try_build()
                 .unwrap()
                 .execute_reader(Box::new(RecordBatchIterator::new(
-                    [Ok(first.clone()), Ok(second)],
-                    first.schema(),
+                    source_batches,
+                    source_schema,
                 )))
                 .await
                 .unwrap();
 
         assert_eq!(stats.num_inserted_rows, expected_inserted);
-        assert_eq!(stats.num_updated_rows, 0);
-        assert_eq!(stats.num_skipped_duplicates, 1);
+        assert_eq!(stats.num_updated_rows, expected_updated);
+        assert_eq!(stats.num_skipped_duplicates, expected_skipped);
+
+        if with_index {
+            let result = dataset.scan().try_into_batch().await.unwrap();
+            let ids = result["id"].as_primitive::<Int32Type>();
+            let values = result["value"].as_primitive::<Int32Type>();
+            let actual = ids
+                .values()
+                .iter()
+                .zip(values.values().iter())
+                .map(|(&id, &value)| (id, value))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(actual.len(), 64);
+            for first_row in 0..64 {
+                let id = (first_row * 37) % 64;
+                assert_eq!(actual.get(&id), Some(&first_row));
+            }
+            return;
+        }
 
         let inserted = dataset
             .scan()
