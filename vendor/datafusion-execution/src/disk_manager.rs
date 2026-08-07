@@ -334,17 +334,40 @@ impl DiskManager {
         }
 
         let dir_index = rng().random_range(0..local_dirs.len());
+        let tempfile = Builder::new()
+            .tempfile_in(local_dirs[dir_index].as_ref())
+            .map_err(DataFusionError::IoError)?;
         self.active_files_count.fetch_add(1, Ordering::Relaxed);
         Ok(RefCountedTempFile {
-            parent_temp_dir: Arc::clone(&local_dirs[dir_index]),
-            tempfile: Arc::new(
-                Builder::new()
-                    .tempfile_in(local_dirs[dir_index].as_ref())
-                    .map_err(DataFusionError::IoError)?,
-            ),
-            current_file_disk_usage: Arc::new(AtomicU64::new(0)),
-            disk_manager: Arc::clone(self),
+            state: Arc::new(TempFileState {
+                tempfile,
+                _parent_temp_dir: Arc::clone(&local_dirs[dir_index]),
+                current_file_disk_usage: AtomicU64::new(0),
+                disk_manager: Arc::clone(self),
+            }),
         })
+    }
+}
+
+#[derive(Debug)]
+struct TempFileState {
+    tempfile: NamedTempFile,
+    /// Keeps the directory alive until after the temporary file is removed.
+    _parent_temp_dir: Arc<TempDir>,
+    current_file_disk_usage: AtomicU64,
+    disk_manager: Arc<DiskManager>,
+}
+
+impl Drop for TempFileState {
+    fn drop(&mut self) {
+        let _accounting_guard = self.disk_manager.accounting_lock.lock();
+        let current_usage = self.current_file_disk_usage.load(Ordering::Relaxed);
+        self.disk_manager
+            .used_disk_space
+            .fetch_sub(current_usage, Ordering::Relaxed);
+        self.disk_manager
+            .active_files_count
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -365,41 +388,18 @@ impl DiskManager {
 ///
 /// Once all references to this file are dropped, the file is deleted, and the
 /// disk usage is subtracted from the disk manager's total.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RefCountedTempFile {
-    /// The reference to the directory in which temporary files are created to ensure
-    /// it is not cleaned up prior to the NamedTempFile
-    parent_temp_dir: Arc<TempDir>,
-    /// The underlying temporary file, wrapped in Arc to allow cloning
-    tempfile: Arc<NamedTempFile>,
-    /// Tracks the current disk usage of this temporary file. See
-    /// [`Self::update_disk_usage`] for more details.
-    ///
-    /// This is wrapped in `Arc<AtomicU64>` so that all clones share the same
-    /// disk usage tracking, preventing incorrect accounting when clones are dropped.
-    current_file_disk_usage: Arc<AtomicU64>,
-    /// The disk manager that created and manages this temporary file
-    disk_manager: Arc<DiskManager>,
-}
-
-impl Clone for RefCountedTempFile {
-    fn clone(&self) -> Self {
-        Self {
-            parent_temp_dir: Arc::clone(&self.parent_temp_dir),
-            tempfile: Arc::clone(&self.tempfile),
-            current_file_disk_usage: Arc::clone(&self.current_file_disk_usage),
-            disk_manager: Arc::clone(&self.disk_manager),
-        }
-    }
+    state: Arc<TempFileState>,
 }
 
 impl RefCountedTempFile {
     pub fn path(&self) -> &Path {
-        self.tempfile.path()
+        self.state.tempfile.path()
     }
 
     pub fn inner(&self) -> &NamedTempFile {
-        self.tempfile.as_ref()
+        &self.state.tempfile
     }
 
     /// Updates the global disk usage counter after modifications to the underlying file.
@@ -408,14 +408,18 @@ impl RefCountedTempFile {
     /// - Returns an error if the global disk usage exceeds the configured limit.
     pub fn update_disk_usage(&mut self) -> Result<()> {
         // Get new file size from OS
-        let metadata = self.tempfile.as_file().metadata()?;
+        let metadata = self.state.tempfile.as_file().metadata()?;
         let new_disk_usage = metadata.len();
 
-        let _accounting_guard = self.disk_manager.accounting_lock.lock();
+        let _accounting_guard = self.state.disk_manager.accounting_lock.lock();
 
         // Get the old disk usage
-        let old_disk_usage = self.current_file_disk_usage.load(Ordering::Relaxed);
-        let used_disk_space = self.disk_manager.used_disk_space.load(Ordering::Relaxed);
+        let old_disk_usage = self.state.current_file_disk_usage.load(Ordering::Relaxed);
+        let used_disk_space = self
+            .state
+            .disk_manager
+            .used_disk_space
+            .load(Ordering::Relaxed);
         let Some(global_disk_usage) = used_disk_space
             .checked_sub(old_disk_usage)
             .and_then(|usage| usage.checked_add(new_disk_usage))
@@ -424,45 +428,28 @@ impl RefCountedTempFile {
                 "spill disk accounting overflow: used_disk_space={used_disk_space}, old_file_disk_usage={old_disk_usage}, new_file_disk_usage={new_disk_usage}"
             )));
         };
-        if global_disk_usage > self.disk_manager.max_temp_directory_size {
+        if global_disk_usage > self.state.disk_manager.max_temp_directory_size {
             return resources_err!(
                 "The used disk space during the spilling process has exceeded the allowable limit of {}. \
                 Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.",
-                human_readable_size(self.disk_manager.max_temp_directory_size as usize)
+                human_readable_size(self.state.disk_manager.max_temp_directory_size as usize)
             );
         }
 
         // Commit global and per-file usage together only after the limit check.
-        self.disk_manager
+        self.state
+            .disk_manager
             .used_disk_space
             .store(global_disk_usage, Ordering::Relaxed);
-        self.current_file_disk_usage
+        self.state
+            .current_file_disk_usage
             .store(new_disk_usage, Ordering::Relaxed);
 
         Ok(())
     }
 
     pub fn current_disk_usage(&self) -> u64 {
-        self.current_file_disk_usage.load(Ordering::Relaxed)
-    }
-}
-
-/// When the temporary file is dropped, subtract its disk usage from the disk manager's total
-impl Drop for RefCountedTempFile {
-    fn drop(&mut self) {
-        // Only subtract disk usage when this is the last reference to the file
-        // Check if we're the last one by seeing if there's only one strong reference
-        // left to the underlying tempfile (the one we're holding)
-        if Arc::strong_count(&self.tempfile) == 1 {
-            let _accounting_guard = self.disk_manager.accounting_lock.lock();
-            let current_usage = self.current_file_disk_usage.load(Ordering::Relaxed);
-            self.disk_manager
-                .used_disk_space
-                .fetch_sub(current_usage, Ordering::Relaxed);
-            self.disk_manager
-                .active_files_count
-                .fetch_sub(1, Ordering::Relaxed);
-        }
+        self.state.current_file_disk_usage.load(Ordering::Relaxed)
     }
 }
 
@@ -485,6 +472,11 @@ fn create_local_dirs(local_dirs: &[PathBuf]) -> Result<Vec<Arc<TempDir>>> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Barrier, mpsc},
+        thread,
+    };
+
     use super::*;
 
     #[test]
@@ -683,6 +675,55 @@ mod tests {
         assert_eq!(dm.used_disk_space(), 1);
         drop(first);
         assert_eq!(dm.used_disk_space(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_final_drops_release_disk_usage() -> Result<()> {
+        const ATTEMPTS: usize = 20_000;
+
+        let dm = Arc::new(DiskManagerBuilder::default().build()?);
+        let barrier = Arc::new(Barrier::new(3));
+        let (first_sender, first_receiver) = mpsc::channel::<RefCountedTempFile>();
+        let (second_sender, second_receiver) = mpsc::channel::<RefCountedTempFile>();
+
+        thread::scope(|scope| {
+            for receiver in [first_receiver, second_receiver] {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    while let Ok(file) = receiver.recv() {
+                        barrier.wait();
+                        drop(file);
+                        barrier.wait();
+                    }
+                });
+            }
+
+            for attempt in 0..ATTEMPTS {
+                let mut first = dm
+                    .create_tmp_file("Testing concurrent final drops")
+                    .unwrap();
+                first.inner().as_file().set_len(1).unwrap();
+                first.update_disk_usage().unwrap();
+                let second = first.clone();
+                first_sender.send(first).unwrap();
+                second_sender.send(second).unwrap();
+
+                barrier.wait();
+                barrier.wait();
+
+                assert_eq!(dm.used_disk_space(), 0, "failed on attempt {attempt}");
+                assert_eq!(
+                    dm.spilling_progress().active_files_count,
+                    0,
+                    "failed on attempt {attempt}"
+                );
+            }
+
+            drop(first_sender);
+            drop(second_sender);
+        });
+
         Ok(())
     }
 
