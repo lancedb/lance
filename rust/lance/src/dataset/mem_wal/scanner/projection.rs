@@ -191,17 +191,13 @@ pub fn null_columns(
     Ok(Arc::new(projection_exec))
 }
 
-/// Force `plan` to report exactly `target_schema`, re-labeling its batches when
-/// the plan's own schema differs.
+/// Force `plan` to report exactly `target_schema`; a no-op when they agree.
 ///
-/// DataFusion derives a `ProjectionExec`'s field nullability from its
-/// expressions (`Column::nullable(input_schema)`), not from the schema the
-/// planner asked for, so a projection alone cannot pin this down. It matters
-/// because a shard's storage tier widens non-PK columns to nullable while the
-/// base-table arm keeps the base table's nullability, and `CoalesceFirstExec`
-/// and `concat_batches` both require exact schema equality.
-///
-/// A no-op when the schemas already agree.
+/// A `ProjectionExec` cannot do this on its own — DataFusion derives its field
+/// nullability from the expressions, not from the schema the planner asked for
+/// — and the storage schema's widened non-PK columns leave the WAL arms
+/// disagreeing with the base arm, which `CoalesceFirstExec` and
+/// `concat_batches` both reject.
 pub(super) fn force_schema(
     plan: Arc<dyn ExecutionPlan>,
     target_schema: &SchemaRef,
@@ -216,8 +212,7 @@ pub(super) fn force_schema(
 /// forwarded by name; system / `_distance` cols missing from the source
 /// are NULL-filled. Other missing columns are an internal error.
 ///
-/// The result reports `target_schema` exactly, including nullability — see
-/// [`force_schema`].
+/// Reports `target_schema` exactly, nullability included — see [`force_schema`].
 pub fn project_to_canonical(
     plan: Arc<dyn ExecutionPlan>,
     target_schema: &SchemaRef,

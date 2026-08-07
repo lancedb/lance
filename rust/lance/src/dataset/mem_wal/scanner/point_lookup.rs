@@ -756,21 +756,18 @@ fn cols_with_tombstone(cols: &[String], present: bool) -> Vec<String> {
     out
 }
 
-/// Carry schema = canonical output, widened to the shard's storage nullability,
-/// plus a trailing non-nullable `_tombstone` Boolean.
+/// Carry schema = canonical output at the storage schema's nullability, plus a
+/// trailing non-nullable `_tombstone` Boolean.
 ///
-/// Widened because tombstone rows are still in flight at this point — they are
-/// only dropped after `CoalesceFirstExec` picks a winner (see
-/// [`filter_tombstones_after_coalesce`]), and a tombstone carries null in every
-/// non-PK column. Narrowing back to the base table's nullability happens on the
-/// far side of that filter.
-///
-/// `_tombstone` itself stays non-nullable so the base arm's synthesized
+/// Widened because tombstone rows — null in every non-PK column — are still in
+/// flight here; [`filter_tombstones_after_coalesce`] drops them on the far side
+/// of `CoalesceFirstExec`, and the narrowing back to the logical schema happens
+/// after that. `_tombstone` stays non-nullable so the base arm's synthesized
 /// `Literal(false)` matches the WAL arms' real column under
 /// `CoalesceFirstExec`'s exact-schema check.
 fn carry_schema(canonical: &SchemaRef, pk_columns: &[String]) -> SchemaRef {
-    let relaxed = relax_non_pk_nullability(canonical, pk_columns);
-    let mut fields: Vec<Arc<Field>> = relaxed.fields().iter().cloned().collect();
+    let widened = relax_non_pk_nullability(canonical, pk_columns);
+    let mut fields: Vec<Arc<Field>> = widened.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(TOMBSTONE, DataType::Boolean, false)));
     Arc::new(Schema::new(fields))
 }
@@ -812,8 +809,7 @@ fn project_to_carry(
     let projected = Arc::new(ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
         lance_core::Error::internal(format!("Failed to build carry ProjectionExec: {}", e))
     })?);
-    // Every arm must land on exactly `carry`, or `CoalesceFirstExec` panics on
-    // the nullability difference between the base arm and the WAL arms.
+    // `CoalesceFirstExec` panics unless every arm lands on exactly `carry`.
     Ok(force_schema(projected, &carry))
 }
 

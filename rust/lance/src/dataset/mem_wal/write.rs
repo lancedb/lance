@@ -902,14 +902,14 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
-                    // Entries written before deletes existed lack `_tombstone`;
-                    // inject `false` so they match the extended memtable schema.
-                    // Normal entries already carry it and pass through unchanged.
-                    let target_schema = active.schema().clone();
+                    // Re-label every replayed entry to the current storage
+                    // schema; entries written before deletes existed also need
+                    // `_tombstone = false` injected.
+                    let storage_schema = active.schema().clone();
                     let batches = entry
                         .batches
                         .into_iter()
-                        .map(|b| ensure_tombstone_column(b, &target_schema))
+                        .map(|b| ensure_tombstone_column(b, &storage_schema))
                         .collect::<Result<Vec<_>>>()?;
 
                     // Seal + flush at the entry boundary on the *same* criteria the
@@ -1045,49 +1045,45 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
         .collect()
 }
 
-/// Re-label `batch` to the shard's storage schema, injecting `_tombstone =
-/// false` for every row when the column is absent.
+/// Re-label `batch` to the storage schema, injecting `_tombstone = false` when
+/// the column is absent — callers pass logical-shaped batches, and WAL entries
+/// written before deletes existed lack it.
 ///
-/// Used on the normal write path ([`ShardWriter::put`]) where callers pass
-/// base-shaped batches, and on WAL replay of entries written before deletes
-/// existed (legacy entries lack the column). A batch that already carries
-/// `_tombstone` keeps its values and is re-labeled rather than passed through,
-/// so an entry written under an older, narrower storage schema still replays
-/// into the current one.
+/// A batch that already carries `_tombstone` is re-labeled rather than passed
+/// through, so an entry written under an older storage schema replays into the
+/// current one.
 fn ensure_tombstone_column(
     batch: RecordBatch,
-    target_schema: &Arc<ArrowSchema>,
+    storage_schema: &Arc<ArrowSchema>,
 ) -> Result<RecordBatch> {
     let n = batch.num_rows();
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     if batch.schema().column_with_name(TOMBSTONE).is_none() {
         columns.push(Arc::new(BooleanArray::from(vec![false; n])));
     }
-    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+    RecordBatch::try_new(storage_schema.clone(), columns).map_err(|e| {
         Error::invalid_input(format!(
-            "failed to inject _tombstone column (does the batch match the base schema?): {}",
+            "failed to inject _tombstone column (does the batch match the base table schema?): {}",
             e
         ))
     })
 }
 
-/// Build a tombstone batch from a key-only `keys` batch: the primary key
-/// columns are carried through, `_tombstone` is set to `true`, and every other
-/// column in the storage schema is null.
+/// Build a tombstone batch from a key-only `keys` batch: primary keys carried
+/// through, `_tombstone` true, every other column null.
 ///
-/// `target_schema` is the storage schema, whose non-PK columns are nullable
-/// regardless of what the base table declares — that is what lets a tombstone
-/// exist for a base table with non-nullable columns. Primary keys stay
-/// non-nullable there, so the `RecordBatch` validation below still rejects a
-/// null, mistyped, or missing key.
+/// The storage schema's non-PK columns are nullable whatever the base table
+/// declares — that is what lets a table with non-nullable columns have
+/// tombstones at all. Primary keys stay non-nullable, so the `RecordBatch`
+/// validation below still rejects a null, mistyped, or missing key.
 fn build_tombstone_batch(
     keys: &RecordBatch,
-    target_schema: &Arc<ArrowSchema>,
+    storage_schema: &Arc<ArrowSchema>,
     pk_columns: &[String],
 ) -> Result<RecordBatch> {
     let n = keys.num_rows();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target_schema.fields().len());
-    for field in target_schema.fields() {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(storage_schema.fields().len());
+    for field in storage_schema.fields() {
         let name = field.name();
         if name == TOMBSTONE {
             columns.push(Arc::new(BooleanArray::from(vec![true; n])));
@@ -1103,7 +1099,7 @@ fn build_tombstone_batch(
             columns.push(new_null_array(field.data_type(), n));
         }
     }
-    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+    RecordBatch::try_new(storage_schema.clone(), columns).map_err(|e| {
         Error::invalid_input(format!(
             "failed to build tombstone batch (do the delete keys match the primary key?): {}",
             e
@@ -1504,12 +1500,11 @@ pub struct ShardWriter {
     manifest_store: Arc<ShardManifestStore>,
     stats: SharedWriteStats,
     mode: WriterMode,
-    /// The base table's schema exactly as the caller passed it — no
-    /// `_tombstone`, nullability untouched. The shard's *logical* half of the
-    /// schema pair: it is what caller input is held to and what the scan path
-    /// narrows back to, while the storage schema
-    /// ([`relax_non_pk_nullability`]) is what the memtable, WAL, and SSTables
-    /// physically carry. See [`Self::validate_against_logical_schema`].
+    /// The base table's schema as the caller passed it — no `_tombstone`,
+    /// nullability untouched. Caller input is held to this and the scan path
+    /// narrows back to it; the memtable, WAL, and SSTables carry the widened
+    /// storage schema ([`relax_non_pk_nullability`]) instead. See
+    /// [`Self::validate_against_logical_schema`].
     logical_schema: Arc<ArrowSchema>,
 }
 
@@ -1549,12 +1544,10 @@ impl ShardWriter {
             ));
         }
 
-        // Callers pass the base table's schema. It becomes the shard's *logical*
-        // schema — the contract every batch handed to `put` is validated against
-        // — while the *storage* schema the memtable, WAL, and SSTables actually
-        // carry is derived from it below, once the primary key is known. lance
-        // owns the `_tombstone` column and appends it here. Idempotent, so a
-        // reopen that already extended the schema is a no-op.
+        // The caller's schema is the shard's logical schema; the storage schema
+        // is derived from it below, once the primary key is known. lance owns
+        // `_tombstone` and appends it here — idempotent, so a reopen that
+        // already extended the schema is a no-op.
         let logical_schema = schema;
         let tombstoned = schema_with_tombstone(&logical_schema);
 
@@ -1590,10 +1583,9 @@ impl ShardWriter {
                 &pk_columns,
             )?;
 
-            // Widen only after the primary key is known: a tombstone nulls every
-            // non-PK column, so the storage tier has to allow a null where the
-            // base table does not. `unenforced_primary_key` above ran against the
-            // unrelaxed schema, which is what enforces non-nullable PKs.
+            // Widen only now that the primary key is known — a tombstone nulls
+            // every non-PK column. `unenforced_primary_key` above ran against
+            // the logical schema, which is what enforces non-nullable PKs.
             let storage_schema = relax_non_pk_nullability(&tombstoned, &pk_columns);
             Some((pk_field_ids, pk_columns, storage_schema))
         } else {
@@ -1987,9 +1979,8 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
-                // Inject `_tombstone = false` and re-label to the storage
-                // schema; callers only ever pass base-shaped batches and never
-                // name the column.
+                // Callers pass logical-shaped batches and never name
+                // `_tombstone`.
                 let batches = batches
                     .into_iter()
                     .map(|b| ensure_tombstone_column(b, &writer_state.schema))
@@ -2018,10 +2009,8 @@ impl ShardWriter {
     /// its key: it wins newest-per-PK resolution (suppressing the older real
     /// row) and is then dropped from query results.
     ///
-    /// Only supported in memtable mode. The base table's own nullability is not
-    /// a constraint here: tombstones live in the shard's storage schema, whose
-    /// non-PK columns are widened to nullable for exactly this reason, so a
-    /// delete works against a base table with non-nullable columns.
+    /// Only supported in memtable mode. Works against non-nullable base columns:
+    /// tombstones live in the storage schema, which widens them to nullable.
     ///
     /// ```
     /// # use lance::Result;
@@ -2116,8 +2105,7 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
-                // Inject `_tombstone = false` and re-label to the storage
-                // schema, mirroring `put`.
+                // Mirrors `put`.
                 let batches = batches
                     .into_iter()
                     .map(|b| ensure_tombstone_column(b, &writer_state.schema))
@@ -2131,20 +2119,18 @@ impl ShardWriter {
         }
     }
 
-    /// Reject caller input that violates the shard's logical schema: wrong
-    /// column count, wrong types, or a null in a column the base table declares
-    /// non-nullable.
+    /// Reject caller input that violates the logical schema: wrong column count
+    /// or types, or a null in a column the base table declares non-nullable.
     ///
-    /// This is the *only* gate on that contract. The storage schema widens
-    /// every non-PK column so a tombstone can null it, so it no longer rejects
-    /// a caller's null, and nothing downstream would either: both append and
+    /// The *only* gate on that contract. The storage schema no longer rejects a
+    /// caller's null, and nothing downstream does either — append and
     /// `merge_insert` compare schemas with `NullabilityComparison::Ignore`, and
-    /// the encoder derives validity from the array rather than from the field.
-    /// A null that gets past here reaches the base table silently.
+    /// the encoder takes validity from the array, not the field — so a null that
+    /// gets past here reaches the base table silently.
     ///
-    /// Runs before the WAL append, not after: a batch that is appended and only
-    /// then rejected would fail identically on every subsequent replay, leaving
-    /// the shard unable to reopen.
+    /// Runs before the WAL append: a batch rejected only after being appended
+    /// would fail identically on every replay, leaving the shard unable to
+    /// reopen.
     fn validate_against_logical_schema(&self, batches: &[RecordBatch]) -> Result<()> {
         for (i, batch) in batches.iter().enumerate() {
             RecordBatch::try_new(self.logical_schema.clone(), batch.columns().to_vec()).map_err(
@@ -3734,8 +3720,8 @@ mod tests {
         ]))
     }
 
-    /// [`create_pk_test_schema`] with a **non-nullable** `name`: the shape that
-    /// used to make `delete` fail, since a tombstone has to null that column.
+    /// [`create_pk_test_schema`] with a non-nullable `name` — the shape that
+    /// used to make `delete` fail.
     fn create_strict_pk_test_schema() -> Arc<ArrowSchema> {
         let fields: Vec<Field> = create_pk_test_schema()
             .fields()
@@ -3760,9 +3746,9 @@ mod tests {
     #[test]
     fn test_ensure_tombstone_column_injects_false() {
         let base = create_test_schema();
-        let target = schema_with_tombstone(&base);
-        let out = ensure_tombstone_column(create_test_batch(&base, 0, 3), &target).unwrap();
-        assert_eq!(out.schema(), target);
+        let storage = schema_with_tombstone(&base);
+        let out = ensure_tombstone_column(create_test_batch(&base, 0, 3), &storage).unwrap();
+        assert_eq!(out.schema(), storage);
         let ts = out
             .column_by_name(TOMBSTONE)
             .unwrap()
@@ -3774,16 +3760,16 @@ mod tests {
             "put injects _tombstone = false"
         );
         // Idempotent: a batch already carrying the column passes through.
-        let again = ensure_tombstone_column(out.clone(), &target).unwrap();
+        let again = ensure_tombstone_column(out.clone(), &storage).unwrap();
         assert_eq!(again.schema(), out.schema());
     }
 
     #[test]
     fn test_build_tombstone_batch_shape() {
-        let target = schema_with_tombstone(&create_test_schema());
+        let storage = schema_with_tombstone(&create_test_schema());
         let tomb =
-            build_tombstone_batch(&id_only_keys(&[5, 7]), &target, &["id".to_string()]).unwrap();
-        assert_eq!(tomb.schema(), target);
+            build_tombstone_batch(&id_only_keys(&[5, 7]), &storage, &["id".to_string()]).unwrap();
+        assert_eq!(tomb.schema(), storage);
         assert_eq!(tomb.num_rows(), 2);
         let ids = tomb
             .column_by_name("id")
@@ -3808,7 +3794,7 @@ mod tests {
 
     #[test]
     fn test_build_tombstone_batch_missing_pk_errors() {
-        let target = schema_with_tombstone(&create_test_schema());
+        let storage = schema_with_tombstone(&create_test_schema());
         let keys = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![Field::new(
                 "other",
@@ -3818,7 +3804,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1]))],
         )
         .unwrap();
-        assert!(build_tombstone_batch(&keys, &target, &["id".to_string()]).is_err());
+        assert!(build_tombstone_batch(&keys, &storage, &["id".to_string()]).is_err());
     }
 
     #[test]
@@ -3830,9 +3816,9 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("v", DataType::Int32, false),
         ]));
-        let target = relax_non_pk_nullability(&schema_with_tombstone(&base), &pk);
+        let storage = relax_non_pk_nullability(&schema_with_tombstone(&base), &pk);
 
-        let batch = build_tombstone_batch(&id_only_keys(&[1]), &target, &pk).unwrap();
+        let batch = build_tombstone_batch(&id_only_keys(&[1]), &storage, &pk).unwrap();
 
         assert!(batch["v"].is_null(0), "the tombstone must null `v`");
         assert!(!batch["id"].is_null(0), "the primary key survives");
@@ -3854,7 +3840,7 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("v", DataType::Int32, false),
         ]));
-        let target = relax_non_pk_nullability(&schema_with_tombstone(&base), &pk);
+        let storage = relax_non_pk_nullability(&schema_with_tombstone(&base), &pk);
         let keys = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![Field::new(
                 "id",
@@ -3865,7 +3851,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = build_tombstone_batch(&keys, &target, &pk).unwrap_err();
+        let error = build_tombstone_batch(&keys, &storage, &pk).unwrap_err();
         assert!(
             matches!(error, Error::InvalidInput { .. }),
             "expected InvalidInput, got {error:?}"
@@ -3942,10 +3928,8 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    /// A base table whose non-PK columns are all non-nullable still supports
-    /// delete: tombstones live in the widened storage schema, and the surviving
-    /// rows come back through the narrowing egress relabel with their values
-    /// intact.
+    /// Delete works against a base table with non-nullable non-PK columns, and
+    /// survivors come back through the narrowing egress relabel intact.
     #[tokio::test]
     async fn test_delete_against_non_nullable_base_column_round_trip() {
         use crate::dataset::mem_wal::scanner::LsmScanner;
@@ -3998,8 +3982,6 @@ mod tests {
 
         let mut rows: Vec<(i32, String)> = Vec::new();
         for b in &batches {
-            // The scan must hand back the base table's own nullability, not the
-            // widened storage schema.
             assert!(
                 !b.schema().field_with_name("name").unwrap().is_nullable(),
                 "egress must narrow back to the logical schema"

@@ -58,13 +58,13 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 /// its primary key, carrying null in every non-PK column, that wins
 /// newest-per-PK resolution and is then silently dropped from query results.
 ///
-/// The column is owned end-to-end by lance: callers pass the base schema and
+/// The column is owned end-to-end by lance: callers pass the logical schema and
 /// lance injects the column on the write path ([`write::ShardWriter::put`] /
 /// [`write::ShardWriter::delete`]), so no caller ever constructs or names it.
 pub const TOMBSTONE: &str = "_tombstone";
 
-/// The mem_wal tombstone field appended to the base schema to form the
-/// memtable/generation schema.
+/// The mem_wal tombstone field appended to the logical schema on the way to the
+/// storage schema.
 ///
 /// Non-nullable: the write path always populates it (`false` for normal rows,
 /// `true` for tombstones). Non-nullability also lets the point-lookup base arm
@@ -74,32 +74,26 @@ pub fn tombstone_field() -> ArrowField {
     ArrowField::new(TOMBSTONE, DataType::Boolean, false)
 }
 
-/// Derive a shard's **storage schema** from its **logical schema** by making
-/// every top-level field nullable except the primary key and `_tombstone`.
+/// Derive a shard's *storage* schema from its *logical* (base table) schema by
+/// widening every top-level field to nullable except the primary key and
+/// `_tombstone`.
 ///
-/// A shard carries two schemas. The *logical* schema is the base table's, as
-/// the caller declared it: it is the contract [`write::ShardWriter::put`]
-/// validates input against, and the schema the scan path narrows back to at its
-/// output boundary. The *storage* schema is what the memtable, WAL entries, and
-/// SSTables physically hold — it exists because a tombstone carries the primary
-/// key and null in every other column, so the storage tier must permit a null
-/// wherever the base table does not. This mirrors the logical/physical split
-/// `SchemaAdapter` already applies to JSON and view types in
-/// `crate::dataset::utils`.
+/// A tombstone carries the primary key and null in every other column, so the
+/// memtable, WAL entries, and SSTables must permit a null wherever the base
+/// table does not. The logical schema stays the caller's contract:
+/// [`write::ShardWriter::put`] validates against it and the scan path narrows
+/// back to it.
 ///
-/// Top-level only: Arrow validates nullability just at the top level of a
-/// `RecordBatch`, so a null `FixedSizeList` or `Struct` needs no change to its
-/// child fields — they stay exactly as the caller declared them, and a vector
-/// column's item field gains no validity layer.
-///
-/// The primary key is excluded because [`lance_core::datatypes::Schema`]
-/// requires PK fields and their ancestors to be non-nullable, and a tombstone
-/// always carries a real key. `_tombstone` is excluded because the write path
-/// always populates it.
-///
-/// Idempotent: relaxing an already-relaxed schema is a no-op.
-pub fn relax_non_pk_nullability(logical: &ArrowSchema, pk_columns: &[String]) -> Arc<ArrowSchema> {
-    let fields: Vec<ArrowField> = logical
+/// Top-level only — Arrow validates nullability only at the top level of a
+/// `RecordBatch`, so a vector column's item field gains no validity layer.
+/// Primary keys are excluded because [`lance_core::datatypes::Schema`] requires
+/// them to be non-nullable and a tombstone always carries a real key;
+/// `_tombstone` because the write path always populates it. Idempotent.
+pub fn relax_non_pk_nullability(
+    logical_schema: &ArrowSchema,
+    pk_columns: &[String],
+) -> Arc<ArrowSchema> {
+    let fields: Vec<ArrowField> = logical_schema
         .fields()
         .iter()
         .map(|field| {
@@ -116,12 +110,12 @@ pub fn relax_non_pk_nullability(logical: &ArrowSchema, pk_columns: &[String]) ->
         .collect();
     Arc::new(ArrowSchema::new_with_metadata(
         fields,
-        logical.metadata().clone(),
+        logical_schema.metadata().clone(),
     ))
 }
 
-/// Extend a base schema with the trailing `_tombstone` column to form the
-/// mem_wal memtable/generation schema.
+/// Extend the logical schema with the trailing `_tombstone` column — the
+/// intermediate [`relax_non_pk_nullability`] widens into the storage schema.
 ///
 /// Idempotent: a schema that already carries `_tombstone` (a reopen/replay
 /// path) is returned unchanged. Schema-level metadata and per-field metadata
@@ -184,8 +178,7 @@ mod tests {
 
     #[test]
     fn relax_leaves_nested_fields_exactly_as_declared() {
-        // Arrow validates nullability only at the top level of a RecordBatch, so
-        // a null struct/vector needs no change below the top — and a vector
+        // Arrow validates nullability only at the top level, and a vector
         // column's item field must not gain a validity layer.
         let item = Arc::new(ArrowField::new("item", DataType::Float32, false));
         let child = ArrowField::new("a", DataType::Int32, false);

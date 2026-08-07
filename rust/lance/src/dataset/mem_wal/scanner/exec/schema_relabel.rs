@@ -19,25 +19,20 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 
-/// Re-labels every batch to an exact target schema, keeping the column arrays
+/// Re-labels every batch to an exact target schema, leaving the arrays
 /// untouched.
 ///
-/// A shard's storage tier widens non-PK columns to nullable so a tombstone can
-/// null them (see `relax_non_pk_nullability`), so an LSM plan's arms can
-/// disagree with the base-table arm on nullability alone. DataFusion derives a
-/// `ProjectionExec`'s output nullability from its expressions rather than from
-/// the schema the planner intended, so it cannot pin that down on its own —
-/// hence this node.
+/// A shard's storage schema widens non-PK columns to nullable (see
+/// `relax_non_pk_nullability`), so plan arms disagree with the base-table arm on
+/// nullability alone. `ProjectionExec` cannot pin this down: DataFusion derives
+/// its output nullability from the expressions, not from the schema the planner
+/// intended.
 ///
-/// It is used in both directions:
-///
-/// - **Widening** (non-nullable → nullable), to make every arm agree before a
-///   `UnionExec` or `CoalesceFirstExec`. Always succeeds.
-/// - **Narrowing** (nullable → non-nullable), once at the scan's output
-///   boundary, to restore the base table's declared schema. This is also the
-///   assertion that no tombstone row escaped its filter: `RecordBatch::try_new`
-///   rejects a null in a column the target declares non-nullable, so a leak
-///   surfaces as an error instead of a row of nulls reaching the caller.
+/// Used both ways: **widening**, so arms agree before `UnionExec` /
+/// `CoalesceFirstExec`; and **narrowing** at the scan's output boundary, back to
+/// the logical schema. Narrowing doubles as the tombstone-leak check —
+/// `RecordBatch::try_new` rejects a null in a non-nullable column, so a leak
+/// errors instead of reaching the caller.
 #[derive(Debug)]
 pub struct SchemaRelabelExec {
     input: Arc<dyn ExecutionPlan>,
@@ -46,13 +41,10 @@ pub struct SchemaRelabelExec {
 }
 
 impl SchemaRelabelExec {
-    /// Wrap `input` so its batches are re-labeled to `schema`.
-    ///
-    /// The caller is responsible for `schema` being column-compatible with the
-    /// input (same count, same order, same data types); only field names,
-    /// nullability, and metadata may differ. A mismatch surfaces per batch at
-    /// execution time rather than at plan time, because the arrays are what
-    /// `RecordBatch::try_new` actually validates.
+    /// Wrap `input` so its batches are re-labeled to `schema`, which the caller
+    /// must keep column-compatible (same count, order, and data types); only
+    /// names, nullability, and metadata may differ. A mismatch surfaces per
+    /// batch at execution time, not at plan time.
     pub fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -136,9 +128,8 @@ impl Stream for SchemaRelabelStream {
         match self.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 let schema = self.schema.clone();
-                // An empty batch carries no arrays to re-label and `try_new`
-                // cannot infer its row count, so hand back an empty batch with
-                // the target schema directly.
+                // Guards the column-less case: `try_new` infers the row count
+                // from the first column and errors when there is none.
                 let relabeled = if batch.num_rows() == 0 {
                     Ok(RecordBatch::new_empty(schema))
                 } else {
@@ -209,8 +200,8 @@ mod tests {
 
     #[tokio::test]
     async fn narrowing_succeeds_when_no_nulls_remain() {
-        // The post-tombstone-filter case: the storage tier declared `name`
-        // nullable, but every surviving row has a value.
+        // Post-tombstone-filter: `name` is nullable in storage, but every
+        // surviving row has a value.
         let input = source(batch(schema_with(true), vec![Some("a"), Some("b")]));
         let relabeled = Arc::new(SchemaRelabelExec::new(input, schema_with(false)));
 
@@ -221,8 +212,8 @@ mod tests {
 
     #[tokio::test]
     async fn narrowing_rejects_a_surviving_null() {
-        // A tombstone row that escaped its filter must not reach the caller as
-        // a row of nulls — the narrowing relabel is what catches it.
+        // A tombstone that escaped its filter must error here, not reach the
+        // caller as a row of nulls.
         let input = source(batch(schema_with(true), vec![Some("a"), None]));
         let relabeled = Arc::new(SchemaRelabelExec::new(input, schema_with(false)));
 
