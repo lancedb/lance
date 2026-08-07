@@ -281,7 +281,7 @@ async fn current_manifest_path(
     base: &Path,
 ) -> Result<ManifestLocation> {
     if object_store.is_local() {
-        if let Ok(Some(location)) = current_manifest_local(base) {
+        if let Ok(Some(location)) = current_manifest_local(object_store, base) {
             return Ok(location);
         }
     } else if uses_version_hint(object_store)
@@ -652,8 +652,11 @@ async fn resolve_version_from_listing(
 // This is an optimized function that searches for the latest manifest. In
 // object_store, list operations lookup metadata for each file listed. This
 // method only gets the metadata for the found latest manifest.
-fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
-    let path = lance_io::local::to_local_path(&base.clone().join(VERSIONS_DIR));
+fn current_manifest_local(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> std::io::Result<Option<ManifestLocation>> {
+    let path = object_store.to_local_path(&base.clone().join(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;
 
     let mut latest_entry: Option<(u64, DirEntry)> = None;

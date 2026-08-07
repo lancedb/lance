@@ -139,6 +139,8 @@ pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
+    /// Filesystem root for object-store paths that are relative to a UNC share.
+    local_path_prefix: Option<std::path::PathBuf>,
     block_size: usize,
     max_iop_size: u64,
     /// Whether to use constant size upload parts for multipart uploads. This
@@ -514,6 +516,7 @@ impl ObjectStore {
             let store = Self {
                 inner: tracked_store,
                 scheme: path.scheme().to_string(),
+                local_path_prefix: None,
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -593,6 +596,33 @@ impl ObjectStore {
         self.scheme == "file" || self.scheme == "file+uring"
     }
 
+    /// Convert an object-store path into its corresponding local filesystem path.
+    ///
+    /// UNC-backed stores keep their server and share in the store root, while
+    /// ordinary local stores encode the complete absolute path in `path`.
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # fn resolve_path(store: &ObjectStore) {
+    /// let versions = store.to_local_path(&"dataset/_versions".into());
+    /// # let _ = versions;
+    /// # }
+    /// ```
+    pub fn to_local_path(&self, path: &Path) -> std::path::PathBuf {
+        match &self.local_path_prefix {
+            Some(prefix) => {
+                let mut local_path = prefix.clone();
+                local_path.extend(path.parts().map(|part| part.as_ref().to_owned()));
+                local_path
+            }
+            None => super::local::to_local_path(path).into(),
+        }
+    }
+
+    fn uses_direct_local_io(&self) -> bool {
+        self.is_local() && self.local_path_prefix.is_none()
+    }
+
     pub fn is_cloud(&self) -> bool {
         if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
             return false;
@@ -664,7 +694,7 @@ impl ObjectStore {
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.uses_direct_local_io() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -726,7 +756,7 @@ impl ObjectStore {
         }
 
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.uses_direct_local_io() => {
                 LocalObjectReader::open_with_tracker(
                     path,
                     self.block_size,
@@ -789,7 +819,7 @@ impl ObjectStore {
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
         match self.scheme.as_str() {
-            "file" => {
+            "file" if self.uses_direct_local_io() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
                 if let Some(parent) = local_path.parent() {
@@ -860,7 +890,7 @@ impl ObjectStore {
         multipart_copy_fallback: bool,
         max_single_copy: u64,
     ) -> Result<()> {
-        if self.is_local() {
+        if self.uses_direct_local_io() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
             let metrics = self.io_tracker.begin_io("copy");
             let result = super::local::copy_file(from, to);
@@ -932,7 +962,7 @@ impl ObjectStore {
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
             let metrics = self.io_tracker.begin_io("delete");
-            let result = super::local::remove_dir_all(&path);
+            let result = super::local::remove_dir_all_at(self.to_local_path(&path), &path);
             metrics.record(&result, 0);
             return result;
         }
@@ -948,7 +978,7 @@ impl ObjectStore {
         if self.scheme == "file-object-store" {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
-            return super::local::remove_dir_all(&path);
+            return super::local::remove_dir_all_at(self.to_local_path(&path), &path);
         }
         Ok(())
     }
@@ -990,9 +1020,16 @@ impl ObjectStore {
         }
 
         let path = Path::parse(root_path.into())?;
+        let local_path = self.to_local_path(&path);
         let metrics = self.io_tracker.begin_io("delete");
         let result = tokio::task::spawn_blocking(move || {
-            super::local::remove_empty_dirs(&path, &retained_dirs, &verified_dirs, unmodified_since)
+            super::local::remove_empty_dirs(
+                local_path,
+                &path,
+                &retained_dirs,
+                &verified_dirs,
+                unmodified_since,
+            )
         })
         .await
         .map_err(|error| Error::io(format!("empty-directory cleanup task failed: {error}")))?;
@@ -1218,6 +1255,7 @@ impl ObjectStore {
         Self {
             inner: tracked_store,
             scheme: scheme.into(),
+            local_path_prefix: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
