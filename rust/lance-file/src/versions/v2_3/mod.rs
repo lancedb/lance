@@ -133,7 +133,7 @@ pub fn encoding_strategy(params: CompressionParams) -> Arc<dyn FieldEncodingStra
         primitive: PrimitiveFieldEncoding::new([
             PrimitivePageEncoding::sparse(compression.clone()),
             PrimitivePageEncoding::constant(),
-            PrimitivePageEncoding::dense_u32(compression),
+            PrimitivePageEncoding::dense_u32_with_page_splitting(compression),
         ]),
     })
 }

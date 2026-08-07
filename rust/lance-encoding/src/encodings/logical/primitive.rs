@@ -97,6 +97,7 @@ pub mod dict;
 pub mod fullzip;
 mod layout;
 pub mod miniblock;
+mod page_split;
 pub(crate) mod sparse;
 
 use chunk_index::{ItemCounts, MiniBlockChunkIndex, PrefixSums, RowMapping, parse_nested_rep};
@@ -4579,7 +4580,21 @@ impl PrimitivePageEncoding {
     /// Encode dense pages with the u32 miniblock grammar.
     pub fn dense_u32(compression: Arc<dyn CompressionStrategy>) -> Self {
         Self {
-            behavior: Arc::new(DenseU32PrimitiveEncoding { compression }),
+            behavior: Arc::new(DenseU32PrimitiveEncoding {
+                compression,
+                should_split_oversized_pages: false,
+            }),
+        }
+    }
+
+    /// Encode dense pages with the u32 miniblock grammar, splitting inputs that exceed
+    /// [`EncodingOptions::max_page_bytes`].
+    pub fn dense_u32_with_page_splitting(compression: Arc<dyn CompressionStrategy>) -> Self {
+        Self {
+            behavior: Arc::new(DenseU32PrimitiveEncoding {
+                compression,
+                should_split_oversized_pages: true,
+            }),
         }
     }
 }
@@ -4603,12 +4618,14 @@ struct DenseU16PrimitiveEncoding {
 #[derive(Debug)]
 struct DenseU32PrimitiveEncoding {
     compression: Arc<dyn CompressionStrategy>,
+    should_split_oversized_pages: bool,
 }
 
 pub struct PrimitiveStructuralEncoder {
     // Accumulates arrays until we have enough data to justify a disk page
     accumulation_queue: AccumulationQueue,
 
+    max_page_bytes: u64,
     keep_original_array: bool,
     accumulated_repdefs: Vec<RepDefBuilder>,
     page_encodings: Arc<[PrimitivePageEncoding]>,
@@ -4667,6 +4684,7 @@ struct PrimitivePlanContext<'a> {
     column_idx: u32,
     field: &'a Field,
     encoding_metadata: &'a HashMap<String, String>,
+    max_page_bytes: u64,
 }
 
 enum PrimitiveEncodeAttempt {
@@ -4707,6 +4725,7 @@ impl PrimitiveStructuralEncoder {
                 column_index,
                 options.keep_original_array,
             ),
+            max_page_bytes: options.max_page_bytes,
             keep_original_array: options.keep_original_array,
             accumulated_repdefs: Vec::new(),
             column_index,
@@ -6574,6 +6593,7 @@ impl PrimitiveStructuralEncoder {
             column_idx: self.column_index,
             field: &self.field,
             encoding_metadata: &self.encoding_metadata,
+            max_page_bytes: self.max_page_bytes,
         };
         let mut pages = None;
         for page_encoding in self.page_encodings.iter() {
@@ -6741,16 +6761,26 @@ impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
 impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
     fn try_plan_pages(
         &self,
-        _ctx: &PrimitivePlanContext<'_>,
+        ctx: &PrimitivePlanContext<'_>,
         arrays: &[ArrayRef],
         normalized: &NormalizedStructuralPlan,
         row_number: u64,
         num_rows: u64,
         num_values: u64,
     ) -> Result<Option<Vec<PrimitivePageData>>> {
-        Ok(Some(plan_dense_primitive_pages(
-            arrays, normalized, row_number, num_rows, num_values,
-        )?))
+        let pages =
+            plan_dense_primitive_pages(arrays, normalized, row_number, num_rows, num_values)?;
+        if self.should_split_oversized_pages {
+            Ok(Some(page_split::split_dense_pages(
+                pages,
+                arrays,
+                ctx.max_page_bytes,
+                num_rows,
+                num_values,
+            )?))
+        } else {
+            Ok(Some(pages))
+        }
     }
 
     fn try_encode_page(

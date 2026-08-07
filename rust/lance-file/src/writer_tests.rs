@@ -713,8 +713,11 @@ mod tests {
         assert_eq!(reader.column_num_rows(1).unwrap(), 3);
     }
 
+    #[rstest]
+    #[case::v2_0(ConcreteFileVersion::V2_0)]
+    #[case::v2_3(ConcreteFileVersion::V2_3)]
     #[tokio::test]
-    async fn test_max_page_bytes_enforced() {
+    async fn test_oversized_batch_split_into_pages(#[case] version: ConcreteFileVersion) {
         let arrow_field = Field::new("data", DataType::UInt64, false);
         let arrow_schema = Schema::new(vec![arrow_field]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -735,7 +738,7 @@ mod tests {
         let mut writer = create_writer(
             object_store.create(&path).await.unwrap(),
             lance_schema,
-            ConcreteFileVersion::V2_0,
+            version,
             options,
         )
         .unwrap();
