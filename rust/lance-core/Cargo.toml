@@ -23,6 +23,7 @@ byteorder.workspace = true
 bytes.workspace = true
 datafusion-common = { workspace = true, optional = true }
 datafusion-sql = { workspace = true, optional = true }
+lance-cache-abi.workspace = true
 lance-derive.workspace = true
 futures.workspace = true
 itertools.workspace = true

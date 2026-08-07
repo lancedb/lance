@@ -1,0 +1,22 @@
+[package]
+name = "lance-cache-abi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Dynamic cache backend ABI for Lance"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xabi = "=0.1.0"
+
+[dev-dependencies]
+futures.workspace = true
+xabi-assert = "=0.1.0"
+
+[lints]
+workspace = true

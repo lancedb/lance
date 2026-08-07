@@ -1,0 +1,170 @@
+format=xabi-contract-snapshot-v1
+package=lance-cache-abi
+target=x86_64-apple-darwin
+
+contract org.lance.cache.DynamicCacheBackend
+  abi_version=0
+  rust_trait=lance_cache_abi::xabi_contract::DynamicCacheBackend
+
+type lance_cache_abi::xabi_contract::CacheKey128Wire
+  stability=fixed
+  size=16
+  align=1
+  field.bytes offset=0 type=[u8; 16]
+
+type lance_cache_abi::xabi_contract::XabiV1DataCacheAbiError
+  stability=prefix
+  size=40
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.message offset=16 type=XabiOwnedBytes
+
+type lance_cache_abi::xabi_contract::XabiV1DataCacheLookup
+  stability=prefix
+  size=48
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.bytes offset=16 type=XabiOwnedBytes
+  field.size_bytes offset=40 type=usize
+
+type lance_cache_abi::xabi_contract::XabiV1DataCacheMeasure
+  stability=prefix
+  size=32
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.entries offset=16 type=usize
+  field.size_bytes offset=24 type=usize
+
+type lance_cache_abi::xabi_contract::XabiV1OwnedRefTraitDynamicCacheBackend
+  stability=prefix
+  size=24
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.vtable offset=16 type=*mut XabiV1VtableTraitDynamicCacheBackend
+
+type lance_cache_abi::xabi_contract::XabiV1RefTraitDynamicCacheBackend
+  stability=prefix
+  size=24
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.vtable offset=16 type=*const XabiV1VtableTraitDynamicCacheBackend
+
+type lance_cache_abi::xabi_contract::XabiV1VtableTraitDynamicCacheBackend
+  stability=prefix
+  size=88
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.capabilities offset=16 type=u64
+  field.instance offset=24 type=*mut c_void
+  field.destroy offset=32 type=unsafe extern "C" fn(*mut c_void)
+  field.release offset=40 type=unsafe extern "C" fn(*mut XabiV1VtableTraitDynamicCacheBackend)
+  field.name offset=48 type=unsafe extern "C" fn(*mut c_void) -> XabiOwnedBytes
+  field.get offset=56 type=unsafe extern "C" fn(*mut c_void, *const <CacheKey128 as XabiType>::Wire, *mut XabiFuture) -> i32
+  field.insert offset=64 type=unsafe extern "C" fn(*mut c_void, *const <CacheKey128 as XabiType>::Wire, XabiBytes, *const <usize as XabiType>::Wire, *mut XabiFuture) -> i32
+  field.clear offset=72 type=unsafe extern "C" fn(*mut c_void, *mut XabiFuture) -> i32
+  field.measure offset=80 type=unsafe extern "C" fn(*mut c_void, *mut XabiFuture) -> i32
+
+type xabi::XabiBytes
+  stability=fixed
+  size=16
+  align=8
+  field.0 offset=0 type=XabiSlice<u8>
+
+type xabi::XabiErrorWire
+  stability=prefix
+  size=16
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.kind offset=12 type=u32
+
+type xabi::XabiExport
+  stability=prefix
+  size=72
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.abi_id offset=16 type=XabiStr
+  field.name offset=32 type=XabiStr
+  field.contract_version offset=48 type=u32
+  field.export_version offset=52 type=u32
+  field.capabilities offset=56 type=u64
+  field.make offset=64 type=unsafe extern "C" fn() -> *mut c_void
+
+type xabi::XabiFuture
+  stability=prefix
+  size=40
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.instance offset=16 type=*mut c_void
+  field.poll offset=24 type=unsafe extern "C" fn(*mut c_void, *const XabiWaker, *mut XabiResult) -> i32
+  field.release offset=32 type=unsafe extern "C" fn(*mut c_void)
+
+type xabi::XabiManifest
+  stability=prefix
+  size=32
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.exports offset=16 type=XabiSlice<XabiExport>
+
+type xabi::XabiOption
+  stability=prefix
+  size=40
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.is_some offset=12 type=u8
+  field.payload offset=16 type=XabiOwnedBytes
+
+type xabi::XabiOwnedBytes
+  stability=fixed
+  size=24
+  align=8
+  field.ptr offset=0 type=*mut u8
+  field.len offset=8 type=usize
+  field.free offset=16 type=unsafe extern "C" fn(*mut u8, usize)
+
+type xabi::XabiResult
+  stability=fixed
+  size=32
+  align=8
+  field.code offset=0 type=i32
+  field.payload offset=8 type=XabiOwnedBytes
+
+type xabi::XabiSlice<u8>
+  stability=fixed
+  size=16
+  align=8
+  field.ptr offset=0 type=*const u8
+  field.len offset=8 type=usize
+
+type xabi::XabiStr
+  stability=fixed
+  size=16
+  align=8
+  field.ptr offset=0 type=*const u8
+  field.len offset=8 type=usize
+
+type xabi::XabiWaker
+  stability=prefix
+  size=56
+  align=8
+  field.size offset=0 type=usize
+  field.abi_version offset=8 type=u32
+  field.instance offset=16 type=*mut c_void
+  field.clone offset=24 type=unsafe extern "C" fn(*mut c_void) -> XabiWaker
+  field.wake offset=32 type=unsafe extern "C" fn(*mut c_void)
+  field.wake_by_ref offset=40 type=unsafe extern "C" fn(*mut c_void)
+  field.release offset=48 type=unsafe extern "C" fn(*mut c_void)
+
+vtable lance_cache_abi::xabi_contract::XabiV1VtableTraitDynamicCacheBackend
+  full_size=88
+  min_size=48

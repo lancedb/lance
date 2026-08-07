@@ -15,6 +15,8 @@ use crate::error::CloneableError;
 use super::backend::{CacheBackend, CacheEntry};
 use super::{CacheCodec, InternalCacheKey};
 
+type CacheLoader<'a> = Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>;
+
 /// Internal record stored in the moka cache.
 #[derive(Clone, Debug)]
 struct MokaCacheEntry {
@@ -101,6 +103,37 @@ impl MokaCacheBackend {
             .try_into()
             .unwrap_or(usize::MAX)
     }
+
+    pub(crate) async fn get_or_insert_record<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: CacheLoader<'a>,
+    ) -> Result<(CacheEntry, usize, bool)> {
+        // Track whether the loader actually ran (= cache miss).
+        let was_miss = Arc::new(AtomicBool::new(false));
+        let was_miss_clone = was_miss.clone();
+
+        let init = async move {
+            was_miss_clone.store(true, Ordering::Relaxed);
+            loader
+                .await
+                .map(|(entry, size_bytes)| MokaCacheEntry { entry, size_bytes })
+                .map_err(CloneableError)
+        };
+
+        let owned_key = *key;
+        match self.cache.try_get_with(owned_key, init).await {
+            Ok(record) => {
+                let was_cached = !was_miss.load(Ordering::Relaxed);
+                Ok((record.entry, record.size_bytes, was_cached))
+            }
+            Err(error) => Err(Arc::unwrap_or_clone(error).0),
+        }
+    }
+
+    pub(crate) async fn invalidate_key(&self, key: &InternalCacheKey) {
+        self.cache.invalidate(key).await;
+    }
 }
 
 #[async_trait]
@@ -127,26 +160,8 @@ impl CacheBackend for MokaCacheBackend {
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
         _codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
-        // Track whether the loader actually ran (= cache miss).
-        let was_miss = Arc::new(AtomicBool::new(false));
-        let was_miss_clone = was_miss.clone();
-
-        let init = async move {
-            was_miss_clone.store(true, Ordering::Relaxed);
-            loader
-                .await
-                .map(|(entry, size_bytes)| MokaCacheEntry { entry, size_bytes })
-                .map_err(CloneableError)
-        };
-
-        let owned_key = *key;
-        match self.cache.try_get_with(owned_key, init).await {
-            Ok(record) => {
-                let was_cached = !was_miss.load(Ordering::Relaxed);
-                Ok((record.entry, was_cached))
-            }
-            Err(error) => Err(Arc::unwrap_or_clone(error).0),
-        }
+        let (entry, _, was_cached) = self.get_or_insert_record(key, loader).await?;
+        Ok((entry, was_cached))
     }
 
     async fn clear(&self) {
