@@ -255,6 +255,38 @@ impl ScalarQuantizationStorage {
             Ok(new)
         }
     }
+
+    /// Reconstruct the quantized vectors as one row-major `f32` matrix.
+    ///
+    /// CAGRA builds a neighbor graph from floating-point vectors. Reconstructing
+    /// from the persisted SQ codes keeps its graph input aligned exactly with
+    /// the vector ordering used by Lance's SQ storage.
+    pub(crate) fn to_f32_matrix(&self) -> Result<(Vec<f32>, usize)> {
+        let dim = self.quantizer.metadata.dim;
+        let value_count = self
+            .len()
+            .checked_mul(dim)
+            .ok_or_else(|| Error::index("SQ vector matrix size overflow".to_string()))?;
+        let bounds = self.quantizer.bounds();
+        let lower_bound = bounds.start as f32;
+        let value_scale = sq_value_scale(&bounds);
+        let mut values = Vec::with_capacity(value_count);
+        for chunk in &self.chunks {
+            values.extend(
+                chunk
+                    .sq_codes
+                    .values()
+                    .iter()
+                    .map(|value| lower_bound + f32::from(*value) * value_scale),
+            );
+        }
+        debug_assert_eq!(
+            values.len(),
+            value_count,
+            "reconstructed SQ matrix length must match rows times dimension"
+        );
+        Ok((values, dim))
+    }
 }
 
 #[async_trait]

@@ -4852,6 +4852,7 @@ dependencies = [
  "lance-table",
  "lance-testing",
  "lance-tokenizer",
+ "libc",
  "libsais-rs",
  "log",
  "ndarray",

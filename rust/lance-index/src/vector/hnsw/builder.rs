@@ -43,7 +43,7 @@ use crate::vector::graph::{
     Visited, beam_search_acorn, beam_search_borrowed, greedy_search, greedy_search_borrowed,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
-use crate::vector::v3::subindex::IvfSubIndex;
+use crate::vector::v3::subindex::{IvfSubIndex, SubIndexBuildAccelerator};
 use crate::vector::{ApproxMode, Query, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
@@ -262,6 +262,55 @@ impl HNSW {
                 visited_generator_queue,
             }),
         }
+    }
+
+    /// Import a fixed-degree neighbor graph as a one-level HNSW graph.
+    ///
+    /// CAGRA emits a row-major `num_nodes x graph_degree` graph. Node ids are
+    /// local to the IVF partition and therefore line up with Lance's storage
+    /// offsets without remapping.
+    pub(crate) fn from_neighbor_graph(
+        params: HnswBuildParams,
+        neighbors: Vec<u32>,
+        graph_degree: usize,
+    ) -> Result<Self> {
+        params.validate()?;
+        if graph_degree == 0 {
+            return Err(Error::invalid_input(
+                "CAGRA graph_degree must be greater than 0".to_string(),
+            ));
+        }
+        if !neighbors.len().is_multiple_of(graph_degree) {
+            return Err(Error::invalid_input(format!(
+                "CAGRA graph has {} neighbor ids, which is not divisible by graph_degree {}",
+                neighbors.len(),
+                graph_degree
+            )));
+        }
+        let num_nodes = neighbors.len() / graph_degree;
+        if num_nodes > u32::MAX as usize {
+            return Err(Error::invalid_input(format!(
+                "CAGRA graph has {num_nodes} nodes, exceeding the u32 node-id limit"
+            )));
+        }
+        if let Some(invalid_neighbor) = neighbors
+            .iter()
+            .copied()
+            .find(|neighbor| *neighbor as usize >= num_nodes)
+        {
+            return Err(Error::invalid_input(format!(
+                "CAGRA graph neighbor id {invalid_neighbor} is outside the node range 0..{num_nodes}"
+            )));
+        }
+
+        let nodes = neighbors
+            .chunks_exact(graph_degree)
+            .map(|neighbors| {
+                let neighbors = Arc::new(neighbors.to_vec());
+                GraphBuilderNode::from_parts(vec![neighbors.clone()], vec![Vec::new()], neighbors)
+            })
+            .collect();
+        Ok(Self::from_parts(params, nodes, vec![num_nodes], 0))
     }
 
     pub fn empty() -> Self {
@@ -1447,6 +1496,37 @@ impl IvfSubIndex for HNSW {
         Ok(builder.finish())
     }
 
+    fn index_vectors_with_accelerator(
+        storage: &impl VectorStore,
+        params: Self::BuildParams,
+        accelerator: &SubIndexBuildAccelerator,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        match accelerator {
+            SubIndexBuildAccelerator::Cagra(accelerator) => {
+                if accelerator.is_disabled()
+                    || !super::cagra::supports_partition(storage.len(), &params)
+                {
+                    return Self::index_vectors(storage, params);
+                }
+                match super::cagra::build(storage, params.clone(), accelerator.library_path()) {
+                    Ok(index) => Ok(index),
+                    Err(error) => {
+                        if accelerator.disable() {
+                            log::warn!(
+                                "cuVS CAGRA HNSW build failed; falling back to CPU: {}",
+                                error
+                            );
+                        }
+                        Self::index_vectors(storage, params)
+                    }
+                }
+            }
+        }
+    }
+
     fn remap(
         &self,
         _mapping: &RowAddrRemap, // we don't need the mapping here because we rebuild the graph from remapped storage
@@ -1540,10 +1620,11 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+        UInt64Array, cast::AsArray, types::UInt32Type,
     };
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::{Error, deepsize::DeepSizeOf};
+    use lance_core::{Error, ROW_ID, deepsize::DeepSizeOf};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader,
         writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
@@ -1562,11 +1643,13 @@ mod tests {
         ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
     use crate::vector::graph::builder::GraphBuilderNode;
+    use crate::vector::sq::storage::ScalarQuantizationStorage;
     use crate::vector::storage::{DistCalculator, VectorStore};
-    use crate::vector::v3::subindex::IvfSubIndex;
+    use crate::vector::v3::subindex::{IvfSubIndex, SubIndexBuildAccelerator};
     use crate::vector::{
+        SQ_CODE_COLUMN,
         flat::storage::{FlatBinStorage, FlatFloatStorage},
-        graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
+        graph::{DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, HnswMetadata, VECTOR_ID_FIELD,
             builder::{HnswBuildParams, HnswQueryParams},
@@ -2072,6 +2155,94 @@ mod tests {
             "level-0 greedy descent adds distance computations beyond the \
              beam's one per node"
         );
+    }
+
+    #[test]
+    fn test_import_cagra_neighbor_graph() {
+        let params = HnswBuildParams::default();
+        let graph = vec![1, 2, 0, 2, 0, 3, 1, 2];
+        let hnsw = HNSW::from_neighbor_graph(params, graph, 2).unwrap();
+
+        assert_eq!(hnsw.len(), 4);
+        assert_eq!(hnsw.max_level(), 1);
+        let batch = hnsw.to_batch().unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
+        assert_eq!(
+            neighbors.value(0).as_primitive::<UInt32Type>().values(),
+            &[1, 2]
+        );
+        assert_eq!(
+            neighbors.value(3).as_primitive::<UInt32Type>().values(),
+            &[1, 2]
+        );
+
+        let loaded = HNSW::load(batch).unwrap();
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded.max_level(), 1);
+    }
+
+    #[test]
+    fn test_import_cagra_neighbor_graph_rejects_invalid_node() {
+        let error =
+            HNSW::from_neighbor_graph(HnswBuildParams::default(), vec![1, 0, 0, 3], 2).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("neighbor id 3"));
+        assert!(error.to_string().contains("0..2"));
+    }
+
+    #[test]
+    fn test_cagra_missing_library_falls_back_to_cpu() {
+        let storage = make_sq_storage(8);
+        let accelerator = SubIndexBuildAccelerator::cagra("/missing/libcuvs_c.so");
+
+        let hnsw = HNSW::index_vectors_with_accelerator(
+            &storage,
+            HnswBuildParams::default().num_edges(4).ef_construction(10),
+            &accelerator,
+        )
+        .unwrap();
+
+        assert_eq!(hnsw.len(), 8);
+        let SubIndexBuildAccelerator::Cagra(accelerator) = accelerator;
+        assert!(accelerator.is_disabled());
+    }
+
+    #[test]
+    fn test_cagra_small_partition_does_not_disable_acceleration() {
+        let storage = make_sq_storage(4);
+        let accelerator = SubIndexBuildAccelerator::cagra("/missing/libcuvs_c.so");
+
+        let hnsw = HNSW::index_vectors_with_accelerator(
+            &storage,
+            HnswBuildParams::default().num_edges(4).ef_construction(10),
+            &accelerator,
+        )
+        .unwrap();
+
+        assert_eq!(hnsw.len(), 4);
+        let SubIndexBuildAccelerator::Cagra(accelerator) = accelerator;
+        assert!(!accelerator.is_disabled());
+    }
+
+    fn make_sq_storage(num_rows: usize) -> ScalarQuantizationStorage {
+        let values = (0..num_rows)
+            .flat_map(|row| {
+                let value = (row * 255 / num_rows.saturating_sub(1).max(1)) as u8;
+                [value, value]
+            })
+            .collect::<Vec<_>>();
+        let codes = FixedSizeListArray::try_new_from_values(UInt8Array::from(values), 2).unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from((0..num_rows as u64).collect::<Vec<_>>())) as ArrayRef,
+            ),
+            (SQ_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+        ])
+        .unwrap();
+        ScalarQuantizationStorage::try_new(8, DistanceType::L2, 0.0..1.0, [batch], None).unwrap()
     }
 
     /// Brute-force top-`k` restricted to mask-passing ids.

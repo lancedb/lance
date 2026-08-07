@@ -32,7 +32,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 
-use super::{StageParams, VectorIndexParams};
+use super::{CUVS_LIBRARY_RUNTIME_HINT, StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
 use crate::index::open_index_proto;
 use crate::{Error, Result};
@@ -95,6 +95,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
     let mut hnsw_index_config = None;
     let mut compression = None;
     let mut runtime_hints: HashMap<String, String> = params.runtime_hints.clone();
+    runtime_hints.remove(CUVS_LIBRARY_RUNTIME_HINT);
 
     for stage in &params.stages {
         match stage {
@@ -1114,7 +1115,7 @@ mod tests {
         use lance_linalg::distance::DistanceType;
 
         // Non-default values for IVF and PQ hints
-        let params = VectorIndexParams::with_ivf_pq_params(
+        let mut params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             IvfBuildParams {
                 max_iters: 100,
@@ -1131,6 +1132,10 @@ mod tests {
                 sample_rate: 128,
                 ..Default::default()
             },
+        );
+        params.runtime_hints.insert(
+            CUVS_LIBRARY_RUNTIME_HINT.to_string(),
+            "/opt/libcuvs_c.so".to_string(),
         );
 
         let any = vector_index_details(&params);
@@ -1194,6 +1199,11 @@ mod tests {
         assert_eq!(
             details.runtime_hints.get("lance.skip_transpose"),
             Some(&"false".to_string())
+        );
+        assert!(
+            !details
+                .runtime_hints
+                .contains_key(CUVS_LIBRARY_RUNTIME_HINT)
         );
 
         // Roundtrip: apply hints back to a fresh params struct

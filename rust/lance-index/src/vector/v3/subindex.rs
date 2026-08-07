@@ -4,7 +4,10 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use lance_core::deepsize::DeepSizeOf;
@@ -15,6 +18,52 @@ use crate::vector::graph::OrderedNode;
 use crate::vector::storage::{QueryResidual, QueryScratch, VectorStore};
 use crate::vector::{flat, hnsw};
 use crate::{prefilter::PreFilter, vector::Query};
+
+/// Optional external accelerator for building an IVF sub-index.
+///
+/// The accelerator only changes how the in-memory graph is constructed. Lance
+/// still owns quantization, persistence, and query execution.
+#[derive(Debug, Clone)]
+pub enum SubIndexBuildAccelerator {
+    /// Build a CAGRA graph through the cuVS C API and import it as HNSW.
+    Cagra(CagraBuildAccelerator),
+}
+
+impl SubIndexBuildAccelerator {
+    /// Create a cuVS CAGRA accelerator from an absolute `libcuvs_c` path.
+    pub fn cagra(library_path: impl Into<String>) -> Self {
+        Self::Cagra(CagraBuildAccelerator {
+            library_path: library_path.into(),
+            is_disabled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
+/// Shared state for one cuVS CAGRA index build.
+///
+/// A failing cuVS call disables acceleration for the remaining IVF partitions,
+/// avoiding repeated loader or CUDA failures before their CPU fallback.
+#[derive(Debug, Clone)]
+pub struct CagraBuildAccelerator {
+    library_path: String,
+    is_disabled: Arc<AtomicBool>,
+}
+
+impl CagraBuildAccelerator {
+    pub(crate) fn library_path(&self) -> &str {
+        &self.library_path
+    }
+
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.is_disabled.load(Ordering::Relaxed)
+    }
+
+    /// Disable the accelerator and return whether this call changed its state.
+    pub(crate) fn disable(&self) -> bool {
+        !self.is_disabled.swap(true, Ordering::Relaxed)
+    }
+}
+
 /// A sub index for IVF index
 pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     type QueryParams: Send + Sync + for<'a> From<&'a Query>;
@@ -115,6 +164,21 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     fn index_vectors(storage: &impl VectorStore, params: Self::BuildParams) -> Result<Self>
     where
         Self: Sized;
+
+    /// Build with an optional external accelerator.
+    ///
+    /// Sub-index implementations that do not support the requested accelerator
+    /// retain their normal CPU build behavior.
+    fn index_vectors_with_accelerator(
+        storage: &impl VectorStore,
+        params: Self::BuildParams,
+        _accelerator: &SubIndexBuildAccelerator,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Self::index_vectors(storage, params)
+    }
 
     fn remap(&self, mapping: &RowAddrRemap, store: &impl VectorStore) -> Result<Self>
     where

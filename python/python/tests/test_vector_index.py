@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import importlib
 import logging
 import os
 import platform
@@ -738,7 +739,9 @@ def test_create_index_unsupported_accelerator(tmp_path):
         )
 
 
-def test_create_index_accelerator_fallback(tmp_path, caplog):
+def test_create_index_accelerator_fallback(tmp_path, caplog, monkeypatch):
+    dataset_module = importlib.import_module("lance.dataset")
+    monkeypatch.setattr(dataset_module, "_locate_cuvs_library", lambda: None)
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
 
@@ -753,7 +756,30 @@ def test_create_index_accelerator_fallback(tmp_path, caplog):
     stats = dataset.stats.index_stats("vector_idx")
     assert stats["index_type"] == "IVF_HNSW_SQ"
     assert any(
-        "does not support GPU acceleration; falling back to CPU" in record.message
+        "compatible cuVS CAGRA library was not found" in record.message
+        for record in caplog.records
+    )
+
+
+def test_create_index_cagra_accelerator_dispatch(tmp_path, caplog, monkeypatch):
+    dataset_module = importlib.import_module("lance.dataset")
+    monkeypatch.setattr(
+        dataset_module, "_locate_cuvs_library", lambda: "/missing/libcuvs_c.so"
+    )
+    dataset = lance.write_dataset(create_table(), tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        dataset = dataset.create_index(
+            "vector",
+            index_type="IVF_HNSW_SQ",
+            num_partitions=4,
+            accelerator="cuda",
+        )
+
+    stats = dataset.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_SQ"
+    assert not any(
+        "does not support GPU acceleration" in record.message
         for record in caplog.records
     )
 

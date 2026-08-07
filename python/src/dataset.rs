@@ -5151,12 +5151,17 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
-    if let Some(kwargs) = kwargs
-        && let Some(acc) = kwargs.get_item("accelerator")?
-    {
-        params
-            .runtime_hints
-            .insert("lancedb.accelerator".to_string(), acc.to_string());
+    if let Some(kwargs) = kwargs {
+        if let Some(acc) = kwargs.get_item("accelerator")? {
+            params
+                .runtime_hints
+                .insert("lancedb.accelerator".to_string(), acc.to_string());
+        }
+        if let Some(library_path) = kwargs.get_item("cuvs_library")? {
+            params
+                .runtime_hints
+                .insert("lancedb.cuvs_library".to_string(), library_path.extract()?);
+        }
     }
     Ok(params)
 }

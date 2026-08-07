@@ -103,6 +103,42 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[Union[float, Iterable[float]]],
     ]
+
+
+def _locate_cuvs_library() -> Optional[str]:
+    """Find a cuVS C library that can derive CAGRA params from HNSW params."""
+    import ctypes
+    from importlib.util import find_spec
+
+    try:
+        spec = find_spec("libcuvs")
+    except ModuleNotFoundError:
+        return None
+    if spec is None:
+        return None
+
+    package_dirs = [Path(path) for path in spec.submodule_search_locations or []]
+    if spec.origin is not None:
+        package_dirs.append(Path(spec.origin).parent)
+
+    candidates = {
+        candidate
+        for package_dir in package_dirs
+        for candidate in (package_dir / "lib64").glob("libcuvs_c.so*")
+    }
+    for candidate in sorted(
+        candidates,
+        key=lambda path: (path.name != "libcuvs_c.so", path.name),
+    ):
+        try:
+            library = ctypes.CDLL(str(candidate))
+        except OSError:
+            continue
+        if hasattr(library, "cuvsCagraIndexParamsFromHnswParams"):
+            return str(candidate)
+    return None
+
+
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 # Mirrors Rust's `lance::dataset::DEFAULT_COMMIT_TIMEOUT`; keep the two in sync.
 _DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=30)
@@ -3781,7 +3817,26 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
-        if accelerator is not None and index_type != "IVF_PQ":
+        cagra_library = None
+        if accelerator is not None and index_type == "IVF_HNSW_SQ":
+            if str(accelerator).lower() != "cuda":
+                LOGGER.warning(
+                    "IVF_HNSW_SQ CAGRA acceleration supports only accelerator='cuda'; "
+                    "falling back to CPU"
+                )
+            else:
+                cagra_library = _locate_cuvs_library()
+                if cagra_library is None:
+                    LOGGER.warning(
+                        "A compatible cuVS CAGRA library was not found; falling back "
+                        "to CPU for IVF_HNSW_SQ"
+                    )
+                else:
+                    kwargs["cuvs_library"] = cagra_library
+            # CAGRA accelerates only the per-partition HNSW graph build. The
+            # one-pass Torch path below applies exclusively to IVF_PQ.
+            accelerator = None
+        elif accelerator is not None and index_type != "IVF_PQ":
             LOGGER.warning(
                 "Index type %s does not support GPU acceleration; falling back to CPU",
                 index_type,
@@ -3790,10 +3845,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         # IMPORTANT: Distributed indexing is CPU-only. Enforce single-node when
         # accelerator or torch-related paths are detected.
-        torch_detected = False
+        accelerator_or_torch_detected = cagra_library is not None
         try:
             if accelerator is not None:
-                torch_detected = True
+                accelerator_or_torch_detected = True
             else:
                 impl = kwargs.get("implementation")
                 use_torch_flag = kwargs.get("use_torch") is True
@@ -3807,16 +3862,16 @@ class LanceDataset(pa.dataset.Dataset):
                     or torch_centroids
                     or torch_codebook
                 ):
-                    torch_detected = True
+                    accelerator_or_torch_detected = True
         except Exception:
             # Be conservative: if detection fails, do not modify behavior
             pass
 
-        if torch_detected:
+        if accelerator_or_torch_detected:
             if require_commit:
                 if fragment_ids is not None or index_uuid is not None:
                     LOGGER.info(
-                        "Torch detected; "
+                        "Accelerator or Torch input detected; "
                         "enforce single-node indexing (distributed is CPU-only)."
                     )
                 fragment_ids = None
@@ -3824,7 +3879,7 @@ class LanceDataset(pa.dataset.Dataset):
             else:
                 if index_uuid is not None:
                     LOGGER.info(
-                        "Torch detected; "
+                        "Accelerator or Torch input detected; "
                         "enforce single-node indexing (distributed is CPU-only)."
                     )
                 index_uuid = None
@@ -4126,9 +4181,11 @@ class LanceDataset(pa.dataset.Dataset):
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         accelerator : str or ``torch.Device``, optional
-            If set, use an accelerator to speed up the training process.
-            Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
-            If not set, use the CPU.
+            If set, use an accelerator for supported index build stages.
+            ``IVF_PQ`` accepts "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU)
+            and requires PyTorch. ``IVF_HNSW_SQ`` accepts "cuda" and uses cuVS
+            CAGRA to construct each HNSW graph when the ``libcuvs`` Python package
+            is installed. Unsupported or unavailable accelerators fall back to CPU.
         index_cache_size : int, optional
             The size of the index cache in number of entries. Default value is 256.
         shuffle_partition_batches : int, optional
@@ -4262,9 +4319,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Experimental Accelerator (GPU) support:
 
-        - *accelerate*: use GPU to train IVF partitions.
-            Only supports CUDA (Nvidia) or MPS (Apple) currently.
-            Requires PyTorch being installed.
+        - ``IVF_PQ`` uses CUDA or MPS through PyTorch for IVF/PQ training.
+        - ``IVF_HNSW_SQ`` uses CUDA through cuVS CAGRA for HNSW graph
+          construction and requires the ``libcuvs`` Python package.
 
         .. code-block:: python
 
@@ -4279,9 +4336,9 @@ class LanceDataset(pa.dataset.Dataset):
                 accelerator="cuda"
             )
 
-        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
-        type. Providing an accelerator for other index types will fall back to CPU
-        index building.
+        Other index types fall back to CPU index building when an accelerator is
+        provided. ``IVF_HNSW_SQ`` also falls back to CPU when compatible cuVS CAGRA
+        support is unavailable.
 
         References
         ----------

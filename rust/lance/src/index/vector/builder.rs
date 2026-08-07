@@ -59,7 +59,7 @@ use lance_index::{
         transform::Transformer,
         v3::{
             shuffler::{ShuffleReader, Shuffler},
-            subindex::IvfSubIndex,
+            subindex::{IvfSubIndex, SubIndexBuildAccelerator},
         },
     },
 };
@@ -250,6 +250,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     // whether to transpose codes when building storage
     transpose_codes: bool,
 
+    // Optional accelerator used only while constructing each partition's sub-index.
+    sub_index_accelerator: Option<SubIndexBuildAccelerator>,
+
     // lance file version for writing index files
     format_version: LanceFileVersion,
 
@@ -305,6 +308,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            sub_index_accelerator: None,
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
@@ -372,6 +376,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            sub_index_accelerator: None,
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
@@ -506,6 +511,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// This mainly affects intermediate PQ/RQ storage when building distributed indices.
     pub fn with_transpose(&mut self, transpose: bool) -> &mut Self {
         self.transpose_codes = transpose;
+        self
+    }
+
+    /// Use an external accelerator when constructing each partition's sub-index.
+    pub fn with_sub_index_accelerator(
+        &mut self,
+        accelerator: SubIndexBuildAccelerator,
+    ) -> &mut Self {
+        self.sub_index_accelerator = Some(accelerator);
         self
     }
 
@@ -987,6 +1001,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let column = self.column.clone();
         let frag_reuse_index = self.frag_reuse_index.clone();
         let partition_adjustment = Arc::new(partition_adjustment);
+        let sub_index_accelerator = self.sub_index_accelerator.clone();
+        // A cuVS resources handle owns one CUDA stream. Build partitions serially
+        // so concurrent partitions do not compete for all remaining GPU memory.
+        let partition_concurrency = if sub_index_accelerator.is_some() {
+            1
+        } else {
+            get_num_compute_intensive_cpus()
+        };
         let build_iter =
             assign_batches
                 .into_iter()
@@ -1000,6 +1022,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let column = column.clone();
                     let frag_reuse_index = frag_reuse_index.clone();
                     let partition_adjustment = partition_adjustment.clone();
+                    let sub_index_accelerator = sub_index_accelerator.clone();
                     async move {
                         let (is_affected, split_reader) = match partition_adjustment.as_ref() {
                             Some(PartitionAdjustment::Split {
@@ -1050,7 +1073,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             loss += extra_loss;
                         }
 
-                        spawn_cpu(move || {
+                        let is_accelerated = sub_index_accelerator.is_some();
+                        let build_partition = move || {
                             // Apply assign_batch for join operations (splits no
                             // longer use assign_batches)
                             if let Some((assign_batch, deleted_row_ids)) = assign_batch {
@@ -1089,14 +1113,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 batches,
                                 column,
                                 frag_reuse_index,
+                                sub_index_accelerator.as_ref(),
                             )?;
                             Ok(Some((storage, sub_index, loss)))
-                        })
-                        .await
+                        };
+
+                        if is_accelerated {
+                            // CAGRA waits on GPU work and must not occupy Lance's
+                            // pure-CPU pool while its CUDA stream is running.
+                            tokio::task::spawn_blocking(build_partition).await?
+                        } else {
+                            spawn_cpu(build_partition).await
+                        }
                     }
                 });
         Ok(stream::iter(build_iter)
-            .buffered(get_num_compute_intensive_cpus())
+            .buffered(partition_concurrency)
             .boxed())
     }
 
@@ -1109,10 +1141,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         batches: Vec<RecordBatch>,
         column: String,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        sub_index_accelerator: Option<&SubIndexBuildAccelerator>,
     ) -> Result<(Q::Storage, S)> {
         let storage = StorageBuilder::new(column, distance_type, quantizer, frag_reuse_index)?
             .build(batches)?;
-        let sub_index = S::index_vectors(&storage, sub_index_params)?;
+        let sub_index = match sub_index_accelerator {
+            Some(accelerator) => {
+                S::index_vectors_with_accelerator(&storage, sub_index_params, accelerator)?
+            }
+            None => S::index_vectors(&storage, sub_index_params)?,
+        };
 
         Ok((storage, sub_index))
     }

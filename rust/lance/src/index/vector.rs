@@ -43,7 +43,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::{Shuffler, create_ivf_shuffler};
-use lance_index::vector::v3::subindex::SubIndexType;
+use lance_index::vector::v3::subindex::{SubIndexBuildAccelerator, SubIndexType};
 use lance_index::vector::{
     VectorIndex,
     hnsw::{
@@ -70,6 +70,12 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
+
+/// Transient runtime hint carrying the cuVS C library used for CAGRA builds.
+///
+/// This value controls only the current build and is removed before index
+/// details are persisted.
+pub(crate) const CUVS_LIBRARY_RUNTIME_HINT: &str = "lancedb.cuvs_library";
 
 /// A materialized snapshot of one logical vector index and all of its segments.
 #[derive(Debug)]
@@ -504,6 +510,13 @@ impl IndexParams for VectorIndexParams {
     }
 }
 
+fn cagra_accelerator(params: &VectorIndexParams) -> Option<SubIndexBuildAccelerator> {
+    params
+        .runtime_hints
+        .get(CUVS_LIBRARY_RUNTIME_HINT)
+        .map(|library_path| SubIndexBuildAccelerator::cagra(library_path.clone()))
+}
+
 /// Prepare the shared build inputs used by both direct local builds and
 /// staged shard builds.
 ///
@@ -893,7 +906,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -903,11 +916,15 @@ pub(crate) async fn build_distributed_vector_index(
                 Some(sq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
-            )?
-            .with_fragment_filter(fragment_filter)
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            )?;
+            if let Some(accelerator) = cagra_accelerator(params) {
+                builder.with_sub_index_accelerator(accelerator);
+            }
+            let summary = builder
+                .with_fragment_filter(fragment_filter)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
             return Ok((segment_uuid, summary.files));
         }
 
@@ -1262,21 +1279,25 @@ async fn build_vector_index_impl(
                     stages
                 )));
             };
-            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let mut builder = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
-                dataset.indices_dir().clone().join(uuid.to_string()),
+                dataset.indices_dir().join(uuid.to_string()),
                 params.metric_type,
                 shuffler,
                 Some(ivf_params),
                 Some(sq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
-            )?
-            .with_optional_fragment_filter(fragment_ids)
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            )?;
+            if let Some(accelerator) = cagra_accelerator(params) {
+                builder.with_sub_index_accelerator(accelerator);
+            }
+            let summary = builder
+                .with_optional_fragment_filter(fragment_ids)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
             Ok(summary.files)
         }
         _ => Err(Error::index(format!(
