@@ -4678,6 +4678,8 @@ struct PrimitivePageData {
     row_number: u64,
     // Number of top-level rows in this page.
     num_rows: u64,
+    // Page-local automatic dictionaries are disabled when dense splitting would duplicate them.
+    disable_automatic_dictionary: bool,
 }
 
 struct PrimitivePlanContext<'a> {
@@ -6223,6 +6225,7 @@ impl PrimitiveStructuralEncoder {
                 },
                 row_number,
                 num_rows,
+                disable_automatic_dictionary: false,
             }]);
         }
         if let MiniBlockRepDefBudget::SingleRowOverBudget(num_levels) = budget {
@@ -6234,6 +6237,7 @@ impl PrimitiveStructuralEncoder {
                 },
                 row_number,
                 num_rows,
+                disable_automatic_dictionary: false,
             }]);
         }
 
@@ -6253,6 +6257,7 @@ impl PrimitiveStructuralEncoder {
                 },
                 row_number: row_number + split.row_start,
                 num_rows: split.num_rows,
+                disable_automatic_dictionary: false,
             });
         }
         Ok(pages)
@@ -6278,6 +6283,7 @@ impl PrimitiveStructuralEncoder {
             structure,
             row_number,
             num_rows,
+            disable_automatic_dictionary,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
 
@@ -6510,23 +6516,27 @@ impl PrimitiveStructuralEncoder {
 
         // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
         // preferred structural encoding.
-        let dict_result = Self::should_dictionary_encode(
-            &data_block,
-            &field,
-            fixed_width_dictionary_encoding,
-        )
-        .and_then(|budget| {
-            log::debug!(
-                "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                column_idx,
-                num_values
-            );
-            dict::dictionary_encode(
+        let dict_result = if disable_automatic_dictionary {
+            None
+        } else {
+            Self::should_dictionary_encode(
                 &data_block,
-                budget.max_dict_entries,
-                budget.max_encoded_size,
+                &field,
+                fixed_width_dictionary_encoding,
             )
-        });
+            .and_then(|budget| {
+                log::debug!(
+                    "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                    column_idx,
+                    num_values
+                );
+                dict::dictionary_encode(
+                    &data_block,
+                    budget.max_dict_entries,
+                    budget.max_encoded_size,
+                )
+            })
+        };
 
         if let Some((indices_data_block, dictionary_data_block)) = dict_result {
             Self::encode_miniblock(
@@ -6774,7 +6784,6 @@ impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
             Ok(Some(page_split::split_dense_pages(
                 pages,
                 arrays,
-                ctx.field,
                 ctx.max_page_bytes,
                 num_rows,
                 num_values,
@@ -6831,6 +6840,7 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                 },
                 row_number,
                 num_rows,
+                disable_automatic_dictionary: false,
             }]));
         }
 
@@ -6878,6 +6888,7 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                 },
                 row_number,
                 num_rows,
+                disable_automatic_dictionary: false,
             }]
         }))
     }
@@ -6899,6 +6910,7 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                 },
             row_number,
             num_rows,
+            ..
         } = page
         else {
             unreachable!()

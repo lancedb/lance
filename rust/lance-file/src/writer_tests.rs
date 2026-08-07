@@ -38,11 +38,16 @@ mod tests {
         versions::create_writer(version, object_writer, schema, options)
     }
 
-    async fn write_batch_page_sizes(
+    struct WrittenPage {
+        buffer_sizes: Vec<u64>,
+        encoding: String,
+    }
+
+    async fn write_batch_pages(
         batch: &RecordBatch,
         version: ConcreteFileVersion,
         max_page_bytes: u64,
-    ) -> Vec<Vec<Vec<u64>>> {
+    ) -> Vec<Vec<WrittenPage>> {
         let mut lance_schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
         lance_schema.set_dictionary(batch).unwrap();
         let path = TempObjFile::default();
@@ -85,7 +90,10 @@ mod tests {
                 column
                     .pages
                     .iter()
-                    .map(|page| page.buffer_sizes.clone())
+                    .map(|page| WrittenPage {
+                        buffer_sizes: page.buffer_sizes.clone(),
+                        encoding: describe_encoding(page),
+                    })
                     .collect()
             })
             .collect()
@@ -780,15 +788,15 @@ mod tests {
         let array = UInt64Array::from(data);
         let batch =
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
-        let page_buffer_sizes = write_batch_page_sizes(&batch, version, 1024 * 1024).await;
+        let pages = write_batch_pages(&batch, version, 1024 * 1024).await;
 
         let mut total_page_num: u32 = 0;
-        for (col_idx, pages) in page_buffer_sizes.iter().enumerate() {
+        for (col_idx, pages) in pages.iter().enumerate() {
             assert!(!pages.is_empty(), "Column {} has no pages", col_idx);
 
-            for (page_idx, buffer_sizes) in pages.iter().enumerate() {
+            for (page_idx, page) in pages.iter().enumerate() {
                 total_page_num += 1;
-                let total_size: u64 = buffer_sizes.iter().sum();
+                let total_size: u64 = page.buffer_sizes.iter().sum();
                 assert!(
                     total_size <= 1024 * 1024,
                     "Column {} Page {} size {} exceeds 1MB limit",
@@ -812,10 +820,9 @@ mod tests {
         )
         .unwrap();
 
-        let page_buffer_sizes =
-            write_batch_page_sizes(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
+        let pages = write_batch_pages(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
 
-        assert_eq!(page_buffer_sizes[0].len(), 2);
+        assert_eq!(pages[0].len(), 2);
     }
 
     #[tokio::test]
@@ -834,14 +841,13 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(arrow_schema.into(), vec![Arc::new(dictionary)]).unwrap();
 
-        let page_buffer_sizes =
-            write_batch_page_sizes(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
+        let pages = write_batch_pages(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
 
-        assert_eq!(page_buffer_sizes[0].len(), 1);
+        assert_eq!(pages[0].len(), 1);
     }
 
     #[tokio::test]
-    async fn test_oversized_automatic_dictionary_batch_remains_single_page() {
+    async fn test_oversized_automatic_dictionary_batch_splits_without_dictionary() {
         let unique_values = (0..128)
             .map(|index| format!("{index:04}-{}", "x".repeat(2043)))
             .collect::<Vec<_>>();
@@ -852,10 +858,32 @@ mod tests {
         let arrow_schema = Schema::new(vec![Field::new("data", DataType::Utf8, false)]);
         let batch = RecordBatch::try_new(arrow_schema.into(), vec![Arc::new(values)]).unwrap();
 
-        let page_buffer_sizes =
-            write_batch_page_sizes(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
+        let pages = write_batch_pages(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
 
-        assert_eq!(page_buffer_sizes[0].len(), 1);
+        assert!(pages[0].len() > 1);
+        assert!(
+            pages[0]
+                .iter()
+                .all(|page| !page.encoding.contains("dictionary: Some"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_rejected_dictionary_candidate_splits_into_pages() {
+        let values = StringArray::from_iter_values(
+            (0..100).map(|index| format!("{index:03}-{}", "x".repeat(20 * 1024 - 4))),
+        );
+        let arrow_schema = Schema::new(vec![Field::new("data", DataType::Utf8, false)]);
+        let batch = RecordBatch::try_new(arrow_schema.into(), vec![Arc::new(values)]).unwrap();
+
+        let pages = write_batch_pages(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
+
+        assert_eq!(pages[0].len(), 2);
+        assert!(
+            pages[0]
+                .iter()
+                .all(|page| !page.encoding.contains("dictionary: Some"))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

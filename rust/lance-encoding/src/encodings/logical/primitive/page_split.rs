@@ -3,13 +3,11 @@
 
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
-use lance_core::{Error, Result, datatypes::Field};
+use lance_core::{Error, Result};
 
 use super::{
-    FixedWidthDictionaryEncoding, PrimitivePageData, PrimitivePageStructure,
-    PrimitiveStructuralEncoder, SerializedRepDefs,
+    PrimitivePageData, PrimitivePageStructure, PrimitiveStructuralEncoder, SerializedRepDefs,
 };
-use crate::data::DataBlock;
 
 /// Split dense pages into independently encodable tasks using the unencoded byte size.
 ///
@@ -19,7 +17,6 @@ use crate::data::DataBlock;
 pub(super) fn split_dense_pages(
     pages: Vec<PrimitivePageData>,
     arrays: &[ArrayRef],
-    field: &Field,
     max_page_bytes: u64,
     num_rows: u64,
     num_values: u64,
@@ -58,30 +55,26 @@ pub(super) fn split_dense_pages(
     if total_size_bytes <= max_page_bytes {
         return Ok(pages);
     }
-    // Automatic dictionary selection happens while encoding each page. Splitting first would
-    // cause every page to build and serialize its own copy of the dictionary payload.
-    let data_block = DataBlock::from_arrays(arrays, num_values);
-    if PrimitiveStructuralEncoder::should_dictionary_encode(
-        &data_block,
-        field,
-        FixedWidthDictionaryEncoding::Include64Bit,
-    )
-    .is_some()
-    {
-        return Ok(pages);
-    }
-
     let desired_pages = total_size_bytes
         .div_ceil(max_page_bytes)
         .min(num_rows)
         .min(num_values);
     let target_values_per_page = num_values.div_ceil(desired_pages);
 
-    pages
+    let mut pages = pages
         .into_iter()
         .map(|page| split_dense_page(page, target_values_per_page))
         .collect::<Result<Vec<_>>>()
-        .map(|pages| pages.into_iter().flatten().collect())
+        .map(|pages| pages.into_iter().flatten().collect::<Vec<_>>())?;
+
+    if pages.len() > 1 {
+        // Automatic dictionary selection is page-local. Disable it after splitting so that the
+        // same logical dictionary is not independently constructed and serialized in every page.
+        for page in &mut pages {
+            page.disable_automatic_dictionary = true;
+        }
+    }
+    Ok(pages)
 }
 
 fn split_dense_page(
@@ -93,6 +86,7 @@ fn split_dense_page(
         structure,
         row_number,
         num_rows,
+        disable_automatic_dictionary,
     } = page;
     let PrimitivePageStructure::Dense {
         repdef,
@@ -126,6 +120,7 @@ fn split_dense_page(
             single_row_miniblock_repdef_levels,
             row_number,
             num_rows,
+            disable_automatic_dictionary,
         ));
     }
 
@@ -136,6 +131,7 @@ fn split_dense_page(
         num_rows,
         num_values,
         target_values_per_page,
+        disable_automatic_dictionary,
     )
 }
 
@@ -146,25 +142,41 @@ fn split_non_repeated_page(
     num_rows: u64,
     num_values: u64,
     target_values_per_page: u64,
+    disable_automatic_dictionary: bool,
 ) -> Result<Vec<PrimitivePageData>> {
     // Without repetition, primitive values are either one-per-row or a fixed number per row.
     // If that invariant does not hold then there is no safe row boundary to infer here.
     if !num_values.is_multiple_of(num_rows) {
         return Ok(unsplit_dense_page(
-            arrays, repdef, None, row_number, num_rows,
+            arrays,
+            repdef,
+            None,
+            row_number,
+            num_rows,
+            disable_automatic_dictionary,
         ));
     }
 
     let values_per_row = num_values / num_rows;
     if values_per_row == 0 {
         return Ok(unsplit_dense_page(
-            arrays, repdef, None, row_number, num_rows,
+            arrays,
+            repdef,
+            None,
+            row_number,
+            num_rows,
+            disable_automatic_dictionary,
         ));
     }
     let rows_per_page = (target_values_per_page / values_per_row).max(1);
     if rows_per_page >= num_rows {
         return Ok(unsplit_dense_page(
-            arrays, repdef, None, row_number, num_rows,
+            arrays,
+            repdef,
+            None,
+            row_number,
+            num_rows,
+            disable_automatic_dictionary,
         ));
     }
 
@@ -223,6 +235,7 @@ fn split_non_repeated_page(
             },
             row_number: page_row_number,
             num_rows: page_num_rows,
+            disable_automatic_dictionary,
         });
         row_start = row_start.checked_add(page_num_rows).ok_or_else(|| {
             Error::internal("Row offset overflowed u64 while splitting a primitive page")
@@ -237,6 +250,7 @@ fn unsplit_dense_page(
     single_row_miniblock_repdef_levels: Option<u64>,
     row_number: u64,
     num_rows: u64,
+    disable_automatic_dictionary: bool,
 ) -> Vec<PrimitivePageData> {
     vec![PrimitivePageData {
         arrays,
@@ -246,5 +260,6 @@ fn unsplit_dense_page(
         },
         row_number,
         num_rows,
+        disable_automatic_dictionary,
     }]
 }
