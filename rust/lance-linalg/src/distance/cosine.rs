@@ -368,7 +368,8 @@ mod f32 {
     /// whole `chunks_exact` loop runs inside one `#[target_feature]` context so
     /// the per-vector `cosine_once_*` / `cosine_fast` kernels inline (no
     /// per-vector `*SIMD_SUPPORT` branch, no per-vector call boundary). Used for
-    /// the AVX-512 path on the default wheel and for all tiers on sub-AVX2 builds.
+    /// the AVX-512 path on AVX2-baseline builds and for all tiers on sub-AVX2
+    /// builds.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx,fma")]
     pub(super) unsafe fn cosine_batch_avx_fma(
@@ -442,11 +443,11 @@ mod f32 {
     }
 }
 
-/// Inlined f32 cosine kernels for builds whose baseline already guarantees AVX2
-/// (the default `haswell` wheel). No `#[target_feature]`, no runtime dispatch:
-/// under `target-feature=+avx2,+fma` these compile to AVX2 and inline into the
-/// batch loop exactly like the pre-PR code, so the modern path is not taxed by
-/// the runtime-dispatch machinery (only needed below the AVX2 baseline).
+/// Inlined f32 cosine kernels for builds whose baseline already guarantees
+/// AVX2. No `#[target_feature]`, no runtime dispatch: under
+/// `target-feature=+avx2,+fma` these compile to AVX2 and inline into the batch
+/// loop, so explicitly tuned builds are not taxed by the runtime-dispatch
+/// machinery needed below the AVX2 baseline.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 mod f32_baseline {
     use super::{dot, f32x8, f32x16, norm_l2};
@@ -532,12 +533,12 @@ impl Cosine for f32 {
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
         let x_norm = norm_l2(x);
 
-        // On a build whose baseline already guarantees AVX2 (the default
-        // `haswell` wheel), avoid the per-vector runtime dispatch + `#[target_feature]`
-        // wrapping that taxes the modern path. Dispatch ONCE per batch: AVX-512
-        // hosts get the wide kernel; everyone else uses the inlined AVX2 baseline
-        // path (base-equivalent). The runtime-dispatch path below is only
-        // compiled/reached when the baseline is below AVX2 (pre-Haswell builds).
+        // On a build whose baseline already guarantees AVX2, avoid the
+        // per-vector runtime dispatch + `#[target_feature]` wrapping that taxes
+        // the tuned path. Dispatch ONCE per batch: AVX-512 hosts get the wide
+        // kernel; everyone else uses the inlined AVX2 baseline path. The
+        // runtime-dispatch path below is only compiled/reached when the baseline
+        // is below AVX2.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             // dim 8/16 always use the inlined AVX2 baseline: AVX-512 gives no

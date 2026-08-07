@@ -266,12 +266,12 @@ impl Dot for f32 {
         // Exactly one arm compiles. Keeping each a tail expression (rather than
         // an early `return` guarded by `cfg`) mirrors `dot_f32_dispatched` and
         // avoids an unreachable tail on AVX2-baseline builds.
-        // AVX2-baseline build (the default `haswell` wheel). Hoist the tier
-        // choice out of the loop, but keep the SIMD kernel: the baseline already
-        // guarantees avx2+fma, so call the AVX+FMA kernel directly rather than
-        // re-checking per vector. Falling back to the scalar kernel here would
-        // lose ~4x at small dimensions, which is where batch calls live (PQ
-        // sub-vectors are 8 wide).
+        // On an AVX2-baseline build, hoist the tier choice out of the loop, but
+        // keep the SIMD kernel: the baseline already guarantees avx2+fma, so
+        // call the AVX+FMA kernel directly rather than re-checking per vector.
+        // Falling back to the scalar kernel here would lose ~4x at small
+        // dimensions, which is where batch calls live (PQ sub-vectors are 8
+        // wide).
         //
         // The iterator is a bare `Map`: `Map<ChunksExact, _>` is `TrustedLen`,
         // so `.collect()` preallocates, and `Map::fold` drives `ChunksExact` in

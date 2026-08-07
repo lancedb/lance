@@ -67,10 +67,9 @@ pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
 /// available at runtime.
 ///
 /// On x86_64 with AVX-512 this uses 16-wide f32 lanes; otherwise it falls back
-/// to [`l2`], which auto-vectorizes to the compiled target (AVX2 on the default
-/// `haswell` build). Lance ships an AVX2-baseline binary, so the generic
-/// [`l2`] never emits AVX-512 even on capable CPUs — this dispatcher recovers
-/// that throughput for callers in the hot path (e.g. the in-memory HNSW index).
+/// to [`l2`], whose x86_64 implementation selects the best runtime-supported
+/// kernel. This entry point gives hot-path callers such as the in-memory HNSW
+/// index an explicit f32 API.
 #[inline]
 pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
