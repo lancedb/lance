@@ -579,7 +579,7 @@ impl Branches<'_> {
         let referenced_tags = self
             .refs
             .tags()
-            .list()
+            .fetch_tags()
             .await?
             .into_iter()
             .filter_map(|(name, contents)| {
