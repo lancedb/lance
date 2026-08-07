@@ -184,7 +184,7 @@ mod tests {
         let child = ArrowField::new("a", DataType::Int32, false);
         let schema = ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("vector", DataType::FixedSizeList(item.clone(), 4), false),
+            ArrowField::new("vector", DataType::FixedSizeList(item, 4), false),
             ArrowField::new("s", DataType::Struct(Fields::from(vec![child])), false),
         ]);
 
