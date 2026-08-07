@@ -511,8 +511,9 @@ impl Dataset {
     /// - Create the branch dataset by shallow cloning.
     /// - Create the branch metadata (a.k.a. `BranchContents`).
     ///
-    /// These two phases are not atomic. We consider `BranchContents` as the source of truth
-    /// for the branch.
+    /// These two phases are not atomically committed, so `BranchContents` remains the source of
+    /// truth. They are held under one renewable reference lease so branch deletion cannot reclaim
+    /// the physical generation before its metadata is published.
     ///
     /// The cleanup procedure should:
     /// - Clean up zombie branch datasets that have no related `BranchContents`.
@@ -529,47 +530,52 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
-        let branch_contents = self
-            .branches()
-            .prepare_create(branch, version_number, source_branch.as_deref())
-            .await?;
-        let storage = branch_contents.storage.as_ref().ok_or_else(|| {
-            Error::internal(format!(
-                "new branch '{}' is missing its physical storage mapping",
-                branch
-            ))
-        })?;
-        let branch_location = self
-            .branch_location()
-            .find_branch_generation(branch, &storage.generation)?;
-        self.commit_handler
-            .register_branch_path(&branch_location.path, Some(branch));
-        let source_location = self
-            .branches()
-            .resolve_location(source_branch.as_deref())
-            .await?;
-        let clone_op = Operation::Clone {
-            is_shallow: true,
-            ref_name: source_branch.clone(),
-            ref_version: version_number,
-            ref_path: source_location.uri,
-            branch_name: Some(branch.to_string()),
-        };
-        let transaction = Transaction::new(version_number, clone_op, None);
+        let branch = branch.to_string();
+        let refs = self.refs.clone();
+        let mutation_refs = refs.clone();
+        let object_store = Arc::new(self.object_store.as_ref().clone());
+        let commit_handler = self.commit_handler.clone();
+        let storage_format = self.manifest.data_storage_format.lance_file_version()?;
+        let store_params =
+            store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default());
 
-        let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
-            // Fall back to the dataset's own store params
-            .with_store_params(
-                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
-            )
-            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
-            .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
-        let dataset = builder.execute(transaction).await?;
+        // Branch creation is one fenced reference mutation. A force deletion cannot observe and
+        // reclaim the detached generation between the physical clone and metadata publication.
+        refs.run_mutation(async move {
+            let branches = mutation_refs.branches();
+            let branch_contents = branches
+                .prepare_create(&branch, version_number, source_branch.as_deref())
+                .await?;
+            let storage = branch_contents.storage.as_ref().ok_or_else(|| {
+                Error::internal(format!(
+                    "new branch '{}' is missing its physical storage mapping",
+                    branch
+                ))
+            })?;
+            let branch_location = mutation_refs
+                .base_location
+                .find_branch_generation(&branch, &storage.generation)?;
+            commit_handler.register_branch_path(&branch_location.path, Some(&branch));
+            let source_location = branches.resolve_location(source_branch.as_deref()).await?;
+            let clone_op = Operation::Clone {
+                is_shallow: true,
+                ref_name: source_branch,
+                ref_version: version_number,
+                ref_path: source_location.uri,
+                branch_name: Some(branch.clone()),
+            };
+            let transaction = Transaction::new(version_number, clone_op, None);
+            let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
+                .with_store_params(store_params)
+                .with_object_store(object_store)
+                .with_commit_handler(commit_handler)
+                .with_storage_format(storage_format);
+            let dataset = builder.execute(transaction).await?;
 
-        // Create BranchContents after shallow_clone
-        self.branches().create(branch, branch_contents).await?;
-        Ok(dataset)
+            branches.create_unlocked(&branch, branch_contents).await?;
+            Ok(dataset)
+        })
+        .await
     }
 
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {

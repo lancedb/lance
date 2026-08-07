@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::{
+    future::BoxFuture,
+    stream::{StreamExt, TryStreamExt},
+};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::CommitHandler;
@@ -30,9 +33,15 @@ use uuid::Uuid;
 pub const MAIN_BRANCH: &str = "main";
 
 const REF_MUTATION_LOCK_FILE: &str = "mutation.json";
+const REF_MUTATION_LEASES_DIR: &str = "mutation_leases";
 const TAG_MUTATION_INTENTS_DIR: &str = "tag_mutations";
+const LEASE_FILE: &str = "lease.json";
+const LEASE_HEARTBEATS_DIR: &str = "heartbeats";
+const LEASE_RELEASED_FILE: &str = "released.json";
 const REF_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const REF_MUTATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const REF_MUTATION_LEASE_DURATION_MILLIS: i64 = 30_000;
+const REF_MUTATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Lance Ref
 #[derive(Debug, Clone)]
@@ -128,64 +137,112 @@ impl Refs {
         self.base_location.find_main()
     }
 
-    async fn run_mutation<T>(&self, mutation: impl Future<Output = Result<T>>) -> Result<T> {
-        let mut lease = RefMutationLease::acquire(self).await?;
-        let mutation_result = mutation.await;
-        Self::finish_mutation(&mut lease, mutation_result).await
+    pub(super) fn run_mutation<'a, T, F>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
+    where
+        T: Send + 'a,
+        F: Future<Output = Result<T>> + Send + 'a,
+    {
+        Box::pin(async move {
+            let mut lease = RefMutationLease::acquire(self).await?;
+            let mutation_result = Self::drive_with_lease(&mut lease.handle, mutation).await;
+            Self::finish_mutation(&mut lease, mutation_result).await
+        })
     }
 
-    async fn run_tag_mutation<T>(&self, mutation: impl Future<Output = Result<T>>) -> Result<T> {
-        let mut intent = TagMutationIntent::acquire(self).await?;
-        let mutation_result = self.run_mutation(mutation).await;
-        match intent.release().await {
-            Ok(()) => mutation_result,
-            Err(release_error) => match mutation_result {
-                Ok(_) => Err(release_error),
-                Err(mutation_error) => {
-                    log::warn!(
-                        "Failed to release tag mutation intent after mutation error: {}",
-                        release_error
-                    );
-                    Err(mutation_error)
+    fn run_tag_mutation<'a, T, F>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
+    where
+        T: Send + 'a,
+        F: Future<Output = Result<T>> + Send + 'a,
+    {
+        Box::pin(async move {
+            let mut intent = TagMutationIntent::acquire(self).await?;
+            let mutation_result =
+                Self::drive_with_lease(&mut intent.handle, self.run_mutation(mutation)).await;
+            match intent.release().await {
+                Ok(()) => mutation_result,
+                Err(release_error) => match mutation_result {
+                    Ok(_) => Err(release_error),
+                    Err(mutation_error) => {
+                        log::warn!(
+                            "Failed to release tag mutation intent after mutation error: {}",
+                            release_error
+                        );
+                        Err(mutation_error)
+                    }
+                },
+            }
+        })
+    }
+
+    fn run_branch_deletion<'a, T, F>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
+    where
+        T: Send + 'a,
+        F: Future<Output = Result<T>> + Send + 'a,
+    {
+        Box::pin(async move {
+            // Give already-scheduled tag mutations a chance to publish their durable intent before
+            // deletion takes the exclusive mutation lock. This gives durable references priority
+            // when both operations begin together.
+            tokio::task::yield_now().await;
+            let deadline = tokio::time::Instant::now() + REF_MUTATION_LOCK_TIMEOUT;
+            let mut lease = loop {
+                while self.has_active_tag_mutation_intents().await? {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Error::RefConflict {
+                            message: format!(
+                                "a tag mutation did not finish within {} seconds",
+                                REF_MUTATION_LOCK_TIMEOUT.as_secs()
+                            ),
+                        });
+                    }
+                    tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
                 }
-            },
+
+                let mut lease = RefMutationLease::acquire(self).await?;
+                if !self.has_active_tag_mutation_intents().await? {
+                    break lease;
+                }
+                lease.release().await?;
+                tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
+            };
+
+            let mutation_result = Self::drive_with_lease(&mut lease.handle, mutation).await;
+            Self::finish_mutation(&mut lease, mutation_result).await
+        })
+    }
+
+    async fn drive_with_lease<T, F>(handle: &mut DurableLeaseHandle, mutation: F) -> Result<T>
+    where
+        T: Send,
+        F: Future<Output = Result<T>> + Send,
+    {
+        tokio::pin!(mutation);
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(REF_MUTATION_LEASE_RENEW_INTERVAL) => {
+                    handle.renew().await?;
+                }
+                result = &mut mutation => return result,
+            }
         }
     }
 
-    async fn run_branch_deletion<T>(&self, mutation: impl Future<Output = Result<T>>) -> Result<T> {
-        // Give already-scheduled tag mutations a chance to publish their durable intent before
-        // deletion takes the exclusive mutation lock. This gives durable references priority
-        // when both operations begin together.
-        tokio::task::yield_now().await;
-        let deadline = tokio::time::Instant::now() + REF_MUTATION_LOCK_TIMEOUT;
-        let mut lease = loop {
-            while self.has_tag_mutation_intents().await? {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(Error::RefConflict {
-                        message: format!(
-                            "a tag mutation did not finish within {} seconds",
-                            REF_MUTATION_LOCK_TIMEOUT.as_secs()
-                        ),
-                    });
-                }
-                tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
+    async fn has_active_tag_mutation_intents(&self) -> Result<bool> {
+        let base_path = base_tag_mutation_intents_path(&self.root()?.path);
+        for file_name in self.object_store.read_dir(base_path.clone()).await? {
+            let path = base_path.clone().join(file_name);
+            if path.extension() == Some("json") {
+                // The previous protocol wrote empty intent objects. They carry no
+                // recoverable ownership and must not permanently block deletion.
+                log::warn!("Ignoring stale legacy tag mutation intent {}", path);
+                continue;
             }
-
-            let mut lease = RefMutationLease::acquire(self).await?;
-            if !self.has_tag_mutation_intents().await? {
-                break lease;
+            if DurableLeaseHandle::is_active(&self.object_store, &path).await? {
+                return Ok(true);
             }
-            lease.release().await?;
-            tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
-        };
-
-        let mutation_result = mutation.await;
-        Self::finish_mutation(&mut lease, mutation_result).await
-    }
-
-    async fn has_tag_mutation_intents(&self) -> Result<bool> {
-        let path = base_tag_mutation_intents_path(&self.root()?.path);
-        Ok(!self.object_store.read_dir(path).await?.is_empty())
+        }
+        Ok(false)
     }
 
     async fn finish_mutation<T>(
@@ -209,72 +266,86 @@ impl Refs {
 }
 
 struct TagMutationIntent {
-    object_store: Arc<ObjectStore>,
-    path: Path,
-    is_held: bool,
+    handle: DurableLeaseHandle,
 }
 
 impl TagMutationIntent {
     async fn acquire(refs: &Refs) -> Result<Self> {
         let path = base_tag_mutation_intents_path(&refs.root()?.path)
-            .join(format!("{}.json", Uuid::new_v4().simple()));
-        refs.object_store
-            .inner
-            .put_opts(
-                &path,
-                Bytes::new().into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await?;
+            .join(Uuid::new_v4().simple().to_string());
+        let state = DurableLeaseState::acquired(Uuid::new_v4().simple().to_string(), 1)?;
+        if !create_lease_file(&refs.object_store, &path, &state).await? {
+            return Err(Error::RefConflict {
+                message: "tag mutation intent identifier already exists".to_string(),
+            });
+        }
         Ok(Self {
-            object_store: refs.object_store.clone(),
-            path,
-            is_held: true,
+            handle: DurableLeaseHandle::new(refs.object_store.clone(), path, state, None),
         })
     }
 
     async fn release(&mut self) -> Result<()> {
-        if !self.is_held {
+        if !self.handle.is_held {
             return Ok(());
         }
-        self.object_store.delete(&self.path).await?;
-        self.is_held = false;
+        let path = self.handle.path.clone();
+        let object_store = self.handle.object_store.clone();
+        self.handle.release().await?;
+        if let Err(error) = object_store.remove_dir_all(path).await
+            && !matches!(error, Error::NotFound { .. })
+        {
+            return Err(error);
+        }
         Ok(())
     }
 }
 
-impl Drop for TagMutationIntent {
-    fn drop(&mut self) {
-        if !self.is_held {
-            return;
-        }
-        self.is_held = false;
-        let object_store = self.object_store.clone();
-        let path = self.path.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(error) = object_store.delete(&path).await
-                    && !matches!(error, Error::NotFound { .. })
-                {
-                    log::warn!("Failed to release cancelled tag mutation intent: {}", error);
-                }
+// Lease epochs and heartbeats are immutable because not every supported object store implements
+// conditional updates. Atomic create elects one owner for each increasing epoch; renewal checks
+// that epoch is still the newest fence, and an expired owner cannot resume after a takeover.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableLeaseState {
+    owner: String,
+    #[serde(default)]
+    epoch: u64,
+    #[serde(default)]
+    expires_at_millis: i64,
+}
+
+impl DurableLeaseState {
+    fn acquired(owner: String, epoch: u64) -> Result<Self> {
+        Ok(Self {
+            owner,
+            epoch,
+            expires_at_millis: lease_expiry_millis()?,
+        })
+    }
+
+    fn renewed(&self) -> Result<Self> {
+        if !self.is_active() {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "reference mutation lease epoch {} expired before renewal",
+                    self.epoch
+                ),
             });
         }
+        Ok(Self {
+            expires_at_millis: lease_expiry_millis()?,
+            ..self.clone()
+        })
     }
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RefMutationLockState {
-    owner: String,
-}
+    fn released(&self) -> Self {
+        Self {
+            expires_at_millis: 0,
+            ..self.clone()
+        }
+    }
 
-impl RefMutationLockState {
-    fn locked(owner: String) -> Self {
-        Self { owner }
+    fn is_active(&self) -> bool {
+        self.expires_at_millis > utc_now().timestamp_millis()
     }
 
     fn serialize(&self) -> Result<Bytes> {
@@ -282,48 +353,163 @@ impl RefMutationLockState {
     }
 }
 
-struct RefMutationLease {
+fn lease_expiry_millis() -> Result<i64> {
+    utc_now()
+        .timestamp_millis()
+        .checked_add(REF_MUTATION_LEASE_DURATION_MILLIS)
+        .ok_or_else(|| Error::internal("reference mutation lease expiry overflow"))
+}
+
+struct DurableLeaseHandle {
     object_store: Arc<ObjectStore>,
     path: Path,
-    owner: String,
+    state: DurableLeaseState,
+    fence_path: Option<Path>,
     is_held: bool,
+}
+
+impl DurableLeaseHandle {
+    fn new(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        state: DurableLeaseState,
+        fence_path: Option<Path>,
+    ) -> Self {
+        Self {
+            object_store,
+            path,
+            state,
+            fence_path,
+            is_held: true,
+        }
+    }
+
+    async fn renew(&mut self) -> Result<()> {
+        let next_state = self.state.renewed()?;
+        if let Some(fence_path) = self.fence_path.as_ref()
+            && latest_lease_epoch(&self.object_store, fence_path).await? != Some(self.state.epoch)
+        {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "reference mutation lease epoch {} lost its fence",
+                    self.state.epoch
+                ),
+            });
+        }
+        let heartbeat_path = self
+            .path
+            .clone()
+            .join(LEASE_HEARTBEATS_DIR)
+            .join(format!("{}.json", Uuid::new_v4().simple()));
+        self.object_store
+            .inner
+            .put_opts(
+                &heartbeat_path,
+                next_state.serialize()?.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        self.state = next_state;
+        Ok(())
+    }
+
+    async fn release_owned(
+        object_store: &ObjectStore,
+        path: &Path,
+        state: &DurableLeaseState,
+    ) -> Result<()> {
+        let released_path = path.clone().join(LEASE_RELEASED_FILE);
+        match object_store
+            .inner
+            .put_opts(
+                &released_path,
+                state.released().serialize()?.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_)
+            | Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn is_active(object_store: &ObjectStore, path: &Path) -> Result<bool> {
+        if object_store
+            .exists(&path.clone().join(LEASE_RELEASED_FILE))
+            .await?
+        {
+            return Ok(false);
+        }
+
+        if read_lease_state(object_store, &path.clone().join(LEASE_FILE))
+            .await?
+            .is_some_and(|state| state.is_active())
+        {
+            return Ok(true);
+        }
+        let heartbeats_path = path.clone().join(LEASE_HEARTBEATS_DIR);
+        for heartbeat in object_store.read_dir(heartbeats_path.clone()).await? {
+            if read_lease_state(object_store, &heartbeats_path.clone().join(heartbeat))
+                .await?
+                .is_some_and(|state| state.is_active())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn release(&mut self) -> Result<()> {
+        if !self.is_held {
+            return Ok(());
+        }
+        Self::release_owned(&self.object_store, &self.path, &self.state).await?;
+        self.is_held = false;
+        Ok(())
+    }
+}
+
+impl Drop for DurableLeaseHandle {
+    fn drop(&mut self) {
+        if !self.is_held {
+            return;
+        }
+        self.is_held = false;
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        let state = self.state.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = Self::release_owned(&object_store, &path, &state).await {
+                    log::warn!("Failed to release cancelled reference mutation: {}", error);
+                }
+            });
+        }
+    }
+}
+
+struct RefMutationLease {
+    handle: DurableLeaseHandle,
 }
 
 impl RefMutationLease {
     async fn acquire(refs: &Refs) -> Result<Self> {
-        let path = ref_mutation_lock_path(&refs.root()?.path);
+        let root_path = refs.root()?.path;
+        discard_legacy_mutation_lock(&refs.object_store, &root_path).await?;
+        let fence_path = base_ref_mutation_leases_path(&root_path);
         let owner = Uuid::new_v4().simple().to_string();
-        let locked_payload = RefMutationLockState::locked(owner.clone()).serialize()?;
         let deadline = tokio::time::Instant::now() + REF_MUTATION_LOCK_TIMEOUT;
 
         loop {
-            let create_result = refs
-                .object_store
-                .inner
-                .put_opts(
-                    &path,
-                    locked_payload.clone().into(),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            match create_result {
-                Ok(_) => {
-                    return Ok(Self {
-                        object_store: refs.object_store.clone(),
-                        path,
-                        owner,
-                        is_held: true,
-                    });
-                }
-                Err(
-                    ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. },
-                ) => {}
-                Err(error) => return Err(error.into()),
-            }
-
             if tokio::time::Instant::now() >= deadline {
                 return Err(Error::RefConflict {
                     message: format!(
@@ -332,54 +518,130 @@ impl RefMutationLease {
                     ),
                 });
             }
-            tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
-        }
-    }
+            let latest_epoch = latest_lease_epoch(&refs.object_store, &fence_path).await?;
+            if let Some(epoch) = latest_epoch {
+                let latest_path = lease_epoch_path(&fence_path, epoch);
+                if DurableLeaseHandle::is_active(&refs.object_store, &latest_path).await? {
+                    tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
+                    continue;
+                }
+            }
 
-    async fn release_owned(object_store: &ObjectStore, path: &Path, owner: &str) -> Result<()> {
-        let current = match object_store.inner.get(path).await {
-            Ok(current) => current,
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        let current_state: RefMutationLockState = serde_json::from_slice(&current.bytes().await?)?;
-        if current_state.owner != owner {
-            return Err(Error::RefConflict {
-                message: "reference mutation lock ownership changed before release".to_string(),
-            });
+            let next_epoch = latest_epoch
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| Error::internal("reference mutation lease epoch overflow"))?;
+            let state = DurableLeaseState::acquired(owner.clone(), next_epoch)?;
+            let path = lease_epoch_path(&fence_path, next_epoch);
+            if create_lease_file(&refs.object_store, &path, &state).await? {
+                let cleanup_object_store = refs.object_store.clone();
+                let cleanup_path = fence_path.clone();
+                tokio::spawn(async move {
+                    cleanup_old_lease_epochs(&cleanup_object_store, &cleanup_path, next_epoch)
+                        .await;
+                });
+                return Ok(Self {
+                    handle: DurableLeaseHandle::new(
+                        refs.object_store.clone(),
+                        path,
+                        state,
+                        Some(fence_path),
+                    ),
+                });
+            }
         }
-        object_store.delete(path).await
     }
 
     async fn release(&mut self) -> Result<()> {
-        if !self.is_held {
-            return Ok(());
-        }
-        Self::release_owned(&self.object_store, &self.path, &self.owner).await?;
-        self.is_held = false;
-        Ok(())
+        self.handle.release().await
     }
 }
 
-impl Drop for RefMutationLease {
-    fn drop(&mut self) {
-        if !self.is_held {
-            return;
+async fn create_lease_file(
+    object_store: &ObjectStore,
+    path: &Path,
+    state: &DurableLeaseState,
+) -> Result<bool> {
+    match object_store
+        .inner
+        .put_opts(
+            &path.clone().join(LEASE_FILE),
+            state.serialize()?.into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => {
+            Ok(false)
         }
-        self.is_held = false;
-        let object_store = self.object_store.clone();
-        let path = self.path.clone();
-        let owner = self.owner.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(error) = Self::release_owned(&object_store, &path, &owner).await
-                    && !matches!(error, Error::RefConflict { .. })
-                {
-                    log::warn!("Failed to release cancelled reference mutation: {}", error);
-                }
-            });
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn read_lease_state(
+    object_store: &ObjectStore,
+    path: &Path,
+) -> Result<Option<DurableLeaseState>> {
+    let current = match object_store.inner.get(path).await {
+        Ok(current) => current,
+        Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(serde_json::from_slice(&current.bytes().await?)?))
+}
+
+async fn latest_lease_epoch(object_store: &ObjectStore, path: &Path) -> Result<Option<u64>> {
+    Ok(object_store
+        .read_dir(path.clone())
+        .await?
+        .into_iter()
+        .filter_map(|name| name.parse::<u64>().ok())
+        .max())
+}
+
+fn lease_epoch_path(base_path: &Path, epoch: u64) -> Path {
+    base_path.clone().join(format!("{epoch:020}"))
+}
+
+async fn cleanup_old_lease_epochs(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    current_epoch: u64,
+) {
+    let Ok(entries) = object_store.read_dir(base_path.clone()).await else {
+        return;
+    };
+    for entry in entries {
+        let Ok(epoch) = entry.parse::<u64>() else {
+            continue;
+        };
+        if epoch >= current_epoch {
+            continue;
+        }
+        let path = base_path.clone().join(entry);
+        if let Err(error) = object_store.remove_dir_all(path).await
+            && !matches!(error, Error::NotFound { .. })
+        {
+            log::warn!(
+                "Failed to clean up an old reference mutation lease: {}",
+                error
+            );
         }
     }
+}
+
+async fn discard_legacy_mutation_lock(object_store: &ObjectStore, root_path: &Path) -> Result<()> {
+    let path = ref_mutation_lock_path(root_path);
+    if let Err(error) = object_store.delete(&path).await
+        && !matches!(error, Error::NotFound { .. })
+    {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Tags operation
@@ -476,6 +738,7 @@ impl Tags<'_> {
 
     pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
+        let reference = reference.into();
         self.refs
             .run_tag_mutation(async {
                 let root_location = self.refs.root()?;
@@ -522,6 +785,7 @@ impl Tags<'_> {
 
     pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
+        let reference = reference.into();
         self.refs
             .run_tag_mutation(async {
                 let root_location = self.refs.root()?;
@@ -846,44 +1110,42 @@ impl Branches<'_> {
         })
     }
 
-    // Only create branch metadata
-    pub(crate) async fn create(
+    // Only create branch metadata. The caller holds the reference mutation lease across the
+    // physical clone and this metadata publication.
+    pub(crate) async fn create_unlocked(
         &self,
         branch_name: &str,
         branch_contents: BranchContents,
     ) -> Result<()> {
-        self.refs
-            .run_mutation(async {
-                let root_location = self.refs.root()?;
-                let branch_file = branch_contents_path(&root_location.path, branch_name);
-                if self.object_store().exists(&branch_file).await? {
-                    return Err(Error::RefConflict {
-                        message: format!("branch {} already exists", branch_name),
-                    });
-                }
+        let root_location = self.refs.root()?;
+        let branch_file = branch_contents_path(&root_location.path, branch_name);
+        if self.object_store().exists(&branch_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("branch {} already exists", branch_name),
+            });
+        }
 
-                let serialized = serde_json::to_vec_pretty(&branch_contents)?;
-                self.object_store()
-                    .inner
-                    .put_opts(
-                        &branch_file,
-                        Bytes::from(serialized).into(),
-                        PutOptions {
-                            mode: PutMode::Create,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| match error {
-                        ObjectStoreError::AlreadyExists { .. }
-                        | ObjectStoreError::Precondition { .. } => Error::RefConflict {
-                            message: format!("branch {} already exists", branch_name),
-                        },
-                        error => error.into(),
-                    })
-            })
+        let serialized = serde_json::to_vec_pretty(&branch_contents)?;
+        self.object_store()
+            .inner
+            .put_opts(
+                &branch_file,
+                Bytes::from(serialized).into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
             .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+                    Error::RefConflict {
+                        message: format!("branch {} already exists", branch_name),
+                    }
+                }
+                error => error.into(),
+            })
     }
 
     pub async fn replace_metadata(
@@ -1400,6 +1662,13 @@ pub fn base_branches_contents_path(base_path: &Path) -> Path {
 
 fn ref_mutation_lock_path(base_path: &Path) -> Path {
     base_path.clone().join("_refs").join(REF_MUTATION_LOCK_FILE)
+}
+
+fn base_ref_mutation_leases_path(base_path: &Path) -> Path {
+    base_path
+        .clone()
+        .join("_refs")
+        .join(REF_MUTATION_LEASES_DIR)
 }
 
 fn base_tag_mutation_intents_path(base_path: &Path) -> Path {

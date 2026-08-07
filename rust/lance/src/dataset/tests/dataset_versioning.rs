@@ -1344,6 +1344,118 @@ async fn test_branch() {
 }
 
 #[tokio::test]
+async fn test_branch_creation_holds_ref_lease_before_generation_write() {
+    let tempdir = TempDir::default();
+    let uri = tempdir.path_str();
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+    let root = dataset.refs.root().unwrap().path;
+    let object_store = dataset.object_store.clone();
+
+    let lease_acquired = Arc::new(tokio::sync::Barrier::new(2));
+    let release_lease = Arc::new(tokio::sync::Notify::new());
+    let refs = dataset.refs.clone();
+    let lease_task = tokio::spawn({
+        let lease_acquired = lease_acquired.clone();
+        let release_lease = release_lease.clone();
+        async move {
+            refs.run_mutation(async {
+                lease_acquired.wait().await;
+                release_lease.notified().await;
+                Ok(())
+            })
+            .await
+        }
+    });
+    lease_acquired.wait().await;
+
+    let mut branch_dataset = Dataset::open(&uri).await.unwrap();
+    let mut create_task =
+        tokio::spawn(async move { branch_dataset.create_branch("protected", 1, None).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut create_task)
+            .await
+            .is_err()
+    );
+    assert!(
+        object_store
+            .read_dir(root.clone().join("_branch_generations"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    release_lease.notify_one();
+    lease_task.await.unwrap().unwrap();
+    create_task.await.unwrap().unwrap();
+    dataset.checkout_branch("protected").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ref_mutations_recover_stale_coordination_records() {
+    let tempdir = TempDir::default();
+    let uri = tempdir.path_str();
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+    let root = dataset.refs.root().unwrap().path;
+
+    // Recover both the previous unbounded lock format and an expired fenced epoch.
+    dataset
+        .object_store
+        .put(
+            &root.clone().join("_refs").join("mutation.json"),
+            br#"{"owner":"crashed"}"#,
+        )
+        .await
+        .unwrap();
+    dataset
+        .object_store
+        .put(
+            &root
+                .clone()
+                .join("_refs")
+                .join("mutation_leases")
+                .join("00000000000000000007")
+                .join("lease.json"),
+            br#"{"owner":"crashed","epoch":7,"expiresAtMillis":0}"#,
+        )
+        .await
+        .unwrap();
+    dataset.tags().create("recovered", 1).await.unwrap();
+
+    dataset
+        .create_branch("stale-intent", 1, None)
+        .await
+        .unwrap();
+    let intents = root.clone().join("_refs").join("tag_mutations");
+    dataset
+        .object_store
+        .put(&intents.clone().join("legacy.json"), &[])
+        .await
+        .unwrap();
+    dataset
+        .object_store
+        .put(
+            &intents.clone().join("expired").join("lease.json"),
+            br#"{"owner":"crashed","epoch":1,"expiresAtMillis":0}"#,
+        )
+        .await
+        .unwrap();
+
+    dataset.delete_branch("stale-intent").await.unwrap();
+    dataset.tags().create("recovered-again", 1).await.unwrap();
+    assert_eq!(dataset.tags().get_version("recovered").await.unwrap(), 1);
+    assert_eq!(
+        dataset.tags().get_version("recovered-again").await.unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn test_concurrent_tag_create_serializes_with_branch_delete() {
     let tempdir = TempDir::default();
     let uri = tempdir.path_str();
