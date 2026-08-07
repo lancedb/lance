@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
-use crate::dataset::version_lease::remove_branch_state;
+use crate::dataset::version_lease::{ensure_reference_admissible, remove_branch_state};
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
@@ -227,14 +227,30 @@ impl Tags<'_> {
         let tag_contents = self
             .build_tag_content_by_ref(reference, Some(now), Some(now))
             .await?;
+        ensure_reference_admissible(
+            self.refs,
+            tag_contents.branch.as_deref(),
+            tag_contents.version,
+        )
+        .await?;
 
         self.object_store()
             .put(
                 &tag_file,
                 serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
             )
-            .await
-            .map(|_| ())
+            .await?;
+        if let Err(error) = ensure_reference_admissible(
+            self.refs,
+            tag_contents.branch.as_deref(),
+            tag_contents.version,
+        )
+        .await
+        {
+            self.object_store().delete(&tag_file).await?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn delete(&self, tag: &str) -> Result<()> {
@@ -262,10 +278,17 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let original_tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
         let updated_reference = self
-            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
+            .build_tag_content_by_ref(reference, original_tag_contents.created_at, Some(utc_now()))
             .await?;
+        ensure_reference_admissible(
+            self.refs,
+            updated_reference.branch.as_deref(),
+            updated_reference.version,
+        )
+        .await?;
+        let mut tag_contents = original_tag_contents.clone();
         tag_contents.branch = updated_reference.branch;
         tag_contents.version = updated_reference.version;
         tag_contents.created_at = updated_reference.created_at;
@@ -277,8 +300,23 @@ impl Tags<'_> {
                 &tag_file,
                 serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
             )
-            .await
-            .map(|_| ())
+            .await?;
+        if let Err(error) = ensure_reference_admissible(
+            self.refs,
+            tag_contents.branch.as_deref(),
+            tag_contents.version,
+        )
+        .await
+        {
+            self.object_store()
+                .put(
+                    &tag_file,
+                    serde_json::to_string_pretty(&original_tag_contents)?.as_bytes(),
+                )
+                .await?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn replace_metadata(
@@ -354,7 +392,6 @@ impl Tags<'_> {
         } else {
             self.object_store().size(&manifest_file.path).await? as usize
         };
-
         let tag_contents = TagContents {
             branch,
             version: manifest_file.version,
@@ -479,6 +516,7 @@ impl Branches<'_> {
                 message: format!("Manifest file {} does not exist", manifest_file.path),
             });
         };
+        ensure_reference_admissible(self.refs, source_branch.as_deref(), version_number).await?;
 
         let parent_branch_id = if let Some(ref parent_branch) = source_branch {
             let parent_file = branch_contents_path(&root_location.path, parent_branch);
@@ -513,8 +551,18 @@ impl Branches<'_> {
                 &branch_file,
                 serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
             )
-            .await
-            .map(|_| ())
+            .await?;
+        if let Err(error) = ensure_reference_admissible(
+            self.refs,
+            branch_contents.parent_branch.as_deref(),
+            version_number,
+        )
+        .await
+        {
+            self.object_store().delete(&branch_file).await?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn replace_metadata(

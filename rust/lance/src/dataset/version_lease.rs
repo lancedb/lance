@@ -18,7 +18,10 @@ use object_store::{ObjectMeta, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Dataset, refs::MAIN_BRANCH};
+use super::{
+    Dataset,
+    refs::{MAIN_BRANCH, Refs},
+};
 use crate::{Error, Result};
 
 const LEASES_DIR: &str = "_refs/version_leases";
@@ -26,6 +29,7 @@ const LEASE_GC_MARKERS_DIR: &str = "_refs/version_lease_gc";
 const LEASE_FILE_SUFFIX: &str = ".lease";
 const DRAINING_MARKER_SUFFIX: &str = ".draining";
 const SEALED_MARKER_SUFFIX: &str = ".sealed";
+const COMMITTED_MARKER_SUFFIX: &str = ".committed";
 const STORAGE_CLOCK_PATH: &str = "_clock";
 
 /// HTTP `Last-Modified`, used by supported cloud stores, has whole-second precision.
@@ -156,6 +160,7 @@ struct LeaseFile {
 struct RetirementFence {
     draining_path: Option<Path>,
     sealed_path: Option<Path>,
+    committed_path: Option<Path>,
     observed_at: DateTime<Utc>,
     manifest_paths: Vec<Path>,
 }
@@ -165,20 +170,29 @@ struct RetirementMarker {
     manifest_paths: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementState {
+    Draining,
+    Sealed,
+    Committed,
+}
+
 #[derive(Debug)]
 struct RetirementMarkerMetadata {
     version: u64,
     operation_id: String,
-    is_sealed: bool,
+    state: RetirementState,
     metadata: ObjectMeta,
 }
 
 /// Per-cleanup retirement markers for versions selected for deletion.
 ///
 /// Draining markers reject new leases while allowing already-admitted leases
-/// to renew. Sealed markers reject both acquisition and renewal immediately
-/// before deletion. Unique operation markers keep cancellation and finalization
-/// safe when multiple cleanups overlap.
+/// to renew. Sealed markers reject both acquisition and renewal while cleanup
+/// performs its final lease and reference checks. Committed markers are the
+/// durable, irreversible deletion boundary shared with reference admission.
+/// Unique operation markers keep cancellation and finalization safe when
+/// multiple cleanups overlap.
 #[derive(Debug)]
 pub(super) struct RetirementGuard {
     store: VersionLeaseStore,
@@ -187,9 +201,22 @@ pub(super) struct RetirementGuard {
 
 impl VersionLeaseStore {
     pub(super) async fn for_dataset(dataset: &Dataset) -> Result<Self> {
-        let root = dataset.refs.root()?;
         let branch = dataset.manifest.branch.as_deref();
-        let branch_identifier = dataset.branches().get_identifier(branch).await?;
+        Self::for_refs(
+            &dataset.refs,
+            branch,
+            Some(dataset.manifest_location.path.clone()),
+        )
+        .await
+    }
+
+    async fn for_refs(
+        refs: &Refs,
+        branch: Option<&str>,
+        manifest_path: Option<Path>,
+    ) -> Result<Self> {
+        let root = refs.root()?;
+        let branch_identifier = refs.branches().get_identifier(branch).await?;
         let namespace = if branch.is_none() {
             MAIN_BRANCH
         } else {
@@ -206,10 +233,10 @@ impl VersionLeaseStore {
         };
 
         Ok(Self {
-            object_store: Arc::clone(&dataset.object_store),
+            object_store: Arc::clone(&refs.object_store),
             leases_path: root.path.clone().join(LEASES_DIR).join(namespace),
             markers_path: root.path.join(LEASE_GC_MARKERS_DIR).join(namespace),
-            manifest_path: Some(dataset.manifest_location.path.clone()),
+            manifest_path,
         })
     }
 
@@ -342,6 +369,7 @@ impl VersionLeaseStore {
                         RetirementFence {
                             draining_path: Some(path),
                             sealed_path: None,
+                            committed_path: None,
                             observed_at,
                             manifest_paths,
                         },
@@ -389,12 +417,15 @@ impl VersionLeaseStore {
             .version_marker_metadata(version)
             .await?
             .iter()
-            .any(|marker| marker.is_sealed))
+            .any(|marker| marker.state != RetirementState::Draining))
     }
 
     async fn has_active_retirement_marker(&self, version: u64) -> Result<bool> {
         let markers = self.version_marker_metadata(version).await?;
-        if markers.iter().any(|marker| marker.is_sealed) {
+        if markers
+            .iter()
+            .any(|marker| marker.state != RetirementState::Draining)
+        {
             return Ok(true);
         }
 
@@ -489,11 +520,13 @@ impl VersionLeaseStore {
             )
         })?;
         let file_name = &relative_parts[1];
-        let (operation_id, is_sealed) =
+        let (operation_id, state) =
             if let Some(operation_id) = file_name.strip_suffix(DRAINING_MARKER_SUFFIX) {
-                (operation_id, false)
+                (operation_id, RetirementState::Draining)
             } else if let Some(operation_id) = file_name.strip_suffix(SEALED_MARKER_SUFFIX) {
-                (operation_id, true)
+                (operation_id, RetirementState::Sealed)
+            } else if let Some(operation_id) = file_name.strip_suffix(COMMITTED_MARKER_SUFFIX) {
+                (operation_id, RetirementState::Committed)
             } else {
                 return Err(Error::corrupt_file(
                     metadata.location,
@@ -509,7 +542,7 @@ impl VersionLeaseStore {
         Ok(RetirementMarkerMetadata {
             version,
             operation_id: operation_id.to_string(),
-            is_sealed,
+            state,
             metadata,
         })
     }
@@ -535,20 +568,20 @@ impl VersionLeaseStore {
 
         let sealed_operations: HashSet<_> = markers
             .iter()
-            .filter(|marker| marker.is_sealed)
+            .filter(|marker| marker.state != RetirementState::Draining)
             .map(|marker| (marker.version, marker.operation_id.clone()))
             .collect();
         let observed_at = self.storage_observed_at().await?;
         let sealed_observation = markers
             .iter()
-            .filter(|marker| marker.is_sealed)
+            .filter(|marker| marker.state != RetirementState::Draining)
             .map(|marker| (marker.version, observed_at))
             .collect::<HashMap<_, _>>();
         let actively_leased_versions = self.active_versions_at(&sealed_observation, true).await?;
         let mut stale_drains = Vec::new();
         let mut sealed_manifest_paths = HashMap::<u64, HashSet<Path>>::new();
         for marker in markers {
-            if marker.is_sealed {
+            if marker.state != RetirementState::Draining {
                 let manifest_paths = self.read_retirement_marker(&marker.metadata).await?;
                 sealed_manifest_paths
                     .entry(marker.version)
@@ -741,8 +774,100 @@ impl RetirementGuard {
         Ok(())
     }
 
+    /// Publish the irreversible retirement boundary after the final lease and
+    /// durable-reference scans. Reference admission checks this marker before
+    /// and after publishing a tag or branch.
+    pub(super) async fn commit_versions(&mut self, versions: &HashSet<u64>) -> Result<()> {
+        let mut marker_paths = Vec::with_capacity(versions.len());
+        for version in versions {
+            let fence = self.fences.get(version).ok_or_else(|| {
+                Error::internal(format!("missing sealed fence for version {version}"))
+            })?;
+            let sealed_path = fence.sealed_path.as_ref().ok_or_else(|| {
+                Error::internal(format!("version {version} has no sealed marker"))
+            })?;
+            let file_name = sealed_path.filename().ok_or_else(|| {
+                Error::internal(format!("sealed marker {sealed_path} has no filename"))
+            })?;
+            let operation_id = file_name
+                .strip_suffix(SEALED_MARKER_SUFFIX)
+                .ok_or_else(|| {
+                    Error::internal(format!("sealed marker {sealed_path} has an invalid suffix"))
+                })?;
+            marker_paths.push((
+                *version,
+                self.store
+                    .marker_version_path(*version)
+                    .join(format!("{operation_id}{COMMITTED_MARKER_SUFFIX}")),
+                retirement_marker_payload(&fence.manifest_paths)?,
+            ));
+        }
+
+        let store = self.store.clone();
+        let results = stream::iter(marker_paths)
+            .map(move |(version, path, payload)| {
+                let store = store.clone();
+                async move {
+                    let metadata = store.create_marker(&path, payload).await?;
+                    Ok::<_, Error>((version, path, metadata.last_modified))
+                }
+            })
+            .buffer_unordered(self.store.object_store.io_parallelism())
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok((version, committed_path, observed_at)) => {
+                    let fence = self.fences.get_mut(&version).ok_or_else(|| {
+                        Error::internal(format!("missing sealed fence for version {version}"))
+                    })?;
+                    fence.committed_path = Some(committed_path);
+                    fence.observed_at = observed_at;
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        let sealed_paths = versions
+            .iter()
+            .filter_map(|version| {
+                self.fences
+                    .get(version)
+                    .and_then(|fence| fence.sealed_path.clone())
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = self.store.delete_paths(sealed_paths).await {
+            tracing::warn!(
+                error = %error,
+                "Failed to remove superseded sealed retirement markers"
+            );
+        } else {
+            for version in versions {
+                if let Some(fence) = self.fences.get_mut(version) {
+                    fence.sealed_path = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn cancel_versions(&mut self, versions: &HashSet<u64>) -> Result<()> {
-        let paths = versions
+        let cancellable_versions = versions
+            .iter()
+            .filter(|version| {
+                self.fences
+                    .get(version)
+                    .is_some_and(|fence| fence.committed_path.is_none())
+            })
+            .copied()
+            .collect::<HashSet<_>>();
+        let paths = cancellable_versions
             .iter()
             .filter_map(|version| self.fences.get(version))
             .flat_map(|fence| {
@@ -752,7 +877,8 @@ impl RetirementGuard {
             })
             .collect::<Vec<_>>();
         self.store.delete_paths(paths).await?;
-        self.fences.retain(|version, _| !versions.contains(version));
+        self.fences
+            .retain(|version, _| !cancellable_versions.contains(version));
         Ok(())
     }
 
@@ -849,18 +975,57 @@ impl VersionLeaseStore {
         let marker_streams = marker_prefixes
             .into_iter()
             .map(|prefix| self.object_store.list(Some(prefix)));
-        let mut paths = stream::iter(marker_streams)
+        let marker_metadata = stream::iter(marker_streams)
             .flatten()
-            .map_ok(|metadata| metadata.location)
             .try_collect::<Vec<_>>()
             .await?;
+        let parsed_markers = marker_metadata
+            .into_iter()
+            .map(|metadata| self.parse_retirement_marker_metadata(metadata))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut dependent_marker_paths = Vec::new();
+        let mut anchor_paths = Vec::new();
+        for version in &versions {
+            let version_markers = parsed_markers
+                .iter()
+                .filter(|marker| marker.version == *version)
+                .collect::<Vec<_>>();
+            let has_committed = version_markers
+                .iter()
+                .any(|marker| marker.state == RetirementState::Committed);
+            if !has_committed
+                && !version_markers
+                    .iter()
+                    .any(|marker| marker.state == RetirementState::Sealed)
+            {
+                return Err(Error::internal(format!(
+                    "cannot finalize retirement for version {version} without a durable marker"
+                )));
+            }
+            for marker in version_markers {
+                let is_anchor = marker.state == RetirementState::Committed
+                    || (!has_committed && marker.state == RetirementState::Sealed);
+                if is_anchor {
+                    anchor_paths.push(marker.metadata.location.clone());
+                } else {
+                    dependent_marker_paths.push(marker.metadata.location.clone());
+                }
+            }
+        }
+
+        let mut lease_paths = Vec::new();
         for metadata in self.lease_metadata().await? {
             let (version, _) = parse_lease_metadata(&metadata)?;
             if versions.contains(&version) {
-                paths.push(metadata.location);
+                lease_paths.push(metadata.location);
             }
         }
-        self.delete_paths(paths).await
+        // Leases and superseded marker states are dependent metadata. Keep at
+        // least one terminal marker as the retry anchor until they are gone.
+        self.delete_paths(lease_paths).await?;
+        self.delete_paths(dependent_marker_paths).await?;
+        self.delete_paths(anchor_paths).await
     }
 
     async fn delete_paths(&self, paths: Vec<Path>) -> Result<()> {
@@ -875,6 +1040,44 @@ impl VersionLeaseStore {
             })
             .await
     }
+}
+
+/// Verify that a durable tag or branch can be admitted for a version.
+///
+/// Callers check both before and after publishing their reference. Cleanup
+/// publishes a draining marker before its final reference scan, so either the
+/// reference is visible to that scan or the second admission check rejects and
+/// rolls it back.
+pub(super) async fn ensure_reference_admissible(
+    refs: &Refs,
+    branch: Option<&str>,
+    version: u64,
+) -> Result<()> {
+    let branch_location = refs.base_location.find_branch(branch)?;
+    let manifest = refs
+        .commit_handler
+        .resolve_version_location(&branch_location.path, version, &refs.object_store.inner)
+        .await?;
+    if !refs.object_store.exists(&manifest.path).await? {
+        return Err(Error::VersionNotFound {
+            message: format!("version {version} no longer exists and cannot be referenced"),
+        });
+    }
+
+    let store = VersionLeaseStore::for_refs(refs, branch, None).await?;
+    if store.has_active_retirement_marker(version).await? {
+        return Err(Error::RefConflict {
+            message: format!(
+                "version {version} is retiring and cannot accept a new durable reference"
+            ),
+        });
+    }
+    if !refs.object_store.exists(&manifest.path).await? {
+        return Err(Error::VersionNotFound {
+            message: format!("version {version} no longer exists and cannot be referenced"),
+        });
+    }
+    Ok(())
 }
 
 pub(super) async fn remove_branch_state(
@@ -1050,6 +1253,8 @@ fn retiring_version_error(version: u64) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::test::FailingProxyStore;
+    use lance_io::object_store::WrappingObjectStore;
     use mock_instant::thread_local::MockClock;
 
     use super::*;
@@ -1137,6 +1342,72 @@ mod tests {
         assert!(matches!(error, Error::VersionNotFound { .. }));
         assert!(error.to_string().contains("retiring"), "{error}");
         guard.cancel_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_retirement_cannot_be_cancelled() {
+        let store = memory_store();
+        let mut guard = store.fence_versions(&manifest_paths(42)).await.unwrap();
+        guard.seal_versions(&HashSet::from([42])).await.unwrap();
+        guard.commit_versions(&HashSet::from([42])).await.unwrap();
+        let committed_path = guard.fences[&42].committed_path.clone().unwrap();
+
+        guard.cancel_all().await.unwrap();
+
+        assert!(!guard.is_empty());
+        assert!(store.object_store.exists(&committed_path).await.unwrap());
+        let error = store
+            .acquire(42, Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retiring"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn terminal_marker_survives_lease_deletion_failure() {
+        let failing_store = Arc::new(FailingProxyStore::new());
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = failing_store.wrap("memory", Arc::clone(&object_store.inner));
+        let store = VersionLeaseStore {
+            object_store: Arc::new(object_store),
+            leases_path: Path::from("leases"),
+            markers_path: Path::from("markers"),
+            manifest_path: None,
+        };
+        let lease = store.acquire(42, Duration::from_secs(60)).await.unwrap();
+        let manifests = manifest_paths(42);
+        let mut guard = store.fence_versions(&manifests).await.unwrap();
+        guard.seal_versions(&HashSet::from([42])).await.unwrap();
+        guard.commit_versions(&HashSet::from([42])).await.unwrap();
+        let committed_path = guard.fences[&42].committed_path.clone().unwrap();
+        failing_store.fail_when(
+            "delete",
+            LEASE_FILE_SUFFIX,
+            "injected lease deletion failure",
+        );
+
+        let error = guard.finalize(&manifests).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected lease deletion failure"),
+            "{error}"
+        );
+        assert!(store.object_store.exists(&committed_path).await.unwrap());
+        assert!(store.object_store.exists(&lease.path).await.unwrap());
+
+        failing_store.clear_fail_when("delete", LEASE_FILE_SUFFIX);
+        assert!(
+            store
+                .clone()
+                .recover_retirements()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.object_store.exists(&committed_path).await.unwrap());
+        assert!(!store.object_store.exists(&lease.path).await.unwrap());
     }
 
     #[test]
