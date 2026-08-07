@@ -6,10 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{
-    future::BoxFuture,
-    stream::{StreamExt, TryStreamExt},
-};
+use futures::future::BoxFuture;
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::CommitHandler;
@@ -34,13 +31,12 @@ pub const MAIN_BRANCH: &str = "main";
 const REF_MUTATION_LOCK_FILE: &str = "mutation.json";
 const REF_MUTATION_LEASES_DIR: &str = "mutation_leases";
 const TAG_MUTATION_INTENTS_DIR: &str = "tag_mutations";
+const REF_CATALOG_DIR: &str = "catalog";
 const LEASE_FILE: &str = "lease.json";
 const LEASE_HEARTBEATS_DIR: &str = "heartbeats";
 const LEASE_RELEASED_FILE: &str = "released.json";
 const LEASE_PUBLICATION_FILE: &str = "publication.json";
 const LEASE_RECONCILED_FILE: &str = "reconciled.json";
-const REF_MUTATION_EPOCH_FIELD: &str = "_mutationEpoch";
-const REF_DELETED_FIELD: &str = "_deleted";
 const REF_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const REF_MUTATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const REF_MUTATION_LEASE_DURATION_MILLIS: i64 = 30_000;
@@ -379,26 +375,43 @@ struct DurableRefPublication {
 impl DurableRefPublication {
     async fn apply(&self, object_store: &ObjectStore) -> Result<()> {
         let path = Path::parse(&self.path)?;
-        // The epoch-qualified object is authoritative. The flat path is only a compatibility
-        // mirror, so a delayed lower-epoch mirror cannot supersede a newer reference for current
-        // readers.
-        let version_path = ref_version_path(&path, self.epoch)?;
-        create_immutable_body(object_store, &version_path, self.body.as_bytes()).await?;
+        let catalog: RefCatalog = serde_json::from_str(&self.body)?;
+        if catalog.mutation_epoch != self.epoch {
+            return Err(Error::internal(format!(
+                "reference catalog epoch {} does not match publication epoch {}",
+                catalog.mutation_epoch, self.epoch
+            )));
+        }
+        let root = ref_catalog_root_from_version_path(&path)?;
+        let expected_path = ref_catalog_version_path(&root, self.epoch);
+        if path != expected_path {
+            return Err(Error::internal(format!(
+                "reference catalog publication path {} does not match {}",
+                path, expected_path
+            )));
+        }
 
-        object_store
-            .inner
-            .put_opts(
-                &path,
-                Bytes::copy_from_slice(self.body.as_bytes()).into(),
-                PutOptions {
-                    mode: PutMode::Overwrite,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
+        // A complete catalog snapshot is the atomically discoverable state for point reads and
+        // enumeration. Delayed lower epochs are harmless because readers select the greatest
+        // epoch, and the next successful publication compacts them.
+        create_immutable_body(object_store, &path, self.body.as_bytes()).await?;
+        remove_legacy_ref_files(object_store, &root).await?;
+        if let Err(error) = compact_ref_catalog(object_store, &root, self.epoch).await {
+            log::warn!("Failed to compact superseded reference catalogs: {}", error);
+        }
+        Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefCatalog {
+    #[serde(rename = "_mutationEpoch")]
+    mutation_epoch: u64,
+    #[serde(default)]
+    tags: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    branches: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,13 +447,29 @@ impl DurableLeaseFence {
     where
         T: Serialize,
     {
+        let address = RefAddress::from_path(path)?;
+        let mut catalog = read_ref_catalog(&self.object_store, &address.root).await?;
+        catalog.mutation_epoch = self.epoch;
+        let entries = match address.kind {
+            RefKind::Tag => &mut catalog.tags,
+            RefKind::Branch => &mut catalog.branches,
+        };
+        match contents {
+            Some(contents) => {
+                entries.insert(address.name, serde_json::to_value(contents)?);
+            }
+            None => {
+                entries.remove(&address.name);
+            }
+        }
+        let publication_path = ref_catalog_version_path(&address.root, self.epoch);
         let publication = DurableRefPublication {
             epoch: self.epoch,
-            path: path.to_string(),
-            body: serialize_ref_file(contents, self.epoch)?,
+            path: publication_path.to_string(),
+            body: serde_json::to_string_pretty(&catalog)?,
         };
-        let publication_path = self.path.clone().join(LEASE_PUBLICATION_FILE);
-        create_serialized_file(&self.object_store, &publication_path, &publication).await?;
+        let intent_path = self.path.clone().join(LEASE_PUBLICATION_FILE);
+        create_serialized_file(&self.object_store, &intent_path, &publication).await?;
         self.ensure_current().await?;
         publication.apply(&self.object_store).await?;
         self.ensure_current().await
@@ -719,10 +748,11 @@ impl RefMutationLease {
                 }
                 let cleanup_object_store = refs.object_store.clone();
                 let cleanup_path = fence_path.clone();
-                tokio::spawn(async move {
-                    cleanup_old_lease_epochs(&cleanup_object_store, &cleanup_path, next_epoch)
-                        .await;
-                });
+                // Complete local directory removal before returning the lease. On Windows, a
+                // detached cleanup task can otherwise remove an epoch directory while the next
+                // mutation is walking it, which makes the local object-store listing fail with
+                // AccessDenied.
+                cleanup_old_lease_epochs(&cleanup_object_store, &cleanup_path, next_epoch).await;
                 return Ok(lease);
             }
         }
@@ -829,27 +859,6 @@ where
     Ok(Some(serde_json::from_slice(&current.bytes().await?)?))
 }
 
-fn serialize_ref_file<T>(contents: Option<&T>, epoch: u64) -> Result<String>
-where
-    T: Serialize,
-{
-    let mut value = match contents {
-        Some(contents) => serde_json::to_value(contents)?,
-        None => serde_json::Value::Object(Default::default()),
-    };
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| Error::internal("reference contents must serialize as a JSON object"))?;
-    object.insert(
-        REF_MUTATION_EPOCH_FIELD.to_string(),
-        serde_json::Value::from(epoch),
-    );
-    if contents.is_none() {
-        object.insert(REF_DELETED_FIELD.to_string(), serde_json::Value::Bool(true));
-    }
-    Ok(serde_json::to_string_pretty(&value)?)
-}
-
 async fn read_lease_state(
     object_store: &ObjectStore,
     path: &Path,
@@ -939,30 +948,16 @@ impl Branches<'_> {
 impl Tags<'_> {
     pub async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
         let root_location = self.refs.root()?;
-        let base_path = base_tags_path(&root_location.path);
-        let tag_files = self.object_store().read_dir(base_path).await?;
-
-        let tag_names: Vec<String> = tag_files
-            .iter()
-            .filter_map(|name| name.strip_suffix(".json"))
-            .map(|name| name.to_string())
-            .collect_vec();
-
-        let root_path = &root_location.path;
-        let tags: Vec<Option<(String, TagContents)>> = futures::stream::iter(tag_names)
-            .map(|tag_name| async move {
-                let stored =
-                    read_stored_ref(&tag_path(root_path, &tag_name), self.object_store()).await?;
-                Ok::<_, Error>(
-                    stored
-                        .and_then(|stored| stored.contents)
-                        .map(|contents| (tag_name, contents)),
-                )
+        let catalog = read_ref_catalog(self.object_store(), &root_location.path).await?;
+        catalog
+            .tags
+            .into_iter()
+            .map(|(name, value)| {
+                serde_json::from_value(value)
+                    .map(|contents| (name, contents))
+                    .map_err(Into::into)
             })
-            .buffer_unordered(10)
-            .try_collect()
-            .await?;
-        Ok(tags.into_iter().flatten().collect())
+            .collect()
     }
 
     pub async fn list(&self) -> Result<HashMap<String, TagContents>> {
@@ -1181,45 +1176,16 @@ impl Branches<'_> {
 
     pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
         let root_location = self.refs.root()?;
-        let base_path = base_branches_contents_path(&root_location.path);
-        let branch_files = self.object_store().read_dir(base_path).await?;
-
-        let branch_names: Vec<String> = branch_files
-            .iter()
-            .filter_map(|name| name.strip_suffix(".json"))
-            .map(|str| {
-                Path::from_url_path(str)
-                    .map_err(|e| Error::InvalidRef {
-                        message: format!(
-                            "Failed to decode branch name: {} due to exception {}",
-                            str, e
-                        ),
-                    })
-                    .map(|path| path.to_string())
+        let catalog = read_ref_catalog(self.object_store(), &root_location.path).await?;
+        catalog
+            .branches
+            .into_iter()
+            .map(|(name, value)| {
+                let mut contents: BranchContents = serde_json::from_value(value)?;
+                contents.hydrate_legacy_identifier(&name);
+                Ok((name, contents))
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        let branch_path = &root_location.path;
-        let branches: Vec<Option<(String, BranchContents)>> = futures::stream::iter(branch_names)
-            .map(|name| async move {
-                let stored = read_stored_ref::<BranchContents>(
-                    &branch_contents_path(branch_path, &name),
-                    self.object_store(),
-                )
-                .await?;
-                Ok::<_, Error>(
-                    stored
-                        .and_then(|stored| stored.contents)
-                        .map(|mut contents| {
-                            contents.hydrate_legacy_identifier(&name);
-                            (name, contents)
-                        }),
-                )
-            })
-            .buffer_unordered(10)
-            .try_collect()
-            .await?;
-        Ok(branches.into_iter().flatten().collect())
+            .collect()
     }
 
     pub async fn list(&self) -> Result<HashMap<String, BranchContents>> {
@@ -1430,6 +1396,22 @@ impl Branches<'_> {
                 branch_contents.metadata = metadata;
 
                 fence.publish(&branch_file, Some(&branch_contents)).await
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn publish_contents_for_test(
+        &self,
+        branch: &str,
+        contents: Option<BranchContents>,
+    ) -> Result<()> {
+        let branch = branch.to_string();
+        self.refs
+            .run_mutation(|fence| async move {
+                let root_location = self.refs.root()?;
+                let branch_file = branch_contents_path(&root_location.path, &branch);
+                fence.publish(&branch_file, contents.as_ref()).await
             })
             .await
     }
@@ -1954,35 +1936,255 @@ pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).join(format!("{}.json", branch))
 }
 
-fn ref_versions_path(path: &Path) -> Result<Path> {
-    let parent = path
+fn base_ref_catalog_path(base_path: &Path) -> Path {
+    base_path.clone().join("_refs").join(REF_CATALOG_DIR)
+}
+
+fn ref_catalog_version_path(base_path: &Path, epoch: u64) -> Path {
+    base_ref_catalog_path(base_path).join(format!("{epoch:020}.json"))
+}
+
+fn ref_catalog_root_from_version_path(path: &Path) -> Result<Path> {
+    let catalog_path = path
         .parent()
-        .ok_or_else(|| Error::internal(format!("reference path {} has no parent", path)))?;
-    let file_name = path
-        .filename()
-        .ok_or_else(|| Error::internal(format!("reference path {} has no file name", path)))?;
-    let ref_name = file_name.strip_suffix(".json").unwrap_or(file_name);
-    Ok(parent.join("_versions").join(ref_name))
+        .ok_or_else(|| Error::internal(format!("reference catalog path {} has no parent", path)))?;
+    if catalog_path.filename() != Some(REF_CATALOG_DIR) {
+        return Err(Error::internal(format!(
+            "reference catalog path {} is not below {}",
+            path, REF_CATALOG_DIR
+        )));
+    }
+    let refs_path = catalog_path.parent().ok_or_else(|| {
+        Error::internal(format!(
+            "reference catalog path {} is not below _refs",
+            path
+        ))
+    })?;
+    if refs_path.filename() != Some("_refs") {
+        return Err(Error::internal(format!(
+            "reference catalog path {} is not below _refs",
+            path
+        )));
+    }
+    refs_path.parent().ok_or_else(|| {
+        Error::internal(format!(
+            "reference catalog path {} has no dataset root",
+            path
+        ))
+    })
 }
 
-fn ref_version_path(path: &Path, epoch: u64) -> Result<Path> {
-    Ok(ref_versions_path(path)?.join(format!("{epoch:020}.json")))
+#[derive(Clone, Copy)]
+enum RefKind {
+    Tag,
+    Branch,
 }
 
-async fn latest_ref_version_path(object_store: &ObjectStore, path: &Path) -> Result<Option<Path>> {
-    let versions_path = ref_versions_path(path)?;
-    Ok(object_store
-        .read_dir(versions_path.clone())
+struct RefAddress {
+    root: Path,
+    kind: RefKind,
+    name: String,
+}
+
+impl RefAddress {
+    fn from_path(path: &Path) -> Result<Self> {
+        let category_path = path
+            .parent()
+            .ok_or_else(|| Error::internal(format!("reference path {} has no parent", path)))?;
+        let refs_path = category_path.parent().ok_or_else(|| {
+            Error::internal(format!("reference path {} is not below _refs", path))
+        })?;
+        if refs_path.filename() != Some("_refs") {
+            return Err(Error::internal(format!(
+                "reference path {} is not below _refs",
+                path
+            )));
+        }
+        let root = refs_path.parent().ok_or_else(|| {
+            Error::internal(format!("reference path {} has no dataset root", path))
+        })?;
+        let file_name = path
+            .filename()
+            .ok_or_else(|| Error::internal(format!("reference path {} has no file name", path)))?;
+        let encoded_name = file_name.strip_suffix(".json").ok_or_else(|| {
+            Error::internal(format!("reference path {} is not a JSON file", path))
+        })?;
+        let (kind, name) = match category_path.filename() {
+            Some("tags") => (RefKind::Tag, encoded_name.to_string()),
+            Some("branches") => {
+                let name = Path::from_url_path(encoded_name)
+                    .map_err(|error| Error::InvalidRef {
+                        message: format!(
+                            "Failed to decode branch name: {} due to exception {}",
+                            encoded_name, error
+                        ),
+                    })?
+                    .to_string();
+                (RefKind::Branch, name)
+            }
+            _ => {
+                return Err(Error::internal(format!(
+                    "reference path {} has an unknown category",
+                    path
+                )));
+            }
+        };
+        Ok(Self { root, kind, name })
+    }
+}
+
+async fn read_latest_ref_catalog(
+    object_store: &ObjectStore,
+    root: &Path,
+) -> Result<Option<RefCatalog>> {
+    let catalog_path = base_ref_catalog_path(root);
+    for attempt in 0..3 {
+        let entries = match object_store.read_dir(catalog_path.clone()).await {
+            Ok(entries) => entries,
+            Err(error) if attempt < 2 => {
+                tokio::task::yield_now().await;
+                log::debug!("Retrying reference catalog listing after: {}", error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((epoch, file_name)) = entries
+            .into_iter()
+            .filter_map(|file_name| {
+                file_name
+                    .strip_suffix(".json")
+                    .and_then(|epoch| epoch.parse::<u64>().ok())
+                    .map(|epoch| (epoch, file_name))
+            })
+            .max_by_key(|(epoch, _)| *epoch)
+        else {
+            return Ok(None);
+        };
+        let path = catalog_path.clone().join(file_name);
+        let result = match object_store.inner.get(&path).await {
+            Ok(result) => result,
+            Err(ObjectStoreError::NotFound { .. }) if attempt < 2 => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let catalog: RefCatalog = serde_json::from_slice(&result.bytes().await?)?;
+        if catalog.mutation_epoch != epoch {
+            return Err(Error::corrupt_file(
+                path,
+                format!(
+                    "reference catalog epoch {} does not match path epoch {}",
+                    catalog.mutation_epoch, epoch
+                ),
+            ));
+        }
+        return Ok(Some(catalog));
+    }
+    Ok(None)
+}
+
+async fn read_legacy_ref_entries(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    is_branch: bool,
+) -> Result<HashMap<String, serde_json::Value>> {
+    let mut entries = HashMap::new();
+    for file_name in object_store.read_dir(base_path.clone()).await? {
+        let Some(encoded_name) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        let encoded_name = encoded_name.to_string();
+        let path = base_path.clone().join(file_name);
+        let result = match object_store.inner.get(&path).await {
+            Ok(result) => result,
+            Err(ObjectStoreError::NotFound { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&result.bytes().await?)?;
+        if value
+            .get("_deleted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = if is_branch {
+            Path::from_url_path(&encoded_name)
+                .map_err(|error| Error::InvalidRef {
+                    message: format!(
+                        "Failed to decode branch name: {} due to exception {}",
+                        encoded_name, error
+                    ),
+                })?
+                .to_string()
+        } else {
+            encoded_name
+        };
+        entries.insert(name, value);
+    }
+    Ok(entries)
+}
+
+async fn read_ref_catalog(object_store: &ObjectStore, root: &Path) -> Result<RefCatalog> {
+    if let Some(catalog) = read_latest_ref_catalog(object_store, root).await? {
+        return Ok(catalog);
+    }
+    let legacy = RefCatalog {
+        mutation_epoch: 0,
+        tags: read_legacy_ref_entries(object_store, &base_tags_path(root), false).await?,
+        branches: read_legacy_ref_entries(object_store, &base_branches_contents_path(root), true)
+            .await?,
+    };
+    // If a writer crossed the migration boundary while legacy files were being read, prefer its
+    // complete catalog rather than returning a partial legacy view.
+    Ok(read_latest_ref_catalog(object_store, root)
         .await?
-        .into_iter()
-        .filter_map(|file_name| {
-            file_name
-                .strip_suffix(".json")
-                .and_then(|epoch| epoch.parse::<u64>().ok())
-                .map(|epoch| (epoch, file_name))
-        })
-        .max_by_key(|(epoch, _)| *epoch)
-        .map(|(_, file_name)| versions_path.join(file_name)))
+        .unwrap_or(legacy))
+}
+
+async fn remove_legacy_ref_files(object_store: &ObjectStore, root: &Path) -> Result<()> {
+    for base_path in [base_tags_path(root), base_branches_contents_path(root)] {
+        for file_name in object_store.read_dir(base_path.clone()).await? {
+            if !file_name.ends_with(".json") {
+                continue;
+            }
+            let path = base_path.clone().join(file_name);
+            if let Err(error) = object_store.delete(&path).await
+                && !matches!(error, Error::NotFound { .. })
+            {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn compact_ref_catalog(
+    object_store: &ObjectStore,
+    root: &Path,
+    current_epoch: u64,
+) -> Result<()> {
+    let catalog_path = base_ref_catalog_path(root);
+    for file_name in object_store.read_dir(catalog_path.clone()).await? {
+        let Some(epoch) = file_name
+            .strip_suffix(".json")
+            .and_then(|epoch| epoch.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if epoch >= current_epoch {
+            continue;
+        }
+        let path = catalog_path.clone().join(file_name);
+        if let Err(error) = object_store.delete(&path).await
+            && !matches!(error, Error::NotFound { .. })
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
@@ -2007,46 +2209,22 @@ async fn read_stored_ref<T>(path: &Path, object_store: &ObjectStore) -> Result<O
 where
     T: DeserializeOwned,
 {
-    let read_path = latest_ref_version_path(object_store, path)
-        .await?
-        .unwrap_or_else(|| path.clone());
-    let result = match object_store.inner.get(&read_path).await {
-        Ok(result) => result,
-        Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let address = RefAddress::from_path(path)?;
+    let catalog = read_ref_catalog(object_store, &address.root).await?;
+    let value = match address.kind {
+        RefKind::Tag => catalog.tags.get(&address.name),
+        RefKind::Branch => catalog.branches.get(&address.name),
     };
-    let bytes = result.bytes().await?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let object = value.as_object().ok_or_else(|| {
-        Error::corrupt_file(
-            read_path.clone(),
-            "reference file must contain a JSON object",
-        )
-    })?;
-    if object
-        .get(REF_MUTATION_EPOCH_FIELD)
-        .is_some_and(|epoch| epoch.as_u64().is_none())
-    {
-        return Err(Error::corrupt_file(
-            read_path.clone(),
-            format!("{} must be an unsigned integer", REF_MUTATION_EPOCH_FIELD),
-        ));
-    }
-    let is_deleted = match object.get(REF_DELETED_FIELD) {
-        Some(value) => value.as_bool().ok_or_else(|| {
-            Error::corrupt_file(
-                read_path.clone(),
-                format!("{} must be a boolean", REF_DELETED_FIELD),
-            )
-        })?,
-        None => false,
-    };
-    let contents = if is_deleted {
-        None
-    } else {
-        Some(serde_json::from_value(value)?)
-    };
-    Ok(Some(StoredRef { contents }))
+    value
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map(|contents| {
+            contents.map(|contents| StoredRef {
+                contents: Some(contents),
+            })
+        })
+        .map_err(Into::into)
 }
 
 impl TagContents {
@@ -2207,7 +2385,6 @@ mod tests {
     use rstest::rstest;
 
     #[derive(Debug)]
-    #[cfg_attr(coverage, coverage(off))]
     struct DelayedHeartbeatStore {
         target: Arc<dyn object_store::ObjectStore>,
         heartbeat_started: Arc<tokio::sync::Notify>,
@@ -2472,7 +2649,8 @@ mod tests {
     #[tokio::test]
     async fn test_reference_publication_ignores_delayed_older_epoch() {
         let object_store = ObjectStore::memory();
-        let path = tag_path(&Path::from("dataset"), "release");
+        let root = Path::from("dataset");
+        let path = tag_path(&root, "release");
         let older_contents = TagContents {
             branch: None,
             version: 1,
@@ -2487,18 +2665,39 @@ mod tests {
         };
         let older = DurableRefPublication {
             epoch: 1,
-            path: path.to_string(),
-            body: serialize_ref_file(Some(&older_contents), 1).unwrap(),
+            path: ref_catalog_version_path(&root, 1).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 1,
+                tags: HashMap::from([(
+                    "release".to_string(),
+                    serde_json::to_value(&older_contents).unwrap(),
+                )]),
+                branches: HashMap::new(),
+            })
+            .unwrap(),
         };
         let newer = DurableRefPublication {
             epoch: 2,
-            path: path.to_string(),
-            body: serialize_ref_file(Some(&newer_contents), 2).unwrap(),
+            path: ref_catalog_version_path(&root, 2).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 2,
+                tags: HashMap::from([(
+                    "release".to_string(),
+                    serde_json::to_value(&newer_contents).unwrap(),
+                )]),
+                branches: HashMap::new(),
+            })
+            .unwrap(),
         };
         let deleted = DurableRefPublication {
             epoch: 3,
-            path: path.to_string(),
-            body: serialize_ref_file::<TagContents>(None, 3).unwrap(),
+            path: ref_catalog_version_path(&root, 3).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 3,
+                tags: HashMap::new(),
+                branches: HashMap::new(),
+            })
+            .unwrap(),
         };
 
         older.apply(&object_store).await.unwrap();
@@ -2521,8 +2720,6 @@ mod tests {
             read_stored_ref::<TagContents>(&path, &object_store)
                 .await
                 .unwrap()
-                .unwrap()
-                .contents
                 .is_none()
         );
     }
@@ -2557,8 +2754,16 @@ mod tests {
             &first_path.join(LEASE_PUBLICATION_FILE),
             &DurableRefPublication {
                 epoch: 1,
-                path: tag_file.to_string(),
-                body: serialize_ref_file(Some(&tag_contents), 1).unwrap(),
+                path: ref_catalog_version_path(&Path::from("dataset"), 1).to_string(),
+                body: serde_json::to_string_pretty(&RefCatalog {
+                    mutation_epoch: 1,
+                    tags: HashMap::from([(
+                        "pending".to_string(),
+                        serde_json::to_value(&tag_contents).unwrap(),
+                    )]),
+                    branches: HashMap::new(),
+                })
+                .unwrap(),
             },
         )
         .await
@@ -2590,6 +2795,140 @@ mod tests {
                 .unwrap()
                 .version,
             7
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_publication_is_discoverable_by_list() {
+        let object_store = ObjectStore::memory();
+        let root = Path::from("dataset");
+        let contents = TagContents {
+            branch: None,
+            version: 7,
+            created_at: None,
+            updated_at: None,
+            manifest_size: 1,
+            metadata: HashMap::new(),
+        };
+        let publication = DurableRefPublication {
+            epoch: 1,
+            path: ref_catalog_version_path(&root, 1).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 1,
+                tags: HashMap::from([(
+                    "pending".to_string(),
+                    serde_json::to_value(&contents).unwrap(),
+                )]),
+                branches: HashMap::new(),
+            })
+            .unwrap(),
+        };
+
+        publication.apply(&object_store).await.unwrap();
+
+        let catalog = read_ref_catalog(&object_store, &root).await.unwrap();
+        assert!(catalog.tags.contains_key("pending"));
+        assert_eq!(
+            read_stored_ref::<TagContents>(&tag_path(&root, "pending"), &object_store)
+                .await
+                .unwrap()
+                .unwrap()
+                .contents
+                .unwrap()
+                .version,
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_migration_removes_legacy_flat_refs() {
+        let object_store = ObjectStore::memory();
+        let root = Path::from("dataset");
+        let legacy_path = tag_path(&root, "legacy");
+        let contents = TagContents {
+            branch: None,
+            version: 1,
+            created_at: None,
+            updated_at: None,
+            manifest_size: 1,
+            metadata: HashMap::new(),
+        };
+        object_store
+            .put(
+                &legacy_path,
+                serde_json::to_vec(&contents).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        let publication = DurableRefPublication {
+            epoch: 1,
+            path: ref_catalog_version_path(&root, 1).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 1,
+                tags: HashMap::new(),
+                branches: HashMap::new(),
+            })
+            .unwrap(),
+        };
+
+        publication.apply(&object_store).await.unwrap();
+
+        assert!(!object_store.exists(&legacy_path).await.unwrap());
+        assert!(
+            read_stored_ref::<TagContents>(&legacy_path, &object_store)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reference_catalog_compacts_history() {
+        let object_store = ObjectStore::memory();
+        let root = Path::from("dataset");
+        for epoch in 1..=100 {
+            let contents = TagContents {
+                branch: None,
+                version: epoch,
+                created_at: None,
+                updated_at: None,
+                manifest_size: 1,
+                metadata: HashMap::new(),
+            };
+            DurableRefPublication {
+                epoch,
+                path: ref_catalog_version_path(&root, epoch).to_string(),
+                body: serde_json::to_string_pretty(&RefCatalog {
+                    mutation_epoch: epoch,
+                    tags: HashMap::from([(
+                        "release".to_string(),
+                        serde_json::to_value(contents).unwrap(),
+                    )]),
+                    branches: HashMap::new(),
+                })
+                .unwrap(),
+            }
+            .apply(&object_store)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            object_store
+                .read_dir(base_ref_catalog_path(&root))
+                .await
+                .unwrap(),
+            vec!["00000000000000000100.json"]
+        );
+        assert_eq!(
+            read_stored_ref::<TagContents>(&tag_path(&root, "release"), &object_store)
+                .await
+                .unwrap()
+                .unwrap()
+                .contents
+                .unwrap()
+                .version,
+            100
         );
     }
 

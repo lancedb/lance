@@ -22,7 +22,6 @@ use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use mock_instant::thread_local::MockClock;
 
-use crate::dataset::refs::branch_contents_path;
 use crate::utils::test::copy_test_data_to_tmp;
 use futures::TryStreamExt;
 use lance_core::Error;
@@ -1250,9 +1249,11 @@ async fn test_branch() {
 
     // Finally delete the remaining branches.
     // Test deleting zombie branch
-    let root_location = dataset.refs.root().unwrap();
-    let branch_file = branch_contents_path(&root_location.path, "feature/nathan/branch3");
-    dataset.object_store.delete(&branch_file).await.unwrap();
+    dataset
+        .branches()
+        .publish_contents_for_test("feature/nathan/branch3", None)
+        .await
+        .unwrap();
     // Now "feature/nathan/branch3" is a zombie branch
     // Use delete_branch to verify if the directory is cleaned up
     dataset
@@ -1297,40 +1298,9 @@ async fn test_branch() {
     std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
     std::fs::rename(detached_path, &legacy_path).unwrap();
     legacy_contents.storage = None;
-    let root_location = dataset.refs.root().unwrap();
-    let legacy_file = branch_contents_path(&root_location.path, legacy_name);
     dataset
-        .object_store
-        .remove_dir_all(
-            root_location
-                .path
-                .clone()
-                .join("_refs")
-                .join("branches")
-                .join("_versions")
-                .join(legacy_name),
-        )
-        .await
-        .unwrap();
-    dataset
-        .object_store
-        .remove_dir_all(
-            root_location
-                .path
-                .clone()
-                .join("_refs")
-                .join("mutation_leases"),
-        )
-        .await
-        .unwrap();
-    dataset
-        .object_store
-        .put(
-            &legacy_file,
-            serde_json::to_string_pretty(&legacy_contents)
-                .unwrap()
-                .as_bytes(),
-        )
+        .branches()
+        .publish_contents_for_test(legacy_name, Some(legacy_contents))
         .await
         .unwrap();
     // Reopen after changing the physical layout so the commit handler does not retain the

@@ -21,45 +21,52 @@ Branch names must follow these validation rules:
 
 ### Branch Metadata Path
 
-Branch metadata is published as immutable fenced records under
-`_refs/branches/_versions/{branch-name}/{epoch}.json`. The greatest numeric epoch is authoritative.
-`_refs/branches/{branch-name}.json` mirrors the latest publication for compatibility with earlier
-readers. Since branch names support hierarchical naming with `/` characters, the `/` is URL-encoded
-as `%2F` in the filename and version directory (e.g., `bugfix/issue-123` becomes
-`bugfix%2Fissue-123`):
+Branch and tag metadata are published together as a complete immutable catalog under
+`_refs/catalog/{epoch}.json`. The greatest numeric epoch is authoritative for both point lookup and
+enumeration, so a catalog is either wholly visible or wholly absent. A delayed lower-epoch writer
+cannot supersede a newer catalog. Branch names are keys in the `branches` object and therefore do
+not determine a physical metadata path:
 
 ```
 {dataset_root}/
     _refs/
-        branches/
-            feature-a.json
-            bugfix%2Fissue-123.json  # Note: '/' encoded as '%2F'
-            _versions/
-                feature-a/
-                    00000000000000000042.json
-                bugfix%2Fissue-123/
-                    00000000000000000043.json
+        catalog/
+            00000000000000000042.json
 ```
 
-Each live fenced record contains the branch metadata below plus `_mutationEpoch`, whose value
-matches the epoch in its file name. Deletion appends a tombstone instead of removing earlier
-records:
+Each catalog contains the epoch encoded by its file name and complete live tag and branch maps:
 
 ```json
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "required": ["_mutationEpoch", "_deleted"],
-  "properties": {
-    "_mutationEpoch": {"type": "integer", "minimum": 1},
-    "_deleted": {"const": true}
+  "_mutationEpoch": 42,
+  "tags": {
+    "release": {
+      "version": 7,
+      "manifestSize": 1024
+    }
   },
-  "additionalProperties": false
+  "branches": {
+    "feature-a": {
+      "parentBranch": null,
+      "parentVersion": 7,
+      "createAt": 1775600000,
+      "manifestSize": 1024
+    }
+  }
 }
 ```
 
-Readers ignore lower-epoch records even if a delayed writer publishes one after a newer epoch.
-When no version records exist, readers load the unversioned metadata file as a legacy record.
+Deletion removes a name from the next complete catalog instead of publishing a per-name tombstone.
+After publishing a catalog, writers remove superseded lower-epoch catalogs. A lower epoch that
+finishes after compaction remains harmless and is reclaimed by the next successful reference
+publication. Thus normal sustained churn retains one catalog plus only records from delayed
+writers that have not yet crossed another publication boundary.
+
+When no catalog exists, readers load legacy `_refs/tags/*.json` and `_refs/branches/*.json` files.
+The first catalog publication is an explicit migration boundary: it imports every legacy reference
+into the catalog and removes the flat files. Clients that only understand flat reference files must
+not access a dataset after this boundary. Catalog writers never expose tombstones or new state at
+the legacy paths.
 
 ### Branch Metadata File Format
 
@@ -118,10 +125,6 @@ Each branch metadata file is a JSON object with this schema:
     "metadata": {
       "type": "object",
       "additionalProperties": {"type": "string"}
-    },
-    "_mutationEpoch": {
-      "type": "integer",
-      "minimum": 1
     }
   }
 }
@@ -194,22 +197,15 @@ Note that tag names do not support `/` characters, unlike branch names.
 
 ### Tag Storage
 
-Tags use the same immutable epoch publication protocol under
-`_refs/tags/_versions/{tag-name}/{epoch}.json`. The greatest epoch is authoritative, and a deleted
-tag is represented by the tombstone schema above. `_refs/tags/{tag-name}.json` mirrors the latest
-publication for compatibility with earlier readers. Tags are always stored at the root dataset
-level, regardless of which branch they reference.
+Tags are entries in the same root-level catalog as branches. Publishing one complete snapshot keeps
+tag point reads, tag enumeration, and branch metadata on the same fenced epoch. Tags remain global
+to the root dataset regardless of which branch they reference.
 
 ```
 {dataset_root}/
     _refs/
-        tags/
-            v1.0.0.json
-            v1.1.0.json
-            production.json
-            _versions/
-                production/
-                    00000000000000000042.json
+        catalog/
+            00000000000000000042.json
 ```
 
 ### Tag File Format
