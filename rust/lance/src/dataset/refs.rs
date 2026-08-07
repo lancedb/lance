@@ -1011,7 +1011,8 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
 
     if branch_name.eq("main") {
         return Err(Error::InvalidRef {
-            message: "Branch name cannot be 'main'".to_string(),
+            message: "\"main\" is reserved for the default branch; use a different branch name"
+                .to_string(),
         });
     }
     Ok(())
