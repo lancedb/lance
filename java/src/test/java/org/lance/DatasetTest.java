@@ -1589,6 +1589,7 @@ public class DatasetTest {
                 .withTargetRowsPerFragment(100)
                 .withMaxBytesPerFile(1024 * 1024) // 1MB limit
                 .withBatchSize(10) // Process 10 rows at a time
+                .withIoBufferSize(256 * 1024) // 256KB I/O buffer
                 .withNumThreads(2) // Use 2 threads
                 .withMaterializeDeletions(false)
                 .withDeferIndexRemap(true)
@@ -1608,6 +1609,8 @@ public class DatasetTest {
         assertEquals(1024 * 1024, options.getMaxBytesPerFile().get().intValue());
         assertTrue(options.getBatchSize().isPresent());
         assertEquals(10, options.getBatchSize().get().intValue());
+        assertTrue(options.getIoBufferSize().isPresent());
+        assertEquals(256 * 1024, options.getIoBufferSize().get().intValue());
         assertTrue(options.getNumThreads().isPresent());
         assertEquals(2, options.getNumThreads().get().intValue());
         assertFalse(options.getMaterializeDeletions().get());
@@ -1709,6 +1712,7 @@ public class DatasetTest {
                 .withMaterializeDeletionsThreshold(0.15f) // 15% threshold
                 .withNumThreads(1)
                 .withBatchSize(5)
+                .withIoBufferSize(128 * 1024)
                 .withDeferIndexRemap(false)
                 .build();
 
@@ -1733,6 +1737,8 @@ public class DatasetTest {
         assertEquals(1, allOptions.getNumThreads().get().intValue());
         assertTrue(allOptions.getBatchSize().isPresent());
         assertEquals(5, allOptions.getBatchSize().get().intValue());
+        assertTrue(allOptions.getIoBufferSize().isPresent());
+        assertEquals(128 * 1024, allOptions.getIoBufferSize().get().intValue());
         assertFalse(allOptions.getDeferIndexRemap().get());
       }
     }

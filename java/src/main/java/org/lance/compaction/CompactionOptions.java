@@ -36,6 +36,7 @@ public class CompactionOptions implements Serializable {
   private Optional<Float> materializeDeletionsThreshold;
   private Optional<Long> numThreads;
   private Optional<Long> batchSize;
+  private Optional<Long> ioBufferSize;
   private Optional<Boolean> deferIndexRemap;
   private Optional<CompactionMode> compactionMode;
   private Optional<Long> binaryCopyReadBatchBytes;
@@ -49,6 +50,7 @@ public class CompactionOptions implements Serializable {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
+      Optional<Long> ioBufferSize,
       Optional<Boolean> deferIndexRemap,
       Optional<CompactionMode> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
@@ -60,6 +62,7 @@ public class CompactionOptions implements Serializable {
     this.materializeDeletionsThreshold = materializeDeletionsThreshold;
     this.numThreads = numThreads;
     this.batchSize = batchSize;
+    this.ioBufferSize = ioBufferSize;
     this.deferIndexRemap = deferIndexRemap;
     this.compactionMode = compactionMode;
     this.binaryCopyReadBatchBytes = binaryCopyReadBatchBytes;
@@ -95,6 +98,10 @@ public class CompactionOptions implements Serializable {
     return batchSize;
   }
 
+  public Optional<Long> getIoBufferSize() {
+    return ioBufferSize;
+  }
+
   public Optional<Long> getMaxBytesPerFile() {
     return maxBytesPerFile;
   }
@@ -125,6 +132,7 @@ public class CompactionOptions implements Serializable {
         .add("materializeDeletionsThreshold", materializeDeletionsThreshold.orElse(null))
         .add("numThreads", numThreads.orElse(null))
         .add("batchSize", batchSize.orElse(null))
+        .add("ioBufferSize", ioBufferSize.orElse(null))
         .add("deferIndexRemap", deferIndexRemap.orElse(null))
         .add("compactionMode", compactionMode.orElse(null))
         .add("binaryCopyReadBatchBytes", binaryCopyReadBatchBytes.orElse(null))
@@ -140,6 +148,7 @@ public class CompactionOptions implements Serializable {
     output.writeObject(materializeDeletionsThreshold.orElse(null));
     output.writeObject(numThreads.orElse(null));
     output.writeObject(batchSize.orElse(null));
+    output.writeObject(ioBufferSize.orElse(null));
     output.writeObject(deferIndexRemap.orElse(null));
     output.writeObject(compactionMode.map(CompactionMode::getValue).orElse(null));
     output.writeObject(binaryCopyReadBatchBytes.orElse(null));
@@ -154,6 +163,7 @@ public class CompactionOptions implements Serializable {
     this.materializeDeletionsThreshold = Optional.ofNullable((Float) input.readObject());
     this.numThreads = Optional.ofNullable((Long) input.readObject());
     this.batchSize = Optional.ofNullable((Long) input.readObject());
+    this.ioBufferSize = Optional.ofNullable((Long) input.readObject());
     this.deferIndexRemap = Optional.ofNullable((Boolean) input.readObject());
     String modeStr = (String) input.readObject();
     this.compactionMode = Optional.empty();
@@ -178,6 +188,7 @@ public class CompactionOptions implements Serializable {
     private Optional<Float> materializeDeletionsThreshold = Optional.empty();
     private Optional<Long> numThreads = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
+    private Optional<Long> ioBufferSize = Optional.empty();
     private Optional<Boolean> deferIndexRemap = Optional.empty();
     private Optional<CompactionMode> compactionMode = Optional.empty();
     private Optional<Long> binaryCopyReadBatchBytes = Optional.empty();
@@ -220,6 +231,15 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
+    /**
+     * Sets the number of bytes allowed to queue in the I/O buffer when scanning input fragments.
+     * Increase this if a single scanned batch can be larger than the scanner's default buffer.
+     */
+    public Builder withIoBufferSize(long ioBufferSize) {
+      this.ioBufferSize = Optional.of(ioBufferSize);
+      return this;
+    }
+
     public Builder withDeferIndexRemap(boolean deferIndexRemap) {
       this.deferIndexRemap = Optional.of(deferIndexRemap);
       return this;
@@ -254,6 +274,7 @@ public class CompactionOptions implements Serializable {
           materializeDeletionsThreshold,
           numThreads,
           batchSize,
+          ioBufferSize,
           deferIndexRemap,
           compactionMode,
           binaryCopyReadBatchBytes,

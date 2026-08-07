@@ -187,6 +187,7 @@ pub fn build_compaction_options(
     materialize_deletions_threshold: &JObject, // Optional<Float>
     num_threads: &JObject,                     // Optional<Long>
     batch_size: &JObject,                      // Optional<Long>
+    io_buffer_size: &JObject,                  // Optional<Long>
     defer_index_remap: &JObject,               // Optional<Boolean>
     compaction_mode: &JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: &JObject,    // Optional<Long>
@@ -217,6 +218,9 @@ pub fn build_compaction_options(
     }
     if let Some(batch_size_val) = env.get_long_opt(batch_size)? {
         compaction_options.batch_size = Some(batch_size_val as usize);
+    }
+    if let Some(io_buffer_size_val) = env.get_long_opt(io_buffer_size)? {
+        compaction_options.io_buffer_size = Some(io_buffer_size_val as u64);
     }
     if let Some(defer_index_remap_val) = env.get_boolean_opt(defer_index_remap)? {
         compaction_options.defer_index_remap = defer_index_remap_val;

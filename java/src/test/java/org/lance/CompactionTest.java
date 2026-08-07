@@ -49,8 +49,14 @@ public class CompactionTest {
       testDataset.write(1, 10).close();
       try (Dataset dataset = testDataset.write(2, 10)) {
         CompactionOptions compactionOptions =
-            CompactionOptions.builder().withTargetRowsPerFragment(100).withNumThreads(1).build();
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withNumThreads(1)
+                .withIoBufferSize(1024 * 1024)
+                .build();
         CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
+        assertEquals(
+            1024 * 1024, compactionPlan.getCompactionOptions().getIoBufferSize().get().intValue());
 
         // will plan to compact two fragments into one.
         assertEquals(1, compactionPlan.getCompactionTasks().size());
@@ -61,6 +67,7 @@ public class CompactionTest {
 
         // mock network transferring
         task = serializeAndDeserialize(task);
+        assertEquals(1024 * 1024, task.getCompactionOptions().getIoBufferSize().get().intValue());
         RewriteResult result = task.execute(dataset);
         CompactionMetrics metrics = result.getMetrics();
         // remove previous fragments and add new single fragment
