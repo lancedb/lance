@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -136,6 +136,16 @@ class CleanupExplanation:
     candidate_file_limit: int
     referenced_branches: List[CleanupReferencedBranch]
     warnings: List[str]
+
+class VersionLease:
+    @property
+    def version(self) -> int: ...
+    @property
+    def expires_at(self) -> datetime: ...
+    def renew(self, ttl: timedelta) -> None: ...
+    def release(self) -> None: ...
+    def __enter__(self) -> VersionLease: ...
+    def __exit__(self, exc_type, exc_value, traceback) -> bool: ...
 
 class LanceFileWriteSummary:
     num_rows: int
@@ -460,6 +470,7 @@ class _Dataset:
     def checkout_version(
         self, version: int | str | Tuple[Optional[str], Optional[int]]
     ) -> _Dataset: ...
+    def acquire_version_lease(self, ttl_micros: int) -> VersionLease: ...
     def checkout_latest(self) -> _Dataset: ...
     def shallow_clone(
         self,

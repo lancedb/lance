@@ -45,6 +45,7 @@ use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
+use dataset::version_lease::PyVersionLease;
 use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
 use env_logger::{Builder, Env};
 use file::{
@@ -284,6 +285,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CleanupCandidateFile>()?;
     m.add_class::<CleanupReferencedBranch>()?;
     m.add_class::<CleanupExplanation>()?;
+    m.add_class::<PyVersionLease>()?;
     m.add_class::<IoStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;

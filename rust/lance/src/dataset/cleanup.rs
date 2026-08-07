@@ -34,6 +34,7 @@
 //! happening at the same time)
 
 use super::refs::TagContents;
+use super::version_lease::VersionLeaseStore;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -53,7 +54,7 @@ use lance_core::{
 use lance_table::{
     format::{IndexMetadata, Manifest},
     io::{
-        commit::ManifestLocation,
+        commit::{ManifestLocation, ManifestNamingScheme},
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
@@ -64,7 +65,7 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::Mutex,
     time::Duration,
 };
 use tokio::time::{MissedTickBehavior, interval};
@@ -467,7 +468,14 @@ impl<'a> CleanupTask<'a> {
             .map(|tag_content| tag_content.version)
             .collect();
 
-        let mut inspection = self.process_manifests(&tagged_versions).await?;
+        let version_lease_store = VersionLeaseStore::for_dataset(self.dataset).await?;
+        let leased_versions = version_lease_store
+            .active_versions(self.action.deletes_files())
+            .await?;
+
+        let mut inspection = self
+            .process_manifests(&tagged_versions, &leased_versions)
+            .await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -487,6 +495,10 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
+        inspection = self
+            .fence_old_versions_and_retain_new_leases(inspection, &version_lease_store)
+            .await?;
+
         final_result.merge(
             self.delete_unreferenced_files(inspection).await?,
             candidate_file_limit,
@@ -498,6 +510,7 @@ impl<'a> CleanupTask<'a> {
     async fn process_manifests(
         &'a self,
         tagged_versions: &HashSet<u64>,
+        leased_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
@@ -505,7 +518,7 @@ impl<'a> CleanupTask<'a> {
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions)
+                self.process_manifest_file(location, &inspection, tagged_versions, leased_versions)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -516,6 +529,7 @@ impl<'a> CleanupTask<'a> {
         location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
+        leased_versions: &HashSet<u64>,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
@@ -551,7 +565,9 @@ impl<'a> CleanupTask<'a> {
         // version.  These are either in-progress or newly added since we started.
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        let is_leased = leased_versions.contains(&manifest.version);
+        let in_working_set =
+            is_latest || !self.policy.should_clean(&manifest) || is_tagged || is_leased;
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -566,16 +582,77 @@ impl<'a> CleanupTask<'a> {
                 .old_manifests
                 .insert(location.path.clone(), manifest.version);
         } else {
-            let commit_ts = manifest.timestamp();
-            if let Some(ts) = inspection.earliest_retained_manifest_time {
-                if commit_ts < ts {
-                    inspection.earliest_retained_manifest_time = Some(commit_ts);
-                }
-            } else {
-                inspection.earliest_retained_manifest_time = Some(commit_ts);
-            }
+            Self::note_retained_manifest_time(&mut inspection, &manifest);
         }
         Ok(())
+    }
+
+    async fn fence_old_versions_and_retain_new_leases(
+        &self,
+        mut inspection: CleanupInspection,
+        version_lease_store: &VersionLeaseStore,
+    ) -> Result<CleanupInspection> {
+        if !self.action.deletes_files() {
+            return Ok(inspection);
+        }
+
+        let versions_to_delete: HashSet<u64> = inspection.old_manifests.values().copied().collect();
+        version_lease_store
+            .fence_versions(&versions_to_delete)
+            .await?;
+
+        // A lease acquired between the initial list and the fence either sees
+        // the fence and fails, or appears here and conservatively retains this
+        // version for the current cleanup pass.
+        let leased_versions = version_lease_store.active_versions(true).await?;
+        for version in versions_to_delete.intersection(&leased_versions) {
+            self.retain_version(&mut inspection, *version).await?;
+        }
+        Ok(inspection)
+    }
+
+    async fn retain_version(&self, inspection: &mut CleanupInspection, version: u64) -> Result<()> {
+        let manifest_paths: Vec<Path> = inspection
+            .old_manifests
+            .iter()
+            .filter(|(_, manifest_version)| **manifest_version == version)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        for path in manifest_paths {
+            let filename = path.filename().ok_or_else(|| {
+                Error::internal(format!("manifest path {} has no filename", path))
+            })?;
+            let naming_scheme = ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| {
+                Error::internal(format!("invalid manifest filename: '{filename}'"))
+            })?;
+            let location = ManifestLocation {
+                path: path.clone(),
+                version,
+                size: None,
+                naming_scheme,
+                e_tag: None,
+            };
+            let manifest =
+                read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            let indexes =
+                read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+            self.process_manifest(&manifest, &indexes, true, inspection)?;
+            inspection.old_manifests.remove(&path);
+            Self::note_retained_manifest_time(inspection, &manifest);
+        }
+        Ok(())
+    }
+
+    fn note_retained_manifest_time(inspection: &mut CleanupInspection, manifest: &Manifest) {
+        let commit_ts = manifest.timestamp();
+        if let Some(ts) = inspection.earliest_retained_manifest_time {
+            if commit_ts < ts {
+                inspection.earliest_retained_manifest_time = Some(commit_ts);
+            }
+        } else {
+            inspection.earliest_retained_manifest_time = Some(commit_ts);
+        }
     }
 
     fn process_manifest(
@@ -583,7 +660,7 @@ impl<'a> CleanupTask<'a> {
         manifest: &Manifest,
         indexes: &Vec<IndexMetadata>,
         in_working_set: bool,
-        inspection: &mut MutexGuard<CleanupInspection>,
+        inspection: &mut CleanupInspection,
     ) -> Result<()> {
         // If this part of our working set then update referenced_files.  Otherwise, just mark the
         // file as verified.
@@ -2136,9 +2213,75 @@ mod tests {
                 old_manifest,
                 &Mutex::new(CleanupInspection::default()),
                 &HashSet::new(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_retains_version_with_active_lease() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let historical = fixture.load().await.unwrap();
+        let mut lease = historical
+            .acquire_version_lease(Duration::from_secs(30 * 24 * 60 * 60))
+            .await
+            .unwrap();
+        lease
+            .renew(Duration::from_secs(30 * 24 * 60 * 60))
+            .await
+            .unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 0);
+        historical.scan().try_into_batch().await.unwrap();
+
+        lease.release().await.unwrap();
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 1);
+        assert!(
+            fixture
+                .load()
+                .await
+                .unwrap()
+                .checkout_version(1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_version_lease_does_not_block_cleanup() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let historical = fixture.load().await.unwrap();
+        let _lease = historical
+            .acquire_version_lease(Duration::from_secs(1))
+            .await
+            .unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 1);
+        let error = historical
+            .acquire_version_lease(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("fenced for cleanup"), "{error}");
     }
 
     #[tokio::test]
@@ -2817,7 +2960,10 @@ mod tests {
                 .build(),
             CleanupAction::Execute,
         );
-        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let inspection = task
+            .process_manifests(&HashSet::new(), &HashSet::new())
+            .await
+            .unwrap();
         let referenced_branches = task.find_referenced_branches().await.unwrap();
         let inspection = task
             .retain_branch_lineage_files(inspection, &referenced_branches, &HashSet::new())
@@ -2881,7 +3027,10 @@ mod tests {
                 .build(),
             CleanupAction::Execute,
         );
-        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let inspection = task
+            .process_manifests(&HashSet::new(), &HashSet::new())
+            .await
+            .unwrap();
         let kept: HashSet<&Path> = inspection
             .referenced_files
             .data_paths

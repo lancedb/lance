@@ -64,6 +64,7 @@ from .lance import (
     LanceSchema,
     PySearchFilter,
     ScanStatistics,
+    VersionLease,
     _Dataset,
     _format_field_path,
     _MergeInsertBuilder,
@@ -3088,6 +3089,33 @@ class LanceDataset(pa.dataset.Dataset):
         if version != ds.version:
             ds._ds = self._ds.checkout_version(version)
         return ds
+
+    def acquire_version_lease(self, ttl: timedelta) -> VersionLease:
+        """Protect this dataset version from cleanup with a renewable lease.
+
+        Acquire the lease before starting a long-running read and renew it before
+        :attr:`VersionLease.expires_at`. Cleanup may remove the version after the
+        lease expires. A context manager releases the lease on exit; a process
+        that exits without releasing it stops protecting the version at expiry.
+
+        Parameters
+        ----------
+        ttl : timedelta
+            How long the lease protects this version. Must be positive.
+
+        Returns
+        -------
+        VersionLease
+            A renewable lease for this dataset version.
+
+        Examples
+        --------
+        >>> historical = dataset.checkout_version(1)
+        >>> with historical.acquire_version_lease(timedelta(minutes=5)) as lease:
+        ...     table = historical.to_table()
+        ...     lease.renew(timedelta(minutes=5))
+        """
+        return self._ds.acquire_version_lease(td_to_micros(ttl))
 
     def restore(self):
         """

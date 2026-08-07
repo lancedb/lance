@@ -114,6 +114,7 @@ use self::cleanup::{
 };
 use self::commit::PyCommitLock;
 use self::io_stats::IoStats;
+use self::version_lease::PyVersionLease;
 
 pub mod blob;
 pub mod cleanup;
@@ -121,6 +122,7 @@ pub mod commit;
 pub mod io_stats;
 pub mod optimize;
 pub mod stats;
+pub mod version_lease;
 
 const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
@@ -2076,6 +2078,14 @@ impl Dataset {
     fn checkout_version(&self, version: Bound<PyAny>) -> PyResult<Self> {
         let reference = self.transform_ref(Some(version))?;
         self._checkout_version(reference)
+    }
+
+    fn acquire_version_lease(&self, py: Python<'_>, ttl_micros: i64) -> PyResult<PyVersionLease> {
+        let ttl = PyVersionLease::ttl(ttl_micros)?;
+        let lease = rt()
+            .block_on(Some(py), self.ds.acquire_version_lease(ttl))?
+            .infer_error()?;
+        Ok(PyVersionLease::new(lease))
     }
 
     /// Restore the current version

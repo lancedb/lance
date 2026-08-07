@@ -93,6 +93,7 @@ pub mod transaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
+mod version_lease;
 pub(crate) mod versions;
 pub mod write;
 
@@ -135,6 +136,7 @@ pub use schema_evolution::{
 };
 pub use take::TakeBuilder;
 use uuid::Uuid;
+pub use version_lease::VersionLease;
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
     WhenNotMatched, WhenNotMatchedBySource,

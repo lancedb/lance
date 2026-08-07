@@ -1592,6 +1592,26 @@ def test_cleanup_old_versions(tmp_path):
     assert stats.old_versions == 1
 
 
+def test_cleanup_retains_active_version_lease(tmp_path: Path):
+    table = pa.table({"value": range(10)})
+    dataset = lance.write_dataset(table, tmp_path / "leased", mode="create")
+    historical = dataset.checkout_version(1)
+    dataset = lance.write_dataset(table, tmp_path / "leased", mode="overwrite")
+
+    with historical.acquire_version_lease(timedelta(minutes=1)) as lease:
+        assert lease.version == 1
+        assert lease.expires_at > datetime.now(tz=lease.expires_at.tzinfo)
+        lease.renew(timedelta(minutes=1))
+        stats = dataset.cleanup_old_versions(retain_versions=1)
+        assert stats.old_versions == 0
+        assert historical.to_table() == table
+
+    stats = dataset.cleanup_old_versions(retain_versions=1)
+    assert stats.old_versions == 1
+    with pytest.raises(OSError):
+        dataset.checkout_version(1)
+
+
 def test_explain_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
