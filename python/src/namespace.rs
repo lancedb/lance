@@ -826,15 +826,19 @@ pub struct PyRestNamespace {
 
 #[pymethods]
 impl PyRestNamespace {
-    /// Create a new RestNamespace from properties
+    /// Create a new RestNamespace from properties.
     ///
     /// # Arguments
     ///
     /// * `context_provider` - Optional object with `provide_context(info: dict) -> dict` method
     ///   for providing dynamic per-request context. Context keys that start with `headers.`
-    ///   are converted to HTTP headers by stripping the prefix. For example,
-    ///   `{"headers.Authorization": "Bearer token"}` becomes the `Authorization` header.
-    /// * `**properties` - Namespace configuration properties (uri, delimiter, header.*, etc.)
+    ///   are converted to HTTP headers by stripping the prefix.
+    /// * `**properties` - Namespace configuration properties (uri, delimiter, header.*,
+    ///   rest.auth.type, rest.auth.sigv4.region, rest.auth.sigv4.service,
+    ///   rest.auth.sigv4.access-key-id, rest.auth.sigv4.secret-access-key,
+    ///   rest.auth.sigv4.session-token, etc.)
+    ///
+    /// `rest.auth.*` and `header.Authorization` are mutually exclusive.
     #[new]
     #[pyo3(signature = (context_provider = None, **properties))]
     fn new(
@@ -860,7 +864,11 @@ impl PyRestNamespace {
             builder = builder.context_provider(Arc::new(py_provider));
         }
 
-        let namespace = builder.build();
+        let namespace = builder.build().infer_error()?;
+
+        crate::rt()
+            .block_on(None, namespace.warm_up_auth())?
+            .infer_error()?;
 
         Ok(Self {
             inner: Arc::new(namespace),

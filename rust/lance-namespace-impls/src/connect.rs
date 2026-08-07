@@ -184,7 +184,9 @@ impl ConnectBuilder {
                 if let Some(provider) = self.context_provider {
                     builder = builder.context_provider(provider);
                 }
-                Ok(Arc::new(builder.build()) as Arc<dyn LanceNamespace>)
+                let ns = builder.build()?;
+                ns.warm_up_auth().await?;
+                Ok(Arc::new(ns) as Arc<dyn LanceNamespace>)
             }
             #[cfg(not(feature = "rest"))]
             "rest" => Err(NamespaceError::Unsupported {

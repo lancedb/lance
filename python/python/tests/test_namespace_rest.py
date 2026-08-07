@@ -747,3 +747,372 @@ class TestDynamicContextProvider:
 
                 # Explicit provider should have been used
                 assert explicit_called["called"]
+
+
+class TestSigV4Auth:
+    def test_sigv4_connects_and_signs_requests(self, monkeypatch):
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+        monkeypatch.setenv(
+            "AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        )
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend_config = {"root": tmpdir}
+
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+                client = connect(
+                    "rest",
+                    {
+                        "uri": f"http://127.0.0.1:{adapter.port}",
+                        "rest.auth.type": "sigv4",
+                        "rest.auth.sigv4.region": "us-east-1",
+                        "rest.auth.sigv4.service": "execute-api",
+                    },
+                )
+
+                create_req = CreateNamespaceRequest(id=["sigv4test"])
+                client.create_namespace(create_req)
+
+                list_req = ListNamespacesRequest(id=[])
+                resp = client.list_namespaces(list_req)
+                assert "sigv4test" in resp.namespaces
+
+    def test_sigv4_missing_region_fails_at_connect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend_config = {"root": tmpdir}
+
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+                with pytest.raises(Exception, match="rest.auth.sigv4.region"):
+                    connect(
+                        "rest",
+                        {
+                            "uri": f"http://127.0.0.1:{adapter.port}",
+                            "rest.auth.type": "sigv4",
+                            # no region — should fail
+                        },
+                    )
+
+    def test_sigv4_signature_correctness(self, monkeypatch):
+        import json
+        import re
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
+        SECRET_KEY = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+        captured_requests = []
+
+        class Recorder(BaseHTTPRequestHandler):
+            def _capture_and_respond(self):
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length) if content_length else b""
+                captured_requests.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "headers": {k.lower(): v for k, v in self.headers.items()},
+                        "body": body,
+                    }
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"namespaces": []}).encode())
+
+            def do_GET(self):
+                self._capture_and_respond()
+
+            def do_POST(self):
+                self._capture_and_respond()
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Recorder)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        try:
+            client = connect(
+                "rest",
+                {
+                    "uri": f"http://127.0.0.1:{port}",
+                    "rest.auth.type": "sigv4",
+                    "rest.auth.sigv4.region": "us-east-1",
+                    "rest.auth.sigv4.service": "execute-api",
+                },
+            )
+
+            try:
+                client.list_namespaces(ListNamespacesRequest(id=[]))
+            except Exception:
+                pass
+
+            try:
+                client.create_namespace(CreateNamespaceRequest(id=["verify"]))
+            except Exception:
+                pass
+
+            assert len(captured_requests) >= 2, (
+                f"expected at least 2 requests (GET+POST), got {len(captured_requests)}"
+            )
+            methods_seen = {r["method"] for r in captured_requests}
+            assert "GET" in methods_seen, "expected at least one GET request"
+            assert "POST" in methods_seen, "expected at least one POST request"
+
+            creds = Credentials(ACCESS_KEY, SECRET_KEY)
+            signer = SigV4Auth(creds, "execute-api", "us-east-1")
+
+            for req in captured_requests:
+                rust_auth = req["headers"].get("authorization", "")
+                assert rust_auth.startswith("AWS4-HMAC-SHA256"), (
+                    f"{req['method']} {req['path']}: missing SigV4 header"
+                )
+
+                rust_sig = re.search(r"Signature=([a-f0-9]{64})", rust_auth).group(1)
+                amz_date = req["headers"]["x-amz-date"]
+
+                url = f"http://127.0.0.1:{port}{req['path']}"
+
+                signed_names = (
+                    re.search(r"SignedHeaders=([^,]+)", rust_auth).group(1).split(";")
+                )
+                headers_for_signing = {}
+                for name in signed_names:
+                    if name in req["headers"]:
+                        headers_for_signing[name] = req["headers"][name]
+
+                aws_req = AWSRequest(
+                    method=req["method"],
+                    url=url,
+                    headers=headers_for_signing,
+                    data=req["body"],
+                )
+                aws_req.context["timestamp"] = amz_date
+
+                cr = signer.canonical_request(aws_req)
+                sts = signer.string_to_sign(aws_req, cr)
+                boto_sig = signer.signature(sts, aws_req)
+
+                assert rust_sig == boto_sig, (
+                    f"{req['method']} {req['path']}: signature mismatch\n"
+                    f"  rust:    {rust_sig}\n"
+                    f"  botocore:{boto_sig}\n"
+                    f"  rust_auth:  {rust_auth}\n"
+                    f"  botocore canonical_request:\n{cr}"
+                )
+        finally:
+            server.shutdown()
+
+    def test_sigv4_explicit_credentials_take_precedence_over_env(self, monkeypatch):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ENVAKID_SHOULD_NOT_APPEAR")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "envSecretShouldNotAppear")
+
+        captured_headers = []
+
+        class Recorder(BaseHTTPRequestHandler):
+            def _capture_and_respond(self):
+                captured_headers.append({k.lower(): v for k, v in self.headers.items()})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"namespaces": []}).encode())
+
+            def do_GET(self):
+                self._capture_and_respond()
+
+            def do_POST(self):
+                self._capture_and_respond()
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Recorder)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        try:
+            client = connect(
+                "rest",
+                {
+                    "uri": f"http://127.0.0.1:{port}",
+                    "rest.auth.type": "sigv4",
+                    "rest.auth.sigv4.region": "us-east-1",
+                    "rest.auth.sigv4.service": "execute-api",
+                    "rest.auth.sigv4.access-key-id": "AKIAIOSFODNN7EXAMPLE",
+                    "rest.auth.sigv4.secret-access-key": (
+                        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                },
+            )
+
+            try:
+                client.list_namespaces(ListNamespacesRequest(id=[]))
+            except Exception:
+                pass
+
+            assert len(captured_headers) >= 1
+            auth = captured_headers[0].get("authorization", "")
+            assert "Credential=AKIAIOSFODNN7EXAMPLE/" in auth, (
+                "properties credentials must take precedence over env"
+            )
+            assert "ENVAKID_SHOULD_NOT_APPEAR" not in auth
+        finally:
+            server.shutdown()
+
+    def test_sigv4_partial_credentials_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend_config = {"root": tmpdir}
+
+            with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
+                with pytest.raises(
+                    Exception, match="rest.auth.sigv4.secret-access-key"
+                ):
+                    connect(
+                        "rest",
+                        {
+                            "uri": f"http://127.0.0.1:{adapter.port}",
+                            "rest.auth.type": "sigv4",
+                            "rest.auth.sigv4.region": "us-east-1",
+                            "rest.auth.sigv4.access-key-id": "AKIAIOSFODNN7EXAMPLE",
+                        },
+                    )
+
+    def test_sigv4_explicit_credentials(self, monkeypatch):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+        monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+
+        captured_headers = []
+
+        class Recorder(BaseHTTPRequestHandler):
+            def _capture_and_respond(self):
+                captured_headers.append({k.lower(): v for k, v in self.headers.items()})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"namespaces": []}).encode())
+
+            def do_GET(self):
+                self._capture_and_respond()
+
+            def do_POST(self):
+                self._capture_and_respond()
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Recorder)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        try:
+            client = connect(
+                "rest",
+                {
+                    "uri": f"http://127.0.0.1:{port}",
+                    "rest.auth.type": "sigv4",
+                    "rest.auth.sigv4.region": "us-east-1",
+                    "rest.auth.sigv4.service": "execute-api",
+                    "rest.auth.sigv4.access-key-id": "AKIAIOSFODNN7EXAMPLE",
+                    "rest.auth.sigv4.secret-access-key": (
+                        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                },
+            )
+
+            try:
+                client.list_namespaces(ListNamespacesRequest(id=[]))
+            except Exception:
+                pass
+
+            assert len(captured_headers) >= 1
+            auth = captured_headers[0].get("authorization", "")
+            assert auth.startswith("AWS4-HMAC-SHA256"), (
+                f"expected SigV4 header, got: {auth}"
+            )
+            assert "Credential=AKIAIOSFODNN7EXAMPLE/" in auth
+        finally:
+            server.shutdown()
+
+    def test_sigv4_explicit_credentials_with_session_token(self, monkeypatch):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+        monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+
+        captured_headers = []
+
+        class Recorder(BaseHTTPRequestHandler):
+            def _capture_and_respond(self):
+                captured_headers.append({k.lower(): v for k, v in self.headers.items()})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"namespaces": []}).encode())
+
+            def do_GET(self):
+                self._capture_and_respond()
+
+            def do_POST(self):
+                self._capture_and_respond()
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Recorder)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        try:
+            client = connect(
+                "rest",
+                {
+                    "uri": f"http://127.0.0.1:{port}",
+                    "rest.auth.type": "sigv4",
+                    "rest.auth.sigv4.region": "us-east-1",
+                    "rest.auth.sigv4.service": "execute-api",
+                    "rest.auth.sigv4.access-key-id": "AKIAIOSFODNN7EXAMPLE",
+                    "rest.auth.sigv4.secret-access-key": (
+                        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+                    ),
+                    "rest.auth.sigv4.session-token": "FakeSessionToken123",
+                },
+            )
+
+            try:
+                client.list_namespaces(ListNamespacesRequest(id=[]))
+            except Exception:
+                pass
+
+            assert len(captured_headers) >= 1
+            auth = captured_headers[0].get("authorization", "")
+            assert auth.startswith("AWS4-HMAC-SHA256")
+
+            token = captured_headers[0].get("x-amz-security-token", "")
+            assert token == "FakeSessionToken123", (
+                f"expected session token in header, got: {token}"
+            )
+        finally:
+            server.shutdown()

@@ -75,6 +75,8 @@ pub mod connect;
 pub mod context;
 pub mod credentials;
 pub mod dir;
+#[cfg(feature = "rest")]
+pub mod rest_auth;
 
 #[cfg(feature = "rest")]
 pub mod rest;
@@ -88,6 +90,9 @@ pub use context::{DynamicContextProvider, OperationInfo};
 pub use dir::{
     DirectoryNamespace, DirectoryNamespaceBuilder, OpsMetrics, manifest::ManifestNamespace,
 };
+
+#[cfg(feature = "rest")]
+pub use rest_auth::{NoopAuthProvider, RequestContext, RestAuthProvider};
 
 // Re-export credential vending
 pub use credentials::{
