@@ -500,7 +500,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::native::NativeDirLister;
-    use super::store_model::{BudgetMode, KeyOrder, Resume as ModelResume, StoreModel};
+    use super::store_model::{BudgetMode, KeyOrder, Resume, StoreModel};
     use super::*;
     use crate::object_store::throttle::{AimdThrottleConfig, AimdThrottledStore};
     use crate::object_store::{ObjectStoreParams, ObjectStoreRegistry};
@@ -560,8 +560,8 @@ mod tests {
             });
             let prefix = prefix.unwrap_or("");
             let resume = match resume {
-                Some(cursor) => ModelResume::Token(cursor.expect_backend()?),
-                None => ModelResume::Start,
+                Some(cursor) => Resume::Token(cursor.expect_backend()?),
+                None => Resume::Start,
             };
             let page = self.model.list_level(prefix, resume, limit);
 
@@ -650,8 +650,10 @@ mod tests {
         #[allow(deprecated)]
         let params = ObjectStoreParams {
             object_store: Some((inner, url::Url::parse("memory:///").unwrap())),
-            // The deprecated hand-built path assumes nothing about the store it was given.
-            list_is_lexically_ordered: Some(backend != Unordered),
+            // Set because the deprecated hand-built path assumes nothing about the store it
+            // was given, and set conservatively: nothing on the `read_dir_page` path reads it,
+            // since the fallback sorts what it listed and the pushdown never compares keys.
+            list_is_lexically_ordered: Some(false),
             ..Default::default()
         };
         let (store, _) = ObjectStore::from_uri_and_params(
@@ -837,6 +839,7 @@ mod tests {
     #[case::not_a_token("a.lance")]
     #[case::wrong_version("9ka.lance")]
     #[case::unknown_kind("1za.lance")]
+    #[case::no_kind("1")]
     #[case::empty("")]
     #[tokio::test]
     async fn test_a_token_from_nowhere_is_rejected(#[case] page_token: &str) {
@@ -855,6 +858,31 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+    }
+
+    /// The other half of keeping the two kinds apart: a continuation token handed to a store
+    /// that lists in full. Read as a key it would compare as one, drop whatever sorted before
+    /// it, and report a short directory as a complete one.
+    #[tokio::test]
+    async fn test_a_backend_token_is_rejected_by_a_full_listing() {
+        let store = test_store(FullListing, TABLES).await;
+
+        let err = store
+            .store
+            .read_dir_page(
+                Path::from("db"),
+                ReadDirOptions {
+                    page_token: Some(DirCursor::backend("opaque").encode()),
+                    limit: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("resumes by continuation token"),
+            "unexpected error: {err}"
+        );
     }
 
     /// A token round-trips through its string form unchanged, including one holding the
