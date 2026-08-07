@@ -43,7 +43,7 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, buffered_fragment_opens};
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -64,18 +64,6 @@ async fn open_file(
         reader.with_make_deletions_null();
     };
     Ok(reader)
-}
-
-fn spawn_io_task<F, T>(task: F) -> impl std::future::Future<Output = Result<T>>
-where
-    F: std::future::Future<Output = Result<T>> + Send + 'static,
-    T: Send + 'static,
-{
-    // Buffered streams may stop polling one I/O future while another future
-    // that would unblock it is waiting on the same connection pool.
-    tokio::spawn(task.in_current_span()).map(|task_result| {
-        task_result.map_err(|error| DataFusionError::External(Box::new(error)))?
-    })
 }
 
 struct FragmentWithRange {
@@ -454,9 +442,11 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let batches = if config.ordered_output {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(spawn_io_task(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -468,9 +458,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    )))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -486,9 +476,11 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(spawn_io_task(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -500,9 +492,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    )))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -854,24 +846,6 @@ mod tests {
         );
 
         scan.execute(0, Arc::new(TaskContext::default())).unwrap();
-    }
-
-    #[tokio::test]
-    async fn spawned_io_task_progresses_without_outer_poll() {
-        let (ran_tx, ran_rx) = tokio::sync::oneshot::channel();
-        let task = spawn_io_task(async move {
-            ran_tx.send(()).unwrap();
-            Result::Ok(())
-        });
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), ran_rx)
-            .await
-            .expect("spawned I/O task did not make independent progress")
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .expect("spawned I/O task did not finish")
-            .unwrap();
     }
 
     /// Verify that executing with target_partitions=1 produces the same row count as the

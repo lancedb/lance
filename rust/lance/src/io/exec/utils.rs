@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
@@ -26,15 +27,38 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::stream::FuturesUnordered;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
 use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
+use tracing::Instrument;
 
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
+
+/// Open fragments on cancellation-safe tasks while preserving the stream's
+/// ordering and readahead bound.
+pub(crate) fn buffered_fragment_opens<S, Open, OpenFuture, Reader>(
+    fragments: S,
+    fragment_readahead: usize,
+    mut open: Open,
+) -> impl Stream<Item = DataFusionResult<Reader>>
+where
+    S: Stream + Send,
+    Open: FnMut(S::Item) -> OpenFuture + Send,
+    OpenFuture: Future<Output = DataFusionResult<Reader>> + Send + 'static,
+    Reader: Send + 'static,
+{
+    fragments
+        .map(move |fragment| {
+            SpawnedTask::spawn(open(fragment).in_current_span()).map(|task_result| {
+                task_result.map_err(|error| DataFusionError::External(Box::new(error)))?
+            })
+        })
+        .buffered(fragment_readahead)
+}
 
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
