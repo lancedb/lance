@@ -183,9 +183,16 @@ impl ScalarIndex for JsonIndex {
 
     fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
         let target_params = self.target_index.derive_index_params()?;
+        let target_data_type = self
+            .target_index
+            .training_data_type()
+            .as_ref()
+            .map(JsonIndexTargetType::try_from)
+            .transpose()?;
         let params = JsonIndexParameters {
             target_index_type: target_params.index_type,
             target_index_parameters: target_params.params,
+            target_data_type,
             path: self.path.clone(),
         };
         Ok(super::ScalarIndexParams::new("json".to_string()).with_params(&params))
@@ -201,7 +208,47 @@ impl ScalarIndex for JsonIndex {
 pub struct JsonIndexParameters {
     target_index_type: String,
     target_index_parameters: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_data_type: Option<JsonIndexTargetType>,
     path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum JsonIndexTargetType {
+    Boolean,
+    Int64,
+    Float64,
+    Utf8,
+    LargeBinary,
+}
+
+impl TryFrom<&DataType> for JsonIndexTargetType {
+    type Error = Error;
+
+    fn try_from(data_type: &DataType) -> Result<Self> {
+        match data_type {
+            DataType::Boolean => Ok(Self::Boolean),
+            DataType::Int64 => Ok(Self::Int64),
+            DataType::Float64 => Ok(Self::Float64),
+            DataType::Utf8 => Ok(Self::Utf8),
+            DataType::LargeBinary => Ok(Self::LargeBinary),
+            _ => Err(Error::not_supported(format!(
+                "JSON index target data type {data_type:?} cannot be preserved for rebuilds"
+            ))),
+        }
+    }
+}
+
+impl From<JsonIndexTargetType> for DataType {
+    fn from(data_type: JsonIndexTargetType) -> Self {
+        match data_type {
+            JsonIndexTargetType::Boolean => Self::Boolean,
+            JsonIndexTargetType::Int64 => Self::Int64,
+            JsonIndexTargetType::Float64 => Self::Float64,
+            JsonIndexTargetType::Utf8 => Self::Utf8,
+            JsonIndexTargetType::LargeBinary => Self::LargeBinary,
+        }
+    }
 }
 
 // TODO: Do we really need to wrap the query or could we just return the target query directly?
@@ -826,10 +873,13 @@ impl BasicTrainer for JsonIndexPlugin {
             ));
         }
 
-        // Initially use Utf8, will be refined during training with type inference
-        let target_type = DataType::Utf8;
-
         let params = serde_json::from_str::<JsonIndexParameters>(params)?;
+        // Initial builds infer the type from the data. Derived rebuild parameters
+        // carry the learned type so every new segment uses the same target schema.
+        let target_type = params
+            .target_data_type
+            .map(DataType::from)
+            .unwrap_or(DataType::Utf8);
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&params.target_index_type)?;
         let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
@@ -858,13 +908,20 @@ impl BasicTrainer for JsonIndexPlugin {
             .unwrap();
         let path = request.parameters.path.clone();
 
-        // Extract JSON with type information
-        let (data_stream, inferred_type) =
-            Self::extract_json_with_type_info(data, path.clone()).await?;
+        let (data_stream, target_type) =
+            if let Some(target_data_type) = request.parameters.target_data_type {
+                (
+                    Self::extract_json(data, path.clone())?,
+                    DataType::from(target_data_type),
+                )
+            } else {
+                Self::extract_json_with_type_info(data, path.clone()).await?
+            };
 
-        // Convert the stream to properly typed values based on inferred type
+        // Initial builds use the inferred type; rebuilds use the learned target
+        // type carried in the derived parameters.
         let converted_stream =
-            Self::convert_stream_by_type(data_stream, inferred_type.clone(), path.clone())?;
+            Self::convert_stream_by_type(data_stream, target_type.clone(), path.clone())?;
 
         // `JsonTrainingRequest::criteria()` asked the scanner for unordered input (see
         // its constructor), since the scanner can only sort on the raw JSON column, not
@@ -881,11 +938,9 @@ impl BasicTrainer for JsonIndexPlugin {
                 converted_stream
             };
 
-        // Update the target request with inferred type
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&request.parameters.target_index_type)?;
 
-        // Create a new training request with the inferred type
         let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
             Error::invalid_input_source(
                 format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", request.parameters.target_index_type).into(),
@@ -897,7 +952,7 @@ impl BasicTrainer for JsonIndexPlugin {
                 .target_index_parameters
                 .as_deref()
                 .unwrap_or("{}"),
-            &Field::new("", inferred_type, true),
+            &Field::new("", target_type, true),
         )?;
 
         let target_index = target_trainer
@@ -1423,6 +1478,10 @@ mod tests {
         assert_eq!(parameters.path, "v");
         assert_eq!(parameters.target_index_type, "btree");
         assert!(parameters.target_index_parameters.is_some());
+        assert_eq!(
+            parameters.target_data_type,
+            Some(JsonIndexTargetType::Int64)
+        );
     }
 
     /// Regression test for https://github.com/lance-format/lance/issues/7859.
