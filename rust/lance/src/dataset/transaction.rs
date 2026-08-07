@@ -1750,6 +1750,48 @@ impl Transaction {
         })
     }
 
+    /// Keep replacements for existing fragment IDs in current manifest order,
+    /// then append genuinely new fragments in their supplied order.
+    fn preserve_existing_fragment_order(
+        existing_fragments: &[Fragment],
+        fragments: Vec<Fragment>,
+        operation_name: &str,
+    ) -> Result<Vec<Fragment>> {
+        let existing_fragment_ids = existing_fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<HashSet<_>>();
+        let mut seen_fragment_ids = HashSet::with_capacity(fragments.len());
+        let mut existing_fragments_by_id = HashMap::with_capacity(existing_fragments.len());
+        let mut new_fragments = Vec::with_capacity(fragments.len());
+        for fragment in fragments {
+            if !seen_fragment_ids.insert(fragment.id) {
+                return Err(Error::invalid_input(format!(
+                    "{operation_name} contains multiple fragments with id {}",
+                    fragment.id
+                )));
+            }
+            if existing_fragment_ids.contains(&fragment.id) {
+                existing_fragments_by_id.insert(fragment.id, fragment);
+            } else {
+                new_fragments.push(fragment);
+            }
+        }
+
+        let mut ordered_fragments = Vec::with_capacity(seen_fragment_ids.len());
+        for existing_fragment in existing_fragments {
+            let Some(fragment) = existing_fragments_by_id.remove(&existing_fragment.id) else {
+                return Err(Error::internal(format!(
+                    "{operation_name} lost fragment {} while preserving logical order",
+                    existing_fragment.id
+                )));
+            };
+            ordered_fragments.push(fragment);
+        }
+        ordered_fragments.extend(new_fragments);
+        Ok(ordered_fragments)
+    }
+
     fn data_storage_format_from_files(
         fragments: &[Fragment],
         user_requested: Option<LanceFileVersion>,
@@ -2239,7 +2281,16 @@ impl Transaction {
                         }
                     }
                 }
-                final_fragments.extend(merged_fragments);
+
+                // Merge changes columns in existing fragments without changing
+                // their row placement. Reassemble those fragments in current
+                // manifest order, then append genuinely new fragments in the
+                // caller-provided order.
+                final_fragments = Self::preserve_existing_fragment_order(
+                    existing_fragments,
+                    merged_fragments,
+                    "Merge",
+                )?;
 
                 // A Merge can rewrite a column's data file in place; the field stays
                 // in the schema, so the index is retained -- prune its now-stale
@@ -2400,24 +2451,11 @@ impl Transaction {
                 // Data replacement changes files, not row placement. Reassemble
                 // the fragments in their existing logical order without using
                 // fragment ids as ordering keys.
-                let mut fragments_by_id = HashMap::with_capacity(final_fragments.len());
-                for fragment in final_fragments.drain(..) {
-                    if fragments_by_id.insert(fragment.id, fragment).is_some() {
-                        return Err(Error::invalid_input(
-                            "DataReplacement contains multiple replacements for the same fragment"
-                                .to_string(),
-                        ));
-                    }
-                }
-                for existing_fragment in existing_fragments {
-                    let Some(fragment) = fragments_by_id.remove(&existing_fragment.id) else {
-                        return Err(Error::internal(format!(
-                            "DataReplacement lost fragment {} while preserving logical order",
-                            existing_fragment.id
-                        )));
-                    };
-                    final_fragments.push(fragment);
-                }
+                final_fragments = Self::preserve_existing_fragment_order(
+                    existing_fragments,
+                    final_fragments,
+                    "DataReplacement",
+                )?;
 
                 // 5. Invalidate index bitmaps for replaced fields
                 let modified_fragments: Vec<Fragment> = final_fragments
@@ -4413,6 +4451,34 @@ mod tests {
             .map(|fragment| fragment.id)
             .collect::<Vec<_>>();
         assert_eq!(fragment_ids, vec![4, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_merge_build_manifest_preserves_logical_fragment_order() {
+        let manifest = sample_manifest_with_fragments(0..3);
+        let fragments = manifest.fragments.iter().rev().cloned().collect::<Vec<_>>();
+        let operation = Operation::Merge {
+            fragments,
+            schema: manifest.schema.clone(),
+        };
+        validate_operation(Some(&manifest), &operation).unwrap();
+        let transaction = Transaction::new(manifest.version, operation, None);
+
+        let (merged, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let fragment_ids = merged
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids, vec![0, 1, 2]);
     }
 
     #[test]

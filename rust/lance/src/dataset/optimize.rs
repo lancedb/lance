@@ -7214,6 +7214,16 @@ mod tests {
             .map(|fragment| fragment.id)
             .collect::<Vec<_>>();
         assert_eq!(logical_fragment_ids, vec![5, 2, 3, 4]);
+        assert_ne!(
+            dataset.manifest.reader_feature_flags
+                & lance_table::feature_flags::FLAG_LOGICAL_FRAGMENT_ORDER,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags
+                & lance_table::feature_flags::FLAG_LOGICAL_FRAGMENT_ORDER,
+            0
+        );
         let fragments_by_id = dataset
             .get_fragments_from_ids(&[5, 2, 4, 3])
             .unwrap()

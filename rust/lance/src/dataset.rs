@@ -3039,6 +3039,26 @@ impl Dataset {
             }
         }
 
+        if !self.manifest.uses_logical_fragment_order() {
+            self.manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .try_fold(0, |previous_id, fragment_id| {
+                    if fragment_id < previous_id {
+                        Err(Error::corrupt_file(
+                            self.base.clone(),
+                            format!(
+                                "Fragment ids are not sorted in increasing fragment-id order, but the logical fragment order feature is not set. Found {fragment_id} after {previous_id} in dataset {:?}",
+                                self.base
+                            ),
+                        ))
+                    } else {
+                        Ok(fragment_id)
+                    }
+                })?;
+        }
+
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.validate().await })

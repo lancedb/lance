@@ -18,7 +18,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{
+    FLAG_LOGICAL_FRAGMENT_ORDER, FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag,
+};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -49,8 +51,9 @@ pub struct Manifest {
 
     /// Fragments, the pieces to build the dataset.
     ///
-    /// This list is stored in order, sorted by fragment id.  However, the fragment id
-    /// sequence may have gaps.
+    /// This list is stored in logical row order when
+    /// [`FLAG_LOGICAL_FRAGMENT_ORDER`] is set. Otherwise it is sorted by fragment
+    /// id, though the fragment id sequence may have gaps.
     pub fragments: Arc<Vec<Fragment>>,
 
     /// The file position of the version aux data.
@@ -494,6 +497,12 @@ impl Manifest {
     /// Whether the dataset uses stable row ids.
     pub fn uses_stable_row_ids(&self) -> bool {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+    }
+
+    /// Whether manifest position, rather than fragment ID, defines logical row
+    /// order.
+    pub fn uses_logical_fragment_order(&self) -> bool {
+        self.reader_feature_flags & FLAG_LOGICAL_FRAGMENT_ORDER != 0
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
