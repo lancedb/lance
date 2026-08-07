@@ -216,11 +216,18 @@ fn remove_extension_types(
     let substrait_names = normalize_substrait_names(substrait_schema, arrow_schema.as_ref())?;
     let mut kept_substrait_fields = Vec::with_capacity(fields.types.len());
     let mut kept_arrow_fields = Vec::with_capacity(arrow_schema.fields.len());
-    let mut index_mapping = HashMap::with_capacity(arrow_schema.fields.len());
-    let mut field_counter = 0;
-    let mut field_index = 0;
+    let mut name_index_mapping = HashMap::with_capacity(substrait_names.len());
+    let mut field_index_mapping = HashMap::with_capacity(arrow_schema.fields.len());
+    let mut kept_name_count = 0;
+    let mut name_index = 0;
+    let mut kept_field_count = 0;
     // TODO: this logic doesn't catch user defined fields inside of struct fields
-    for (substrait_field, arrow_field) in fields.types.iter().zip(arrow_schema.fields.iter()) {
+    for (field_index, (substrait_field, arrow_field)) in fields
+        .types
+        .iter()
+        .zip(arrow_schema.fields.iter())
+        .enumerate()
+    {
         let num_fields = count_fields(substrait_field);
 
         let kind = substrait_field.kind.as_ref().unwrap();
@@ -232,21 +239,23 @@ fn remove_extension_types(
             _ => false,
         };
 
-        if !substrait_names[field_index].starts_with("__unlikely_name_placeholder")
+        if !substrait_names[name_index].starts_with("__unlikely_name_placeholder")
             && !is_user_defined
         {
             kept_substrait_fields.push(substrait_field.clone());
             kept_arrow_fields.push(arrow_field.clone());
             for i in 0..num_fields {
-                index_mapping.insert(field_index + i, field_counter + i);
+                name_index_mapping.insert(name_index + i, kept_name_count + i);
             }
-            field_counter += num_fields;
+            field_index_mapping.insert(field_index, kept_field_count);
+            kept_name_count += num_fields;
+            kept_field_count += 1;
         }
-        field_index += num_fields;
+        name_index += num_fields;
     }
-    let mut names = vec![String::new(); index_mapping.len()];
+    let mut names = vec![String::new(); name_index_mapping.len()];
     for (old_idx, old_name) in substrait_names.iter().enumerate() {
-        if let Some(new_idx) = index_mapping.get(&old_idx) {
+        if let Some(new_idx) = name_index_mapping.get(&old_idx) {
             names[*new_idx] = old_name.clone();
         }
     }
@@ -259,7 +268,7 @@ fn remove_extension_types(
             types: kept_substrait_fields,
         }),
     };
-    Ok((new_substrait_schema, new_arrow_schema, index_mapping))
+    Ok((new_substrait_schema, new_arrow_schema, field_index_mapping))
 }
 
 fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
@@ -879,6 +888,54 @@ mod tests {
         let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
             .await
             .unwrap();
+        assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
+    async fn test_pyarrow_shallow_names_with_placeholder_before_filter() {
+        let list_field = list_of_struct(
+            "items",
+            vec![
+                Field::new("value", DataType::Float32, true),
+                Field::new("label", DataType::Utf8, true),
+            ],
+        );
+        let placeholder = "__unlikely_name_placeholder_0";
+        let serialized_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            list_field.clone(),
+            Field::new(placeholder, DataType::Int8, true),
+            Field::new("checkpoint", DataType::Int64, true),
+        ]));
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            list_field,
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+            Field::new("checkpoint", DataType::Int64, true),
+        ]));
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("checkpoint"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Int64(Some(0)), None)),
+        });
+
+        let bytes = encode_substrait(expr.clone(), serialized_schema, &session_state()).unwrap();
+        let mut envelope = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        envelope.base_schema.as_mut().unwrap().names = ["id", "items", placeholder, "checkpoint"]
+            .map(ToString::to_string)
+            .to_vec();
+
+        let decoded = parse_substrait(
+            envelope.encode_to_vec().as_slice(),
+            input_schema,
+            &session_state(),
+        )
+        .await
+        .unwrap();
         assert_eq!(decoded, expr);
     }
 
