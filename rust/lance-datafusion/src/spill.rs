@@ -51,7 +51,7 @@ pub fn create_replay_spill(
     let (status_sender, status_receiver) = tokio::sync::watch::channel(initial_status);
     let sender = SpillSender {
         memory_limit,
-        managed_spill_file: None,
+        managed_spill: None,
         path: path.clone(),
         schema: schema.clone(),
         state: SpillState::default(),
@@ -181,7 +181,10 @@ pub async fn spilling_table_provider_with_disk_manager(
     let spill_file = disk_manager.create_tmp_file("writing replay spill")?;
     let spill_path = spill_file.path().to_owned();
     let (mut sender, receiver) = create_replay_spill(spill_path, schema.clone(), memory_limit);
-    sender.managed_spill_file = Some(spill_file.clone());
+    sender.managed_spill = Some(ManagedSpillFile {
+        file: spill_file.clone(),
+        disk_manager,
+    });
 
     // Drain the one-shot source into the spill once, in the background. The spill
     // tees to memory/disk so the first reader can consume batches as they arrive
@@ -408,7 +411,7 @@ impl SpillReader {
 /// spill. Otherwise, they will return an error.
 pub struct SpillSender {
     memory_limit: usize,
-    managed_spill_file: Option<RefCountedTempFile>,
+    managed_spill: Option<ManagedSpillFile>,
     schema: Arc<Schema>,
     path: PathBuf,
     state: SpillState,
@@ -586,7 +589,7 @@ impl SpillSender {
                     let writer = AsyncStreamWriter::open(
                         self.path.clone(),
                         self.schema.clone(),
-                        self.managed_spill_file.clone(),
+                        self.managed_spill.clone(),
                     )
                     .await?;
                     let batches_written = batches.len();
@@ -695,15 +698,15 @@ impl AsyncStreamWriter {
     pub async fn open(
         path: PathBuf,
         schema: Arc<Schema>,
-        managed_spill_file: Option<RefCountedTempFile>,
+        managed_spill: Option<ManagedSpillFile>,
     ) -> Result<Self, ArrowError> {
         let writer = tokio::task::spawn_blocking(move || {
-            let file = if let Some(spill_file) = managed_spill_file.as_ref() {
-                spill_file.inner().reopen().map_err(ArrowError::from)?
+            let file = if let Some(spill) = managed_spill.as_ref() {
+                spill.file.inner().reopen().map_err(ArrowError::from)?
             } else {
                 std::fs::File::create(&path).map_err(ArrowError::from)?
             };
-            TrackedStreamWriter::try_new(file, &schema, managed_spill_file)
+            TrackedStreamWriter::try_new(file, &schema, managed_spill)
         })
         .await
         .unwrap()?;
@@ -732,21 +735,65 @@ impl AsyncStreamWriter {
     }
 }
 
+#[derive(Clone)]
+struct ManagedSpillFile {
+    file: RefCountedTempFile,
+    disk_manager: Arc<DiskManager>,
+}
+
+impl ManagedSpillFile {
+    fn update_disk_usage(&mut self) -> Result<(), ArrowError> {
+        let new_file_usage = self
+            .file
+            .inner()
+            .as_file()
+            .metadata()
+            .map_err(ArrowError::from)?
+            .len();
+        let old_file_usage = self.file.current_disk_usage();
+        let used_without_file = self
+            .disk_manager
+            .used_disk_space()
+            .checked_sub(old_file_usage)
+            .ok_or_else(|| {
+                ArrowError::ExternalError(Box::new(DataFusionError::Internal(format!(
+                    "replay spill accounting is inconsistent: used_disk_space={} is less than current_file_disk_usage={old_file_usage}",
+                    self.disk_manager.used_disk_space()
+                ))))
+            })?;
+        if used_without_file
+            .checked_add(new_file_usage)
+            .is_none_or(|usage| usage > self.disk_manager.max_temp_directory_size())
+        {
+            return Err(ArrowError::ExternalError(Box::new(
+                DataFusionError::ResourcesExhausted(format!(
+                    "The used disk space during the spilling process has exceeded the allowable limit of {} bytes. Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.",
+                    self.disk_manager.max_temp_directory_size()
+                )),
+            )));
+        }
+
+        self.file
+            .update_disk_usage()
+            .map_err(|error| ArrowError::ExternalError(Box::new(error)))
+    }
+}
+
 struct TrackedStreamWriter {
     writer: StreamWriter<BufWriter<std::fs::File>>,
-    managed_spill_file: Option<RefCountedTempFile>,
+    managed_spill: Option<ManagedSpillFile>,
 }
 
 impl TrackedStreamWriter {
     fn try_new(
         file: std::fs::File,
         schema: &Schema,
-        managed_spill_file: Option<RefCountedTempFile>,
+        managed_spill: Option<ManagedSpillFile>,
     ) -> Result<Self, ArrowError> {
         let writer = StreamWriter::try_new(BufWriter::new(file), schema)?;
         let mut tracked = Self {
             writer,
-            managed_spill_file,
+            managed_spill,
         };
         tracked.flush_and_update_disk_usage()?;
         Ok(tracked)
@@ -764,10 +811,8 @@ impl TrackedStreamWriter {
 
     fn flush_and_update_disk_usage(&mut self) -> Result<(), ArrowError> {
         self.writer.flush()?;
-        if let Some(spill_file) = self.managed_spill_file.as_mut() {
-            spill_file
-                .update_disk_usage()
-                .map_err(|error| ArrowError::ExternalError(Box::new(error)))?;
+        if let Some(spill) = self.managed_spill.as_mut() {
+            spill.update_disk_usage()?;
         }
         Ok(())
     }
@@ -1062,7 +1107,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let provider = spilling_table_provider_with_disk_manager(source, 0, disk_manager)
+        let provider = spilling_table_provider_with_disk_manager(source, 0, disk_manager.clone())
             .await
             .unwrap();
         let error = provider_to_stream(provider)
@@ -1075,6 +1120,11 @@ mod tests {
         assert!(
             message.contains("exceeded the allowable limit"),
             "unexpected replay quota error: {message}"
+        );
+        assert_eq!(
+            disk_manager.used_disk_space(),
+            0,
+            "failed replay spills must release their disk reservation"
         );
     }
 

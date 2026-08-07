@@ -118,7 +118,7 @@ use lance_datafusion::{
     dataframe::BatchStreamGrouper,
     exec::{
         HardCapBatchSizeExec, LanceExecutionOptions, OneShotPartitionStream, analyze_plan,
-        execute_plan_with_session_context, get_session_context, provider_to_stream,
+        execute_plan_with_session_context, new_session_context, provider_to_stream,
     },
     spill::spilling_table_provider_with_disk_manager,
     utils::{StreamingWriteSource, reader_to_stream},
@@ -485,13 +485,13 @@ pub struct MergeInsertJob {
     dataset: Arc<Dataset>,
     // The parameters controlling how to merge the two streams
     params: MergeInsertParams,
-    // Held for the job's lifetime so indexed replay and sort spills share one
-    // aggregate DiskManager quota, including across commit retries.
-    indexed_execution_context: SessionContext,
-    indexed_execution_options: LanceExecutionOptions,
+    // A job-local context shared by retry replay, indexed execution, and
+    // partial-update sorting, including across commit retries.
+    spill_session_context: SessionContext,
+    spill_execution_options: LanceExecutionOptions,
 }
 
-fn indexed_join_execution_options() -> LanceExecutionOptions {
+fn merge_insert_execution_options() -> LanceExecutionOptions {
     let options = LanceExecutionOptions {
         use_spilling: true,
         batch_size: Some(INDEXED_JOIN_BATCH_ROWS),
@@ -504,6 +504,13 @@ fn indexed_join_execution_options() -> LanceExecutionOptions {
         max_temp_directory_size: Some(options.max_temp_directory_size()),
         ..options
     }
+}
+
+fn fragment_update_session_context(spill_session_context: &SessionContext) -> SessionContext {
+    let config = spill_session_context
+        .copied_config()
+        .with_target_partitions(get_num_compute_intensive_cpus().min(8));
+    SessionContext::new_with_config_rt(config, spill_session_context.runtime_env())
 }
 
 /// Build a merge insert operation.
@@ -812,13 +819,16 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
-        let indexed_execution_options = indexed_join_execution_options();
-        let indexed_execution_context = get_session_context(&indexed_execution_options);
+        let spill_execution_options = merge_insert_execution_options();
+        // Merge-insert disk accounting must not survive the job. In particular,
+        // a rejected DataFusion spill growth can otherwise leave a charge in a
+        // cached manager that reduces the quota of later jobs.
+        let spill_session_context = new_session_context(&spill_execution_options);
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
-            indexed_execution_context,
-            indexed_execution_options,
+            spill_session_context,
+            spill_execution_options,
         })
     }
 }
@@ -1185,10 +1195,10 @@ impl MergeInsertJob {
                 }
                 name
             });
-        let execution_options = self.indexed_execution_options.clone();
+        let execution_options = self.spill_execution_options.clone();
         let max_batch_bytes = ((execution_options.mem_pool_size() as usize) / 8)
             .clamp(1, MAX_INDEXED_JOIN_BATCH_BYTES);
-        let session_ctx = &self.indexed_execution_context;
+        let session_ctx = &self.spill_session_context;
         let disk_manager = session_ctx.runtime_env().disk_manager.clone();
         let ordinal_field = source_ordinal_column
             .as_ref()
@@ -1592,17 +1602,14 @@ impl MergeInsertJob {
         source: SendableRecordBatchStream,
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
+        spill_session_context: &SessionContext,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
         let target_bases_info = Arc::new(target_bases_info);
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = get_session_context(&LanceExecutionOptions {
-            use_spilling: true,
-            target_partition: Some(get_num_compute_intensive_cpus().min(8)),
-            ..Default::default()
-        });
+        let session_ctx = fragment_update_session_context(spill_session_context);
         // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
         // single batch that is larger than the memory pool, so we must
         // rechunk oversized batches before they reach the sort.
@@ -2192,7 +2199,7 @@ impl MergeInsertJob {
         if self.params.conflict_retries > 0 && self.params.spill_for_retry {
             // Allow buffering up to 100MB in memory before spilling to disk.
             let disk_manager = self
-                .indexed_execution_context
+                .spill_session_context
                 .runtime_env()
                 .disk_manager
                 .clone();
@@ -2713,6 +2720,7 @@ impl MergeInsertJob {
                 Box::pin(stream),
                 self.dataset.manifest.version + 1,
                 target_bases_info,
+                &self.spill_session_context,
             )
             .await?;
 
@@ -3684,12 +3692,14 @@ mod tests {
         .unwrap();
         let update_stream =
             RecordBatchStreamAdapter::new(updates.schema(), futures::stream::iter([Ok(updates)]));
+        let spill_session_context = new_session_context(&merge_insert_execution_options());
 
         let error = MergeInsertJob::update_fragments(
             dataset.clone(),
             Box::pin(update_stream),
             dataset.manifest().version + 1,
             None,
+            &spill_session_context,
         )
         .await
         .unwrap_err();
@@ -4995,12 +5005,23 @@ mod tests {
         )
         .unwrap();
 
-        let (ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["path".to_string()])
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["path".to_string()])
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
-            .unwrap()
+            .unwrap();
+        let job_disk_manager = job.spill_session_context.runtime_env().disk_manager.clone();
+        let fragment_update_context = fragment_update_session_context(&job.spill_session_context);
+        assert!(
+            Arc::ptr_eq(
+                &job_disk_manager,
+                &fragment_update_context.runtime_env().disk_manager
+            ),
+            "indexed execution and partial-update sorting must share one disk manager"
+        );
+
+        let (ds, stats) = job
             .execute_reader(RecordBatchIterator::new([Ok(updates)], upd_schema))
             .await
             .unwrap();
