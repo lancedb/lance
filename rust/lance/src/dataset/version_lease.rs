@@ -193,6 +193,22 @@ pub(super) enum ReferenceMutation {
 struct ReferenceIntent {
     manifest_path: String,
     mutation: ReferenceMutation,
+    #[serde(default)]
+    state: ReferenceIntentState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ReferenceIntentState {
+    #[default]
+    Pending,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletedReferenceIntentHandling {
+    DeferToCanonicalCensus,
+    RetainForCurrentScan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,29 +376,74 @@ impl VersionLeaseStore {
     }
 
     pub(super) async fn active_reference_versions(&self) -> Result<HashSet<u64>> {
+        self.reference_versions(CompletedReferenceIntentHandling::RetainForCurrentScan)
+            .await
+    }
+
+    /// Fence in-flight publication before the caller scans canonical tags and
+    /// branches. Completed intents can be removed without retaining their
+    /// target because the following canonical census observes their result.
+    pub(super) async fn reference_versions_before_canonical_census(&self) -> Result<HashSet<u64>> {
+        self.reference_versions(CompletedReferenceIntentHandling::DeferToCanonicalCensus)
+            .await
+    }
+
+    async fn reference_versions(
+        &self,
+        completed_handling: CompletedReferenceIntentHandling,
+    ) -> Result<HashSet<u64>> {
         let observed_at = self.storage_observed_at().await?;
         let mut active_versions = HashSet::new();
         let mut stale_paths = Vec::new();
         for intent in self.reference_intent_metadata().await? {
-            if reference_owner_is_active(intent.metadata.last_modified, observed_at)? {
-                active_versions.insert(intent.version);
-            } else {
-                // The intent contains the exact conditional mutation, so an
-                // expired owner cannot resume a different or unconditional
-                // publication after recovery removes its intent. Applying the
-                // same mutation either publishes the reference or proves that
-                // its original precondition can no longer succeed.
-                let manifest_path = Path::parse(&intent.intent.manifest_path)?;
-                if self.object_store.exists(&manifest_path).await?
-                    && !self.has_committed_marker(intent.version).await?
-                    && self
-                        .apply_reference_mutation(&intent.intent.mutation)
-                        .await?
-                        == ReferenceMutationOutcome::Published
+            match intent.intent.state {
+                ReferenceIntentState::Completed => {
+                    // The completed intent is the durable handoff from an
+                    // in-flight publication to its canonical object. A caller
+                    // that already completed its canonical census retains a
+                    // matching payload for this scan; a caller about to census
+                    // canonical state can defer to that newer observation.
+                    if completed_handling == CompletedReferenceIntentHandling::RetainForCurrentScan
+                    {
+                        let (path, payload) = match &intent.intent.mutation {
+                            ReferenceMutation::Create { path, payload }
+                            | ReferenceMutation::Update { path, payload, .. } => {
+                                (Path::parse(path)?, payload)
+                            }
+                        };
+                        if self
+                            .reference_mutation_conflict_outcome(&path, payload)
+                            .await?
+                            == ReferenceMutationOutcome::Published
+                        {
+                            active_versions.insert(intent.version);
+                        }
+                    }
+                    stale_paths.push(intent.metadata.location);
+                }
+                ReferenceIntentState::Pending
+                    if reference_owner_is_active(intent.metadata.last_modified, observed_at)? =>
                 {
                     active_versions.insert(intent.version);
                 }
-                stale_paths.push(intent.metadata.location);
+                ReferenceIntentState::Pending => {
+                    // The intent contains the exact conditional mutation, so an
+                    // expired owner cannot resume a different or unconditional
+                    // publication after recovery removes its intent. Applying the
+                    // same mutation either publishes the reference or proves that
+                    // its original precondition can no longer succeed.
+                    let manifest_path = Path::parse(&intent.intent.manifest_path)?;
+                    if self.object_store.exists(&manifest_path).await?
+                        && !self.has_committed_marker(intent.version).await?
+                        && self
+                            .apply_reference_mutation(&intent.intent.mutation)
+                            .await?
+                            == ReferenceMutationOutcome::Published
+                    {
+                        active_versions.insert(intent.version);
+                    }
+                    stale_paths.push(intent.metadata.location);
+                }
             }
         }
         self.delete_paths(stale_paths).await?;
@@ -1412,6 +1473,7 @@ pub(super) async fn begin_reference_admission(
     let intent = ReferenceIntent {
         manifest_path: manifest.path.to_string(),
         mutation: mutation.clone(),
+        state: ReferenceIntentState::Pending,
     };
     let (path, created_at) = store.create_reference_intent(version, &intent).await?;
     let admission = ReferenceAdmission {
@@ -1454,7 +1516,7 @@ impl ReferenceAdmission {
         }
         match self.store.apply_reference_mutation(&self.mutation).await {
             Ok(ReferenceMutationOutcome::Published) => {
-                self.complete();
+                self.complete().await;
                 Ok(())
             }
             Ok(ReferenceMutationOutcome::Conflict) => {
@@ -1484,10 +1546,29 @@ impl ReferenceAdmission {
         }
     }
 
-    /// Leave the intent as the durable handoff to the canonical reference.
-    /// Cleanup later observes the intent and, after its ownership timeout,
-    /// verifies or replays the exact conditional mutation before removing it.
-    fn complete(&self) {}
+    /// Mark the intent as the durable handoff to the canonical reference.
+    /// Cleanup verifies the canonical payload, retains it for the current scan,
+    /// and removes the completed intent without waiting for the ownership timeout.
+    async fn complete(&self) {
+        let intent = ReferenceIntent {
+            manifest_path: self.manifest_path.to_string(),
+            mutation: self.mutation.clone(),
+            state: ReferenceIntentState::Completed,
+        };
+        let result = match serde_json::to_vec(&intent) {
+            Ok(payload) => self.store.object_store.put(&self.path, &payload).await,
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = result {
+            // The pending intent remains a safe bounded fallback if completion
+            // cannot be recorded after the canonical write succeeded.
+            tracing::warn!(
+                path = %self.path,
+                error = %error,
+                "Failed to complete reference admission intent"
+            );
+        }
+    }
 }
 
 async fn ensure_reference_available(
@@ -1724,6 +1805,7 @@ mod tests {
                 path: format!("tags/version-{version}.json"),
                 payload: version.to_string().into_bytes(),
             },
+            state: ReferenceIntentState::Pending,
         }
     }
 
@@ -2033,6 +2115,7 @@ mod tests {
                 path: canonical_path.to_string(),
                 payload: b"reference".to_vec(),
             },
+            state: ReferenceIntentState::Pending,
         };
         let (intent_path, created_at) = store.create_reference_intent(42, &intent).await.unwrap();
         let admission = ReferenceAdmission {
@@ -2053,15 +2136,90 @@ mod tests {
             .put(&canonical_path, b"reference")
             .await
             .unwrap();
-        admission.complete();
+        admission.complete().await;
 
         assert_eq!(
             guard.commit_versions(&HashSet::from([42])).await.unwrap(),
             HashSet::from([42])
         );
-        assert!(store.object_store.exists(&intent_path).await.unwrap());
+        assert!(!store.object_store.exists(&intent_path).await.unwrap());
         guard.cancel_all().await.unwrap();
-        store.object_store.delete(&intent_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_intent_does_not_retain_deleted_reference() {
+        let store = memory_store();
+        let manifest_path = Path::from("manifests/42.manifest");
+        let canonical_path = Path::from("tags/removed.json");
+        store.object_store.put(&manifest_path, &[]).await.unwrap();
+        let intent = ReferenceIntent {
+            manifest_path: manifest_path.to_string(),
+            mutation: ReferenceMutation::Create {
+                path: canonical_path.to_string(),
+                payload: b"reference".to_vec(),
+            },
+            state: ReferenceIntentState::Pending,
+        };
+        let (intent_path, created_at) = store.create_reference_intent(42, &intent).await.unwrap();
+        let admission = ReferenceAdmission {
+            store: store.clone(),
+            path: intent_path.clone(),
+            manifest_path,
+            version: 42,
+            created_at,
+            mutation: intent.mutation,
+        };
+        store
+            .object_store
+            .put(&canonical_path, b"reference")
+            .await
+            .unwrap();
+        admission.complete().await;
+        store.object_store.delete(&canonical_path).await.unwrap();
+
+        assert!(store.active_reference_versions().await.unwrap().is_empty());
+        assert!(!store.object_store.exists(&intent_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn completed_intent_defers_to_following_canonical_census() {
+        let store = memory_store();
+        let manifest_path = Path::from("manifests/42.manifest");
+        let canonical_path = Path::from("branches/child.json");
+        store.object_store.put(&manifest_path, &[]).await.unwrap();
+        let intent = ReferenceIntent {
+            manifest_path: manifest_path.to_string(),
+            mutation: ReferenceMutation::Create {
+                path: canonical_path.to_string(),
+                payload: b"reference".to_vec(),
+            },
+            state: ReferenceIntentState::Pending,
+        };
+        let (intent_path, created_at) = store.create_reference_intent(42, &intent).await.unwrap();
+        let admission = ReferenceAdmission {
+            store: store.clone(),
+            path: intent_path.clone(),
+            manifest_path,
+            version: 42,
+            created_at,
+            mutation: intent.mutation,
+        };
+        store
+            .object_store
+            .put(&canonical_path, b"reference")
+            .await
+            .unwrap();
+        admission.complete().await;
+
+        assert!(
+            store
+                .reference_versions_before_canonical_census()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.object_store.exists(&canonical_path).await.unwrap());
+        assert!(!store.object_store.exists(&intent_path).await.unwrap());
     }
 
     #[tokio::test]
