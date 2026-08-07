@@ -1837,6 +1837,22 @@ impl DataBlock {
         .map_or(Ok(()), Err)
     }
 
+    fn validate_variable_width_layouts(array_data: &ArrayData) -> std::result::Result<(), String> {
+        match array_data.data_type() {
+            DataType::Binary | DataType::Utf8 => {
+                Self::validate_variable_width_offsets::<i32>(array_data)?;
+            }
+            DataType::LargeBinary | DataType::LargeUtf8 => {
+                Self::validate_variable_width_offsets::<i64>(array_data)?;
+            }
+            _ => {}
+        }
+        for child_data in array_data.child_data() {
+            Self::validate_variable_width_layouts(child_data)?;
+        }
+        Ok(())
+    }
+
     fn validate_array_data(
         array_data: &ArrayData,
         field_name: &str,
@@ -1845,15 +1861,7 @@ impl DataBlock {
         let validation = array_data
             .validate()
             .map_err(|error| error.to_string())
-            .and_then(|_| match array_data.data_type() {
-                DataType::Binary | DataType::Utf8 => {
-                    Self::validate_variable_width_offsets::<i32>(array_data)
-                }
-                DataType::LargeBinary | DataType::LargeUtf8 => {
-                    Self::validate_variable_width_offsets::<i64>(array_data)
-                }
-                _ => Ok(()),
-            });
+            .and_then(|_| Self::validate_variable_width_layouts(array_data));
         validation.map_err(|error| {
             Error::invalid_input_source(
                 format!(
