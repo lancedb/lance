@@ -262,10 +262,17 @@ mod tests {
         let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
         let target_branch = location.branch.as_deref();
+        let main_location = location.find_main().unwrap();
         let new_location = location.find_branch(target_branch).unwrap();
 
-        assert_eq!(new_location.path, location.path);
-        assert_eq!(new_location.uri, location.uri);
+        assert_eq!(
+            new_location.path.as_ref(),
+            format!("{}/tree/feature/new", main_location.path.as_ref())
+        );
+        assert_eq!(
+            new_location.uri,
+            format!("{}/tree/feature/new", main_location.uri)
+        );
         assert_eq!(new_location.branch, location.branch);
         assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
     }
