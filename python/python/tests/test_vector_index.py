@@ -791,7 +791,13 @@ def test_create_index_cagra_required_disables_fallback(tmp_path, monkeypatch):
     )
     dataset = lance.write_dataset(create_table(), tmp_path)
 
-    with pytest.raises(OSError, match="failed to load cuVS library"):
+    with pytest.raises(
+        OSError,
+        match=(
+            "CAGRA HNSW acceleration is currently supported only on Unix"
+            "|failed to load cuVS library"
+        ),
+    ):
         dataset.create_index(
             "vector",
             index_type="IVF_HNSW_SQ",
