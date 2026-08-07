@@ -1609,6 +1609,10 @@ struct TencentCosCommitHandler;
 
 #[async_trait::async_trait]
 impl CommitHandler for TencentCosCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
     async fn commit(
         &self,
         _manifest: &mut Manifest,
