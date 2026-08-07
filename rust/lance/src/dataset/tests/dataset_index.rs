@@ -1322,6 +1322,54 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
 }
 
 #[tokio::test]
+async fn test_compound_phrase_confirmation_short_circuit_is_exact() {
+    let texts = (0..100)
+        .map(|row| {
+            if row % 10 == 0 {
+                "high cost phrase check cheap reject bonus"
+            } else if row % 5 == 0 {
+                "high cost phrase check cheap reject"
+            } else {
+                "high cost phrase check cheap filler reject"
+            }
+        })
+        .collect::<Vec<_>>();
+    let batch = arrow_array::record_batch!(("text", Utf8, texts)).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 25,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let phrase_query = |terms: &str| -> FtsQuery {
+        PhraseQuery::new(terms.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, phrase_query("high cost phrase check")),
+        (Occur::Must, phrase_query("cheap reject")),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, query.clone(), 10).await;
+
+    let nested: FtsQuery = BooleanQuery::new([
+        (Occur::Must, query.clone()),
+        (Occur::Should, compound_match_query("bonus", "text", 1.0)),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, nested, 10).await;
+}
+
+#[tokio::test]
 async fn test_compound_tie_uses_resolved_row_id() {
     let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; 384])).unwrap();
     let schema = batch.schema();
