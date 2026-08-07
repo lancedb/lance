@@ -406,6 +406,12 @@ pub enum Operation {
     Merge {
         fragments: Vec<Fragment>,
         schema: Schema,
+        /// Set when this merge makes no nullability-affecting schema change:
+        /// it introduces no field that data staged against an earlier schema
+        /// could not safely omit. Without the assertion the merge conflicts
+        /// with concurrent appends in either commit order, since a stale
+        /// append omits new columns entirely and its rows read as null.
+        preserves_nullability: bool,
     },
     /// Restore an old version of the database
     Restore { version: u64 },
@@ -455,8 +461,16 @@ pub enum Operation {
         updated_fragment_offsets: Option<UpdatedFragmentOffsets>,
     },
 
-    /// Project to a new schema. This only changes the schema, not the data.
-    Project { schema: Schema },
+    /// Project to a new schema.
+    Project {
+        schema: Schema,
+        /// Set when this projection makes no nullability-affecting schema
+        /// change, as a rename or a drop does not. A nullability tightening
+        /// must not set this: its producer proved the claim by scanning at its
+        /// read version, so a concurrent write can falsify it and the
+        /// projection conflicts with value-writes in either commit order.
+        preserves_nullability: bool,
+    },
 
     /// Update the dataset configuration.
     UpdateConfig {
@@ -649,12 +663,18 @@ impl PartialEq for Operation {
                 Self::Merge {
                     fragments: a_fragments,
                     schema: a_schema,
+                    preserves_nullability: a_preserves,
                 },
                 Self::Merge {
                     fragments: b_fragments,
                     schema: b_schema,
+                    preserves_nullability: b_preserves,
                 },
-            ) => compare_vec(a_fragments, b_fragments) && a_schema == b_schema,
+            ) => {
+                compare_vec(a_fragments, b_fragments)
+                    && a_schema == b_schema
+                    && a_preserves == b_preserves
+            }
             (Self::Restore { version: a }, Self::Restore { version: b }) => a == b,
             (
                 Self::ReserveFragments { num_fragments: a },
@@ -697,7 +717,16 @@ impl PartialEq for Operation {
                     && a_inserted_rows_filter == b_inserted_rows_filter
                     && a_updated_fragment_offsets == b_updated_fragment_offsets
             }
-            (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
+            (
+                Self::Project {
+                    schema: a,
+                    preserves_nullability: a_preserves,
+                },
+                Self::Project {
+                    schema: b,
+                    preserves_nullability: b_preserves,
+                },
+            ) => a == b && a_preserves == b_preserves,
             (
                 Self::UpdateConfig {
                     config_updates: a_config,
@@ -3468,12 +3497,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                 fragments,
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
+                preserves_nullability,
             })) => Operation::Merge {
                 fragments: fragments
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 schema: Schema::try_from(&Fields(schema))?,
+                // False for a writer that predates the field: no assertion, so
+                // a legacy required-field merge still conflicts and a legacy
+                // nullable merge over-conflicts, which only retries.
+                preserves_nullability,
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
@@ -3525,11 +3559,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 },
             },
-            Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
-                Operation::Project {
-                    schema: Schema::try_from(&Fields(schema))?,
-                }
-            }
+            Some(pb::transaction::Operation::Project(pb::transaction::Project {
+                schema,
+                preserves_nullability,
+            })) => Operation::Project {
+                schema: Schema::try_from(&Fields(schema))?,
+                // False for a writer that predates the field: no assertion, so
+                // a legacy tightening still conflicts and a legacy rename
+                // over-conflicts, which only retries.
+                preserves_nullability,
+            },
             Some(pb::transaction::Operation::UpdateConfig(update_config)) => {
                 // Check if new-style fields are present
                 let has_new_fields = update_config.config_updates.is_some()
@@ -3815,13 +3854,16 @@ impl From<&Transaction> for pb::Transaction {
                     .map(pb::IndexMetadata::from)
                     .collect(),
             }),
-            Operation::Merge { fragments, schema } => {
-                pb::transaction::Operation::Merge(pb::transaction::Merge {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    schema: Fields::from(schema).0,
-                    schema_metadata: Default::default(), // TODO: handle metadata
-                })
-            }
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability,
+            } => pb::transaction::Operation::Merge(pb::transaction::Merge {
+                fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                schema: Fields::from(schema).0,
+                schema_metadata: Default::default(), // TODO: handle metadata
+                preserves_nullability: *preserves_nullability,
+            }),
             Operation::Restore { version } => {
                 pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
@@ -3869,11 +3911,13 @@ impl From<&Transaction> for pb::Transaction {
                     })
                     .unwrap_or_default(),
             }),
-            Operation::Project { schema } => {
-                pb::transaction::Operation::Project(pb::transaction::Project {
-                    schema: Fields::from(schema).0,
-                })
-            }
+            Operation::Project {
+                schema,
+                preserves_nullability,
+            } => pb::transaction::Operation::Project(pb::transaction::Project {
+                schema: Fields::from(schema).0,
+                preserves_nullability: *preserves_nullability,
+            }),
             Operation::UpdateConfig {
                 config_updates,
                 table_metadata_updates,
@@ -4022,10 +4066,12 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             // Fragments must contain all fields in the schema
             schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }
-        Operation::Project { schema } => {
+        Operation::Project { schema, .. } => {
             schema_fragments_valid(Some(manifest), schema, manifest.fragments.as_ref())
         }
-        Operation::Merge { fragments, schema } => {
+        Operation::Merge {
+            fragments, schema, ..
+        } => {
             merge_fragments_valid(manifest, fragments)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
@@ -5718,6 +5764,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5803,6 +5850,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5878,6 +5926,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5957,6 +6006,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![existing_fragment, new_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -6982,5 +7032,47 @@ mod tests {
             frag_reuse_index: None,
         };
         assert_ne!(overlay(1), rewrite);
+    }
+
+    #[test]
+    fn test_nullability_assertion_defaults_conservative() {
+        // A writer that predates the field encodes nothing, which decodes as
+        // false: no assertion, so a legacy tightening or required-field merge
+        // still conflicts. Only an explicit true skips the barrier.
+        for encoded in [false, true] {
+            let txn = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::Project(
+                    pb::transaction::Project {
+                        schema: vec![],
+                        preserves_nullability: encoded,
+                    },
+                )),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                matches!(txn.operation, Operation::Project { preserves_nullability, .. } if preserves_nullability == encoded),
+                "encoded={encoded:?}"
+            );
+
+            let txn = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
+                    fragments: vec![],
+                    schema: vec![],
+                    schema_metadata: Default::default(),
+                    preserves_nullability: encoded,
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                matches!(txn.operation, Operation::Merge { preserves_nullability, .. } if preserves_nullability == encoded),
+                "encoded={encoded:?}"
+            );
+        }
     }
 }

@@ -434,7 +434,18 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .extract::<Vec<PyLance<Fragment>>>()?;
                 let fragments = fragments.into_iter().map(|f| f.0).collect();
 
-                let op = Operation::Merge { schema, fragments };
+                // Absent on objects predating the field: no assertion, which
+                // conservatively conflicts.
+                let preserves_nullability = ob
+                    .getattr("preserves_nullability")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(false);
+
+                let op = Operation::Merge {
+                    schema,
+                    fragments,
+                    preserves_nullability,
+                };
                 Ok(Self(op))
             }
             "Restore" => {
@@ -482,8 +493,17 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             }
             "Project" => {
                 let schema = extract_schema(&ob.getattr("schema")?)?;
+                // Absent on objects predating the field: no assertion, which
+                // conservatively conflicts.
+                let preserves_nullability = ob
+                    .getattr("preserves_nullability")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(false);
 
-                let op = Operation::Project { schema };
+                let op = Operation::Project {
+                    schema,
+                    preserves_nullability,
+                };
                 Ok(Self(op))
             }
             "UpdateConfig" => {
@@ -636,13 +656,17 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Delete class");
                 cls.call1((updated_fragments, deleted_fragment_ids, predicate))
             }
-            Operation::Merge { fragments, schema } => {
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability,
+            } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Merge")
                     .expect("Failed to get Merge class");
-                cls.call1((fragments_py, schema_py))
+                cls.call1((fragments_py, schema_py, *preserves_nullability))
             }
             Operation::Restore { version } => {
                 let cls = namespace
@@ -674,12 +698,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get CreateIndex class");
                 cls.call1((new_indices_py, removed_indices_py))
             }
-            Operation::Project { schema } => {
+            Operation::Project {
+                schema,
+                preserves_nullability,
+            } => {
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Project")
                     .expect("Failed to get Project class");
-                cls.call1((schema_py,))
+                cls.call1((schema_py, *preserves_nullability))
             }
             Operation::ReserveFragments { num_fragments } => {
                 if let Ok(cls) = namespace.getattr("ReserveFragments") {

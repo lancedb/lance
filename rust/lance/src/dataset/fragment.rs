@@ -2086,14 +2086,15 @@ impl FileFragment {
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> Result<FragmentAddColumnsResult> {
-        let (fragments, schema, fragments_to_cleanup) = schema_evolution::add_columns_to_fragments(
-            self.dataset.as_ref(),
-            transforms,
-            read_columns,
-            std::slice::from_ref(self),
-            batch_size,
-        )
-        .await?;
+        let (fragments, schema, fragments_to_cleanup, _) =
+            schema_evolution::add_columns_to_fragments(
+                self.dataset.as_ref(),
+                transforms,
+                read_columns,
+                std::slice::from_ref(self),
+                batch_size,
+            )
+            .await?;
         let fragment_count = fragments.len();
         let Ok([fragment]) = <Vec<Fragment> as TryInto<[Fragment; 1]>>::try_into(fragments) else {
             return Err(Error::internal(format!(
@@ -5828,6 +5829,7 @@ mod tests {
             let op = Operation::Merge {
                 fragments: merged_fragments,
                 schema: full_schema.clone(),
+                preserves_nullability: true,
             };
 
             let dataset = Dataset::commit(
@@ -6071,6 +6073,7 @@ mod tests {
             Operation::Merge {
                 schema,
                 fragments: vec![frag],
+                preserves_nullability: true,
             },
             Some(dataset.manifest.version),
             None,
