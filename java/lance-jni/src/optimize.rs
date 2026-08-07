@@ -312,6 +312,7 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
+const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
 const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
@@ -361,13 +362,22 @@ impl IntoJava for &CompactionOptions {
         let batch_size_opt = to_java_optional(env, batch_size)?;
         let defer_index_remap = to_java_boolean_obj(env, Some(self.defer_index_remap))?;
         let defer_index_remap_opt = to_java_optional(env, defer_index_remap)?;
-        let compaction_mode_str = self.compaction_mode.as_ref().map(|mode| match mode {
-            CompactionMode::Reencode => "reencode",
-            CompactionMode::TryBinaryCopy => "try_binary_copy",
-            CompactionMode::ForceBinaryCopy => "force_binary_copy",
+        // Build the Java CompactionMode enum constant (not a String): the Java field is
+        // Optional<CompactionMode>, and passing a String here corrupts it across JNI's
+        // type-erased Optional signature.
+        let compaction_mode_name = self.compaction_mode.as_ref().map(|mode| match mode {
+            CompactionMode::Reencode => "REENCODE",
+            CompactionMode::TryBinaryCopy => "TRY_BINARY_COPY",
+            CompactionMode::ForceBinaryCopy => "FORCE_BINARY_COPY",
         });
-        let compaction_mode_obj = match compaction_mode_str {
-            Some(s) => env.new_string(s)?.into(),
+        let compaction_mode_obj = match compaction_mode_name {
+            Some(name) => env
+                .get_static_field(
+                    COMPACTION_MODE_CLASS,
+                    name,
+                    format!("L{};", COMPACTION_MODE_CLASS),
+                )?
+                .l()?,
             None => JObject::null(),
         };
         let compaction_mode_opt = to_java_optional(env, compaction_mode_obj)?;
