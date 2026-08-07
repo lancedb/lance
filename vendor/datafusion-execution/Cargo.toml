@@ -131,6 +131,9 @@ unnecessary_lazy_evaluations = "warn"
 used_underscore_binding = "warn"
 
 [lints.rust]
+# Lance coverage uses a newer nightly where AtomicUsize::fetch_update is
+# deprecated, while DataFusion 54's supported toolchains lack its replacement.
+deprecated = "allow"
 unused_qualifications = "deny"
 
 [lints.rust.unexpected_cfgs]

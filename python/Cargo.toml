@@ -17,7 +17,7 @@ publish = false
 # Keep the standalone Python build on the workspace's DataFusion accounting
 # backport for https://github.com/lance-format/lance/issues/8129.
 [patch.crates-io]
-datafusion-execution = { path = "../rust/vendor/datafusion-execution" }
+datafusion-execution = { path = "../vendor/datafusion-execution" }
 
 [lib]
 name = "lance"

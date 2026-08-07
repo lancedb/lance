@@ -27,14 +27,14 @@ members = [
     "rust/arrow-scalar",
     "rust/arrow-stats",
 ]
-exclude = ["python", "java/lance-jni", "rust/vendor/datafusion-execution"]
+exclude = ["python", "java/lance-jni", "vendor/datafusion-execution"]
 # Python package needs to be built by maturin.
 resolver = "3"
 
 # Backport error-atomic spill accounting for DataFusion 54.1.0 while fixing
 # https://github.com/lance-format/lance/issues/8129.
 [patch.crates-io]
-datafusion-execution = { path = "rust/vendor/datafusion-execution" }
+datafusion-execution = { path = "vendor/datafusion-execution" }
 
 [workspace.package]
 version = "11.0.0-beta.2"
