@@ -481,7 +481,6 @@ struct MergeInsertParams {
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
 /// part of a single transaction.
-#[derive(Clone)]
 pub struct MergeInsertJob {
     // The column to merge the new data into
     dataset: Arc<Dataset>,
@@ -491,6 +490,18 @@ pub struct MergeInsertJob {
     // partial-update sorting, including across commit retries.
     spill_session_context: SessionContext,
     spill_execution_options: LanceExecutionOptions,
+}
+
+impl Clone for MergeInsertJob {
+    fn clone(&self) -> Self {
+        let spill_execution_options = self.spill_execution_options.clone();
+        Self {
+            dataset: self.dataset.clone(),
+            params: self.params.clone(),
+            spill_session_context: new_session_context(&spill_execution_options),
+            spill_execution_options,
+        }
+    }
 }
 
 fn merge_insert_execution_options() -> LanceExecutionOptions {
@@ -1104,6 +1115,17 @@ impl PartitionStream for SequentialSourcePartitionStream {
 }
 
 impl MergeInsertJob {
+    /// Clone one execution attempt while preserving the spill manager owned by
+    /// the surrounding retry loop.
+    fn clone_for_retry(&self) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            params: self.params.clone(),
+            spill_session_context: self.spill_session_context.clone(),
+            spill_execution_options: self.spill_execution_options.clone(),
+        }
+    }
+
     pub async fn execute_reader(
         self,
         source: impl StreamingWriteSource,
@@ -3083,12 +3105,22 @@ pub struct UncommittedMergeInsert {
 }
 
 /// Wrapper struct that combines MergeInsertJob with the source provider for retry functionality
-#[derive(Clone)]
 struct MergeInsertJobWithProvider {
     job: MergeInsertJob,
     provider: Arc<dyn TableProvider>,
     replayable: bool,
     attempt_count: Arc<AtomicU32>,
+}
+
+impl Clone for MergeInsertJobWithProvider {
+    fn clone(&self) -> Self {
+        Self {
+            job: self.job.clone_for_retry(),
+            provider: self.provider.clone(),
+            replayable: self.replayable,
+            attempt_count: self.attempt_count.clone(),
+        }
+    }
 }
 
 impl RetryExecutor for MergeInsertJobWithProvider {
@@ -3101,7 +3133,7 @@ impl RetryExecutor for MergeInsertJobWithProvider {
 
         // Re-scan the provider on each retry attempt.
         self.job
-            .clone()
+            .clone_for_retry()
             .execute_uncommitted_impl(self.provider.clone(), self.replayable)
             .await
     }
@@ -3684,26 +3716,67 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_merge_insert_spill_contexts_are_job_local() {
-        let execution_options = merge_insert_execution_options();
-        let first_context = new_session_context(&execution_options);
-        let second_context = new_session_context(&execution_options);
-        let first_manager = &first_context.runtime_env().disk_manager;
-        let second_manager = &second_context.runtime_env().disk_manager;
+    #[tokio::test]
+    async fn test_cloned_merge_jobs_do_not_reuse_failed_spill_accounting() {
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut first_job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        first_job.spill_execution_options.max_temp_directory_size = Some(1);
+        first_job.spill_session_context = new_session_context(&first_job.spill_execution_options);
+
+        let second_job = first_job.clone();
+        let first_manager = first_job
+            .spill_session_context
+            .runtime_env()
+            .disk_manager
+            .clone();
+        let second_manager = second_job
+            .spill_session_context
+            .runtime_env()
+            .disk_manager
+            .clone();
 
         assert!(
-            !Arc::ptr_eq(first_manager, second_manager),
-            "each merge job must own an independent disk manager"
+            !Arc::ptr_eq(&first_manager, &second_manager),
+            "cloned executable jobs must own independent disk managers"
+        );
+        let retry_job = second_job.clone_for_retry();
+        assert!(
+            Arc::ptr_eq(
+                &second_manager,
+                &retry_job.spill_session_context.runtime_env().disk_manager
+            ),
+            "retry attempts within one execution must share a disk manager"
         );
 
-        let mut spill = first_manager
-            .create_tmp_file("testing merge job isolation")
+        let mut rejected = first_manager
+            .create_tmp_file("testing rejected merge job spill")
             .unwrap();
-        spill.inner().as_file().set_len(1).unwrap();
-        spill.update_disk_usage().unwrap();
-        assert_eq!(first_manager.used_disk_space(), 1);
-        assert_eq!(second_manager.used_disk_space(), 0);
+        rejected.inner().as_file().set_len(2).unwrap();
+        assert!(matches!(
+            rejected.update_disk_usage(),
+            Err(DataFusionError::ResourcesExhausted(_))
+        ));
+        drop(rejected);
+
+        let mut next_spill = second_manager
+            .create_tmp_file("testing independent merge job spill")
+            .unwrap();
+        next_spill.inner().as_file().set_len(1).unwrap();
+        next_spill.update_disk_usage().unwrap();
+        assert_eq!(second_manager.used_disk_space(), 1);
     }
 
     #[test]
