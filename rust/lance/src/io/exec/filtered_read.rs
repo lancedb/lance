@@ -13,6 +13,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -125,6 +126,7 @@ struct ScopedFragmentRead {
     // An in-memory filter to apply after reading the fragment (whatever couldn't be
     // pushed down into the index query)
     filter: Option<Expr>,
+    physical_filter: Option<Arc<dyn PhysicalExpr>>,
     priority: u32,
     scan_scheduler: Arc<ScanScheduler>,
 }
@@ -861,6 +863,9 @@ impl FilteredReadStream {
 
                 // Get filter for this fragment (convert Arc<Expr> back to Expr)
                 let filter = plan.filters.get(&fragment_id).map(|f| (**f).clone());
+                let physical_filter = filter
+                    .as_ref()
+                    .and_then(|filter| options.physical_filter(filter));
 
                 scoped_fragments.push(ScopedFragmentRead {
                     fragment: Arc::new(FileFragment::new(dataset.clone(), fragment.clone())),
@@ -870,6 +875,7 @@ impl FilteredReadStream {
                     batch_size: default_batch_size,
                     file_reader_options: options.file_reader_options.clone(),
                     filter,
+                    physical_filter,
                     priority: priority as u32,
                     scan_scheduler: scan_scheduler.clone(),
                 });
@@ -1315,15 +1321,18 @@ impl FilteredReadStream {
         // the row ids are not contiguous
         fragment_read_task.ranges.sort_by_key(|r| r.start);
 
-        let physical_filter = fragment_read_task
-            .filter
-            .map(|filter| {
-                let planner = Planner::new(public_blob_v2_binary_projection_schema(
-                    fragment_read_task.projection.as_ref(),
-                ));
-                planner.create_physical_expr(&filter)
-            })
-            .transpose()?;
+        let physical_filter = match fragment_read_task.physical_filter {
+            Some(filter) => Some(filter),
+            None => fragment_read_task
+                .filter
+                .map(|filter| {
+                    let planner = Planner::new(public_blob_v2_binary_projection_schema(
+                        fragment_read_task.projection.as_ref(),
+                    ));
+                    planner.create_physical_expr(&filter)
+                })
+                .transpose()?,
+        };
 
         // We are going to count the fragment as scanned on the first batch we
         // read. This might miss empty fragments, but we assume that wouldn't be
@@ -1511,6 +1520,7 @@ pub struct FilteredReadOptions {
     /// result to avoid applying this (and instead only apply the refine filter) but in some cases
     /// the index result does not cover all fragments or is not exact.
     pub full_filter: Option<Expr>,
+    physical_filters: Vec<(Expr, Arc<dyn PhysicalExpr>)>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
@@ -1550,6 +1560,7 @@ impl FilteredReadOptions {
             projection,
             refine_filter: None,
             full_filter: None,
+            physical_filters: Vec::new(),
             io_buffer_size_bytes: None,
             only_indexed_fragments: false,
             overlay_block: None,
@@ -1683,6 +1694,7 @@ impl FilteredReadOptions {
                 "refine_filter is set but full_filter is not".into(),
             ));
         }
+        self.physical_filters.clear();
         self.refine_filter = refine_filter;
         self.full_filter = full_filter;
         Ok(self)
@@ -1690,9 +1702,45 @@ impl FilteredReadOptions {
 
     /// An alternative to [`Self::with_filter`] to set the filters from a FilterPlan if you already have one
     pub fn with_filter_plan(mut self, filter_plan: FilterPlan) -> Self {
+        self.physical_filters.clear();
         self.refine_filter = filter_plan.refine_expr;
         self.full_filter = filter_plan.full_expr;
         self
+    }
+
+    /// Plan configured filters with the supplied DataFusion session.
+    pub(crate) fn with_physical_filters(mut self, session: &dyn Session) -> Result<Self> {
+        for filter in [&self.full_filter, &self.refine_filter]
+            .into_iter()
+            .flatten()
+        {
+            if self
+                .physical_filters
+                .iter()
+                .any(|(planned_filter, _)| planned_filter == filter)
+            {
+                continue;
+            }
+
+            let filter_columns = Planner::column_names_in_expr(filter);
+            let projection = self
+                .projection
+                .clone()
+                .union_columns(filter_columns, OnMissing::Error)?;
+            let schema = public_blob_v2_binary_projection_schema(&projection);
+            let physical_filter =
+                Planner::new(schema).create_physical_expr_with_session(filter, session)?;
+            self.physical_filters
+                .push((filter.clone(), physical_filter));
+        }
+        Ok(self)
+    }
+
+    fn physical_filter(&self, filter: &Expr) -> Option<Arc<dyn PhysicalExpr>> {
+        self.physical_filters
+            .iter()
+            .find(|(planned_filter, _)| planned_filter == filter)
+            .map(|(_, physical_filter)| physical_filter.clone())
     }
 
     /// Specify the projection to use for the scan
@@ -1701,6 +1749,7 @@ impl FilteredReadOptions {
     /// of the output schema.  If both are requested then the row id will come before
     /// the row address.
     pub fn with_projection(mut self, projection: Projection) -> Self {
+        self.physical_filters.clear();
         self.projection = projection;
         self
     }
@@ -2953,8 +3002,10 @@ impl ExecutionPlan for FilteredReadExec {
 
         let read_schema = public_blob_v2_binary_projection_schema(&read_projection);
 
-        let planner = Arc::new(Planner::new(read_schema.clone()));
-        let physical_filter = planner.create_physical_expr(filter)?;
+        let physical_filter = match self.options.physical_filter(filter) {
+            Some(physical_filter) => physical_filter,
+            None => Planner::new(read_schema.clone()).create_physical_expr(filter)?,
+        };
 
         let mock_input = Arc::new(Self::try_new(
             self.dataset.clone(),
