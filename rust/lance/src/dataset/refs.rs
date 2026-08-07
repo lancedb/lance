@@ -3,20 +3,19 @@
 
 use std::ops::Range;
 
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::CommitHandler;
-use object_store::{ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
+use object_store::{ObjectStoreExt, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::dataset::version_lease::{
-    ReferenceAdmission, begin_reference_admission, remove_branch_state,
+    ReferenceMutation, begin_reference_admission, remove_branch_state,
 };
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
@@ -148,117 +147,6 @@ impl Branches<'_> {
     }
 }
 
-async fn publish_new_reference(
-    object_store: &ObjectStore,
-    path: &Path,
-    payload: Vec<u8>,
-    admission: ReferenceAdmission,
-    reference_kind: &str,
-    reference_name: &str,
-) -> Result<()> {
-    if let Err(error) = admission.ensure_owned().await {
-        admission.cancel_before_publish().await;
-        return Err(error);
-    }
-    match object_store
-        .inner
-        .put_opts(
-            path,
-            Bytes::from(payload).into(),
-            PutOptions {
-                mode: PutMode::Create,
-                ..Default::default()
-            },
-        )
-        .await
-    {
-        Ok(_) => {
-            admission.complete().await;
-            Ok(())
-        }
-        Err(
-            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. },
-        ) => {
-            admission.cancel_before_publish().await;
-            Err(Error::RefConflict {
-                message: format!("{reference_kind} {reference_name} already exists"),
-            })
-        }
-        // A generic transport failure can be ambiguous after the server has
-        // accepted the conditional write. Keep the intent until bounded
-        // recovery instead of risking deletion beneath a published reference.
-        Err(error) => Err(error.into()),
-    }
-}
-
-async fn publish_updated_reference(
-    object_store: &ObjectStore,
-    path: &Path,
-    expected_payload: &[u8],
-    expected_version: UpdateVersion,
-    payload: Vec<u8>,
-    admission: ReferenceAdmission,
-    reference_label: String,
-) -> Result<()> {
-    if let Err(error) = admission.ensure_owned().await {
-        admission.cancel_before_publish().await;
-        return Err(error);
-    }
-    let conditional_result = object_store
-        .inner
-        .put_opts(
-            path,
-            Bytes::from(payload.clone()).into(),
-            PutOptions {
-                mode: PutMode::Update(expected_version),
-                ..Default::default()
-            },
-        )
-        .await;
-    let result = match conditional_result {
-        Err(
-            object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented { .. },
-        ) => {
-            // The local object store does not implement UpdateVersion. Preserve
-            // local tag updates, but verify the exact object immediately before
-            // the atomic overwrite. Cloud stores retain native CAS semantics.
-            let current = object_store.inner.get(path).await?.bytes().await?;
-            if current.as_ref() != expected_payload {
-                admission.cancel_before_publish().await;
-                return Err(Error::RefConflict {
-                    message: format!("{reference_label} changed during conditional update"),
-                });
-            }
-            if let Err(error) = admission.ensure_owned().await {
-                admission.cancel_before_publish().await;
-                return Err(error);
-            }
-            object_store
-                .inner
-                .put(path, Bytes::from(payload).into())
-                .await
-        }
-        result => result,
-    };
-    match result {
-        Ok(_) => {
-            admission.complete().await;
-            Ok(())
-        }
-        Err(
-            object_store::Error::AlreadyExists { .. }
-            | object_store::Error::Precondition { .. }
-            | object_store::Error::NotFound { .. },
-        ) => {
-            admission.cancel_before_publish().await;
-            Err(Error::RefConflict {
-                message: format!("{reference_label} changed during conditional update"),
-            })
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 impl Tags<'_> {
     pub async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
         let root_location = self.refs.root()?;
@@ -342,21 +230,18 @@ impl Tags<'_> {
             .build_tag_content_by_ref(reference, Some(now), Some(now))
             .await?;
         let payload = serde_json::to_vec_pretty(&tag_contents)?;
+        let mutation = ReferenceMutation::Create {
+            path: tag_file.to_string(),
+            payload,
+        };
         let admission = begin_reference_admission(
             self.refs,
             tag_contents.branch.as_deref(),
             tag_contents.version,
+            mutation,
         )
         .await?;
-        publish_new_reference(
-            self.object_store(),
-            &tag_file,
-            payload,
-            admission,
-            "tag",
-            tag,
-        )
-        .await
+        admission.publish(format!("tag {tag} already exists")).await
     }
 
     pub async fn delete(&self, tag: &str) -> Result<()> {
@@ -385,10 +270,8 @@ impl Tags<'_> {
             });
         }
         let original_get = self.object_store().inner.get(&tag_file).await?;
-        let expected_version = UpdateVersion {
-            e_tag: original_get.meta.e_tag.clone(),
-            version: original_get.meta.version.clone(),
-        };
+        let expected_etag = original_get.meta.e_tag.clone();
+        let expected_version = original_get.meta.version.clone();
         let original_payload = original_get.bytes().await?;
         let original_tag_contents: TagContents = serde_json::from_slice(&original_payload)?;
         let updated_reference = self
@@ -401,22 +284,23 @@ impl Tags<'_> {
         tag_contents.updated_at = updated_reference.updated_at;
         tag_contents.manifest_size = updated_reference.manifest_size;
         let payload = serde_json::to_vec_pretty(&tag_contents)?;
+        let mutation = ReferenceMutation::Update {
+            path: tag_file.to_string(),
+            expected_payload: original_payload.to_vec(),
+            expected_etag,
+            expected_version,
+            payload,
+        };
         let admission = begin_reference_admission(
             self.refs,
             tag_contents.branch.as_deref(),
             tag_contents.version,
+            mutation,
         )
         .await?;
-        publish_updated_reference(
-            self.object_store(),
-            &tag_file,
-            &original_payload,
-            expected_version,
-            payload,
-            admission,
-            format!("tag {tag}"),
-        )
-        .await
+        admission
+            .publish(format!("tag {tag} changed during conditional update"))
+            .await
     }
 
     pub async fn replace_metadata(
@@ -435,30 +319,29 @@ impl Tags<'_> {
         }
 
         let original_get = self.object_store().inner.get(&tag_file).await?;
-        let expected_version = UpdateVersion {
-            e_tag: original_get.meta.e_tag.clone(),
-            version: original_get.meta.version.clone(),
-        };
+        let expected_etag = original_get.meta.e_tag.clone();
+        let expected_version = original_get.meta.version.clone();
         let original_payload = original_get.bytes().await?;
         let mut tag_contents: TagContents = serde_json::from_slice(&original_payload)?;
         tag_contents.metadata = metadata;
         let payload = serde_json::to_vec_pretty(&tag_contents)?;
+        let mutation = ReferenceMutation::Update {
+            path: tag_file.to_string(),
+            expected_payload: original_payload.to_vec(),
+            expected_etag,
+            expected_version,
+            payload,
+        };
         let admission = begin_reference_admission(
             self.refs,
             tag_contents.branch.as_deref(),
             tag_contents.version,
+            mutation,
         )
         .await?;
-        publish_updated_reference(
-            self.object_store(),
-            &tag_file,
-            &original_payload,
-            expected_version,
-            payload,
-            admission,
-            format!("tag {tag}"),
-        )
-        .await
+        admission
+            .publish(format!("tag {tag} changed during conditional update"))
+            .await
     }
 
     async fn build_tag_content_by_ref(
@@ -659,21 +542,20 @@ impl Branches<'_> {
             metadata: HashMap::new(),
         };
         let payload = serde_json::to_vec_pretty(&branch_contents)?;
+        let mutation = ReferenceMutation::Create {
+            path: branch_file.to_string(),
+            payload,
+        };
         let admission = begin_reference_admission(
             self.refs,
             branch_contents.parent_branch.as_deref(),
             version_number,
+            mutation,
         )
         .await?;
-        publish_new_reference(
-            self.object_store(),
-            &branch_file,
-            payload,
-            admission,
-            "branch",
-            branch_name,
-        )
-        .await
+        admission
+            .publish(format!("branch {branch_name} already exists"))
+            .await
     }
 
     pub async fn replace_metadata(
@@ -691,17 +573,37 @@ impl Branches<'_> {
             });
         }
 
-        let mut branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
+        let original_get = self.object_store().inner.get(&branch_file).await?;
+        let expected_etag = original_get.meta.e_tag.clone();
+        let expected_version = original_get.meta.version.clone();
+        let original_payload = original_get.bytes().await?;
+        let mut branch_contents: BranchContents = serde_json::from_slice(&original_payload)?;
+        if branch_contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
+            branch_contents.identifier = BranchIdentifier::synthetic_identifier(
+                branch,
+                branch_contents.parent_branch.as_deref(),
+                branch_contents.parent_version,
+                branch_contents.create_at,
+            );
+        }
         branch_contents.metadata = metadata;
-
-        self.object_store()
-            .put(
-                &branch_file,
-                serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
-            )
+        let mutation = ReferenceMutation::Update {
+            path: branch_file.to_string(),
+            expected_payload: original_payload.to_vec(),
+            expected_etag,
+            expected_version,
+            payload: serde_json::to_vec_pretty(&branch_contents)?,
+        };
+        let admission = begin_reference_admission(
+            self.refs,
+            branch_contents.parent_branch.as_deref(),
+            branch_contents.parent_version,
+            mutation,
+        )
+        .await?;
+        admission
+            .publish(format!("branch {branch} changed during conditional update"))
             .await
-            .map(|_| ())
     }
 
     /// Delete a branch
