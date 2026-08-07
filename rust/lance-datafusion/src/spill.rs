@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    io::{BufReader, BufWriter, Write},
+    io::{BufReader, BufWriter},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -12,14 +12,16 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
-    execution::{SendableRecordBatchStream, TaskContext},
+    execution::{
+        SendableRecordBatchStream, TaskContext,
+        disk_manager::{DiskManager, RefCountedTempFile},
+    },
     physical_plan::{stream::RecordBatchStreamAdapter, streaming::PartitionStream},
 };
 use datafusion_common::DataFusionError;
 use futures::StreamExt;
 use lance_arrow::memory::MemoryAccumulator;
 use lance_core::error::LanceOptionExt;
-use lance_core::utils::tempfile::TempDir;
 
 /// Start a spill of Arrow data to a file that can be read later multiple times.
 ///
@@ -45,20 +47,11 @@ pub fn create_replay_spill(
     schema: Arc<Schema>,
     memory_limit: usize,
 ) -> (SpillSender, SpillReceiver) {
-    create_replay_spill_with_disk_limit(path, schema, memory_limit, u64::MAX)
-}
-
-fn create_replay_spill_with_disk_limit(
-    path: std::path::PathBuf,
-    schema: Arc<Schema>,
-    memory_limit: usize,
-    max_disk_bytes: u64,
-) -> (SpillSender, SpillReceiver) {
     let initial_status = WriteStatus::default();
     let (status_sender, status_receiver) = tokio::sync::watch::channel(initial_status);
     let sender = SpillSender {
         memory_limit,
-        max_disk_bytes,
+        managed_spill_file: None,
         path: path.clone(),
         schema: schema.clone(),
         state: SpillState::default(),
@@ -128,15 +121,21 @@ pub async fn spilling_table_provider(
     source: SendableRecordBatchStream,
     memory_limit: usize,
 ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
-    spilling_table_provider_with_disk_limit(source, memory_limit, u64::MAX).await
+    let disk_manager = Arc::new(
+        DiskManager::builder()
+            .with_max_temp_directory_size(u64::MAX)
+            .build()?,
+    );
+    spilling_table_provider_with_disk_manager(source, memory_limit, disk_manager).await
 }
 
-/// Wrap a one-shot stream in a replayable provider with a disk-spill limit.
+/// Wrap a one-shot stream in a replayable provider using a shared disk manager.
 ///
 /// This has the same memory-first and streaming-replay behavior as
-/// [`spilling_table_provider`], but fails the replay if
-/// its serialized spill exceeds `max_disk_bytes`. Dropping the provider aborts
-/// an unfinished background drain of the source.
+/// [`spilling_table_provider`], but charges its spill file to `disk_manager`.
+/// Sharing that manager with DataFusion execution enforces one aggregate quota
+/// across replay and operator spill files. Dropping the provider aborts an
+/// unfinished background drain of the source.
 ///
 /// # Examples
 ///
@@ -148,7 +147,8 @@ pub async fn spilling_table_provider(
 /// # use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 /// # use futures::TryStreamExt;
 /// # use lance_datafusion::exec::provider_to_stream;
-/// # use lance_datafusion::spill::spilling_table_provider_with_disk_limit;
+/// # use datafusion::execution::disk_manager::DiskManager;
+/// # use lance_datafusion::spill::spilling_table_provider_with_disk_manager;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
@@ -160,25 +160,28 @@ pub async fn spilling_table_provider(
 ///     schema,
 ///     futures::stream::iter(vec![Ok(batch)]),
 /// ));
-/// let provider = spilling_table_provider_with_disk_limit(source, 0, 1024 * 1024).await?;
+/// let disk_manager = Arc::new(
+///     DiskManager::builder()
+///         .with_max_temp_directory_size(1024 * 1024)
+///         .build()?,
+/// );
+/// let provider =
+///     spilling_table_provider_with_disk_manager(source, 0, disk_manager).await?;
 /// let replayed: Vec<RecordBatch> = provider_to_stream(provider).await?.try_collect().await?;
 /// assert_eq!(replayed.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
 /// # Ok(())
 /// # }
 /// ```
-pub async fn spilling_table_provider_with_disk_limit(
+pub async fn spilling_table_provider_with_disk_manager(
     mut source: SendableRecordBatchStream,
     memory_limit: usize,
-    max_disk_bytes: u64,
+    disk_manager: Arc<DiskManager>,
 ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
     let schema = source.schema();
-    let tmp_dir = tokio::task::spawn_blocking(TempDir::try_new)
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("Failed to spawn temp dir task: {e}")))?
-        .map_err(|e| DataFusionError::Execution(format!("Failed to create temp dir: {e}")))?;
-    let tmp_path = tmp_dir.std_path().join("spill.arrows");
-    let (mut sender, receiver) =
-        create_replay_spill_with_disk_limit(tmp_path, schema.clone(), memory_limit, max_disk_bytes);
+    let spill_file = disk_manager.create_tmp_file("writing replay spill")?;
+    let spill_path = spill_file.path().to_owned();
+    let (mut sender, receiver) = create_replay_spill(spill_path, schema.clone(), memory_limit);
+    sender.managed_spill_file = Some(spill_file.clone());
 
     // Drain the one-shot source into the spill once, in the background. The spill
     // tees to memory/disk so the first reader can consume batches as they arrive
@@ -214,7 +217,7 @@ pub async fn spilling_table_provider_with_disk_limit(
         schema: schema.clone(),
         receiver,
         _drain_handle: Arc::new(AbortOnDropHandle::new(drain_handle)),
-        _tmp_dir: Arc::new(tmp_dir),
+        _spill_file: Arc::new(spill_file),
     });
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
 }
@@ -245,11 +248,11 @@ struct SpillPartition {
     receiver: SpillReceiver,
     // Keeps the background drain task (which owns the `SpillSender`) alive. The
     // `SpillSender` must outlive the readers or they error out, so we hold the
-    // handle rather than detaching it. It is declared before the temp dir so
+    // handle rather than detaching it. It is declared before the spill file so
     // cancellation is requested before spill cleanup begins.
     _drain_handle: Arc<AbortOnDropHandle<SpillSender>>,
-    // The spilled data lives in this temp dir; dropping it deletes the spill file.
-    _tmp_dir: Arc<TempDir>,
+    // Keeps the DiskManager-owned spill file alive and accounts its disk usage.
+    _spill_file: Arc<RefCountedTempFile>,
 }
 
 impl std::fmt::Debug for SpillPartition {
@@ -268,12 +271,12 @@ impl PartitionStream for SpillPartition {
     fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let stream = self.receiver.read();
         let drain_handle = self._drain_handle.clone();
-        let tmp_dir = self._tmp_dir.clone();
+        let spill_file = self._spill_file.clone();
         let stream = stream.map(move |batch| {
             // The reader may outlive the provider and physical plan that
             // created it. Keep the drain and spill file alive until this
             // stream itself is dropped.
-            let _keep_alive = (&drain_handle, &tmp_dir);
+            let _keep_alive = (&drain_handle, &spill_file);
             batch
         });
         Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
@@ -405,7 +408,7 @@ impl SpillReader {
 /// spill. Otherwise, they will return an error.
 pub struct SpillSender {
     memory_limit: usize,
-    max_disk_bytes: u64,
+    managed_spill_file: Option<RefCountedTempFile>,
     schema: Arc<Schema>,
     path: PathBuf,
     state: SpillState,
@@ -583,7 +586,7 @@ impl SpillSender {
                     let writer = AsyncStreamWriter::open(
                         self.path.clone(),
                         self.schema.clone(),
-                        self.max_disk_bytes,
+                        self.managed_spill_file.clone(),
                     )
                     .await?;
                     let batches_written = batches.len();
@@ -685,19 +688,22 @@ impl SpillSender {
 /// An async wrapper around [`StreamWriter`]. Each call uses [`tokio::task::spawn_blocking`]
 /// to spawn a blocking task to write the batch.
 struct AsyncStreamWriter {
-    writer: Arc<Mutex<StreamWriter<DiskQuotaWriter<BufWriter<std::fs::File>>>>>,
+    writer: Arc<Mutex<TrackedStreamWriter>>,
 }
 
 impl AsyncStreamWriter {
     pub async fn open(
         path: PathBuf,
         schema: Arc<Schema>,
-        max_disk_bytes: u64,
+        managed_spill_file: Option<RefCountedTempFile>,
     ) -> Result<Self, ArrowError> {
         let writer = tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::create(&path).map_err(ArrowError::from)?;
-            let writer = DiskQuotaWriter::new(BufWriter::new(file), max_disk_bytes);
-            StreamWriter::try_new(writer, &schema)
+            let file = if let Some(spill_file) = managed_spill_file.as_ref() {
+                spill_file.inner().reopen().map_err(ArrowError::from)?
+            } else {
+                std::fs::File::create(&path).map_err(ArrowError::from)?
+            };
+            TrackedStreamWriter::try_new(file, &schema, managed_spill_file)
         })
         .await
         .unwrap()?;
@@ -709,8 +715,7 @@ impl AsyncStreamWriter {
         let writer = self.writer.clone();
         tokio::task::spawn_blocking(move || {
             let mut writer = writer.lock().unwrap();
-            writer.write(&batch)?;
-            writer.flush()
+            writer.write(&batch)
         })
         .await
         .unwrap()
@@ -727,48 +732,44 @@ impl AsyncStreamWriter {
     }
 }
 
-struct DiskQuotaWriter<W> {
-    inner: W,
-    bytes_written: u64,
-    max_bytes: u64,
+struct TrackedStreamWriter {
+    writer: StreamWriter<BufWriter<std::fs::File>>,
+    managed_spill_file: Option<RefCountedTempFile>,
 }
 
-impl<W> DiskQuotaWriter<W> {
-    fn new(inner: W, max_bytes: u64) -> Self {
-        Self {
-            inner,
-            bytes_written: 0,
-            max_bytes,
+impl TrackedStreamWriter {
+    fn try_new(
+        file: std::fs::File,
+        schema: &Schema,
+        managed_spill_file: Option<RefCountedTempFile>,
+    ) -> Result<Self, ArrowError> {
+        let writer = StreamWriter::try_new(BufWriter::new(file), schema)?;
+        let mut tracked = Self {
+            writer,
+            managed_spill_file,
+        };
+        tracked.flush_and_update_disk_usage()?;
+        Ok(tracked)
+    }
+
+    fn write(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
+        self.writer.write(batch)?;
+        self.flush_and_update_disk_usage()
+    }
+
+    fn finish(&mut self) -> Result<(), ArrowError> {
+        self.writer.finish()?;
+        self.flush_and_update_disk_usage()
+    }
+
+    fn flush_and_update_disk_usage(&mut self) -> Result<(), ArrowError> {
+        self.writer.flush()?;
+        if let Some(spill_file) = self.managed_spill_file.as_mut() {
+            spill_file
+                .update_disk_usage()
+                .map_err(|error| ArrowError::ExternalError(Box::new(error)))?;
         }
-    }
-
-    fn quota_error(&self) -> std::io::Error {
-        std::io::Error::other(format!(
-            "replay spill exceeded maximum temporary directory size of {} bytes",
-            self.max_bytes
-        ))
-    }
-}
-
-impl<W: Write> Write for DiskQuotaWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let remaining = self.max_bytes.saturating_sub(self.bytes_written);
-        if remaining == 0 && !buf.is_empty() {
-            return Err(self.quota_error());
-        }
-        let allowed = buf
-            .len()
-            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-        let written = self.inner.write(&buf[..allowed])?;
-        self.bytes_written = self
-            .bytes_written
-            .checked_add(written as u64)
-            .ok_or_else(|| self.quota_error())?;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        Ok(())
     }
 }
 
@@ -1055,7 +1056,13 @@ mod tests {
             futures::stream::iter([Ok(batch)]),
         ));
 
-        let provider = spilling_table_provider_with_disk_limit(source, 0, 64)
+        let disk_manager = Arc::new(
+            DiskManager::builder()
+                .with_max_temp_directory_size(64)
+                .build()
+                .unwrap(),
+        );
+        let provider = spilling_table_provider_with_disk_manager(source, 0, disk_manager)
             .await
             .unwrap();
         let error = provider_to_stream(provider)
@@ -1066,9 +1073,69 @@ mod tests {
             .unwrap_err();
         let message = error.to_string();
         assert!(
-            message.contains("maximum temporary directory size of 64 bytes"),
+            message.contains("exceeded the allowable limit"),
             "unexpected replay quota error: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_spilling_table_providers_share_disk_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1; 1024]))],
+        )
+        .unwrap();
+        let serialized_size = {
+            let mut buffer = Vec::new();
+            let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+            drop(writer);
+            u64::try_from(buffer.len()).unwrap()
+        };
+        let disk_manager = Arc::new(
+            DiskManager::builder()
+                .with_max_temp_directory_size(serialized_size * 2 - 1)
+                .build()
+                .unwrap(),
+        );
+
+        let source = |batch: RecordBatch| {
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter([Ok(batch)]),
+            )) as SendableRecordBatchStream
+        };
+        let first = spilling_table_provider_with_disk_manager(
+            source(batch.clone()),
+            0,
+            disk_manager.clone(),
+        )
+        .await
+        .unwrap();
+        provider_to_stream(first.clone())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let second =
+            spilling_table_provider_with_disk_manager(source(batch), 0, disk_manager.clone())
+                .await
+                .unwrap();
+        let error = provider_to_stream(second)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded the allowable limit"),
+            "unexpected shared replay quota error: {error}"
+        );
+        drop(first);
     }
 
     #[tokio::test]
@@ -1082,7 +1149,13 @@ mod tests {
         });
         let source = Box::pin(RecordBatchStreamAdapter::new(schema, pending_source));
 
-        let provider = spilling_table_provider_with_disk_limit(source, 0, 1024)
+        let disk_manager = Arc::new(
+            DiskManager::builder()
+                .with_max_temp_directory_size(1024)
+                .build()
+                .unwrap(),
+        );
+        let provider = spilling_table_provider_with_disk_manager(source, 0, disk_manager)
             .await
             .unwrap();
         tokio::task::yield_now().await;

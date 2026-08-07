@@ -681,14 +681,26 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
+    let session_ctx = get_session_context(&options);
+    execute_plan_with_session_context(plan, options, &session_ctx)
+}
+
+/// Executes a plan with an existing session context.
+///
+/// This is useful when resources created outside the physical plan, such as
+/// replay spill files, must share the context's memory or disk managers with
+/// operators in the plan. `options` must describe the supplied context.
+pub fn execute_plan_with_session_context(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    session_ctx: &SessionContext,
+) -> Result<SendableRecordBatchStream> {
     if !options.skip_logging {
         debug!(
             "Executing plan:\n{}",
             DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
         );
     }
-
-    let session_ctx = get_session_context(&options);
 
     // Coalesce to a single partition if the optimizer left more than one.
     // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
@@ -708,7 +720,7 @@ pub fn execute_plan(
         Arc::new(CoalescePartitionsExec::new(plan))
     };
 
-    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
+    let stream = plan.execute(0, get_task_context(session_ctx, &options))?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {

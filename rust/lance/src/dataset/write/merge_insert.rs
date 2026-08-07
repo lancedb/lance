@@ -35,6 +35,10 @@ const MERGE_ACTION_COLUMN: &str = "__action";
 // to determine which side each row came from.  The sentinel is stripped by
 // `prepare_stream_schema` and never written to the dataset.
 pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
+/// Row cap for indexed external-sort output batches; payload rows may be wide.
+const INDEXED_JOIN_BATCH_ROWS: usize = 128;
+/// Byte cap for indexed sort input batches and in-memory replay buffers.
+const MAX_INDEXED_JOIN_BATCH_BYTES: usize = 25 * 1024 * 1024;
 
 pub mod inserted_rows;
 
@@ -114,9 +118,9 @@ use lance_datafusion::{
     dataframe::BatchStreamGrouper,
     exec::{
         HardCapBatchSizeExec, LanceExecutionOptions, OneShotPartitionStream, analyze_plan,
-        execute_plan, get_session_context, provider_to_stream,
+        execute_plan_with_session_context, get_session_context, provider_to_stream,
     },
-    spill::spilling_table_provider_with_disk_limit,
+    spill::spilling_table_provider_with_disk_manager,
     utils::{StreamingWriteSource, reader_to_stream},
 };
 use lance_file::version::LanceFileVersion;
@@ -481,6 +485,25 @@ pub struct MergeInsertJob {
     dataset: Arc<Dataset>,
     // The parameters controlling how to merge the two streams
     params: MergeInsertParams,
+    // Held for the job's lifetime so indexed replay and sort spills share one
+    // aggregate DiskManager quota, including across commit retries.
+    indexed_execution_context: SessionContext,
+    indexed_execution_options: LanceExecutionOptions,
+}
+
+fn indexed_join_execution_options() -> LanceExecutionOptions {
+    let options = LanceExecutionOptions {
+        use_spilling: true,
+        batch_size: Some(INDEXED_JOIN_BATCH_ROWS),
+        ..Default::default()
+    };
+    // Resolve environment-backed limits once so the held context and every
+    // execution attempt use exactly the same resource configuration.
+    LanceExecutionOptions {
+        mem_pool_size: Some(options.mem_pool_size()),
+        max_temp_directory_size: Some(options.max_temp_directory_size()),
+        ..options
+    }
 }
 
 /// Build a merge insert operation.
@@ -789,9 +812,13 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
+        let indexed_execution_options = indexed_join_execution_options();
+        let indexed_execution_context = get_session_context(&indexed_execution_options);
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
+            indexed_execution_context,
+            indexed_execution_options,
         })
     }
 }
@@ -974,6 +1001,22 @@ impl SequentialSourcePartitionStream {
             ordinal_field,
         })
     }
+
+    /// Obtain one provider scan and normalize its partitions into a single,
+    /// deterministic stream. Call this once per consumer so re-scannable
+    /// providers retain `TableProvider::scan()` as their replay boundary.
+    async fn from_provider_scan(
+        provider: &Arc<dyn TableProvider>,
+        context: &SessionContext,
+        ordinal_field: Option<Field>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let input = provider.scan(&context.state(), None, &[], None).await?;
+        let partition = Arc::new(Self::try_new(input, ordinal_field)?);
+        Ok(Arc::new(StreamingTable::try_new(
+            partition.schema().clone(),
+            vec![partition],
+        )?))
+    }
 }
 
 impl PartitionStream for SequentialSourcePartitionStream {
@@ -1142,53 +1185,62 @@ impl MergeInsertJob {
                 }
                 name
             });
-        /// Row cap for external-sort output batches; payload rows may be wide.
-        const JOIN_BATCH_ROWS: usize = 128;
-        /// Byte cap for sort input batches and in-memory replay buffers.
-        const MAX_JOIN_BATCH_BYTES: usize = 25 * 1024 * 1024;
-        let execution_options = LanceExecutionOptions {
-            use_spilling: true,
-            batch_size: Some(JOIN_BATCH_ROWS),
-            ..Default::default()
-        };
-        let max_batch_bytes =
-            ((execution_options.mem_pool_size() as usize) / 8).clamp(1, MAX_JOIN_BATCH_BYTES);
-        let max_temp_directory_size = execution_options.max_temp_directory_size();
-        let session_ctx = SessionContext::new();
-        let source_plan = source_provider
-            .scan(&session_ctx.state(), None, &[], None)
-            .await?;
+        let execution_options = self.indexed_execution_options.clone();
+        let max_batch_bytes = ((execution_options.mem_pool_size() as usize) / 8)
+            .clamp(1, MAX_INDEXED_JOIN_BATCH_BYTES);
+        let session_ctx = &self.indexed_execution_context;
+        let disk_manager = session_ctx.runtime_env().disk_manager.clone();
         let ordinal_field = source_ordinal_column
             .as_ref()
             .map(|name| Field::new(name, DataType::UInt64, false));
-        let sequential_source = Arc::new(SequentialSourcePartitionStream::try_new(
-            source_plan,
-            ordinal_field,
-        )?);
-        let normalized_source: Arc<dyn TableProvider> = Arc::new(StreamingTable::try_new(
-            sequential_source.schema().clone(),
-            vec![sequential_source],
-        )?);
 
-        // A genuine provider can serve both the index probe and final join
-        // directly. Only a one-shot provider needs a replay spill here.
-        let replayable_source = if source_is_replayable {
-            normalized_source
+        // A genuine provider is re-scanned independently for the index probe
+        // and final join. A one-shot provider is scanned exactly once, then its
+        // normalized stream is replayed for those two consumers.
+        let (source_input, index_input) = if source_is_replayable {
+            let source_scan = SequentialSourcePartitionStream::from_provider_scan(
+                &source_provider,
+                session_ctx,
+                ordinal_field.clone(),
+            )
+            .await?;
+            let index_scan = SequentialSourcePartitionStream::from_provider_scan(
+                &source_provider,
+                session_ctx,
+                ordinal_field,
+            )
+            .await?;
+            (
+                source_scan
+                    .scan(&session_ctx.state(), None, &[], None)
+                    .await?,
+                index_scan
+                    .scan(&session_ctx.state(), None, &[], None)
+                    .await?,
+            )
         } else {
+            let normalized_source = SequentialSourcePartitionStream::from_provider_scan(
+                &source_provider,
+                session_ctx,
+                ordinal_field,
+            )
+            .await?;
             let source = provider_to_stream(normalized_source).await?;
-            spilling_table_provider_with_disk_limit(
+            let replayable_source = spilling_table_provider_with_disk_manager(
                 source,
                 max_batch_bytes,
-                max_temp_directory_size,
+                disk_manager.clone(),
             )
-            .await?
+            .await?;
+            (
+                replayable_source
+                    .scan(&session_ctx.state(), None, &[], None)
+                    .await?,
+                replayable_source
+                    .scan(&session_ctx.state(), None, &[], None)
+                    .await?,
+            )
         };
-        let source_input = replayable_source
-            .scan(&session_ctx.state(), None, &[], None)
-            .await?;
-        let index_input = replayable_source
-            .scan(&session_ctx.state(), None, &[], None)
-            .await?;
 
         // 3 - Probe every indexed join column.  For composite keys this is
         //     the AND of one `IsIn` query per indexed column, which yields
@@ -1215,13 +1267,14 @@ impl MergeInsertJob {
         // rows. Otherwise its retained candidate set competes with both sorts
         // for the same pool. Replaying these row addresses is inexpensive and
         // spills when needed.
-        let mapped_rows = execute_plan(index_mapper, execution_options.clone())?;
-        let mapped_rows = spilling_table_provider_with_disk_limit(
-            mapped_rows,
-            max_batch_bytes,
-            max_temp_directory_size,
-        )
-        .await?;
+        let mapped_rows = execute_plan_with_session_context(
+            index_mapper,
+            execution_options.clone(),
+            session_ctx,
+        )?;
+        let mapped_rows =
+            spilling_table_provider_with_disk_manager(mapped_rows, max_batch_bytes, disk_manager)
+                .await?;
         let mut initial_scan = provider_to_stream(mapped_rows.clone()).await?;
         while initial_scan.try_next().await?.is_some() {}
         drop(initial_scan);
@@ -1397,7 +1450,7 @@ impl MergeInsertJob {
         } else {
             joined
         };
-        execute_plan(joined, execution_options)
+        execute_plan_with_session_context(joined, execution_options, session_ctx)
     }
 
     fn prefix_columns(df: DataFrame, prefix: &str) -> DataFrame {
@@ -2138,14 +2191,14 @@ impl MergeInsertJob {
     ) -> Result<(Arc<dyn TableProvider>, bool)> {
         if self.params.conflict_retries > 0 && self.params.spill_for_retry {
             // Allow buffering up to 100MB in memory before spilling to disk.
-            let max_temp_directory_size =
-                LanceExecutionOptions::default().max_temp_directory_size();
-            let provider = spilling_table_provider_with_disk_limit(
-                source,
-                100 * 1024 * 1024,
-                max_temp_directory_size,
-            )
-            .await?;
+            let disk_manager = self
+                .indexed_execution_context
+                .runtime_env()
+                .disk_manager
+                .clone();
+            let provider =
+                spilling_table_provider_with_disk_manager(source, 100 * 1024 * 1024, disk_manager)
+                    .await?;
             Ok((provider, true))
         } else {
             Ok((one_shot_provider(source)?, false))
@@ -3507,6 +3560,7 @@ mod tests {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
+    use async_trait::async_trait;
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
@@ -3527,6 +3581,41 @@ mod tests {
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    /// Returns a fresh one-shot physical plan for every provider scan. This
+    /// catches callers that incorrectly execute one scan plan more than once.
+    #[derive(Debug)]
+    struct FreshOneShotPlanProvider {
+        batch: RecordBatch,
+    }
+
+    #[async_trait]
+    impl TableProvider for FreshOneShotPlanProvider {
+        fn schema(&self) -> Arc<Schema> {
+            self.batch.schema()
+        }
+
+        fn table_type(&self) -> datafusion::logical_expr::TableType {
+            datafusion::logical_expr::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            session: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            let schema = self.batch.schema();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter([Ok(self.batch.clone())]),
+            ));
+            let partition = Arc::new(OneShotPartitionStream::new(stream));
+            let provider = StreamingTable::try_new(schema, vec![partition])?;
+            provider.scan(session, projection, filters, limit).await
+        }
     }
 
     #[test]
@@ -4926,6 +5015,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n_indexed, UPD, "expected {UPD} rows flipped to 'indexed'");
+    }
+
+    #[tokio::test]
+    async fn test_indexed_merge_rescans_provider_instead_of_reexecuting_plan() {
+        let initial =
+            record_batch!(("id", UInt32, [0, 1, 2]), ("value", UInt32, [0, 0, 0])).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let source = record_batch!(("id", UInt32, [1]), ("value", UInt32, [10])).unwrap();
+        let provider: Arc<dyn TableProvider> = Arc::new(FreshOneShotPlanProvider { batch: source });
+
+        let (dataset, stats) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_provider(provider)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<UInt32Type>();
+        let values = batch["value"].as_primitive::<UInt32Type>();
+        let rows = ids
+            .values()
+            .iter()
+            .zip(values.values())
+            .map(|(id, value)| (*id, *value))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(rows, HashMap::from([(0, 0), (1, 10), (2, 0)]));
     }
 
     #[tokio::test]
