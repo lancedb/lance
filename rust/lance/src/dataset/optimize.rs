@@ -260,10 +260,11 @@ pub struct CompactionOptions {
     /// Controls how much data is read at once when performing binary copy.
     /// Defaults to 16MB (16 * 1024 * 1024).
     pub binary_copy_read_batch_bytes: Option<usize>,
-    /// Maximum number of source fragments to compact in a single run. When set,
-    /// tasks are included in the plan until adding the next task would exceed
-    /// this limit. This allows for incremental compaction (e.g., compact 20
-    /// fragments at a time).
+    /// Maximum number of fragments whose identities may change in a single run.
+    /// This includes compacted source fragments and any following fragments that
+    /// must be relabeled to preserve row order. The planner selects candidates
+    /// from a suffix within this limit, allowing bounded incremental compaction
+    /// without unbounded index remapping or metadata churn.
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
     /// Maximum number of data overlay files a fragment may carry before it is
@@ -808,7 +809,27 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let all_tasks: Vec<TaskData> = candidate_bins
+        if let Some(max_frags) = self.options.max_source_fragments {
+            let suffix_start = dataset.manifest.fragments.len().saturating_sub(max_frags);
+            candidate_bins = candidate_bins
+                .into_iter()
+                .filter_map(|mut bin| {
+                    if bin.pos_range.end <= suffix_start {
+                        return None;
+                    }
+                    let skip = suffix_start.saturating_sub(bin.pos_range.start);
+                    if skip > 0 {
+                        bin.fragments.drain(..skip);
+                        bin.candidacy.drain(..skip);
+                        bin.row_counts.drain(..skip);
+                        bin.pos_range.start += skip;
+                    }
+                    (!bin.is_noop()).then_some(bin)
+                })
+                .collect();
+        }
+
+        let tasks: Vec<TaskData> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
@@ -816,19 +837,6 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 fragments: bin.fragments,
             })
             .collect();
-
-        let tasks = if let Some(max_frags) = self.options.max_source_fragments {
-            let mut total_frags = 0;
-            all_tasks
-                .into_iter()
-                .take_while(|task| {
-                    total_frags += task.fragments.len();
-                    total_frags <= max_frags
-                })
-                .collect()
-        } else {
-            all_tasks
-        };
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
@@ -1734,7 +1742,7 @@ fn rebase_task_source_fragments(
 fn complete_rewrite_suffix(
     manifest_fragments: &[Fragment],
     completed_tasks: Vec<RewriteResult>,
-    capture_row_addrs: bool,
+    max_affected_fragments: Option<usize>,
     read_version: u64,
     current_version: u64,
 ) -> Result<Vec<RewriteResult>> {
@@ -1795,6 +1803,21 @@ fn complete_rewrite_suffix(
     let Some(first_position) = positioned_tasks.first().map(|(start, _, _)| *start) else {
         return Ok(Vec::new());
     };
+    let affected_fragments = manifest_fragments.len() - first_position;
+    if let Some(max_frags) = max_affected_fragments
+        && affected_fragments > max_frags
+    {
+        let message = format!(
+            "compaction would change {affected_fragments} fragment identities, exceeding max_source_fragments={max_frags}"
+        );
+        if read_version < current_version {
+            return Err(Error::retryable_commit_conflict_source(
+                current_version,
+                message.into(),
+            ));
+        }
+        return Err(Error::invalid_input(message));
+    }
     let mut completed_suffix = Vec::with_capacity(
         positioned_tasks.len() + manifest_fragments.len().saturating_sub(first_position),
     );
@@ -1816,17 +1839,12 @@ fn complete_rewrite_suffix(
         }
 
         let fragment = manifest_fragments[position].clone();
-        let row_addrs = if capture_row_addrs {
-            Some(serialize_fragment_row_addrs(&fragment)?)
-        } else {
-            None
-        };
         completed_suffix.push(RewriteResult {
             metrics: CompactionMetrics::default(),
             new_fragments: vec![fragment.clone()],
             read_version,
             original_fragments: vec![fragment],
-            row_addrs,
+            row_addrs: None,
         });
         position += 1;
     }
@@ -1849,6 +1867,47 @@ fn is_metadata_only_relabel(task: &RewriteResult) -> bool {
     let mut relabeled_fragment = new_fragment.clone();
     relabeled_fragment.id = old_fragment.id;
     relabeled_fragment == *old_fragment
+}
+
+async fn prepare_metadata_only_relabels(
+    dataset: &Dataset,
+    completed_tasks: &mut [RewriteResult],
+) -> Result<()> {
+    let relabel_task_indices = completed_tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, task)| is_metadata_only_relabel(task).then_some(index))
+        .collect::<Vec<_>>();
+    if relabel_task_indices.is_empty() {
+        return Ok(());
+    }
+
+    let relabeled_fragments = relabel_task_indices
+        .iter()
+        .map(|index| completed_tasks[*index].original_fragments[0].clone())
+        .collect::<Vec<_>>();
+    // Manifests written before writer-version metadata may contain missing or
+    // inaccurate row counts. Recompute those bounded suffix fragments before
+    // their physical addresses are serialized.
+    let recompute_stats = dataset.manifest.writer_version.is_none();
+    let migrated_fragments =
+        migrate_fragments(dataset, &relabeled_fragments, recompute_stats).await?;
+    if migrated_fragments.len() != relabel_task_indices.len() {
+        return Err(Error::invalid_input(
+            "cannot preserve compaction order because a trailing fragment became empty during metadata migration"
+                .to_string(),
+        ));
+    }
+
+    for (task_index, migrated_fragment) in relabel_task_indices.into_iter().zip(migrated_fragments)
+    {
+        let row_addrs = serialize_fragment_row_addrs(&migrated_fragment)?;
+        let task = &mut completed_tasks[task_index];
+        task.original_fragments[0] = migrated_fragment.clone();
+        task.new_fragments[0] = migrated_fragment;
+        task.row_addrs = Some(row_addrs);
+    }
+    Ok(())
 }
 
 async fn copy_relabeled_deletion_files(
@@ -2374,10 +2433,13 @@ pub async fn commit_compaction(
     let mut completed_tasks = complete_rewrite_suffix(
         &dataset.manifest.fragments,
         completed_tasks,
-        capture_row_addrs,
+        options.max_source_fragments,
         tasks_read_version,
         dataset.manifest.version,
     )?;
+    if capture_row_addrs {
+        prepare_metadata_only_relabels(dataset, &mut completed_tasks).await?;
+    }
     let has_address_style = completed_tasks.iter().any(|task| task.row_addrs.is_some());
     let needs_remapping = !uses_stable_row_ids && !options.defer_index_remap && has_address_style;
     // Confirm there is a remapper before materializing the potentially very large row address map.
@@ -2606,7 +2668,7 @@ mod tests {
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
@@ -7326,8 +7388,8 @@ mod tests {
             plan_all.num_tasks()
         );
 
-        // Plan with max_source_fragments=4 should include tasks covering <= 4
-        // source fragments
+        // Plan with max_source_fragments=4 should only affect a suffix of at
+        // most four fragments, including any required metadata relabels.
         let opts_bounded = CompactionOptions {
             target_rows_per_fragment: 250,
             max_source_fragments: Some(4),
@@ -7349,7 +7411,8 @@ mod tests {
             .iter()
             .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
             .collect::<Vec<_>>();
-        let expected_fragment_ids = dataset.manifest.fragments[..bounded_source_frags]
+        let expected_fragment_ids = dataset.manifest.fragments
+            [dataset.manifest.fragments.len() - bounded_source_frags..]
             .iter()
             .map(|fragment| fragment.id)
             .collect::<Vec<_>>();
@@ -7398,7 +7461,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_bounded_compaction_preserves_order_across_candidate_gap(
+    async fn test_partial_compaction_preserves_order_across_candidate_gap(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
@@ -7439,7 +7502,6 @@ mod tests {
         let expected = dataset.scan().try_into_batch().await.unwrap();
         let options = CompactionOptions {
             target_rows_per_fragment: 250,
-            max_source_fragments: Some(2),
             ..Default::default()
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
@@ -7448,11 +7510,20 @@ mod tests {
             .iter()
             .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
             .collect::<Vec<_>>();
-        assert_eq!(planned_fragment_ids, vec![0, 1]);
+        assert_eq!(planned_fragment_ids, vec![0, 1, 3, 4]);
+        let tasks = plan.compaction_tasks().collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 2);
+        let first_result = tasks[0].execute(&dataset).await.unwrap();
+        let second_result = tasks[1].execute(&dataset).await.unwrap();
 
-        compact_files(&mut dataset, options.clone(), None)
-            .await
-            .unwrap();
+        commit_compaction(
+            &mut dataset,
+            vec![first_result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(dataset.get_fragments().len(), 4);
         let fragment_ids = dataset
@@ -7474,19 +7545,72 @@ mod tests {
         let after_first = dataset.scan().try_into_batch().await.unwrap();
         assert_eq!(after_first, expected);
 
-        let second_plan = plan_compaction(&dataset, &options).await.unwrap();
-        let second_fragment_ids = second_plan
-            .tasks()
-            .iter()
-            .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
-            .collect::<Vec<_>>();
-        assert_eq!(second_fragment_ids, vec![7, 8]);
-
-        compact_files(&mut dataset, options, None).await.unwrap();
+        commit_compaction(
+            &mut dataset,
+            vec![second_result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
 
         let compacted = dataset.scan().try_into_batch().await.unwrap();
         assert_eq!(compacted, expected);
         assert_eq!(dataset.get_fragments().len(), 3);
+    }
+
+    #[test]
+    fn test_complete_rewrite_suffix_respects_max_source_fragments() {
+        let mut source = Fragment::new(0);
+        source.physical_rows = Some(1);
+        let mut trailing = Fragment::new(1);
+        trailing.physical_rows = Some(100_000);
+        let task = RewriteResult {
+            metrics: CompactionMetrics::default(),
+            new_fragments: vec![Fragment::new(2)],
+            read_version: 1,
+            original_fragments: vec![source.clone()],
+            row_addrs: None,
+        };
+
+        let error =
+            complete_rewrite_suffix(&[source, trailing], vec![task], Some(1), 1, 1).unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            message.contains(
+                "compaction would change 2 fragment identities, exceeding max_source_fragments=1"
+            ),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_only_relabel_migrates_released_fragment_stats() {
+        let test_dir = copy_test_data_to_tmp("v0.7.5/with_deletions").unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+        assert!(dataset.manifest.writer_version.is_none());
+        let trailing = dataset.manifest.fragments[0].clone();
+        assert_eq!(trailing.physical_rows, None);
+        let mut tasks = vec![RewriteResult {
+            metrics: CompactionMetrics::default(),
+            new_fragments: vec![trailing.clone()],
+            read_version: dataset.version().version,
+            original_fragments: vec![trailing],
+            row_addrs: None,
+        }];
+
+        prepare_metadata_only_relabels(&dataset, &mut tasks)
+            .await
+            .unwrap();
+
+        assert_eq!(tasks[0].original_fragments[0].physical_rows, Some(100));
+        assert_eq!(tasks[0].new_fragments[0].physical_rows, Some(100));
+        let row_addrs = RoaringTreemap::deserialize_from(&mut Cursor::new(
+            tasks[0].row_addrs.as_ref().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(row_addrs.len(), 100);
     }
 
     #[tokio::test]
