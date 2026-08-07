@@ -36,7 +36,7 @@ A Lance dataset in its basic form stores all files within the dataset root direc
         branches/
             *.json        -- Branch metadata
     tree/
-        {branch_name}/
+        {branch_storage_id}/
             ...           -- Branch dataset
             
 ```
@@ -213,4 +213,3 @@ The optional file `_versions/latest_version_hint.json` records the latest commit
 It exists to accelerate latest-version discovery on stores where listing `_versions/` is expensive: a reader can read the hint and probe higher versions with HEAD requests instead of listing the whole directory, falling back to a full listing if the hint is missing or stale.
 
 The hint is purely an optimization. It is always safe to delete, never affects correctness, and can be ignored by readers that don't understand it. Writers may choose not to write it.
-

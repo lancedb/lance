@@ -670,7 +670,7 @@ impl DatasetBuilder {
         };
 
         let target_ref = self.version.clone();
-        let table_uri = self.table_uri.clone();
+        let mut table_uri = self.table_uri.clone();
 
         // How do we detect which version scheme is in use?
         let manifest = self.manifest.take();
@@ -687,7 +687,30 @@ impl DatasetBuilder {
         let managed_store_active =
             self.namespace_managed.is_some() && self.commit_handler.is_none();
 
-        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+        let (object_store, mut base_path, commit_handler) = self.build_object_store().await?;
+
+        // Keep logical branch URLs (`<root>/tree/<branch-name>`) working after branch storage is
+        // moved under an opaque UUID. Physical UUID URLs retain their path while recovering the
+        // logical branch name from metadata when one exists.
+        if let Some((root_path, path_branch)) =
+            BranchLocation::split_branch_path(base_path.as_ref())
+            && let Some((root_uri, uri_branch)) = BranchLocation::split_branch_path(&table_uri)
+            && path_branch == uri_branch
+        {
+            let root_location = BranchLocation {
+                path: Path::parse(root_path)?,
+                uri: root_uri,
+                branch: None,
+            };
+            let refs = Refs::new(
+                object_store.clone(),
+                commit_handler.clone(),
+                root_location.clone(),
+            );
+            let location = refs.branches().resolve_path_location(&path_branch).await?;
+            base_path = location.path;
+            table_uri = location.uri;
+        }
 
         // Two cases that need to check out after loading the manifest:
         // 1. If the target is configured as a branch, we need to check the branch field in the manifest
@@ -758,12 +781,16 @@ impl DatasetBuilder {
         // (data placement, refs and the path-derived store branch all follow the
         // base path).
         let (base_path, table_uri) = if managed_store_active && branch.is_some() {
-            let branch_location = BranchLocation {
-                path: base_path,
-                uri: table_uri,
-                branch: None,
-            }
-            .find_branch(branch.as_deref())?;
+            let refs = Refs::new(
+                object_store.clone(),
+                commit_handler.clone(),
+                BranchLocation {
+                    path: base_path,
+                    uri: table_uri,
+                    branch: None,
+                },
+            );
+            let branch_location = refs.branches().resolve_location(branch.as_deref()).await?;
             (branch_location.path, branch_location.uri)
         } else {
             (base_path, table_uri)

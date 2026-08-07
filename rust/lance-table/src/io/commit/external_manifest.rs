@@ -42,6 +42,9 @@ use crate::io::commit::{CommitError, CommitHandler};
 /// <https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04>
 #[async_trait]
 pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
+    /// Associate an opaque physical dataset path with its logical branch name.
+    fn register_branch_path(&self, _base_path: &Path, _branch: Option<&str>) {}
+
     /// Get the manifest path for a given base_uri and version
     async fn get(&self, base_uri: &str, version: u64) -> Result<String>;
 
@@ -483,6 +486,11 @@ impl ExternalManifestCommitHandler {
 
 #[async_trait]
 impl CommitHandler for ExternalManifestCommitHandler {
+    fn register_branch_path(&self, base_path: &Path, branch: Option<&str>) {
+        self.external_manifest_store
+            .register_branch_path(base_path, branch);
+    }
+
     async fn resolve_latest_location(
         &self,
         base_path: &Path,

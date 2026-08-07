@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use lance_core::Result;
@@ -40,6 +41,7 @@ pub struct LanceNamespaceExternalManifestStore {
     /// trait methods receive is resolved against this to derive which branch a
     /// request targets, so a single store serves every branch of the table.
     table_root: Path,
+    branch_paths: RwLock<HashMap<String, Option<String>>>,
 }
 
 impl LanceNamespaceExternalManifestStore {
@@ -52,6 +54,7 @@ impl LanceNamespaceExternalManifestStore {
             namespace_client,
             table_id,
             table_root,
+            branch_paths: RwLock::new(HashMap::new()),
         }
     }
 
@@ -74,12 +77,25 @@ impl LanceNamespaceExternalManifestStore {
     /// path layout is owned by [`BranchLocation`]; this store never parses or
     /// constructs it directly.
     fn branch_for_base(&self, base: &str) -> Result<Option<String>> {
+        if let Ok(branch_paths) = self.branch_paths.read()
+            && let Some(branch) = branch_paths.get(base)
+        {
+            return Ok(branch.clone());
+        }
         BranchLocation::branch_of(self.table_root.as_ref(), base)
     }
 }
 
 #[async_trait]
 impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
+    fn register_branch_path(&self, base_path: &Path, branch: Option<&str>) {
+        if let Ok(mut branch_paths) = self.branch_paths.write() {
+            branch_paths.insert(base_path.to_string(), branch.map(ToString::to_string));
+        } else {
+            log::warn!("Could not register branch path because the path map lock is poisoned");
+        }
+    }
+
     async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
         let request = DescribeTableVersionRequest {
             id: Some(self.table_id.clone()),
@@ -294,5 +310,18 @@ mod tests {
                 latest
             );
         }
+    }
+
+    #[test]
+    fn test_registered_branch_path() {
+        let store = store_with(|| lance_core::Error::io("unused".to_string()));
+        let storage_path =
+            Path::parse("data/t.lance/tree/34e6c4b343a84a7ca40295852ed4d5d8").unwrap();
+        store.register_branch_path(&storage_path, Some("feature/dev"));
+
+        assert_eq!(
+            store.branch_for_base(storage_path.as_ref()).unwrap(),
+            Some("feature/dev".to_string())
+        );
     }
 }

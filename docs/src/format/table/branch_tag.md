@@ -34,15 +34,64 @@ Since branch names support hierarchical naming with `/` characters, the `/` is U
 
 ### Branch Metadata File Format
 
-Each branch metadata file is a JSON file with the following fields:
+Each branch metadata file is a JSON object with this schema:
 
-| JSON Key         | Type   | Optional | Description                                                                    |
-|------------------|--------|----------|--------------------------------------------------------------------------------|
-| `parentBranch`   | string | Yes      | Name of the branch this was created from. `null` indicates branched from main. |
-| `parentVersion`  | number |          | Version number of the parent branch at the time this branch was created.       |
-| `createAt`       | number |          | Unix timestamp (seconds since epoch) when the branch was created.              |
-| `manifestSize`   | number |          | Size of the initial manifest file in bytes.                                    |
-| `metadata`       | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object.    |
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "parentVersion",
+    "createAt",
+    "manifestSize"
+  ],
+  "properties": {
+    "parentBranch": {
+      "type": ["string", "null"]
+    },
+    "identifier": {
+      "type": "object",
+      "required": ["version_mapping"],
+      "properties": {
+        "version_mapping": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {"type": "integer", "minimum": 0},
+              {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+            ],
+            "items": false
+          }
+        }
+      }
+    },
+    "parentVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "createAt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "manifestSize": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    }
+  }
+}
+```
+
+`parentBranch` is `null` when the branch was created from `main`. `identifier` records the
+version and UUID for each branch in the lineage. The final UUID in `identifier.version_mapping`
+is the physical branch directory identifier for newly written branches. Metadata written before
+branch identifiers may omit `identifier` and `metadata`. Branches written before storage
+indirection can contain an identifier while still using their logical name as the physical path;
+readers detect and preserve that legacy layout.
 
 ### Branch Dataset Layout
 
@@ -52,7 +101,7 @@ Branch datasets are organized using the `tree/` directory at the dataset root:
 ```
 {dataset_root}/
     tree/
-        {branch_name}/
+        {storage_id}/
             _versions/
                 *.manifest
             _transactions/
@@ -65,22 +114,26 @@ Branch datasets are organized using the `tree/` directory at the dataset root:
                     index.idx
 ```
 
-Named branches store their version-specific files under `tree/{branch_name}/`, resembling the GitHub branch path convention.
-It uses the branch name as is to form the path, 
-which means `/` would create a logical subdirectory (e.g., `bugfix/issue-123`, `feature/user-auth`):
+Named branches store their version-specific files under `tree/{storage_id}/`. The metadata file is
+the mapping from a logical branch name to its physical UUID. The logical URL
+`{dataset_root}/tree/{branch_name}` remains a supported way to open a branch; the reader resolves
+it through the metadata before loading the physical dataset.
 
 ```
 {dataset_root}/
     tree/
-        feature-a/
+        34e6c4b343a84a7ca40295852ed4d5d8/
             _versions/
                 1.manifest
                 2.manifest
-        bugfix/
-            issue-123/
-                _versions/
-                    1.manifest
+        ecde70dc5d964b3b9626a1249682be52/
+            _versions/
+                1.manifest
 ```
+
+Deleting branch metadata releases its logical name immediately. If a descendant still references
+the branch, its UUID directory remains until no remaining branch lineage contains that UUID.
+Legacy name-based directories remain readable and use the legacy directory cleanup rules.
 
 ## Tagging
 

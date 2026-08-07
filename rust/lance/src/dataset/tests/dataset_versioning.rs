@@ -906,7 +906,25 @@ async fn test_branch() {
         .create_branch("branch1", original_version, None)
         .await
         .unwrap();
-    assert_eq!(branch1_dataset.uri, format!("{}/tree/branch1", test_uri));
+    let branch1_storage_id = dataset
+        .branches()
+        .get("branch1")
+        .await
+        .unwrap()
+        .identifier
+        .storage_id()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        branch1_dataset.uri,
+        format!("{}/tree/{}", test_uri, branch1_storage_id)
+    );
+    let branch1_physical_location = dataset
+        .branches()
+        .resolve_path_location(&branch1_storage_id)
+        .await
+        .unwrap();
+    assert_eq!(branch1_physical_location.branch.as_deref(), Some("branch1"));
 
     branch1_dataset = write_dataset(
         branch1_dataset.uri(),
@@ -925,9 +943,18 @@ async fn test_branch() {
         )
         .await
         .unwrap();
+    let branch2_storage_id = dataset
+        .branches()
+        .get("dev/branch2")
+        .await
+        .unwrap()
+        .identifier
+        .storage_id()
+        .unwrap()
+        .to_string();
     assert_eq!(
         branch2_dataset.uri,
-        format!("{}/tree/dev/branch2", test_uri)
+        format!("{}/tree/{}", test_uri, branch2_storage_id)
     );
 
     branch2_dataset = write_dataset(
@@ -950,9 +977,18 @@ async fn test_branch() {
         .create_branch("feature/nathan/branch3", "tag1", None)
         .await
         .unwrap();
+    let branch3_storage_id = dataset
+        .branches()
+        .get("feature/nathan/branch3")
+        .await
+        .unwrap()
+        .identifier
+        .storage_id()
+        .unwrap()
+        .to_string();
     assert_eq!(
         branch3_dataset.uri,
-        format!("{}/tree/feature/nathan/branch3", test_uri)
+        format!("{}/tree/{}", test_uri, branch3_storage_id)
     );
 
     branch3_dataset = write_dataset(
@@ -975,6 +1011,19 @@ async fn test_branch() {
     let (branch1_rows, _) = collect_rows(&updated_branch1).await;
     assert_eq!(branch1_rows, 80); // batch1+batch2
     assert_eq!(updated_branch1.version().version, 2);
+    let branch1_by_logical_uri = Dataset::open(&format!("{}/tree/branch1", test_uri))
+        .await
+        .unwrap();
+    assert_eq!(branch1_by_logical_uri.count_rows(None).await.unwrap(), 80);
+    let branch1_v1_by_logical_uri = DatasetBuilder::from_uri(format!("{}/tree/branch1", test_uri))
+        .with_version(1)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(
+        branch1_v1_by_logical_uri.count_rows(None).await.unwrap(),
+        50
+    );
 
     // branch2 has data 1 + 2 + 3 (100 rows)
     let updated_branch2 = Dataset::open(branch2_dataset.uri()).await.unwrap();
@@ -1156,11 +1205,33 @@ async fn test_branch() {
         .unwrap();
 
     let mut dataset = main_dataset;
-    // Finally delete all branches
-    assert!(matches!(
-        dataset.delete_branch("branch1").await,
-        Err(Error::RefConflict { message: _ })
-    ));
+    // A referenced branch can be deleted and its logical name reused without disturbing its
+    // descendant. The old physical directory remains until the descendant lineage is deleted.
+    dataset.delete_branch("branch1").await.unwrap();
+    dataset.force_delete_branch("branch1").await.unwrap();
+    let surviving_branch2 = dataset.checkout_branch("dev/branch2").await.unwrap();
+    assert_eq!(surviving_branch2.count_rows(None).await.unwrap(), 100);
+    let recreated_branch1 = dataset
+        .create_branch("branch1", original_version, None)
+        .await
+        .unwrap();
+    let recreated_storage_id = dataset
+        .branches()
+        .get("branch1")
+        .await
+        .unwrap()
+        .identifier
+        .storage_id()
+        .unwrap()
+        .to_string();
+    assert_ne!(recreated_storage_id, branch1_storage_id);
+    assert_eq!(recreated_branch1.count_rows(None).await.unwrap(), 50);
+    dataset.delete_branch("branch1").await.unwrap();
+    let recreated_path =
+        Path::parse(format!("{}/tree/{}", test_uri, recreated_storage_id)).unwrap();
+    assert!(!dataset.object_store.exists(&recreated_path).await.unwrap());
+
+    // Finally delete the remaining branches.
     // Test deleting zombie branch
     let root_location = dataset.refs.root().unwrap();
     let branch_file = branch_contents_path(&root_location.path, "feature/nathan/branch3");
@@ -1171,11 +1242,10 @@ async fn test_branch() {
         .force_delete_branch("feature/nathan/branch3")
         .await
         .unwrap();
-    let cleaned_path = Path::parse(format!("{}/tree/feature", test_uri)).unwrap();
+    let cleaned_path = Path::parse(format!("{}/tree/{}", test_uri, branch3_storage_id)).unwrap();
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
     dataset.delete_branch("dev/branch2").await.unwrap();
-    dataset.delete_branch("branch1").await.unwrap();
 
     // Verify list_branches is empty
     let branches_after_delete = dataset.list_branches().await.unwrap();

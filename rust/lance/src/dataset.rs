@@ -529,10 +529,25 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
-        let branch_location = self.branch_location().find_branch(Some(branch))?;
-        let source_location = self
+        let branch_contents = self
+            .branches()
+            .prepare_create(branch, version_number, source_branch.as_deref())
+            .await?;
+        let storage_id = branch_contents.identifier.storage_id().ok_or_else(|| {
+            Error::internal(format!(
+                "new branch '{}' is missing its physical storage identifier",
+                branch
+            ))
+        })?;
+        let branch_location = self
             .branch_location()
-            .find_branch(source_branch.as_deref())?;
+            .find_branch_at(Some(branch), Some(storage_id))?;
+        self.commit_handler
+            .register_branch_path(&branch_location.path, Some(branch));
+        let source_location = self
+            .branches()
+            .resolve_location(source_branch.as_deref())
+            .await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name: source_branch.clone(),
@@ -553,9 +568,7 @@ impl Dataset {
         let dataset = builder.execute(transaction).await?;
 
         // Create BranchContents after shallow_clone
-        self.branches()
-            .create(branch, version_number, source_branch.as_deref())
-            .await?;
+        self.branches().create(branch, branch_contents).await?;
         Ok(dataset)
     }
 
@@ -601,7 +614,7 @@ impl Dataset {
             refs::check_valid_branch(branch_name)?;
         }
 
-        let new_location = self.branch_location().find_branch(branch)?;
+        let new_location = self.branches().resolve_location(branch).await?;
 
         let manifest_location = if let Some(version_number) = version_number {
             self.commit_handler
@@ -3143,7 +3156,10 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
-        let source_location = self.branch_location().find_branch(ref_name.as_deref())?;
+        let source_location = self
+            .branches()
+            .resolve_location(ref_name.as_deref())
+            .await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
@@ -3289,7 +3305,8 @@ impl Dataset {
                 if let Some(version_number) = version_number {
                     Ok((branch, version_number))
                 } else {
-                    let branch_location = self.branch_location().find_branch(branch.as_deref())?;
+                    let branch_location =
+                        self.branches().resolve_location(branch.as_deref()).await?;
                     let version_number = self
                         .commit_handler
                         .resolve_latest_location(&branch_location.path, &self.object_store)

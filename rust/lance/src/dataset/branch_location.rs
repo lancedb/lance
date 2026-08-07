@@ -15,6 +15,31 @@ pub struct BranchLocation {
 }
 
 impl BranchLocation {
+    /// Split a legacy logical branch path into its dataset root and branch name.
+    pub(crate) fn split_branch_path(path_str: &str) -> Option<(String, String)> {
+        let (path_part, query) = match path_str.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (path_str, None),
+        };
+        let marker = format!("/{}/", BRANCH_DIR);
+        let (root, branch) = path_part.rsplit_once(&marker).or_else(|| {
+            if cfg!(windows) {
+                let marker = format!("\\{}\\", BRANCH_DIR);
+                path_part.rsplit_once(&marker)
+            } else {
+                None
+            }
+        })?;
+        if root.is_empty() || branch.is_empty() {
+            return None;
+        }
+        let root = match query {
+            Some(query) => format!("{}?{}", root, query),
+            None => root.to_string(),
+        };
+        Some((root, branch.to_string()))
+    }
+
     /// Find the root location
     pub fn find_main(&self) -> Result<Self> {
         if let Some(branch_name) = self.branch.as_deref() {
@@ -37,14 +62,19 @@ impl BranchLocation {
             Some((path, query)) => (path, Some(query)),
             None => (path_str, None),
         };
-        let branch_suffix = format!("{}/{}", BRANCH_DIR, branch_name);
-        let branch_suffix = branch_suffix.as_str();
+        // The physical branch directory may be an opaque storage identifier instead of the
+        // logical branch name. Locate the branch-directory boundary rather than deriving the
+        // suffix from `branch_name`.
+        let branch_marker = format!("/{}/", BRANCH_DIR);
         let root_path_str = path_part
-            .strip_suffix(branch_suffix)
+            .rfind(&branch_marker)
+            .map(|index| &path_part[..index])
             .or_else(|| {
                 if cfg!(windows) {
-                    let windows_suffix = branch_suffix.replace('/', "\\");
-                    path_part.strip_suffix(&windows_suffix)
+                    let windows_marker = format!("\\{}\\", BRANCH_DIR);
+                    path_part
+                        .rfind(&windows_marker)
+                        .map(|index| &path_part[..index])
                 } else {
                     None
                 }
@@ -55,19 +85,15 @@ impl BranchLocation {
                     branch_name, path_str,
                 ))
             })?;
-        let root_path_str = if root_path_str.ends_with('/') {
-            root_path_str.trim_end_matches('/').to_string()
-        } else if cfg!(windows) {
-            root_path_str.trim_end_matches('\\').to_string()
-        } else {
+        if root_path_str.is_empty() {
             return Err(Error::invalid_input(format!(
                 "Invalid dataset root uri {} for branch {}",
-                root_path_str, path_str,
+                path_str, branch_name,
             )));
-        };
+        }
         Ok(match query {
             Some(query) => format!("{}?{}", root_path_str, query),
-            None => root_path_str,
+            None => root_path_str.to_string(),
         })
     }
 
@@ -105,22 +131,29 @@ impl BranchLocation {
 
     /// Find the target branch location
     pub fn find_branch(&self, branch_name: Option<&str>) -> Result<Self> {
-        if branch_name == self.branch.as_deref() {
-            return Ok(self.clone());
-        }
+        self.find_branch_at(branch_name, branch_name)
+    }
+
+    /// Find a logical branch at an independently-addressed physical directory.
+    pub fn find_branch_at(
+        &self,
+        branch_name: Option<&str>,
+        storage_name: Option<&str>,
+    ) -> Result<Self> {
+        debug_assert_eq!(branch_name.is_some(), storage_name.is_some());
 
         let root_location = self.find_main()?;
         if Branches::is_main_branch(branch_name) {
             return Ok(root_location);
         }
 
-        if let Some(target_branch) = branch_name {
+        if let (Some(target_branch), Some(storage_name)) = (branch_name, storage_name) {
             let (new_path, new_uri) = {
                 // Handle empty segment
-                if target_branch.is_empty() {
+                if storage_name.is_empty() {
                     (self.path.clone(), self.uri.clone())
                 } else {
-                    let segments = target_branch.split('/');
+                    let segments = storage_name.split('/');
                     let mut new_path_str = Self::join_str(root_location.path.as_ref(), "tree")?;
                     let mut new_uri = Self::join_str(root_location.uri.as_str(), "tree")?;
                     for segment in segments {
@@ -253,6 +286,38 @@ mod tests {
         );
         assert_eq!(new_location.branch.as_deref(), new_branch);
         assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
+    }
+
+    #[test]
+    fn test_find_opaque_branch_storage() {
+        let root_path = TempStdDir::default().to_owned();
+        let location = create_branch_location(root_path);
+        let storage_id = "34e6c4b343a84a7ca40295852ed4d5d8";
+        let new_location = location
+            .find_branch_at(Some("featureA"), Some(storage_id))
+            .unwrap();
+        let main_location = location.find_main().unwrap();
+
+        assert_eq!(
+            new_location.path.as_ref(),
+            format!("{}/tree/{}", main_location.path.as_ref(), storage_id)
+        );
+        assert_eq!(new_location.branch.as_deref(), Some("featureA"));
+        assert_eq!(new_location.find_main().unwrap(), main_location);
+    }
+
+    #[test]
+    fn test_split_logical_branch_path() {
+        assert_eq!(
+            BranchLocation::split_branch_path(
+                "s3+ddb://bucket/table.lance/tree/feature/dev?ddbTableName=t"
+            ),
+            Some((
+                "s3+ddb://bucket/table.lance?ddbTableName=t".to_string(),
+                "feature/dev".to_string()
+            ))
+        );
+        assert_eq!(BranchLocation::split_branch_path("data/table.lance"), None);
     }
 
     #[test]

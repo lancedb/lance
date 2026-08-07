@@ -1158,10 +1158,14 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(inspection);
         for (branch, root_version_number) in referenced_branches {
-            // Use find_branch to get the branch path directly without checkout.
+            // Resolve the branch path directly without checkout.
             // This avoids creating a dataset instance and prevents manifest deletion
             // during the retain operation.
-            let branch_location = self.dataset.branch_location().find_branch(Some(branch))?;
+            let branch_location = self
+                .dataset
+                .branches()
+                .resolve_location(Some(branch))
+                .await?;
             self.dataset
                 .commit_handler
                 .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)

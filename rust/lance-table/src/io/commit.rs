@@ -781,6 +781,12 @@ const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait CommitHandler: Debug + Send + Sync {
+    /// Associate an opaque physical dataset path with its logical branch name.
+    ///
+    /// Most handlers resolve manifests directly from the path and need no mapping. External
+    /// stores that address version chains by logical branch can override this hook.
+    fn register_branch_path(&self, _base_path: &Path, _branch: Option<&str>) {}
+
     /// Whether a not-found result from [`Self::resolve_version_location`] is
     /// definitive immediately after a commit attempt.
     ///
