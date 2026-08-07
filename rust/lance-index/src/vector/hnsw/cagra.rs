@@ -165,7 +165,7 @@ fn dl_error_message() -> String {
 
 #[cfg(unix)]
 struct CuvsApi {
-    _library: DynamicLibrary,
+    _library: Option<DynamicLibrary>,
     get_last_error_text: GetLastErrorText,
     resources_create: ResourcesCreate,
     resources_destroy: ResourcesDestroy,
@@ -185,6 +185,11 @@ struct CuvsApi {
 #[cfg(unix)]
 impl CuvsApi {
     fn load(path: &Path) -> Result<Self> {
+        #[cfg(test)]
+        if path == Path::new(tests::FAKE_CUVS_LIBRARY_PATH) {
+            return Ok(tests::fake_api());
+        }
+
         let library = DynamicLibrary::open(path)?;
         Ok(Self {
             get_last_error_text: library.symbol(b"cuvsGetLastErrorText\0")?,
@@ -201,7 +206,7 @@ impl CuvsApi {
             index_destroy: library.symbol(b"cuvsCagraIndexDestroy\0")?,
             cagra_build: library.symbol(b"cuvsCagraBuild\0")?,
             index_get_graph: library.symbol(b"cuvsCagraIndexGetGraph\0")?,
-            _library: library,
+            _library: Some(library),
         })
     }
 
@@ -340,7 +345,10 @@ fn host_tensor<T>(values: &mut [T], shape: &mut [i64], dtype: DLDataType) -> DLM
 fn cuvs_distance_type(distance_type: DistanceType) -> Result<c_int> {
     match distance_type {
         DistanceType::L2 => Ok(0),
-        DistanceType::Cosine => Ok(2),
+        // SQ evaluates cosine queries with scaled squared L2 over normalized
+        // codes. Reconstructed vectors are not exactly unit length, so asking
+        // CAGRA for cosine here can produce a different topology ordering.
+        DistanceType::Cosine => Ok(0),
         DistanceType::Dot => Ok(6),
         DistanceType::Hamming => Err(Error::invalid_input(
             "CAGRA does not support Lance bitwise Hamming vectors".to_string(),
@@ -550,6 +558,366 @@ pub(super) fn build(
             num_rows,
             graph_degree
         );
-        HNSW::from_neighbor_graph(params, neighbors, graph_degree)
+        HNSW::from_neighbor_graph(storage, params, neighbors, graph_degree)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::ROW_ID;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::vector::SQ_CODE_COLUMN;
+    use crate::vector::hnsw::builder::HnswQueryParams;
+    use crate::vector::storage::DistCalculator;
+    use crate::vector::v3::subindex::{IvfSubIndex, SubIndexBuildAccelerator};
+
+    pub(super) const FAKE_CUVS_LIBRARY_PATH: &str = "/fake/libcuvs_c.so";
+
+    static BUILD_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct FakeParams {
+        num_rows: usize,
+        graph_degree: usize,
+    }
+
+    struct FakeIndex {
+        graph: Vec<u32>,
+        shape: [i64; 2],
+    }
+
+    unsafe extern "C" fn fake_get_last_error_text() -> *const c_char {
+        static ERROR: &[u8] = b"fake cuVS error\0";
+        ERROR.as_ptr().cast()
+    }
+
+    unsafe extern "C" fn fake_resources_create(resources: *mut CuvsResources) -> CuvsStatus {
+        if resources.is_null() {
+            return 0;
+        }
+        // SAFETY: the fake ABI caller supplies a valid output pointer.
+        unsafe { resources.write(1) };
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_resources_destroy(_resources: CuvsResources) -> CuvsStatus {
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_stream_sync(_resources: CuvsResources) -> CuvsStatus {
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_matrix_copy(
+        _resources: CuvsResources,
+        source: *mut DLManagedTensor,
+        destination: *mut DLManagedTensor,
+    ) -> CuvsStatus {
+        if source.is_null() || destination.is_null() {
+            return 0;
+        }
+        // SAFETY: both managed tensors are live for this synchronous fake call.
+        let (source, destination) = unsafe { (&*source, &mut *destination) };
+        let source_tensor = &source.dl_tensor;
+        let destination_tensor = &mut destination.dl_tensor;
+        if source_tensor.ndim != 2
+            || source_tensor.shape.is_null()
+            || source_tensor.data.is_null()
+            || destination_tensor.data.is_null()
+        {
+            return 0;
+        }
+        // SAFETY: rank two was checked above and the fake index owns both shape values.
+        let shape = unsafe { std::slice::from_raw_parts(source_tensor.shape, 2) };
+        let Ok(rows) = usize::try_from(shape[0]) else {
+            return 0;
+        };
+        let Ok(columns) = usize::try_from(shape[1]) else {
+            return 0;
+        };
+        let Some(len) = rows.checked_mul(columns) else {
+            return 0;
+        };
+        // SAFETY: source and destination were allocated for the matching graph shape.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                source_tensor.data.cast::<u32>(),
+                destination_tensor.data.cast::<u32>(),
+                len,
+            )
+        };
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_dataset_make_standard_view(
+        _resources: CuvsResources,
+        tensor: *mut DLManagedTensor,
+        dataset: *mut CuvsDataset,
+    ) -> CuvsStatus {
+        if tensor.is_null() || dataset.is_null() {
+            return 0;
+        }
+        // SAFETY: the tensor outlives the synchronous fake CAGRA build.
+        unsafe { dataset.write(tensor.cast()) };
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_dataset_destroy(_dataset: CuvsDataset) -> CuvsStatus {
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_params_create(params: *mut CuvsCagraParams) -> CuvsStatus {
+        if params.is_null() {
+            return 0;
+        }
+        let params_value = Box::new(FakeParams {
+            num_rows: 0,
+            graph_degree: 0,
+        });
+        // SAFETY: ownership transfers to the matching fake destroy function.
+        unsafe { params.write(Box::into_raw(params_value).cast()) };
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_params_destroy(params: CuvsCagraParams) -> CuvsStatus {
+        if !params.is_null() {
+            // SAFETY: this pointer was allocated by fake_params_create and is dropped once.
+            unsafe { drop(Box::from_raw(params.cast::<FakeParams>())) };
+        }
+        CUVS_SUCCESS
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe extern "C" fn fake_params_from_hnsw(
+        params: CuvsCagraParams,
+        num_rows: i64,
+        _dim: i64,
+        m: c_int,
+        _ef_construction: c_int,
+        _strategy: c_int,
+        _metric: c_int,
+    ) -> CuvsStatus {
+        if params.is_null() {
+            return 0;
+        }
+        let (Ok(num_rows), Ok(graph_degree)) = (usize::try_from(num_rows), usize::try_from(m))
+        else {
+            return 0;
+        };
+        // SAFETY: this pointer was allocated by fake_params_create and remains live.
+        let params = unsafe { &mut *params.cast::<FakeParams>() };
+        params.num_rows = num_rows;
+        params.graph_degree = graph_degree;
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_index_create(index: *mut CuvsCagraIndex) -> CuvsStatus {
+        if index.is_null() {
+            return 0;
+        }
+        let index_value = Box::new(FakeIndex {
+            graph: Vec::new(),
+            shape: [0, 0],
+        });
+        // SAFETY: ownership transfers to the matching fake destroy function.
+        unsafe { index.write(Box::into_raw(index_value).cast()) };
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_index_destroy(index: CuvsCagraIndex) -> CuvsStatus {
+        if !index.is_null() {
+            // SAFETY: this pointer was allocated by fake_index_create and is dropped once.
+            unsafe { drop(Box::from_raw(index.cast::<FakeIndex>())) };
+        }
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_cagra_build(
+        _resources: CuvsResources,
+        params: CuvsCagraParams,
+        dataset: CuvsDataset,
+        index: CuvsCagraIndex,
+    ) -> CuvsStatus {
+        if params.is_null() || dataset.is_null() || index.is_null() {
+            return 0;
+        }
+        // SAFETY: the fake create functions allocated both live handles.
+        let (params, index) = unsafe {
+            (
+                &*params.cast::<FakeParams>(),
+                &mut *index.cast::<FakeIndex>(),
+            )
+        };
+        let graph_degree = params.graph_degree.min(params.num_rows.saturating_sub(1));
+        if graph_degree == 0 {
+            return 0;
+        }
+        index.graph = (0..params.num_rows)
+            .flat_map(|node| {
+                (1..=graph_degree).map(move |offset| ((node + offset) % params.num_rows) as u32)
+            })
+            .collect();
+        index.shape = [params.num_rows as i64, graph_degree as i64];
+        BUILD_CALLS.fetch_add(1, Ordering::Relaxed);
+        CUVS_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_index_get_graph(
+        index: CuvsCagraIndex,
+        graph: *mut DLManagedTensor,
+    ) -> CuvsStatus {
+        if index.is_null() || graph.is_null() {
+            return 0;
+        }
+        // SAFETY: the fake index remains live until after the graph copy.
+        let index = unsafe { &mut *index.cast::<FakeIndex>() };
+        let managed = DLManagedTensor {
+            dl_tensor: DLTensor {
+                data: index.graph.as_mut_ptr().cast(),
+                device: DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
+                ndim: 2,
+                dtype: DLDataType {
+                    code: DL_UINT,
+                    bits: 32,
+                    lanes: 1,
+                },
+                shape: index.shape.as_mut_ptr(),
+                strides: ptr::null_mut(),
+                byte_offset: 0,
+            },
+            manager_ctx: ptr::null_mut(),
+            deleter: None,
+        };
+        // SAFETY: the caller provided uninitialized output storage for the full value.
+        unsafe { graph.write(managed) };
+        CUVS_SUCCESS
+    }
+
+    pub(super) fn fake_api() -> CuvsApi {
+        CuvsApi {
+            _library: None,
+            get_last_error_text: fake_get_last_error_text,
+            resources_create: fake_resources_create,
+            resources_destroy: fake_resources_destroy,
+            stream_sync: fake_stream_sync,
+            matrix_copy: fake_matrix_copy,
+            dataset_make_standard_view: fake_dataset_make_standard_view,
+            dataset_destroy: fake_dataset_destroy,
+            params_create: fake_params_create,
+            params_destroy: fake_params_destroy,
+            params_from_hnsw: fake_params_from_hnsw,
+            index_create: fake_index_create,
+            index_destroy: fake_index_destroy,
+            cagra_build: fake_cagra_build,
+            index_get_graph: fake_index_get_graph,
+        }
+    }
+
+    fn make_sq_storage(distance_type: DistanceType) -> (ScalarQuantizationStorage, ArrayRef) {
+        const NUM_ROWS: usize = 64;
+        const DIM: usize = 8;
+        const QUERY_ROW: usize = 17;
+
+        let sq_codes = (0..NUM_ROWS)
+            .flat_map(|row| {
+                (0..DIM).map(move |column| ((row * 37 + column * 53 + row * column) % 256) as u8)
+            })
+            .collect::<Vec<_>>();
+        let query = Arc::new(Float32Array::from(
+            sq_codes[QUERY_ROW * DIM..(QUERY_ROW + 1) * DIM]
+                .iter()
+                .map(|code| -1.0 + 2.0 * *code as f32 / 255.0)
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let codes = FixedSizeListArray::try_new_from_values(UInt8Array::from(sq_codes), DIM as i32)
+            .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (
+                ROW_ID,
+                Arc::new(arrow_array::UInt64Array::from_iter_values(
+                    0..NUM_ROWS as u64,
+                )) as ArrayRef,
+            ),
+            (SQ_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+        ])
+        .unwrap();
+        let storage =
+            ScalarQuantizationStorage::try_new(8, distance_type, -1.0..1.0, [batch], None).unwrap();
+        (storage, query)
+    }
+
+    #[rstest]
+    #[case::l2(DistanceType::L2, 0)]
+    #[case::cosine(DistanceType::Cosine, 0)]
+    #[case::dot(DistanceType::Dot, 6)]
+    fn test_cuvs_distance_matches_sq_contract(
+        #[case] distance_type: DistanceType,
+        #[case] expected: c_int,
+    ) {
+        assert_eq!(cuvs_distance_type(distance_type).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[case::dot(DistanceType::Dot)]
+    fn test_successful_cagra_backend_recall(#[case] distance_type: DistanceType) {
+        let (storage, query) = make_sq_storage(distance_type);
+        let accelerator = SubIndexBuildAccelerator::cagra(FAKE_CUVS_LIBRARY_PATH);
+        let calls_before = BUILD_CALLS.load(Ordering::Relaxed);
+        let hnsw = HNSW::index_vectors_with_accelerator(
+            &storage,
+            HnswBuildParams::default().num_edges(4).ef_construction(10),
+            &accelerator,
+        )
+        .unwrap();
+        assert!(BUILD_CALLS.load(Ordering::Relaxed) > calls_before);
+        assert_eq!(hnsw.max_level(), 1);
+
+        // Search the serialized graph so recall also covers the v3 write/read path.
+        let loaded = HNSW::load(hnsw.to_batch().unwrap()).unwrap();
+        let k = 10;
+        let query_params = HnswQueryParams {
+            ef: storage.len(),
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let results = loaded
+            .search_basic(query.clone(), k, &query_params, None, &storage)
+            .unwrap();
+
+        let distances = storage
+            .dist_calculator(query, 0.0)
+            .distance_all(storage.len());
+        let mut truth = distances.into_iter().enumerate().collect::<Vec<_>>();
+        truth.sort_by(|(left_id, left), (right_id, right)| {
+            left.total_cmp(right).then_with(|| left_id.cmp(right_id))
+        });
+        let truth = truth
+            .into_iter()
+            .take(k)
+            .map(|(id, _)| id as u32)
+            .collect::<HashSet<_>>();
+        let hits = results
+            .iter()
+            .filter(|result| truth.contains(&result.id))
+            .count();
+        let recall = hits as f32 / k as f32;
+        assert!(
+            recall >= 0.5,
+            "{distance_type} CAGRA recall {recall} is below 0.5"
+        );
     }
 }

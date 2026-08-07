@@ -784,6 +784,47 @@ def test_create_index_cagra_accelerator_dispatch(tmp_path, caplog, monkeypatch):
     )
 
 
+@pytest.mark.cuda
+@pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
+def test_create_index_cagra_accelerated_recall(tmp_path, caplog, metric):
+    dataset_module = importlib.import_module("lance.dataset")
+    if dataset_module._locate_cuvs_library() is None:
+        pytest.skip(
+            "compatible libcuvs is unavailable; "
+            "https://github.com/lance-format/lance/issues/5061"
+        )
+
+    rng = np.random.default_rng(42)
+    vectors = rng.standard_normal((2048, 32)).astype(np.float32)
+    table = vec_to_table(data=vectors).append_column(
+        "id", pa.array(np.arange(len(vectors)))
+    )
+    dataset = lance.write_dataset(table, tmp_path)
+    query = vectors[17]
+    nearest = {"column": "vector", "q": query, "k": 10, "metric": metric}
+    ground_truth = dataset.to_table(columns=["id"], nearest=nearest)["id"].to_numpy()
+
+    with caplog.at_level(logging.WARNING):
+        indexed = dataset.create_index(
+            "vector",
+            index_type="IVF_HNSW_SQ",
+            metric=metric,
+            num_partitions=1,
+            accelerator="cuda",
+        )
+    assert not any(
+        "CAGRA HNSW build failed; falling back to CPU" in record.message
+        for record in caplog.records
+    )
+
+    result = indexed.to_table(columns=["id"], nearest=nearest)["id"].to_numpy()
+    recall = len(set(ground_truth) & set(result)) / len(ground_truth)
+    assert recall >= 0.5, (
+        f"metric={metric}, recall={recall}, "
+        f"ground_truth={ground_truth}, result={result}"
+    )
+
+
 def test_use_index(dataset, tmp_path):
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(

@@ -270,6 +270,7 @@ impl HNSW {
     /// local to the IVF partition and therefore line up with Lance's storage
     /// offsets without remapping.
     pub(crate) fn from_neighbor_graph(
+        storage: &impl VectorStore,
         params: HnswBuildParams,
         neighbors: Vec<u32>,
         graph_degree: usize,
@@ -288,6 +289,12 @@ impl HNSW {
             )));
         }
         let num_nodes = neighbors.len() / graph_degree;
+        if num_nodes != storage.len() {
+            return Err(Error::invalid_input(format!(
+                "CAGRA graph has {num_nodes} nodes, but vector storage has {} rows",
+                storage.len()
+            )));
+        }
         if num_nodes > u32::MAX as usize {
             return Err(Error::invalid_input(format!(
                 "CAGRA graph has {num_nodes} nodes, exceeding the u32 node-id limit"
@@ -305,9 +312,21 @@ impl HNSW {
 
         let nodes = neighbors
             .chunks_exact(graph_degree)
-            .map(|neighbors| {
+            .enumerate()
+            .map(|(node_id, neighbors)| {
+                let dist_calculator = storage.dist_calculator_from_id(node_id as u32);
+                let neighbors_ranked = neighbors
+                    .iter()
+                    .map(|neighbor| {
+                        OrderedNode::new(*neighbor, dist_calculator.distance(*neighbor).into())
+                    })
+                    .collect();
                 let neighbors = Arc::new(neighbors.to_vec());
-                GraphBuilderNode::from_parts(vec![neighbors.clone()], vec![Vec::new()], neighbors)
+                GraphBuilderNode::from_parts(
+                    vec![neighbors.clone()],
+                    vec![neighbors_ranked],
+                    neighbors,
+                )
             })
             .collect();
         Ok(Self::from_parts(params, nodes, vec![num_nodes], 0))
@@ -1647,7 +1666,7 @@ mod tests {
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::{IvfSubIndex, SubIndexBuildAccelerator};
     use crate::vector::{
-        SQ_CODE_COLUMN,
+        DIST_COL, SQ_CODE_COLUMN,
         flat::storage::{FlatBinStorage, FlatFloatStorage},
         graph::{DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
@@ -2159,9 +2178,10 @@ mod tests {
 
     #[test]
     fn test_import_cagra_neighbor_graph() {
+        let storage = make_sq_storage(4);
         let params = HnswBuildParams::default();
         let graph = vec![1, 2, 0, 2, 0, 3, 1, 2];
-        let hnsw = HNSW::from_neighbor_graph(params, graph, 2).unwrap();
+        let hnsw = HNSW::from_neighbor_graph(&storage, params, graph, 2).unwrap();
 
         assert_eq!(hnsw.len(), 4);
         assert_eq!(hnsw.max_level(), 1);
@@ -2176,6 +2196,36 @@ mod tests {
             neighbors.value(3).as_primitive::<UInt32Type>().values(),
             &[1, 2]
         );
+        let distances = batch[DIST_COL].as_list::<i32>();
+        for node_id in 0..batch.num_rows() {
+            let node_neighbors = neighbors.value(node_id);
+            let node_neighbors = node_neighbors.as_primitive::<UInt32Type>();
+            let node_distances = distances.value(node_id);
+            let node_distances = node_distances.as_primitive::<arrow_array::types::Float32Type>();
+
+            assert_eq!(node_neighbors.len(), node_distances.len());
+            for (neighbor, distance) in node_neighbors.values().iter().zip(node_distances.values())
+            {
+                assert_eq!(
+                    *distance,
+                    storage.dist_between(node_id as u32, *neighbor),
+                    "serialized distance for edge {node_id}->{neighbor}"
+                );
+            }
+        }
+
+        // Released v3 readers reconstruct adjacency by zipping these two
+        // lists. Keep this exact compatibility contract covered even though
+        // the current zero-copy reader no longer materializes edge distances.
+        let released_reader_edge_count = (0..batch.num_rows())
+            .map(|node_id| {
+                neighbors
+                    .value(node_id)
+                    .len()
+                    .min(distances.value(node_id).len())
+            })
+            .sum::<usize>();
+        assert_eq!(released_reader_edge_count, 8);
 
         let loaded = HNSW::load(batch).unwrap();
         assert_eq!(loaded.len(), 4);
@@ -2184,8 +2234,10 @@ mod tests {
 
     #[test]
     fn test_import_cagra_neighbor_graph_rejects_invalid_node() {
+        let storage = make_sq_storage(2);
         let error =
-            HNSW::from_neighbor_graph(HnswBuildParams::default(), vec![1, 0, 0, 3], 2).unwrap_err();
+            HNSW::from_neighbor_graph(&storage, HnswBuildParams::default(), vec![1, 0, 0, 3], 2)
+                .unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("neighbor id 3"));
