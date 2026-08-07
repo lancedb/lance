@@ -1266,16 +1266,19 @@ class LanceDataset(pa.dataset.Dataset):
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
         io_buffer_size: int, default None
-            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
-            for more information.
+            The maximum number of bytes to buffer from storage before applying
+            backpressure. See ``ScannerBuilder.io_buffer_size`` for more information.
         batch_readahead: int, optional
-            The number of batches to read ahead.
+            The number of batches to decode concurrently.
         fragment_readahead: int, optional
-            The number of fragments to read ahead.
+            The number of fragments whose reads may be scheduled concurrently.
+            This applies even when ``scan_in_order`` is true. Set this to ``1``
+            to avoid overlapping I/O from multiple fragments.
         scan_in_order: bool, default True
-            Whether to read the fragments and batches in order. If false,
-            throughput may be higher, but batches will be returned out of order
-            and memory use might increase.
+            Whether to return fragments and batches in order. This does not make
+            storage reads sequential; use ``fragment_readahead=1`` for that. If
+            false, throughput may be higher, but batches will be returned out of
+            order and memory use might increase.
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
