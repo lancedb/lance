@@ -192,13 +192,19 @@ pub struct DirPage {
 /// Kept separate from [`ObjectStore::inner`] because paginated listing is not part of the
 /// `ObjectStore` trait and so cannot be reached through a `dyn ObjectStore`.
 ///
-/// This is where a backend joins the fast path: implement it, hand one to
-/// [`ObjectStore::paginated_lister`], and pages are pushed down instead of listed in full.
+/// This is where a backend joins the fast path: implement it, hand one to the store's
+/// `paginated_lister`, and pages are pushed down instead of listed in full.
 ///
-/// A backend mints [`DirCursor::backend`] and resumes from its own token, which is exact and
+/// Backends live in this crate for now: minting a cursor and installing a lister are both
+/// crate private, and they would have to open together, against a real second backend. What
+/// an outside crate implements is a decorator — metering, caching, throttling — which wraps
+/// the lister [`super::WrappingObjectStore::wrap_paginated`] handed it and passes that
+/// lister's cursors straight back, so it never needs to mint one.
+///
+/// A backend mints a cursor of its own and resumes from its own token, which is exact and
 /// needs no key order to be correct. A cursor minted by the full-listing fallback is not one
-/// of its own: a walk cannot start on one path and finish on the other, and
-/// [`DirCursor::expect_backend`] says so rather than guessing at a position.
+/// of its own: a walk cannot start on one path and finish on the other, and the listing fails
+/// rather than guessing at a position.
 #[async_trait::async_trait]
 pub trait PaginatedDirLister: std::fmt::Debug + Send + Sync + 'static {
     /// One page of the immediate children of `prefix`, resuming after `resume`.
