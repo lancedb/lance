@@ -773,8 +773,14 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
-                Operation::Append { .. }
-                | Operation::ReserveFragments { .. }
+                // Rewrites allocate a consecutive suffix of fragment IDs for the
+                // replacement range and every following fragment. If a row-adding
+                // operation landed before that reservation, ID sorting would put
+                // its rows before the rewritten range, so replan from the new manifest.
+                Operation::Append { .. } => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -784,17 +790,30 @@ impl<'a> TransactionRebase<'a> {
                     updated_fragments,
                     deleted_fragment_ids,
                     ..
-                }
-                | Operation::Update {
-                    updated_fragments,
-                    removed_fragment_ids: deleted_fragment_ids,
-                    ..
                 } => {
                     if updated_fragments
                         .iter()
                         .map(|f| f.id)
                         .chain(deleted_fragment_ids.iter().copied())
                         .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::Update {
+                    updated_fragments,
+                    removed_fragment_ids: deleted_fragment_ids,
+                    new_fragments,
+                    ..
+                } => {
+                    if !new_fragments.is_empty()
+                        || updated_fragments
+                            .iter()
+                            .map(|f| f.id)
+                            .chain(deleted_fragment_ids.iter().copied())
+                            .any(|id| self.modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -2644,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_is_compatible_with_row_adding_update() {
+    fn test_rewrite_conflicts_with_row_adding_update() {
         let operation = Operation::Rewrite {
             groups: vec![RewriteGroup {
                 old_fragments: vec![Fragment::new(0)],
@@ -2677,7 +2696,10 @@ mod tests {
             None,
         );
 
-        assert!(rebase.check_txn(&other, 1).is_ok());
+        assert!(matches!(
+            rebase.check_txn(&other, 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
     }
 
     #[test]
@@ -2874,7 +2896,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Compatible,    // append
+                    Retryable,     // append
                     Retryable,     // create index
                     Compatible,    // delete
                     Retryable,     // merge
@@ -2896,7 +2918,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Compatible,    // append
+                    Retryable,     // append
                     Retryable,     // create index
                     Retryable,     // delete
                     Retryable,     // merge

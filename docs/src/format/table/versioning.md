@@ -28,10 +28,7 @@ they should return an "unsupported" error on any read or write operation.
 | 4        | `FLAG_USE_V2_FORMAT_DEPRECATED` | No              | No              | Files are written with the new v2 format. This flag is deprecated and no longer used.                       |
 | 8        | `FLAG_TABLE_CONFIG`             | No              | Yes             | Table config is present in the manifest.                                                                    |
 | 16       | `FLAG_BASE_PATHS`               | Yes             | Yes             | Dataset uses multiple base paths (for shallow clones or multi-base datasets).                               |
-| 32       | `FLAG_DISABLE_TRANSACTION_FILE` | No              | Yes             | Transaction files are stored inline in manifests instead of under `_transaction`.                          |
-| 64       | `FLAG_UNSTABLE_DATA_OVERLAY_FILES` | Yes          | Yes             | Fragments contain data overlay files; this feature is not yet released.                                    |
-| 128      | `FLAG_LOGICAL_FRAGMENT_ORDER`   | Yes             | Yes             | Manifest position defines logical row order, so fragments must not be reordered by ID.                     |
 
 </div>
 
-Flags with bit values 256 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.
+Flags with bit values 32 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.

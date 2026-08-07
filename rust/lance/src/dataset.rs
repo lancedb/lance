@@ -183,9 +183,6 @@ pub struct Dataset {
 
     // Bitmap of fragment ids in this dataset.
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
-    // Manifest positions indexed by ascending fragment-id rank. Fragment ids are
-    // stable identities, while manifest position defines logical row order.
-    fragment_indices_by_id: Arc<Vec<usize>>,
 
     // These are references to session caches, but with the dataset URI as a prefix.
     pub(crate) index_cache: Arc<DSIndexCache>,
@@ -211,22 +208,6 @@ impl std::fmt::Debug for Dataset {
             .field("base_store_params", &self.base_store_params.is_some())
             .finish()
     }
-}
-
-fn build_fragment_lookup(fragments: &[Fragment]) -> (Arc<RoaringBitmap>, Arc<Vec<usize>>) {
-    let fragment_bitmap: Arc<RoaringBitmap> = Arc::new(
-        fragments
-            .iter()
-            .map(|fragment| fragment.id as u32)
-            .collect(),
-    );
-    let mut fragment_indices_by_id = vec![0; fragments.len()];
-    for (manifest_index, fragment) in fragments.iter().enumerate() {
-        let id_rank = fragment_bitmap.rank(fragment.id as u32) as usize;
-        debug_assert!(id_rank > 0);
-        fragment_indices_by_id[id_rank - 1] = manifest_index;
-    }
-    (fragment_bitmap, Arc::new(fragment_indices_by_id))
 }
 
 /// Dataset Version
@@ -511,8 +492,13 @@ impl Dataset {
         let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = manifest;
         self.manifest_location = manifest_location;
-        (self.fragment_bitmap, self.fragment_indices_by_id) =
-            build_fragment_lookup(&self.manifest.fragments);
+        self.fragment_bitmap = Arc::new(
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as u32)
+                .collect(),
+        );
         Ok(())
     }
 
@@ -845,7 +831,7 @@ impl Dataset {
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
-        let (fragment_bitmap, fragment_indices_by_id) = build_fragment_lookup(&manifest.fragments);
+        let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         write::log_unregistered_base_scoped_options(
             store_params.as_ref(),
             &manifest.base_paths,
@@ -861,7 +847,6 @@ impl Dataset {
             session,
             refs,
             fragment_bitmap,
-            fragment_indices_by_id,
             metadata_cache,
             index_cache,
             file_reader_options,
@@ -1641,8 +1626,13 @@ impl Dataset {
 
         self.manifest = Arc::new(manifest);
         self.manifest_location = manifest_location;
-        (self.fragment_bitmap, self.fragment_indices_by_id) =
-            build_fragment_lookup(&self.manifest.fragments);
+        self.fragment_bitmap = Arc::new(
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as u32)
+                .collect(),
+        );
 
         Ok(())
     }
@@ -2724,9 +2714,7 @@ impl Dataset {
         Projection::full(self.clone())
     }
 
-    /// Get fragments in logical row order.
-    ///
-    /// Fragment ids are stable identities and are not guaranteed to be sorted.
+    /// Get fragments.
     pub fn get_fragments(&self) -> Vec<FileFragment> {
         let dataset = Arc::new(self.clone());
         self.manifest
@@ -2736,8 +2724,7 @@ impl Dataset {
             .collect()
     }
 
-    /// Iterate over manifest fragments in logical row order without allocating
-    /// [`FileFragment`] wrappers.
+    /// Iterate over manifest fragments without allocating [`FileFragment`] wrappers.
     pub fn iter_fragments(&self) -> impl Iterator<Item = &Fragment> {
         self.manifest.fragments.iter()
     }
@@ -2848,12 +2835,11 @@ impl Dataset {
                 if !self.fragment_bitmap.contains(*id) {
                     return None;
                 }
-                let id_rank = self.fragment_bitmap.rank(*id) as usize - 1;
-                let fragment_index = self.fragment_indices_by_id[id_rank];
+                let fragment_index = self.fragment_bitmap.rank(*id) as usize - 1;
                 let fragment = self.manifest.fragments.get(fragment_index)?;
                 debug_assert_eq!(
                     fragment.id, *id as u64,
-                    "fragment lookup for id {id} resolved to fragment {}, but the lookup and manifest.fragments are expected to stay in sync",
+                    "fragment_bitmap rank({id}) resolved to fragment {}, but fragment_bitmap and manifest.fragments are expected to stay in sync",
                     fragment.id
                 );
                 Some(FileFragment::new(dataset.clone(), fragment.clone()))
@@ -3039,25 +3025,21 @@ impl Dataset {
             }
         }
 
-        if !self.manifest.uses_logical_fragment_order() {
-            self.manifest
-                .fragments
-                .iter()
-                .map(|fragment| fragment.id)
-                .try_fold(0, |previous_id, fragment_id| {
-                    if fragment_id < previous_id {
-                        Err(Error::corrupt_file(
-                            self.base.clone(),
-                            format!(
-                                "Fragment ids are not sorted in increasing fragment-id order, but the logical fragment order feature is not set. Found {fragment_id} after {previous_id} in dataset {:?}",
-                                self.base
-                            ),
-                        ))
-                    } else {
-                        Ok(fragment_id)
-                    }
-                })?;
-        }
+        // Fragments are sorted in increasing fragment id order
+        self.manifest
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .try_fold(0, |prev, id| {
+                if id < prev {
+                    Err(Error::corrupt_file(self.base.clone(), format!(
+                        "Fragment ids are not sorted in increasing fragment-id order. Found {} after {} in dataset {:?}",
+                        id, prev, self.base
+                    )))
+                } else {
+                    Ok(id)
+                }
+            })?;
 
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())

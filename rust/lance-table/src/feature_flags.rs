@@ -30,12 +30,8 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
-/// Manifest fragments are stored in logical row order instead of fragment-ID
-/// order. Readers must preserve the list order, and writers must not reorder the
-/// fragments by ID.
-pub const FLAG_LOGICAL_FRAGMENT_ORDER: u64 = 128;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 256;
+pub const FLAG_UNKNOWN: u64 = 128;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -99,15 +95,6 @@ pub fn apply_feature_flags(
     if has_overlays {
         manifest.reader_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
-    }
-
-    let has_logical_fragment_order = manifest
-        .fragments
-        .windows(2)
-        .any(|fragments| fragments[0].id > fragments[1].id);
-    if has_logical_fragment_order {
-        manifest.reader_feature_flags |= FLAG_LOGICAL_FRAGMENT_ORDER;
-        manifest.writer_feature_flags |= FLAG_LOGICAL_FRAGMENT_ORDER;
     }
 
     if disable_transaction_file {
@@ -174,7 +161,6 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        assert!(can_read_dataset(super::FLAG_LOGICAL_FRAGMENT_ORDER));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -251,7 +237,6 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        assert!(can_write_dataset(super::FLAG_LOGICAL_FRAGMENT_ORDER));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -319,46 +304,5 @@ mod tests {
             multi_base_manifest.writer_feature_flags & FLAG_BASE_PATHS,
             0
         );
-    }
-
-    #[test]
-    fn test_logical_fragment_order_is_mixed_version_gated() {
-        use crate::format::{DataStorageFormat, Fragment};
-        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut manifest = Manifest::new(
-            schema,
-            Arc::new(vec![Fragment::new(5), Fragment::new(2)]),
-            DataStorageFormat::default(),
-            HashMap::new(),
-        );
-
-        apply_feature_flags(&mut manifest, false, false).unwrap();
-
-        assert_ne!(
-            manifest.reader_feature_flags & FLAG_LOGICAL_FRAGMENT_ORDER,
-            0
-        );
-        assert_ne!(
-            manifest.writer_feature_flags & FLAG_LOGICAL_FRAGMENT_ORDER,
-            0
-        );
-        assert!(can_read_dataset(manifest.reader_feature_flags));
-        assert!(can_write_dataset(manifest.writer_feature_flags));
-
-        // Lance releases predating logical fragment order support only recognize
-        // lower feature bits, so they reject instead of misreading this manifest.
-        let released_supported_flags = FLAG_LOGICAL_FRAGMENT_ORDER - 1;
-        assert_ne!(manifest.reader_feature_flags & !released_supported_flags, 0);
-        assert_ne!(manifest.writer_feature_flags & !released_supported_flags, 0);
     }
 }

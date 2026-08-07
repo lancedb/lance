@@ -118,8 +118,6 @@ message Manifest {
   // * 1 << 6: data overlay files are present (see DataOverlayFile). Readers that do
   //   not understand overlays must refuse the dataset, since ignoring an overlay
   //   would silently return stale base values.
-  // * 1 << 7: fragments are stored in logical row order rather than fragment-ID
-  //   order. Readers and writers must preserve their manifest positions.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.

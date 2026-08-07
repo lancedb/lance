@@ -17,7 +17,7 @@ use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
 use crate::{
     Dataset, Error, Result,
     dataset::{
-        ManifestWriteConfig, ReadParams, build_fragment_lookup,
+        ManifestWriteConfig, ReadParams,
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
         refs::Refs,
@@ -473,7 +473,7 @@ impl<'a> CommitBuilder<'a> {
             operation=&transaction.operation.name()
         );
 
-        let (fragment_bitmap, fragment_indices_by_id) = build_fragment_lookup(&manifest.fragments);
+        let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
             WriteDestination::Dataset(dataset) => Ok(Dataset {
@@ -481,7 +481,6 @@ impl<'a> CommitBuilder<'a> {
                 manifest_location,
                 session,
                 fragment_bitmap,
-                fragment_indices_by_id,
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => {
@@ -506,7 +505,6 @@ impl<'a> CommitBuilder<'a> {
                     refs,
                     index_cache,
                     fragment_bitmap,
-                    fragment_indices_by_id,
                     metadata_cache,
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),

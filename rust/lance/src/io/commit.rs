@@ -701,10 +701,10 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     Ok(())
 }
 
-/// Reject a manifest in which fragment identities are ambiguous or their order
-/// requires a feature flag that is not set. Per-fragment state is keyed by
-/// fragment id — deletion file paths, cached row id sequences, row addresses —
-/// so a duplicate makes it ambiguous which rows that state describes.
+/// Reject a manifest in which fragment identities are ambiguous or out of order.
+/// Per-fragment state is keyed by fragment id — deletion file paths, cached row
+/// id sequences, row addresses — so a duplicate makes it ambiguous which rows
+/// that state describes.
 ///
 /// Runs after the legacy fixups above, so a dataset that needs a rollback for some
 /// other reason is diagnosed with that first.
@@ -723,15 +723,14 @@ fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
             fragment.id
         )));
     }
-    if !manifest.uses_logical_fragment_order()
-        && let Some(fragments) = manifest
-            .fragments
-            .windows(2)
-            .find(|fragments| fragments[0].id > fragments[1].id)
+    if let Some(fragments) = manifest
+        .fragments
+        .windows(2)
+        .find(|fragments| fragments[0].id > fragments[1].id)
     {
         return Err(Error::invalid_input(format!(
-            "The commit would place fragment {} before lower fragment id {}, but the logical \
-             fragment order feature is not set",
+            "The commit would place fragment {} before lower fragment id {}. Fragment ids must \
+             remain sorted in increasing order",
             fragments[0].id, fragments[1].id
         )));
     }
@@ -1700,8 +1699,8 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[test]
-    fn test_check_fragment_ids_requires_logical_order_feature() {
-        let mut manifest = Manifest::new(
+    fn test_check_fragment_ids_requires_sorted_order() {
+        let manifest = Manifest::new(
             Schema::try_from(&ArrowSchema::empty()).unwrap(),
             Arc::new(vec![Fragment::new(5), Fragment::new(2)]),
             DataStorageFormat::default(),
@@ -1710,11 +1709,11 @@ mod tests {
 
         let error = check_fragment_ids(&manifest).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("logical fragment order feature"));
-
-        manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_LOGICAL_FRAGMENT_ORDER;
-        manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_LOGICAL_FRAGMENT_ORDER;
-        check_fragment_ids(&manifest).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("Fragment ids must remain sorted in increasing order")
+        );
     }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
