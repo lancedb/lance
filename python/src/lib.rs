@@ -71,6 +71,7 @@ pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
+pub(crate) mod fts;
 pub(crate) mod indices;
 pub(crate) mod mem_wal;
 pub(crate) mod namespace;
@@ -296,6 +297,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Session>()?;
     m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
@@ -324,6 +326,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
+    m.add_wrapped(wrap_pyfunction!(fts::tokenize))?;
     // OpenTelemetry metrics bridge
     m.add_class::<otel::PyMetricPoint>()?;
     m.add_class::<otel::PyMetricDescription>()?;
