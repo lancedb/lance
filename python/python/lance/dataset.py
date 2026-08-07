@@ -7065,6 +7065,9 @@ class LanceScanner(pa.dataset.Scanner):
     def analyze_plan(self, count_rows: bool = False) -> str:
         """Execute the plan for this scanner and display with runtime metrics.
 
+        Full-text-search nodes include the execution-time ``tokenized_query``
+        text and positions.
+
         Parameters
         ----------
         count_rows : bool, default False
