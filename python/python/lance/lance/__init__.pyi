@@ -63,6 +63,9 @@ from .fragment import (
 from .fragment import (
     RowIdMeta as RowIdMeta,
 )
+from .fragment import (
+    RowIdSequence as RowIdSequence,
+)
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
 from .lance import PySearchFilter

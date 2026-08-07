@@ -1153,12 +1153,15 @@ pub async fn commit_handler_from_url(
             // Get accessor from the options
             let accessor = options.get_accessor();
 
+            let provider_scheme = storage_options_raw.aws_provider_scheme()?;
+
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
                 accessor,
+                provider_scheme,
             )
             .await?;
 

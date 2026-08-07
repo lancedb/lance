@@ -18,24 +18,25 @@ pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
-    // Virtual path to prevent collisions in the cache.
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
-        Some(RowIdMeta::Inline(data)) => {
+        Some(row_id_meta @ RowIdMeta::Inline(data)) => {
             let data = data.clone();
             let key = RowIdSequenceKey {
                 fragment_id: fragment.id,
+                row_id_meta,
             };
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
                 .await
         }
-        Some(RowIdMeta::External(file_slice)) => {
+        Some(row_id_meta @ RowIdMeta::External(file_slice)) => {
             let file_slice = file_slice.clone();
             let dataset_clone = dataset.clone();
             let key = RowIdSequenceKey {
                 fragment_id: fragment.id,
+                row_id_meta,
             };
             dataset
                 .metadata_cache
@@ -286,6 +287,7 @@ mod test {
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
+    use crate::session::Session;
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
@@ -526,6 +528,121 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
         assert!(index.get(num_rows).is_some());
+    }
+
+    /// Fragment ids are a high water mark within one dataset, but a dataset
+    /// dropped and recreated at the same URI restarts them at 0 while sharing the
+    /// cache namespace of its predecessor (see #7645). The two generations must
+    /// still be told apart.
+    #[tokio::test]
+    async fn test_row_ids_recreate_at_same_uri() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        // Shared so the cache stays warm across the drop, as it would for a host
+        // that keeps one session open for the lifetime of the process.
+        let session = Arc::new(Session::default());
+        let write = |rows: Range<i32>| {
+            let batch = sequence_batch(rows);
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let params = WriteParams {
+                enable_stable_row_ids: true,
+                session: Some(session.clone()),
+                ..Default::default()
+            };
+            async move {
+                Dataset::write(reader, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let dataset = write(0..100).await;
+        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(sequence.len(), 100);
+
+        // Reloading the unchanged fragment must still hit: keying on contents has
+        // to leave the sequence cacheable, not just make it distinguishable.
+        let hits_before = session.metadata_cache_stats().await.hits;
+        load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(session.metadata_cache_stats().await.hits, hits_before + 1);
+
+        drop(dataset);
+        std::fs::remove_dir_all(tmp_path.as_str()).unwrap();
+
+        // Shorter than the dataset it replaces, so a stale hit is observable: an
+        // equal-length sequence would be byte-identical and harmless.
+        let dataset = write(0..60).await;
+        assert_eq!(dataset.manifest.fragments[0].id, 0);
+
+        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            sequence.iter().collect::<Vec<_>>(),
+            (0..60).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_after_recreate() {
+        // Compaction rechunks the row id sequences of the fragments it merges, so
+        // a sequence cached for a dropped dataset does not just misreport ids, it
+        // writes ids the fragments do not hold back into the manifest.
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let session = Arc::new(Session::default());
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+
+        let write = |rows: Range<i32>, mode: WriteMode| {
+            let batch = sequence_batch(rows);
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let params = WriteParams {
+                mode,
+                ..params.clone()
+            };
+            async move {
+                Dataset::write(reader, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let dataset = write(0..100, WriteMode::Create).await;
+        load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+
+        drop(dataset);
+        std::fs::remove_dir_all(tmp_path.as_str()).unwrap();
+
+        // The recreated dataset holds 60 rows in fragment 0, not the 100 cached
+        // above, and a second fragment so compaction has something to merge.
+        write(0..60, WriteMode::Create).await;
+        let mut dataset = write(0..100, WriteMode::Append).await;
+
+        compact(&mut dataset, 1024).await;
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 160);
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let batch = scan.try_into_batch().await.unwrap();
+        let row_ids = batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        // A stale 100-long sequence would rechunk 0..100 onto the 60 rows of
+        // fragment 0 and shift everything after it.
+        assert_eq!(row_ids, (0..160).collect::<HashSet<_>>());
     }
 
     #[tokio::test]
