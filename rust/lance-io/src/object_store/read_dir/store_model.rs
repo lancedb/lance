@@ -20,13 +20,10 @@ pub enum KeyOrder {
     /// Byte order over whole keys, which is what a flat namespace gives: a key is a name and
     /// names sort against each other whole.
     ByKey,
-    /// Byte order with the delimiter below every other character. A store that holds a real
-    /// directory tree orders each level by child name, so a directory comes before a sibling
-    /// whose name extends it — `foo/` before `foo-bar/`, where byte order has them the other
-    /// way round. Azure documents this for accounts with a hierarchical namespace.
-    DelimiterLowest,
-    /// No order a caller could predict, which is what S3 Express gives. Spelled as byte order
-    /// backwards so that a test is repeatable, but nothing may rely on the shape of it.
+    /// No order a caller could predict, which is what S3 Express gives, and which an Azure
+    /// account with a hierarchical namespace gives too by ordering each level by child name.
+    /// Spelled as byte order backwards so that a test is repeatable, but nothing may rely on
+    /// the shape of it: a listing that survives this survives any order a store might use.
     Reversed,
 }
 
@@ -34,20 +31,7 @@ impl KeyOrder {
     fn cmp(&self, left: &str, right: &str) -> std::cmp::Ordering {
         match self {
             Self::ByKey => left.cmp(right),
-            Self::DelimiterLowest => left
-                .bytes()
-                .map(Self::rank)
-                .cmp(right.bytes().map(Self::rank)),
             Self::Reversed => right.cmp(left),
-        }
-    }
-
-    /// The delimiter moved below every byte that sorts under it, and nothing else disturbed.
-    fn rank(byte: u8) -> u8 {
-        match byte {
-            b'/' => 0,
-            byte if byte < b'/' => byte + 1,
-            byte => byte,
         }
     }
 }

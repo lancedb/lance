@@ -62,9 +62,9 @@ const SHAPES: &[&str] = &[
     // Characters that have to be escaped in the response XML.
     "db/amp&ersand",
     "db/less<than",
-    // Characters whose treatment in a query string is the risk: a literal `+` and a space
-    // both become `+` under form encoding, so a store that decodes the resume position as a
-    // form value and one that decodes it as a URI path disagree about which key was meant.
+    // A literal `+` and a space, which collapse together under form encoding. Nothing in a
+    // request carries a key any more, so what these hold to account is the response: two names
+    // that a client decoding the XML too eagerly would report as the same child.
     "db/plus+one",
     "db/with space",
     // Characters that are legal in a key but reserved in a URL.

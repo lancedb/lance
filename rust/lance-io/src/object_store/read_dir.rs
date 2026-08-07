@@ -505,13 +505,11 @@ mod tests {
         /// A paginated API over a store that lists in key order, like S3, GCS, or Azure over a
         /// flat namespace.
         KeyOrdered,
-        /// A paginated API over a store that orders each directory level by child name rather
-        /// than by whole key, which Azure documents for accounts with a hierarchical namespace.
-        NameOrdered,
-        /// A paginated API over a store that lists in no particular order, like S3 Express.
+        /// A paginated API over a store that lists in no particular order, like S3 Express or
+        /// an Azure account with a hierarchical namespace.
         Unordered,
     }
-    use Backend::{FullListing, KeyOrdered, NameOrdered, Unordered};
+    use Backend::{FullListing, KeyOrdered, Unordered};
 
     /// One list request, as the backend saw it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -655,7 +653,6 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         if backend != FullListing {
             let order = match backend {
-                NameOrdered => KeyOrder::DelimiterLowest,
                 Unordered => KeyOrder::Reversed,
                 _ => KeyOrder::ByKey,
             };
@@ -679,7 +676,8 @@ mod tests {
     ];
 
     /// Walking a directory hands back every child exactly once, however the store resolves the
-    /// listing, whatever order it lists in, and however small the pages are.
+    /// listing and however small the pages are. That it holds whatever order the store lists
+    /// in is [`test_an_unordered_store_is_still_paged`].
     #[rstest]
     #[case::whole_directory(TABLES, "db", vec!["a.lance", "b.lance", "c.lance", "loose.txt"])]
     #[case::empty_directory(TABLES, "nonexistent", vec![])]
@@ -687,19 +685,19 @@ mod tests {
     // A directory and the sibling that follows it: `foo/` and `foo0` are adjacent in key order
     // with nothing between them, so resuming past `foo`'s contents must not swallow `foo0`.
     #[case::the_sibling_after_a_directory(&["db/foo/inside", "db/foo0"], "db", vec!["foo", "foo0"])]
-    // The two orders a store can list a level in disagree over siblings where one name is a
-    // prefix of another: `foo/` and `foo-bar/` differ at `/` against `-`.
+    // Siblings where one name is a prefix of another, which is where a page boundary is easiest
+    // to get wrong: `foo/` and `foo-bar/` differ at `/` against `-`.
     #[case::a_prefix_shaped_sibling(&["db/foo/inside", "db/foo-bar/inside", "db/zzz.txt"], "db", vec!["foo", "foo-bar", "zzz.txt"])]
     // A store that keeps a marker object for a directory reports the directory itself when
     // that directory is listed. Dropping the marker must not also drop the progress the page
     // made, or a page holding nothing but the marker reads as the end of the listing.
     #[case::a_directory_marker(&["db/marked/", "db/marked/a.txt", "db/marked/b.txt"], "db/marked", vec!["a.txt", "b.txt"])]
-    // A name holding a character `Path::from` would percent-encode still pages in the
-    // backend's own order.
+    // A name holding a character `Path::from` would percent-encode is still reported, and
+    // sorted, under the name it was stored with.
     #[case::an_encodable_name(&["db/az", "db/a~"], "db", vec!["az", "a~"])]
     #[tokio::test]
     async fn test_walking_a_directory_is_complete(
-        #[values(FullListing, KeyOrdered, NameOrdered, Unordered)] backend: Backend,
+        #[values(FullListing, KeyOrdered)] backend: Backend,
         #[values(None, Some(1), Some(2), Some(3))] limit: Option<usize>,
         #[case] keys: &[&str],
         #[case] dir: &str,
@@ -734,12 +732,9 @@ mod tests {
 
     /// The point of the pushdown: a caller that wants one child of a directory holding more
     /// makes one request, for one child.
-    #[rstest]
     #[tokio::test]
-    async fn test_a_bounded_page_makes_one_request(
-        #[values(KeyOrdered, NameOrdered, Unordered)] backend: Backend,
-    ) {
-        let store = test_store(backend, TABLES).await;
+    async fn test_a_bounded_page_makes_one_request() {
+        let store = test_store(KeyOrdered, TABLES).await;
 
         let page = store.first_page("db", Some(1)).await;
 
@@ -793,12 +788,9 @@ mod tests {
     /// A page whose whole budget went on things that are not children still has to move. The
     /// directory marker is the cheap way to arrange that: on a store that lists in key order it
     /// sorts first, so with a page of one it arrives on its own, leaving nothing to hand back.
-    #[rstest]
     #[tokio::test]
-    async fn test_a_page_of_no_entries_keeps_going(
-        #[values(KeyOrdered, NameOrdered)] backend: Backend,
-    ) {
-        let store = test_store(backend, &["db/marked/", "db/marked/a.txt"]).await;
+    async fn test_a_page_of_no_entries_keeps_going() {
+        let store = test_store(KeyOrdered, &["db/marked/", "db/marked/a.txt"]).await;
 
         let page = store.first_page("db/marked", Some(1)).await;
 
