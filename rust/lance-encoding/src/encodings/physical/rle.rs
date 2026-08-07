@@ -1324,28 +1324,38 @@ impl RleDecompressor {
         let (values_buffer, lengths_buffer) =
             self.decode_child_buffers(values_buffer, lengths_buffer)?;
 
+        self.decode_child_data(&values_buffer, &lengths_buffer, num_values, clamp_overflow)
+    }
+
+    fn decode_child_data(
+        &self,
+        values_buffer: &LanceBuffer,
+        lengths_buffer: &LanceBuffer,
+        num_values: u64,
+        clamp_overflow: bool,
+    ) -> Result<DataBlock> {
         let decoded_data = match self.bits_per_value {
             8 => self.decode_generic::<u8>(
-                &values_buffer,
-                &lengths_buffer,
+                values_buffer,
+                lengths_buffer,
                 num_values,
                 clamp_overflow,
             )?,
             16 => self.decode_generic::<u16>(
-                &values_buffer,
-                &lengths_buffer,
+                values_buffer,
+                lengths_buffer,
                 num_values,
                 clamp_overflow,
             )?,
             32 => self.decode_generic::<u32>(
-                &values_buffer,
-                &lengths_buffer,
+                values_buffer,
+                lengths_buffer,
                 num_values,
                 clamp_overflow,
             )?,
             64 => self.decode_generic::<u64>(
-                &values_buffer,
-                &lengths_buffer,
+                values_buffer,
+                lengths_buffer,
                 num_values,
                 clamp_overflow,
             )?,
@@ -1366,6 +1376,79 @@ impl RleDecompressor {
             num_values,
             block_info: BlockInfo::default(),
         }))
+    }
+
+    fn infer_num_values(
+        &self,
+        values_buffer: &LanceBuffer,
+        lengths_buffer: &LanceBuffer,
+    ) -> Result<u64> {
+        let (value_size, value_type) = match self.bits_per_value {
+            8 => (1, "u8"),
+            16 => (2, "u16"),
+            32 => (4, "u32"),
+            64 => (8, "u64"),
+            _ => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE decoding bits_per_value must be 8, 16, 32, or 64, got {}",
+                        self.bits_per_value
+                    )
+                    .into(),
+                ));
+            }
+        };
+        let length_size =
+            self.validate_buffer_sizes(values_buffer, lengths_buffer, value_size, value_type)?;
+
+        lengths_buffer
+            .chunks_exact(length_size)
+            .try_fold(0_u64, |num_values, length_bytes| {
+                let length = self.run_length_width.read_length(length_bytes);
+                if length == 0 {
+                    return Err(Error::invalid_input_source(
+                        "RLE decoding encountered a zero run length".into(),
+                    ));
+                }
+                num_values.checked_add(length).ok_or_else(|| {
+                    Error::invalid_input_source("RLE run length sum overflowed u64".into())
+                })
+            })
+    }
+
+    fn validate_buffer_sizes(
+        &self,
+        values_buffer: &LanceBuffer,
+        lengths_buffer: &LanceBuffer,
+        value_size: usize,
+        value_type: &str,
+    ) -> Result<usize> {
+        let length_size = self.run_length_width.bytes_per_value();
+        if !values_buffer.len().is_multiple_of(value_size)
+            || !lengths_buffer.len().is_multiple_of(length_size)
+        {
+            return Err(Error::invalid_input_source(format!(
+                "Invalid buffer sizes for RLE {value_type} decoding: values {} bytes (not divisible by {}), lengths {} bytes (not divisible by {})",
+                values_buffer.len(),
+                value_size,
+                lengths_buffer.len(),
+                length_size
+            )
+            .into()));
+        }
+
+        let num_runs = values_buffer.len() / value_size;
+        let num_length_entries = lengths_buffer.len() / length_size;
+        if num_runs != num_length_entries {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Inconsistent RLE buffers: {} runs but {} length entries",
+                    num_runs, num_length_entries
+                )
+                .into(),
+            ));
+        }
+        Ok(length_size)
     }
 
     fn decode_child_buffers(
@@ -1441,7 +1524,6 @@ impl RleDecompressor {
         T: bytemuck::Pod + Copy + std::fmt::Debug + ArrowNativeType,
     {
         let type_size = std::mem::size_of::<T>();
-        let length_size = self.run_length_width.bytes_per_value();
 
         if values_buffer.is_empty() || lengths_buffer.is_empty() {
             if num_values == 0 {
@@ -1453,31 +1535,12 @@ impl RleDecompressor {
             }
         }
 
-        if !values_buffer.len().is_multiple_of(type_size)
-            || !lengths_buffer.len().is_multiple_of(length_size)
-        {
-            return Err(Error::invalid_input_source(format!(
-                "Invalid buffer sizes for RLE {} decoding: values {} bytes (not divisible by {}), lengths {} bytes (not divisible by {})",
-                std::any::type_name::<T>(),
-                values_buffer.len(),
-                type_size,
-                lengths_buffer.len(),
-                length_size
-            )
-            .into()));
-        }
-
-        let num_runs = values_buffer.len() / type_size;
-        let num_length_entries = lengths_buffer.len() / length_size;
-        if num_runs != num_length_entries {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Inconsistent RLE buffers: {} runs but {} length entries",
-                    num_runs, num_length_entries
-                )
-                .into(),
-            ));
-        }
+        let length_size = self.validate_buffer_sizes(
+            values_buffer,
+            lengths_buffer,
+            type_size,
+            std::any::type_name::<T>(),
+        )?;
 
         let values_ref = values_buffer.borrow_to_typed_slice::<T>();
         let values: &[T] = values_ref.as_ref();
@@ -1568,6 +1631,19 @@ impl BlockDecompressor for RleDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;
         self.decode_data(vec![values_buffer, lengths_buffer], num_values, false)
+    }
+
+    fn decompress_with_num_values_inference(
+        &self,
+        data: LanceBuffer,
+        _num_values: u64,
+    ) -> Result<(DataBlock, Option<u64>)> {
+        let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;
+        let (values_buffer, lengths_buffer) =
+            self.decode_child_buffers(values_buffer, lengths_buffer)?;
+        let num_values = self.infer_num_values(&values_buffer, &lengths_buffer)?;
+        self.decode_child_data(&values_buffer, &lengths_buffer, num_values, false)
+            .map(|data| (data, Some(num_values)))
     }
 }
 
@@ -1932,6 +2008,31 @@ mod tests {
             .decode_u16_runs(LanceBuffer::empty(), 0)
             .unwrap_err();
         assert!(error.to_string().contains("Insufficient data size: 0"));
+    }
+
+    #[test]
+    fn block_rle_infers_value_count_from_run_lengths() {
+        let num_values = u64::from(u16::MAX) + 8;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2_u64.to_le_bytes());
+        frame.extend_from_slice(&7_u16.to_le_bytes());
+        frame.extend_from_slice(&(num_values as u32).to_le_bytes());
+
+        let (decoded, inferred_num_values) =
+            RleDecompressor::with_run_length_width(16, RunLengthWidth::U32)
+                .decompress_with_num_values_inference(LanceBuffer::from(frame), 0)
+                .unwrap();
+        assert_eq!(inferred_num_values, Some(num_values));
+        let decoded = decoded.as_fixed_width().unwrap();
+        assert_eq!(decoded.num_values, num_values);
+        assert_eq!(decoded.bits_per_value, 16);
+        assert!(
+            decoded
+                .data
+                .borrow_to_typed_slice::<u16>()
+                .iter()
+                .all(|level| *level == 7)
+        );
     }
 
     #[rstest]

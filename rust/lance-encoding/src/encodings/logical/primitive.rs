@@ -192,10 +192,49 @@ impl DecodeMiniBlockTask {
         levels: LanceBuffer,
         num_levels: u16,
     ) -> Result<ScalarBuffer<u16>> {
-        let rep = rep_decompressor.decompress(levels, num_levels as u64)?;
-        let rep = rep.as_fixed_width().unwrap();
-        debug_assert_eq!(rep.num_values, num_levels as u64);
-        debug_assert_eq!(rep.bits_per_value, 16);
+        let declared_num_levels = u64::from(num_levels);
+        let (rep, inferred_num_levels) =
+            rep_decompressor.decompress_with_num_values_inference(levels, declared_num_levels)?;
+        let expected_num_levels = match inferred_num_levels {
+            Some(actual_num_levels) => {
+                let is_wrapped_u16_count = actual_num_levels > declared_num_levels
+                    && (actual_num_levels - declared_num_levels)
+                        .is_multiple_of(u64::from(u16::MAX) + 1);
+                if actual_num_levels != declared_num_levels && !is_wrapped_u16_count {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "miniblock levels decoded {actual_num_levels} values but the header declared {declared_num_levels}; the difference is not a wrapped u16 count"
+                        )
+                        .into(),
+                    ));
+                }
+                actual_num_levels
+            }
+            None => declared_num_levels,
+        };
+        let rep = rep.as_fixed_width().ok_or_else(|| {
+            Error::invalid_input_source(
+                "miniblock levels did not decode to fixed-width data".into(),
+            )
+        })?;
+        if rep.num_values != expected_num_levels {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} values, expected {expected_num_levels}",
+                    rep.num_values
+                )
+                .into(),
+            ));
+        }
+        if rep.bits_per_value != 16 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} bits per value, expected 16",
+                    rep.bits_per_value
+                )
+                .into(),
+            ));
+        }
         Ok(rep.data.borrow_to_typed_slice::<u16>())
     }
 
@@ -9744,6 +9783,27 @@ mod tests {
         RleDecompressor::with_run_length_width(16, run_length_width)
             .decode_u16_runs(frame, levels.len() as u64)
             .unwrap()
+    }
+
+    #[test]
+    fn miniblock_levels_recover_wrapped_u16_count() {
+        let actual_num_levels = usize::from(u16::MAX) + 8;
+        let levels = vec![1_u16; actual_num_levels];
+        let frame = encoded_u16_frame(&levels, RunLengthWidth::U32);
+        let decompressor = RleDecompressor::with_run_length_width(16, RunLengthWidth::U32);
+
+        let decoded = DecodeMiniBlockTask::decode_levels(&decompressor, frame, 7).unwrap();
+        assert_eq!(decoded.as_ref(), levels);
+    }
+
+    #[test]
+    fn miniblock_levels_reject_non_wrapped_count_mismatch() {
+        let frame = encoded_u16_frame(&[1_u16; 8], RunLengthWidth::U8);
+        let decompressor = RleDecompressor::with_run_length_width(16, RunLengthWidth::U8);
+
+        let error = DecodeMiniBlockTask::decode_levels(&decompressor, frame, 7).unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not a wrapped u16 count"));
     }
 
     fn physical_levels(levels: &[u16]) -> LazyLevels {

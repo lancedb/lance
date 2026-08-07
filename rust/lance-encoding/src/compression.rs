@@ -923,6 +923,18 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
+
+    /// Decompress a block, inferring its decoded value count from the payload when supported.
+    ///
+    /// `num_values` is used when the encoding requires an external count. The second tuple item
+    /// is `Some` only when the decompressor determined the count independently from the payload.
+    fn decompress_with_num_values_inference(
+        &self,
+        data: LanceBuffer,
+        num_values: u64,
+    ) -> Result<(DataBlock, Option<u64>)> {
+        self.decompress(data, num_values).map(|data| (data, None))
+    }
 }
 
 pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {

@@ -14,7 +14,7 @@ use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
-use arrow_array::{Float32Array, Int64Array, RecordBatchIterator};
+use arrow_array::{Array, Float32Array, Int64Array, ListArray, RecordBatchIterator, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use lance_file::version::LanceFileVersion;
 
@@ -510,4 +510,32 @@ async fn test_list_struct_field_reorder_issue_5702() {
 
     // Verify schema has expected columns
     assert_eq!(batch.schema().fields().len(), 3); // id, data, extra
+}
+
+/// Regression test for issue #6936: v6.0.1 truncated a miniblock's structural
+/// level count to u16 while retaining the complete RLE payload.
+#[tokio::test]
+async fn test_v6_0_1_miniblock_level_count_overflow() {
+    let test_dir = copy_test_data_to_tmp("v6.0.1/miniblock_level_count_overflow.lance").unwrap();
+    let test_uri = test_dir.path_str();
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 66_049);
+
+    let captions = batch["captions"]
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let values = captions
+        .values()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert_eq!(values.len(), 16_416);
+    assert_eq!(values.values().as_ref(), (0..16_416).collect::<Vec<_>>());
+
+    let offsets = captions.value_offsets();
+    assert_eq!(offsets[513], 16_416);
+    assert!(offsets[513..].iter().all(|offset| *offset == 16_416));
 }
