@@ -144,14 +144,28 @@ struct ApplicationCredentialKind {
     credential_type: String,
 }
 
-fn gcs_client_options(storage_options: &StorageOptions) -> Result<ClientOptions> {
-    let mut client_options = storage_options.client_options()?;
+struct GcsClientOptions {
+    object_requests: ClientOptions,
+    credential_requests: ClientOptions,
+}
+
+fn gcs_client_options(storage_options: &StorageOptions) -> Result<GcsClientOptions> {
+    let mut object_requests = storage_options.client_options()?;
+    // headers.* options are scoped to object requests and may contain secrets. Credential
+    // exchanges can target unrelated identity endpoints, so only share typed client settings.
+    let mut credential_requests = object_requests
+        .clone()
+        .with_default_headers(Default::default());
     for (key, value) in storage_options.as_gcs_options() {
         if let GoogleConfigKey::Client(key) = key {
-            client_options = client_options.with_config(key, value);
+            object_requests = object_requests.with_config(key, value.clone());
+            credential_requests = credential_requests.with_config(key, value);
         }
     }
-    Ok(client_options)
+    Ok(GcsClientOptions {
+        object_requests,
+        credential_requests,
+    })
 }
 
 fn workload_identity_credential_provider(
@@ -237,7 +251,7 @@ impl GcsStoreProvider {
         let mut builder = GoogleCloudStorageBuilder::new()
             .with_url(base_path.as_ref())
             .with_retry(retry_config)
-            .with_client_options(client_options.clone());
+            .with_client_options(client_options.object_requests.clone());
         for (key, value) in storage_options.as_gcs_options() {
             builder = builder.with_config(key, value);
         }
@@ -252,9 +266,10 @@ impl GcsStoreProvider {
             };
             let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
             builder = builder.with_credentials(credential_provider);
-        } else if let Some(credential_provider) =
-            workload_identity_credential_provider(storage_options, &client_options)?
-        {
+        } else if let Some(credential_provider) = workload_identity_credential_provider(
+            storage_options,
+            &client_options.credential_requests,
+        )? {
             // object_store cannot exchange external-account ADC files, while reqsign supports
             // the workload identity format emitted by google-github-actions/auth.
             builder = builder.with_credentials(credential_provider);
@@ -481,8 +496,12 @@ mod tests {
             .await;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage_options =
+        let mut storage_options =
             external_account_storage_options(&temp_dir, format!("{}/token", mock_server.uri()));
+        storage_options.insert(
+            "headers.Authorization".to_string(),
+            "Bearer storage-secret".to_string(),
+        );
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 storage_options.clone(),
@@ -498,10 +517,12 @@ mod tests {
 
         let storage_options = StorageOptions::new(storage_options);
         let client_options = gcs_client_options(&storage_options).unwrap();
-        let credential_provider =
-            workload_identity_credential_provider(&storage_options, &client_options)
-                .expect("external account credential provider should build")
-                .expect("external account credentials should select the reqsign provider");
+        let credential_provider = workload_identity_credential_provider(
+            &storage_options,
+            &client_options.credential_requests,
+        )
+        .expect("external account credential provider should build")
+        .expect("external account credentials should select the reqsign provider");
         for _ in 0..2 {
             let credential = credential_provider
                 .get_credential()
@@ -510,6 +531,8 @@ mod tests {
             assert_eq!(credential.bearer, "federated-token");
         }
         mock_server.verify().await;
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(!requests[0].headers.contains_key("authorization"));
     }
 
     #[tokio::test]
@@ -535,10 +558,12 @@ mod tests {
         storage_options.insert("timeout".to_string(), "50ms".to_string());
         let storage_options = StorageOptions::new(storage_options);
         let client_options = gcs_client_options(&storage_options).unwrap();
-        let credential_provider =
-            workload_identity_credential_provider(&storage_options, &client_options)
-                .expect("external account credential provider should build")
-                .expect("external account credentials should select the reqsign provider");
+        let credential_provider = workload_identity_credential_provider(
+            &storage_options,
+            &client_options.credential_requests,
+        )
+        .expect("external account credential provider should build")
+        .expect("external account credentials should select the reqsign provider");
 
         let credential_result = tokio::time::timeout(
             Duration::from_millis(200),
