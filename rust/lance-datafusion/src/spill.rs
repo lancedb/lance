@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
+    collections::HashMap,
     io::{BufReader, BufWriter},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
@@ -22,6 +23,22 @@ use datafusion_common::DataFusionError;
 use futures::StreamExt;
 use lance_arrow::memory::MemoryAccumulator;
 use lance_core::error::LanceOptionExt;
+
+fn disk_manager_accounting_lock(disk_manager: &Arc<DiskManager>) -> Arc<Mutex<()>> {
+    static ACCOUNTING_LOCKS: OnceLock<Mutex<HashMap<usize, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = ACCOUNTING_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+
+    let key = Arc::as_ptr(disk_manager) as usize;
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
 
 /// Start a spill of Arrow data to a file that can be read later multiple times.
 ///
@@ -181,9 +198,11 @@ pub async fn spilling_table_provider_with_disk_manager(
     let spill_file = disk_manager.create_tmp_file("writing replay spill")?;
     let spill_path = spill_file.path().to_owned();
     let (mut sender, receiver) = create_replay_spill(spill_path, schema.clone(), memory_limit);
+    let accounting_lock = disk_manager_accounting_lock(&disk_manager);
     sender.managed_spill = Some(ManagedSpillFile {
         file: spill_file.clone(),
         disk_manager,
+        accounting_lock,
     });
 
     // Drain the one-shot source into the spill once, in the background. The spill
@@ -739,10 +758,19 @@ impl AsyncStreamWriter {
 struct ManagedSpillFile {
     file: RefCountedTempFile,
     disk_manager: Arc<DiskManager>,
+    accounting_lock: Arc<Mutex<()>>,
 }
 
 impl ManagedSpillFile {
     fn update_disk_usage(&mut self) -> Result<(), ArrowError> {
+        // DataFusion 54 checks its limit after updating the global counter but
+        // before recording the new per-file size. Serialize the preflight and
+        // mutation for every replay file backed by this manager so a rejected
+        // concurrent growth cannot leave an unowned global charge.
+        let _accounting_guard = self
+            .accounting_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let new_file_usage = self
             .file
             .inner()
@@ -853,7 +881,7 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use futures::{StreamExt, TryStreamExt, poll};
     use lance_core::utils::tempfile::{TempStdFile, TempStdPath};
-    use tokio::sync::oneshot;
+    use tokio::sync::{Barrier, oneshot};
 
     use super::*;
     use crate::exec::provider_to_stream;
@@ -1125,6 +1153,66 @@ mod tests {
             disk_manager.used_disk_space(),
             0,
             "failed replay spills must release their disk reservation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_quota_errors_release_disk_usage() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1; 1024]))],
+        )
+        .unwrap();
+        let header_size = {
+            let mut buffer = Vec::new();
+            let writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
+            drop(writer);
+            u64::try_from(buffer.len()).unwrap()
+        };
+        let disk_manager = Arc::new(
+            DiskManager::builder()
+                .with_max_temp_directory_size(header_size * 2 - 1)
+                .build()
+                .unwrap(),
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let source = |batch: RecordBatch| {
+            let barrier = barrier.clone();
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::once(async move {
+                    barrier.wait().await;
+                    Ok(batch)
+                }),
+            )) as SendableRecordBatchStream
+        };
+        let first = spilling_table_provider_with_disk_manager(
+            source(batch.clone()),
+            0,
+            disk_manager.clone(),
+        )
+        .await
+        .unwrap();
+        let second =
+            spilling_table_provider_with_disk_manager(source(batch), 0, disk_manager.clone())
+                .await
+                .unwrap();
+        let collect = |provider| async move {
+            provider_to_stream(provider)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+        };
+        let (first_result, second_result) = tokio::join!(collect(first), collect(second));
+        assert!(first_result.is_err());
+        assert!(second_result.is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            disk_manager.used_disk_space(),
+            0,
+            "concurrent replay quota failures must release their disk reservations"
         );
     }
 

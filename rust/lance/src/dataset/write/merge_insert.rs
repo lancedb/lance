@@ -506,10 +506,31 @@ fn merge_insert_execution_options() -> LanceExecutionOptions {
     }
 }
 
-fn fragment_update_session_context(spill_session_context: &SessionContext) -> SessionContext {
+fn max_fragment_update_partitions(memory_pool_size: u64) -> usize {
+    // Every sort partition reserves the configured spill-merge budget. Leave
+    // one such budget available for the lazy indexed input feeding this sort.
+    let sort_spill_reservation = (memory_pool_size / 3).clamp(1, 40 * 1024 * 1024);
+    usize::try_from(
+        (memory_pool_size / sort_spill_reservation)
+            .saturating_sub(1)
+            .max(1),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+fn fragment_update_session_context(
+    spill_session_context: &SessionContext,
+    spill_execution_options: &LanceExecutionOptions,
+) -> SessionContext {
+    let target_partitions =
+        get_num_compute_intensive_cpus()
+            .min(8)
+            .min(max_fragment_update_partitions(
+                spill_execution_options.mem_pool_size(),
+            ));
     let config = spill_session_context
         .copied_config()
-        .with_target_partitions(get_num_compute_intensive_cpus().min(8));
+        .with_target_partitions(target_partitions);
     SessionContext::new_with_config_rt(config, spill_session_context.runtime_env())
 }
 
@@ -1603,13 +1624,15 @@ impl MergeInsertJob {
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         spill_session_context: &SessionContext,
+        spill_execution_options: &LanceExecutionOptions,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
         let target_bases_info = Arc::new(target_bases_info);
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = fragment_update_session_context(spill_session_context);
+        let session_ctx =
+            fragment_update_session_context(spill_session_context, spill_execution_options);
         // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
         // single batch that is larger than the memory pool, so we must
         // rechunk oversized batches before they reach the sort.
@@ -2721,6 +2744,7 @@ impl MergeInsertJob {
                 self.dataset.manifest.version + 1,
                 target_bases_info,
                 &self.spill_session_context,
+                &self.spill_execution_options,
             )
             .await?;
 
@@ -3627,6 +3651,15 @@ mod tests {
     }
 
     #[test]
+    fn test_fragment_update_partitions_leave_upstream_memory() {
+        assert_eq!(
+            max_fragment_update_partitions(150 * 1024 * 1024),
+            2,
+            "a 150 MiB pool cannot host more than two 40 MiB sort merges while the indexed input is live"
+        );
+    }
+
+    #[test]
     fn test_inserted_key_tracker_preserves_logical_nulls() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Null, true)])),
@@ -3692,7 +3725,8 @@ mod tests {
         .unwrap();
         let update_stream =
             RecordBatchStreamAdapter::new(updates.schema(), futures::stream::iter([Ok(updates)]));
-        let spill_session_context = new_session_context(&merge_insert_execution_options());
+        let spill_execution_options = merge_insert_execution_options();
+        let spill_session_context = new_session_context(&spill_execution_options);
 
         let error = MergeInsertJob::update_fragments(
             dataset.clone(),
@@ -3700,6 +3734,7 @@ mod tests {
             dataset.manifest().version + 1,
             None,
             &spill_session_context,
+            &spill_execution_options,
         )
         .await
         .unwrap_err();
@@ -5012,7 +5047,10 @@ mod tests {
             .try_build()
             .unwrap();
         let job_disk_manager = job.spill_session_context.runtime_env().disk_manager.clone();
-        let fragment_update_context = fragment_update_session_context(&job.spill_session_context);
+        let fragment_update_context = fragment_update_session_context(
+            &job.spill_session_context,
+            &job.spill_execution_options,
+        );
         assert!(
             Arc::ptr_eq(
                 &job_disk_manager,
