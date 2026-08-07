@@ -12,7 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [package.metadata.docs.rs]
-features = []
+# Include the documentation-only `metrics` module catalogue.
+features = ["metrics"]
 no-default-features = true
 
 [package.metadata.cargo-machete]
