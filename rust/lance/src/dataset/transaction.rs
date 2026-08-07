@@ -2397,6 +2397,28 @@ impl Transaction {
 
                 final_fragments.extend(unmodified_fragments);
 
+                // Data replacement changes files, not row placement. Reassemble
+                // the fragments in their existing logical order without using
+                // fragment ids as ordering keys.
+                let mut fragments_by_id = HashMap::with_capacity(final_fragments.len());
+                for fragment in final_fragments.drain(..) {
+                    if fragments_by_id.insert(fragment.id, fragment).is_some() {
+                        return Err(Error::invalid_input(
+                            "DataReplacement contains multiple replacements for the same fragment"
+                                .to_string(),
+                        ));
+                    }
+                }
+                for existing_fragment in existing_fragments {
+                    let Some(fragment) = fragments_by_id.remove(&existing_fragment.id) else {
+                        return Err(Error::internal(format!(
+                            "DataReplacement lost fragment {} while preserving logical order",
+                            existing_fragment.id
+                        )));
+                    };
+                    final_fragments.push(fragment);
+                }
+
                 // 5. Invalidate index bitmaps for replaced fields
                 let modified_fragments: Vec<Fragment> = final_fragments
                     .iter()
@@ -2486,9 +2508,6 @@ impl Transaction {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
         };
-
-        // If a fragment was reserved then it may not belong at the end of the fragments list.
-        final_fragments.sort_by_key(|frag| frag.id);
 
         // Clean up data files that only contain tombstoned fields
         Self::remove_tombstoned_data_files(&mut final_fragments);
@@ -4305,6 +4324,95 @@ mod tests {
         ];
 
         assert_eq!(final_fragments, expected_fragments);
+    }
+
+    #[test]
+    fn test_rewrite_build_manifest_preserves_logical_fragment_order() {
+        let manifest = sample_manifest_with_fragments(0..4);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                    new_fragments: vec![Fragment::new(0)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+
+        let (rewritten, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let fragment_ids = rewritten
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids, vec![0, 4, 3]);
+    }
+
+    #[test]
+    fn test_rewrite_after_row_adding_update_preserves_logical_order() {
+        let manifest = sample_manifest_with_fragments(0..3);
+        let update = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![],
+                new_fragments: vec![Fragment::new(0)],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+        let (updated, _) = update
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "update-txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let rewrite = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(0)],
+                    new_fragments: vec![Fragment::new(0)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+        let (rewritten, _) = rewrite
+            .build_manifest(
+                Some(&updated),
+                vec![],
+                "rewrite-txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let fragment_ids = rewritten
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids, vec![4, 1, 2, 3]);
     }
 
     #[test]

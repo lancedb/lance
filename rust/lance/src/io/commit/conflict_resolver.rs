@@ -773,14 +773,8 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
-                // A rewrite allocates replacement fragment ids above the current
-                // high-water mark. If an append landed after the rewrite was
-                // planned, rebasing would place the replacement after the newly
-                // appended rows and violate insertion order.
-                Operation::Append { .. } => {
-                    Err(self.retryable_conflict_err(other_transaction, other_version))
-                }
-                Operation::ReserveFragments { .. }
+                Operation::Append { .. }
+                | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -2650,6 +2644,43 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_is_compatible_with_row_adding_update() {
+        let operation = Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![Fragment::new(0)],
+                new_fragments: vec![Fragment::new(2)],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, operation.clone(), None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&operation).collect::<HashSet<_>>(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let other = Transaction::new(
+            0,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![],
+                new_fragments: vec![Fragment::new(1)],
+                fields_modified: vec![],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        assert!(rebase.check_txn(&other, 1).is_ok());
+    }
+
+    #[test]
     fn test_conflicts() {
         use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
 
@@ -2843,7 +2874,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Retryable,     // append
+                    Compatible,    // append
                     Retryable,     // create index
                     Compatible,    // delete
                     Retryable,     // merge
@@ -2865,7 +2896,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Retryable,     // append
+                    Compatible,    // append
                     Retryable,     // create index
                     Retryable,     // delete
                     Retryable,     // merge

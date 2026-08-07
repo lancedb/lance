@@ -703,14 +703,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             ));
         }
 
-        // get_fragments should be returning fragments in sorted order (by id)
-        // and fragment ids should be unique
+        // Manifest order is logical row order. Fragment ids are stable identities
+        // and may be out of order after a rewrite.
         let fragments = dataset.get_fragments();
-
-        debug_assert!(
-            fragments.windows(2).all(|w| w[0].id() < w[1].id()),
-            "fragments in manifest are not sorted"
-        );
         let mut fragment_metrics = futures::stream::iter(fragments)
             .map(|fragment| async move {
                 match collect_metrics(&fragment).await {
@@ -808,30 +803,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let compactable_bins = if self.options.max_source_fragments.is_some() {
-            // New fragment ids are allocated above the manifest high-water mark,
-            // so a bounded replacement before an untouched fragment would move
-            // behind it. Select a contiguous suffix when bounding the work.
-            let mut suffix_start = i;
-            let mut suffix_bins = Vec::new();
-            for bin in candidate_bins.into_iter().rev() {
-                if bin.pos_range.end != suffix_start || bin.is_noop() {
-                    break;
-                }
-                suffix_start = bin.pos_range.start;
-                suffix_bins.push(bin);
-            }
-            suffix_bins.reverse();
-            suffix_bins
-        } else {
-            candidate_bins
-                .into_iter()
-                .filter(|bin| !bin.is_noop())
-                .collect()
-        };
-
-        let all_tasks: Vec<TaskData> = compactable_bins
+        let all_tasks: Vec<TaskData> = candidate_bins
             .into_iter()
+            .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
             .map(|bin| TaskData {
                 fragments: bin.fragments,
@@ -840,16 +814,13 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let tasks = if let Some(max_frags) = self.options.max_source_fragments {
             let mut total_frags = 0;
-            let mut tasks = all_tasks
+            all_tasks
                 .into_iter()
-                .rev()
                 .take_while(|task| {
                     total_frags += task.fragments.len();
                     total_frags <= max_frags
                 })
-                .collect::<Vec<_>>();
-            tasks.reverse();
-            tasks
+                .collect()
         } else {
             all_tasks
         };
@@ -862,17 +833,14 @@ impl CompactionPlanner for DefaultCompactionPlanner {
     }
 }
 
-/// Compacts files in the dataset.
+/// Compacts the files in the dataset without reordering them.
 ///
 /// By default, this does a few things:
 ///  * Removes deleted rows from fragments.
 ///  * Removes dropped columns from fragments.
 ///  * Merges fragments that are too small.
 ///
-/// Row order is preserved when the selected fragments form a contiguous suffix,
-/// including a full-dataset compaction. Within other partial or gapped plans,
-/// rewritten ranges retain their relative order but move after untouched
-/// fragments because fragment ids are monotonically allocated.
+/// This method tries to preserve the insertion order of rows in the dataset.
 ///
 /// If no compaction is needed, this method will not make a new version of the table.
 pub async fn compact_files(
@@ -2073,10 +2041,8 @@ async fn recalc_versions_for_rewritten_fragments(
 /// some of the tasks have been committed, the remainder of the tasks will not
 /// be able to be committed and should be considered cancelled.
 ///
-/// Completed tasks are ordered by their source fragments. This preserves row
-/// order when they collectively replace a contiguous suffix. A partial or
-/// gapped set is appended after untouched fragments because replacement ids are
-/// monotonically allocated.
+/// Completed tasks are ordered by their source fragments' current logical
+/// positions so partial and gapped result sets replace their ranges in place.
 pub async fn commit_compaction(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
@@ -2128,10 +2094,21 @@ pub async fn commit_compaction(
         ));
     }
 
-    // Rewrite tasks finish in an arbitrary order, but new fragment ids determine
-    // their order in the manifest. Reserve ids in the original fragment order so
-    // parallel and distributed compaction preserve the dataset's row order.
-    completed_tasks.sort_unstable_by_key(|task| task.original_fragments[0].id);
+    // Rewrite tasks finish in an arbitrary order. Apply their groups in current
+    // manifest order so every replacement is spliced into its logical position.
+    let fragment_positions = dataset
+        .manifest
+        .fragments
+        .iter()
+        .enumerate()
+        .map(|(position, fragment)| (fragment.id, position))
+        .collect::<HashMap<_, _>>();
+    completed_tasks.sort_by_key(|task| {
+        fragment_positions
+            .get(&task.original_fragments[0].id)
+            .copied()
+            .map_or((1, usize::MAX), |position| (0, position))
+    });
 
     // Collect the rewritten fragments' file paths up front so every failure
     // path below can clean them up (or deliberately keep them). Fragment ids
@@ -3038,6 +3015,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![4, 5, 6]
         );
+        let expected_data = dataset.scan().try_into_batch().await.unwrap();
 
         // Run compaction
         let metrics = compact_files(&mut dataset, options, Some(Arc::new(remap_a)))
@@ -3055,7 +3033,9 @@ mod tests {
             .iter()
             .map(|f| f.id())
             .collect::<Vec<_>>();
-        assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
+        assert_eq!(fragment_ids, vec![7, 8, 3, 9, 10]);
+        let compacted_data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(compacted_data, expected_data);
     }
 
     #[rstest]
@@ -7123,8 +7103,7 @@ mod tests {
             .iter()
             .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
             .collect::<Vec<_>>();
-        let expected_fragment_ids = dataset.manifest.fragments
-            [dataset.manifest.fragments.len() - bounded_source_frags..]
+        let expected_fragment_ids = dataset.manifest.fragments[..bounded_source_frags]
             .iter()
             .map(|fragment| fragment.id)
             .collect::<Vec<_>>();
@@ -7166,8 +7145,8 @@ mod tests {
         assert_eq!(after_second_data, data.slice(0, 1_000));
         let after_second = dataset.get_fragments().len();
         assert!(
-            after_second <= after_first,
-            "expected progress: {after_second} should be <= {after_first}"
+            after_second < after_first,
+            "expected progress: {after_second} should be < {after_first}"
         );
     }
 
@@ -7221,12 +7200,44 @@ mod tests {
             .iter()
             .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
             .collect::<Vec<_>>();
-        assert_eq!(planned_fragment_ids, vec![3, 4]);
+        assert_eq!(planned_fragment_ids, vec![0, 1]);
+
+        compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 4);
+        let logical_fragment_ids = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(logical_fragment_ids, vec![5, 2, 3, 4]);
+        let fragments_by_id = dataset
+            .get_fragments_from_ids(&[5, 2, 4, 3])
+            .unwrap()
+            .into_iter()
+            .map(|fragment| fragment.id())
+            .collect::<Vec<_>>();
+        assert_eq!(fragments_by_id, vec![2, 3, 4, 5]);
+        dataset.validate().await.unwrap();
+        let after_first = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(after_first, data.slice(0, offset));
+
+        let second_plan = plan_compaction(&dataset, &options).await.unwrap();
+        let second_fragment_ids = second_plan
+            .tasks()
+            .iter()
+            .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
+            .collect::<Vec<_>>();
+        assert_eq!(second_fragment_ids, vec![3, 4]);
 
         compact_files(&mut dataset, options, None).await.unwrap();
 
         let compacted = dataset.scan().try_into_batch().await.unwrap();
         assert_eq!(compacted, data.slice(0, offset));
+        assert_eq!(dataset.get_fragments().len(), 3);
     }
 
     #[tokio::test]

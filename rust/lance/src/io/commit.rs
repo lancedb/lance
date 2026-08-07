@@ -706,16 +706,20 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
 /// addresses — so a duplicate makes it ambiguous which rows that state describes.
 ///
 /// Runs after the legacy fixups above, so a dataset that needs a rollback for some
-/// other reason is diagnosed with that first. Relies on `build_manifest` leaving
-/// the fragments sorted by id.
+/// other reason is diagnosed with that first.
 fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
-    if let Some(pair) = manifest.fragments.windows(2).find(|p| p[0].id == p[1].id) {
+    let mut fragment_ids = HashSet::with_capacity(manifest.fragments.len());
+    if let Some(fragment) = manifest
+        .fragments
+        .iter()
+        .find(|fragment| !fragment_ids.insert(fragment.id))
+    {
         return Err(Error::invalid_input(format!(
             "The commit would produce two fragments with id {}. Fragment ids must be \
              unique. Datasets written by Lance 0.16 and earlier may already contain \
              duplicate ids; those have to be rewritten, or rolled back to a version \
              without the duplicate.",
-            pair[0].id
+            fragment.id
         )));
     }
     Ok(())
