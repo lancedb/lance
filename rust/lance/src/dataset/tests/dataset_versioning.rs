@@ -1301,6 +1301,30 @@ async fn test_branch() {
     let legacy_file = branch_contents_path(&root_location.path, legacy_name);
     dataset
         .object_store
+        .remove_dir_all(
+            root_location
+                .path
+                .clone()
+                .join("_refs")
+                .join("branches")
+                .join("_versions")
+                .join(legacy_name),
+        )
+        .await
+        .unwrap();
+    dataset
+        .object_store
+        .remove_dir_all(
+            root_location
+                .path
+                .clone()
+                .join("_refs")
+                .join("mutation_leases"),
+        )
+        .await
+        .unwrap();
+    dataset
+        .object_store
         .put(
             &legacy_file,
             serde_json::to_string_pretty(&legacy_contents)
@@ -1309,6 +1333,9 @@ async fn test_branch() {
         )
         .await
         .unwrap();
+    // Reopen after changing the physical layout so the commit handler does not retain the
+    // detached-generation path that the current-format branch registered above.
+    dataset = Dataset::open(&test_uri).await.unwrap();
     let mut legacy_dataset = dataset.checkout_branch(legacy_name).await.unwrap();
     legacy_dataset
         .create_branch("legacy-child", legacy_dataset.version().version, None)
@@ -1361,7 +1388,7 @@ async fn test_branch_creation_holds_ref_lease_before_generation_write() {
         let lease_acquired = lease_acquired.clone();
         let release_lease = release_lease.clone();
         async move {
-            refs.run_mutation(async {
+            refs.run_mutation(|_| async {
                 lease_acquired.wait().await;
                 release_lease.notified().await;
                 Ok(())

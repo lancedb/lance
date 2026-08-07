@@ -541,7 +541,7 @@ impl Dataset {
 
         // Branch creation is one fenced reference mutation. A force deletion cannot observe and
         // reclaim the detached generation between the physical clone and metadata publication.
-        refs.run_mutation(async move {
+        refs.run_mutation(|fence| async move {
             let branches = mutation_refs.branches();
             let branch_contents = branches
                 .prepare_create(&branch, version_number, source_branch.as_deref())
@@ -572,7 +572,9 @@ impl Dataset {
                 .with_storage_format(storage_format);
             let dataset = builder.execute(transaction).await?;
 
-            branches.create_unlocked(&branch, branch_contents).await?;
+            branches
+                .create_unlocked(&fence, &branch, branch_contents)
+                .await?;
             Ok(dataset)
         })
         .await

@@ -21,8 +21,12 @@ Branch names must follow these validation rules:
 
 ### Branch Metadata Path
 
-Branch metadata is stored at `_refs/branches/{branch-name}.json` in the dataset root.
-Since branch names support hierarchical naming with `/` characters, the `/` is URL-encoded as `%2F` in the filename to distinguish it from directory separators (e.g., `bugfix/issue-123` becomes `bugfix%2Fissue-123.json`):
+Branch metadata is published as immutable fenced records under
+`_refs/branches/_versions/{branch-name}/{epoch}.json`. The greatest numeric epoch is authoritative.
+`_refs/branches/{branch-name}.json` mirrors the latest publication for compatibility with earlier
+readers. Since branch names support hierarchical naming with `/` characters, the `/` is URL-encoded
+as `%2F` in the filename and version directory (e.g., `bugfix/issue-123` becomes
+`bugfix%2Fissue-123`):
 
 ```
 {dataset_root}/
@@ -30,7 +34,32 @@ Since branch names support hierarchical naming with `/` characters, the `/` is U
         branches/
             feature-a.json
             bugfix%2Fissue-123.json  # Note: '/' encoded as '%2F'
+            _versions/
+                feature-a/
+                    00000000000000000042.json
+                bugfix%2Fissue-123/
+                    00000000000000000043.json
 ```
+
+Each live fenced record contains the branch metadata below plus `_mutationEpoch`, whose value
+matches the epoch in its file name. Deletion appends a tombstone instead of removing earlier
+records:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["_mutationEpoch", "_deleted"],
+  "properties": {
+    "_mutationEpoch": {"type": "integer", "minimum": 1},
+    "_deleted": {"const": true}
+  },
+  "additionalProperties": false
+}
+```
+
+Readers ignore lower-epoch records even if a delayed writer publishes one after a newer epoch.
+When no version records exist, readers load the unversioned metadata file as a legacy record.
 
 ### Branch Metadata File Format
 
@@ -89,6 +118,10 @@ Each branch metadata file is a JSON object with this schema:
     "metadata": {
       "type": "object",
       "additionalProperties": {"type": "string"}
+    },
+    "_mutationEpoch": {
+      "type": "integer",
+      "minimum": 1
     }
   }
 }
@@ -161,7 +194,11 @@ Note that tag names do not support `/` characters, unlike branch names.
 
 ### Tag Storage
 
-Tags are stored as JSON files under `_refs/tags/` at the dataset root:
+Tags use the same immutable epoch publication protocol under
+`_refs/tags/_versions/{tag-name}/{epoch}.json`. The greatest epoch is authoritative, and a deleted
+tag is represented by the tombstone schema above. `_refs/tags/{tag-name}.json` mirrors the latest
+publication for compatibility with earlier readers. Tags are always stored at the root dataset
+level, regardless of which branch they reference.
 
 ```
 {dataset_root}/
@@ -170,9 +207,10 @@ Tags are stored as JSON files under `_refs/tags/` at the dataset root:
             v1.0.0.json
             v1.1.0.json
             production.json
+            _versions/
+                production/
+                    00000000000000000042.json
 ```
-
-Tags are always stored at the root dataset level, regardless of which branch they reference.
 
 ### Tag File Format
 

@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::future::Future;
-use std::ops::Range;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -38,6 +37,10 @@ const TAG_MUTATION_INTENTS_DIR: &str = "tag_mutations";
 const LEASE_FILE: &str = "lease.json";
 const LEASE_HEARTBEATS_DIR: &str = "heartbeats";
 const LEASE_RELEASED_FILE: &str = "released.json";
+const LEASE_PUBLICATION_FILE: &str = "publication.json";
+const LEASE_RECONCILED_FILE: &str = "reconciled.json";
+const REF_MUTATION_EPOCH_FIELD: &str = "_mutationEpoch";
+const REF_DELETED_FIELD: &str = "_deleted";
 const REF_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const REF_MUTATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const REF_MUTATION_LEASE_DURATION_MILLIS: i64 = 30_000;
@@ -137,22 +140,25 @@ impl Refs {
         self.base_location.find_main()
     }
 
-    pub(super) fn run_mutation<'a, T, F>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
+    pub(super) fn run_mutation<'a, T, F, Fut>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
     where
         T: Send + 'a,
-        F: Future<Output = Result<T>> + Send + 'a,
+        F: FnOnce(DurableLeaseFence) -> Fut + Send + 'a,
+        Fut: Future<Output = Result<T>> + Send + 'a,
     {
         Box::pin(async move {
             let mut lease = RefMutationLease::acquire(self).await?;
-            let mutation_result = Self::drive_with_lease(&mut lease.handle, mutation).await;
+            let fence = lease.handle.fence()?;
+            let mutation_result = Self::drive_with_lease(&mut lease.handle, mutation(fence)).await;
             Self::finish_mutation(&mut lease, mutation_result).await
         })
     }
 
-    fn run_tag_mutation<'a, T, F>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
+    fn run_tag_mutation<'a, T, F, Fut>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
     where
         T: Send + 'a,
-        F: Future<Output = Result<T>> + Send + 'a,
+        F: FnOnce(DurableLeaseFence) -> Fut + Send + 'a,
+        Fut: Future<Output = Result<T>> + Send + 'a,
     {
         Box::pin(async move {
             let mut intent = TagMutationIntent::acquire(self).await?;
@@ -174,10 +180,11 @@ impl Refs {
         })
     }
 
-    fn run_branch_deletion<'a, T, F>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
+    fn run_branch_deletion<'a, T, F, Fut>(&'a self, mutation: F) -> BoxFuture<'a, Result<T>>
     where
         T: Send + 'a,
-        F: Future<Output = Result<T>> + Send + 'a,
+        F: FnOnce(DurableLeaseFence) -> Fut + Send + 'a,
+        Fut: Future<Output = Result<T>> + Send + 'a,
     {
         Box::pin(async move {
             // Give already-scheduled tag mutations a chance to publish their durable intent before
@@ -206,7 +213,8 @@ impl Refs {
                 tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
             };
 
-            let mutation_result = Self::drive_with_lease(&mut lease.handle, mutation).await;
+            let fence = lease.handle.fence()?;
+            let mutation_result = Self::drive_with_lease(&mut lease.handle, mutation(fence)).await;
             Self::finish_mutation(&mut lease, mutation_result).await
         })
     }
@@ -360,6 +368,133 @@ fn lease_expiry_millis() -> Result<i64> {
         .ok_or_else(|| Error::internal("reference mutation lease expiry overflow"))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableRefPublication {
+    epoch: u64,
+    path: String,
+    body: String,
+}
+
+impl DurableRefPublication {
+    async fn apply(&self, object_store: &ObjectStore) -> Result<()> {
+        let path = Path::parse(&self.path)?;
+        // The epoch-qualified object is authoritative. The flat path is only a compatibility
+        // mirror, so a delayed lower-epoch mirror cannot supersede a newer reference for current
+        // readers.
+        let version_path = ref_version_path(&path, self.epoch)?;
+        create_immutable_body(object_store, &version_path, self.body.as_bytes()).await?;
+
+        object_store
+            .inner
+            .put_opts(
+                &path,
+                Bytes::copy_from_slice(self.body.as_bytes()).into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseReconciliationState {
+    through_epoch: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct DurableLeaseFence {
+    object_store: Arc<ObjectStore>,
+    path: Path,
+    fence_path: Path,
+    epoch: u64,
+}
+
+impl DurableLeaseFence {
+    async fn ensure_current(&self) -> Result<()> {
+        if latest_lease_epoch(&self.object_store, &self.fence_path).await? != Some(self.epoch)
+            || !DurableLeaseHandle::is_active(&self.object_store, &self.path).await?
+        {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "reference mutation lease epoch {} lost its fence",
+                    self.epoch
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn publish<T>(&self, path: &Path, contents: Option<&T>) -> Result<()>
+    where
+        T: Serialize,
+    {
+        let publication = DurableRefPublication {
+            epoch: self.epoch,
+            path: path.to_string(),
+            body: serialize_ref_file(contents, self.epoch)?,
+        };
+        let publication_path = self.path.clone().join(LEASE_PUBLICATION_FILE);
+        create_serialized_file(&self.object_store, &publication_path, &publication).await?;
+        self.ensure_current().await?;
+        publication.apply(&self.object_store).await?;
+        self.ensure_current().await
+    }
+
+    async fn reconcile_prior_publications(&self) -> Result<()> {
+        let mut epochs = self
+            .object_store
+            .read_dir(self.fence_path.clone())
+            .await?
+            .into_iter()
+            .filter_map(|entry| entry.parse::<u64>().ok())
+            .filter(|epoch| *epoch < self.epoch)
+            .collect_vec();
+        epochs.sort_unstable();
+
+        let mut reconciled_through = 0;
+        for epoch in epochs.iter().rev() {
+            let path = lease_epoch_path(&self.fence_path, *epoch).join(LEASE_RECONCILED_FILE);
+            if let Some(state) =
+                read_serialized_file::<LeaseReconciliationState>(&self.object_store, &path).await?
+            {
+                reconciled_through = state.through_epoch;
+                break;
+            }
+        }
+
+        for epoch in epochs {
+            if epoch <= reconciled_through {
+                continue;
+            }
+            let path = lease_epoch_path(&self.fence_path, epoch).join(LEASE_PUBLICATION_FILE);
+            if let Some(publication) =
+                read_serialized_file::<DurableRefPublication>(&self.object_store, &path).await?
+            {
+                publication.apply(&self.object_store).await?;
+            }
+        }
+
+        let state = LeaseReconciliationState {
+            through_epoch: self.epoch.checked_sub(1).ok_or_else(|| {
+                Error::internal("reference mutation lease epoch must be greater than zero")
+            })?,
+        };
+        create_serialized_file(
+            &self.object_store,
+            &self.path.clone().join(LEASE_RECONCILED_FILE),
+            &state,
+        )
+        .await?;
+        self.ensure_current().await
+    }
+}
+
 struct DurableLeaseHandle {
     object_store: Arc<ObjectStore>,
     path: Path,
@@ -382,6 +517,18 @@ impl DurableLeaseHandle {
             fence_path,
             is_held: true,
         }
+    }
+
+    fn fence(&self) -> Result<DurableLeaseFence> {
+        let fence_path = self.fence_path.clone().ok_or_else(|| {
+            Error::internal("reference publication requested from an unfenced lease")
+        })?;
+        Ok(DurableLeaseFence {
+            object_store: self.object_store.clone(),
+            path: self.path.clone(),
+            fence_path,
+            epoch: self.state.epoch,
+        })
     }
 
     async fn renew(&mut self) -> Result<()> {
@@ -412,6 +559,24 @@ impl DurableLeaseHandle {
                 },
             )
             .await?;
+        if let Some(fence_path) = self.fence_path.as_ref()
+            && latest_lease_epoch(&self.object_store, fence_path).await? != Some(self.state.epoch)
+        {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "reference mutation lease epoch {} lost its fence",
+                    self.state.epoch
+                ),
+            });
+        }
+        if !next_state.is_active() {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "reference mutation lease epoch {} expired during renewal",
+                    self.state.epoch
+                ),
+            });
+        }
         self.state = next_state;
         Ok(())
     }
@@ -534,20 +699,31 @@ impl RefMutationLease {
             let state = DurableLeaseState::acquired(owner.clone(), next_epoch)?;
             let path = lease_epoch_path(&fence_path, next_epoch);
             if create_lease_file(&refs.object_store, &path, &state).await? {
+                let mut lease = Self {
+                    handle: DurableLeaseHandle::new(
+                        refs.object_store.clone(),
+                        path,
+                        state,
+                        Some(fence_path.clone()),
+                    ),
+                };
+                let fence = lease.handle.fence()?;
+                if let Err(error) = fence.reconcile_prior_publications().await {
+                    if let Err(release_error) = lease.release().await {
+                        log::warn!(
+                            "Failed to release reference mutation lease after reconciliation error: {}",
+                            release_error
+                        );
+                    }
+                    return Err(error);
+                }
                 let cleanup_object_store = refs.object_store.clone();
                 let cleanup_path = fence_path.clone();
                 tokio::spawn(async move {
                     cleanup_old_lease_epochs(&cleanup_object_store, &cleanup_path, next_epoch)
                         .await;
                 });
-                return Ok(Self {
-                    handle: DurableLeaseHandle::new(
-                        refs.object_store.clone(),
-                        path,
-                        state,
-                        Some(fence_path),
-                    ),
-                });
+                return Ok(lease);
             }
         }
     }
@@ -580,6 +756,98 @@ async fn create_lease_file(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+async fn create_serialized_file<T>(object_store: &ObjectStore, path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize + DeserializeOwned + PartialEq,
+{
+    let body = serde_json::to_vec(value)?;
+    match object_store
+        .inner
+        .put_opts(
+            path,
+            Bytes::from(body).into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => {
+            if read_serialized_file(object_store, path).await?.as_ref() == Some(value) {
+                Ok(())
+            } else {
+                Err(Error::RefConflict {
+                    message: format!("coordination record already exists at {}", path),
+                })
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn create_immutable_body(object_store: &ObjectStore, path: &Path, body: &[u8]) -> Result<()> {
+    match object_store
+        .inner
+        .put_opts(
+            path,
+            Bytes::copy_from_slice(body).into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => {
+            let current = object_store.inner.get(path).await?.bytes().await?;
+            if current.as_ref() == body {
+                Ok(())
+            } else {
+                Err(Error::RefConflict {
+                    message: format!("immutable coordination record changed at {}", path),
+                })
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn read_serialized_file<T>(object_store: &ObjectStore, path: &Path) -> Result<Option<T>>
+where
+    T: DeserializeOwned,
+{
+    let current = match object_store.inner.get(path).await {
+        Ok(current) => current,
+        Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(serde_json::from_slice(&current.bytes().await?)?))
+}
+
+fn serialize_ref_file<T>(contents: Option<&T>, epoch: u64) -> Result<String>
+where
+    T: Serialize,
+{
+    let mut value = match contents {
+        Some(contents) => serde_json::to_value(contents)?,
+        None => serde_json::Value::Object(Default::default()),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| Error::internal("reference contents must serialize as a JSON object"))?;
+    object.insert(
+        REF_MUTATION_EPOCH_FIELD.to_string(),
+        serde_json::Value::from(epoch),
+    );
+    if contents.is_none() {
+        object.insert(REF_DELETED_FIELD.to_string(), serde_json::Value::Bool(true));
+    }
+    Ok(serde_json::to_string_pretty(&value)?)
 }
 
 async fn read_lease_state(
@@ -681,16 +949,20 @@ impl Tags<'_> {
             .collect_vec();
 
         let root_path = &root_location.path;
-        futures::stream::iter(tag_names)
+        let tags: Vec<Option<(String, TagContents)>> = futures::stream::iter(tag_names)
             .map(|tag_name| async move {
-                let contents =
-                    TagContents::from_path(&tag_path(root_path, &tag_name), self.object_store())
-                        .await?;
-                Ok((tag_name, contents))
+                let stored =
+                    read_stored_ref(&tag_path(root_path, &tag_name), self.object_store()).await?;
+                Ok::<_, Error>(
+                    stored
+                        .and_then(|stored| stored.contents)
+                        .map(|contents| (tag_name, contents)),
+                )
             })
             .buffer_unordered(10)
             .try_collect()
-            .await
+            .await?;
+        Ok(tags.into_iter().flatten().collect())
     }
 
     pub async fn list(&self) -> Result<HashMap<String, TagContents>> {
@@ -726,25 +998,27 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
+        read_stored_ref(&tag_file, self.object_store())
+            .await?
+            .and_then(|stored| stored.contents)
+            .ok_or_else(|| Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
-            });
-        }
-
-        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        Ok(tag_contents)
+            })
     }
 
     pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
         let reference = reference.into();
         self.refs
-            .run_tag_mutation(async {
+            .run_tag_mutation(|fence| async move {
                 let root_location = self.refs.root()?;
                 let tag_file = tag_path(&root_location.path, tag);
 
-                if self.object_store().exists(&tag_file).await? {
+                let stored = read_stored_ref::<TagContents>(&tag_file, self.object_store()).await?;
+                if stored
+                    .as_ref()
+                    .is_some_and(|stored| stored.contents.is_some())
+                {
                     return Err(Error::RefConflict {
                         message: format!("tag {} already exists", tag),
                     });
@@ -754,13 +1028,7 @@ impl Tags<'_> {
                     .build_tag_content_by_ref(reference, Some(now), Some(now))
                     .await?;
 
-                self.object_store()
-                    .put(
-                        &tag_file,
-                        serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-                    )
-                    .await
-                    .map(|_| ())
+                fence.publish(&tag_file, Some(&tag_contents)).await
             })
             .await
     }
@@ -768,17 +1036,21 @@ impl Tags<'_> {
     pub async fn delete(&self, tag: &str) -> Result<()> {
         check_valid_tag(tag)?;
         self.refs
-            .run_tag_mutation(async {
+            .run_tag_mutation(|fence| async move {
                 let root_location = self.refs.root()?;
                 let tag_file = tag_path(&root_location.path, tag);
 
-                if !self.object_store().exists(&tag_file).await? {
+                let stored = read_stored_ref::<TagContents>(&tag_file, self.object_store()).await?;
+                if !stored
+                    .as_ref()
+                    .is_some_and(|stored| stored.contents.is_some())
+                {
                     return Err(Error::RefNotFound {
                         message: format!("tag {} does not exist", tag),
                     });
                 }
 
-                self.object_store().delete(&tag_file).await
+                fence.publish::<TagContents>(&tag_file, None).await
             })
             .await
     }
@@ -787,16 +1059,18 @@ impl Tags<'_> {
         check_valid_tag(tag)?;
         let reference = reference.into();
         self.refs
-            .run_tag_mutation(async {
+            .run_tag_mutation(|fence| async move {
                 let root_location = self.refs.root()?;
                 let tag_file = tag_path(&root_location.path, tag);
-                if !self.object_store().exists(&tag_file).await? {
+                let stored = read_stored_ref::<TagContents>(&tag_file, self.object_store()).await?;
+                let Some(stored) = stored.filter(|stored| stored.contents.is_some()) else {
                     return Err(Error::RefNotFound {
                         message: format!("tag {} does not exist", tag),
                     });
-                }
-                let mut tag_contents =
-                    TagContents::from_path(&tag_file, self.object_store()).await?;
+                };
+                let mut tag_contents = stored.contents.ok_or_else(|| {
+                    Error::internal("live tag reference lost its contents during update")
+                })?;
                 let updated_reference = self
                     .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
                     .await?;
@@ -806,13 +1080,7 @@ impl Tags<'_> {
                 tag_contents.updated_at = updated_reference.updated_at;
                 tag_contents.manifest_size = updated_reference.manifest_size;
 
-                self.object_store()
-                    .put(
-                        &tag_file,
-                        serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-                    )
-                    .await
-                    .map(|_| ())
+                fence.publish(&tag_file, Some(&tag_contents)).await
             })
             .await
     }
@@ -824,26 +1092,21 @@ impl Tags<'_> {
     ) -> Result<()> {
         check_valid_tag(tag)?;
         self.refs
-            .run_tag_mutation(async {
+            .run_tag_mutation(|fence| async move {
                 let root_location = self.refs.root()?;
                 let tag_file = tag_path(&root_location.path, tag);
-                if !self.object_store().exists(&tag_file).await? {
+                let stored = read_stored_ref::<TagContents>(&tag_file, self.object_store()).await?;
+                let Some(stored) = stored.filter(|stored| stored.contents.is_some()) else {
                     return Err(Error::RefNotFound {
                         message: format!("tag {} does not exist", tag),
                     });
-                }
-
-                let mut tag_contents =
-                    TagContents::from_path(&tag_file, self.object_store()).await?;
+                };
+                let mut tag_contents = stored.contents.ok_or_else(|| {
+                    Error::internal("live tag reference lost its contents during metadata update")
+                })?;
                 tag_contents.metadata = metadata;
 
-                self.object_store()
-                    .put(
-                        &tag_file,
-                        serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-                    )
-                    .await
-                    .map(|_| ())
+                fence.publish(&tag_file, Some(&tag_contents)).await
             })
             .await
     }
@@ -937,19 +1200,26 @@ impl Branches<'_> {
             .collect::<Result<Vec<_>>>()?;
 
         let branch_path = &root_location.path;
-        futures::stream::iter(branch_names)
+        let branches: Vec<Option<(String, BranchContents)>> = futures::stream::iter(branch_names)
             .map(|name| async move {
-                let contents = BranchContents::from_path(
+                let stored = read_stored_ref::<BranchContents>(
                     &branch_contents_path(branch_path, &name),
                     self.object_store(),
-                    &name,
                 )
                 .await?;
-                Ok((name, contents))
+                Ok::<_, Error>(
+                    stored
+                        .and_then(|stored| stored.contents)
+                        .map(|mut contents| {
+                            contents.hydrate_legacy_identifier(&name);
+                            (name, contents)
+                        }),
+                )
             })
             .buffer_unordered(10)
             .try_collect()
-            .await
+            .await?;
+        Ok(branches.into_iter().flatten().collect())
     }
 
     pub async fn list(&self) -> Result<HashMap<String, BranchContents>> {
@@ -964,16 +1234,14 @@ impl Branches<'_> {
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
 
-        if !self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefNotFound {
+        let mut contents = read_stored_ref::<BranchContents>(&branch_file, self.object_store())
+            .await?
+            .and_then(|stored| stored.contents)
+            .ok_or_else(|| Error::RefNotFound {
                 message: format!("branch {} does not exist", branch),
-            });
-        }
-
-        let branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
-
-        Ok(branch_contents)
+            })?;
+        contents.hydrate_legacy_identifier(branch);
+        Ok(contents)
     }
 
     pub async fn get_identifier(&self, branch: Option<&str>) -> Result<BranchIdentifier> {
@@ -1055,7 +1323,10 @@ impl Branches<'_> {
         let source_branch = source_branch.and_then(standardize_branch);
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch_name);
-        if self.object_store().exists(&branch_file).await? {
+        if read_stored_ref::<BranchContents>(&branch_file, self.object_store())
+            .await?
+            .is_some_and(|stored| stored.contents.is_some())
+        {
             return Err(Error::RefConflict {
                 message: format!("branch {} already exists", branch_name),
             });
@@ -1112,40 +1383,25 @@ impl Branches<'_> {
 
     // Only create branch metadata. The caller holds the reference mutation lease across the
     // physical clone and this metadata publication.
-    pub(crate) async fn create_unlocked(
+    pub(super) async fn create_unlocked(
         &self,
+        fence: &DurableLeaseFence,
         branch_name: &str,
         branch_contents: BranchContents,
     ) -> Result<()> {
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch_name);
-        if self.object_store().exists(&branch_file).await? {
+        let stored = read_stored_ref::<BranchContents>(&branch_file, self.object_store()).await?;
+        if stored
+            .as_ref()
+            .is_some_and(|stored| stored.contents.is_some())
+        {
             return Err(Error::RefConflict {
                 message: format!("branch {} already exists", branch_name),
             });
         }
 
-        let serialized = serde_json::to_vec_pretty(&branch_contents)?;
-        self.object_store()
-            .inner
-            .put_opts(
-                &branch_file,
-                Bytes::from(serialized).into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| match error {
-                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
-                    Error::RefConflict {
-                        message: format!("branch {} already exists", branch_name),
-                    }
-                }
-                error => error.into(),
-            })
+        fence.publish(&branch_file, Some(&branch_contents)).await
     }
 
     pub async fn replace_metadata(
@@ -1155,26 +1411,25 @@ impl Branches<'_> {
     ) -> Result<()> {
         check_valid_branch(branch)?;
         self.refs
-            .run_mutation(async {
+            .run_mutation(|fence| async move {
                 let root_location = self.refs.root()?;
                 let branch_file = branch_contents_path(&root_location.path, branch);
-                if !self.object_store().exists(&branch_file).await? {
+                let stored =
+                    read_stored_ref::<BranchContents>(&branch_file, self.object_store()).await?;
+                let Some(stored) = stored.filter(|stored| stored.contents.is_some()) else {
                     return Err(Error::RefNotFound {
                         message: format!("branch {} does not exist", branch),
                     });
-                }
-
-                let mut branch_contents =
-                    BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
+                };
+                let mut branch_contents = stored.contents.ok_or_else(|| {
+                    Error::internal(
+                        "live branch reference lost its contents during metadata update",
+                    )
+                })?;
+                branch_contents.hydrate_legacy_identifier(branch);
                 branch_contents.metadata = metadata;
 
-                self.object_store()
-                    .put(
-                        &branch_file,
-                        serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
-                    )
-                    .await
-                    .map(|_| ())
+                fence.publish(&branch_file, Some(&branch_contents)).await
             })
             .await
     }
@@ -1187,11 +1442,16 @@ impl Branches<'_> {
         check_valid_branch(branch)?;
 
         self.refs
-            .run_branch_deletion(self.delete_unlocked(branch, force))
+            .run_branch_deletion(|fence| self.delete_unlocked(fence, branch, force))
             .await
     }
 
-    async fn delete_unlocked(&self, branch: &str, force: bool) -> Result<()> {
+    async fn delete_unlocked(
+        &self,
+        fence: DurableLeaseFence,
+        branch: &str,
+        force: bool,
+    ) -> Result<()> {
         let mut referencing_tags = self
             .refs
             .tags()
@@ -1212,8 +1472,14 @@ impl Branches<'_> {
             });
         }
 
+        let root_location = self.refs.root()?;
+        let branch_file = branch_contents_path(&root_location.path, branch);
+        let stored = read_stored_ref::<BranchContents>(&branch_file, self.object_store()).await?;
+        let mut branch_contents = stored.as_ref().and_then(|stored| stored.contents.clone());
+        if let Some(contents) = branch_contents.as_mut() {
+            contents.hydrate_legacy_identifier(branch);
+        }
         let all_branches = self.list().await?;
-        let branch_contents = all_branches.get(branch).cloned();
         if branch_contents.is_none() && !force {
             return Err(Error::RefNotFound {
                 message: format!("Branch {} does not exist", branch),
@@ -1238,10 +1504,11 @@ impl Branches<'_> {
             }
         }
 
-        let root_location = self.refs.root()?;
-        let branch_file = branch_contents_path(&root_location.path, branch);
-        if self.object_store().exists(&branch_file).await? {
-            self.object_store().delete(&branch_file).await?;
+        if stored
+            .as_ref()
+            .is_some_and(|stored| stored.contents.is_some())
+        {
+            fence.publish::<BranchContents>(&branch_file, None).await?;
         }
 
         let Some(branch_contents) = branch_contents else {
@@ -1687,6 +1954,37 @@ pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).join(format!("{}.json", branch))
 }
 
+fn ref_versions_path(path: &Path) -> Result<Path> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::internal(format!("reference path {} has no parent", path)))?;
+    let file_name = path
+        .filename()
+        .ok_or_else(|| Error::internal(format!("reference path {} has no file name", path)))?;
+    let ref_name = file_name.strip_suffix(".json").unwrap_or(file_name);
+    Ok(parent.join("_versions").join(ref_name))
+}
+
+fn ref_version_path(path: &Path, epoch: u64) -> Result<Path> {
+    Ok(ref_versions_path(path)?.join(format!("{epoch:020}.json")))
+}
+
+async fn latest_ref_version_path(object_store: &ObjectStore, path: &Path) -> Result<Option<Path>> {
+    let versions_path = ref_versions_path(path)?;
+    Ok(object_store
+        .read_dir(versions_path.clone())
+        .await?
+        .into_iter()
+        .filter_map(|file_name| {
+            file_name
+                .strip_suffix(".json")
+                .and_then(|epoch| epoch.parse::<u64>().ok())
+                .map(|epoch| (epoch, file_name))
+        })
+        .max_by_key(|(epoch, _)| *epoch)
+        .map(|(_, file_name)| versions_path.join(file_name)))
+}
+
 pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
     match branch {
         None => MAIN_BRANCH.to_string(),
@@ -1701,46 +1999,93 @@ pub(crate) fn standardize_branch(branch: &str) -> Option<String> {
     }
 }
 
-async fn from_path<T>(path: &Path, object_store: &ObjectStore) -> Result<T>
+struct StoredRef<T> {
+    contents: Option<T>,
+}
+
+async fn read_stored_ref<T>(path: &Path, object_store: &ObjectStore) -> Result<Option<StoredRef<T>>>
 where
     T: DeserializeOwned,
 {
-    let tag_reader = object_store.open(path).await?;
-    let tag_bytes = tag_reader
-        .get_range(Range {
-            start: 0,
-            end: tag_reader.size().await?,
-        })
-        .await?;
-    let json_str = String::from_utf8(tag_bytes.to_vec())
-        .map_err(|e| Error::corrupt_file(path.clone(), e.to_string()))?;
-    Ok(serde_json::from_str(&json_str)?)
+    let read_path = latest_ref_version_path(object_store, path)
+        .await?
+        .unwrap_or_else(|| path.clone());
+    let result = match object_store.inner.get(&read_path).await {
+        Ok(result) => result,
+        Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = result.bytes().await?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let object = value.as_object().ok_or_else(|| {
+        Error::corrupt_file(
+            read_path.clone(),
+            "reference file must contain a JSON object",
+        )
+    })?;
+    if object
+        .get(REF_MUTATION_EPOCH_FIELD)
+        .is_some_and(|epoch| epoch.as_u64().is_none())
+    {
+        return Err(Error::corrupt_file(
+            read_path.clone(),
+            format!("{} must be an unsigned integer", REF_MUTATION_EPOCH_FIELD),
+        ));
+    }
+    let is_deleted = match object.get(REF_DELETED_FIELD) {
+        Some(value) => value.as_bool().ok_or_else(|| {
+            Error::corrupt_file(
+                read_path.clone(),
+                format!("{} must be a boolean", REF_DELETED_FIELD),
+            )
+        })?,
+        None => false,
+    };
+    let contents = if is_deleted {
+        None
+    } else {
+        Some(serde_json::from_value(value)?)
+    };
+    Ok(Some(StoredRef { contents }))
 }
 
 impl TagContents {
     pub async fn from_path(path: &Path, object_store: &ObjectStore) -> Result<Self> {
-        from_path(path, object_store).await
+        read_stored_ref(path, object_store)
+            .await?
+            .and_then(|stored| stored.contents)
+            .ok_or_else(|| Error::RefNotFound {
+                message: format!("tag metadata does not exist at {}", path),
+            })
     }
 }
 
 impl BranchContents {
+    fn hydrate_legacy_identifier(&mut self, branch_name: &str) {
+        if self.identifier == BranchIdentifier::missing_identifier_sentinel() {
+            self.identifier = BranchIdentifier::synthetic_identifier(
+                branch_name,
+                self.parent_branch.as_deref(),
+                self.parent_version,
+                self.create_at,
+            );
+        }
+    }
+
     pub async fn from_path(
         path: &Path,
         object_store: &ObjectStore,
         branch_name: &str,
     ) -> Result<Self> {
-        let mut contents: Self = from_path(path, object_store).await?;
-        if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
-            // Legacy branch files do not store an identifier. Derive a deterministic fallback
-            // from stable branch metadata so repeated reads expose the same public
-            // branch_identifier.
-            contents.identifier = BranchIdentifier::synthetic_identifier(
-                branch_name,
-                contents.parent_branch.as_deref(),
-                contents.parent_version,
-                contents.create_at,
-            );
-        }
+        let mut contents: Self = read_stored_ref(path, object_store)
+            .await?
+            .and_then(|stored| stored.contents)
+            .ok_or_else(|| Error::RefNotFound {
+                message: format!("branch {} does not exist", branch_name),
+            })?;
+        // Legacy branch files do not store an identifier. Derive a deterministic fallback from
+        // stable branch metadata so repeated reads expose the same public branch_identifier.
+        contents.hydrate_legacy_identifier(branch_name);
         Ok(contents)
     }
 }
@@ -1853,8 +2198,113 @@ pub fn check_valid_tag(s: &str) -> Result<()> {
 mod tests {
     use super::*;
     use datafusion::common::assert_contains;
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult,
+    };
 
     use rstest::rstest;
+
+    #[derive(Debug)]
+    #[cfg_attr(coverage, coverage(off))]
+    struct DelayedHeartbeatStore {
+        target: Arc<dyn object_store::ObjectStore>,
+        heartbeat_started: Arc<tokio::sync::Notify>,
+        release_heartbeat: Arc<tokio::sync::Notify>,
+    }
+
+    impl fmt::Display for DelayedHeartbeatStore {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            write!(formatter, "DelayedHeartbeatStore({})", self.target)
+        }
+    }
+
+    #[async_trait::async_trait]
+    #[deny(clippy::missing_trait_methods)]
+    #[cfg_attr(coverage, coverage(off))]
+    impl object_store::ObjectStore for DelayedHeartbeatStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            if location.as_ref().contains("/heartbeats/") {
+                self.heartbeat_started.notify_one();
+                self.release_heartbeat.notified().await;
+            }
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.target.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
+            self.target.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.target.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> ObjectStoreResult<()> {
+            self.target.rename_opts(from, to, options).await
+        }
+    }
 
     #[rstest]
     fn test_ok_ref(
@@ -1968,6 +2418,178 @@ mod tests {
         assert_eq!(
             branch_file_path,
             Path::from("dataset/_refs/branches/feature.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delayed_heartbeat_cannot_revive_fenced_epoch() {
+        let heartbeat_started = Arc::new(tokio::sync::Notify::new());
+        let release_heartbeat = Arc::new(tokio::sync::Notify::new());
+        let target: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = Arc::new(DelayedHeartbeatStore {
+            target,
+            heartbeat_started: heartbeat_started.clone(),
+            release_heartbeat: release_heartbeat.clone(),
+        });
+        let object_store = Arc::new(object_store);
+        let fence_path = Path::from("dataset/_refs/mutation_leases");
+
+        let first_state = DurableLeaseState::acquired("first".to_string(), 1).unwrap();
+        let first_path = lease_epoch_path(&fence_path, 1);
+        assert!(
+            create_lease_file(&object_store, &first_path, &first_state)
+                .await
+                .unwrap()
+        );
+        let mut first_handle = DurableLeaseHandle::new(
+            object_store.clone(),
+            first_path,
+            first_state,
+            Some(fence_path.clone()),
+        );
+        let renew_task = tokio::spawn(async move { first_handle.renew().await });
+        heartbeat_started.notified().await;
+
+        let second_state = DurableLeaseState::acquired("second".to_string(), 2).unwrap();
+        assert!(
+            create_lease_file(
+                &object_store,
+                &lease_epoch_path(&fence_path, 2),
+                &second_state,
+            )
+            .await
+            .unwrap()
+        );
+        release_heartbeat.notify_one();
+
+        let error = renew_task.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }));
+        assert!(error.to_string().contains("lost its fence"));
+    }
+
+    #[tokio::test]
+    async fn test_reference_publication_ignores_delayed_older_epoch() {
+        let object_store = ObjectStore::memory();
+        let path = tag_path(&Path::from("dataset"), "release");
+        let older_contents = TagContents {
+            branch: None,
+            version: 1,
+            created_at: None,
+            updated_at: None,
+            manifest_size: 1,
+            metadata: HashMap::new(),
+        };
+        let newer_contents = TagContents {
+            version: 2,
+            ..older_contents.clone()
+        };
+        let older = DurableRefPublication {
+            epoch: 1,
+            path: path.to_string(),
+            body: serialize_ref_file(Some(&older_contents), 1).unwrap(),
+        };
+        let newer = DurableRefPublication {
+            epoch: 2,
+            path: path.to_string(),
+            body: serialize_ref_file(Some(&newer_contents), 2).unwrap(),
+        };
+        let deleted = DurableRefPublication {
+            epoch: 3,
+            path: path.to_string(),
+            body: serialize_ref_file::<TagContents>(None, 3).unwrap(),
+        };
+
+        older.apply(&object_store).await.unwrap();
+        newer.apply(&object_store).await.unwrap();
+        older.apply(&object_store).await.unwrap();
+        assert_eq!(
+            read_stored_ref::<TagContents>(&path, &object_store)
+                .await
+                .unwrap()
+                .unwrap()
+                .contents
+                .unwrap()
+                .version,
+            2
+        );
+
+        deleted.apply(&object_store).await.unwrap();
+        newer.apply(&object_store).await.unwrap();
+        assert!(
+            read_stored_ref::<TagContents>(&path, &object_store)
+                .await
+                .unwrap()
+                .unwrap()
+                .contents
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successor_reconciles_prior_reference_publication() {
+        let object_store = Arc::new(ObjectStore::memory());
+        let fence_path = Path::from("dataset/_refs/mutation_leases");
+        let tag_file = tag_path(&Path::from("dataset"), "pending");
+        let tag_contents = TagContents {
+            branch: None,
+            version: 7,
+            created_at: None,
+            updated_at: None,
+            manifest_size: 1,
+            metadata: HashMap::new(),
+        };
+
+        let first_path = lease_epoch_path(&fence_path, 1);
+        let first_state = DurableLeaseState {
+            owner: "expired".to_string(),
+            epoch: 1,
+            expires_at_millis: 0,
+        };
+        assert!(
+            create_lease_file(&object_store, &first_path, &first_state)
+                .await
+                .unwrap()
+        );
+        create_serialized_file(
+            &object_store,
+            &first_path.join(LEASE_PUBLICATION_FILE),
+            &DurableRefPublication {
+                epoch: 1,
+                path: tag_file.to_string(),
+                body: serialize_ref_file(Some(&tag_contents), 1).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let second_path = lease_epoch_path(&fence_path, 2);
+        let second_state = DurableLeaseState::acquired("successor".to_string(), 2).unwrap();
+        assert!(
+            create_lease_file(&object_store, &second_path, &second_state)
+                .await
+                .unwrap()
+        );
+        DurableLeaseFence {
+            object_store: object_store.clone(),
+            path: second_path,
+            fence_path,
+            epoch: 2,
+        }
+        .reconcile_prior_publications()
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_stored_ref::<TagContents>(&tag_file, &object_store)
+                .await
+                .unwrap()
+                .unwrap()
+                .contents
+                .unwrap()
+                .version,
+            7
         );
     }
 
