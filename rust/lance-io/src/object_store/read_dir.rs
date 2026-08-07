@@ -55,77 +55,78 @@ const LIST_OP: &str = "list_paginated";
 /// rejected rather than read as something it is not.
 const TOKEN_VERSION: char = '1';
 
+/// Marks a cursor a backend minted, holding its own continuation token.
+const BACKEND_TAG: char = 'b';
+/// Marks a cursor the full-listing fallback minted, holding a key within the directory.
+const KEY_TAG: char = 'k';
+
 /// Where a listing resumes.
 ///
 /// Opaque to callers: [`ObjectStore::read_dir_page`] mints one, hands it over as the string in
 /// [`DirListing::next_token`], and takes it back in [`ReadDirOptions::page_token`]. What it
-/// holds depends on the store that minted it, so a token means nothing anywhere else.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirCursor(Resume);
-
-/// The two things a listing can resume from, one for each path that serves a page.
+/// holds depends on the path that minted it, so a token means nothing anywhere else.
 ///
-/// A cursor is only ever handed back to the path that minted it. The tag is what makes the
-/// other path reject it rather than read it as something it is not.
+/// The string is the token exactly as a caller sees it: the version, then a tag naming the
+/// path that minted it, then that path's own position. A cursor is only ever handed back to
+/// the path that minted it, and the tag is what makes the other path reject it rather than
+/// read it as something it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Resume {
-    /// The backend's own continuation token, which resumes exactly where the page stopped.
+pub struct DirCursor(String);
+
+impl DirCursor {
+    /// A backend's own continuation token, which resumes exactly where the page stopped.
     ///
     /// Nothing is compared against it, so a store whose listings are not in key order — S3
     /// Express, or an Azure account with a hierarchical namespace — pages correctly on one.
-    Backend(String),
-    /// A key within the directory, which the next page resumes strictly after: the last key
-    /// the page reported. What the full-listing fallback mints, having no token of its own.
-    Key(String),
-}
-
-impl DirCursor {
-    pub(crate) fn backend(token: impl Into<String>) -> Self {
-        Self(Resume::Backend(token.into()))
+    pub(crate) fn backend(token: impl AsRef<str>) -> Self {
+        Self::tagged(BACKEND_TAG, token.as_ref())
     }
 
-    pub(crate) fn key(key: impl Into<String>) -> Self {
-        Self(Resume::Key(key.into()))
+    /// A key within the directory, which the next page resumes strictly after: the last key
+    /// the page reported. What the full-listing fallback mints, having no token of its own.
+    pub(crate) fn key(key: impl AsRef<str>) -> Self {
+        Self::tagged(KEY_TAG, key.as_ref())
+    }
+
+    fn tagged(tag: char, value: &str) -> Self {
+        Self(format!("{TOKEN_VERSION}{tag}{value}"))
     }
 
     /// The continuation token to resume from, for a backend that pages by its own token.
     #[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
     pub(crate) fn expect_backend(&self) -> Result<&str> {
-        match &self.0 {
-            Resume::Backend(token) => Ok(token),
-            Resume::Key(_) => Err(Error::invalid_input(
+        self.untag(BACKEND_TAG).ok_or_else(|| {
+            Error::invalid_input(
                 "this page token came from a store that lists a directory in full, \
                  which this one cannot resume from",
-            )),
-        }
+            )
+        })
     }
 
     /// The key to resume after, for a store that lists a directory in full.
     pub(crate) fn expect_key(&self) -> Result<&str> {
-        match &self.0 {
-            Resume::Key(key) => Ok(key),
-            Resume::Backend(_) => Err(Error::invalid_input(
+        self.untag(KEY_TAG).ok_or_else(|| {
+            Error::invalid_input(
                 "this page token came from a store that resumes by continuation token, \
                  which this one cannot use",
-            )),
-        }
+            )
+        })
     }
 
-    fn encode(&self) -> String {
-        let (tag, value) = match &self.0 {
-            Resume::Backend(token) => ('b', token),
-            Resume::Key(key) => ('k', key),
-        };
-        format!("{TOKEN_VERSION}{tag}{value}")
+    /// The position this cursor holds, if `tag` is the path that minted it.
+    fn untag(&self, tag: char) -> Option<&str> {
+        self.0.strip_prefix(TOKEN_VERSION)?.strip_prefix(tag)
+    }
+
+    fn encode(self) -> String {
+        self.0
     }
 
     fn decode(token: &str) -> Result<Self> {
         let invalid = || Error::invalid_input(format!("not a directory page token: '{token}'"));
         let rest = token.strip_prefix(TOKEN_VERSION).ok_or_else(invalid)?;
-        let (tag, value) = rest.split_at_checked(1).ok_or_else(invalid)?;
-        match tag {
-            "b" => Ok(Self::backend(value)),
-            "k" => Ok(Self::key(value)),
+        match rest.chars().next() {
+            Some(BACKEND_TAG | KEY_TAG) => Ok(Self(token.to_string())),
             _ => Err(invalid()),
         }
     }
@@ -347,7 +348,7 @@ async fn fill_page(
     }
     Ok(DirListing {
         values,
-        next_token: resume.as_ref().map(DirCursor::encode),
+        next_token: resume.map(DirCursor::encode),
     })
 }
 
@@ -373,7 +374,7 @@ async fn full_listing_page(
     }
     let taken = limit.unwrap_or(children.len()).min(children.len());
     let next_token =
-        (taken < children.len()).then(|| DirCursor::key(children[taken - 1].key.clone()).encode());
+        (taken < children.len()).then(|| DirCursor::key(&children[taken - 1].key).encode());
     children.truncate(taken);
     Ok(DirListing {
         values: children.into_iter().map(|child| child.entry).collect(),
@@ -383,7 +384,7 @@ async fn full_listing_page(
 
 /// A child of the directory being listed, with the key the backend listed it under.
 pub struct KeyedEntry {
-    /// The key relative to the directory, which is what a [`Resume::Key`] cursor names. A
+    /// The key relative to the directory, which is what a [`DirCursor::key`] cursor names. A
     /// child directory keeps its trailing delimiter, since that is the prefix its keys share
     /// and so where it sits in the listing; a child file is its name.
     pub key: String,
@@ -858,7 +859,8 @@ mod tests {
     #[case(DirCursor::key("a.lance/"))]
     #[case(DirCursor::key(""))]
     fn test_a_token_round_trips(#[case] cursor: DirCursor) {
-        assert_eq!(DirCursor::decode(&cursor.encode()).unwrap(), cursor);
+        let token = cursor.clone().encode();
+        assert_eq!(DirCursor::decode(&token).unwrap(), cursor);
     }
 
     #[rstest]
