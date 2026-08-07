@@ -2087,6 +2087,19 @@ pub async fn commit_compaction(
         .unwrap_or(dataset.manifest.version);
 
     let mut completed_tasks = completed_tasks;
+    if completed_tasks
+        .iter()
+        .any(|task| task.original_fragments.is_empty())
+    {
+        return Err(Error::invalid_input(
+            "compaction results must replace at least one original fragment".to_string(),
+        ));
+    }
+
+    // Rewrite tasks finish in an arbitrary order, but new fragment ids determine
+    // their order in the manifest. Reserve ids in the original fragment order so
+    // parallel and distributed compaction preserve the dataset's row order.
+    completed_tasks.sort_unstable_by_key(|task| task.original_fragments[0].id);
 
     // Collect the rewritten fragments' file paths up front so every failure
     // path below can clean them up (or deliberately keep them). Fragment ids
@@ -2504,14 +2517,6 @@ mod tests {
             let mut result_str = format!("(len={})", map.len());
             result_str.push_str(&first_keys);
             result_str
-        }
-
-        fn in_any_order(expectations: &[Self]) -> Self {
-            let expectations = expectations
-                .iter()
-                .flat_map(|item| item.expectations.clone())
-                .collect::<Vec<_>>();
-            Self { expectations }
         }
     }
 
@@ -2950,9 +2955,7 @@ mod tests {
             .unwrap();
 
         let first_new_frag_idx = 7;
-        // Predicting the remap is difficult.  One task will remap to fragments 7/8 and the other
-        // will remap to fragments 9/10 but we don't know which is which and so we just allow ourselves
-        // to expect both possibilities.
+        // Tasks may finish in any order, but commit assigns fragment ids in plan order.
         let remap_a = expect_remap(
             &[
                 vec![
@@ -2973,26 +2976,6 @@ mod tests {
                     (row_addrs(5, 0..200), true),
                 ],
                 vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
-            ],
-            first_new_frag_idx,
-        );
-        let remap_b = expect_remap(
-            &[
-                // Frags 4, 5, and 6 are rewritten to frags 7 & 8
-                vec![
-                    (row_addrs(4, 0..200), true),
-                    (row_addrs(4, 200..400), false),
-                    (row_addrs(4, 400..1000), true),
-                    (row_addrs(5, 0..200), true),
-                ],
-                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
-                // 3 small fragments rewritten to frags 9 & 10
-                vec![
-                    (row_addrs(0, 0..400), true),
-                    (row_addrs(1, 0..400), true),
-                    (row_addrs(2, 0..200), true),
-                ],
-                vec![(row_addrs(2, 200..400), true)],
             ],
             first_new_frag_idx,
         );
@@ -3024,10 +3007,8 @@ mod tests {
             vec![4, 5, 6]
         );
 
-        let mock_remapper = MockIndexRemapper::in_any_order(&[remap_a, remap_b]);
-
         // Run compaction
-        let metrics = compact_files(&mut dataset, options, Some(Arc::new(mock_remapper)))
+        let metrics = compact_files(&mut dataset, options, Some(Arc::new(remap_a)))
             .await
             .unwrap();
 
@@ -3043,6 +3024,63 @@ mod tests {
             .map(|f| f.id())
             .collect::<Vec<_>>();
         assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_commit_compaction_preserves_plan_order(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2_500,
+                max_rows_per_group: 2_500,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 5_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let tasks = plan.compaction_tasks().collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 2);
+
+        // Compaction tasks may complete in any order when executed concurrently
+        // or by distributed workers.
+        let completed_tasks = vec![
+            tasks[1].execute(&dataset).await.unwrap(),
+            tasks[0].execute(&dataset).await.unwrap(),
+        ];
+        commit_compaction(
+            &mut dataset,
+            completed_tasks,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let compacted = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(compacted, data);
+
+        let taken = dataset
+            .take(&[0, 4_999, 5_000, 9_999], dataset.schema().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            taken["a"].as_primitive::<Int64Type>().values(),
+            &[0, 4_999, 5_000, 9_999]
+        );
     }
 
     #[rstest]
