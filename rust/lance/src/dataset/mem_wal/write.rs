@@ -7542,10 +7542,12 @@ mod tests {
         // generation's successful flush would.
         writer
             .manifest_store
-            .commit_update(writer.epoch(), |current| ShardManifest {
-                version: current.version + 1,
-                current_generation: sealed + 2,
-                ..current.clone()
+            .commit_update(writer.epoch(), |current| {
+                Ok(ShardManifest {
+                    version: current.version + 1,
+                    current_generation: sealed + 2,
+                    ..current.clone()
+                })
             })
             .await
             .unwrap();
