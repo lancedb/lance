@@ -1266,6 +1266,18 @@ async fn test_branch() {
     .unwrap();
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
+    // Tags currently persist a logical branch name, so deleting that branch must retain its
+    // metadata and generation until every referring tag is removed.
+    let error = dataset.delete_branch("dev/branch2").await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }));
+    assert!(error.to_string().contains("tag1"));
+    let tagged_branch2 = dataset.checkout_version("tag1").await.unwrap();
+    assert_eq!(
+        tagged_branch2.manifest.branch.as_deref(),
+        Some("dev/branch2")
+    );
+    assert_eq!(tagged_branch2.count_rows(None).await.unwrap(), 100);
+    dataset.tags().delete("tag1").await.unwrap();
     dataset.delete_branch("dev/branch2").await.unwrap();
 
     // Legacy name-backed branches retain their delete conflict while descendants reference them.
@@ -1329,4 +1341,24 @@ async fn test_branch() {
         .await
         .unwrap();
     assert!(generations.is_empty());
+}
+
+#[tokio::test]
+async fn test_tree_main_dataset_root_is_not_a_branch_alias() {
+    let tempdir = TempStdDir::default();
+    let source_path = tempdir.join("source");
+    let target_path = tempdir.join("tree").join("main");
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    Dataset::write(reader, source_path.to_str().unwrap(), None)
+        .await
+        .unwrap();
+
+    std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+    std::fs::rename(source_path, &target_path).unwrap();
+
+    let dataset = Dataset::open(target_path.to_str().unwrap()).await.unwrap();
+    assert_eq!(dataset.manifest.branch, None);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 10);
 }

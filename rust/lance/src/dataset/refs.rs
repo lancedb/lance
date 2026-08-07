@@ -474,6 +474,11 @@ impl Branches<'_> {
         &self,
         path_branch: &str,
     ) -> Result<Option<BranchLocation>> {
+        // This is only a probe for a logical alias. An invalid branch name means the path suffix
+        // belongs to the dataset root (for example, a main dataset rooted at `tree/main`).
+        if check_valid_branch(path_branch).is_err() {
+            return Ok(None);
+        }
         match self.get(path_branch).await {
             Ok(_) => self.resolve_location(Some(path_branch)).await.map(Some),
             Err(Error::RefNotFound { .. }) => Ok(None),
@@ -637,6 +642,26 @@ impl Branches<'_> {
     /// If `force` is true, it will try to delete the branch directories no matter `BranchContents` exists or not.
     pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
+
+        let mut referencing_tags = self
+            .refs
+            .tags()
+            .fetch_tags()
+            .await?
+            .into_iter()
+            .filter_map(|(tag_name, contents)| {
+                (contents.branch.as_deref() == Some(branch)).then_some(tag_name)
+            })
+            .collect_vec();
+        referencing_tags.sort();
+        if !referencing_tags.is_empty() {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Branch {} is referenced by tags {:?} and cannot be deleted",
+                    branch, referencing_tags
+                ),
+            });
+        }
 
         let all_branches = self.list().await?;
         let branch_contents = all_branches.get(branch).cloned();

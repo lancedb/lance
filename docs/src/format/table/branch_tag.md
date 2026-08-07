@@ -142,7 +142,8 @@ it through the metadata before loading the physical dataset.
 Deleting detached branch metadata releases its logical name immediately. If a descendant still
 references the branch, its generation directory remains until no remaining branch lineage contains
 that UUID. Legacy name-based directories remain readable; a referenced legacy branch cannot be
-deleted until its descendants are removed.
+deleted until its descendants are removed. Because tag metadata records a logical branch name, a
+branch referenced by a tag cannot be deleted until that tag is removed.
 
 ## Tagging
 
