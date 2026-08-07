@@ -122,7 +122,7 @@ use lance_datafusion::{
         HardCapBatchSizeExec, LanceExecutionOptions, OneShotPartitionStream, analyze_plan,
         execute_plan_with_session_context, new_session_context, provider_to_stream,
     },
-    spill::spilling_table_provider_with_disk_manager,
+    spill::spilling_table_provider_with_job_disk_manager,
     utils::{StreamingWriteSource, reader_to_stream},
 };
 use lance_file::version::LanceFileVersion;
@@ -843,9 +843,9 @@ impl MergeInsertBuilder {
             ));
         }
         let spill_execution_options = merge_insert_execution_options();
-        // Merge-insert disk accounting must not survive the job. In particular,
-        // a rejected DataFusion spill growth can otherwise leave a charge in a
-        // cached manager that reduces the quota of later jobs.
+        // DataFusion 54.1.0 can retain a rejected spill charge. Keep its manager
+        // operation-scoped so any execution error discards that accounting and
+        // cannot reduce the quota of a later merge job.
         let spill_session_context = new_session_context(&spill_execution_options);
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
@@ -1259,7 +1259,7 @@ impl MergeInsertJob {
             )
             .await?;
             let source = provider_to_stream(normalized_source).await?;
-            let replayable_source = spilling_table_provider_with_disk_manager(
+            let replayable_source = spilling_table_provider_with_job_disk_manager(
                 source,
                 max_batch_bytes,
                 disk_manager.clone(),
@@ -1305,9 +1305,12 @@ impl MergeInsertJob {
             execution_options.clone(),
             session_ctx,
         )?;
-        let mapped_rows =
-            spilling_table_provider_with_disk_manager(mapped_rows, max_batch_bytes, disk_manager)
-                .await?;
+        let mapped_rows = spilling_table_provider_with_job_disk_manager(
+            mapped_rows,
+            max_batch_bytes,
+            disk_manager,
+        )
+        .await?;
         let mut initial_scan = provider_to_stream(mapped_rows.clone()).await?;
         while initial_scan.try_next().await?.is_some() {}
         drop(initial_scan);
@@ -1632,7 +1635,7 @@ impl MergeInsertJob {
         // indexed join can keep merge streams for both sorted inputs live while
         // its output is pulled; draining a disk-backed replay first releases
         // those upstream reservations before the downstream sort allocates.
-        let staged_source = spilling_table_provider_with_disk_manager(
+        let staged_source = spilling_table_provider_with_job_disk_manager(
             source,
             0,
             spill_session_context.runtime_env().disk_manager.clone(),
@@ -2245,9 +2248,12 @@ impl MergeInsertJob {
                 .runtime_env()
                 .disk_manager
                 .clone();
-            let provider =
-                spilling_table_provider_with_disk_manager(source, 100 * 1024 * 1024, disk_manager)
-                    .await?;
+            let provider = spilling_table_provider_with_job_disk_manager(
+                source,
+                100 * 1024 * 1024,
+                disk_manager,
+            )
+            .await?;
             Ok((provider, true))
         } else {
             Ok((one_shot_provider(source)?, false))
@@ -3676,6 +3682,28 @@ mod tests {
             1,
             "a 150 MiB pool has room for one merge reservation and two capped working batches"
         );
+    }
+
+    #[test]
+    fn test_merge_insert_spill_contexts_are_job_local() {
+        let execution_options = merge_insert_execution_options();
+        let first_context = new_session_context(&execution_options);
+        let second_context = new_session_context(&execution_options);
+        let first_manager = &first_context.runtime_env().disk_manager;
+        let second_manager = &second_context.runtime_env().disk_manager;
+
+        assert!(
+            !Arc::ptr_eq(first_manager, second_manager),
+            "each merge job must own an independent disk manager"
+        );
+
+        let mut spill = first_manager
+            .create_tmp_file("testing merge job isolation")
+            .unwrap();
+        spill.inner().as_file().set_len(1).unwrap();
+        spill.update_disk_usage().unwrap();
+        assert_eq!(first_manager.used_disk_space(), 1);
+        assert_eq!(second_manager.used_disk_space(), 0);
     }
 
     #[test]
