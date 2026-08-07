@@ -141,6 +141,15 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
+        let target_criteria = self.target_index.update_criteria().data_criteria;
+        let (new_data, inferred_type) =
+            JsonIndexPlugin::extract_json_with_type_info(new_data, self.path.clone()).await?;
+        let new_data = JsonIndexPlugin::convert_stream_by_type(new_data, inferred_type).await?;
+        let new_data = if target_criteria.ordering == TrainingOrdering::Values {
+            JsonIndexPlugin::sort_stream_by_value(new_data).await?
+        } else {
+            new_data
+        };
         let target_created = self
             .target_index
             .update(new_data, dest_store, old_data_filter)
@@ -158,7 +167,11 @@ impl ScalarIndex for JsonIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        self.target_index.update_criteria()
+        let target_criteria = self.target_index.update_criteria();
+        UpdateCriteria {
+            requires_old_data: target_criteria.requires_old_data,
+            data_criteria: json_scan_criteria(&target_criteria.data_criteria),
+        }
     }
 
     fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
@@ -360,25 +373,19 @@ pub struct JsonTrainingRequest {
     criteria: TrainingCriteria,
 }
 
+fn json_scan_criteria(target_criteria: &TrainingCriteria) -> TrainingCriteria {
+    let mut criteria = target_criteria.clone();
+    if criteria.ordering == TrainingOrdering::Values {
+        // The scanner can only order the raw JSON column. The JSON wrapper sorts
+        // the extracted path value before passing it to the target index.
+        criteria.ordering = TrainingOrdering::None;
+    }
+    criteria
+}
+
 impl JsonTrainingRequest {
     pub fn new(parameters: JsonIndexParameters, target_request: Box<dyn TrainingRequest>) -> Self {
-        let target_criteria = target_request.criteria();
-        // The scanner can only sort its output by the raw JSON column, not by the value
-        // at `path` that this plugin extracts from it, so a `Values`-ordered scan here
-        // would sort by the wrong key and still need re-sorting after extraction. Ask
-        // for unordered input instead and let `train_index` sort the extracted value
-        // stream itself, once, right before handing it to the target trainer.
-        //
-        // Preserve `Addresses` so callers must still provide the ordering required by
-        // target trainers such as ZoneMap, even though the dataset scanner currently
-        // returns rows in row-address order by default.
-        let ordering = match target_criteria.ordering {
-            TrainingOrdering::Values => TrainingOrdering::None,
-            ordering => ordering,
-        };
-        let mut criteria = TrainingCriteria::new(ordering);
-        criteria.needs_row_ids = target_criteria.needs_row_ids;
-        criteria.needs_row_addrs = target_criteria.needs_row_addrs;
+        let criteria = json_scan_criteria(target_request.criteria());
         Self {
             parameters,
             target_request,
@@ -562,6 +569,19 @@ impl JsonIndexPlugin {
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
                 .ok_or_else(|| Error::invalid_input_source("value is not LargeBinary".into()))?;
+            let type_array = struct_array
+                .column_by_name("type_tag")
+                .ok_or_else(|| {
+                    Error::invalid_input_source("Missing type_tag column in struct".into())
+                })?
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| Error::invalid_input_source("type_tag is not UInt8".into()))?;
+            let is_null = |index| {
+                binary_array.is_null(index)
+                    || (!type_array.is_null(index)
+                        && type_array.value(index) == JsonbType::Null.as_u8())
+            };
 
             // Convert based on target type using serde deserialization
             let converted_array: Arc<dyn Array> =
@@ -570,7 +590,7 @@ impl JsonIndexPlugin {
                         let mut builder =
                             arrow_array::builder::BooleanBuilder::with_capacity(binary_array.len());
                         for i in 0..binary_array.len() {
-                            if binary_array.is_null(i) {
+                            if is_null(i) {
                                 builder.append_null();
                             } else if let Some(bytes) = binary_array.value(i).into() {
                                 let raw_jsonb = jsonb::RawJsonb::new(bytes);
@@ -595,7 +615,7 @@ impl JsonIndexPlugin {
                         let mut builder =
                             arrow_array::builder::Int64Builder::with_capacity(binary_array.len());
                         for i in 0..binary_array.len() {
-                            if binary_array.is_null(i) {
+                            if is_null(i) {
                                 builder.append_null();
                             } else if let Some(bytes) = binary_array.value(i).into() {
                                 let raw_jsonb = jsonb::RawJsonb::new(bytes);
@@ -620,7 +640,7 @@ impl JsonIndexPlugin {
                         let mut builder =
                             arrow_array::builder::Float64Builder::with_capacity(binary_array.len());
                         for i in 0..binary_array.len() {
-                            if binary_array.is_null(i) {
+                            if is_null(i) {
                                 builder.append_null();
                             } else if let Some(bytes) = binary_array.value(i).into() {
                                 let raw_jsonb = jsonb::RawJsonb::new(bytes);
@@ -647,7 +667,7 @@ impl JsonIndexPlugin {
                             1024,
                         );
                         for i in 0..binary_array.len() {
-                            if binary_array.is_null(i) {
+                            if is_null(i) {
                                 builder.append_null();
                             } else if let Some(bytes) = binary_array.value(i).into() {
                                 let raw_jsonb = jsonb::RawJsonb::new(bytes);
@@ -665,10 +685,10 @@ impl JsonIndexPlugin {
                         }
                         Arc::new(builder.finish())
                     }
-                    DataType::LargeBinary => {
-                        // Keep as binary for array/object types
-                        value_array.clone()
-                    }
+                    DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter(
+                        (0..binary_array.len())
+                            .map(|i| (!is_null(i)).then(|| binary_array.value(i))),
+                    )),
                     _ => {
                         return Err(Error::invalid_input_source(
                             format!("Unsupported target type: {:?}", target_type).into(),
@@ -1261,13 +1281,9 @@ mod tests {
     /// resulting btree still answers `IsNull` and non-null range/equality queries
     /// correctly with nulls mixed in and fed out of value order.
     ///
-    /// Row 1's `path` is missing entirely, which is what actually produces a null in the
-    /// extracted value column (`extract_json_path_with_type` returns `None`, which
-    /// `json_extract_with_type_impl` turns into an arrow-null). An explicit JSON `null`
-    /// literal at `path` (e.g. `{"v": null}`) is a different, pre-existing case that
-    /// `convert_stream_by_type` does not yet handle (it tries to deserialize the JSONB
-    /// `null` bytes as the inferred type and errors) -- unrelated to this fix, so it's
-    /// out of scope here.
+    /// Row 1's `path` contains an explicit JSON null. The extracted binary value still
+    /// contains JSONB bytes, so conversion must use the accompanying type tag to turn it
+    /// into an Arrow null before sorting and training the target index.
     #[tokio::test]
     async fn test_json_btree_index_null_at_path() {
         use crate::metrics::NoOpMetricsCollector;
@@ -1281,10 +1297,10 @@ mod tests {
             TrainingOrdering::None,
             "v",
             &[
-                r#"{"v": 40.1}"#,  // row 0
-                r#"{"other": 1}"#, // row 1: path missing -> null
-                r#"{"v": -3.2}"#,  // row 2
-                r#"{"v": 10.5}"#,  // row 3
+                r#"{"v": 40.1}"#, // row 0
+                r#"{"v": null}"#, // row 1
+                r#"{"v": -3.2}"#, // row 2
+                r#"{"v": 10.5}"#, // row 3
             ],
         )
         .await;
