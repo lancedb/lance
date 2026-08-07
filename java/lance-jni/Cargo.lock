@@ -4106,8 +4106,6 @@ dependencies = [
  "reqsign-core",
  "reqsign-file-read-tokio",
  "reqsign-google",
- "reqsign-http-send-reqwest",
- "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tempfile",
@@ -6043,22 +6041,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "reqsign-http-send-reqwest"
-version = "4.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d87ab629e40e93184828f462d3e8f444017d4afbf5b0afc04b5b203caf748bc"
-dependencies = [
- "anyhow",
- "bytes",
- "futures-channel",
- "http 1.4.2",
- "http-body-util",
- "reqsign-core",
- "reqwest 0.13.4",
- "wasm-bindgen-futures",
 ]
 
 [[package]]

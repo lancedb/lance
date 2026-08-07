@@ -3,13 +3,15 @@
 
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
-use object_store::{CredentialProvider, ObjectStore as OSObjectStore, Result as ObjectStoreResult};
+use object_store::{
+    ClientOptions, CredentialProvider, ObjectStore as OSObjectStore, Result as ObjectStoreResult,
+    client::{HttpClient, HttpConnector, HttpRequestBody, ReqwestConnector},
+};
 use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Gcs};
-use reqsign_core::{Context as ReqsignContext, OsEnv, ProvideCredential};
+use reqsign_core::{Context as ReqsignContext, HttpSend, OsEnv, ProvideCredential};
 use reqsign_file_read_tokio::TokioFileRead;
 use reqsign_google::{Credential as ReqsignCredential, FileCredentialProvider};
-use reqsign_http_send_reqwest::ReqwestHttpSend;
 use tokio::sync::RwLock;
 
 use object_store::{
@@ -30,6 +32,31 @@ use lance_core::error::{Error, Result};
 pub struct GcsStoreProvider;
 
 #[derive(Debug)]
+struct ObjectStoreHttpSend {
+    client: HttpClient,
+}
+
+impl HttpSend for ObjectStoreHttpSend {
+    async fn http_send(
+        &self,
+        request: http::Request<bytes::Bytes>,
+    ) -> reqsign_core::Result<http::Response<bytes::Bytes>> {
+        let (parts, body) = request.into_parts();
+        let request = http::Request::from_parts(parts, HttpRequestBody::from(body));
+        let response = self.client.execute(request).await.map_err(|source| {
+            reqsign_core::Error::unexpected("failed to send Google workload identity HTTP request")
+                .with_source(source)
+        })?;
+        let (parts, body) = response.into_parts();
+        let body = body.bytes().await.map_err(|source| {
+            reqsign_core::Error::unexpected("failed to read Google workload identity HTTP response")
+                .with_source(source)
+        })?;
+        Ok(http::Response::from_parts(parts, body))
+    }
+}
+
+#[derive(Debug)]
 struct WorkloadIdentityCredentialProvider {
     provider: FileCredentialProvider,
     context: ReqsignContext,
@@ -37,10 +64,12 @@ struct WorkloadIdentityCredentialProvider {
 }
 
 impl WorkloadIdentityCredentialProvider {
-    fn new(application_credentials_path: String) -> Self {
+    fn new(application_credentials_path: String, http_client: HttpClient) -> Self {
         let context = ReqsignContext::new()
             .with_file_read(TokioFileRead)
-            .with_http_send(ReqwestHttpSend::new(reqwest::Client::new()))
+            .with_http_send(ObjectStoreHttpSend {
+                client: http_client,
+            })
             .with_env(OsEnv);
         Self {
             provider: FileCredentialProvider::new(application_credentials_path),
@@ -115,26 +144,47 @@ struct ApplicationCredentialKind {
     credential_type: String,
 }
 
+fn gcs_client_options(storage_options: &StorageOptions) -> Result<ClientOptions> {
+    let mut client_options = storage_options.client_options()?;
+    for (key, value) in storage_options.as_gcs_options() {
+        if let GoogleConfigKey::Client(key) = key {
+            client_options = client_options.with_config(key, value);
+        }
+    }
+    Ok(client_options)
+}
+
 fn workload_identity_credential_provider(
     storage_options: &StorageOptions,
-) -> Option<Arc<dyn CredentialProvider<Credential = GcpCredential>>> {
+    client_options: &ClientOptions,
+) -> Result<Option<Arc<dyn CredentialProvider<Credential = GcpCredential>>>> {
     let gcs_options = storage_options.as_gcs_options();
     if gcs_options.contains_key(&GoogleConfigKey::ServiceAccount)
         || gcs_options.contains_key(&GoogleConfigKey::ServiceAccountKey)
     {
-        return None;
+        return Ok(None);
     }
 
-    let application_credentials_path = gcs_options.get(&GoogleConfigKey::ApplicationCredentials)?;
-    let contents = std::fs::read(application_credentials_path).ok()?;
-    let credential_kind = serde_json::from_slice::<ApplicationCredentialKind>(&contents).ok()?;
+    let Some(application_credentials_path) =
+        gcs_options.get(&GoogleConfigKey::ApplicationCredentials)
+    else {
+        return Ok(None);
+    };
+    let Ok(contents) = std::fs::read(application_credentials_path) else {
+        return Ok(None);
+    };
+    let Ok(credential_kind) = serde_json::from_slice::<ApplicationCredentialKind>(&contents) else {
+        return Ok(None);
+    };
     if credential_kind.credential_type != "external_account" {
-        return None;
+        return Ok(None);
     }
 
-    Some(Arc::new(WorkloadIdentityCredentialProvider::new(
+    let http_client = ReqwestConnector::default().connect(client_options)?;
+    Ok(Some(Arc::new(WorkloadIdentityCredentialProvider::new(
         application_credentials_path.clone(),
-    )))
+        http_client,
+    ))))
 }
 
 impl GcsStoreProvider {
@@ -182,10 +232,12 @@ impl GcsStoreProvider {
             retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
 
+        let client_options = gcs_client_options(storage_options)?;
+
         let mut builder = GoogleCloudStorageBuilder::new()
             .with_url(base_path.as_ref())
             .with_retry(retry_config)
-            .with_client_options(storage_options.client_options()?);
+            .with_client_options(client_options.clone());
         for (key, value) in storage_options.as_gcs_options() {
             builder = builder.with_config(key, value);
         }
@@ -201,7 +253,7 @@ impl GcsStoreProvider {
             let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
             builder = builder.with_credentials(credential_provider);
         } else if let Some(credential_provider) =
-            workload_identity_credential_provider(storage_options)
+            workload_identity_credential_provider(storage_options, &client_options)?
         {
             // object_store cannot exchange external-account ADC files, while reqsign supports
             // the workload identity format emitted by google-github-actions/auth.
@@ -321,10 +373,43 @@ mod tests {
 
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+    use tempfile::TempDir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    fn external_account_storage_options(
+        temp_dir: &TempDir,
+        token_url: String,
+    ) -> HashMap<String, String> {
+        let subject_token_path = temp_dir.path().join("oidc-token");
+        fs::write(&subject_token_path, "github-oidc-token").unwrap();
+        let application_credentials_path = temp_dir.path().join("credentials.json");
+        fs::write(
+            &application_credentials_path,
+            serde_json::to_vec(&serde_json::json!({
+                "type": "external_account",
+                "audience": "test-audience",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": token_url,
+                "credential_source": {
+                    "file": subject_token_path.to_string_lossy(),
+                    "format": { "type": "text" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HashMap::from([
+            (
+                "google_application_credentials".to_string(),
+                application_credentials_path.to_string_lossy().into_owned(),
+            ),
+            ("allow_http".to_string(), "true".to_string()),
+        ])
+    }
 
     #[test]
     fn test_gcs_store_path() {
@@ -396,29 +481,8 @@ mod tests {
             .await;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let subject_token_path = temp_dir.path().join("oidc-token");
-        fs::write(&subject_token_path, "github-oidc-token").unwrap();
-        let application_credentials_path = temp_dir.path().join("credentials.json");
-        fs::write(
-            &application_credentials_path,
-            serde_json::to_vec(&serde_json::json!({
-                "type": "external_account",
-                "audience": "test-audience",
-                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
-                "token_url": format!("{}/token", mock_server.uri()),
-                "credential_source": {
-                    "file": subject_token_path.to_string_lossy(),
-                    "format": { "type": "text" }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let storage_options = HashMap::from([(
-            "google_application_credentials".to_string(),
-            application_credentials_path.to_string_lossy().into_owned(),
-        )]);
+        let storage_options =
+            external_account_storage_options(&temp_dir, format!("{}/token", mock_server.uri()));
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 storage_options.clone(),
@@ -432,8 +496,11 @@ mod tests {
             .expect("external account credentials should build a GCS store");
         assert_eq!(store.scheme, "gs");
 
+        let storage_options = StorageOptions::new(storage_options);
+        let client_options = gcs_client_options(&storage_options).unwrap();
         let credential_provider =
-            workload_identity_credential_provider(&StorageOptions::new(storage_options))
+            workload_identity_credential_provider(&storage_options, &client_options)
+                .expect("external account credential provider should build")
                 .expect("external account credentials should select the reqsign provider");
         for _ in 0..2 {
             let credential = credential_provider
@@ -442,6 +509,51 @@ mod tests {
                 .expect("workload identity token exchange should succeed");
             assert_eq!(credential.bearer, "federated-token");
         }
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_external_account_respects_client_timeout() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(1))
+                    .set_body_json(serde_json::json!({
+                        "access_token": "federated-token",
+                        "expires_in": 3600
+                    })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut storage_options =
+            external_account_storage_options(&temp_dir, format!("{}/token", mock_server.uri()));
+        storage_options.insert("timeout".to_string(), "50ms".to_string());
+        let storage_options = StorageOptions::new(storage_options);
+        let client_options = gcs_client_options(&storage_options).unwrap();
+        let credential_provider =
+            workload_identity_credential_provider(&storage_options, &client_options)
+                .expect("external account credential provider should build")
+                .expect("external account credentials should select the reqsign provider");
+
+        let credential_result = tokio::time::timeout(
+            Duration::from_millis(200),
+            credential_provider.get_credential(),
+        )
+        .await
+        .expect("configured client timeout should bound the credential exchange");
+        let error = credential_result.expect_err("the delayed token exchange should time out");
+        assert!(matches!(&error, object_store::Error::Generic { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to send Google workload identity HTTP request"),
+            "unexpected error: {error}"
+        );
         mock_server.verify().await;
     }
 }
