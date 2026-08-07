@@ -33,6 +33,7 @@ use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
+use crate::index::vector::details::vector_index_details_default;
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
@@ -1110,10 +1111,9 @@ impl MemTableFlusher {
         );
         index_writer.finish().await?;
 
-        let index_details = Some(Arc::new(prost_types::Any {
-            type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
-            value: vec![],
-        }));
+        // Packed the same way index creation does; hand-building the `Any` here
+        // produced a `type.googleapis.com/` url no other writer in lance emits.
+        let index_details = Some(Arc::new(vector_index_details_default()));
         let index_meta = IndexMetadata {
             uuid: index_uuid,
             name: config.name.clone(),

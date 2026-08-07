@@ -4177,6 +4177,23 @@ impl SqlQueryBuilder {
         }
     }
 
+    #[pyo3(signature = (blob_handling))]
+    fn blob_handling(&self, blob_handling: &str) -> PyResult<Self> {
+        let blob_handling = match blob_handling {
+            "all_binary" => BlobHandling::AllBinary,
+            "blobs_descriptions" => BlobHandling::BlobsDescriptions,
+            "all_descriptions" => BlobHandling::AllDescriptions,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
+                )));
+            }
+        };
+        Ok(Self {
+            builder: self.builder.clone().blob_handling(blob_handling),
+        })
+    }
+
     /// Build the SQL query.
     fn build(&self) -> PyResult<SqlQuery> {
         Ok(SqlQuery {

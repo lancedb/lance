@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
@@ -22,6 +23,7 @@ use lance_file::version::LanceFileVersion;
 use mock_instant::thread_local::MockClock;
 
 use crate::dataset::refs::branch_contents_path;
+use crate::utils::test::copy_test_data_to_tmp;
 use futures::TryStreamExt;
 use lance_core::Error;
 use object_store::path::Path;
@@ -634,6 +636,152 @@ async fn test_fragment_id_never_reset() {
     assert_eq!(dataset.get_fragments()[0].id(), 3);
     assert_eq!(dataset.get_fragments()[1].id(), 4);
     assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
+}
+
+#[tokio::test]
+async fn test_overwrite_does_not_reuse_fragment_ids() {
+    // An overwrite replaces every fragment, but the ids it hands out must still
+    // continue from the dataset's high water mark: an id that named one set of
+    // rows must never name another.
+    let test_dir = TempStrDir::default();
+    let write = |mode: WriteMode, rows: u64| {
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(rows), BatchCount::from(1));
+        let params = WriteParams {
+            mode,
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        Dataset::write(reader, test_dir.as_str(), Some(params))
+    };
+    let fragment_ids = |dataset: &Dataset| {
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id())
+            .collect::<Vec<_>>()
+    };
+
+    let dataset = write(WriteMode::Create, 30).await.unwrap();
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, 2]);
+
+    let dataset = write(WriteMode::Overwrite, 20).await.unwrap();
+    assert_eq!(fragment_ids(&dataset), vec![3, 4]);
+    assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
+
+    let dataset = write(WriteMode::Append, 10).await.unwrap();
+    assert_eq!(fragment_ids(&dataset), vec![3, 4, 5]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_overwrite_rejects_fragment_with_deletion_file(
+    // Every form of the operation must be rejected: upserting config alongside
+    // the overwrite does not make renumbering the fragment any safer.
+    #[values(None, Some(HashMap::from([("key".to_string(), "value".to_string())])))]
+    config_upsert_values: Option<HashMap<String, String>>,
+) {
+    // A deletion file's path embeds the fragment id, so it cannot follow its
+    // fragment to the fresh id an overwrite assigns. Such a fragment belongs to
+    // the dataset being replaced, so the operation is rejected rather than
+    // silently losing the deletions.
+    let test_dir = TempStrDir::default();
+    let reader = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+        .await
+        .unwrap();
+    dataset.delete("i < 3").await.unwrap();
+
+    let fragment = dataset.manifest.fragments[0].clone();
+    assert!(fragment.deletion_file.is_some());
+    let schema = dataset.schema().clone();
+    let read_version = dataset.manifest.version;
+
+    let err = CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            read_version,
+            Operation::Overwrite {
+                fragments: vec![fragment],
+                schema,
+                config_upsert_values,
+                initial_bases: None,
+            },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidInput { .. }),
+        "expected invalid input, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("must be newly written"),
+        "unexpected message: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_commit_rejects_duplicate_fragment_ids() {
+    // Append honors an id a fragment arrives with, so a caller can still hand in
+    // one that an existing fragment already uses. Committing that would leave two
+    // fragments sharing everything keyed by the id.
+    let test_dir = TempStrDir::default();
+    let write = |mode: WriteMode| {
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let params = WriteParams {
+            mode,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        Dataset::write(reader, test_dir.as_str(), Some(params))
+    };
+    let dataset = write(WriteMode::Create).await.unwrap();
+    let existing = dataset.manifest.fragments[1].clone();
+    assert_eq!(existing.id, 1);
+
+    let err = CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            1,
+            Operation::Append {
+                fragments: vec![existing],
+            },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("two fragments with id 1"),
+        "unexpected message: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_commit_on_dataset_with_mixed_file_versions() {
+    // A v0.16 dataset that has both v1 and v2 files also has two fragments with
+    // id 1, because the id allocation of that era could hand out an id a caller
+    // had already supplied. The mixture is the more actionable diagnosis, so the
+    // duplicate check must not preempt it.
+    let test_dir = copy_test_data_to_tmp("v0.16.0/wrong_data_version_no_fix.lance").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let ids = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|f| f.id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![0, 1, 1, 2]);
+
+    let err = dataset.delete("false").await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("The dataset contains a mixture of file versions"),
+        "unexpected message: {err}"
+    );
 }
 
 /// create_branch and shallow_clone must read the SOURCE ref's chain, not the

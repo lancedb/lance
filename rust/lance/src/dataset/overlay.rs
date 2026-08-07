@@ -158,9 +158,8 @@ pub fn collect_overlay_stale_frags(
     Ok(())
 }
 
-/// Like [`collect_overlay_stale_frags`] but with row-level granularity: instead of marking the
-/// whole fragment stale, it computes exactly which row offsets within each covered fragment are
-/// stale and accumulates them into `stale` (fragment_id → stale row offsets).
+/// Compute exactly which row offsets within each covered fragment are stale and accumulate them
+/// into `stale` (fragment_id → stale row offsets).
 ///
 /// Used by the scalar and vector paths to block only the affected rows from index results and
 /// re-evaluate only those rows on the flat path, keeping overhead proportional to the number of
@@ -1353,8 +1352,6 @@ mod tests {
     #[test]
     fn test_collect_frags_missing_bitmap_covers_all() {
         let schema = flat_test_schema();
-        // A segment with no fragment_bitmap (legacy index predating bitmap tracking) must treat
-        // every overlaid fragment as covered so stale rows can't leak past the index unmasked.
         let fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1, 2], 9));
         let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
 
@@ -1363,7 +1360,6 @@ mod tests {
             .unwrap();
         assert_eq!(stale, bitmap([3]), "missing bitmap must cover fragment 3");
 
-        // A present bitmap that excludes fragment 3 leaves it untouched.
         let mut stale = RoaringBitmap::new();
         collect_overlay_stale_frags(
             &segment(vec![3], 1, Some(bitmap([0]))),
@@ -1377,7 +1373,6 @@ mod tests {
             "fragment absent from bitmap is not covered"
         );
 
-        // A present bitmap that includes fragment 3 marks it stale.
         let mut stale = RoaringBitmap::new();
         collect_overlay_stale_frags(
             &segment(vec![3], 1, Some(bitmap([3]))),
@@ -1423,5 +1418,16 @@ mod tests {
             stale.is_empty(),
             "fragment absent from bitmap contributes no rows"
         );
+
+        // A present bitmap that includes fragment 3 contributes its stale rows.
+        let mut stale = HashMap::new();
+        collect_overlay_stale_rows_for_segment(
+            &segment(vec![3], 1, Some(bitmap([3]))),
+            &overlaid,
+            &mut stale,
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(stale.get(&3), Some(&bitmap([1, 2])));
     }
 }

@@ -35,6 +35,9 @@ from .lance import (
 from .lance import (
     RowIdMeta as RowIdMeta,
 )
+from .lance import (
+    RowIdSequence as RowIdSequence,
+)
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader

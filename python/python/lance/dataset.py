@@ -750,6 +750,14 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """Mark MemWAL SSTables as compacted into the base table.
 
         Call this before executing merge_insert when it compacts MemWAL SSTables.
+        The progress is recorded in the same commit as the data.
+
+        For multi-pass compaction, call this only on the final successful
+        data-changing pass. Intermediate passes must not carry compaction
+        progress. Lance cannot tell whether a caller has another pass planned,
+        so it cannot enforce this: if a delete pass carried the marker and the
+        process then died before the matching upsert, the recorded progress
+        would claim rows were copied in that never were.
 
         Parameters
         ----------
@@ -5592,6 +5600,21 @@ class SqlQueryBuilder:
         self._builder = self._builder.with_row_addr(with_row_addr)
         return self
 
+    def blob_handling(
+        self,
+        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
+    ) -> "SqlQueryBuilder":
+        """
+        Control how blob columns are returned by this SQL query.
+
+        - ``"all_binary"`` materializes blob columns as binary values.
+        - ``"blobs_descriptions"`` returns blob descriptors (the default).
+        - ``"all_descriptions"`` returns descriptions for all binary-like
+          columns.
+        """
+        self._builder = self._builder.blob_handling(blob_handling)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
@@ -5793,7 +5816,13 @@ class LanceOperation:
         new_schema: pyarrow.Schema
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
-            The fragments that make up the new dataset.
+            The newly written fragments that make up the new dataset. They are
+            assigned fresh ids when the operation is committed, continuing from
+            the highest id the dataset has ever used, so any id they carry is
+            ignored. Since we reassign fragment ids, a fragment with a deletion
+            file is rejected: use :class:`LanceOperation.Delete` to commit
+            deletions, or :class:`LanceOperation.Merge` to change the schema of
+            existing fragments.
         initial_bases: list[DatasetBasePath], optional
             Base paths to register when creating a new dataset (CREATE mode only).
             **Only valid in CREATE mode**. Will raise an error if used with

@@ -356,7 +356,7 @@ impl UpdateJob {
             })?;
             for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                 let serialized = lance_table::rowids::write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
             }
         }
 
@@ -1352,6 +1352,21 @@ mod tests {
             "the address-domain index must not cover the rewritten fragment"
         );
 
+        // Regression for https://github.com/lance-format/lance/issues/8278: a later
+        // update must find rows moved out of the address-domain index's coverage.
+        let second_update = UpdateBuilder::new(dataset)
+            .update_where(query)
+            .unwrap()
+            .set("category", "-2")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(second_update.rows_updated, expected_rows as u64);
+        let dataset = second_update.new_dataset;
+
         let after = dataset
             .scan()
             .filter(query)
@@ -1360,6 +1375,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.num_rows(), expected_rows);
+
+        let updated = dataset
+            .scan()
+            .filter("category = -2")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(updated.num_rows(), expected_rows);
     }
 
     /// Regression test for https://github.com/lance-format/lance/issues/8076
