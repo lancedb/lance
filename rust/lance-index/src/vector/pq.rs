@@ -615,6 +615,7 @@ mod tests {
     use lance_linalg::kernels::argmin;
     use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
+    use rstest::rstest;
     use storage::transpose;
 
     #[test]
@@ -688,6 +689,35 @@ mod tests {
             .for_each(|(v, e)| {
                 assert_relative_eq!(*v, *e, epsilon = 1e-4);
             });
+    }
+
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::dot(DistanceType::Dot)]
+    fn test_distance_with_legacy_truncated_dimension(#[case] distance_type: DistanceType) {
+        const DIM: usize = 64;
+        const NUM_SUB_VECTORS: usize = 14;
+        const NUM_BITS: u32 = 4;
+        const NUM_CENTROIDS: usize = 1 << NUM_BITS;
+        const SUB_VECTOR_DIM: usize = DIM / NUM_SUB_VECTORS;
+
+        // Older writers silently omitted the tail when the dimension was not
+        // divisible by the number of sub-vectors. Preserve searches over those
+        // indexes even though current writers reject this configuration.
+        let codebook =
+            Float32Array::from(vec![0.0; NUM_SUB_VECTORS * NUM_CENTROIDS * SUB_VECTOR_DIM]);
+        let pq = ProductQuantizer::new(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            DIM,
+            FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap(),
+            distance_type,
+        );
+        let query = Float32Array::from(vec![0.0; DIM]);
+        let code = UInt8Array::from(vec![0; NUM_SUB_VECTORS / 2]);
+
+        let distances = pq.compute_distances(&query, &code).unwrap();
+        assert_eq!(distances.len(), 1);
     }
 
     #[test]
