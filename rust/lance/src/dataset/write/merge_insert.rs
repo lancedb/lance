@@ -39,6 +39,8 @@ pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 const INDEXED_JOIN_BATCH_ROWS: usize = 128;
 /// Byte cap for indexed sort input batches and in-memory replay buffers.
 const MAX_INDEXED_JOIN_BATCH_BYTES: usize = 25 * 1024 * 1024;
+/// Byte cap for each batch entering the partial-update fragment sort.
+const MAX_FRAGMENT_UPDATE_BATCH_BYTES: usize = 25 * 1024 * 1024;
 
 pub mod inserted_rows;
 
@@ -507,15 +509,15 @@ fn merge_insert_execution_options() -> LanceExecutionOptions {
 }
 
 fn max_fragment_update_partitions(memory_pool_size: u64) -> usize {
-    // Every sort partition reserves the configured spill-merge budget. Leave
-    // one such budget available for the lazy indexed input feeding this sort.
+    // The joined update stream is staged before this sort, so no upstream sort
+    // reservation remains live. Budget each downstream partition for its merge
+    // reservation plus one capped input and output/fragment-grouping batch.
     let sort_spill_reservation = (memory_pool_size / 3).clamp(1, 40 * 1024 * 1024);
-    usize::try_from(
-        (memory_pool_size / sort_spill_reservation)
-            .saturating_sub(1)
-            .max(1),
-    )
-    .unwrap_or(usize::MAX)
+    let working_memory = u64::try_from(MAX_FRAGMENT_UPDATE_BATCH_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2);
+    let partition_budget = sort_spill_reservation.saturating_add(working_memory);
+    usize::try_from((memory_pool_size / partition_budget).max(1)).unwrap_or(usize::MAX)
 }
 
 fn fragment_update_session_context(
@@ -1626,6 +1628,22 @@ impl MergeInsertJob {
         spill_session_context: &SessionContext,
         spill_execution_options: &LanceExecutionOptions,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
+        // Fully stage the joined updates before starting the fragment sort. An
+        // indexed join can keep merge streams for both sorted inputs live while
+        // its output is pulled; draining a disk-backed replay first releases
+        // those upstream reservations before the downstream sort allocates.
+        let staged_source = spilling_table_provider_with_disk_manager(
+            source,
+            0,
+            spill_session_context.runtime_env().disk_manager.clone(),
+        )
+        .await?;
+        provider_to_stream(staged_source.clone())
+            .await?
+            .try_for_each(|_| async { Ok::<(), DataFusionError>(()) })
+            .await?;
+        let source = provider_to_stream(staged_source).await?;
+
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
         let target_bases_info = Arc::new(target_bases_info);
@@ -1636,7 +1654,6 @@ impl MergeInsertJob {
         // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
         // single batch that is larger than the memory pool, so we must
         // rechunk oversized batches before they reach the sort.
-        const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
         let sorted = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
@@ -1651,8 +1668,10 @@ impl MergeInsertJob {
                     let new_children: Vec<Arc<dyn ExecutionPlan>> = children
                         .into_iter()
                         .map(|c| {
-                            Arc::new(HardCapBatchSizeExec::new(c.clone(), MAX_BATCH_BYTES))
-                                as Arc<dyn ExecutionPlan>
+                            Arc::new(HardCapBatchSizeExec::new(
+                                c.clone(),
+                                MAX_FRAGMENT_UPDATE_BATCH_BYTES,
+                            )) as Arc<dyn ExecutionPlan>
                         })
                         .collect();
                     let new_node = node.with_new_children(new_children)?;
@@ -3651,11 +3670,11 @@ mod tests {
     }
 
     #[test]
-    fn test_fragment_update_partitions_leave_upstream_memory() {
+    fn test_fragment_update_partitions_include_working_memory() {
         assert_eq!(
             max_fragment_update_partitions(150 * 1024 * 1024),
-            2,
-            "a 150 MiB pool cannot host more than two 40 MiB sort merges while the indexed input is live"
+            1,
+            "a 150 MiB pool has room for one merge reservation and two capped working batches"
         );
     }
 

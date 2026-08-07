@@ -21,6 +21,10 @@ use lance_index::scalar::ScalarIndexParams;
 const MEM_POOL_SIZE: u64 = 16 * 1024 * 1024;
 const LARGE_ROW_MEM_POOL_SIZE: u64 = 512 * 1024 * 1024;
 const LARGE_PAYLOAD_BYTES: u64 = 30 * 1024 * 1024;
+const PARTIAL_UPDATE_MEM_POOL_SIZE: u64 = 150 * 1024 * 1024;
+const PARTIAL_ROWS_PER_BATCH: u64 = 50_000;
+const PARTIAL_BATCHES: u32 = 4;
+const WIDE_KEY_BYTES: u64 = 2048;
 const NUM_ROWS: u64 = 8192;
 
 #[tokio::test]
@@ -139,5 +143,76 @@ async fn test_indexed_merge_insert_spills_wide_source() {
             .await
             .unwrap(),
         1
+    );
+
+    // Partial updates add a downstream fragment sort after the indexed join.
+    // Both wide-key join inputs spill here; their merge streams must be fully
+    // released before the fragment sort starts using the same bounded pool.
+    let partial_target = gen_batch()
+        .with_seed(Seed::from(5))
+        .col(
+            "id",
+            array::rand_utf8(ByteCount::from(WIDE_KEY_BYTES), false),
+        )
+        .col("payload", array::fill::<arrow_array::types::UInt32Type>(0))
+        .col("updated", array::fill::<arrow_array::types::UInt32Type>(0))
+        .into_reader_rows(
+            RowCount::from(PARTIAL_ROWS_PER_BATCH),
+            BatchCount::from(PARTIAL_BATCHES),
+        );
+    let mut partial_dataset = Dataset::write(partial_target, "memory://", None)
+        .await
+        .unwrap();
+    partial_dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    unsafe {
+        std::env::set_var(
+            "LANCE_MEM_POOL_SIZE",
+            PARTIAL_UPDATE_MEM_POOL_SIZE.to_string(),
+        );
+    }
+
+    let partial_source: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
+        gen_batch()
+            .with_seed(Seed::from(5))
+            .col(
+                "id",
+                array::rand_utf8(ByteCount::from(WIDE_KEY_BYTES), false),
+            )
+            .col("updated", array::fill::<arrow_array::types::UInt32Type>(1))
+            .into_reader_rows(
+                RowCount::from(PARTIAL_ROWS_PER_BATCH),
+                BatchCount::from(PARTIAL_BATCHES),
+            ),
+    );
+    let (partial_dataset, partial_stats) =
+        MergeInsertBuilder::try_new(Arc::new(partial_dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(partial_source)
+            .await
+            .unwrap();
+
+    let partial_total_rows = PARTIAL_ROWS_PER_BATCH * u64::from(PARTIAL_BATCHES);
+    assert_eq!(partial_stats.num_updated_rows, partial_total_rows);
+    assert_eq!(partial_stats.num_inserted_rows, 0);
+    assert_eq!(
+        partial_dataset
+            .count_rows(Some("updated = 1".to_string()))
+            .await
+            .unwrap(),
+        partial_total_rows as usize
     );
 }
