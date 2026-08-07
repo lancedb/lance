@@ -4075,8 +4075,11 @@ async fn test_fts_phrase_query_preserves_stop_word_gaps() {
     assert!(!ids.contains(&3), "ids={ids:?}");
 }
 
+#[rstest]
+#[case::merge(false)]
+#[case::append_rebuild(true)]
 #[tokio::test]
-async fn test_optimize_json_btree_index() {
+async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
     fn json_batch(values: Vec<&str>) -> RecordBatch {
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -4120,10 +4123,12 @@ async fn test_optimize_json_btree_index() {
             .unwrap();
     }
 
-    dataset
-        .optimize_indices(&OptimizeOptions::default())
-        .await
-        .unwrap();
+    let options = if append_rebuild {
+        OptimizeOptions::append()
+    } else {
+        OptimizeOptions::default()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
 
     let indexed_fragments = dataset
         .load_indices_by_name("json_idx")
