@@ -116,7 +116,7 @@ use lance_datafusion::{
         HardCapBatchSizeExec, LanceExecutionOptions, OneShotPartitionStream, analyze_plan,
         execute_plan, get_session_context, provider_to_stream,
     },
-    spill::spilling_table_provider,
+    spill::spilling_table_provider_with_disk_limit,
     utils::{StreamingWriteSource, reader_to_stream},
 };
 use lance_file::version::LanceFileVersion;
@@ -948,6 +948,85 @@ impl PartitionStream for DeduplicatingSourcePartitionStream {
     }
 }
 
+/// Presents all source partitions as one deterministic, replayable stream.
+///
+/// The indexed join scans the source twice. Genuine table providers can serve
+/// both scans directly, so this adapter avoids copying their rows into another
+/// replay spill. FirstSeen sources also receive a temporary encounter ordinal
+/// before either scan can reorder them.
+#[derive(Debug)]
+struct SequentialSourcePartitionStream {
+    input: Arc<dyn ExecutionPlan>,
+    schema: Arc<Schema>,
+    ordinal_field: Option<Field>,
+}
+
+impl SequentialSourcePartitionStream {
+    fn try_new(input: Arc<dyn ExecutionPlan>, ordinal_field: Option<Field>) -> Result<Self> {
+        let schema = if let Some(field) = ordinal_field.as_ref() {
+            Arc::new(input.schema().as_ref().try_with_column(field.clone())?)
+        } else {
+            input.schema()
+        };
+        Ok(Self {
+            input,
+            schema,
+            ordinal_field,
+        })
+    }
+}
+
+impl PartitionStream for SequentialSourcePartitionStream {
+    fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
+    fn execute(
+        &self,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> SendableRecordBatchStream {
+        let input = self.input.clone();
+        let partition_count = input.properties().output_partitioning().partition_count();
+        let partition_streams = stream::iter(0..partition_count)
+            .map(move |partition| input.execute(partition, context.clone()))
+            .try_flatten();
+
+        if let Some(ordinal_field) = self.ordinal_field.clone() {
+            let mut next_ordinal = 0_u64;
+            let source_with_ordinals = partition_streams.map(move |batch| {
+                let batch = batch?;
+                let num_rows = u64::try_from(batch.num_rows()).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "merge-insert source batch row count {} exceeds u64::MAX",
+                        batch.num_rows()
+                    ))
+                })?;
+                let end_ordinal = next_ordinal.checked_add(num_rows).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "merge-insert source ordinal overflow at {} with batch row count {}",
+                        next_ordinal,
+                        batch.num_rows()
+                    ))
+                })?;
+                let ordinals = Arc::new(UInt64Array::from_iter_values(next_ordinal..end_ordinal));
+                next_ordinal = end_ordinal;
+                batch
+                    .try_with_column(ordinal_field.clone(), ordinals)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))
+            });
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                source_with_ordinals,
+            ))
+        } else {
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                partition_streams,
+            ))
+        }
+    }
+}
+
 impl MergeInsertJob {
     pub async fn execute_reader(
         self,
@@ -1036,7 +1115,8 @@ impl MergeInsertJob {
 
     async fn create_indexed_scan_joined_stream(
         &self,
-        source: SendableRecordBatchStream,
+        source_provider: Arc<dyn TableProvider>,
+        source_is_replayable: bool,
         indexed_keys: Vec<(String, IndexMetadata)>,
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
@@ -1045,7 +1125,7 @@ impl MergeInsertJob {
             !indexed_keys.is_empty(),
             "create_indexed_scan_joined_stream requires at least one indexed key"
         );
-        let schema = source.schema();
+        let schema = source_provider.schema();
         let add_row_addr = match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => false,
             SchemaComparison::Subschema => true,
@@ -1062,42 +1142,6 @@ impl MergeInsertJob {
                 }
                 name
             });
-        let source = if let Some(source_ordinal_column) = source_ordinal_column.as_ref() {
-            let ordinal_field = Field::new(source_ordinal_column, DataType::UInt64, false);
-            let ordinal_schema = Arc::new(schema.as_ref().try_with_column(ordinal_field.clone())?);
-            let mut next_ordinal = 0_u64;
-            let source_with_ordinal = source.map(move |batch| {
-                let batch = batch?;
-                let num_rows = u64::try_from(batch.num_rows()).map_err(|_| {
-                    DataFusionError::Execution(format!(
-                        "merge-insert source batch row count {} exceeds u64::MAX",
-                        batch.num_rows()
-                    ))
-                })?;
-                let end_ordinal = next_ordinal.checked_add(num_rows).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "merge-insert source ordinal overflow at {} with batch row count {}",
-                        next_ordinal,
-                        batch.num_rows()
-                    ))
-                })?;
-                let ordinals = Arc::new(UInt64Array::from_iter_values(next_ordinal..end_ordinal));
-                next_ordinal = end_ordinal;
-                batch
-                    .try_with_column(ordinal_field.clone(), ordinals)
-                    .map_err(|error| DataFusionError::External(Box::new(error)))
-            });
-            Box::pin(RecordBatchStreamAdapter::new(
-                ordinal_schema,
-                source_with_ordinal,
-            )) as SendableRecordBatchStream
-        } else {
-            source
-        };
-
-        // 1 - Make the one-shot source replayable for the index probe and the
-        //     final join. Keep only a small, pool-relative buffer in memory;
-        //     larger sources spill to disk.
         /// Row cap for external-sort output batches; payload rows may be wide.
         const JOIN_BATCH_ROWS: usize = 128;
         /// Byte cap for sort input batches and in-memory replay buffers.
@@ -1109,8 +1153,36 @@ impl MergeInsertJob {
         };
         let max_batch_bytes =
             ((execution_options.mem_pool_size() as usize) / 8).clamp(1, MAX_JOIN_BATCH_BYTES);
-        let replayable_source = spilling_table_provider(source, max_batch_bytes).await?;
+        let max_temp_directory_size = execution_options.max_temp_directory_size();
         let session_ctx = SessionContext::new();
+        let source_plan = source_provider
+            .scan(&session_ctx.state(), None, &[], None)
+            .await?;
+        let ordinal_field = source_ordinal_column
+            .as_ref()
+            .map(|name| Field::new(name, DataType::UInt64, false));
+        let sequential_source = Arc::new(SequentialSourcePartitionStream::try_new(
+            source_plan,
+            ordinal_field,
+        )?);
+        let normalized_source: Arc<dyn TableProvider> = Arc::new(StreamingTable::try_new(
+            sequential_source.schema().clone(),
+            vec![sequential_source],
+        )?);
+
+        // A genuine provider can serve both the index probe and final join
+        // directly. Only a one-shot provider needs a replay spill here.
+        let replayable_source = if source_is_replayable {
+            normalized_source
+        } else {
+            let source = provider_to_stream(normalized_source).await?;
+            spilling_table_provider_with_disk_limit(
+                source,
+                max_batch_bytes,
+                max_temp_directory_size,
+            )
+            .await?
+        };
         let source_input = replayable_source
             .scan(&session_ctx.state(), None, &[], None)
             .await?;
@@ -1144,7 +1216,12 @@ impl MergeInsertJob {
         // for the same pool. Replaying these row addresses is inexpensive and
         // spills when needed.
         let mapped_rows = execute_plan(index_mapper, execution_options.clone())?;
-        let mapped_rows = spilling_table_provider(mapped_rows, max_batch_bytes).await?;
+        let mapped_rows = spilling_table_provider_with_disk_limit(
+            mapped_rows,
+            max_batch_bytes,
+            max_temp_directory_size,
+        )
+        .await?;
         let mut initial_scan = provider_to_stream(mapped_rows.clone()).await?;
         while initial_scan.try_next().await?.is_some() {}
         drop(initial_scan);
@@ -1419,7 +1496,8 @@ impl MergeInsertJob {
     /// prefix them with _target.
     async fn create_joined_stream(
         &self,
-        source: SendableRecordBatchStream,
+        source_provider: Arc<dyn TableProvider>,
+        source_is_replayable: bool,
     ) -> Result<SendableRecordBatchStream> {
         if self.params.use_index
             && matches!(
@@ -1434,7 +1512,11 @@ impl MergeInsertJob {
             let indexed_keys = self.indexed_join_keys().await?;
             if indexed_keys.len() == self.params.on.len() {
                 return self
-                    .create_indexed_scan_joined_stream(source, indexed_keys)
+                    .create_indexed_scan_joined_stream(
+                        source_provider,
+                        source_is_replayable,
+                        indexed_keys,
+                    )
                     .await;
             }
         }
@@ -1448,6 +1530,7 @@ impl MergeInsertJob {
             );
         }
 
+        let source = provider_to_stream(source_provider).await?;
         self.create_full_table_joined_stream(source).await
     }
 
@@ -2011,7 +2094,7 @@ impl MergeInsertJob {
         batches: Vec<RecordBatch>,
     ) -> Result<UncommittedMergeInsert> {
         let provider = self.batches_to_provider(batches)?;
-        self.execute_uncommitted_impl(provider).await
+        self.execute_uncommitted_impl(provider, true).await
     }
 
     /// Wrap materialized batches in a multi-partition in-memory [`MemTable`].
@@ -2055,7 +2138,14 @@ impl MergeInsertJob {
     ) -> Result<(Arc<dyn TableProvider>, bool)> {
         if self.params.conflict_retries > 0 && self.params.spill_for_retry {
             // Allow buffering up to 100MB in memory before spilling to disk.
-            let provider = spilling_table_provider(source, 100 * 1024 * 1024).await?;
+            let max_temp_directory_size =
+                LanceExecutionOptions::default().max_temp_directory_size();
+            let provider = spilling_table_provider_with_disk_limit(
+                source,
+                100 * 1024 * 1024,
+                max_temp_directory_size,
+            )
+            .await?;
             Ok((provider, true))
         } else {
             Ok((one_shot_provider(source)?, false))
@@ -2086,6 +2176,7 @@ impl MergeInsertJob {
         let wrapper = MergeInsertJobWithProvider {
             job: self,
             provider,
+            replayable,
             attempt_count: Arc::new(AtomicU32::new(0)),
         };
 
@@ -2100,7 +2191,7 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
-        self.execute_uncommitted_impl(one_shot_provider(stream)?)
+        self.execute_uncommitted_impl(one_shot_provider(stream)?, false)
             .await
     }
 
@@ -2447,6 +2538,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_impl(
         self,
         provider: Arc<dyn TableProvider>,
+        source_is_replayable: bool,
     ) -> Result<UncommittedMergeInsert> {
         // Check if we can use the fast path
         let can_use_fast_path = self.can_use_create_plan(provider.schema().as_ref()).await?;
@@ -2464,9 +2556,7 @@ impl MergeInsertJob {
 
         let target_bases_info = resolve_target_bases(&self.dataset, &self.params).await?;
 
-        // The slow path consumes a single stream; adapt the provider back into one.
-        let source = provider_to_stream(provider).await?;
-        let source_schema = source.schema();
+        let source_schema = provider.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
         let is_full_schema = full_schema.compare_with_options(
@@ -2478,7 +2568,9 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
-        let joined = self.create_joined_stream(source).await?;
+        let joined = self
+            .create_joined_stream(provider, source_is_replayable)
+            .await?;
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
@@ -2885,6 +2977,7 @@ pub struct UncommittedMergeInsert {
 struct MergeInsertJobWithProvider {
     job: MergeInsertJob,
     provider: Arc<dyn TableProvider>,
+    replayable: bool,
     attempt_count: Arc<AtomicU32>,
 }
 
@@ -2899,7 +2992,7 @@ impl RetryExecutor for MergeInsertJobWithProvider {
         // Re-scan the provider on each retry attempt.
         self.job
             .clone()
-            .execute_uncommitted_impl(self.provider.clone())
+            .execute_uncommitted_impl(self.provider.clone(), self.replayable)
             .await
     }
 
