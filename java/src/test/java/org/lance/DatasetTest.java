@@ -686,7 +686,10 @@ public class DatasetTest {
               .build();
       dataset.alterColumns(Collections.singletonList(renameAndWiden));
 
-      assertNull(dataset.getSchema().findField("id"));
+      List<String> fieldNames =
+          dataset.getSchema().getFields().stream().map(Field::getName).collect(Collectors.toList());
+      assertFalse(fieldNames.contains("id"));
+      assertTrue(fieldNames.contains("id_long"));
       assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id_long").getType());
     }
   }
