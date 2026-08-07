@@ -3048,6 +3048,8 @@ impl Dataset {
             .try_collect::<Vec<()>>()
             .await?;
 
+        rowids::validate_stable_row_ids(self).await?;
+
         // Validate indices
         let indices = self.load_indices().await?;
         self.validate_indices(&indices)?;
@@ -3316,7 +3318,7 @@ impl Dataset {
                     external_file.path
                 )));
             }
-            for data_file in fragment.files.iter() {
+            for data_file in fragment.referenced_lance_files() {
                 let base_root = if let Some(base_id) = data_file.base_id {
                     let base_path =
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {

@@ -35,7 +35,7 @@ metrics = { workspace = true, optional = true }
 moka.workspace = true
 pin-project.workspace = true
 prost.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true

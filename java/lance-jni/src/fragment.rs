@@ -568,7 +568,7 @@ fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String
     env.get_long_array_region(row_ids, 0, buf.as_mut_slice())?;
     let ids: Vec<u64> = buf.into_iter().map(|x| x as u64).collect();
     let seq = RowIdSequence::from(ids.as_slice());
-    let meta = RowIdMeta::Inline(write_row_ids(&seq));
+    let meta = RowIdMeta::Inline(write_row_ids(&seq).into());
     let json = serde_json::to_string(&meta)?;
     Ok(json)
 }
