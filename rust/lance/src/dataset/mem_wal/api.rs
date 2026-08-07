@@ -5,6 +5,14 @@
 //!
 //! This module provides the user-facing API for initializing and using MemWAL
 //! on a Dataset.
+//!
+//! # Limitations
+//!
+//! MemWAL does not track dataset changes made after it is initialized: dropping
+//! or replacing a maintained index, or projecting away its column, leaves
+//! `maintained_indexes` naming something the writer cannot build. A change that
+//! races the initialization commit lands the same way. Both surface as a failing
+//! `mem_wal_writer`; handling them is follow-up work.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -193,6 +201,9 @@ impl<'a> InitializeMemWalBuilder<'a> {
     /// Fails if any maintained index does not exist or cannot be maintained by
     /// the MemWAL, if the selected sharding configuration is invalid, or if
     /// MemWAL is already initialized.
+    ///
+    /// Validated against the dataset as it stands here; see the module-level
+    /// limitations for changes made afterwards.
     pub async fn execute(self) -> Result<()> {
         let Self {
             dataset,
@@ -729,6 +740,8 @@ async fn build_index_configs(
 /// All-or-nothing: it reports the first index it cannot maintain rather than
 /// returning a usable subset, so a caller inferring a set surfaces the error
 /// instead of dropping an index it believes is maintained.
+///
+/// Judges `dataset` as given; see the module-level limitations.
 ///
 /// Opens each vector index to inherit its distance type.
 pub async fn validate_maintained_indexes(dataset: &Dataset, index_names: &[String]) -> Result<()> {
