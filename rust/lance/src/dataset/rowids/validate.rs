@@ -234,7 +234,7 @@ mod tests {
         let mut dataset = validation_fixture(&temp_dir).await;
         let encoded = encode_segments(vec![range_segment(0, u64::MAX), range_segment(0, u64::MAX)]);
         edit_fragments(&mut dataset, |fragments| {
-            fragments[1].row_id_meta = Some(RowIdMeta::Inline(encoded));
+            fragments[1].row_id_meta = Some(RowIdMeta::Inline(encoded.into()));
         });
 
         assert_invalid(&dataset, "total length exceeding u64::MAX").await;
@@ -256,7 +256,7 @@ mod tests {
         // ids stay clear of fragment 0's, so this dataset is well-formed.
         let encoded = encode_segments(vec![range_segment(10, 20), empty]);
         edit_fragments(&mut dataset, |fragments| {
-            fragments[1].row_id_meta = Some(RowIdMeta::Inline(encoded));
+            fragments[1].row_id_meta = Some(RowIdMeta::Inline(encoded.into()));
         });
 
         dataset.validate().await.unwrap();
@@ -320,7 +320,7 @@ mod tests {
         let mut dataset = validation_fixture(&temp_dir).await;
         edit_fragments(&mut dataset, |fragments| {
             let short = RowIdSequence::from(&[100u64, 101, 102][..]);
-            fragments[1].row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&short)));
+            fragments[1].row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&short).into()));
         });
 
         assert_invalid(&dataset, "Fragment 1 has 3 row ids, but 10 physical rows").await;
