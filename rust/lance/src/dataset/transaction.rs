@@ -401,7 +401,11 @@ pub enum Operation {
     /// specification for resolution, coverage, and versioning rules.
     DataOverlay { groups: Vec<DataOverlayGroup> },
     /// Merge a new column in
-    /// 'fragments' is the final fragments include all data files, the new fragments must align with old ones at rows.
+    /// 'fragments' is the final fragment list: the merged version of every existing
+    /// fragment (aligned with the old one at rows) and, optionally, brand-new fragments
+    /// listed after them. New fragments use id 0 (assigned a fresh id at commit time) or
+    /// a pre-reserved id; either way, on stable row id datasets they are also assigned
+    /// row ids at commit time, like Append.
     /// 'schema' is not forced to include existed columns, which means we could use Merge to drop column data
     Merge {
         fragments: Vec<Fragment>,
@@ -2212,43 +2216,61 @@ impl Transaction {
             Operation::Merge { fragments, .. } => {
                 let existing_fragments = maybe_existing_fragments?;
                 let mut merged_fragments = fragments.clone();
-                if next_row_id.is_some() {
-                    let prev_by_id: HashMap<u64, &Fragment> =
-                        existing_fragments.iter().map(|f| (f.id, f)).collect();
-                    for fragment in merged_fragments.iter_mut() {
-                        match prev_by_id.get(&fragment.id) {
-                            Some(prev) => {
-                                if merge_fragment_physically_rewritten(prev, fragment) {
-                                    lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
-                                        fragment,
-                                        new_version,
-                                    )?;
-                                }
-                            }
-                            None => {
-                                // Brand-new fragment ID not present in the previous manifest.
-                                // Set both last_updated and created version meta, consistent
-                                // with Append/Overwrite for genuinely new fragments.
-                                lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
-                                    fragment,
-                                    new_version,
-                                )?;
-                                fragment.created_at_version_meta =
-                                    fragment.last_updated_at_version_meta.clone();
-                            }
+
+                // For each previous id, the first occurrence in the list is the
+                // merged existing fragment; everything else is new (staged
+                // write_fragments output arrives with placeholder id 0, colliding
+                // with real fragment 0). merge_fragments_valid enforces this rule.
+                let prev_by_id: HashMap<u64, &Fragment> =
+                    existing_fragments.iter().map(|f| (f.id, f)).collect();
+                let mut seen_prev_ids = HashSet::new();
+                let is_new = merged_fragments
+                    .iter()
+                    .map(|f| !prev_by_id.contains_key(&f.id) || !seen_prev_ids.insert(f.id))
+                    .collect::<Vec<_>>();
+
+                // New fragments get Append's treatment: id assignment (0 means
+                // unassigned, non-zero pre-reserved) and, with stable row ids,
+                // row ids plus fresh version metadata.
+                for (fragment, is_new) in merged_fragments.iter_mut().zip(is_new.iter()) {
+                    if *is_new && fragment.id == 0 {
+                        fragment.id = fragment_id;
+                        fragment_id += 1;
+                    }
+                }
+
+                if let Some(next_row_id) = &mut next_row_id {
+                    for (fragment, is_new) in merged_fragments.iter_mut().zip(is_new.iter()) {
+                        if *is_new {
+                            // Fragments that already carry a complete row id sequence
+                            // are left untouched by assign_row_ids.
+                            Self::assign_row_ids(next_row_id, std::slice::from_mut(fragment))?;
+                            let version_meta = build_version_meta(fragment, new_version);
+                            fragment.last_updated_at_version_meta = version_meta.clone();
+                            fragment.created_at_version_meta = version_meta;
+                        } else if let Some(prev) = prev_by_id.get(&fragment.id)
+                            && merge_fragment_physically_rewritten(prev, fragment)
+                        {
+                            lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                                fragment,
+                                new_version,
+                            )?;
                         }
                     }
                 }
-                final_fragments.extend(merged_fragments);
 
                 // A Merge can rewrite a column's data file in place; the field stays
                 // in the schema, so the index is retained -- prune its now-stale
-                // entries for the rewritten fragments.
+                // entries for the rewritten fragments. Compare with the assigned ids
+                // so brand-new fragments are not mistaken for rewrites of the
+                // fragment whose id they arrived with.
                 Self::prune_merge_rewritten_fields_from_indices(
                     &mut final_indices,
                     existing_fragments,
-                    fragments,
+                    &merged_fragments,
                 );
+
+                final_fragments.extend(merged_fragments);
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
@@ -4159,9 +4181,43 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
         )));
     }
 
-    // Collect new fragment IDs
-    let new_fragment_map: HashMap<u64, &Fragment> =
-        new_fragments.iter().map(|f| (f.id, f)).collect();
+    // Id 0 means unassigned (assigned at commit, like Append); a non-zero id
+    // unknown to the manifest was pre-reserved. The first occurrence of each
+    // previous id is the existing fragment (mirrors build_manifest), so staged
+    // id-0 fragments must follow the existing ones.
+    let mut new_fragment_map: HashMap<u64, &Fragment> = HashMap::new();
+    for fragment in new_fragments {
+        if fragment.id != 0 && new_fragment_map.contains_key(&fragment.id) {
+            return Err(Error::invalid_input(format!(
+                "Merge operation contains duplicate fragment id {}. \
+                 New fragments must use id 0 (assigned at commit time) or a unique reserved id.",
+                fragment.id
+            )));
+        }
+        new_fragment_map.entry(fragment.id).or_insert(fragment);
+    }
+
+    // build_manifest treats the FIRST occurrence of each previous id as the
+    // merged existing fragment, so a staged id-0 fragment listed before the
+    // fragment it collides with would silently take that fragment's place.
+    // The row-count and row-id-metadata checks below only catch that swap
+    // when the two fragments differ; enforce the order structurally instead:
+    // every fragment classified as existing must precede every new one.
+    let previous_ids: HashSet<u64> = original_fragments.iter().map(|f| f.id).collect();
+    let mut seen_previous: HashSet<u64> = HashSet::new();
+    let mut first_new_id: Option<u64> = None;
+    for fragment in new_fragments {
+        let is_existing = previous_ids.contains(&fragment.id) && seen_previous.insert(fragment.id);
+        if !is_existing {
+            first_new_id.get_or_insert(fragment.id);
+        } else if let Some(new_id) = first_new_id {
+            return Err(Error::invalid_input(format!(
+                "Merge operation lists existing fragment {} after a new fragment \
+                 (id {}). New fragments must be listed after every existing fragment.",
+                fragment.id, new_id
+            )));
+        }
+    }
 
     // Check that all original fragments are preserved in the new fragments list
     // Validate that each original fragment's metadata is preserved
@@ -4177,6 +4233,16 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
                     original_fragment.id,
                     original_fragment.physical_rows,
                     new_fragment.physical_rows
+                )));
+            }
+            // A previous-id fragment without row id metadata on a stable
+            // dataset is most likely a staged fragment listed too early.
+            if manifest.uses_stable_row_ids() && new_fragment.row_id_meta.is_none() {
+                return Err(Error::invalid_input(format!(
+                    "Merge operation dropped row id metadata for existing fragment {}. \
+                     New fragments (id 0) must be listed after the existing fragments; \
+                     they are assigned row ids at commit time.",
+                    original_fragment.id
                 )));
             }
         } else {
@@ -5993,6 +6059,213 @@ mod tests {
             .unwrap();
         assert_eq!(created_seq.version_at(0).unwrap(), 2);
         assert_eq!(created_seq.version_at(3).unwrap(), 2);
+    }
+
+    fn merge_test_file(path: &str) -> DataFile {
+        use lance_file::version::LanceFileVersion;
+        let (major, minor) = LanceFileVersion::Stable.to_numbers();
+        DataFile::new(path, vec![0], vec![0], major, minor, None, None)
+    }
+
+    /// Committed fragment carrying `row_ids`.
+    fn frag_with_row_ids(id: u64, path: &str, row_ids: &[u64]) -> Fragment {
+        Fragment {
+            id,
+            files: vec![merge_test_file(path)],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&RowIdSequence::from(
+                row_ids,
+            )))),
+            physical_rows: Some(row_ids.len()),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }
+    }
+
+    /// Fragment without row id metadata: staged write_fragments output, or a
+    /// committed fragment of a non-stable dataset.
+    fn frag_without_row_ids(id: u64, path: &str, physical_rows: usize) -> Fragment {
+        Fragment {
+            id,
+            files: vec![merge_test_file(path)],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(physical_rows),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }
+    }
+
+    /// Single-column manifest over `existing`; stable datasets get row id
+    /// flags and `next_row_id` = 100.
+    fn merge_test_manifest(existing: Vec<Fragment>, stable: bool) -> (Manifest, LanceSchema) {
+        use lance_file::version::LanceFileVersion;
+        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            lance_schema.clone(),
+            Arc::new(existing),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        if stable {
+            manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
+            manifest.next_row_id = 100;
+        }
+        (manifest, lance_schema)
+    }
+
+    /// Validate and build a Merge of `fragments` against `manifest`.
+    fn build_merge(
+        manifest: &Manifest,
+        schema: LanceSchema,
+        fragments: Vec<Fragment>,
+    ) -> Result<Manifest> {
+        let operation = Operation::Merge { fragments, schema };
+        validate_operation(Some(manifest), &operation)?;
+        let tx = Transaction::new(manifest.version, operation, None);
+        let (out, _) = tx.build_manifest(
+            Some(manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        )?;
+        Ok(out)
+    }
+
+    #[rstest::rstest]
+    #[case::placeholder_id_0(0, vec![0, 1, 2], 2)]
+    #[case::pre_reserved_id_7(7, vec![0, 1, 7], 7)]
+    fn merge_build_manifest_assigns_ids_and_row_ids_to_staged_fragments(
+        #[case] staged_id: u64,
+        #[case] expected_ids: Vec<u64>,
+        #[case] new_id: u64,
+    ) {
+        // A placeholder id 0 gets a fresh fragment id; a pre-reserved id is
+        // kept. Either way the staged fragment's row ids come from
+        // next_row_id at commit time.
+        let existing = vec![
+            frag_with_row_ids(0, "frag0.lance", &[0, 1, 2]),
+            frag_with_row_ids(1, "frag1.lance", &[3, 4]),
+        ];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), true);
+
+        let mut merge_list = existing.clone();
+        merge_list.push(frag_without_row_ids(staged_id, "staged.lance", 4));
+        let out = build_merge(&manifest, schema, merge_list).unwrap();
+
+        let ids: Vec<u64> = out.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, expected_ids);
+        assert_eq!(out.max_fragment_id, Some(new_id.max(1) as u32));
+
+        // Existing fragments keep their row id sequences byte-identical.
+        for prev in &existing {
+            let frag = out.fragments.iter().find(|f| f.id == prev.id).unwrap();
+            assert_eq!(frag.row_id_meta, prev.row_id_meta);
+        }
+
+        // The staged fragment was allocated row ids from next_row_id.
+        let new_frag = out.fragments.iter().find(|f| f.id == new_id).unwrap();
+        let Some(RowIdMeta::Inline(data)) = &new_frag.row_id_meta else {
+            panic!("staged fragment must have inline row id metadata");
+        };
+        let row_ids: Vec<u64> = read_row_ids(data).unwrap().iter().collect();
+        assert_eq!(row_ids, vec![100, 101, 102, 103]);
+        assert_eq!(out.next_row_id, 104);
+
+        // Version metadata is stamped like Append.
+        assert_eq!(created_at_versions(&out, new_id), vec![2, 2, 2, 2]);
+        assert_eq!(last_updated_at_versions(&out, new_id), vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn merge_build_manifest_assigns_unique_ids_to_staged_fragments_non_stable() {
+        // Regression for the duplicate fragment id corruption: a staged
+        // fragment with placeholder id 0 must not be committed as-is.
+        let existing = vec![
+            frag_without_row_ids(0, "frag0.lance", 2),
+            frag_without_row_ids(1, "frag1.lance", 2),
+        ];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), false);
+
+        let mut merge_list = existing;
+        merge_list.push(frag_without_row_ids(0, "staged.lance", 2));
+        let out = build_merge(&manifest, schema, merge_list).unwrap();
+
+        let ids: Vec<u64> = out.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert!(out.fragments.iter().all(|f| f.row_id_meta.is_none()));
+    }
+
+    #[test]
+    fn merge_validate_rejects_duplicate_nonzero_fragment_ids() {
+        let existing = vec![frag_without_row_ids(1, "frag1.lance", 2)];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), false);
+
+        let mut merge_list = existing;
+        merge_list.push(frag_without_row_ids(1, "other.lance", 2));
+        let err = build_merge(&manifest, schema, merge_list).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("duplicate fragment id 1"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn merge_validate_rejects_staged_fragment_listed_before_existing_non_stable() {
+        // With equal row counts and no row id metadata, a misordered staged
+        // fragment is indistinguishable by content from the fragment whose id
+        // it collides with; the order check must reject it on non-stable
+        // datasets too.
+        let existing = vec![
+            frag_without_row_ids(0, "frag0.lance", 2),
+            frag_without_row_ids(1, "frag1.lance", 2),
+        ];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), false);
+
+        let mut merge_list = vec![frag_without_row_ids(0, "staged.lance", 2)];
+        merge_list.extend(existing);
+        let err = build_merge(&manifest, schema, merge_list).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("after a new fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn merge_validate_rejects_staged_fragment_listed_before_existing_stable() {
+        // A staged id-0 fragment listed before the real fragment 0 would be
+        // taken as the existing one; validation must reject the swap.
+        let existing = frag_with_row_ids(0, "frag0.lance", &[0, 1]);
+        let (manifest, schema) = merge_test_manifest(vec![existing.clone()], true);
+
+        let staged = frag_without_row_ids(0, "staged.lance", 2);
+        let err = build_merge(&manifest, schema, vec![staged, existing]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("dropped row id metadata for existing fragment 0"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
