@@ -320,18 +320,21 @@ async fn fill_page(
     let prefix = list_prefix(dir);
     let mut values: Vec<DirEntry> = Vec::new();
     loop {
-        // `None` once the page is full, which also covers a backend that overshot the limit.
         let remaining = match limit {
-            Some(limit) => limit.checked_sub(values.len()).filter(|left| *left > 0),
-            None => Some(usize::MAX),
-        };
-        let Some(remaining) = remaining else {
-            break;
+            Some(limit) if values.len() >= limit => break,
+            Some(limit) => Some(limit - values.len()),
+            // A listing with no limit spends nothing, so there is nothing left to ask for.
+            None => None,
         };
         let page = lister
-            .list_page(prefix.as_deref(), resume.as_ref(), limit.map(|_| remaining))
+            .list_page(prefix.as_deref(), resume.as_ref(), remaining)
             .await?;
-        values.extend(page.entries);
+        // The limit is the caller's, not the backend's: a page that came back holding more
+        // than it was asked for is held to what was asked for.
+        match remaining {
+            Some(remaining) => values.extend(page.entries.into_iter().take(remaining)),
+            None => values.extend(page.entries),
+        }
         match page.next {
             // A page that hands back the position it was given has not moved, and asking
             // again from it would repeat forever. The contract forbids it; a backend that
@@ -378,10 +381,14 @@ async fn full_listing_page(
         let key = resume.expect_key()?;
         children.retain(|child| child.key.as_str() > key);
     }
-    let taken = limit.unwrap_or(children.len()).min(children.len());
-    let next_token =
-        (taken < children.len()).then(|| DirCursor::key(&children[taken - 1].key).encode());
-    children.truncate(taken);
+    let total = children.len();
+    children.truncate(limit.unwrap_or(total).min(total));
+    // The last key this page took, so a page that took nothing ends the listing rather than
+    // resuming from a position no page ever reached.
+    let next_token = match children.last() {
+        Some(last) if children.len() < total => Some(DirCursor::key(&last.key).encode()),
+        _ => None,
+    };
     Ok(DirListing {
         values: children.into_iter().map(|child| child.entry).collect(),
         next_token,
@@ -935,6 +942,44 @@ mod tests {
 
         assert!(err.to_string().contains("did not advance"), "{err:?}");
         assert_eq!(lister.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A backend that hands back more than the page it was asked for.
+    #[derive(Debug)]
+    struct OvereagerLister;
+
+    #[async_trait::async_trait]
+    impl PaginatedDirLister for OvereagerLister {
+        async fn list_page(
+            &self,
+            _prefix: Option<&str>,
+            _resume: Option<&DirCursor>,
+            limit: Option<usize>,
+        ) -> Result<DirPage> {
+            let entries = (0..limit.unwrap_or(1) + 3)
+                .map(|index| DirEntry {
+                    name: format!("child{index}"),
+                    kind: DirEntryKind::Directory,
+                })
+                .collect();
+            Ok(DirPage {
+                entries,
+                next: None,
+            })
+        }
+    }
+
+    /// The limit is what the caller asked for, not a hint the backend may round up. Holding a
+    /// page to it here is what makes the count [`DirListing::values`] documents true whatever
+    /// the backend does.
+    #[tokio::test]
+    async fn test_a_page_is_held_to_the_limit_asked_for() {
+        let mut store = test_store(KeyOrdered, TABLES).await;
+        store.store.paginated_lister = Some(Arc::new(OvereagerLister));
+
+        let page = store.first_page("db", Some(2)).await;
+
+        assert_eq!(page.values.len(), 2);
     }
 
     /// A recording [`PaginatedListStore`], so the translation `NativeDirLister` performs can be
