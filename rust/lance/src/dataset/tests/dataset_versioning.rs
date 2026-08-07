@@ -917,14 +917,28 @@ async fn test_branch() {
         .to_string();
     assert_eq!(
         branch1_dataset.uri,
-        format!("{}/tree/{}", test_uri, branch1_storage_id)
+        format!("{}/_branch_generations/{}", test_uri, branch1_storage_id)
     );
     let branch1_physical_location = dataset
         .branches()
-        .resolve_path_location(&branch1_storage_id)
+        .resolve_path_location("branch1")
         .await
+        .unwrap()
         .unwrap();
     assert_eq!(branch1_physical_location.branch.as_deref(), Some("branch1"));
+
+    // Logical names and detached generations occupy disjoint path namespaces.
+    let collision_branch = dataset
+        .create_branch(&branch1_storage_id, original_version, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        collision_branch.manifest.branch.as_deref(),
+        Some(branch1_storage_id.as_str())
+    );
+    let reopened_branch1 = Dataset::open(branch1_dataset.uri()).await.unwrap();
+    assert_eq!(reopened_branch1.manifest.branch.as_deref(), Some("branch1"));
+    dataset.delete_branch(&branch1_storage_id).await.unwrap();
 
     branch1_dataset = write_dataset(
         branch1_dataset.uri(),
@@ -954,7 +968,7 @@ async fn test_branch() {
         .to_string();
     assert_eq!(
         branch2_dataset.uri,
-        format!("{}/tree/{}", test_uri, branch2_storage_id)
+        format!("{}/_branch_generations/{}", test_uri, branch2_storage_id)
     );
 
     branch2_dataset = write_dataset(
@@ -988,7 +1002,7 @@ async fn test_branch() {
         .to_string();
     assert_eq!(
         branch3_dataset.uri,
-        format!("{}/tree/{}", test_uri, branch3_storage_id)
+        format!("{}/_branch_generations/{}", test_uri, branch3_storage_id)
     );
 
     branch3_dataset = write_dataset(
@@ -1227,8 +1241,11 @@ async fn test_branch() {
     assert_ne!(recreated_storage_id, branch1_storage_id);
     assert_eq!(recreated_branch1.count_rows(None).await.unwrap(), 50);
     dataset.delete_branch("branch1").await.unwrap();
-    let recreated_path =
-        Path::parse(format!("{}/tree/{}", test_uri, recreated_storage_id)).unwrap();
+    let recreated_path = Path::parse(format!(
+        "{}/_branch_generations/{}",
+        test_uri, recreated_storage_id
+    ))
+    .unwrap();
     assert!(!dataset.object_store.exists(&recreated_path).await.unwrap());
 
     // Finally delete the remaining branches.
@@ -1242,10 +1259,57 @@ async fn test_branch() {
         .force_delete_branch("feature/nathan/branch3")
         .await
         .unwrap();
-    let cleaned_path = Path::parse(format!("{}/tree/{}", test_uri, branch3_storage_id)).unwrap();
+    let cleaned_path = Path::parse(format!(
+        "{}/_branch_generations/{}",
+        test_uri, branch3_storage_id
+    ))
+    .unwrap();
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
     dataset.delete_branch("dev/branch2").await.unwrap();
+
+    // Legacy name-backed branches retain their delete conflict while descendants reference them.
+    let legacy_name = "legacy-parent";
+    dataset
+        .create_branch(legacy_name, original_version, None)
+        .await
+        .unwrap();
+    let mut legacy_contents = dataset.branches().get(legacy_name).await.unwrap();
+    let legacy_generation = legacy_contents.storage.as_ref().unwrap().generation.clone();
+    let detached_path = std::path::Path::new(&test_uri)
+        .join("_branch_generations")
+        .join(&legacy_generation);
+    let legacy_path = std::path::Path::new(&test_uri)
+        .join("tree")
+        .join(legacy_name);
+    std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    std::fs::rename(detached_path, &legacy_path).unwrap();
+    legacy_contents.storage = None;
+    let root_location = dataset.refs.root().unwrap();
+    let legacy_file = branch_contents_path(&root_location.path, legacy_name);
+    dataset
+        .object_store
+        .put(
+            &legacy_file,
+            serde_json::to_string_pretty(&legacy_contents)
+                .unwrap()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut legacy_dataset = dataset.checkout_branch(legacy_name).await.unwrap();
+    legacy_dataset
+        .create_branch("legacy-child", legacy_dataset.version().version, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        dataset.delete_branch(legacy_name).await,
+        Err(Error::RefConflict { .. })
+    ));
+    assert!(dataset.checkout_branch(legacy_name).await.is_ok());
+    dataset.delete_branch("legacy-child").await.unwrap();
+    dataset.delete_branch(legacy_name).await.unwrap();
+    assert!(!legacy_path.exists());
 
     // Verify list_branches is empty
     let branches_after_delete = dataset.list_branches().await.unwrap();
@@ -1259,4 +1323,10 @@ async fn test_branch() {
         .await
         .unwrap();
     assert!(branches.is_empty());
+    let generations = dataset
+        .object_store
+        .read_dir(test_path.join("_branch_generations"))
+        .await
+        .unwrap();
+    assert!(generations.is_empty());
 }

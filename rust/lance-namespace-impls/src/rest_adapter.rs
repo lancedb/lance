@@ -7,6 +7,7 @@
 //! allowing it to be accessed via HTTP. The server implements the Lance REST Namespace
 //! specification.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -855,8 +856,8 @@ async fn list_table_versions(
         limit: params.limit,
         descending: params.descending,
         branch: params.branch,
+        context: extract_context(&headers),
         identity: extract_identity(&headers),
-        ..Default::default()
     };
 
     match backend.list_table_versions(request).await {
@@ -872,6 +873,7 @@ async fn create_table_version(
     Query(params): Query<DelimiterQuery>,
     Json(body): Json<CreateTableVersionRequest>,
 ) -> Response {
+    let context = merge_context(body.context, extract_context(&headers));
     let request = CreateTableVersionRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
@@ -881,6 +883,7 @@ async fn create_table_version(
         e_tag: body.e_tag,
         metadata: body.metadata,
         branch: body.branch,
+        context,
         ..Default::default()
     };
 
@@ -897,12 +900,13 @@ async fn describe_table_version(
     Query(query): Query<DelimiterQuery>,
     Json(body): Json<DescribeTableVersionRequest>,
 ) -> Response {
+    let context = merge_context(body.context, extract_context(&headers));
     let request = DescribeTableVersionRequest {
         id: Some(parse_id(&id, query.delimiter.as_deref())),
         version: body.version,
         branch: body.branch,
+        context,
         identity: extract_identity(&headers),
-        ..Default::default()
     };
 
     match backend.describe_table_version(request).await {
@@ -1462,6 +1466,28 @@ fn extract_identity(headers: &HeaderMap) -> Option<Box<Identity>> {
     } else {
         None
     }
+}
+
+fn extract_context(headers: &HeaderMap) -> Option<HashMap<String, String>> {
+    const PREFIX: &str = "x-lance-ctx-";
+    let context = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let key = name.as_str().strip_prefix(PREFIX)?;
+            let value = value.to_str().ok()?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    (!context.is_empty()).then_some(context)
+}
+
+fn merge_context(
+    body_context: Option<HashMap<String, String>>,
+    header_context: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    let mut context = body_context.unwrap_or_default();
+    context.extend(header_context.unwrap_or_default());
+    (!context.is_empty()).then_some(context)
 }
 
 #[cfg(test)]
@@ -3588,8 +3614,8 @@ mod tests {
                     .branch_location()
                     .path
                     .as_ref()
-                    .ends_with("tree/exp"),
-                "the branch dataset must be rooted at the branch chain"
+                    .contains("_branch_generations/"),
+                "the branch dataset must be rooted at its detached generation"
             );
             branch_ds
                 .append(

@@ -26,6 +26,11 @@ pub use namespace::LanceNamespace;
 // Re-export error types
 pub use error::{ErrorCode, NamespaceError, Result as NamespaceResult};
 
+/// Request-context key carrying the authoritative object-store base path for a branch generation.
+///
+/// Namespace clients use this during the bootstrap commit before branch metadata is published.
+pub const BRANCH_BASE_PATH_CONTEXT_KEY: &str = "branch-base-path";
+
 // Re-export reqwest client for convenience
 pub use lance_namespace_reqwest_client as reqwest_client;
 

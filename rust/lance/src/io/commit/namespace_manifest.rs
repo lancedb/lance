@@ -6,10 +6,10 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use lance_core::Result;
-use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     CreateTableVersionRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
 };
+use lance_namespace::{BRANCH_BASE_PATH_CONTEXT_KEY, LanceNamespace};
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use object_store::ObjectStore as OSObjectStore;
@@ -42,6 +42,11 @@ pub struct LanceNamespaceExternalManifestStore {
     /// request targets, so a single store serves every branch of the table.
     table_root: Path,
     branch_paths: RwLock<HashMap<String, Option<String>>>,
+}
+
+struct BranchRequest {
+    branch: Option<String>,
+    context: Option<HashMap<String, String>>,
 }
 
 impl LanceNamespaceExternalManifestStore {
@@ -84,6 +89,14 @@ impl LanceNamespaceExternalManifestStore {
         }
         BranchLocation::branch_of(self.table_root.as_ref(), base)
     }
+
+    fn branch_request(&self, base: &str) -> Result<BranchRequest> {
+        let branch = self.branch_for_base(base)?;
+        let context = branch
+            .as_ref()
+            .map(|_| HashMap::from([(BRANCH_BASE_PATH_CONTEXT_KEY.to_string(), base.to_string())]));
+        Ok(BranchRequest { branch, context })
+    }
 }
 
 #[async_trait]
@@ -97,10 +110,12 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
     }
 
     async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
+        let BranchRequest { branch, context } = self.branch_request(base_uri)?;
         let request = DescribeTableVersionRequest {
             id: Some(self.table_id.clone()),
             version: Some(version as i64),
-            branch: self.branch_for_base(base_uri)?,
+            branch,
+            context,
             ..Default::default()
         };
 
@@ -114,11 +129,13 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
     }
 
     async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
+        let BranchRequest { branch, context } = self.branch_request(base_uri)?;
         let request = ListTableVersionsRequest {
             id: Some(self.table_id.clone()),
             descending: Some(true),
             limit: Some(1),
-            branch: self.branch_for_base(base_uri)?,
+            branch,
+            context,
             ..Default::default()
         };
 
@@ -162,6 +179,7 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             ManifestNamingScheme::V2 => "V2",
         };
 
+        let BranchRequest { branch, context } = self.branch_request(base_path.as_ref())?;
         let request = CreateTableVersionRequest {
             id: Some(self.table_id.clone()),
             version: version as i64,
@@ -169,7 +187,8 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             manifest_size: Some(size as i64),
             e_tag: e_tag.clone(),
             naming_scheme: Some(naming_scheme_str.to_string()),
-            branch: self.branch_for_base(base_path.as_ref())?,
+            branch,
+            context,
             ..Default::default()
         };
 
@@ -316,12 +335,22 @@ mod tests {
     fn test_registered_branch_path() {
         let store = store_with(|| lance_core::Error::io("unused".to_string()));
         let storage_path =
-            Path::parse("data/t.lance/tree/34e6c4b343a84a7ca40295852ed4d5d8").unwrap();
+            Path::parse("data/t.lance/_branch_generations/34e6c4b343a84a7ca40295852ed4d5d8")
+                .unwrap();
         store.register_branch_path(&storage_path, Some("feature/dev"));
 
         assert_eq!(
             store.branch_for_base(storage_path.as_ref()).unwrap(),
             Some("feature/dev".to_string())
+        );
+        let request = store.branch_request(storage_path.as_ref()).unwrap();
+        assert_eq!(request.branch, Some("feature/dev".to_string()));
+        assert_eq!(
+            request.context,
+            Some(HashMap::from([(
+                BRANCH_BASE_PATH_CONTEXT_KEY.to_string(),
+                storage_path.to_string(),
+            )]))
         );
     }
 }

@@ -49,6 +49,14 @@ Each branch metadata file is a JSON object with this schema:
     "parentBranch": {
       "type": ["string", "null"]
     },
+    "storage": {
+      "type": "object",
+      "required": ["layout", "generation"],
+      "properties": {
+        "layout": {"const": "detached"},
+        "generation": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+      }
+    },
     "identifier": {
       "type": "object",
       "required": ["version_mapping"],
@@ -87,21 +95,20 @@ Each branch metadata file is a JSON object with this schema:
 ```
 
 `parentBranch` is `null` when the branch was created from `main`. `identifier` records the
-version and UUID for each branch in the lineage. The final UUID in `identifier.version_mapping`
-is the physical branch directory identifier for newly written branches. Metadata written before
-branch identifiers may omit `identifier` and `metadata`. Branches written before storage
-indirection can contain an identifier while still using their logical name as the physical path;
-readers detect and preserve that legacy layout.
+version and UUID for each branch in the lineage. `storage` explicitly selects the physical layout
+and generation; new writers use the final UUID in `identifier.version_mapping` as the detached
+generation. Metadata written before branch identifiers may omit `identifier`, `storage`, and
+`metadata`. An absent `storage` field identifies the legacy name-backed layout.
 
 ### Branch Dataset Layout
 
 Each branch dataset is technically a [shallow clone](layout.md#shallow-clone) of the source dataset.
-Branch datasets are organized using the `tree/` directory at the dataset root:
+Branch datasets are stored outside the logical alias namespace:
 
 ```
 {dataset_root}/
-    tree/
-        {storage_id}/
+    _branch_generations/
+        {generation}/
             _versions/
                 *.manifest
             _transactions/
@@ -114,14 +121,15 @@ Branch datasets are organized using the `tree/` directory at the dataset root:
                     index.idx
 ```
 
-Named branches store their version-specific files under `tree/{storage_id}/`. The metadata file is
-the mapping from a logical branch name to its physical UUID. The logical URL
+Named branches store their version-specific files under `_branch_generations/{generation}/`.
+The metadata file is the authoritative mapping from a logical branch name to its physical layout
+and generation. The logical URL
 `{dataset_root}/tree/{branch_name}` remains a supported way to open a branch; the reader resolves
 it through the metadata before loading the physical dataset.
 
 ```
 {dataset_root}/
-    tree/
+    _branch_generations/
         34e6c4b343a84a7ca40295852ed4d5d8/
             _versions/
                 1.manifest
@@ -131,9 +139,10 @@ it through the metadata before loading the physical dataset.
                 1.manifest
 ```
 
-Deleting branch metadata releases its logical name immediately. If a descendant still references
-the branch, its UUID directory remains until no remaining branch lineage contains that UUID.
-Legacy name-based directories remain readable and use the legacy directory cleanup rules.
+Deleting detached branch metadata releases its logical name immediately. If a descendant still
+references the branch, its generation directory remains until no remaining branch lineage contains
+that UUID. Legacy name-based directories remain readable; a referenced legacy branch cannot be
+deleted until its descendants are removed.
 
 ## Tagging
 

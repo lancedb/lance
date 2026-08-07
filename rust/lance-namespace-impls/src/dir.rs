@@ -84,9 +84,9 @@ use lance_core::{Error, Result, box_error};
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
 };
-use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
+use lance_namespace::{BRANCH_BASE_PATH_CONTEXT_KEY, LanceNamespace};
 
 use crate::credentials::{
     CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
@@ -1542,12 +1542,50 @@ impl DirectoryNamespace {
         Ok(dataset)
     }
 
-    async fn resolve_branch_location(&self, table_uri: &str, branch: &str) -> Result<String> {
-        Ok(self
+    async fn resolve_branch_location(
+        &self,
+        table_uri: &str,
+        branch: &str,
+        requested_base: Option<&str>,
+    ) -> Result<String> {
+        let location = self
             .open_validated_branch(table_uri, branch)
             .await?
-            .branch_location()
-            .uri)
+            .branch_location();
+        Self::validate_requested_branch_base(branch, requested_base, &location.path)?;
+        Ok(location.uri)
+    }
+
+    fn validate_requested_branch_base(
+        branch: &str,
+        requested_base: Option<&str>,
+        actual_base: &Path,
+    ) -> Result<()> {
+        if let Some(requested_base) = requested_base {
+            let requested_base =
+                Path::parse(requested_base).map_err(|error| NamespaceError::InvalidInput {
+                    message: format!(
+                        "invalid physical base path '{}' for branch '{}': {}",
+                        requested_base, branch, error
+                    ),
+                })?;
+            if requested_base != *actual_base {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "physical base path '{}' does not match branch '{}' generation '{}'",
+                        requested_base, branch, actual_base
+                    ),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn branch_base_from_context(context: Option<&HashMap<String, String>>) -> Option<&str> {
+        context
+            .and_then(|context| context.get(BRANCH_BASE_PATH_CONTEXT_KEY))
+            .map(String::as_str)
     }
 
     /// Resolves a branch to its `(uri, object-store path, parent_version)` for
@@ -1563,6 +1601,7 @@ impl DirectoryNamespace {
         &self,
         table_uri: &str,
         branch: &str,
+        requested_base: Option<&str>,
     ) -> Result<(String, Path, Option<u64>)> {
         let main = self
             .configured_builder(table_uri)
@@ -1572,14 +1611,62 @@ impl DirectoryNamespace {
                 let message = format!("table at '{}' not found: {}", table_uri, e);
                 Self::map_open_error(e, NamespaceError::TableNotFound { message })
             })?;
-        let branch_location = main.branch_location().find_branch(Some(branch))?;
         match main.branches().get(branch).await {
-            Ok(contents) => Ok((
-                branch_location.uri,
-                branch_location.path,
-                Some(contents.parent_version),
-            )),
+            Ok(contents) => {
+                let branch_location = self
+                    .open_validated_branch(table_uri, branch)
+                    .await?
+                    .branch_location();
+                Self::validate_requested_branch_base(
+                    branch,
+                    requested_base,
+                    &branch_location.path,
+                )?;
+                Ok((
+                    branch_location.uri,
+                    branch_location.path,
+                    Some(contents.parent_version),
+                ))
+            }
             Err(lance_core::Error::RefNotFound { .. }) => {
+                let branch_location = if let Some(requested_base) = requested_base {
+                    let requested_path = Path::parse(requested_base).map_err(|error| {
+                        NamespaceError::InvalidInput {
+                            message: format!(
+                                "invalid physical base path '{}' for branch '{}': {}",
+                                requested_base, branch, error
+                            ),
+                        }
+                    })?;
+                    let generation = requested_path.filename().ok_or_else(|| {
+                        lance_core::Error::from(NamespaceError::InvalidInput {
+                            message: format!(
+                                "physical base path '{}' has no generation for branch '{}'",
+                                requested_base, branch
+                            ),
+                        })
+                    })?;
+                    uuid::Uuid::parse_str(generation).map_err(|error| {
+                        NamespaceError::InvalidInput {
+                            message: format!(
+                                "invalid physical generation '{}' for branch '{}': {}",
+                                generation, branch, error
+                            ),
+                        }
+                    })?;
+                    let location = main
+                        .branch_location()
+                        .find_branch_generation(branch, generation)?;
+                    Self::validate_requested_branch_base(
+                        branch,
+                        Some(requested_base),
+                        &location.path,
+                    )?;
+                    location
+                } else {
+                    // Compatibility for clients bootstrapping the legacy name-backed layout.
+                    main.branch_location().find_branch(Some(branch))?
+                };
                 if self
                     .branch_has_committed_versions(&branch_location.path)
                     .await?
@@ -3007,7 +3094,7 @@ impl DirectoryNamespace {
         for te in table_entries {
             let table_uri = self.resolve_table_location(&te.table_id).await?;
             let table_uri = match branch {
-                Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+                Some(b) => self.resolve_branch_location(&table_uri, b, None).await?,
                 None => table_uri,
             };
             let table_path = self.object_store_path_from_uri(&table_uri)?;
@@ -3901,9 +3988,13 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<ListTableVersionsResponse> {
         self.record_op("list_table_versions");
         let branch = Self::normalized_branch(request.branch.as_deref())?;
+        let branch_base = Self::branch_base_from_context(request.context.as_ref());
         let table_uri = self.resolve_table_location(&request.id).await?;
         let table_uri = match branch {
-            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            Some(b) => {
+                self.resolve_branch_location(&table_uri, b, branch_base)
+                    .await?
+            }
             None => table_uri,
         };
         let want_descending = request.descending == Some(true);
@@ -3923,9 +4014,13 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<CreateTableVersionResponse> {
         self.record_op("create_table_version");
         let branch = Self::normalized_branch(request.branch.as_deref())?;
+        let branch_base = Self::branch_base_from_context(request.context.as_ref());
         let table_uri = self.resolve_table_location(&request.id).await?;
         let (table_uri, table_path, branch_parent_version) = match branch {
-            Some(b) => self.resolve_branch_for_commit(&table_uri, b).await?,
+            Some(b) => {
+                self.resolve_branch_for_commit(&table_uri, b, branch_base)
+                    .await?
+            }
             None => {
                 let table_path = self.object_store_path_from_uri(&table_uri)?;
                 (table_uri, table_path, None)
@@ -4073,9 +4168,13 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<DescribeTableVersionResponse> {
         self.record_op("describe_table_version");
         let branch = Self::normalized_branch(request.branch.as_deref())?;
+        let branch_base = Self::branch_base_from_context(request.context.as_ref());
         let table_uri = self.resolve_table_location(&request.id).await?;
         let table_uri = match branch {
-            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            Some(b) => {
+                self.resolve_branch_location(&table_uri, b, branch_base)
+                    .await?
+            }
             None => table_uri,
         };
         let versions = self
@@ -7137,7 +7236,7 @@ mod tests {
         assert!(
             branch_versions
                 .iter()
-                .all(|v| v.manifest_path.contains("tree/exp")),
+                .all(|v| v.manifest_path.contains("_branch_generations/")),
             "branch versions must resolve to branch manifests: {:?}",
             branch_versions
         );
@@ -7151,7 +7250,7 @@ mod tests {
         assert!(
             main_versions
                 .iter()
-                .all(|v| !v.manifest_path.contains("tree/"))
+                .all(|v| !v.manifest_path.contains("_branch_generations/"))
         );
 
         // A non-existent branch is a clean not-found, not an empty list.
@@ -7179,7 +7278,7 @@ mod tests {
         };
         let resp = namespace.describe_table_version(req).await.unwrap();
         assert_eq!(resp.version.version, latest);
-        assert!(resp.version.manifest_path.contains("tree/exp"));
+        assert!(resp.version.manifest_path.contains("_branch_generations/"));
 
         // A specific existing branch version resolves.
         let req = DescribeTableVersionRequest {
@@ -7361,7 +7460,7 @@ mod tests {
         let info = resp.version.expect("version info");
         // The new manifest must land under the branch's tree path.
         assert!(
-            info.manifest_path.contains("tree/exp"),
+            info.manifest_path.contains("_branch_generations/"),
             "got {}",
             info.manifest_path
         );
@@ -7402,6 +7501,7 @@ mod tests {
             table_id.clone(),
             root_base.clone(),
         );
+        store.register_branch_path(&branch_base, Some("exp"));
 
         // The branch-qualified base resolves the branch chain, the root base
         // resolves main: proof the base path reaches list_table_versions.
@@ -7416,12 +7516,12 @@ mod tests {
             .unwrap()
             .expect("main has versions");
         assert!(
-            branch_path.contains("tree/exp"),
+            branch_path.contains("_branch_generations/"),
             "branch latest must resolve to the branch tree: {}",
             branch_path
         );
         assert!(
-            !main_path.contains("tree/exp"),
+            !main_path.contains("_branch_generations/"),
             "main latest must not resolve to a branch tree: {}",
             main_path
         );
@@ -7432,7 +7532,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            described.contains("tree/exp"),
+            described.contains("_branch_generations/"),
             "describe on the branch must resolve to the branch tree: {}",
             described
         );
@@ -7483,7 +7583,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            committed.path.to_string().contains("tree/exp"),
+            committed.path.to_string().contains("_branch_generations/"),
             "a commit through a branch-qualified base must land on the branch tree: {}",
             committed.path
         );
@@ -7578,7 +7678,7 @@ mod tests {
         assert!(
             exp_versions
                 .iter()
-                .all(|v| v.manifest_path.contains("tree/exp")),
+                .all(|v| v.manifest_path.contains("_branch_generations/")),
             "branch versions must resolve to the branch tree: {:?}",
             exp_versions
         );
@@ -7958,6 +8058,35 @@ mod tests {
         ids
     }
 
+    #[tokio::test]
+    async fn test_managed_table_root_with_tree_component() {
+        use lance::dataset::builder::DatasetBuilder;
+
+        let temp = TempStdDir::default();
+        let namespace_root = temp.join("tree").join("catalog");
+        std::fs::create_dir_all(&namespace_root).unwrap();
+        let ns = create_managed_namespace(namespace_root.to_str().unwrap()).await;
+        let table_id = vec!["t".to_string()];
+        create_managed_table(&ns, &table_id).await;
+
+        let mut dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone())
+            .await
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.branch, None);
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(single_int_batch(3))], single_int_schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.branch, None);
+        assert_eq!(scan_id_column(&dataset).await, vec![1, 2, 3]);
+    }
+
     /// E2e for the managed branch path through the builder: create a branch via the
     /// namespace op, open it with `from_namespace(managed).with_branch`, commit on
     /// it, and confirm the dataset is rooted at the branch chain (manifest, base
@@ -8008,7 +8137,7 @@ mod tests {
         );
         let branch_base = branch_ds.branch_location().path;
         assert!(
-            branch_base.as_ref().ends_with("tree/exp"),
+            branch_base.as_ref().contains("_branch_generations/"),
             "the branch dataset must be rooted at the branch chain: {}",
             branch_base
         );

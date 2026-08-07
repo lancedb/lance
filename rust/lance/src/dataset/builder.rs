@@ -707,9 +707,10 @@ impl DatasetBuilder {
                 commit_handler.clone(),
                 root_location.clone(),
             );
-            let location = refs.branches().resolve_path_location(&path_branch).await?;
-            base_path = location.path;
-            table_uri = location.uri;
+            if let Some(location) = refs.branches().resolve_path_location(&path_branch).await? {
+                base_path = location.path;
+                table_uri = location.uri;
+            }
         }
 
         // Two cases that need to check out after loading the manifest:

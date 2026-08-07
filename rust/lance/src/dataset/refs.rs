@@ -14,7 +14,7 @@ use object_store::{Error as ObjectStoreError, PutMode, PutOptions, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::dataset::branch_location::BranchLocation;
+use crate::dataset::branch_location::{BRANCH_GENERATIONS_DIR, BranchLocation};
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
@@ -455,10 +455,7 @@ impl Branches<'_> {
             return Ok(location);
         };
         let location = match self.get(&branch_name).await {
-            Ok(contents) => {
-                self.resolve_contents_location(&branch_name, &contents)
-                    .await?
-            }
+            Ok(contents) => self.resolve_contents_location(&branch_name, &contents)?,
             // Metadata is the source of truth for branch CRUD, but readers retain the legacy
             // name-derived fallback for branch datasets that predate metadata or are being
             // recovered after an interrupted create.
@@ -473,75 +470,34 @@ impl Branches<'_> {
         Ok(location)
     }
 
-    pub(crate) async fn resolve_path_location(&self, path_branch: &str) -> Result<BranchLocation> {
+    pub(crate) async fn resolve_path_location(
+        &self,
+        path_branch: &str,
+    ) -> Result<Option<BranchLocation>> {
         match self.get(path_branch).await {
-            Ok(_) => return self.resolve_location(Some(path_branch)).await,
-            Err(Error::RefNotFound { .. }) => {}
-            Err(error) => return Err(error),
+            Ok(_) => self.resolve_location(Some(path_branch)).await.map(Some),
+            Err(Error::RefNotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
         }
-        if Uuid::parse_str(path_branch).is_ok() {
-            let branches = self.list().await?;
-            if let Some((branch_name, contents)) = branches
-                .iter()
-                .find(|(_, contents)| contents.identifier.storage_id() == Some(path_branch))
-            {
-                let location = self
-                    .resolve_contents_location(branch_name, contents)
-                    .await?;
-                let uuid_location = self
-                    .refs
-                    .base_location
-                    .find_branch_at(Some(branch_name), Some(path_branch))?;
-                if location.path == uuid_location.path {
-                    self.refs
-                        .commit_handler
-                        .register_branch_path(&location.path, Some(branch_name));
-                    return Ok(location);
-                }
-            }
-        }
-        self.resolve_location(Some(path_branch)).await
     }
 
-    async fn resolve_contents_location(
+    fn resolve_contents_location(
         &self,
         branch_name: &str,
         contents: &BranchContents,
     ) -> Result<BranchLocation> {
-        let Some(storage_id) = contents.identifier.storage_id() else {
+        let Some(storage) = contents.storage.as_ref() else {
             return self.refs.base_location.find_branch(Some(branch_name));
         };
-        Uuid::parse_str(storage_id).map_err(|error| Error::InvalidRef {
-            message: format!("Invalid branch storage id '{}': {}", storage_id, error),
+        Uuid::parse_str(&storage.generation).map_err(|error| Error::InvalidRef {
+            message: format!(
+                "Invalid branch storage generation '{}': {}",
+                storage.generation, error
+            ),
         })?;
-
-        let uuid_location = self
-            .refs
+        self.refs
             .base_location
-            .find_branch_at(Some(branch_name), Some(storage_id))?;
-        if !self
-            .object_store()
-            .read_dir(uuid_location.path.clone())
-            .await?
-            .is_empty()
-        {
-            return Ok(uuid_location);
-        }
-
-        // Identifiers were introduced before UUID-backed storage. Prefer the old logical path
-        // when it contains the branch dataset; if neither path exists, retain the UUID mapping
-        // so a corrupt new-format branch cannot silently resolve to another incarnation.
-        let legacy_location = self.refs.base_location.find_branch(Some(branch_name))?;
-        if !self
-            .object_store()
-            .read_dir(legacy_location.path.clone())
-            .await?
-            .is_empty()
-        {
-            Ok(legacy_location)
-        } else {
-            Ok(uuid_location)
-        }
+            .find_branch_generation(branch_name, &storage.generation)
     }
 
     pub(crate) async fn prepare_create(
@@ -586,8 +542,18 @@ impl Branches<'_> {
         };
 
         let identifier = BranchIdentifier::new(&parent_branch_id, version_number);
+        let generation = identifier.storage_id().ok_or_else(|| {
+            Error::internal(format!(
+                "new branch '{}' is missing its physical storage generation",
+                branch_name
+            ))
+        })?;
         Ok(BranchContents {
             parent_branch: source_branch,
+            storage: Some(BranchStorage {
+                layout: BranchStorageLayout::Detached,
+                generation: generation.to_string(),
+            }),
             identifier,
             parent_version: version_number,
             create_at: chrono::Utc::now().timestamp() as u64,
@@ -674,24 +640,28 @@ impl Branches<'_> {
 
         let all_branches = self.list().await?;
         let branch_contents = all_branches.get(branch).cloned();
-        let is_uuid_backed = if let Some(contents) = branch_contents.as_ref()
-            && let Some(storage_id) = contents.identifier.storage_id()
-        {
-            let resolved = self.resolve_contents_location(branch, contents).await?;
-            resolved
-                == self
-                    .refs
-                    .base_location
-                    .find_branch_at(Some(branch), Some(storage_id))?
-        } else {
-            false
-        };
         if branch_contents.is_none() && !force {
             return Err(Error::RefNotFound {
                 message: format!("Branch {} does not exist", branch),
             });
         } else if branch_contents.is_none() {
             log::warn!("BranchContents of {} does not exist", branch);
+        }
+
+        if let Some(contents) = branch_contents.as_ref()
+            && contents.storage.is_none()
+        {
+            let referenced_versions = contents
+                .identifier
+                .collect_referenced_versions(&all_branches);
+            if !referenced_versions.is_empty() {
+                return Err(Error::RefConflict {
+                    message: format!(
+                        "Legacy branch {} is referenced by {:?} versions and cannot be deleted",
+                        branch, referenced_versions
+                    ),
+                });
+            }
         }
 
         let root_location = self.refs.root()?;
@@ -702,17 +672,11 @@ impl Branches<'_> {
 
         let Some(branch_contents) = branch_contents else {
             self.cleanup_branch_directories(branch).await?;
-            return self.cleanup_uuid_branch_directories(branch).await;
+            return self.cleanup_generation_directories(branch).await;
         };
 
-        if !is_uuid_backed {
-            let referenced_versions = branch_contents
-                .identifier
-                .collect_referenced_versions(&all_branches);
-            if referenced_versions.is_empty() {
-                self.cleanup_branch_directories(branch).await?;
-            }
-            return Ok(());
+        if branch_contents.storage.is_none() {
+            return self.cleanup_branch_directories(branch).await;
         }
 
         // A deleted branch may still provide files to descendants. UUID-backed directories are
@@ -734,7 +698,7 @@ impl Branches<'_> {
             let location = self
                 .refs
                 .base_location
-                .find_branch_at(Some(branch), Some(storage_id))?;
+                .find_branch_generation(branch, storage_id)?;
             if let Err(error) = self.refs.object_store.remove_dir_all(location.path).await
                 && !matches!(error, Error::NotFound { .. })
             {
@@ -744,17 +708,17 @@ impl Branches<'_> {
         Ok(())
     }
 
-    async fn cleanup_uuid_branch_directories(&self, branch: &str) -> Result<()> {
+    async fn cleanup_generation_directories(&self, branch: &str) -> Result<()> {
         let root_location = self.refs.root()?;
-        let tree_path = root_location.path.clone().join("tree");
+        let generations_path = root_location.path.clone().join(BRANCH_GENERATIONS_DIR);
         let branches = self.list().await?;
         let referenced_storage_ids = Self::collect_referenced_storage_ids(&branches);
-        for storage_id in self.object_store().read_dir(tree_path).await? {
+        for storage_id in self.object_store().read_dir(generations_path).await? {
             if Uuid::parse_str(&storage_id).is_err() || referenced_storage_ids.contains(&storage_id)
             {
                 continue;
             }
-            let location = root_location.find_branch_at(Some(branch), Some(&storage_id))?;
+            let location = root_location.find_branch_generation(branch, &storage_id)?;
             self.refs
                 .commit_handler
                 .register_branch_path(&location.path, Some(branch));
@@ -948,6 +912,9 @@ pub struct TagContents {
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
     pub parent_branch: Option<String>,
+    /// Physical storage for this branch. Absence identifies the legacy name-backed layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<BranchStorage>,
     #[serde(default = "BranchIdentifier::missing_identifier_sentinel")]
     pub identifier: BranchIdentifier,
     pub parent_version: u64,
@@ -958,6 +925,24 @@ pub struct BranchContents {
     /// Missing metadata is deserialized as an empty map.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+}
+
+/// Explicit physical storage mapping for a branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchStorage {
+    /// The physical layout used by this branch generation.
+    pub layout: BranchStorageLayout,
+    /// Opaque UUID identifying the physical branch generation.
+    pub generation: String,
+}
+
+/// Physical layout used for branch-specific files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BranchStorageLayout {
+    /// Store files outside the logical alias namespace under `_branch_generations/<generation>`.
+    Detached,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1428,6 +1413,10 @@ mod tests {
         let storage_id = "34e6c4b343a84a7ca40295852ed4d5d8";
         let branch_contents = BranchContents {
             parent_branch: Some("main".to_string()),
+            storage: Some(BranchStorage {
+                layout: BranchStorageLayout::Detached,
+                generation: storage_id.to_string(),
+            }),
             identifier: BranchIdentifier {
                 version_mapping: vec![(42, storage_id.to_string())],
             },
@@ -1440,6 +1429,7 @@ mod tests {
         // Test serialization
         let json = serde_json::to_string(&branch_contents).unwrap();
         assert!(json.contains("parentBranch"));
+        assert!(json.contains("storage"));
         assert!(json.contains("parentVersion"));
         assert!(json.contains("createAt"));
         assert!(json.contains("manifestSize"));
@@ -1448,6 +1438,7 @@ mod tests {
         // Test deserialization
         let deserialized: BranchContents = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.parent_branch, branch_contents.parent_branch);
+        assert_eq!(deserialized.storage, branch_contents.storage);
         assert_eq!(deserialized.parent_version, branch_contents.parent_version);
         assert_eq!(deserialized.create_at, branch_contents.create_at);
         assert_eq!(deserialized.manifest_size, branch_contents.manifest_size);
@@ -1456,6 +1447,7 @@ mod tests {
         // Backward compatibility: older serialized content does not include metadata.
         let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
         let legacy_deserialized: BranchContents = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy_deserialized.storage.is_none());
         assert!(legacy_deserialized.metadata.is_empty());
     }
 
@@ -1636,6 +1628,7 @@ mod tests {
             };
             BranchContents {
                 parent_branch: parent_name.map(String::from),
+                storage: None,
                 identifier: BranchIdentifier::new(&parent_branch_id, parent_ver),
                 parent_version: parent_ver,
                 create_at: 0,

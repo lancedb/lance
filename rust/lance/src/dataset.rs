@@ -533,15 +533,15 @@ impl Dataset {
             .branches()
             .prepare_create(branch, version_number, source_branch.as_deref())
             .await?;
-        let storage_id = branch_contents.identifier.storage_id().ok_or_else(|| {
+        let storage = branch_contents.storage.as_ref().ok_or_else(|| {
             Error::internal(format!(
-                "new branch '{}' is missing its physical storage identifier",
+                "new branch '{}' is missing its physical storage mapping",
                 branch
             ))
         })?;
         let branch_location = self
             .branch_location()
-            .find_branch_at(Some(branch), Some(storage_id))?;
+            .find_branch_generation(branch, &storage.generation)?;
         self.commit_handler
             .register_branch_path(&branch_location.path, Some(branch));
         let source_location = self

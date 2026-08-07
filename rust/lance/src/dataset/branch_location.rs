@@ -6,6 +6,7 @@ use lance_core::{Error, Result};
 use object_store::path::Path;
 
 pub const BRANCH_DIR: &str = "tree";
+pub const BRANCH_GENERATIONS_DIR: &str = "_branch_generations";
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BranchLocation {
@@ -62,23 +63,8 @@ impl BranchLocation {
             Some((path, query)) => (path, Some(query)),
             None => (path_str, None),
         };
-        // The physical branch directory may be an opaque storage identifier instead of the
-        // logical branch name. Locate the branch-directory boundary rather than deriving the
-        // suffix from `branch_name`.
-        let branch_marker = format!("/{}/", BRANCH_DIR);
-        let root_path_str = path_part
-            .rfind(&branch_marker)
+        let root_path_str = Self::branch_boundary(path_part)
             .map(|index| &path_part[..index])
-            .or_else(|| {
-                if cfg!(windows) {
-                    let windows_marker = format!("\\{}\\", BRANCH_DIR);
-                    path_part
-                        .rfind(&windows_marker)
-                        .map(|index| &path_part[..index])
-                } else {
-                    None
-                }
-            })
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Can not find the root location of branch {} by uri {}",
@@ -95,6 +81,20 @@ impl BranchLocation {
             Some(query) => format!("{}?{}", root_path_str, query),
             None => root_path_str.to_string(),
         })
+    }
+
+    fn branch_boundary(path: &str) -> Option<usize> {
+        let mut markers = vec![
+            format!("/{}/", BRANCH_DIR),
+            format!("/{}/", BRANCH_GENERATIONS_DIR),
+        ];
+        if cfg!(windows) {
+            markers.extend([
+                format!("\\{}\\", BRANCH_DIR),
+                format!("\\{}\\", BRANCH_GENERATIONS_DIR),
+            ]);
+        }
+        markers.iter().filter_map(|marker| path.rfind(marker)).max()
     }
 
     /// The branch a location under `root` targets: the inverse of
@@ -131,29 +131,18 @@ impl BranchLocation {
 
     /// Find the target branch location
     pub fn find_branch(&self, branch_name: Option<&str>) -> Result<Self> {
-        self.find_branch_at(branch_name, branch_name)
-    }
-
-    /// Find a logical branch at an independently-addressed physical directory.
-    pub fn find_branch_at(
-        &self,
-        branch_name: Option<&str>,
-        storage_name: Option<&str>,
-    ) -> Result<Self> {
-        debug_assert_eq!(branch_name.is_some(), storage_name.is_some());
-
         let root_location = self.find_main()?;
         if Branches::is_main_branch(branch_name) {
             return Ok(root_location);
         }
 
-        if let (Some(target_branch), Some(storage_name)) = (branch_name, storage_name) {
+        if let Some(target_branch) = branch_name {
             let (new_path, new_uri) = {
                 // Handle empty segment
-                if storage_name.is_empty() {
+                if target_branch.is_empty() {
                     (self.path.clone(), self.uri.clone())
                 } else {
-                    let segments = storage_name.split('/');
+                    let segments = target_branch.split('/');
                     let mut new_path_str = Self::join_str(root_location.path.as_ref(), "tree")?;
                     let mut new_uri = Self::join_str(root_location.uri.as_str(), "tree")?;
                     for segment in segments {
@@ -171,6 +160,24 @@ impl BranchLocation {
         } else {
             Ok(root_location)
         }
+    }
+
+    /// Find a logical branch at its detached physical generation.
+    pub fn find_branch_generation(&self, branch_name: &str, generation: &str) -> Result<Self> {
+        let root_location = self.find_main()?;
+        let generation_path = Self::join_str(
+            Self::join_str(root_location.path.as_ref(), BRANCH_GENERATIONS_DIR)?.as_str(),
+            generation,
+        )?;
+        let generation_uri = Self::join_str(
+            Self::join_str(root_location.uri.as_str(), BRANCH_GENERATIONS_DIR)?.as_str(),
+            generation,
+        )?;
+        Ok(Self {
+            path: Path::parse(generation_path)?,
+            uri: generation_uri,
+            branch: Some(branch_name.to_string()),
+        })
     }
 
     fn join_str(base: &str, segment: &str) -> Result<String> {
@@ -196,7 +203,7 @@ impl BranchLocation {
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::branch_location::BranchLocation;
+    use crate::dataset::branch_location::{BRANCH_GENERATIONS_DIR, BranchLocation};
     use lance_core::utils::tempfile::TempStdDir;
     use object_store::path::Path;
     use std::fs;
@@ -289,18 +296,23 @@ mod tests {
     }
 
     #[test]
-    fn test_find_opaque_branch_storage() {
+    fn test_find_detached_branch_generation() {
         let root_path = TempStdDir::default().to_owned();
         let location = create_branch_location(root_path);
         let storage_id = "34e6c4b343a84a7ca40295852ed4d5d8";
         let new_location = location
-            .find_branch_at(Some("featureA"), Some(storage_id))
+            .find_branch_generation("featureA", storage_id)
             .unwrap();
         let main_location = location.find_main().unwrap();
 
         assert_eq!(
             new_location.path.as_ref(),
-            format!("{}/tree/{}", main_location.path.as_ref(), storage_id)
+            format!(
+                "{}/{}/{}",
+                main_location.path.as_ref(),
+                BRANCH_GENERATIONS_DIR,
+                storage_id
+            )
         );
         assert_eq!(new_location.branch.as_deref(), Some("featureA"));
         assert_eq!(new_location.find_main().unwrap(), main_location);

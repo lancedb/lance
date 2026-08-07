@@ -89,7 +89,13 @@ impl RestClient {
     ///
     /// This method mutates the request's headers directly, which is more efficient
     /// than creating a new client with default_headers for each request.
-    fn apply_headers(&self, request: &mut reqwest::Request, operation: &str, object_id: &str) {
+    fn apply_headers(
+        &self,
+        request: &mut reqwest::Request,
+        operation: &str,
+        object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
+    ) {
         let request_headers = request.headers_mut();
 
         // First apply base headers
@@ -118,6 +124,18 @@ impl RestClient {
                 }
             }
         }
+
+        if let Some(context) = request_context {
+            for (key, value) in context {
+                let header_name = format!("x-lance-ctx-{}", key);
+                if let (Ok(header_name), Ok(header_value)) = (
+                    HeaderName::from_str(&header_name),
+                    HeaderValue::from_str(value),
+                ) {
+                    request_headers.insert(header_name, header_value);
+                }
+            }
+        }
     }
 
     /// Execute a request with dynamic headers applied.
@@ -129,8 +147,19 @@ impl RestClient {
         operation: &str,
         object_id: &str,
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        self.execute_with_context(req_builder, operation, object_id, None)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        req_builder: reqwest::RequestBuilder,
+        operation: &str,
+        object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let mut request = req_builder.build()?;
-        self.apply_headers(&mut request, operation, object_id);
+        self.apply_headers(&mut request, operation, object_id, request_context);
         self.client.execute(request).await
     }
 
@@ -619,12 +648,25 @@ impl RestNamespace {
         operation: &str,
         object_id: &str,
     ) -> Result<R> {
+        self.post_json_with_context(path, query, body, operation, object_id, None)
+            .await
+    }
+
+    async fn post_json_with_context<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &T,
+        operation: &str,
+        object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
+    ) -> Result<R> {
         let url = format!("{}{}", self.rest_client.base_path(), path);
         let req_builder = self.rest_client.client().post(&url).query(query).json(body);
 
         let resp = self
             .rest_client
-            .execute(req_builder, operation, object_id)
+            .execute_with_context(req_builder, operation, object_id, request_context)
             .await
             .map_err(Self::request_error)?;
 
@@ -1304,8 +1346,15 @@ impl LanceNamespace for RestNamespace {
             branch_str = branch.clone();
             query.push(("branch", branch_str.as_str()));
         }
-        self.post_json(&path, &query, &(), "list_table_versions", &id)
-            .await
+        self.post_json_with_context(
+            &path,
+            &query,
+            &(),
+            "list_table_versions",
+            &id,
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn create_table_version(
@@ -1317,8 +1366,15 @@ impl LanceNamespace for RestNamespace {
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/version/create", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "create_table_version", &id)
-            .await
+        self.post_json_with_context(
+            &path,
+            &query,
+            &request,
+            "create_table_version",
+            &id,
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn describe_table_version(
@@ -1330,8 +1386,15 @@ impl LanceNamespace for RestNamespace {
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/version/describe", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "describe_table_version", &id)
-            .await
+        self.post_json_with_context(
+            &path,
+            &query,
+            &request,
+            "describe_table_version",
+            &id,
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn batch_delete_table_versions(
