@@ -6032,6 +6032,14 @@ class LanceOperation:
         schema: LanceSchema or pyarrow.Schema
             The schema of the new dataset. Passing a LanceSchema is preferred,
             and passing a pyarrow.Schema is deprecated.
+        preserves_nullability: bool
+            True when this merge makes no nullability-affecting schema change:
+            it introduces no field that data staged against an earlier schema
+            could not safely omit. Without the assertion (the default) the
+            merge conservatively conflicts with concurrent appends, whose
+            fragments would omit new columns and read as null; that can only
+            cause a retry. Pass True when every column this merge introduces
+            is nullable to let concurrent appends commit without conflict.
 
         Warning
         -------
@@ -6077,6 +6085,7 @@ class LanceOperation:
 
         fragments: Iterable[FragmentMetadata]
         schema: LanceSchema | pa.Schema
+        preserves_nullability: bool = False
 
         def __post_init__(self):
             if isinstance(self.schema, pa.Schema):
@@ -6249,6 +6258,11 @@ class LanceOperation:
         ----------
         schema: LanceSchema
             The lance schema of the new dataset.
+        preserves_nullability: bool
+            True when this projection makes no nullability-affecting schema
+            change, as a rename or a drop does not. Without the assertion
+            (the default) the projection conservatively conflicts with
+            concurrent writes, which can only cause a retry.
 
         Examples
         --------
@@ -6277,6 +6291,7 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+        preserves_nullability: bool = False
 
     @dataclass
     class UpdateMap:
