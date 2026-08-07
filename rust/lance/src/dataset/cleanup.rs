@@ -504,19 +504,27 @@ impl<'a> CleanupTask<'a> {
             ));
         }
 
+        let ignored_branch_manifests: HashSet<_> = final_result
+            .removed_manifests
+            .union(&self.ignored_manifests)
+            .cloned()
+            .collect();
         if !referenced_branches.is_empty() {
-            let ignored_manifests: HashSet<_> = final_result
-                .removed_manifests
-                .union(&self.ignored_manifests)
-                .cloned()
-                .collect();
             inspection = self
-                .retain_branch_lineage_files(inspection, &referenced_branches, &ignored_manifests)
+                .retain_branch_lineage_files(
+                    inspection,
+                    &referenced_branches,
+                    &ignored_branch_manifests,
+                )
                 .await?
         };
 
         let (inspection, mut retirement) = self
-            .fence_old_versions_and_retain_new_leases(inspection, &version_lease_store)
+            .fence_old_versions_and_retain_new_leases(
+                inspection,
+                &version_lease_store,
+                &ignored_branch_manifests,
+            )
             .await?;
 
         let cleanup_result = self.delete_unreferenced_files(inspection).await?;
@@ -628,6 +636,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         mut inspection: CleanupInspection,
         version_lease_store: &VersionLeaseStore,
+        ignored_branch_manifests: &HashSet<Path>,
     ) -> Result<(CleanupInspection, Option<CleanupRetirement>)> {
         if !self.action.deletes_files() {
             return Ok((inspection, None));
@@ -683,9 +692,10 @@ impl<'a> CleanupTask<'a> {
             }
             guard.cancel_versions(&retained_versions).await?;
 
-            // A tag or child branch published before the draining marker must
-            // win. Publications racing the marker perform their own second
-            // admission check and roll back if retirement won instead.
+            // A canonical tag, descendant manifest, or durable publication
+            // intent admitted before the draining marker must win. Descendant
+            // retention is based on actual lineage file references rather than
+            // cleanup policy or branch metadata alone.
             let tags = self.dataset.tags().list().await?;
             let current_branch = &self.dataset.manifest.branch;
             let mut referenced_versions = tags
@@ -697,19 +707,25 @@ impl<'a> CleanupTask<'a> {
                 })
                 .map(|tag| tag.version)
                 .collect::<HashSet<_>>();
-            referenced_versions.extend(
-                self.find_referenced_branches()
-                    .await?
-                    .into_iter()
-                    .map(|(_, version)| version),
-            );
-            let retained_versions = versions_to_seal
+            referenced_versions.extend(version_lease_store.active_reference_versions().await?);
+            let mut retained_versions = versions_to_seal
                 .intersection(&referenced_versions)
                 .copied()
                 .collect::<HashSet<_>>();
             for version in &retained_versions {
                 self.retain_version(&mut inspection, *version).await?;
             }
+
+            let all_descendants = self.all_referenced_branches().await?;
+            inspection = self
+                .retain_branch_lineage_files(inspection, &all_descendants, ignored_branch_manifests)
+                .await?;
+            let remaining_versions = inspection
+                .old_manifests
+                .values()
+                .copied()
+                .collect::<HashSet<_>>();
+            retained_versions.extend(versions_to_seal.difference(&remaining_versions).copied());
             guard.cancel_versions(&retained_versions).await?;
 
             let versions_to_commit = inspection
@@ -717,7 +733,11 @@ impl<'a> CleanupTask<'a> {
                 .values()
                 .copied()
                 .collect::<HashSet<_>>();
-            guard.commit_versions(&versions_to_commit).await?;
+            let late_reference_versions = guard.commit_versions(&versions_to_commit).await?;
+            for version in &late_reference_versions {
+                self.retain_version(&mut inspection, *version).await?;
+            }
+            guard.cancel_versions(&late_reference_versions).await?;
 
             let mut manifest_paths = HashMap::<u64, Vec<Path>>::new();
             for (path, version) in &inspection.old_manifests {
@@ -1260,9 +1280,7 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn find_referenced_branches(&self) -> Result<Vec<(String, u64)>> {
-        let current_branch_id = self.dataset.branch_identifier().await?;
-        let all_branches = self.dataset.branches().list().await?;
-        let children = current_branch_id.collect_referenced_versions(&all_branches);
+        let children = self.all_referenced_branches().await?;
 
         // Use a concurrent set to identify branches eligible for cleanup.
         // The filter below preserves the original (branch_name, version) tuples.
@@ -1284,16 +1302,23 @@ impl<'a> CleanupTask<'a> {
                         )
                         .await?;
 
+                    // A descendant that has already detached from this
+                    // lineage can outlive deletion of its original parent
+                    // manifest. Confirm durable absence explicitly; once an
+                    // object is present, every read error is safety-critical
+                    // and must be propagated.
+                    if !dataset.object_store.exists(&manifest_location.path).await? {
+                        return Ok(());
+                    }
+
                     let manifest = read_manifest(
                         &dataset.object_store,
                         &manifest_location.path,
                         manifest_location.size,
                     )
-                    .await;
+                    .await?;
 
-                    if let Ok(manifest) = manifest
-                        && policy.should_clean(&manifest)
-                    {
+                    if policy.should_clean(&manifest) {
                         referenced_branches.insert(branch_name.clone());
                     }
                     Ok::<(), Error>(())
@@ -1305,12 +1330,16 @@ impl<'a> CleanupTask<'a> {
 
         // Filter children to only include branches that should be cleaned.
         // The DashSet contains branch names found eligible during concurrent scan.
-        let referenced_branches = children
-            .iter()
+        Ok(children
+            .into_iter()
             .filter(|(branch_name, _)| referenced_branches.contains(branch_name))
-            .cloned()
-            .collect();
-        Ok(referenced_branches)
+            .collect())
+    }
+
+    async fn all_referenced_branches(&self) -> Result<Vec<(String, u64)>> {
+        let current_branch_id = self.dataset.branch_identifier().await?;
+        let all_branches = self.dataset.branches().list().await?;
+        Ok(current_branch_id.collect_referenced_versions(&all_branches))
     }
 
     async fn clean_referenced_branches(
@@ -2508,6 +2537,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_retirement_still_respects_descendant_branch() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let historical = fixture.load().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let mut dataset = fixture.load().await.unwrap();
+        fixture
+            .create_branch_and_load(&mut dataset, "child", (None, Some(1)))
+            .await
+            .unwrap();
+
+        let store = VersionLeaseStore::for_dataset(&historical).await.unwrap();
+        let manifest_paths = HashMap::from([(
+            historical.version().version,
+            vec![historical.manifest_location.path.clone()],
+        )]);
+        let mut guard = store.fence_versions(&manifest_paths).await.unwrap();
+        guard.seal_versions(&HashSet::from([1])).await.unwrap();
+        drop(guard);
+
+        let removed = fixture
+            .run_cleanup_with_policy(CleanupPolicy {
+                before_version: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 0);
+        assert!(
+            historical
+                .object_store
+                .exists(&manifest_paths[&1][0])
+                .await
+                .unwrap()
+        );
+        dataset.checkout_version(("child", None)).await.unwrap();
     }
 
     #[tokio::test]

@@ -26,7 +26,9 @@ use crate::{Error, Result};
 
 const LEASES_DIR: &str = "_refs/version_leases";
 const LEASE_GC_MARKERS_DIR: &str = "_refs/version_lease_gc";
+const REFERENCE_INTENTS_DIR: &str = "_refs/version_reference_intents";
 const LEASE_FILE_SUFFIX: &str = ".lease";
+const REFERENCE_INTENT_SUFFIX: &str = ".intent";
 const DRAINING_MARKER_SUFFIX: &str = ".draining";
 const SEALED_MARKER_SUFFIX: &str = ".sealed";
 const COMMITTED_MARKER_SUFFIX: &str = ".committed";
@@ -40,6 +42,11 @@ const STORAGE_TIMESTAMP_PRECISION: Duration = Duration::from_secs(1);
 /// A cleaner that exceeds the window fails before sealing; another actor may then
 /// ignore and remove the abandoned drain without racing a live deletion.
 const DRAINING_OWNERSHIP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Reference publication is expected to be short-lived. An abandoned intent
+/// protects its target for this ownership window and is then recoverable by
+/// cleanup, preventing a crashed writer from retaining a version forever.
+const REFERENCE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Drains whose in-process owner was dropped before sealing. The operation UUID
 /// makes each path unique across stores, while process-wide scope lets a fresh
@@ -146,7 +153,22 @@ pub(super) struct VersionLeaseStore {
     object_store: Arc<ObjectStore>,
     leases_path: Path,
     markers_path: Path,
+    reference_intents_path: Path,
     manifest_path: Option<Path>,
+}
+
+/// Durable ownership of one in-flight tag or branch publication.
+///
+/// This type intentionally has no `Drop` cleanup. Cancelling a future while a
+/// remote conditional write is in flight must leave the intent durable until
+/// cleanup can safely expire it.
+#[derive(Debug)]
+pub(super) struct ReferenceAdmission {
+    store: VersionLeaseStore,
+    path: Path,
+    manifest_path: Path,
+    version: u64,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -182,6 +204,12 @@ struct RetirementMarkerMetadata {
     version: u64,
     operation_id: String,
     state: RetirementState,
+    metadata: ObjectMeta,
+}
+
+#[derive(Debug)]
+struct ReferenceIntentMetadata {
+    version: u64,
     metadata: ObjectMeta,
 }
 
@@ -235,7 +263,8 @@ impl VersionLeaseStore {
         Ok(Self {
             object_store: Arc::clone(&refs.object_store),
             leases_path: root.path.clone().join(LEASES_DIR).join(namespace),
-            markers_path: root.path.join(LEASE_GC_MARKERS_DIR).join(namespace),
+            markers_path: root.path.clone().join(LEASE_GC_MARKERS_DIR).join(namespace),
+            reference_intents_path: root.path.join(REFERENCE_INTENTS_DIR).join(namespace),
             manifest_path,
         })
     }
@@ -297,6 +326,103 @@ impl VersionLeaseStore {
             .into_iter()
             .map(|metadata| parse_lease_metadata(&metadata).map(|(version, _)| version))
             .collect()
+    }
+
+    pub(super) async fn active_reference_versions(&self) -> Result<HashSet<u64>> {
+        let observed_at = self.storage_observed_at().await?;
+        let mut active_versions = HashSet::new();
+        let mut stale_paths = Vec::new();
+        for intent in self.reference_intent_metadata().await? {
+            if reference_owner_is_active(intent.metadata.last_modified, observed_at)? {
+                active_versions.insert(intent.version);
+            } else {
+                stale_paths.push(intent.metadata.location);
+            }
+        }
+        self.delete_paths(stale_paths).await?;
+        Ok(active_versions)
+    }
+
+    async fn create_reference_intent(&self, version: u64) -> Result<(Path, DateTime<Utc>)> {
+        let path = self
+            .reference_intents_path
+            .clone()
+            .join(version.to_string())
+            .join(format!(
+                "{}{}",
+                Uuid::new_v4().simple(),
+                REFERENCE_INTENT_SUFFIX
+            ));
+        self.object_store
+            .inner
+            .put_opts(
+                &path,
+                Bytes::new().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        // A failed HEAD is ambiguous after a successful create. Leave the
+        // intent for bounded recovery instead of deleting a write that may be
+        // protecting an in-flight canonical publication.
+        let metadata = self.object_store.inner.head(&path).await?;
+        Ok((path, metadata.last_modified))
+    }
+
+    async fn reference_intent_metadata(&self) -> Result<Vec<ReferenceIntentMetadata>> {
+        self.object_store
+            .list(Some(self.reference_intents_path.clone()))
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .map(|metadata| self.parse_reference_intent_metadata(metadata))
+            .collect()
+    }
+
+    fn parse_reference_intent_metadata(
+        &self,
+        metadata: ObjectMeta,
+    ) -> Result<ReferenceIntentMetadata> {
+        let relative_parts = metadata
+            .location
+            .prefix_match(&self.reference_intents_path)
+            .ok_or_else(|| {
+                Error::corrupt_file(
+                    metadata.location.clone(),
+                    "reference intent is outside its namespace",
+                )
+            })?
+            .map(|part| part.as_ref().to_string())
+            .collect::<Vec<_>>();
+        if relative_parts.len() != 2 {
+            return Err(Error::corrupt_file(
+                metadata.location,
+                "reference intent path must contain a version and operation filename",
+            ));
+        }
+        let version = relative_parts[0].parse::<u64>().map_err(|error| {
+            Error::corrupt_file(
+                metadata.location.clone(),
+                format!("reference intent has invalid version: {error}"),
+            )
+        })?;
+        let operation_id = relative_parts[1]
+            .strip_suffix(REFERENCE_INTENT_SUFFIX)
+            .ok_or_else(|| {
+                Error::corrupt_file(
+                    metadata.location.clone(),
+                    "reference intent filename has an invalid suffix",
+                )
+            })?;
+        Uuid::parse_str(operation_id).map_err(|error| {
+            Error::corrupt_file(
+                metadata.location.clone(),
+                format!("reference intent has invalid operation id: {error}"),
+            )
+        })?;
+        Ok(ReferenceIntentMetadata { version, metadata })
     }
 
     pub(super) async fn active_versions_at(
@@ -578,6 +704,7 @@ impl VersionLeaseStore {
             .map(|marker| (marker.version, observed_at))
             .collect::<HashMap<_, _>>();
         let actively_leased_versions = self.active_versions_at(&sealed_observation, true).await?;
+        let actively_referenced_versions = self.active_reference_versions().await?;
         let mut stale_drains = Vec::new();
         let mut sealed_manifest_paths = HashMap::<u64, HashSet<Path>>::new();
         for marker in markers {
@@ -611,7 +738,9 @@ impl VersionLeaseStore {
                 // A seal is the renewal cutoff. If its owner disappeared before
                 // confirming the final lease scan, wait out every lease that was
                 // still entitled to its published TTL before resuming deletion.
-                if !actively_leased_versions.contains(&version) {
+                if !actively_leased_versions.contains(&version)
+                    && !actively_referenced_versions.contains(&version)
+                {
                     versions_to_resume.insert(version);
                 }
             } else {
@@ -775,11 +904,26 @@ impl RetirementGuard {
     }
 
     /// Publish the irreversible retirement boundary after the final lease and
-    /// durable-reference scans. Reference admission checks this marker before
-    /// and after publishing a tag or branch.
-    pub(super) async fn commit_versions(&mut self, versions: &HashSet<u64>) -> Result<()> {
+    /// durable-reference scans. A final intent scan keeps any publication that
+    /// crossed the caller's census on the cancellable side of the boundary.
+    pub(super) async fn commit_versions(
+        &mut self,
+        versions: &HashSet<u64>,
+    ) -> Result<HashSet<u64>> {
+        // This scan runs inside the commit operation, after the caller's final
+        // reference census. An admission that won that narrow race remains
+        // cancellable and cannot cross the irreversible committed boundary.
+        let active_reference_versions = self.store.active_reference_versions().await?;
+        let retained_versions = versions
+            .intersection(&active_reference_versions)
+            .copied()
+            .collect::<HashSet<_>>();
+        let versions = versions
+            .difference(&retained_versions)
+            .copied()
+            .collect::<HashSet<_>>();
         let mut marker_paths = Vec::with_capacity(versions.len());
-        for version in versions {
+        for version in &versions {
             let fence = self.fences.get(version).ok_or_else(|| {
                 Error::internal(format!("missing sealed fence for version {version}"))
             })?;
@@ -848,13 +992,13 @@ impl RetirementGuard {
                 "Failed to remove superseded sealed retirement markers"
             );
         } else {
-            for version in versions {
+            for version in &versions {
                 if let Some(fence) = self.fences.get_mut(version) {
                     fence.sealed_path = None;
                 }
             }
         }
-        Ok(())
+        Ok(retained_versions)
     }
 
     pub(super) async fn cancel_versions(&mut self, versions: &HashSet<u64>) -> Result<()> {
@@ -1021,9 +1165,16 @@ impl VersionLeaseStore {
                 lease_paths.push(metadata.location);
             }
         }
+        let mut intent_paths = Vec::new();
+        for intent in self.reference_intent_metadata().await? {
+            if versions.contains(&intent.version) {
+                intent_paths.push(intent.metadata.location);
+            }
+        }
         // Leases and superseded marker states are dependent metadata. Keep at
         // least one terminal marker as the retry anchor until they are gone.
         self.delete_paths(lease_paths).await?;
+        self.delete_paths(intent_paths).await?;
         self.delete_paths(dependent_marker_paths).await?;
         self.delete_paths(anchor_paths).await
     }
@@ -1042,17 +1193,12 @@ impl VersionLeaseStore {
     }
 }
 
-/// Verify that a durable tag or branch can be admitted for a version.
-///
-/// Callers check both before and after publishing their reference. Cleanup
-/// publishes a draining marker before its final reference scan, so either the
-/// reference is visible to that scan or the second admission check rejects and
-/// rolls it back.
-pub(super) async fn ensure_reference_admissible(
+/// Begin a durable tag or branch admission before canonical publication.
+pub(super) async fn begin_reference_admission(
     refs: &Refs,
     branch: Option<&str>,
     version: u64,
-) -> Result<()> {
+) -> Result<ReferenceAdmission> {
     let branch_location = refs.base_location.find_branch(branch)?;
     let manifest = refs
         .commit_handler
@@ -1065,6 +1211,74 @@ pub(super) async fn ensure_reference_admissible(
     }
 
     let store = VersionLeaseStore::for_refs(refs, branch, None).await?;
+    ensure_reference_available(&store, &manifest.path, version).await?;
+    let (path, created_at) = store.create_reference_intent(version).await?;
+    let admission = ReferenceAdmission {
+        store,
+        path,
+        manifest_path: manifest.path,
+        version,
+        created_at,
+    };
+    if let Err(error) = admission.ensure_owned().await {
+        admission.cancel_before_publish().await;
+        return Err(error);
+    }
+    Ok(admission)
+}
+
+impl ReferenceAdmission {
+    /// Recheck ownership immediately before the canonical conditional write.
+    pub(super) async fn ensure_owned(&self) -> Result<()> {
+        let metadata = self.store.object_store.inner.head(&self.path).await?;
+        let observed_at = self.store.storage_observed_at().await?;
+        if metadata.last_modified != self.created_at
+            || !reference_owner_is_active(metadata.last_modified, observed_at)?
+        {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "reference admission for version {} no longer owns its publication intent",
+                    self.version
+                ),
+            });
+        }
+        ensure_reference_available(&self.store, &self.manifest_path, self.version).await
+    }
+
+    /// Remove this operation's uniquely owned intent after a definitive result
+    /// that did not publish the canonical reference.
+    pub(super) async fn cancel_before_publish(&self) {
+        if let Err(error) = self.store.object_store.delete(&self.path).await
+            && !error.is_not_found()
+        {
+            tracing::warn!(
+                path = %self.path,
+                error = %error,
+                "Failed to remove cancelled reference admission intent"
+            );
+        }
+    }
+
+    /// Canonical publication is durable. Intent removal is best-effort because
+    /// the canonical tag or branch now protects the version independently.
+    pub(super) async fn complete(&self) {
+        if let Err(error) = self.store.object_store.delete(&self.path).await
+            && !error.is_not_found()
+        {
+            tracing::warn!(
+                path = %self.path,
+                error = %error,
+                "Failed to remove completed reference admission intent"
+            );
+        }
+    }
+}
+
+async fn ensure_reference_available(
+    store: &VersionLeaseStore,
+    manifest_path: &Path,
+    version: u64,
+) -> Result<()> {
     if store.has_active_retirement_marker(version).await? {
         return Err(Error::RefConflict {
             message: format!(
@@ -1072,7 +1286,7 @@ pub(super) async fn ensure_reference_admissible(
             ),
         });
     }
-    if !refs.object_store.exists(&manifest.path).await? {
+    if !store.object_store.exists(manifest_path).await? {
         return Err(Error::VersionNotFound {
             message: format!("version {version} no longer exists and cannot be referenced"),
         });
@@ -1093,6 +1307,10 @@ pub(super) async fn remove_branch_state(
         root_path
             .clone()
             .join(LEASE_GC_MARKERS_DIR)
+            .join(namespace.to_string()),
+        root_path
+            .clone()
+            .join(REFERENCE_INTENTS_DIR)
             .join(namespace.to_string()),
     ] {
         match object_store.remove_dir_all(path).await {
@@ -1181,6 +1399,13 @@ fn draining_owner_is_active(
     )
 }
 
+fn reference_owner_is_active(
+    intent_observed_at: DateTime<Utc>,
+    current_observed_at: DateTime<Utc>,
+) -> Result<bool> {
+    Ok(expiration_from_ttl(intent_observed_at, REFERENCE_ADMISSION_TIMEOUT)? > current_observed_at)
+}
+
 fn retirement_marker_payload(manifest_paths: &[Path]) -> Result<Bytes> {
     if manifest_paths.is_empty() {
         return Err(Error::internal(
@@ -1264,6 +1489,7 @@ mod tests {
             object_store: Arc::new(ObjectStore::memory()),
             leases_path: Path::from("leases"),
             markers_path: Path::from("markers"),
+            reference_intents_path: Path::from("reference_intents"),
             manifest_path: None,
         }
     }
@@ -1349,7 +1575,13 @@ mod tests {
         let store = memory_store();
         let mut guard = store.fence_versions(&manifest_paths(42)).await.unwrap();
         guard.seal_versions(&HashSet::from([42])).await.unwrap();
-        guard.commit_versions(&HashSet::from([42])).await.unwrap();
+        assert!(
+            guard
+                .commit_versions(&HashSet::from([42]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let committed_path = guard.fences[&42].committed_path.clone().unwrap();
 
         guard.cancel_all().await.unwrap();
@@ -1364,6 +1596,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reference_intent_blocks_retirement_commit() {
+        let store = memory_store();
+        let (intent_path, _) = store.create_reference_intent(42).await.unwrap();
+        let mut guard = store.fence_versions(&manifest_paths(42)).await.unwrap();
+        guard.seal_versions(&HashSet::from([42])).await.unwrap();
+
+        let retained_versions = guard.commit_versions(&HashSet::from([42])).await.unwrap();
+
+        assert_eq!(retained_versions, HashSet::from([42]));
+        assert!(guard.fences[&42].committed_path.is_none());
+        assert!(guard.fences[&42].sealed_path.is_some());
+        store.object_store.delete(&intent_path).await.unwrap();
+        guard.cancel_all().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_marker_survives_lease_deletion_failure() {
         let failing_store = Arc::new(FailingProxyStore::new());
         let mut object_store = ObjectStore::memory();
@@ -1372,13 +1620,20 @@ mod tests {
             object_store: Arc::new(object_store),
             leases_path: Path::from("leases"),
             markers_path: Path::from("markers"),
+            reference_intents_path: Path::from("reference_intents"),
             manifest_path: None,
         };
         let lease = store.acquire(42, Duration::from_secs(60)).await.unwrap();
         let manifests = manifest_paths(42);
         let mut guard = store.fence_versions(&manifests).await.unwrap();
         guard.seal_versions(&HashSet::from([42])).await.unwrap();
-        guard.commit_versions(&HashSet::from([42])).await.unwrap();
+        assert!(
+            guard
+                .commit_versions(&HashSet::from([42]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let committed_path = guard.fences[&42].committed_path.clone().unwrap();
         failing_store.fail_when(
             "delete",
