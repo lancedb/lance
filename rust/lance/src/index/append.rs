@@ -1365,23 +1365,24 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use arrow::datatypes::{Float32Type, Int32Type, UInt32Type};
+    use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator,
-        StringArray, UInt32Array,
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
+        RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
     };
-    use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
+    use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
-    use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array};
+    use lance_datagen::{Dimension, RowCount, array};
+    use lance_file::version::LanceFileVersion;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        IndexParams, IndexType,
+        IndexType,
         scalar::{
             BuiltinIndexType, InvertedIndexParams, ScalarIndexParams, SearchResult, TextQuery,
         },
@@ -3393,170 +3394,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_optimize_append_many_mixed_indices_completes() {
-        const BTREE_INDICES: usize = 6;
-        const BITMAP_INDICES: usize = 6;
-        const LABEL_LIST_INDICES: usize = 3;
-        const FTS_INDICES: usize = 2;
-        const ROWS_PER_FRAGMENT: u64 = 256;
+    async fn test_optimize_append_with_backpressured_multichunk_read() {
+        const WIDE_DIMENSION: usize = 140_000;
+        const NARROW_DIMENSION: usize = 4_096;
+        const SHORT_ROWS: usize = 68;
+        const LONG_ROWS: usize = 128;
 
-        async fn create_named_indices(
-            dataset: &mut Dataset,
-            prefix: &str,
-            count: usize,
-            index_type: IndexType,
-            params: &dyn IndexParams,
-        ) {
-            for index in 0..count {
-                let column = format!("{prefix}_{index}");
-                dataset
-                    .create_index(
-                        &[column.as_str()],
-                        index_type,
-                        Some(column.clone()),
-                        params,
-                        true,
-                    )
-                    .await
-                    .unwrap();
-            }
+        fn make_batch(schema: Arc<Schema>, rows: usize, base: usize) -> RecordBatch {
+            let docs_field = schema.field(1);
+            let DataType::List(item_field) = docs_field.data_type() else {
+                unreachable!("docs must be a list");
+            };
+            let DataType::Struct(doc_fields) = item_field.data_type() else {
+                unreachable!("docs items must be structs");
+            };
+            let wide_values = Float32Array::from_iter_values(
+                (0..rows * WIDE_DIMENSION).map(|index| ((index + base) % 1009) as f32),
+            );
+            let narrow_values = Float32Array::from_iter_values(
+                (0..rows * NARROW_DIMENSION).map(|index| ((index + base) % 251) as f32),
+            );
+            let docs = StructArray::new(
+                doc_fields.clone(),
+                vec![
+                    Arc::new(
+                        FixedSizeListArray::try_new_from_values(wide_values, WIDE_DIMENSION as i32)
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        FixedSizeListArray::try_new_from_values(
+                            narrow_values,
+                            NARROW_DIMENSION as i32,
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..rows).map(|index| format!("document-{}", index + base)),
+                    )),
+                ],
+                None,
+            );
+            let docs = ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(1, rows)),
+                Arc::new(docs),
+                None,
+            );
+            let ids = UInt64Array::from_iter_values(base as u64..(base + rows) as u64);
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(docs)]).unwrap()
         }
 
-        let make_reader = |batch_count: u32| {
-            let mut data = lance_datagen::gen_batch();
-            for index in 0..BTREE_INDICES {
-                data = data.col(format!("btree_{index}"), array::step::<Int32Type>());
-            }
-            for index in 0..BITMAP_INDICES {
-                data = data.col(
-                    format!("bitmap_{index}"),
-                    array::cycle_utf8_literals(&["alpha", "beta", "gamma", "delta"]),
-                );
-            }
-            for index in 0..LABEL_LIST_INDICES {
-                let labels = array::cycle_utf8_literals(&["red", "green", "blue", "yellow"])
-                    .with_random_nulls(0.1);
-                data = data.col(
-                    format!("list_{index}"),
-                    array::rand_list_any(labels, false).with_random_nulls(0.1),
-                );
-            }
-            for index in 0..FTS_INDICES {
-                data = data.col(format!("fts_{index}"), array::random_sentence(3, 8, false));
-            }
-            data.col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
-                .into_reader_rows(
-                    RowCount::from(ROWS_PER_FRAGMENT),
-                    BatchCount::from(batch_count),
-                )
-        };
+        let vector_item = Arc::new(Field::new("item", DataType::Float32, true));
+        let doc_fields = vec![
+            Field::new(
+                "wide",
+                DataType::FixedSizeList(vector_item.clone(), WIDE_DIMENSION as i32),
+                true,
+            ),
+            Field::new(
+                "narrow",
+                DataType::FixedSizeList(vector_item, NARROW_DIMENSION as i32),
+                true,
+            ),
+            Field::new("text", DataType::Utf8, true),
+        ]
+        .into();
+        let docs_item = Arc::new(Field::new("item", DataType::Struct(doc_fields), true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("docs", DataType::List(docs_item), true),
+        ]));
 
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
+        let initial_batch = make_batch(schema.clone(), 1, 1_000);
+        let initial_reader = RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone());
         let mut dataset = Dataset::write(
-            make_reader(4),
-            test_uri,
+            initial_reader,
+            "memory://",
             Some(WriteParams {
-                max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-        assert_eq!(dataset.get_fragments().len(), 4);
-
-        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
-        create_named_indices(
-            &mut dataset,
-            "btree",
-            BTREE_INDICES,
-            IndexType::BTree,
-            &btree_params,
-        )
-        .await;
-
-        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
-        create_named_indices(
-            &mut dataset,
-            "bitmap",
-            BITMAP_INDICES,
-            IndexType::Bitmap,
-            &bitmap_params,
-        )
-        .await;
-
-        let label_list_params = ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList);
-        create_named_indices(
-            &mut dataset,
-            "list",
-            LABEL_LIST_INDICES,
-            IndexType::LabelList,
-            &label_list_params,
-        )
-        .await;
-
-        let fts_params = InvertedIndexParams::default();
-        create_named_indices(
-            &mut dataset,
-            "fts",
-            FTS_INDICES,
-            IndexType::Inverted,
-            &fts_params,
-        )
-        .await;
-
-        let vector_params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::L2,
-            IvfBuildParams::new(2),
-            HnswBuildParams::default(),
-            SQBuildParams::default(),
-        );
         dataset
             .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("vector".to_string()),
-                &vector_params,
+                &["docs.text"],
+                IndexType::Inverted,
+                Some("docs_text".to_string()),
+                &InvertedIndexParams::default(),
                 true,
             )
             .await
             .unwrap();
 
-        let mut dataset = Dataset::write(
-            make_reader(1),
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: ROWS_PER_FRAGMENT as usize,
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let appended_batches = vec![
+            Ok(make_batch(schema.clone(), SHORT_ROWS, 0)),
+            Ok(make_batch(schema.clone(), LONG_ROWS, SHORT_ROWS)),
+        ];
+        let appended_reader = RecordBatchIterator::new(appended_batches, schema);
+        dataset
+            .append(
+                appended_reader,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // The deleted first batch makes the live delta start exactly at the
+        // second write-batch boundary, matching a merge-insert style update.
+        dataset.delete("id < 68").await.unwrap();
 
-        // The regression is a silent scheduler deadlock, so bound the operation
-        // instead of relying on the test runner's much longer global timeout.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            dataset.optimize_indices(&OptimizeOptions::append()),
-        )
-        .await
-        .expect("incremental optimization of mixed indices timed out")
-        .unwrap();
+        let optimize_options = OptimizeOptions::append();
+        // Nested FTS reads the entire `docs` root. Under this budget the wide
+        // sibling is split into same-priority chunks, then the narrow sibling's
+        // higher-priority I/O consumes the remaining budget while the wide read
+        // is awaited. Admitted chunks must continue despite that backpressure.
+        let optimize = crate::index::scalar::TEST_TRAINING_IO_BUFFER_SIZE.scope(
+            70 * 1024 * 1024,
+            dataset.optimize_indices(&optimize_options),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+            .await
+            .expect("incremental nested FTS optimization timed out")
+            .unwrap();
 
-        let indices = dataset.load_indices().await.unwrap();
-        let segment_counts = indices.iter().fold(
-            std::collections::BTreeMap::<String, usize>::new(),
-            |mut counts, index| {
-                *counts.entry(index.name.clone()).or_default() += 1;
-                counts
-            },
-        );
-        assert_eq!(segment_counts.len(), 18);
-        assert!(
-            segment_counts.values().all(|count| *count == 2),
-            "append optimization should create one delta segment per index: {segment_counts:?}"
-        );
+        let segments = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "docs_text")
+            .count();
+        assert_eq!(segments, 2, "optimization should add one FTS delta segment");
     }
 
     #[tokio::test]
