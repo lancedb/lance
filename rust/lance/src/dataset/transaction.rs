@@ -2074,9 +2074,9 @@ impl Transaction {
 
             let mut expected = advance.expected_index_segment_uuids.clone();
             expected.sort_unstable();
-            let deduped = expected.len();
+            let before_dedup = expected.len();
             expected.dedup();
-            if expected.len() != deduped {
+            if expected.len() != before_dedup {
                 return Err(Error::invalid_input(format!(
                     "Duplicate expected segment UUID for index {}",
                     advance.index_name
@@ -2897,20 +2897,23 @@ impl Transaction {
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one operation arm
         // intended.
-        if let Some(segments_before) = mem_wal_segments_before.as_ref() {
+        let advances: &[IndexCatchupAdvance] = match &self.operation {
+            Operation::CreateIndex {
+                mem_wal_index_catchup_advances,
+                ..
+            } => mem_wal_index_catchup_advances,
+            _ => &[],
+        };
+        // Advances are also routed in when the table carries no system index, so a
+        // coverage claim on such a table is rejected rather than silently dropped.
+        if mem_wal_segments_before.is_some() || !advances.is_empty() {
             let safe_retirement_enabled = current_manifest
                 .map(|m| m.reader_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT != 0)
                 .unwrap_or(false);
-            let advances: &[IndexCatchupAdvance] = match &self.operation {
-                Operation::CreateIndex {
-                    mem_wal_index_catchup_advances,
-                    ..
-                } => mem_wal_index_catchup_advances,
-                _ => &[],
-            };
+            let empty_segments = LogicalIndexSegments::new();
             Self::apply_mem_wal_index_coverage(
                 &mut final_indices,
-                segments_before,
+                mem_wal_segments_before.as_ref().unwrap_or(&empty_segments),
                 advances,
                 safe_retirement_enabled,
                 new_version,
@@ -7792,12 +7795,29 @@ mod tests {
             )
             .unwrap_err();
 
-            assert!(
-                err.to_string()
-                    .contains("safe \n                 retirement")
-                    || err.to_string().contains("safe retirement"),
-                "{err}"
-            );
+            assert!(err.to_string().contains("safe retirement"), "{err}");
+        }
+
+        #[test]
+        fn an_advance_on_a_table_without_the_system_index_rejects() {
+            let uuid = Uuid::new_v4();
+            let mut after = vec![user_index("vec_idx", uuid)];
+
+            let advance = IndexCatchupAdvance {
+                index_name: "vec_idx".to_string(),
+                expected_index_segment_uuids: vec![uuid],
+                caught_up_generations: vec![CompactedSsTable::new(Uuid::new_v4(), 10)],
+            };
+            let err = Transaction::apply_mem_wal_index_coverage(
+                &mut after,
+                &LogicalIndexSegments::new(),
+                &[advance],
+                true,
+                2,
+            )
+            .unwrap_err();
+
+            assert!(err.to_string().contains("is not present"), "{err}");
         }
 
         #[test]
