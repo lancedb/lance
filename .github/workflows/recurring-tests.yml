@@ -3,22 +3,44 @@ name: Recurring Tests
 on:
   schedule:
     - cron: "0 0 * * 0" # Runs at 00:00 UTC every Sunday
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      - .github/actions/create-failure-issue/**
+      - .github/workflows/recurring-tests.yml
+      - python/python/tests/recurring/test_recurring.py
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The slowest stable-version job completed about 5% of the unsharded test in
+  # six hours. 64 shards leave enough room to test both the stable and current
+  # versions in one hosted-runner job.
+  LANCE_RECURRING_SHARD_COUNT: "64"
+
 jobs:
   get-pylance-versions:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      shards: ${{ steps.set-matrix.outputs.shards }}
     steps:
       - name: Fetch latest 2 stable pylance versions
         id: set-matrix
         run: |
+          set -euo pipefail
+
           # Get all versions from PyPI
-          pypi_versions=$(curl -s https://pypi.org/pypi/pylance/json | jq -r '.releases | keys_unsorted | .[]')
+          pypi_versions=$(curl -fsSL https://pypi.org/pypi/pylance/json | jq -r '.releases | keys_unsorted | .[]')
 
           # Use only PyPI versions
           all_versions=$(echo -e "$pypi_versions" | sort -u -V)
@@ -44,19 +66,68 @@ jobs:
           done
           json_array="$json_array]"
 
-          matrix="{\"pylance-version\": $json_array}"
-          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+          shards=$(jq -cn --argjson count "$LANCE_RECURRING_SHARD_COUNT" '[range(0; $count)]')
+          matrix=$(jq -cn \
+            --argjson versions "$json_array" \
+            --argjson shards "$shards" \
+            '{"pylance-version": $versions, "shard": $shards}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
+  # Pull requests only need to prove that the workflow and test still execute.
+  # The scheduled jobs below retain the full permutation coverage.
+  recurring-smoke:
+    if: github.event_name == 'pull_request'
+    name: "Recurring: PR smoke"
+    runs-on: ubuntu-24.04-4x
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Test failure issue action
+        working-directory: .
+        run: bash .github/actions/create-failure-issue/test.sh
+      - name: Install protobuf
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+      - name: Install Lance
+        run: pip install -e ".[tests]"
+      - name: Run recurring smoke test
+        env:
+          LANCE_RECURRING_NUM_ROWS: "10000"
+          LANCE_RECURRING_SHARD_INDEX: "0"
+          LANCE_RECURRING_SHARD_COUNT: "1"
+          LANCE_RECURRING_MAX_PERMUTATIONS: "2"
+        run: pytest -vvv -s python/tests/recurring/test_recurring.py -m recurring
 
   # This job is used to test the recurring tests on the latest 2 stable versions of Lance,
   # and the back-compat of the recurring tests.
   recurring-linux:
     needs: get-pylance-versions
-    name: "Recurring: Linux (Pylance ${{ matrix.pylance-version }})"
+    if: github.event_name != 'pull_request'
+    name: "Recurring: Linux (Pylance ${{ matrix.pylance-version }}, shard ${{ matrix.shard }})"
     runs-on: ubuntu-24.04
-    timeout-minutes: 7200
+    timeout-minutes: 330
     strategy:
       fail-fast: false
+      max-parallel: 10
       matrix: ${{ fromJson(needs.get-pylance-versions.outputs.matrix) }}
+    env:
+      LANCE_RECURRING_SHARD_INDEX: ${{ matrix.shard }}
     defaults:
       run:
         shell: bash
@@ -74,14 +145,14 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
       - name: Install dependencies
         working-directory: python
         shell: bash
         run: |
           pip install -e ".[tests]"
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          workspaces: python
       - name: Install Pylance
         run: |
           pip install pylance==${{ matrix.pylance-version }}
@@ -95,9 +166,18 @@ jobs:
 
   # This job is used to test the recurring tests on the main branch.
   recurring-linux-fresh-main:
-    name: "Recurring: Linux (main)"
+    needs: get-pylance-versions
+    if: github.event_name != 'pull_request'
+    name: "Recurring: Linux (main, shard ${{ matrix.shard }})"
     runs-on: ubuntu-24.04
-    timeout-minutes: 7200
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        shard: ${{ fromJson(needs.get-pylance-versions.outputs.shards) }}
+    env:
+      LANCE_RECURRING_SHARD_INDEX: ${{ matrix.shard }}
     defaults:
       run:
         shell: bash
@@ -122,3 +202,20 @@ jobs:
         run: pip install -e ".[tests]"
       - name: Run recurring tests
         run: pytest -vvv -s python/tests/recurring/test_recurring.py
+
+  report-failure:
+    name: Report Workflow Failure
+    needs: [get-pylance-versions, recurring-linux, recurring-linux-fresh-main]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/create-failure-issue
+        with:
+          job-results: ${{ toJSON(needs) }}
+          workflow-name: ${{ github.workflow }}
+          include-cancelled: "true"
+          deduplicate: "true"

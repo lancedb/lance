@@ -1,24 +1,120 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-# Recurring tests that runs all operations on a large dataset,
-# these operations are ran in random order repeated 10 times
+# Recurring tests that run all permutations of write operations on a large dataset.
 
 import abc
 import itertools
+import math
+import os
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import Optional
+from typing import Mapping, Optional
 
 import lance
 import numpy as np
 import pyarrow as pa
 import pytest
 
-# For testing, use smaller numbers to make tests run faster
-# In production, you might want to use: NUM_ROWS = 1_000_000
-NUM_ROWS = 1_000_000
+DEFAULT_NUM_ROWS = 1_000_000
 BATCH_SIZE = 1_000
 DIM = 32
+
+NUM_ROWS_ENV = "LANCE_RECURRING_NUM_ROWS"
+SHARD_INDEX_ENV = "LANCE_RECURRING_SHARD_INDEX"
+SHARD_COUNT_ENV = "LANCE_RECURRING_SHARD_COUNT"
+MAX_PERMUTATIONS_ENV = "LANCE_RECURRING_MAX_PERMUTATIONS"
+
+
+@dataclass(frozen=True)
+class RecurringTestConfig:
+    num_rows: int = DEFAULT_NUM_ROWS
+    shard_index: int = 0
+    shard_count: int = 1
+    max_permutations: Optional[int] = None
+
+    def __post_init__(self):
+        if self.num_rows <= 0:
+            raise ValueError(f"{NUM_ROWS_ENV} must be greater than 0")
+        if self.shard_count <= 0:
+            raise ValueError(f"{SHARD_COUNT_ENV} must be greater than 0")
+        if self.shard_index < 0:
+            raise ValueError(f"{SHARD_INDEX_ENV} must be greater than or equal to 0")
+        if self.shard_index >= self.shard_count:
+            raise ValueError(
+                f"{SHARD_INDEX_ENV} must be less than {SHARD_COUNT_ENV} "
+                f"({self.shard_count}), got {self.shard_index}"
+            )
+        if self.max_permutations is not None and self.max_permutations <= 0:
+            raise ValueError(f"{MAX_PERMUTATIONS_ENV} must be greater than 0")
+
+
+def _read_env_int(
+    environ: Mapping[str, str], name: str, default: Optional[int]
+) -> Optional[int]:
+    value = environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+
+
+def _recurring_test_config(
+    environ: Optional[Mapping[str, str]] = None,
+) -> RecurringTestConfig:
+    if environ is None:
+        environ = os.environ
+
+    num_rows = _read_env_int(environ, NUM_ROWS_ENV, DEFAULT_NUM_ROWS)
+    shard_index = _read_env_int(environ, SHARD_INDEX_ENV, 0)
+    shard_count = _read_env_int(environ, SHARD_COUNT_ENV, 1)
+    max_permutations = _read_env_int(environ, MAX_PERMUTATIONS_ENV, None)
+    assert num_rows is not None
+    assert shard_index is not None
+    assert shard_count is not None
+    return RecurringTestConfig(
+        num_rows=num_rows,
+        shard_index=shard_index,
+        shard_count=shard_count,
+        max_permutations=max_permutations,
+    )
+
+
+def _permutation_bounds(
+    total_permutations: int, config: RecurringTestConfig
+) -> tuple[int, int]:
+    if total_permutations <= 0:
+        raise ValueError("total_permutations must be greater than 0")
+
+    selected_permutations = config.max_permutations or total_permutations
+    if selected_permutations > total_permutations:
+        raise ValueError(
+            f"{MAX_PERMUTATIONS_ENV} ({selected_permutations}) cannot exceed the "
+            f"{total_permutations} available permutations"
+        )
+
+    permutations_per_shard, remainder = divmod(
+        selected_permutations, config.shard_count
+    )
+    start = config.shard_index * permutations_per_shard + min(
+        config.shard_index, remainder
+    )
+    shard_size = permutations_per_shard
+    if config.shard_index < remainder:
+        shard_size += 1
+    return start, start + shard_size
+
+
+def _sharded_permutations(num_operations: int, config: RecurringTestConfig):
+    if num_operations <= 0:
+        raise ValueError("num_operations must be greater than 0")
+
+    start, stop = _permutation_bounds(math.factorial(num_operations), config)
+    permutations = itertools.permutations(range(num_operations))
+    return itertools.islice(permutations, start, stop)
+
 
 schema = pa.schema(
     [
@@ -47,7 +143,7 @@ def random_batch(start_id: int, batch_size: int) -> pa.Table:
     )
 
 
-def create_or_load_dataset(dataset_name: str, kwargs: dict):
+def create_or_load_dataset(dataset_name: str, kwargs: dict, num_rows: int):
     uri = f"tests/recurring/{dataset_name}"
 
     # Try to open existing dataset first
@@ -59,12 +155,13 @@ def create_or_load_dataset(dataset_name: str, kwargs: dict):
         pass
 
     # Create new dataset with initial data
-    initial_batch = random_batch(0, BATCH_SIZE)
+    initial_batch_size = min(BATCH_SIZE, num_rows)
+    initial_batch = random_batch(0, initial_batch_size)
     ds = lance.write_dataset(initial_batch, uri, schema=schema, mode="overwrite")
 
     # Add remaining data
-    for i in range(BATCH_SIZE, NUM_ROWS, BATCH_SIZE):
-        batch = random_batch(i, BATCH_SIZE)
+    for i in range(initial_batch_size, num_rows, BATCH_SIZE):
+        batch = random_batch(i, min(BATCH_SIZE, num_rows - i))
         ds.insert(batch)
 
     # Create indices
@@ -195,9 +292,17 @@ class FullTextSearch(ReadOnlyOperation):
 @pytest.mark.recurring
 @pytest.mark.parametrize("with_position", [True])
 def test_all_permutations(with_position):
-    """Test all operations on dataset without FTS position tracking"""
-    dataset_name = f"test_table_with_position_{with_position}"
-    ds = create_or_load_dataset(dataset_name, {"with_position": with_position})
+    """Test each write ordering assigned to this recurring-test shard."""
+    config = _recurring_test_config()
+    permutation_limit = config.max_permutations or "all"
+    dataset_name = (
+        f"test_table_with_position_{with_position}_{config.num_rows}_rows_"
+        f"{permutation_limit}_permutations_"
+        f"shard_{config.shard_index}_of_{config.shard_count}"
+    )
+    ds = create_or_load_dataset(
+        dataset_name, {"with_position": with_position}, config.num_rows
+    )
 
     write_operations = [
         Append(),
@@ -217,7 +322,18 @@ def test_all_permutations(with_position):
         FullTextSearch(has_position=False, filter="id >= 1000 and id < 8000"),
     ]
 
-    for permutation in itertools.permutations(range(len(write_operations))):
+    permutation_start, permutation_stop = _permutation_bounds(
+        math.factorial(len(write_operations)), config
+    )
+    print(
+        f"Running recurring-test shard {config.shard_index}/{config.shard_count}: "
+        f"permutations [{permutation_start}, {permutation_stop})"
+    )
+    for permutation_index, permutation in enumerate(
+        _sharded_permutations(len(write_operations), config),
+        start=permutation_start,
+    ):
+        print(f"Running permutation {permutation_index}: {permutation}")
         for idx in permutation:
             write_operation = write_operations[idx]
             print(f"Running {write_operation.__class__.__name__}")
@@ -229,3 +345,79 @@ def test_all_permutations(with_position):
             for read_only_operation in read_only_operations:
                 print(f"Running {read_only_operation.__class__.__name__}")
                 read_only_operation.run(ds)
+
+
+def test_recurring_config_defaults_to_full_workload():
+    config = _recurring_test_config({})
+
+    assert config == RecurringTestConfig()
+    assert list(_sharded_permutations(3, config)) == list(
+        itertools.permutations(range(3))
+    )
+
+
+def test_sharded_permutations_are_balanced_complete_and_disjoint():
+    expected = list(itertools.permutations(range(4)))
+    shards = [
+        list(
+            _sharded_permutations(
+                4, RecurringTestConfig(shard_index=index, shard_count=5)
+            )
+        )
+        for index in range(5)
+    ]
+    combined = list(itertools.chain.from_iterable(shards))
+
+    assert [len(shard) for shard in shards] == [5, 5, 5, 5, 4]
+    assert combined == expected
+    assert len(set(combined)) == len(expected)
+
+
+def test_max_permutations_is_applied_before_sharding():
+    expected = list(itertools.islice(itertools.permutations(range(3)), 3))
+    shards = [
+        list(
+            _sharded_permutations(
+                3,
+                RecurringTestConfig(
+                    shard_index=index, shard_count=5, max_permutations=3
+                ),
+            )
+        )
+        for index in range(5)
+    ]
+
+    assert [len(shard) for shard in shards] == [1, 1, 1, 0, 0]
+    assert list(itertools.chain.from_iterable(shards)) == expected
+
+
+@pytest.mark.parametrize(
+    ("environ", "error"),
+    [
+        ({NUM_ROWS_ENV: "not-an-integer"}, f"{NUM_ROWS_ENV} must be an integer"),
+        ({NUM_ROWS_ENV: "0"}, f"{NUM_ROWS_ENV} must be greater than 0"),
+        ({SHARD_COUNT_ENV: "0"}, f"{SHARD_COUNT_ENV} must be greater than 0"),
+        (
+            {SHARD_INDEX_ENV: "-1"},
+            f"{SHARD_INDEX_ENV} must be greater than or equal to 0",
+        ),
+        (
+            {SHARD_INDEX_ENV: "2", SHARD_COUNT_ENV: "2"},
+            f"{SHARD_INDEX_ENV} must be less than {SHARD_COUNT_ENV}",
+        ),
+        (
+            {MAX_PERMUTATIONS_ENV: "0"},
+            f"{MAX_PERMUTATIONS_ENV} must be greater than 0",
+        ),
+    ],
+)
+def test_recurring_config_rejects_invalid_values(environ, error):
+    with pytest.raises(ValueError, match=error):
+        _recurring_test_config(environ)
+
+
+def test_max_permutations_cannot_exceed_available_permutations():
+    config = RecurringTestConfig(max_permutations=7)
+
+    with pytest.raises(ValueError, match="cannot exceed the 6 available permutations"):
+        list(_sharded_permutations(3, config))
