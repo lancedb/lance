@@ -116,6 +116,22 @@ mod tests {
         (pages, file_size, file_reader)
     }
 
+    fn seeded_binary_values(num_values: usize, value_size: usize) -> Vec<Vec<u8>> {
+        let mut state = 0x9e3779b97f4a7c15_u64;
+        (0..num_values)
+            .map(|_| {
+                (0..value_size)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     fn create_v2_1_writer_with_compression(
         object_writer: Box<dyn Writer>,
         schema: LanceSchema,
@@ -865,19 +881,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oversized_automatic_dictionary_batch_shares_dictionary() {
-        let mut state = 0x9e3779b97f4a7c15_u64;
-        let unique_values = (0..100)
-            .map(|_| {
-                (0..1024)
-                    .map(|_| {
-                        state ^= state << 13;
-                        state ^= state >> 7;
-                        state ^= state << 17;
-                        state as u8
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let unique_values = seeded_binary_values(100, 1024);
         let values = BinaryArray::from_iter_values(
             (0..10_000).map(|index| unique_values[index % unique_values.len()].as_slice()),
         );
@@ -947,6 +951,76 @@ mod tests {
             split_size,
             pages[0].len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_stable_automatic_dictionary_request_batches() {
+        let unique_values = seeded_binary_values(100, 1024);
+        let values = BinaryArray::from_iter_values(
+            (0..9_000).map(|index| unique_values[index % unique_values.len()].as_slice()),
+        );
+        let arrow_schema = Schema::new(vec![Field::new("data", DataType::Binary, false)]);
+        let batch = RecordBatch::try_new(arrow_schema.into(), vec![Arc::new(values)]).unwrap();
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let lance_schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+        let mut writer = create_writer(
+            object_store.create(&path).await.unwrap(),
+            lance_schema,
+            ConcreteFileVersion::V2_2,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        for _ in 0..8 {
+            writer.write_batch(&batch).await.unwrap();
+        }
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let pages = &file_reader.metadata().column_metadatas[0].pages;
+        assert_eq!(pages.len(), 8);
+        assert!(
+            pages
+                .iter()
+                .all(|page| describe_encoding(page).contains("dictionary: Some"))
+        );
+
+        let stats = IoStats::new();
+        let reader = file_reader.with_io_stats(stats.recorder());
+        let read_batches: Vec<RecordBatch> = reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                4,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            read_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            72_000
+        );
+        assert_eq!(stats.snapshot().requests, 16);
     }
 
     #[tokio::test]

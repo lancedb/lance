@@ -8,7 +8,10 @@ use std::{
     fmt::Debug,
     iter,
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     vec,
 };
 
@@ -1900,8 +1903,7 @@ struct MiniBlockSchedulerDictionary {
     dictionary_buf_position_and_size: (u64, u64),
     dictionary_data_alignment: u64,
     num_dictionary_items: u64,
-    // Pages that reference the same dictionary share one fetch and decompression result.
-    initialized_data: Arc<OnceCell<Arc<DataBlock>>>,
+    shared_data: Arc<MiniBlockSharedDictionary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1910,6 +1912,15 @@ struct MiniBlockDictionaryCacheKey {
     encoding: Vec<u8>,
     num_dictionary_items: u64,
 }
+
+#[derive(Debug)]
+struct MiniBlockSharedDictionary {
+    initialized_data: OnceCell<Arc<DataBlock>>,
+    scheduler_count: AtomicUsize,
+}
+
+type MiniBlockDictionaryCache =
+    HashMap<MiniBlockDictionaryCacheKey, Arc<MiniBlockSharedDictionary>>;
 
 /// State that is loaded once and cached for future lookups
 #[derive(Debug)]
@@ -1994,7 +2005,7 @@ impl MiniBlockScheduler {
         items_in_page: u64,
         layout: &pb21::MiniBlockLayout,
         decompressors: &dyn DecompressionStrategy,
-        dictionary_cache: &mut HashMap<MiniBlockDictionaryCacheKey, Arc<OnceCell<Arc<DataBlock>>>>,
+        dictionary_cache: &mut MiniBlockDictionaryCache,
     ) -> Result<Self> {
         let rep_decompressor = layout
             .rep_compression
@@ -2053,20 +2064,26 @@ impl MiniBlockScheduler {
                     ));
                 }
             };
-            let initialized_data = dictionary_cache
+            let shared_data = dictionary_cache
                 .entry(MiniBlockDictionaryCacheKey {
                     buffer_position_and_size: dictionary_buf_position_and_size,
                     encoding: dictionary_encoding.encode_to_vec(),
                     num_dictionary_items,
                 })
-                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .or_insert_with(|| {
+                    Arc::new(MiniBlockSharedDictionary {
+                        initialized_data: OnceCell::new(),
+                        scheduler_count: AtomicUsize::new(0),
+                    })
+                })
                 .clone();
+            shared_data.scheduler_count.fetch_add(1, Ordering::Relaxed);
             Some(MiniBlockSchedulerDictionary {
                 dictionary_decompressor,
                 dictionary_buf_position_and_size,
                 dictionary_data_alignment,
                 num_dictionary_items,
-                initialized_data,
+                shared_data,
             })
         } else {
             None
@@ -2616,12 +2633,27 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
         let base = self.buffer_offsets_and_sizes[1].0;
         let data_buf_size = self.buffer_offsets_and_sizes[1].1;
+        let dictionary_requires_separate_request = self.dictionary.as_ref().is_some_and(|dict| {
+            dict.shared_data.scheduler_count.load(Ordering::Relaxed) > 1
+                || dict.dictionary_buf_position_and_size.0 < meta_buf_position
+        });
         let mut bufs_needed = 1;
+        if self.dictionary.is_some() && !dictionary_requires_separate_request {
+            bufs_needed += 1;
+        }
         if self.repetition_index_depth > 0 {
             bufs_needed += 1;
         }
         let mut required_ranges = Vec::with_capacity(bufs_needed);
         required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
+        if let Some(dictionary) = self
+            .dictionary
+            .as_ref()
+            .filter(|_| !dictionary_requires_separate_request)
+        {
+            let (position, size) = dictionary.dictionary_buf_position_and_size;
+            required_ranges.push(position..position + size);
+        }
         if self.repetition_index_depth > 0 {
             let (rep_index_pos, rep_index_size) = self.buffer_offsets_and_sizes.last().unwrap();
             required_ranges.push(*rep_index_pos..*rep_index_pos + *rep_index_size);
@@ -2631,22 +2663,15 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let dictionary = self.dictionary.clone();
 
         async move {
-            let mut buffers = io_req.await?.into_iter().fuse();
-            let meta_bytes = buffers.next().unwrap();
-            let rep_index_bytes = buffers.next();
-
-            let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
-            let chunk_index = build_chunk_index(
-                &words,
-                self.items_in_page,
-                base,
-                data_buf_size,
-                rep_index_bytes.as_deref(),
-                self.repetition_index_depth,
-            )?;
-
-            let dictionary = if let Some(dictionary) = dictionary {
+            let shared_dictionary_fut = async {
+                let Some(dictionary) = dictionary
+                    .as_ref()
+                    .filter(|_| dictionary_requires_separate_request)
+                else {
+                    return Ok(None);
+                };
                 let initialized = dictionary
+                    .shared_data
                     .initialized_data
                     .get_or_try_init(|| async {
                         let (position, size) = dictionary.dictionary_buf_position_and_size;
@@ -2670,9 +2695,44 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                     })
                     .await?
                     .clone();
-                Some(initialized)
-            } else {
-                None
+                Ok(Some(initialized))
+            };
+            let (buffers, shared_dictionary) = futures::try_join!(io_req, shared_dictionary_fut)?;
+            let mut buffers = buffers.into_iter().fuse();
+            let meta_bytes = buffers.next().unwrap();
+            let inline_dictionary_bytes =
+                if dictionary.is_some() && !dictionary_requires_separate_request {
+                    buffers.next()
+                } else {
+                    None
+                };
+            let rep_index_bytes = buffers.next();
+
+            let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
+            let chunk_index = build_chunk_index(
+                &words,
+                self.items_in_page,
+                base,
+                data_buf_size,
+                rep_index_bytes.as_deref(),
+                self.repetition_index_depth,
+            )?;
+
+            let dictionary = match (shared_dictionary, dictionary) {
+                (Some(dictionary), _) => Some(dictionary),
+                (None, Some(dictionary)) => {
+                    let dictionary_data = inline_dictionary_bytes.ok_or_else(|| {
+                        Error::internal("Encoding I/O omitted a mini-block dictionary buffer")
+                    })?;
+                    Some(Arc::new(dictionary.dictionary_decompressor.decompress(
+                        LanceBuffer::from_bytes(
+                            dictionary_data,
+                            dictionary.dictionary_data_alignment,
+                        ),
+                        dictionary.num_dictionary_items,
+                    )?))
+                }
+                (None, None) => None,
             };
 
             let page_meta = Arc::new(MiniBlockCacheableState {
@@ -4107,7 +4167,7 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
-        dictionary_cache: &mut HashMap<MiniBlockDictionaryCacheKey, Arc<OnceCell<Arc<DataBlock>>>>,
+        dictionary_cache: &mut MiniBlockDictionaryCache,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
@@ -4221,7 +4281,7 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
-        dictionary_cache: &mut HashMap<MiniBlockDictionaryCacheKey, Arc<OnceCell<Arc<DataBlock>>>>,
+        dictionary_cache: &mut MiniBlockDictionaryCache,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
