@@ -146,9 +146,9 @@ impl<'a> InitializeMemWalBuilder<'a> {
     /// Set the base-table indexes to maintain in MemTables, replacing any
     /// previously set list.
     ///
-    /// Each name must reference an index that already exists on the dataset.
-    /// The primary key btree, when present, is maintained implicitly and must
-    /// not be listed.
+    /// Each name must reference an existing index the MemWAL can maintain;
+    /// [`execute`](Self::execute) enforces both. The primary key btree, when
+    /// present, is maintained implicitly and must not be listed.
     pub fn maintained_indexes<I, S>(mut self, indexes: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -190,8 +190,9 @@ impl<'a> InitializeMemWalBuilder<'a> {
 
     /// Initialize MemWAL on the dataset, committing the MemWAL system index.
     ///
-    /// Fails if any maintained index does not exist, if the selected sharding
-    /// configuration is invalid, or if MemWAL is already initialized.
+    /// Fails if any maintained index does not exist or cannot be maintained by
+    /// the MemWAL, if the selected sharding configuration is invalid, or if
+    /// MemWAL is already initialized.
     pub async fn execute(self) -> Result<()> {
         let Self {
             dataset,
@@ -204,19 +205,15 @@ impl<'a> InitializeMemWalBuilder<'a> {
         let (sharding_specs, num_shards) = resolve_sharding(dataset, sharding)?;
 
         let indices = dataset.load_indices().await?;
-        for index_name in &maintained_indexes {
-            if !indices.iter().any(|idx| &idx.name == index_name) {
-                return Err(Error::invalid_input(format!(
-                    "Index '{}' not found on dataset. maintained_indexes must reference existing indexes.",
-                    index_name
-                )));
-            }
-        }
         if indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
             return Err(Error::invalid_input(
                 "MemWAL is already initialized on this dataset.",
             ));
         }
+
+        // Gate the commit, not just a preflight a caller may skip: a set the
+        // writer cannot open leaves the table unwritable.
+        validate_maintained_indexes(dataset, &maintained_indexes).await?;
 
         let details = MemWalIndexDetails {
             num_shards,
@@ -702,7 +699,7 @@ async fn build_index_configs(
             .unwrap_or("");
 
         let kind = MemIndexKind::from_type_url(type_url)
-            .ok_or_else(|| unsupported_index_type(type_url))?;
+            .ok_or_else(|| unsupported_index_type(index_name, type_url))?;
 
         // Exhaustive: a new kind must be built here, or a maintained set could
         // name an index this writer cannot open, failing every memtable claim.
@@ -723,11 +720,11 @@ async fn build_index_configs(
 /// Whether the MemWAL can maintain `index_names` on `dataset`.
 ///
 /// Applies the same rules [`ShardWriter::open`] does, so a set that passes here
-/// is a set the writer can open. Call it before committing a maintained set: a
-/// type url alone cannot decide this — every vector sub-type maps to
-/// [`MemIndexKind::Hnsw`], but the memtable's HNSW needs a
-/// `FixedSizeList<Float32>` column — and committing an index that fails leaves
-/// a table whose every shard-writer open fails.
+/// is a set the writer can open. [`InitializeMemWalBuilder::execute`] runs it
+/// before committing; it is public so a caller inferring a set can ask the same
+/// question first. A type url alone cannot decide this — every vector sub-type
+/// maps to [`MemIndexKind::Hnsw`], but the memtable's HNSW needs a
+/// `FixedSizeList<Float32>` column.
 ///
 /// All-or-nothing: it reports the first index it cannot maintain rather than
 /// returning a usable subset, so a caller inferring a set surfaces the error
@@ -979,6 +976,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validate_maintained_indexes_rejects_unmaintainable_kind() {
+        // A bitmap index is a valid durable index the memtable cannot build.
+        // The error names it, so a caller validating a set knows which to drop.
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader =
+            RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1, 2, 3]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["v"],
+                IndexType::Bitmap,
+                Some("v_bitmap".to_string()),
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let error = validate_maintained_indexes(&dataset, &["v_bitmap".to_string()])
+            .await
+            .expect_err("the memtable cannot build a bitmap index");
+        assert!(
+            error.to_string().contains("v_bitmap"),
+            "the error must name the index: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_validate_maintained_indexes_rejects_unknown_name() {
         let tmp = tempfile::tempdir().unwrap();
         let uri = format!("{}/base", tmp.path().to_str().unwrap());
@@ -995,6 +1024,55 @@ mod tests {
             error.to_string().contains("not found"),
             "unexpected: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mem_wal_rejects_unmaintainable_index() {
+        // Initialization persists the set, so it must apply the writer's rules
+        // itself: a Float64 vector index committed here leaves the table unwritable.
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut dataset = dataset_with_vector_index(&uri, DataType::Float64).await;
+
+        let error = dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .maintained_indexes(["vector_idx"])
+            .execute()
+            .await
+            .expect_err("a Float64 vector column is not maintainable");
+        assert!(
+            error.to_string().contains("FixedSizeList<Float32>"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            dataset.mem_wal_index_details().await.unwrap().is_none(),
+            "a rejected maintained set must not be committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mem_wal_rejects_unknown_index_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let error = dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .maintained_indexes(["nope"])
+            .execute()
+            .await
+            .expect_err("maintained_indexes must reference existing indexes");
+        assert!(
+            error.to_string().contains("nope") && error.to_string().contains("not found"),
+            "unexpected error: {error}"
+        );
+        assert!(dataset.mem_wal_index_details().await.unwrap().is_none());
     }
 
     #[tokio::test]

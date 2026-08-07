@@ -460,11 +460,12 @@ impl MemIndexConfig {
     }
 }
 
-/// Shared by the detection and writer paths so both report the same thing.
-pub(crate) fn unsupported_index_type(type_url: &str) -> Error {
+/// Names the index, not just its type: a caller validating a maintained set
+/// needs to know which one to drop.
+pub(crate) fn unsupported_index_type(index_name: &str, type_url: &str) -> Error {
     Error::invalid_input(format!(
-        "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
-        type_url
+        "index '{}' has type {}, which the MemWAL cannot maintain. Supported: BTree, Inverted, Vector",
+        index_name, type_url
     ))
 }
 
