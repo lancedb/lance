@@ -97,6 +97,114 @@ fn count_fields(dtype: &Type) -> usize {
     }
 }
 
+fn count_fields_without_list_children(dtype: &Type) -> usize {
+    match dtype.kind.as_ref().unwrap() {
+        Kind::Struct(struct_type) => {
+            struct_type
+                .types
+                .iter()
+                .map(count_fields_without_list_children)
+                .sum::<usize>()
+                + 1
+        }
+        Kind::List(_) => 1,
+        _ => 1,
+    }
+}
+
+fn append_nested_field_names(
+    substrait_type: &Type,
+    arrow_type: &DataType,
+    names: &mut Vec<String>,
+) -> Result<()> {
+    match substrait_type.kind.as_ref().unwrap() {
+        Kind::Struct(substrait_struct) => {
+            let DataType::Struct(arrow_fields) = arrow_type else {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "the provided substrait schema contained a struct where the input schema contained {arrow_type}"
+                    )
+                    .into(),
+                ));
+            };
+            if substrait_struct.types.len() != arrow_fields.len() {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "the provided substrait struct had {} fields but the corresponding input struct had {} fields",
+                        substrait_struct.types.len(),
+                        arrow_fields.len()
+                    )
+                    .into(),
+                ));
+            }
+            for (substrait_field, arrow_field) in
+                substrait_struct.types.iter().zip(arrow_fields.iter())
+            {
+                names.push(arrow_field.name().to_string());
+                append_nested_field_names(substrait_field, arrow_field.data_type(), names)?;
+            }
+        }
+        Kind::List(substrait_list) => {
+            let (DataType::List(arrow_field) | DataType::LargeList(arrow_field)) = arrow_type
+            else {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "the provided substrait schema contained a list where the input schema contained {arrow_type}"
+                    )
+                    .into(),
+                ));
+            };
+            let substrait_element = substrait_list.r#type.as_ref().ok_or_else(|| {
+                Error::invalid_input_source(
+                    "the provided substrait schema contained a list without an element type".into(),
+                )
+            })?;
+            append_nested_field_names(substrait_element, arrow_field.data_type(), names)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn normalize_substrait_names(
+    substrait_schema: &NamedStruct,
+    arrow_schema: &ArrowSchema,
+) -> Result<Vec<String>> {
+    let fields = substrait_schema.r#struct.as_ref().unwrap();
+    let expected_names = fields.types.iter().map(count_fields).sum::<usize>();
+    if substrait_schema.names.len() == expected_names {
+        return Ok(substrait_schema.names.clone());
+    }
+
+    // PyArrow stops emitting names below list element types, while DataFusion's
+    // Substrait consumer requires the complete depth-first list of struct names.
+    let expected_pyarrow_names = fields
+        .types
+        .iter()
+        .map(count_fields_without_list_children)
+        .sum::<usize>();
+    if substrait_schema.names.len() != expected_pyarrow_names {
+        return Err(Error::invalid_input_source(
+            format!(
+                "the provided substrait schema had {} names but its types require either {} names or {} names when list children are omitted",
+                substrait_schema.names.len(),
+                expected_names,
+                expected_pyarrow_names
+            )
+            .into(),
+        ));
+    }
+
+    let mut names = Vec::with_capacity(expected_names);
+    let mut name_index = 0;
+    for (substrait_field, arrow_field) in fields.types.iter().zip(arrow_schema.fields().iter()) {
+        names.push(substrait_schema.names[name_index].clone());
+        append_nested_field_names(substrait_field, arrow_field.data_type(), &mut names)?;
+        name_index += count_fields_without_list_children(substrait_field);
+    }
+    Ok(names)
+}
+
 fn remove_extension_types(
     substrait_schema: &NamedStruct,
     arrow_schema: Arc<ArrowSchema>,
@@ -105,6 +213,7 @@ fn remove_extension_types(
     if fields.types.len() != arrow_schema.fields.len() {
         return Err(Error::invalid_input_source("the number of fields in the provided substrait schema did not match the number of fields in the input schema.".into()));
     }
+    let substrait_names = normalize_substrait_names(substrait_schema, arrow_schema.as_ref())?;
     let mut kept_substrait_fields = Vec::with_capacity(fields.types.len());
     let mut kept_arrow_fields = Vec::with_capacity(arrow_schema.fields.len());
     let mut index_mapping = HashMap::with_capacity(arrow_schema.fields.len());
@@ -123,7 +232,7 @@ fn remove_extension_types(
             _ => false,
         };
 
-        if !substrait_schema.names[field_index].starts_with("__unlikely_name_placeholder")
+        if !substrait_names[field_index].starts_with("__unlikely_name_placeholder")
             && !is_user_defined
         {
             kept_substrait_fields.push(substrait_field.clone());
@@ -136,7 +245,7 @@ fn remove_extension_types(
         field_index += num_fields;
     }
     let mut names = vec![String::new(); index_mapping.len()];
-    for (old_idx, old_name) in substrait_schema.names.iter().enumerate() {
+    for (old_idx, old_name) in substrait_names.iter().enumerate() {
         if let Some(new_idx) = index_mapping.get(&old_idx) {
             names[*new_idx] = old_name.clone();
         }
@@ -732,6 +841,45 @@ mod tests {
         ]);
 
         assert_substrait_roundtrip(schema, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_parse_substrait_with_pyarrow_list_struct_names() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            list_of_struct(
+                "items",
+                vec![
+                    Field::new("value", DataType::Float32, true),
+                    Field::new("label", DataType::Utf8, true),
+                ],
+            ),
+            Field::new("checkpoint", DataType::Int64, true),
+        ]));
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("checkpoint"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Int64(Some(0)), None)),
+        });
+
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let mut envelope = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        let base_schema = envelope.base_schema.as_mut().unwrap();
+        assert_eq!(
+            base_schema.names,
+            ["id", "items", "value", "label", "checkpoint"]
+        );
+
+        // PyArrow omits names nested beneath list element types.
+        base_schema.names = ["id", "items", "checkpoint"]
+            .map(ToString::to_string)
+            .to_vec();
+        let bytes = envelope.encode_to_vec();
+
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
+            .await
+            .unwrap();
+        assert_eq!(decoded, expr);
     }
 
     #[tokio::test]
