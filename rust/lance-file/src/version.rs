@@ -29,7 +29,7 @@ pub const fn next_file_version() -> ConcreteFileVersion {
 ///
 /// `Stable` and `Next` are release selectors. They resolve to an exact
 /// [`ConcreteFileVersion`] before file or dataset dispatch and are never persisted.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LanceFileVersion {
     /// The legacy v1 format.
     Legacy,

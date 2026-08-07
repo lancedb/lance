@@ -49,7 +49,7 @@ use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilt
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
+    LanceFileStatistics, LanceFileWriteSummary, LanceFileWriter, LancePageMetadata, stable_version,
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
@@ -76,6 +76,7 @@ pub(crate) mod mem_wal;
 pub(crate) mod namespace;
 pub(crate) mod otel;
 pub(crate) mod reader;
+pub(crate) mod rowids;
 pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
@@ -96,6 +97,7 @@ pub use dataset::write_dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
+use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 
 use crate::blob::{
@@ -259,6 +261,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FileFragment>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
+    m.add_class::<PyRowIdSequence>()?;
+    m.add_class::<PyRowIdSequenceIterator>()?;
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
@@ -268,6 +272,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
+    m.add_class::<LanceFileWriteSummary>()?;
     m.add_class::<LanceFileSession>()?;
     m.add_class::<LanceFileMetadata>()?;
     m.add_class::<LanceFileStatistics>()?;

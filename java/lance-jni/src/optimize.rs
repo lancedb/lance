@@ -17,7 +17,7 @@ use lance::dataset::{
 };
 
 use crate::{
-    RT,
+    block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::{
         FromJObjectWithEnv, IntoJava, export_vec, import_vec_from_method, import_vec_to_rust,
@@ -108,7 +108,7 @@ fn inner_plan_compaction<'local>(
     let plan = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(plan_compaction(&dataset.inner, &compaction_options))?
+        block_on(plan_compaction(&dataset.inner, &compaction_options))?
     };
     plan.into_java(env)
 }
@@ -197,7 +197,7 @@ fn inner_commit_compaction<'local>(
     let committed_metrics = {
         let mut dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(commit_compaction(
+        block_on(commit_compaction(
             &mut dataset.inner,
             completed_tasks,
             remap_options,
@@ -296,7 +296,7 @@ fn inner_execute_task<'local>(
     let rewrite_result = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(compaction_task.execute(&dataset.inner))?
+        block_on(compaction_task.execute(&dataset.inner))?
     };
     rewrite_result.into_java(env)
 }
@@ -312,6 +312,7 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
+const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
 const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
@@ -361,13 +362,20 @@ impl IntoJava for &CompactionOptions {
         let batch_size_opt = to_java_optional(env, batch_size)?;
         let defer_index_remap = to_java_boolean_obj(env, Some(self.defer_index_remap))?;
         let defer_index_remap_opt = to_java_optional(env, defer_index_remap)?;
-        let compaction_mode_str = self.compaction_mode.as_ref().map(|mode| match mode {
-            CompactionMode::Reencode => "reencode",
-            CompactionMode::TryBinaryCopy => "try_binary_copy",
-            CompactionMode::ForceBinaryCopy => "force_binary_copy",
-        });
-        let compaction_mode_obj = match compaction_mode_str {
-            Some(s) => env.new_string(s)?.into(),
+        let compaction_mode_obj = match self.compaction_mode {
+            Some(mode) => {
+                let name = match mode {
+                    CompactionMode::Reencode => "REENCODE",
+                    CompactionMode::TryBinaryCopy => "TRY_BINARY_COPY",
+                    CompactionMode::ForceBinaryCopy => "FORCE_BINARY_COPY",
+                };
+                env.get_static_field(
+                    COMPACTION_MODE_CLASS,
+                    name,
+                    format!("L{};", COMPACTION_MODE_CLASS),
+                )?
+                .l()?
+            }
             None => JObject::null(),
         };
         let compaction_mode_opt = to_java_optional(env, compaction_mode_obj)?;

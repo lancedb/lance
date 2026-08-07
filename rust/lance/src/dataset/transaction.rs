@@ -16,6 +16,7 @@ use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+use crate::index::index_results_are_row_addrs;
 use crate::index::mem_wal::update_mem_wal_index_compacted_sstables;
 use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
@@ -25,6 +26,7 @@ use lance_core::datatypes::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::ConcreteFileVersion};
+
 use lance_index::mem_wal::CompactedSsTable;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
@@ -38,6 +40,7 @@ use lance_table::{
     },
     io::{
         commit::CommitHandler,
+        deletion::relative_deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
     rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
@@ -332,6 +335,16 @@ pub enum Operation {
     },
     /// Overwrite the entire dataset with the given fragments. This is also
     /// used when initially creating a table.
+    ///
+    /// The fragments are newly written ones and are assigned fresh ids at commit
+    /// time, continuing from the dataset's highest id ever used; the ids they
+    /// arrive with are ignored.
+    ///
+    /// A fragment carrying a deletion file is rejected. A deletion file's path
+    /// embeds the fragment id, so it cannot follow its fragment to the new id:
+    /// minting a fragment and giving it a deletion file are mutually exclusive in
+    /// one transaction. Use [`Self::Delete`] to commit deletions against existing
+    /// fragments, or [`Self::Merge`] to change their schema.
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
@@ -1742,7 +1755,7 @@ impl Transaction {
         if let Some(file_version) = Fragment::try_infer_version(fragments)? {
             // Ensure user-requested matches data files
             if let Some(user_requested) = user_requested
-                && user_requested != file_version
+                && ConcreteFileVersion::from(user_requested) != file_version
             {
                 return Err(Error::invalid_input(format!(
                     "User requested data storage version ({}) does not match version in data files ({})",
@@ -1753,6 +1766,7 @@ impl Transaction {
         } else {
             // If no files use user-requested or default
             Ok(user_requested
+                .map(ConcreteFileVersion::from)
                 .map(DataStorageFormat::new)
                 .unwrap_or_default())
         }
@@ -1847,14 +1861,14 @@ impl Transaction {
             }
         };
 
-        let mut fragment_id = if matches!(self.operation, Operation::Overwrite { .. }) {
-            0
-        } else {
-            current_manifest
-                .and_then(|m| m.max_fragment_id())
-                .map(|id| id + 1)
-                .unwrap_or(0)
-        };
+        // Fragment ids are a high water mark for the whole dataset history: an id
+        // must never name two different sets of rows, or per-fragment state keyed
+        // by id (caches, deletion files, row addresses) can be attributed to the
+        // wrong rows.
+        let mut fragment_id = current_manifest
+            .and_then(|m| m.max_fragment_id())
+            .map(|id| id + 1)
+            .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
 
@@ -1914,13 +1928,15 @@ impl Transaction {
                 ..
             } => {
                 // Remove the deleted fragments
+                // Hash lookups keep this linear on tables with many fragments.
+                let deleted_ids: HashSet<u64> = deleted_fragment_ids.iter().copied().collect();
+                let updated_by_id: HashMap<u64, &Fragment> =
+                    updated_fragments.iter().map(|f| (f.id, f)).collect();
                 final_fragments.extend(maybe_existing_fragments?.clone());
-                final_fragments.retain(|f| !deleted_fragment_ids.contains(&f.id));
+                final_fragments.retain(|f| !deleted_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
-                    for updated in updated_fragments {
-                        if updated.id == f.id {
-                            *f = updated.clone();
-                        }
+                    if let Some(updated) = updated_by_id.get(&f.id) {
+                        *f = (*updated).clone();
                     }
                 });
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
@@ -1940,13 +1956,20 @@ impl Transaction {
                 let existing_fragments = maybe_existing_fragments?;
 
                 // Apply updates to existing fragments
+                // Hash lookups keep this linear on tables with many fragments.
+                let removed_ids: HashSet<u64> = removed_fragment_ids.iter().copied().collect();
+                let mut updated_by_id: HashMap<u64, &Fragment> =
+                    HashMap::with_capacity(updated_fragments.len());
+                for fragment in updated_fragments {
+                    updated_by_id.entry(fragment.id).or_insert(fragment);
+                }
                 let updated_frags: Vec<Fragment> = existing_fragments
                     .iter()
                     .filter_map(|f| {
-                        if removed_fragment_ids.contains(&f.id) {
+                        if removed_ids.contains(&f.id) {
                             return None;
                         }
-                        if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
+                        if let Some(&updated) = updated_by_id.get(&f.id) {
                             let mut updated = updated.clone();
                             // Carry forward the fragment's current overlays (which
                             // may include ones added by a concurrent commit). An
@@ -2047,9 +2070,14 @@ impl Transaction {
 
                     // The original fragments that carried an overlay: their moved rows may have a
                     // stale index entry (see `register_pure_rewrite_rows_update_frags_in_indices`).
+                    // Reuse the hash lookups built above instead of scanning
+                    // `original_fragment_ids` per fragment.
                     let original_overlaid_frags: HashMap<u32, &Fragment> = existing_fragments
                         .iter()
-                        .filter(|f| original_fragment_ids.contains(&f.id) && !f.overlays.is_empty())
+                        .filter(|f| {
+                            (removed_ids.contains(&f.id) || updated_by_id.contains_key(&f.id))
+                                && !f.overlays.is_empty()
+                        })
                         .map(|f| (f.id as u32, f))
                         .collect();
 
@@ -2084,9 +2112,16 @@ impl Transaction {
                 }
             }
             Operation::Overwrite { fragments, .. } => {
-                let mut new_fragments =
-                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                // Every fragment in an overwrite is newly written, so all of them
+                // take fresh ids regardless of the id they arrive with. Fragments
+                // carried over from the dataset being replaced are rejected by
+                // `validate_operation`, which is what makes ignoring the incoming
+                // id safe here.
+                let mut new_fragments = fragments.clone();
+                for fragment in new_fragments.iter_mut() {
+                    fragment.id = fragment_id;
+                    fragment_id += 1;
+                }
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -2118,9 +2153,21 @@ impl Transaction {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
+                        let results_are_row_addrs = index_results_are_row_addrs(index);
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap =
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
+                            *fragment_bitmap = if results_are_row_addrs {
+                                // Stable row ids survive a rewrite, so a row-id-domain index
+                                // can simply follow its data to the new fragments. An
+                                // address-domain index cannot: its stored addresses point into
+                                // the fragments the rewrite dropped. Claiming coverage of the
+                                // new fragments would make it answer queries with addresses
+                                // that no longer resolve, so drop the rewritten fragments from
+                                // its coverage instead and let the scanner fall back to a full
+                                // scan for them.
+                                Self::drop_rewritten_fragments(fragment_bitmap, groups)
+                            } else {
+                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?
+                            };
                         }
                     }
                 } else {
@@ -2310,6 +2357,7 @@ impl Transaction {
                     // given so every field (including base_id) is preserved.
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
                         new_file.file_version()?;
+
                         new_frag.files.push(new_file.clone());
                     }
 
@@ -2352,6 +2400,22 @@ impl Transaction {
                     .filter(|f| fragments_changed.contains(&f.id))
                     .cloned()
                     .collect();
+
+                // A replacement changes what its rows read as, so stamp them
+                // updated. Without this, get_updated_rows never reports them and
+                // an incremental consumer skips them for good.
+                if next_row_id.is_some() {
+                    let new_version = current_manifest.map_or(1, |m| m.version + 1);
+                    for fragment in final_fragments
+                        .iter_mut()
+                        .filter(|f| fragments_changed.contains(&f.id))
+                    {
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                            fragment,
+                            new_version,
+                        )?;
+                    }
+                }
 
                 Self::prune_updated_fields_from_indices(
                     &mut final_indices,
@@ -2454,7 +2518,8 @@ impl Transaction {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+                prev_manifest.data_storage_format =
+                    DataStorageFormat::new(ConcreteFileVersion::from(user_requested_version));
             }
 
             prev_manifest
@@ -2688,6 +2753,11 @@ impl Transaction {
             .collect::<HashSet<_>>();
 
         for index in indices.iter_mut() {
+            // Physical row addresses cannot follow moved rows into a new fragment.
+            // Leave that fragment uncovered so the scanner reads it directly.
+            if index_results_are_row_addrs(index) {
+                continue;
+            }
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
                 value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
             });
@@ -2734,7 +2804,7 @@ impl Transaction {
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
     /// that fragment from any indices that cover one of the modified fields.
-    fn prune_updated_fields_from_indices(
+    pub(crate) fn prune_updated_fields_from_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],
@@ -2864,14 +2934,6 @@ impl Transaction {
         }
     }
 
-    fn is_vector_index(index: &IndexMetadata) -> bool {
-        if let Some(details) = &index.index_details {
-            details.type_url.ends_with("VectorIndexDetails")
-        } else {
-            false
-        }
-    }
-
     /// Remove data files that only contain tombstoned fields (-2)
     /// These files no longer contain any live data and can be safely dropped
     fn remove_tombstoned_data_files(fragments: &mut [Fragment]) {
@@ -2942,15 +3004,19 @@ impl Transaction {
                     });
 
                 if non_empty_indices.is_empty() {
-                    // All indices are empty - for scalar indices, keep only the first (oldest) one
-                    // For vector indices, remove all of them
+                    // All indices are empty -- keep only the oldest definition.
+                    //
+                    // An empty index definition is still correct: the scanner
+                    // falls back to scanning unindexed fragments, and normal
+                    // index maintenance rebuilds coverage once rows accrue.
+                    // Dropping the definition instead would silently lose the
+                    // index whenever an operation replaces every fragment it
+                    // covered (e.g. a full table rewrite), leaving the dataset
+                    // without its declared index.
                     let mut sorted_indices = empty_indices;
                     sorted_indices.sort_by_key(|index: &&IndexMetadata| index.dataset_version); // Sort by ascending dataset_version
 
-                    // Keep only the first (oldest) if it's not a vector index
-                    if let Some(oldest) = sorted_indices.first()
-                        && !Self::is_vector_index(oldest)
-                    {
+                    if let Some(oldest) = sorted_indices.first() {
                         uuids_to_keep.insert(oldest.uuid);
                     }
                 } else {
@@ -2960,18 +3026,10 @@ impl Transaction {
                     }
                 }
             } else {
-                // Single index - keep it unless it's an empty vector index
+                // Single index whose column is still in schema: keep it, even
+                // when its coverage is empty (see the all-empty note above).
                 if let Some(index) = same_name_indices.first() {
-                    let is_empty = index
-                        .effective_fragment_bitmap(&existing_fragments)
-                        .as_ref()
-                        .is_none_or(|bitmap| bitmap.is_empty());
-                    let is_vector = Self::is_vector_index(index);
-
-                    // Keep the index unless it's an empty vector index
-                    if !is_empty || !is_vector {
-                        uuids_to_keep.insert(index.uuid);
-                    }
+                    uuids_to_keep.insert(index.uuid);
                 }
             }
         }
@@ -3014,6 +3072,18 @@ impl Transaction {
             }
         }
         Ok(new_bitmap)
+    }
+
+    /// Coverage of an index that a rewrite invalidates: the rewritten fragments are
+    /// removed and the fragments they became are *not* added.
+    fn drop_rewritten_fragments(old: &RoaringBitmap, groups: &[RewriteGroup]) -> RoaringBitmap {
+        let mut new_bitmap = old.clone();
+        for group in groups {
+            for old_fragment in &group.old_fragments {
+                new_bitmap.remove(old_fragment.id as u32);
+            }
+        }
+        new_bitmap
     }
 
     fn handle_rewrite_indices(
@@ -3197,7 +3267,7 @@ impl Transaction {
                         let combined_sequence = RowIdSequence::from(row_ids.as_slice());
 
                         let serialized = write_row_ids(&combined_sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                         *next_row_id += remaining_rows;
                     }
                     Ordering::Greater => {
@@ -3213,7 +3283,7 @@ impl Transaction {
                 let sequence = RowIdSequence::from(row_ids);
                 // TODO: write to a separate file if large. Possibly share a file with other fragments.
                 let serialized = write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                 *next_row_id += physical_rows;
             }
         }
@@ -3929,6 +3999,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             },
         ) => {
             // Validate here because we are going to return early.
+            overwrite_fragments_valid(fragments)?;
             schema_fragments_valid(None, schema, fragments)?;
 
             return Ok(());
@@ -3956,11 +4027,9 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
-            fragments,
-            schema,
-            config_upsert_values: None,
-            initial_bases: _,
+            fragments, schema, ..
         } => {
+            overwrite_fragments_valid(fragments)?;
             // Pass None for manifest because Overwrite replaces all fragments.
             // The old manifest's storage format is irrelevant for validating
             // the new fragments (e.g., LEGACY→STABLE transitions).
@@ -3976,6 +4045,25 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         }
         _ => Ok(()),
     }
+}
+
+// An overwrite's fragments are newly written, so they are given fresh ids at
+// commit time. A deletion file cannot come along for that ride: its path embeds
+// the fragment id, so renumbering the fragment would orphan the deletion vector
+// and silently resurrect deleted rows.
+fn overwrite_fragments_valid(fragments: &[Fragment]) -> Result<()> {
+    for fragment in fragments {
+        if let Some(deletion_file) = &fragment.deletion_file {
+            return Err(Error::invalid_input(format!(
+                "Overwrite fragments must be newly written, but fragment {} carries \
+                 deletion file {}. Use Delete to commit deletions against existing \
+                 fragments, or Merge to change their schema.",
+                fragment.id,
+                relative_deletion_file_path(fragment.id, deletion_file)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn schema_fragments_valid(
@@ -4146,10 +4234,14 @@ mod tests {
     use crate::session::Session;
 
     fn sample_manifest() -> Manifest {
+        sample_manifest_with_fragments(0..1)
+    }
+
+    fn sample_manifest_with_fragments(ids: std::ops::Range<u64>) -> Manifest {
         let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
         Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
-            Arc::new(vec![Fragment::new(0)]),
+            Arc::new(ids.map(Fragment::new).collect()),
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
@@ -4376,6 +4468,88 @@ mod tests {
     }
 
     #[test]
+    fn test_update_build_manifest_replaces_and_removes_fragments() {
+        let manifest = sample_manifest_with_fragments(0..5);
+
+        let mut updated2 = Fragment::new(2);
+        updated2.physical_rows = Some(42);
+        let mut updated4 = Fragment::new(4);
+        updated4.physical_rows = Some(43);
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![1],
+                // Fragment 99 does not exist in the dataset; it must be ignored,
+                // not appended.
+                updated_fragments: vec![updated2, updated4, Fragment::new(99)],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![0, 2, 3, 4]);
+        let rows: Vec<Option<usize>> = new_manifest
+            .fragments
+            .iter()
+            .map(|f| f.physical_rows)
+            .collect();
+        assert_eq!(rows, vec![None, Some(42), None, Some(43)]);
+    }
+
+    #[test]
+    fn test_delete_build_manifest_replaces_and_removes_fragments() {
+        let manifest = sample_manifest_with_fragments(0..5);
+
+        let mut updated2 = Fragment::new(2);
+        updated2.physical_rows = Some(42);
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Delete {
+                updated_fragments: vec![updated2],
+                deleted_fragment_ids: vec![1, 3],
+                predicate: "id > 0".to_string(),
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![0, 2, 4]);
+        let rows: Vec<Option<usize>> = new_manifest
+            .fragments
+            .iter()
+            .map(|f| f.physical_rows)
+            .collect();
+        assert_eq!(rows, vec![None, Some(42), None]);
+    }
+
+    #[test]
     fn test_remove_tombstoned_data_files() {
         // Create a fragment with mixed data files: some normal, some fully tombstoned
         let mut fragment = Fragment::new(1);
@@ -4474,7 +4648,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50),
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4507,7 +4681,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50), // More physical rows than existing row IDs
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4543,7 +4717,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50), // Less physical rows than existing row IDs
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4582,7 +4756,7 @@ mod tests {
             Fragment {
                 id: 2,
                 physical_rows: Some(25), // Partial existing row IDs
-                row_id_meta: Some(RowIdMeta::Inline(serialized)),
+                row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
@@ -4799,7 +4973,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retain_single_empty_vector_index() {
+    fn test_retain_single_empty_vector_index_is_kept() {
         let schema = create_test_schema(&[1]);
         let fragments = vec![Fragment::new(1)];
 
@@ -4813,8 +4987,9 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        // Single empty vector index should be removed
-        assert_eq!(indices.len(), 0);
+        // The empty definition is retained: coverage is empty but the index
+        // declaration must survive operations that replace every fragment.
+        assert_eq!(indices.len(), 1);
     }
 
     #[test]
@@ -4857,9 +5032,10 @@ mod tests {
         Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
         Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
 
-        // Scalar should be kept, vector should be removed
+        // Both kept: a None bitmap counts as empty coverage, and empty
+        // definitions are retained regardless of index type.
         assert_eq!(scalar_indices.len(), 1);
-        assert_eq!(vector_indices.len(), 0);
+        assert_eq!(vector_indices.len(), 1);
     }
 
     #[test]
@@ -4881,7 +5057,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retain_multiple_empty_vector_indices_removes_all() {
+    fn test_retain_multiple_empty_vector_indices_keeps_oldest() {
         let schema = create_test_schema(&[1]);
         let fragments = vec![Fragment::new(1)];
 
@@ -4893,8 +5069,10 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        // All empty vector indices should be removed
-        assert_eq!(indices.len(), 0);
+        // Same as the scalar case: all deltas are empty, so only the oldest
+        // definition survives.
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 1);
     }
 
     #[test]
@@ -4987,10 +5165,10 @@ mod tests {
         Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
         Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
 
-        // Scalar should be kept (single index, even if effective bitmap is empty)
-        // Vector should be removed (empty effective bitmap)
+        // Both kept: a single index whose column is still in schema is
+        // retained even when its effective coverage is empty.
         assert_eq!(scalar_indices.len(), 1);
-        assert_eq!(vector_indices.len(), 0);
+        assert_eq!(vector_indices.len(), 1);
     }
 
     #[test]
@@ -5006,11 +5184,12 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        // idx_a (empty scalar) should be kept, idx_b (empty vector) removed, idx_c (non-empty) kept
-        assert_eq!(indices.len(), 2);
+        // All three kept: empty definitions are retained for scalar and
+        // vector indexes alike.
+        assert_eq!(indices.len(), 3);
         assert!(indices.iter().any(|idx| idx.name == "idx_a"));
+        assert!(indices.iter().any(|idx| idx.name == "idx_b"));
         assert!(indices.iter().any(|idx| idx.name == "idx_c"));
-        assert!(!indices.iter().any(|idx| idx.name == "idx_b"));
     }
 
     #[test]
@@ -5038,7 +5217,10 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        assert_eq!(indices.len(), 0);
+        // Only the bad-field index is dropped; the empty vector definitions
+        // are retained.
+        assert_eq!(indices.len(), 2);
+        assert!(!indices.iter().any(|idx| idx.name == "idx3"));
     }
 
     #[test]
@@ -5053,7 +5235,7 @@ mod tests {
             create_test_index("idx_a", 1, 3, Some(RoaringBitmap::new()), false),
             create_test_index("idx_a", 1, 1, Some(RoaringBitmap::new()), false), // Oldest
             create_test_index("idx_a", 1, 2, Some(RoaringBitmap::new()), false),
-            // Group "vec_b" - all empty vectors, remove all
+            // Group "vec_b" - all empty vectors, keep oldest definition
             create_test_index("vec_b", 1, 1, Some(RoaringBitmap::new()), true),
             create_test_index("vec_b", 1, 2, Some(RoaringBitmap::new()), true),
             // Group "idx_c" - mixed empty/non-empty, keep non-empty
@@ -5068,8 +5250,9 @@ mod tests {
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        // Expected: frag_reuse, idx_a (oldest), idx_c (2 non-empty), idx_d = 5 total
-        assert_eq!(indices.len(), 5);
+        // Expected: frag_reuse, idx_a (oldest), vec_b (oldest), idx_c (2
+        // non-empty), idx_d = 6 total
+        assert_eq!(indices.len(), 6);
 
         // Verify system index kept
         assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
@@ -5079,8 +5262,10 @@ mod tests {
         assert_eq!(idx_a_indices.len(), 1);
         assert_eq!(idx_a_indices[0].dataset_version, 1);
 
-        // Verify vec_b all removed
-        assert!(!indices.iter().any(|idx| idx.name == "vec_b"));
+        // Verify vec_b kept oldest definition only
+        let vec_b_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "vec_b").collect();
+        assert_eq!(vec_b_indices.len(), 1);
+        assert_eq!(vec_b_indices[0].dataset_version, 1);
 
         // Verify idx_c kept non-empty only
         let idx_c_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_c").collect();
@@ -5129,7 +5314,7 @@ mod tests {
     #[test]
     fn test_partial_rewrite_skips_fragment_with_no_version_meta() {
         let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let data_file = DataFile::new(
             "data.lance",
@@ -5507,7 +5692,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         let row_ids = RowIdSequence::from([100u64, 101, 102, 103, 104].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let prev_fragment = Fragment {
             id: 0,
@@ -5583,7 +5768,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         let row_ids = RowIdSequence::from([200u64, 201, 202, 203, 204].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let uniform_v1 = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
         let meta_v1 = RowDatasetVersionMeta::from_sequence(&uniform_v1).unwrap();
@@ -5744,7 +5929,7 @@ mod tests {
             files: vec![mk_file("existing.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0).into())),
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -5767,7 +5952,7 @@ mod tests {
             files: vec![mk_file("new.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1).into())),
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -5830,7 +6015,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
@@ -5844,7 +6029,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -5887,7 +6072,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq).into())),
                 physical_rows: Some(2),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
@@ -5899,7 +6084,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
@@ -5915,7 +6100,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -5957,7 +6142,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
@@ -5972,7 +6157,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6017,7 +6202,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
@@ -6031,7 +6216,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(4),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6065,7 +6250,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6077,7 +6262,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6106,7 +6291,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6148,7 +6333,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(RowDatasetVersionMeta::Inline(Arc::from(
                 vec![0xFFu8; 8].as_slice(),
@@ -6162,7 +6347,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6204,7 +6389,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
@@ -6225,7 +6410,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
@@ -6240,7 +6425,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6279,7 +6464,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
             last_updated_at_version_meta: None,
@@ -6292,7 +6477,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6341,7 +6526,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
@@ -6356,7 +6541,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6404,7 +6589,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
@@ -6416,7 +6601,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
@@ -6432,7 +6617,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,

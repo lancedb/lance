@@ -54,7 +54,7 @@ impl ArrayFieldEncodingStrategy {
     /// Create the field strategy for the `pb::ArrayEncoding` grammar.
     ///
     /// ```
-    /// use lance_encoding::array_encoding::ArrayFieldEncodingStrategy;
+    /// use lance_encoding::encoder::ArrayFieldEncodingStrategy;
     ///
     /// let strategy = ArrayFieldEncodingStrategy::new();
     /// ```

@@ -111,6 +111,11 @@ public class TestUtils {
     }
 
     public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      return createNewFragment(
+          rowCount, new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+    }
+
+    public List<FragmentMetadata> createNewFragment(int rowCount, WriteParams writeParams) {
       List<FragmentMetadata> fragmentMetas;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
         root.allocateNew();
@@ -124,12 +129,7 @@ public class TestUtils {
         }
         root.setRowCount(rowCount);
 
-        fragmentMetas =
-            Fragment.create(
-                datasetPath,
-                allocator,
-                root,
-                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+        fragmentMetas = Fragment.create(datasetPath, allocator, root, writeParams);
       }
       return fragmentMetas;
     }

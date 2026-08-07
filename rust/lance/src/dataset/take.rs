@@ -299,7 +299,10 @@ async fn do_take_rows(
                 .or_insert_with(|| vec![offset]);
         });
 
-        let fragments = builder.dataset.get_fragments();
+        let addressed_ids: Vec<u32> = row_addrs_per_fragment.keys().copied().collect();
+        let fragments = builder
+            .dataset
+            .get_existing_fragments_from_ids(&addressed_ids);
         let fragment_and_indices = fragments.into_iter().filter_map(|f| {
             let row_offset = row_addrs_per_fragment.remove(&(f.id() as u32))?;
             Some((f, row_offset))

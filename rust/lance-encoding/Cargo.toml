@@ -32,7 +32,6 @@ num-traits.workspace = true
 prost.workspace = true
 hyperloglogplus.workspace = true
 rand.workspace = true
-strum = { workspace =true, features = ["derive"] }
 tokio.workspace = true
 tracing.workspace = true
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

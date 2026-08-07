@@ -618,6 +618,15 @@ mod tests {
             fn type_name() -> &'static str {
                 "Vec<u8>"
             }
+            fn stable_type_id() -> &'static str {
+                "lance.scalar.lance-format.Blob"
+            }
+            fn schema() -> lance_core::cache::CacheKeySchema {
+                lance_core::cache::CacheKeySchema::new("lance.scalar.lance-format.blob-key", 1)
+            }
+            fn write_key(&self, builder: &mut lance_core::cache::KeyBuilder) {
+                builder.write_variant(0);
+            }
         }
 
         let index_dir = TempDir::default();

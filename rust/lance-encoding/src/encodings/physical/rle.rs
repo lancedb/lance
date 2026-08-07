@@ -63,7 +63,7 @@ use crate::data::DataBlock;
 use crate::data::{BlockInfo, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor,
+    MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::encodings::physical::block::{CompressionConfig, GeneralBufferCompressor};
 use crate::format::ProtobufUtils21;
@@ -1036,7 +1036,11 @@ impl RleChildCandidate {
 }
 
 impl MiniBlockCompressor for RleEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 let num_values = fixed_width.num_values;
@@ -1552,6 +1556,12 @@ impl MiniBlockDecompressor for RleDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         self.decode_data(data, num_values, true)
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl BlockDecompressor for RleDecompressor {
@@ -1853,6 +1863,13 @@ mod tests {
     use arrow_array::Int32Array;
     use rstest::rstest;
 
+    fn compress_miniblock(
+        compressor: &dyn MiniBlockCompressor,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+        compressor.compress(MiniBlockCompressionContext::new(0, true, true), data)
+    }
+
     fn expand_u16_runs(runs: &RleRuns) -> Vec<u16> {
         let mut expanded = Vec::with_capacity(runs.num_values());
         for (value, length) in runs.iter() {
@@ -2035,7 +2052,7 @@ mod tests {
         let array = Int32Array::from(vec![1, 1, 1, 2, 2, 3, 3, 3, 3]);
         let data_block = DataBlock::from_array(array);
 
-        let (compressed, _) = MiniBlockCompressor::compress(&encoder, data_block).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, data_block).unwrap();
 
         assert_eq!(compressed.num_values, 9);
         assert_eq!(compressed.chunks.len(), 1);
@@ -2056,8 +2073,7 @@ mod tests {
         data.extend(&[100i32; 300]); // Will be split into 255+45
 
         let array = Int32Array::from(data);
-        let (compressed, _) =
-            MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
         // Should have 6 runs total (4 for first value, 2 for second)
         let lengths_buffer = &compressed.data[1];
@@ -2071,7 +2087,7 @@ mod tests {
         let data = vec![42i32; 1000];
         let array = Int32Array::from(data);
         let (compressed, encoding) =
-            MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+            compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
         assert_eq!(compressed.data[0].len(), 4);
         assert_eq!(compressed.data[1].len(), 2);
@@ -2112,7 +2128,7 @@ mod tests {
             RleEncoder::with_child_encoding(RunLengthWidth::U8, Some(compression), None, false);
         let array = Int32Array::from(repeating_runs(1024, 4));
         let (compressed, encoding) =
-            MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+            compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
         let rle = expect_rle(&encoding);
         assert!(matches!(
@@ -2145,7 +2161,7 @@ mod tests {
         let encoder =
             RleEncoder::with_child_encoding(RunLengthWidth::U8, None, Some(compression), false);
         let expected = repeating_runs(1024, 4);
-        let (compressed, encoding) = MiniBlockCompressor::compress(
+        let (compressed, encoding) = compress_miniblock(
             &encoder,
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -2181,7 +2197,7 @@ mod tests {
         use crate::encodings::physical::bitpacking::OutOfLineBitpacking;
 
         let expected = repeating_runs(1024, 4);
-        let (compressed, _) = MiniBlockCompressor::compress(
+        let (compressed, _) = compress_miniblock(
             &RleEncoder::new(),
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -2275,7 +2291,7 @@ mod tests {
             false,
         );
         let expected = repeating_runs(8192, 4);
-        let (compressed, encoding) = MiniBlockCompressor::compress(
+        let (compressed, encoding) = compress_miniblock(
             &encoder,
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -2306,7 +2322,7 @@ mod tests {
     fn test_rle_miniblock_bitpacks_values_child_when_smaller() {
         let encoder = RleEncoder::with_child_encoding(RunLengthWidth::U8, None, None, true);
         let expected = monotonic_runs(2048, 4);
-        let (compressed, encoding) = MiniBlockCompressor::compress(
+        let (compressed, encoding) = compress_miniblock(
             &encoder,
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -2336,7 +2352,7 @@ mod tests {
     fn test_rle_miniblock_bitpacks_run_lengths_when_values_do_not_shrink() {
         let encoder = RleEncoder::with_child_encoding(RunLengthWidth::U8, None, None, true);
         let expected = high_entropy_runs(2048, 4);
-        let (compressed, encoding) = MiniBlockCompressor::compress(
+        let (compressed, encoding) = compress_miniblock(
             &encoder,
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -2464,7 +2480,7 @@ mod tests {
             block_info: BlockInfo::default(),
         });
 
-        let (compressed, _) = MiniBlockCompressor::compress(&encoder, block).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, block).unwrap();
         let decompressor = RleDecompressor::new(bits_per_value);
         let decompressed = MiniBlockDecompressor::decompress(
             &decompressor,
@@ -2498,7 +2514,7 @@ mod tests {
 
             let array = Int32Array::from(data);
             let (compressed, _) =
-                MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+                compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
             // Verify all non-last chunks have power-of-2 values
             for (i, chunk) in compressed.chunks.iter().enumerate() {
@@ -2737,7 +2753,7 @@ mod tests {
             block_info: BlockInfo::default(),
         });
 
-        let (compressed, _) = MiniBlockCompressor::compress(&encoder, empty_block).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, empty_block).unwrap();
         assert_eq!(compressed.num_values, 0);
         assert!(compressed.data.is_empty());
 
@@ -2771,8 +2787,7 @@ mod tests {
         data.extend(vec![777i32; 2000]);
 
         let array = Int32Array::from(data.clone());
-        let (compressed, _) =
-            MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
         // Manually decompress all chunks
         let mut reconstructed = Vec::new();
@@ -2885,7 +2900,7 @@ mod tests {
             // Compress the data
             let array = Int32Array::from(data.clone());
             let (compressed, _) =
-                MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+                compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
             // Decompress and verify
             match MiniBlockDecompressor::decompress(
@@ -2955,7 +2970,7 @@ mod tests {
             block_info: BlockInfo::default(),
         });
 
-        let (compressed, _) = MiniBlockCompressor::compress(&encoder, block).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, block).unwrap();
 
         // Debug first few chunks
         for (i, chunk) in compressed.chunks.iter().take(5).enumerate() {

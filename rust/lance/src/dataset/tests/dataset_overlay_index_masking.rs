@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 
+use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
@@ -18,7 +19,8 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::scalar::inverted::InvertedIndexParams;
+use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
+use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use lance_table::format::DataFile;
@@ -34,6 +36,8 @@ use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
+use crate::io::exec::filtered_read::FilteredReadExec;
+use crate::io::exec::fts::FlatMatchQueryExec;
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -109,6 +113,7 @@ async fn commit_overlay(
         FileWriterOptions::default(),
     )
     .unwrap();
+
     for (i, array) in columns.into_iter().enumerate() {
         writer.write_column(i, array).await.unwrap();
     }
@@ -187,6 +192,17 @@ fn ids_from_batches(batches: &[RecordBatch]) -> Vec<i32> {
 
 fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
     Arc::new(Int32Array::from_iter(values))
+}
+
+fn string_lists(rows: &[&[&str]]) -> ArrayRef {
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    for row in rows {
+        for value in *row {
+            builder.values().append_value(value);
+        }
+        builder.append(true);
+    }
+    Arc::new(builder.finish())
 }
 
 fn fsl(rows: Vec<Vec<f32>>, dim: i32) -> ArrayRef {
@@ -714,7 +730,7 @@ async fn test_update_nonindexed_column_preserves_overlay_masking() {
 
 /// Text dataset: two fragments, 6 rows each. Schema: id (Int32), text (Utf8).
 /// Texts are unique tokens so each row can be identified by its term.
-async fn create_text_dataset() -> Dataset {
+async fn create_text_dataset(stable_row_ids: bool) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, true),
         ArrowField::new("text", DataType::Utf8, true),
@@ -743,6 +759,7 @@ async fn create_text_dataset() -> Dataset {
     .unwrap();
     let write_params = WriteParams {
         max_rows_per_file: 6,
+        enable_stable_row_ids: stable_row_ids,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -803,7 +820,7 @@ async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
 
 #[tokio::test]
 async fn test_ngram_optimize_preserves_overlay_staleness() {
-    let mut dataset = create_text_dataset().await;
+    let mut dataset = create_text_dataset(false).await;
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
     let fragment_ids = dataset
         .get_fragments()
@@ -896,7 +913,7 @@ async fn test_btree_physical_merge_preserves_overlay_staleness() {
 
 #[tokio::test]
 async fn test_ngram_remap_excludes_newer_overlay_fragments() {
-    let mut dataset = create_text_dataset().await;
+    let mut dataset = create_text_dataset(false).await;
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
     dataset
         .create_index(
@@ -968,9 +985,10 @@ async fn fts_phrase_ids_matching(dataset: &Dataset, phrase: &str) -> Vec<i32> {
 
 /// An overlay committed after the FTS index is built replaces a row's text. Searching for
 /// the old term must not return the stale row; searching for the new term must find it.
+#[rstest]
 #[tokio::test]
-async fn test_fts_overlay_stale_drop_and_new_match() {
-    let mut dataset = create_text_dataset().await;
+async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row_ids: bool) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
     build_text_fts_index(&mut dataset).await;
 
     // fragment 0, row offset 1 (id=1): "apple banana" → "cherry mango"
@@ -1014,13 +1032,12 @@ async fn test_fts_overlay_stale_drop_and_new_match() {
     );
 }
 
-/// A phrase query must not return a stale hit for an overlaid FTS-indexed row. Phrase queries
-/// have no flat re-evaluation path, so the fragment is excluded from the indexed phrase search
-/// (like an unindexed fragment) rather than re-scored — the point of this test is that the
-/// pre-overlay phrase hit is dropped, not that the new value is found.
+/// A phrase query must drop stale indexed positions and re-evaluate the current
+/// overlay value on the flat phrase path.
+#[rstest]
 #[tokio::test]
-async fn test_fts_phrase_overlay_stale_drop() {
-    let mut dataset = create_text_dataset().await;
+async fn test_fts_phrase_overlay_stale_drop(#[values(false, true)] stable_row_ids: bool) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
     build_text_fts_index_with_positions(&mut dataset).await;
 
     // Before any overlay the phrase "apple banana" matches only id=1.
@@ -1045,12 +1062,374 @@ async fn test_fts_phrase_overlay_stale_drop() {
         fts_phrase_ids_matching(&dataset, "apple banana").await,
         Vec::<i32>::new()
     );
+    assert_eq!(
+        fts_phrase_ids_matching(&dataset, "cherry mango").await,
+        vec![1]
+    );
+}
+
+#[tokio::test]
+async fn test_fts_empty_fragment_selection_is_empty() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    let mut match_scan = dataset.scan();
+    match_scan.with_fragments(Vec::new());
+    match_scan
+        .full_text_search(FullTextSearchQuery::new("apple".to_owned()))
+        .unwrap();
+    match_scan.project(&["id"]).unwrap();
+    let match_plan = match_scan.explain_plan(false).await.unwrap();
+    assert!(
+        match_plan.contains("EmptyExec"),
+        "explicit empty fragment selection should produce EmptyExec: {match_plan}"
+    );
+    assert_eq!(match_scan.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let mut phrase_scan = dataset.scan();
+    phrase_scan.with_fragments(Vec::new());
+    phrase_scan
+        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+            PhraseQuery::new("apple pie".to_owned()).with_column(Some("text".to_owned())),
+        )))
+        .unwrap();
+    phrase_scan.project(&["id"]).unwrap();
+    let phrase_plan = phrase_scan.explain_plan(false).await.unwrap();
+    assert!(
+        phrase_plan.contains("EmptyExec"),
+        "explicit empty fragment selection should produce EmptyExec: {phrase_plan}"
+    );
+    assert_eq!(phrase_scan.try_into_batch().await.unwrap().num_rows(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_combines_indexed_overlay_stale_and_unindexed_rows(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    let batch =
+        arrow_array::record_batch!(("id", Int32, [12]), ("text", Utf8, ["cherry mango"])).unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let dataset = Dataset::write(
+        reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: crate::dataset::write::WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dataset = commit_overlay(
+        dataset,
+        "fts_combined_flat_paths",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    assert_eq!(fts_ids_matching(&dataset, "mango").await, vec![1, 6, 12]);
+    assert_eq!(
+        fts_phrase_ids_matching(&dataset, "cherry mango").await,
+        vec![1, 12]
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_overlay_row_level_masking_under_fast_search(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "fts_row_level_fast_search",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    let mut match_scan = dataset.scan();
+    match_scan
+        .full_text_search(FullTextSearchQuery::new("apple".to_owned()))
+        .unwrap();
+    match_scan.project(&["id"]).unwrap();
+    match_scan.fast_search();
+    let match_result = match_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        ids_from_batches(std::slice::from_ref(&match_result)),
+        vec![0]
+    );
+
+    let mut indexed_phrase_scan = dataset.scan();
+    indexed_phrase_scan
+        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+            PhraseQuery::new("apple pie".to_owned()).with_column(Some("text".to_owned())),
+        )))
+        .unwrap();
+    indexed_phrase_scan.project(&["id"]).unwrap();
+    indexed_phrase_scan.fast_search();
+    let indexed_phrase_result = indexed_phrase_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        ids_from_batches(std::slice::from_ref(&indexed_phrase_result)),
+        vec![0]
+    );
+
+    let mut new_phrase_scan = dataset.scan();
+    new_phrase_scan
+        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+            PhraseQuery::new("cherry mango".to_owned()).with_column(Some("text".to_owned())),
+        )))
+        .unwrap();
+    new_phrase_scan.project(&["id"]).unwrap();
+    new_phrase_scan.fast_search();
+    assert_eq!(
+        new_phrase_scan.try_into_batch().await.unwrap().num_rows(),
+        0
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_overlay_flat_path_takes_only_stale_rows(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
+    build_text_fts_index(&mut dataset).await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "fts_targeted_take",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new("cherry".to_owned()))
+        .unwrap();
+    scan.project(&["id"]).unwrap();
+    let plan = scan.create_plan().await.unwrap();
+
+    let mut nodes = vec![plan];
+    let mut flat_path_uses_targeted_take = false;
+    while let Some(node) = nodes.pop() {
+        if node.downcast_ref::<FlatMatchQueryExec>().is_some() {
+            let mut flat_nodes = node.children().into_iter().cloned().collect::<Vec<_>>();
+            while let Some(flat_node) = flat_nodes.pop() {
+                if flat_node
+                    .downcast_ref::<FilteredReadExec>()
+                    .is_some_and(|read| read.index_input().is_some())
+                {
+                    flat_path_uses_targeted_take = true;
+                    break;
+                }
+                flat_nodes.extend(flat_node.children().into_iter().cloned());
+            }
+        }
+        nodes.extend(node.children().into_iter().cloned());
+    }
+
+    assert!(
+        flat_path_uses_targeted_take,
+        "overlay-stale FTS rows must be re-evaluated through a targeted take"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_phrase_searches_unindexed_fragments_unless_fast_search() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, [12, 13, 14]),
+        (
+            "text",
+            Utf8,
+            [
+                "kiwi berry",
+                "kiwi berry filling",
+                "kiwi berry filling filling"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let dataset = Dataset::write(
+        reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: crate::dataset::write::WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new("kiwi berry".to_owned()).with_column(Some("text".to_owned())),
+    ));
+    assert_eq!(fts_ids(&dataset, query.clone()).await, vec![12, 13, 14]);
+
+    let mut limited_scan = dataset.scan();
+    limited_scan.with_fragments(vec![dataset.fragments().last().unwrap().clone()]);
+    limited_scan
+        .full_text_search(query.clone().limit(Some(1)))
+        .unwrap();
+    limited_scan.project(&["id"]).unwrap();
+    let limited_result = limited_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        ids_from_batches(std::slice::from_ref(&limited_result)),
+        vec![12]
+    );
+
+    let mut filtered_scan = dataset.scan();
+    filtered_scan.full_text_search(query.clone()).unwrap();
+    filtered_scan.project(&["id"]).unwrap();
+    filtered_scan.filter("id < 12").unwrap();
+    assert_eq!(filtered_scan.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let mut fast_scan = dataset.scan();
+    fast_scan.full_text_search(query).unwrap();
+    fast_scan.project(&["id"]).unwrap();
+    fast_scan.fast_search();
+    assert_eq!(fast_scan.try_into_batch().await.unwrap().num_rows(), 0);
+}
+
+#[tokio::test]
+async fn test_fts_phrase_stale_rows_honor_query_limit() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "phrase_limit_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some(
+            "apple banana filling filling",
+        )]))],
+    )
+    .await;
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new("apple".to_owned()).with_column(Some("text".to_owned())),
+    ))
+    .limit(Some(1));
+    let mut scan = dataset.scan();
+    scan.with_fragments(vec![dataset.fragments()[0].clone()]);
+    scan.full_text_search(query).unwrap();
+    scan.project(&["id"]).unwrap();
+
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(ids_from_batches(std::slice::from_ref(&result)), vec![0]);
+}
+
+/// Overlay routing must select FTS segments by both field and document
+/// granularity when Row and ListElement indexes coexist.
+#[tokio::test]
+async fn test_list_element_fts_overlay_uses_exact_index_and_flat_fallback() {
+    let ids = Arc::new(Int32Array::from_iter_values(0..4)) as ArrayRef;
+    let tags = string_lists(&[
+        &["old phrase", "keep"],
+        &["other"],
+        &["new phrase"],
+        &["unrelated"],
+    ]);
+    let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .with_position(true)
+                .document_granularity(DocumentGranularity::ListElement),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let dataset = commit_overlay(
+        dataset,
+        "list_element_text_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+        vec![string_lists(&[&["new phrase", "keep"]])],
+    )
+    .await;
+
+    let list_element_match = |terms: &str| {
+        FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new(terms.to_owned())
+                .with_column(Some("tags".to_owned()))
+                .with_document_granularity(DocumentGranularity::ListElement),
+        ))
+    };
+    let list_element_phrase = |terms: &str| {
+        FullTextSearchQuery::new_query(FtsQuery::Phrase(
+            PhraseQuery::new(terms.to_owned())
+                .with_column(Some("tags".to_owned()))
+                .with_document_granularity(DocumentGranularity::ListElement),
+        ))
+    };
+
+    assert_eq!(
+        fts_ids(&dataset, list_element_match("old")).await,
+        Vec::<i32>::new()
+    );
+    assert_eq!(
+        fts_ids(&dataset, list_element_match("new")).await,
+        vec![0, 2]
+    );
+    assert_eq!(
+        fts_ids(&dataset, list_element_phrase("new phrase")).await,
+        vec![0, 2]
+    );
 }
 
 /// An overlay on a non-FTS field must not exclude the fragment from phrase search.
 #[tokio::test]
 async fn test_fts_phrase_overlay_unrelated_field_not_excluded() {
-    let mut dataset = create_text_dataset().await;
+    let mut dataset = create_text_dataset(false).await;
     build_text_fts_index_with_positions(&mut dataset).await;
 
     // Overlay field 0 (`id`), not the FTS-indexed `text` column: phrase coverage is untouched.
@@ -1073,7 +1452,7 @@ async fn test_fts_phrase_overlay_unrelated_field_not_excluded() {
 /// An overlay on a field the FTS index does NOT cover must not exclude anything.
 #[tokio::test]
 async fn test_fts_overlay_unrelated_field_not_excluded() {
-    let mut dataset = create_text_dataset().await;
+    let mut dataset = create_text_dataset(false).await;
     build_text_fts_index(&mut dataset).await;
 
     // Overlay field 0 (id) — not covered by the FTS index on `text`.
@@ -1096,7 +1475,8 @@ async fn test_fts_overlay_unrelated_field_not_excluded() {
 
 /// Benchmark: measure query latency for BTree, FTS, and vector ANN with 0/4/16 overlay layers.
 ///
-/// Run with: cargo test -p lance --lib --release -- overlay_index_masking::bench --ignored --nocapture
+/// Run with:
+/// cargo test -p lance --lib --profile release-with-debug -- overlay_index_masking::bench --ignored --nocapture
 #[tokio::test]
 #[ignore = "benchmark"]
 #[allow(clippy::print_stdout)]
@@ -1117,8 +1497,8 @@ async fn bench_index_query_overlay_overhead() {
     }
 
     // --- Build 1M-row dataset on local disk --------------------------------
-    // Schema: id(0), age(1), vec(2) — 3 top-level fields.
-    // Lance field IDs (depth-first): id=0, age=1, vec=2, vec.item=3.
+    // Schema: id, age, vec, text. Resolve field IDs from the Lance schema instead of
+    // assuming how nested Arrow child fields are numbered.
 
     println!("Building {ROWS}-row dataset at {uri} (this takes ~30 s)...");
 
@@ -1133,6 +1513,7 @@ async fn bench_index_query_overlay_overhead() {
             ),
             false,
         ),
+        ArrowField::new("text", DataType::Utf8, false),
     ]));
 
     let row_ids: Vec<i32> = (0..ROWS).collect();
@@ -1150,6 +1531,9 @@ async fn bench_index_query_overlay_overhead() {
         )
         .unwrap(),
     );
+    let text_col = Arc::new(StringArray::from_iter_values(
+        (0..ROWS).map(|row| if row == 42 { "needle" } else { "common" }),
+    ));
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -1157,6 +1541,7 @@ async fn bench_index_query_overlay_overhead() {
             Arc::new(Int32Array::from(row_ids)),
             Arc::new(Int32Array::from(ages)),
             vec_col,
+            text_col,
         ],
     )
     .unwrap();
@@ -1169,6 +1554,7 @@ async fn bench_index_query_overlay_overhead() {
     let mut dataset = Dataset::write(reader, uri, Some(write_params))
         .await
         .unwrap();
+    let text_field_id = dataset.schema().field_id("text").unwrap();
 
     println!("Building BTree index on age...");
     dataset
@@ -1194,6 +1580,18 @@ async fn bench_index_query_overlay_overhead() {
         .await
         .unwrap();
 
+    println!("Building FTS index on text...");
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
     println!("Indexes built.\n");
 
     // --- Timing helper ---------------------------------------------------
@@ -1213,20 +1611,18 @@ async fn bench_index_query_overlay_overhead() {
 
     // === Scenario A: BTree query overhead ================================
     //
-    // Overlay on `age` (field 1), covering only offset 0 of fragment 0.
-    // Fragment granularity: the entire fragment 0 (100k rows) falls to flat-scan.
+    // Overlay on `age` (field 1), covering only offset 0 of fragment 0. The stale row is
+    // blocked from the BTree and re-evaluated by targeted take.
     //
-    // btree_cold: `age = 420` → id=42 → in fragment 0 (rows 0..99999).
-    //   With overlays: 100k-row flat scan + per-overlay merge instead of index lookup.
-    //   Without overlays: O(log n) BTree lookup.
+    // btree_same_fragment: `age = 420` → id=42 → in fragment 0 (rows 0..99999).
+    //   The matching row stays indexed even though another row in the fragment is stale.
     //
-    // btree_warm: `age = 1000420` → id=100042 → in fragment 1 (rows 100000..199999).
-    //   Always served by the BTree index regardless of overlay count on fragment 0.
-    //   This isolates the index-lookup baseline.
-    println!("=== Scenario A: BTree (overlay on `age`, fragment 0 becomes stale) ===");
+    // btree_other_fragment: `age = 1000420` → id=100042 → in fragment 1.
+    //   This isolates the index-lookup baseline outside the overlaid fragment.
+    println!("=== Scenario A: BTree (one stale row in fragment 0) ===");
     println!(
         "{:>10}  {:>14}  {:>14}",
-        "overlays", "cold_frag0_ms", "warm_frag1_ms"
+        "overlays", "same_frag_ms", "other_frag_ms"
     );
 
     let mut committed_a = 0u32;
@@ -1247,9 +1643,9 @@ async fn bench_index_query_overlay_overhead() {
 
         let ds = Arc::new(dataset.clone());
 
-        // Cold path: stale fragment falls to flat scan when overlays > 0.
+        // Same-fragment indexed match plus targeted re-evaluation of the stale row.
         let ds2 = ds.clone();
-        let cold_ms = timeit(ITERS, || {
+        let same_fragment_ms = timeit(ITERS, || {
             let ds = ds2.clone();
             async move {
                 ds.scan()
@@ -1264,9 +1660,9 @@ async fn bench_index_query_overlay_overhead() {
         })
         .await;
 
-        // Warm path: fragment 1 never stale, always index-served.
+        // Fragment 1 never has a stale row and stays entirely index-served.
         let ds2 = ds.clone();
-        let warm_ms = timeit(ITERS, || {
+        let other_fragment_ms = timeit(ITERS, || {
             let ds = ds2.clone();
             async move {
                 ds.scan()
@@ -1281,7 +1677,7 @@ async fn bench_index_query_overlay_overhead() {
         })
         .await;
 
-        println!("{num_overlays:>10}  {cold_ms:>14.1}  {warm_ms:>14.1}");
+        println!("{num_overlays:>10}  {same_fragment_ms:>14.1}  {other_fragment_ms:>14.1}");
     }
 
     // === Scenario B: Vector ANN overhead =================================
@@ -1291,9 +1687,8 @@ async fn bench_index_query_overlay_overhead() {
     // the vector index (they touch field 1, not field 2). Only a vec overlay (field 2)
     // marks fragment 0 stale for the vector index.
     //
-    // With a vec overlay: 100k rows of fragment 0 are excluded from ANN prefilter
-    // bitmaps and re-scored brute-force (O(100k × DIM) distance computations).
-    println!("\n=== Scenario B: Vector ANN (overlay on `vec`, 100k rows brute-forced) ===");
+    // With a vec overlay, only the stale row is excluded from ANN and re-scored exactly.
+    println!("\n=== Scenario B: Vector ANN (one stale row re-scored) ===");
     println!("{:>12}  {:>10}", "vec_overlays", "ann_ms");
 
     let query_vec = Float32Array::from(vec![0.5f32; DIM as usize]);
@@ -1333,4 +1728,445 @@ async fn bench_index_query_overlay_overhead() {
 
         println!("{num_vec_overlays:>12}  {ann_ms:>10.1}");
     }
+
+    // === Scenario C: FTS overhead ========================================
+    //
+    // The FTS index has one segment spanning all 10 fragments. An overlay on one text row must
+    // keep that segment indexed, block just the stale row, and re-evaluate that row by targeted
+    // take. `needle` belongs to an unaffected row in the same fragment as the stale row.
+    println!("\n=== Scenario C: FTS (one stale row in a 1M-row segment) ===");
+    println!("{:>13}  {:>10}", "text_overlays", "fts_ms");
+
+    for num_text_overlays in [0u32, 1] {
+        if num_text_overlays == 1 {
+            dataset = commit_overlay(
+                dataset,
+                "text_ol0",
+                0,
+                &[text_field_id],
+                OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                vec![Arc::new(StringArray::from(vec![Some("updated")]))],
+            )
+            .await;
+        }
+
+        let ds = Arc::new(dataset.clone());
+        let ds2 = ds.clone();
+        let fts_ms = timeit(ITERS, || {
+            let ds = ds2.clone();
+            async move {
+                let result = ds
+                    .scan()
+                    .full_text_search(FullTextSearchQuery::new("needle".to_owned()))
+                    .unwrap()
+                    .project(&["id"])
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+                assert_eq!(result.num_rows(), 1);
+            }
+        })
+        .await;
+
+        println!("{num_text_overlays:>13}  {fts_ms:>10.1}");
+    }
+}
+
+async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("age", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(ids.clone())),
+            Arc::new(Int32Array::from_iter_values(ids.map(|v| v * 10))),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+// `OptimizeIndices` merges an index's delta segments without re-reading data overlays, so the
+// merged segment carries the old segments' pre-overlay entries. What keeps those entries masked
+// is that the merge stamps the new segment with the *oldest* merged segment's `dataset_version`
+// rather than the current one, leaving the mask's version gate
+// (`overlay.committed_version > segment.dataset_version`) on.
+//
+// That invariant is easy to break by accident -- stamping the current version un-masks every
+// carried-over entry -- and nothing else asserts it end to end. The following tests pin it down
+// for each index type.
+
+/// Scalar (BTree, Bitmap, ZoneMap): a range query over the indexed column after an overlay +
+/// optimize must still drop the stale value and surface the overlaid one.
+///
+/// ZoneMap is the case worth having: it ignores `OldIndexDataFilter`, so nothing scrubs the
+/// pre-overlay zone summaries out of the merged segment. Breaking the version gate shows up here
+/// as a false *negative* -- the stale zone prunes the overlaid value -- rather than the resurfaced
+/// stale entry the other two produce.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[case::zonemap(IndexType::ZoneMap)]
+#[tokio::test]
+async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: IndexType) {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::BuiltinIndexType;
+
+    let params = match index_type {
+        IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+        IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+        _ => ScalarIndexParams::default(),
+    };
+    let mut dataset = create_base_dataset().await;
+    dataset
+        .create_index(&["age"], index_type, None, &params, true)
+        .await
+        .unwrap();
+
+    // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_opt",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Masking works before optimize.
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    // Append an unindexed fragment so the merge does real work, then merge all deltas.
+    append_age_fragment(&mut dataset, 12..18).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: the stale age=10 entry stays dropped and the overlaid age=999 value stays
+    // visible, because the merged segment kept the old segment's `dataset_version`.
+    assert_eq!(
+        ids_matching(&dataset, "age = 10").await,
+        Vec::<i32>::new(),
+        "stale index entry age=10 for id=1 resurfaced after optimize"
+    );
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await,
+        vec![1],
+        "overlaid value age=999 dropped after optimize"
+    );
+    // A row untouched by the overlay is unaffected.
+    assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+}
+
+/// ZoneMap seed path: an *unindexed* fragment carrying an overlay gets folded into the merged
+/// segment from its data file's seed buffer. A seed is a zone summary captured while the base
+/// data file was written, so it describes pre-overlay values -- the merged segment ends up
+/// holding zones that never saw the overlay.
+///
+/// That is only safe because the merge keeps the old `dataset_version`, so the mask still covers
+/// those rows. Stamp the current version (or teach the seed path to claim freshness) and the
+/// overlaid value becomes unfindable, since its stale zone prunes it.
+///
+/// `name` is Utf8, for which seeds are on by default (`default_use_seeds`).
+#[tokio::test]
+async fn test_optimize_seed_path_respects_overlay() {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::BuiltinIndexType;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("name", DataType::Utf8, true),
+    ]));
+    let names: Vec<String> = (0..12).map(|i| format!("n{i:02}")).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..12)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 6,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["name"],
+            IndexType::ZoneMap,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Append fragment 2. The index already exists, so the write emits a zone-map seed buffer
+    // into the new data file.
+    let appended: Vec<String> = (12..18).map(|i| format!("n{i:02}")).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(12..18)),
+            Arc::new(StringArray::from(appended)),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Overlay fragment 2, offset 1 (id=13): "n13" -> "zzz", well outside the seed's zone range.
+    let mut dataset = commit_overlay(
+        dataset,
+        "name_seed",
+        2,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("zzz")]))],
+    )
+    .await;
+
+    // Fragment 2 is unindexed, so the overlaid value is visible via the flat path.
+    assert_eq!(ids_matching(&dataset, "name = 'zzz'").await, vec![13]);
+    assert_eq!(
+        ids_matching(&dataset, "name = 'n13'").await,
+        Vec::<i32>::new()
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ids_matching(&dataset, "name = 'zzz'").await,
+        vec![13],
+        "overlaid value dropped after optimize: the merged segment took pre-overlay zones \
+         from fragment 2's seed buffer"
+    );
+    assert_eq!(
+        ids_matching(&dataset, "name = 'n13'").await,
+        Vec::<i32>::new(),
+        "stale pre-overlay value resurfaced after optimize"
+    );
+    // Rows the overlay never touched keep working through the index.
+    assert_eq!(ids_matching(&dataset, "name = 'n14'").await, vec![14]);
+    assert_eq!(ids_matching(&dataset, "name = 'n03'").await, vec![3]);
+}
+
+/// `DatasetStatistics::column_value_range` folds ZoneMap summaries into a global `[min, max]`
+/// that callers may prune with, so it must be a superset of the live values. An overlay can
+/// move a value outside the summarised range, and the ZoneMap never saw it.
+#[tokio::test]
+async fn test_column_value_range_none_under_overlay() {
+    use crate::index::DatasetIndexExt;
+    use datafusion::scalar::ScalarValue;
+    use lance_index::scalar::BuiltinIndexType;
+
+    let mut dataset = create_base_dataset().await;
+    dataset
+        .create_index(
+            &["age"],
+            IndexType::ZoneMap,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        dataset
+            .statistics()
+            .column_value_range("age")
+            .await
+            .unwrap(),
+        Some((ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(110))))
+    );
+
+    // age 10 -> 999 on fragment 0, committed after the index: 999 is outside [0, 110].
+    let dataset = commit_overlay(
+        dataset,
+        "age_range",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    assert_eq!(
+        dataset
+            .statistics()
+            .column_value_range("age")
+            .await
+            .unwrap(),
+        None,
+        "ZoneMap range must not be reported once an overlay may have moved a value outside it"
+    );
+}
+
+/// FTS: after an overlay replaces a row's text and the index is optimized, searching for the old
+/// terms must not return the stale row, and the new terms must find it.
+#[tokio::test]
+async fn test_optimize_preserves_fts_overlay_masking() {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index(&mut dataset).await;
+
+    // fragment 0, offset 1 (id=1): "apple banana" -> "cherry mango".
+    let mut dataset = commit_overlay(
+        dataset,
+        "text_opt",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    // Masking works before optimize: id=1 no longer matches "banana"/"apple".
+    assert_eq!(fts_ids_matching(&dataset, "banana").await, vec![3]);
+    assert_eq!(fts_ids_matching(&dataset, "apple").await, vec![0]);
+
+    // Append an unindexed fragment of new text, then merge all deltas.
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(12..18)),
+            Arc::new(StringArray::from(vec![
+                "kiwi", "melon", "date", "guava", "papaya", "lychee",
+            ])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: id=1's stale "apple"/"banana" postings stay dropped.
+    assert_eq!(
+        fts_ids_matching(&dataset, "banana").await,
+        vec![3],
+        "stale FTS posting for id=1 (banana) resurfaced after optimize"
+    );
+    assert_eq!(
+        fts_ids_matching(&dataset, "apple").await,
+        vec![0],
+        "stale FTS posting for id=1 (apple) resurfaced after optimize"
+    );
+    // The overlaid terms are found via the flat path.
+    assert!(fts_ids_matching(&dataset, "cherry").await.contains(&1));
+    assert!(fts_ids_matching(&dataset, "mango").await.contains(&1));
+}
+
+/// Vector (IVF): after an overlay moves a row's vector and the index is optimized, the ANN must
+/// not resurface the stale vector, and the moved-onto-query row is found by flat re-scoring.
+#[tokio::test]
+async fn test_optimize_preserves_vector_overlay_masking() {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+
+    // Overlay on fragment 1 moves id=35 away from the query and id=40 onto it.
+    let mut dataset = create_vector_overlay_dataset(false).await;
+
+    // Masking works before optimize.
+    let before = vector_query_ids(&dataset, 3, false).await;
+    assert!(
+        !before.contains(&35),
+        "pre-optimize id=35 should be dropped: {before:?}"
+    );
+    assert!(
+        before.contains(&40),
+        "pre-optimize id=40 should be found: {before:?}"
+    );
+
+    // Append an unindexed fragment of far vectors, then merge all deltas.
+    let far_vecs: Vec<Vec<f32>> = (0..32)
+        .map(|i| {
+            let mut v = vec![0.0_f32; VEC_DIM as usize];
+            v[1] = (i + 200) as f32;
+            v
+        })
+        .collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                VEC_DIM,
+            ),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(64..96)),
+            fsl(far_vecs, VEC_DIM),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: id=35's stale vector stays dropped and id=40 is still found via re-scoring.
+    let after = vector_query_ids(&dataset, 3, false).await;
+    assert!(
+        !after.contains(&35),
+        "stale index vector for id=35 resurfaced after optimize: {after:?}"
+    );
+    assert!(
+        after.contains(&40),
+        "overlaid vector for id=40 dropped after optimize: {after:?}"
+    );
 }

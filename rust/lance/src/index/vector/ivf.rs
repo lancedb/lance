@@ -4,12 +4,12 @@
 //! IVF - Inverted File index.
 
 use super::{
-    LogicalIvfView,
+    LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
-    builder::{IvfIndexBuilder, index_type_string},
+    builder::{ExistingIndex, IvfIndexBuilder, index_type_string},
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
@@ -51,7 +51,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
-    cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
+    cache::{CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
@@ -157,6 +157,14 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
 
     fn type_name() -> &'static str {
         "LegacyIVFPartition"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.legacy-ivf-partition-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.partition_id as u64);
     }
 }
 
@@ -323,7 +331,7 @@ fn candidate_is_better(
     }
 }
 
-fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
+pub(crate) fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
     let (sub_index_type, quantization_type) = index.sub_index_type();
     IndexType::try_from(index_type_string(sub_index_type, quantization_type).as_str())
 }
@@ -387,17 +395,45 @@ pub(crate) fn select_segment_for_single_rebalance(
     Ok(selected.map(|candidate| candidate.segment_id))
 }
 
-fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorSegmentCompatibility {
+    SharedModel,
+    QueryCompatibleModelsDiffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorModelMismatch {
+    StorageFormat,
+    IvfCentroids,
+    QuantizerMetadata,
+}
+
+fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
+    let ivf_dimension = index.ivf_model().dimension();
+    if ivf_dimension != 0 {
+        return ivf_dimension;
+    }
+
+    match index.quantizer() {
+        Quantizer::Flat(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::FlatBin(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::Product(quantizer) => quantizer.dimension,
+        Quantizer::Scalar(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::Rabit(quantizer) => quantizer.metadata(None).rotated_dim(),
+    }
+}
+
+fn validate_vector_query_compatibility(
+    indices: &[Arc<dyn VectorIndex>],
+    operation: &str,
+) -> Result<()> {
     let Some(first) = indices.first() else {
         return Ok(());
     };
-    if indices.len() == 1 {
-        return Ok(());
-    }
 
     let first_metric = first.metric_type();
+    let first_dimension = vector_index_dimension(first.as_ref());
     let first_index_type = first.sub_index_type();
-    let first_centroids = first.ivf_model().centroids_array();
     let first_quantizer = first.quantizer();
     let first_quantizer_type = first_quantizer.quantization_type();
 
@@ -409,6 +445,12 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
                 first_metric
             )));
         }
+        let dimension = vector_index_dimension(index.as_ref());
+        if dimension != first_dimension {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has dimension {dimension}, expected {first_dimension}"
+            )));
+        }
         let index_type = index.sub_index_type();
         if std::mem::discriminant(&index_type.0) != std::mem::discriminant(&first_index_type.0)
             || index_type.1 != first_index_type.1
@@ -417,19 +459,6 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
                 "{operation}: vector index segment {idx} has type {:?}, expected {:?}",
                 index_type, first_index_type
             )));
-        }
-        match (first_centroids, index.ivf_model().centroids_array()) {
-            (Some(expected), Some(actual)) if expected.to_data() != actual.to_data() => {
-                return Err(Error::index(format!(
-                    "{operation}: vector index segments do not share IVF centroids"
-                )));
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(Error::index(format!(
-                    "{operation}: vector index segments do not share IVF centroids"
-                )));
-            }
-            _ => {}
         }
 
         let quantizer = index.quantizer();
@@ -440,14 +469,65 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
                 first_quantizer_type
             )));
         }
-        if !shared_quantizer_model(&first_quantizer, &quantizer) {
-            return Err(Error::index(format!(
-                "{operation}: vector index segments do not share quantizer metadata"
-            )));
-        }
     }
 
     Ok(())
+}
+
+fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {
+    let first = indices.first()?;
+    let first_centroids = first.ivf_model().centroids_array();
+    let first_quantizer = first.quantizer();
+
+    for index in indices.iter().skip(1) {
+        if first.as_any().type_id() != index.as_any().type_id() {
+            return Some(VectorModelMismatch::StorageFormat);
+        }
+        match (first_centroids, index.ivf_model().centroids_array()) {
+            (Some(expected), Some(actual)) if expected.to_data() != actual.to_data() => {
+                return Some(VectorModelMismatch::IvfCentroids);
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Some(VectorModelMismatch::IvfCentroids);
+            }
+            _ => {}
+        }
+
+        if !shared_quantizer_model(&first_quantizer, &index.quantizer()) {
+            return Some(VectorModelMismatch::QuantizerMetadata);
+        }
+    }
+
+    None
+}
+
+pub(crate) fn vector_segment_compatibility(
+    logical_index: &LogicalIvfView<'_>,
+    operation: &str,
+) -> Result<VectorSegmentCompatibility> {
+    let indices = logical_index.indices().cloned().collect::<Vec<_>>();
+    validate_vector_query_compatibility(&indices, operation)?;
+    Ok(if vector_model_mismatch(&indices).is_none() {
+        VectorSegmentCompatibility::SharedModel
+    } else {
+        VectorSegmentCompatibility::QueryCompatibleModelsDiffer
+    })
+}
+
+fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
+    validate_vector_query_compatibility(indices, operation)?;
+    match vector_model_mismatch(indices) {
+        Some(VectorModelMismatch::StorageFormat) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share a storage format"
+        ))),
+        Some(VectorModelMismatch::IvfCentroids) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share IVF centroids"
+        ))),
+        Some(VectorModelMismatch::QuantizerMetadata) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share quantizer metadata"
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
@@ -487,6 +567,31 @@ fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
     }
 }
 
+/// Pair every segment with the coverage that decides which of its rows this optimize
+/// pass may still copy into the new index.
+///
+/// A segment that predates fragment bitmaps has unknown coverage, so it keeps every
+/// row it holds. Turning coverage into a filter is deferred to the first partition
+/// that actually reads the segment, because under stable row ids it costs a row-id
+/// sequence load per covered fragment and most passes only append a delta.
+fn existing_index_sources(
+    dataset: &Dataset,
+    logical_index: &LogicalIvfView<'_>,
+) -> Vec<ExistingIndex> {
+    logical_index
+        .segments()
+        .map(|(metadata, index)| {
+            let (Some(effective), Some(deleted)) = (
+                metadata.effective_fragment_bitmap(&dataset.fragment_bitmap),
+                metadata.deleted_fragment_bitmap(&dataset.fragment_bitmap),
+            ) else {
+                return ExistingIndex::unfiltered(index.clone());
+            };
+            ExistingIndex::with_coverage(index.clone(), dataset.clone(), effective, deleted)
+        })
+        .collect()
+}
+
 // TODO: move to `lance-index` crate.
 ///
 /// Returns (new_uuid, num_indices_merged, files)
@@ -504,19 +609,14 @@ pub(crate) async fn optimize_vector_indices(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
+    validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
 
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
-        validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
-        return optimize_vector_indices_v2(
-            &dataset,
-            unindexed,
-            vector_column,
-            &existing_indices,
-            options,
-        )
-        .await;
+        let sources = existing_index_sources(&dataset, logical_index);
+        return optimize_vector_indices_v2(&dataset, unindexed, vector_column, &sources, options)
+            .await;
     }
 
     let new_uuid = Uuid::new_v4();
@@ -585,7 +685,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn VectorIndex>],
+    existing_indices: &[ExistingIndex],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     // Sanity check the indices
@@ -598,11 +698,12 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let new_uuid = Uuid::new_v4();
     let index_dir = dataset.indices_dir().join(new_uuid.to_string());
-    let ivf_model = existing_indices[0].ivf_model();
-    let quantizer = existing_indices[0].quantizer();
-    let distance_type = existing_indices[0].metric_type();
+    let reference_index = &existing_indices[0].index;
+    let ivf_model = reference_index.ivf_model();
+    let quantizer = reference_index.quantizer();
+    let distance_type = reference_index.metric_type();
     let num_partitions = ivf_model.num_partitions();
-    let index_type = existing_indices[0].sub_index_type();
+    let index_type = reference_index.sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
     let format_version = dataset_format_version(dataset);
@@ -633,7 +734,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
+                .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -651,7 +752,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
+                .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -672,7 +773,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -692,7 +793,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -712,7 +813,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -731,7 +832,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -746,13 +847,13 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    HnswBuildParams::default(),
+                    derive_hnsw_params(reference_index.as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
+                .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -764,13 +865,13 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    HnswBuildParams::default(),
+                    derive_hnsw_params(reference_index.as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
+                .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -785,13 +886,13 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                HnswBuildParams::default(),
+                derive_hnsw_params(reference_index.as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -805,13 +906,13 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                HnswBuildParams::default(),
+                derive_hnsw_params(reference_index.as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
+            .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -4663,6 +4764,7 @@ mod tests {
     use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::VECTOR_INDEX_VERSION;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::OldIndexDataFilter;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
@@ -4680,6 +4782,117 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    /// Building a merge filter loads a row-id sequence per covered fragment under
+    /// stable row ids, and an optimize pass that only appends a delta reads no existing
+    /// row at all. Such a pass must therefore build no filter, and a pass that does
+    /// merge must build one and reuse it across partitions.
+    #[tokio::test]
+    async fn test_optimize_builds_merge_filters_only_when_merging() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let make_batch = || {
+            gen_batch()
+                .col(
+                    "vector",
+                    array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)),
+                )
+                .into_batch_rows(RowCount::from(256))
+                .unwrap()
+        };
+        let batch = make_batch();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // A single partition keeps `check_partition_adjustment` from selecting a split
+        // or a join, which would legitimately merge every segment.
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(make_batch())], schema),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        let ivf_view = logical_index.as_ivf().unwrap();
+        let new_data = |fragments| async {
+            let mut scanner = dataset.scan();
+            scanner
+                .with_fragments(fragments)
+                .with_row_id()
+                .project(&["vector"])
+                .unwrap();
+            scanner.try_into_stream().await.unwrap()
+        };
+        let unindexed = dataset.unindexed_fragments("vector_idx").await.unwrap();
+        assert_eq!(
+            unindexed.len(),
+            1,
+            "the appended fragment must be unindexed"
+        );
+
+        // `ExistingIndex` shares its coverage behind an `Arc`, so the sources handed to
+        // the builder report what the builder actually did with them.
+        let sources = existing_index_sources(&dataset, &ivf_view);
+        optimize_vector_indices_v2(
+            &dataset,
+            Some(new_data(unindexed.clone()).await),
+            "vector",
+            &sources,
+            &OptimizeOptions::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sources.iter().all(|source| !source.filter_is_built()),
+            "a delta append reads no existing row, so it must build no filter"
+        );
+
+        let sources = existing_index_sources(&dataset, &ivf_view);
+        optimize_vector_indices_v2(
+            &dataset,
+            Some(new_data(unindexed).await),
+            "vector",
+            &sources,
+            &OptimizeOptions::merge(1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sources.iter().all(|source| source.filter_is_built()),
+            "a merge reads existing rows, so it must build a filter per merged segment"
+        );
+        assert!(
+            matches!(
+                sources[0].old_data_filter().await.unwrap(),
+                Some(OldIndexDataFilter::RowIds(_))
+            ),
+            "a stable-row-id segment must filter on exact row-id membership"
+        );
+    }
 
     #[test]
     fn test_shared_quantizer_model_compares_skipped_payloads() {

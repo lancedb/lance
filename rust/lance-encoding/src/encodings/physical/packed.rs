@@ -27,7 +27,7 @@ use crate::{
     },
     encodings::logical::primitive::{
         fullzip::{PerValueCompressor, PerValueDataBlock},
-        miniblock::{MiniBlockCompressed, MiniBlockCompressor},
+        miniblock::{MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor},
     },
     format::{
         ProtobufUtils21,
@@ -73,7 +73,11 @@ fn struct_data_block_to_fixed_width_data_block(
 pub struct PackedStructFixedWidthMiniBlockEncoder {}
 
 impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        context: MiniBlockCompressionContext,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::Struct(struct_data_block) => {
                 let bits_per_values = struct_data_block.children.iter().map(|data_block| data_block.as_fixed_width_ref().unwrap().bits_per_value).collect::<Vec<_>>();
@@ -84,7 +88,7 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
                 // store and transformed fixed-width data block.
                 let value_miniblock_compressor = Box::new(ValueEncoder::default()) as Box<dyn MiniBlockCompressor>;
                 let (value_miniblock_compressed, value_array_encoding) =
-                value_miniblock_compressor.compress(data_block)?;
+                value_miniblock_compressor.compress(context, data_block)?;
 
                 Ok((
                     value_miniblock_compressed,
@@ -443,7 +447,7 @@ impl FieldAccumulator {
     // In full-zip variable packed decoding, rep/def may produce a visible row
     // with an empty payload (e.g. null/invalid item). We still need to append
     // one placeholder per child so child row counts remain aligned.
-    fn append_empty(&mut self) {
+    fn append_empty(&mut self) -> Result<()> {
         match self {
             Self::Fixed {
                 builder,
@@ -559,7 +563,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
             }
             if row_start == row_end {
                 for accumulator in accumulators.iter_mut() {
-                    accumulator.append_empty();
+                    accumulator.append_empty()?;
                 }
                 continue;
             }
@@ -588,7 +592,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.append(&value_block, 0..1);
+                        builder.append(&value_block, 0..1)?;
                         cursor = end;
                     }
                     (
@@ -627,7 +631,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.append(&value_block, 0..1);
+                        builder.append(&value_block, 0..1)?;
                         cursor = value_end;
                     }
                     (
@@ -666,7 +670,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.append(&value_block, 0..1);
+                        builder.append(&value_block, 0..1)?;
                         cursor = value_end;
                     }
                     _ => {

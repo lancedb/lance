@@ -21,13 +21,13 @@ use std::{collections::HashMap, ptr::NonNull};
 use arrow_array::{
     Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
     LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
-    UInt8Array, UInt32Array, cast::AsArray, make_array,
+    UInt8Array, UInt32Array, cast::AsArray,
 };
 use arrow_array::{
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, new_null_array,
 };
-use arrow_buffer::{Buffer, MutableBuffer};
-use arrow_data::{ArrayDataBuilder, BufferSpec, layout};
+use arrow_buffer::MutableBuffer;
+use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SortOptions};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
@@ -69,48 +69,6 @@ pub const BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY: &str =
     "lance-encoding:blob-pack-file-size-threshold";
 
 type Result<T> = std::result::Result<T, ArrowError>;
-
-/// Build a null-free Arrow array over a fixed-width byte buffer.
-///
-/// The input is reused without copying when its alignment and size satisfy the
-/// Arrow layout. Otherwise, an aligned buffer is allocated and the missing
-/// trailing bytes are zero-filled.
-pub fn array_from_fixed_width_bytes(
-    data_type: &DataType,
-    bytes: bytes::Bytes,
-    len: usize,
-    offset: usize,
-) -> Result<ArrayRef> {
-    let layout = layout(data_type);
-    if layout.buffers.len() != 1 {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "expected a data type with one fixed-width buffer, found {data_type}"
-        )));
-    }
-
-    let buffer = if let BufferSpec::FixedWidth {
-        byte_width,
-        alignment,
-    } = &layout.buffers[0]
-    {
-        let min_buffer_size = (len + offset).saturating_mul(*byte_width);
-        if bytes.len() < min_buffer_size {
-            Buffer::copy_bytes_bytes(bytes, min_buffer_size)
-        } else {
-            Buffer::from_bytes_bytes(bytes, *alignment as u64)
-        }
-    } else {
-        Buffer::from_slice_ref(bytes)
-    };
-
-    let data = ArrayDataBuilder::new(data_type.clone())
-        .len(len)
-        .offset(offset)
-        .null_count(0)
-        .add_buffer(buffer)
-        .build()?;
-    Ok(make_array(data))
-}
 
 pub trait DataTypeExt {
     /// Returns true if the data type is binary-like, such as Utf8, Binary, or the large and/or view variants.
@@ -1059,34 +1017,25 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     }
 }
 
-/// Helper function to normalize validity buffers
-/// Returns None for all-null validity (placeholder structs)
-fn normalize_validity(
-    validity: Option<&arrow_buffer::NullBuffer>,
-) -> Option<&arrow_buffer::NullBuffer> {
-    validity.filter(|v| v.null_count() != v.len())
-}
-
-/// Helper function to merge validity buffers from two struct arrays
-/// Returns None only if both arrays are null at the same position
+/// Helper function to merge validity buffers from two struct arrays.
 ///
-/// Special handling for placeholder structs (all-null validity)
+/// A row is valid if it is valid in either input.
+/// An absent validity buffer means all rows are valid, an all-null buffer acts as the identity for this merge.
 fn merge_struct_validity(
     left_validity: Option<&arrow_buffer::NullBuffer>,
     right_validity: Option<&arrow_buffer::NullBuffer>,
 ) -> Option<arrow_buffer::NullBuffer> {
-    // Normalize both validity buffers (convert all-null to None)
-    let left_normalized = normalize_validity(left_validity);
-    let right_normalized = normalize_validity(right_validity);
-
-    match (left_normalized, right_normalized) {
+    match (left_validity, right_validity) {
         // Fast paths: no computation needed
-        (None, None) => None,
-        (Some(left), None) => Some(left.clone()),
-        (None, Some(right)) => Some(right.clone()),
+        (None, _) | (_, None) => None,
         (Some(left), Some(right)) => {
-            // Fast path: if both have no nulls, can return either one
-            if left.null_count() == 0 && right.null_count() == 0 {
+            if left.null_count() == 0 || right.null_count() == 0 {
+                return None;
+            }
+            if left.null_count() == left.len() {
+                return Some(right.clone());
+            }
+            if right.null_count() == right.len() {
                 return Some(left.clone());
             }
 
@@ -1616,21 +1565,6 @@ mod tests {
     use arrow_buffer::OffsetBuffer;
 
     #[test]
-    fn fixed_width_bytes_zero_pads_short_input() {
-        let bytes = bytes::Bytes::copy_from_slice(&42_i32.to_le_bytes());
-        let array = array_from_fixed_width_bytes(&DataType::Int32, bytes, 2, 0).unwrap();
-        let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(array.values(), &[42, 0]);
-    }
-
-    #[test]
-    fn fixed_width_bytes_rejects_variable_width_type() {
-        let error =
-            array_from_fixed_width_bytes(&DataType::Utf8, bytes::Bytes::new(), 0, 0).unwrap_err();
-        assert!(error.to_string().contains("one fixed-width buffer"));
-    }
-
-    #[test]
     fn test_convert_to_floating_point_preserves_inner_nulls() {
         // A FixedSizeList<Int8> with a null inner element must convert to a
         // FixedSizeList<Float32> with the null kept in place. Dropping it would
@@ -2108,6 +2042,47 @@ mod tests {
         assert_eq!(width_values.value(0), 300);
         assert_eq!(width_values.value(1), 200);
         assert!(width_values.is_null(2)); // width is null when right struct was null
+
+        // An all-null validity buffer is data, not a placeholder meaning "this side has no
+        // validity": merging two of them keeps the rows null.
+        let all_null_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef],
+            Some(vec![false, false].into()),
+        );
+        let all_null_right = StructArray::new(
+            Fields::from(vec![Field::new("width", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef],
+            Some(vec![false, false].into()),
+        );
+
+        let merged = merge(&all_null_left, &all_null_right);
+        assert_eq!(merged.null_count(), 2);
+
+        // An all-null side is the identity of the merge, so the other side decides each row.
+        let partial_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+        let merged = merge(&partial_left, &all_null_right);
+        assert!(!merged.is_null(0));
+        assert!(merged.is_null(1));
+
+        // A missing validity buffer means all rows are valid, which absorbs an all-null side.
+        let all_valid_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        );
+        let merged = merge(&all_valid_left, &all_null_right);
+        assert_eq!(merged.null_count(), 0);
+
+        // An explicit all-valid buffer has the same semantics as a missing buffer.
+        let all_valid: arrow_buffer::NullBuffer = vec![true, true].into();
+        let partial: arrow_buffer::NullBuffer = vec![true, false].into();
+        assert!(merge_struct_validity(Some(&all_valid), Some(&partial)).is_none());
+        assert!(merge_struct_validity(Some(&partial), Some(&all_valid)).is_none());
     }
 
     #[test]

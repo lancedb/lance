@@ -781,6 +781,27 @@ const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait CommitHandler: Debug + Send + Sync {
+    /// Whether a not-found result from [`Self::resolve_version_location`] is
+    /// definitive immediately after a commit attempt.
+    ///
+    /// Handlers backed by an eventually consistent or external source of
+    /// truth should keep the conservative default. This prevents callers from
+    /// deleting files that a newly committed manifest may reference while the
+    /// manifest is not yet visible through the resolver.
+    fn is_version_not_found_definitive(&self) -> bool {
+        false
+    }
+
+    /// Whether an error should still be returned after readback proves that
+    /// the manifest from the current commit attempt landed.
+    ///
+    /// The conservative default preserves errors from custom handlers. Built-in
+    /// object-store handlers override this because their commit errors may be
+    /// ambiguous transport failures whose successful outcome is authoritative.
+    fn propagate_commit_error_after_success(&self) -> bool {
+        true
+    }
+
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
@@ -1091,9 +1112,8 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "tos" | "shared-memory" => {
-            Ok(Arc::new(ConditionalPutCommitHandler))
-        }
+        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "tos" | "shared-memory"
+        | "goosefs" => Ok(Arc::new(ConditionalPutCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
             "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -1133,12 +1153,15 @@ pub async fn commit_handler_from_url(
             // Get accessor from the options
             let accessor = options.get_accessor();
 
+            let provider_scheme = storage_options_raw.aws_provider_scheme()?;
+
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
                 accessor,
+                provider_scheme,
             )
             .await?;
 
@@ -1201,6 +1224,14 @@ pub struct UnsafeCommitHandler;
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 impl CommitHandler for UnsafeCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        false
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1328,6 +1359,10 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T
 where
     T::Lease: 'static,
 {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1387,6 +1422,14 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T>
 where
     T::Lease: 'static,
 {
+    fn is_version_not_found_definitive(&self) -> bool {
+        self.as_ref().is_version_not_found_definitive()
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        self.as_ref().propagate_commit_error_after_success()
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1418,6 +1461,14 @@ pub struct RenameCommitHandler;
 
 #[async_trait::async_trait]
 impl CommitHandler for RenameCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        false
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1477,6 +1528,14 @@ pub struct ConditionalPutCommitHandler;
 
 #[async_trait::async_trait]
 impl CommitHandler for ConditionalPutCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        false
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1976,6 +2035,7 @@ mod tests {
     #[case::oss("oss://bucket-a/ds")]
     #[case::cos("cos://bucket-a/ds")]
     #[case::tos("tos://bucket-a/ds")]
+    #[case::goosefs("goosefs://bucket-a/ds")]
     async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
         // Every scheme whose store supports atomic put-if-not-exists must
         // route to ConditionalPutCommitHandler — otherwise concurrent writers
@@ -2101,7 +2161,7 @@ mod tests {
 
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::LanceFileVersion;
+        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 
         use crate::format::DataStorageFormat;
 
@@ -2158,7 +2218,7 @@ mod tests {
 
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::LanceFileVersion;
+        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 
         use crate::format::DataStorageFormat;
 

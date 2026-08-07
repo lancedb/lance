@@ -885,6 +885,16 @@ pub fn try_raw_block(data: &DataBlock) -> Option<(Box<dyn BlockCompressor>, Comp
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Returns the exact aggregate decoded size when it is determined solely by the value count.
+    ///
+    /// Implementations should only return `Some` when this aggregate estimate can be used by
+    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
+    /// represented by one aggregate estimate should return `None`.
+    fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
+        None
+    }
 }
 
 pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -894,6 +904,16 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Currently (and probably long term) this must be a multiple of 8
     fn bits_per_value(&self) -> u64;
+
+    /// Returns the exact aggregate decoded size when it is determined solely by the value count.
+    ///
+    /// Implementations should only return `Some` when this aggregate estimate can be used by
+    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
+    /// represented by one aggregate estimate should return `None`.
+    fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
+        None
+    }
 }
 
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -1355,6 +1375,7 @@ mod tests {
     use crate::buffer::LanceBuffer;
     use crate::compression_config::CompressionParams;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    use crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext;
     use crate::statistics::ComputeStat;
     use crate::testing::{TestEncoding, extract_array_encoding_chain, test_compression_strategy};
     use arrow_schema::{DataType, Field as ArrowField};
@@ -1366,6 +1387,10 @@ mod tests {
 
     fn baseline_strategy(params: CompressionParams) -> Arc<dyn CompressionStrategy> {
         strategy(TestEncoding::StructuralU16, params)
+    }
+
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
     }
 
     fn create_test_field(name: &str, data_type: DataType) -> Field {
@@ -1755,12 +1780,16 @@ mod tests {
         let compressor = strategy
             .create_miniblock_compressor(&field, &fixed_data)
             .unwrap();
-        let (_block, encoding) = compressor.compress(fixed_data.clone()).unwrap();
+        let (_block, encoding) = compressor
+            .compress(miniblock_context(), fixed_data.clone())
+            .unwrap();
         check_uncompressed_encoding(&encoding, false);
         let compressor = strategy
             .create_miniblock_compressor(&field, &variable_data)
             .unwrap();
-        let (_block, encoding) = compressor.compress(variable_data.clone()).unwrap();
+        let (_block, encoding) = compressor
+            .compress(miniblock_context(), variable_data.clone())
+            .unwrap();
         check_uncompressed_encoding(&encoding, true);
 
         // Test pervalue
@@ -1790,13 +1819,17 @@ mod tests {
         let compressor = strategy
             .create_miniblock_compressor(&field, &fixed_data)
             .unwrap();
-        let (_block, encoding) = compressor.compress(fixed_data.clone()).unwrap();
+        let (_block, encoding) = compressor
+            .compress(miniblock_context(), fixed_data.clone())
+            .unwrap();
         check_uncompressed_encoding(&encoding, false);
 
         let compressor = strategy
             .create_miniblock_compressor(&field, &variable_data)
             .unwrap();
-        let (_block, encoding) = compressor.compress(variable_data.clone()).unwrap();
+        let (_block, encoding) = compressor
+            .compress(miniblock_context(), variable_data.clone())
+            .unwrap();
         check_uncompressed_encoding(&encoding, true);
 
         // Test pervalue
@@ -2081,7 +2114,7 @@ mod tests {
 
         let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 16);
     }
 
@@ -2106,7 +2139,7 @@ mod tests {
 
             let strategy = strategy(version, CompressionParams::default());
             let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-            let (_compressed, encoding) = compressor.compress(data).unwrap();
+            let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
             assert_eq!(rle_run_length_bits(&encoding), 8, "version={version}");
         }
     }
@@ -2134,7 +2167,7 @@ mod tests {
         let debug_str = format!("{compressor:?}");
         assert!(debug_str.contains("RleEncoder"));
 
-        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 16);
     }
 
@@ -2157,7 +2190,7 @@ mod tests {
 
         let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 16);
     }
 
@@ -2180,7 +2213,7 @@ mod tests {
 
         let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 8);
     }
 
@@ -2217,7 +2250,7 @@ mod tests {
             let data = DataBlock::FixedWidth(data);
 
             let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-            let (_compressed, encoding) = compressor.compress(data).unwrap();
+            let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
             let rle = expect_rle_encoding(&encoding);
 
             assert!(
@@ -2265,7 +2298,7 @@ mod tests {
         let debug_str = format!("{compressor:?}");
         assert!(debug_str.contains("RleEncoder"));
 
-        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
             panic!("expected RLE encoding");
         };
@@ -2315,7 +2348,7 @@ mod tests {
             "expected RLE to beat inline bitpacking after child selection, got: {debug_str}"
         );
 
-        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         let rle = expect_rle_encoding(&encoding);
         assert!(matches!(
             rle.values.as_ref().unwrap().compression.as_ref().unwrap(),

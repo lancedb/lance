@@ -1,18 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::reader::{FileReader, FileReaderOptions, describe_encoding};
+    use crate::reader::{FileReader, FileReaderOptions, ReaderProjection, describe_encoding};
     use crate::testing::FsFixture;
     use crate::version::ConcreteFileVersion;
     use crate::versions;
     use crate::writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriter, FileWriterOptions};
-    use arrow_array::builder::{Float32Builder, Int32Builder, StringDictionaryBuilder};
-    use arrow_array::types::{Float64Type, Int8Type, Int32Type};
+    use arrow_array::builder::{Float32Builder, Int32Builder};
+    use arrow_array::types::Float64Type;
     use arrow_array::{
-        Array, ArrayRef, Int32Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchReader,
-        StringArray, UInt64Array, cast::AsArray,
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchReader, StringArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
@@ -25,7 +27,6 @@ mod tests {
     use lance_io::traits::Writer;
     use lance_io::utils::CachedFileSize;
     use rstest::rstest;
-    use tokio::io::AsyncWriteExt;
 
     fn create_writer(
         object_writer: Box<dyn Writer>,
@@ -46,513 +47,12 @@ mod tests {
             .map(Into::into)
     }
 
-    #[tokio::test]
-    async fn current_writer_dispatch_rejects_legacy_version() {
-        let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
-        let object_writer = object_store.create(&path).await.unwrap();
-        let Err(error) = versions::create_lazy_writer(
-            ConcreteFileVersion::V1,
-            object_writer,
-            FileWriterOptions::default(),
-        ) else {
-            panic!("legacy v1 unexpectedly created a current-format writer");
-        };
-        assert!(matches!(error, lance_core::Error::NotSupported { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("legacy v1 files require an explicit schema and manifest provider")
-        );
-    }
-
-    #[rstest]
-    #[case::v2_0(ConcreteFileVersion::V2_0)]
-    #[case::v2_1(ConcreteFileVersion::V2_1)]
-    #[case::v2_2(ConcreteFileVersion::V2_2)]
-    #[case::v2_3(ConcreteFileVersion::V2_3)]
-    #[tokio::test]
-    async fn version_leaf_writes_exact_standard_footer(#[case] version: ConcreteFileVersion) {
-        let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
-        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            DataType::Int32,
-            true,
-        )]))
-        .unwrap();
-        let mut writer = create_writer(
-            object_store.create(&path).await.unwrap(),
-            schema,
-            version,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
-        let summary = writer.finish().await.unwrap();
-        let footer = object_store
-            .open(&path)
-            .await
-            .unwrap()
-            .get_range(summary.size_bytes as usize - 8..summary.size_bytes as usize)
-            .await
-            .unwrap();
-        let actual = (
-            u16::from_le_bytes([footer[0], footer[1]]),
-            u16::from_le_bytes([footer[2], footer[3]]),
-        );
-        assert_eq!(actual, version.to_standard_footer_numbers());
-    }
-
-    #[rstest]
-    #[case::v2_0(ConcreteFileVersion::V2_0)]
-    #[case::v2_1(ConcreteFileVersion::V2_1)]
-    #[case::v2_2(ConcreteFileVersion::V2_2)]
-    #[case::v2_3(ConcreteFileVersion::V2_3)]
-    fn packed_struct_is_one_physical_column(#[case] version: ConcreteFileVersion) {
-        let packed = ArrowField::new(
-            "packed",
-            DataType::Struct(vec![ArrowField::new("child", DataType::Int32, true)].into()),
-            true,
-        )
-        .with_metadata(HashMap::from([("packed".to_string(), "true".to_string())]));
-        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
-            packed,
-            ArrowField::new("tail", DataType::Int32, true),
-        ]))
-        .unwrap();
-
-        let projection =
-            versions::reader_projection_from_column_names(version, &schema, &["tail"]).unwrap();
-        assert_eq!(projection.column_indices, vec![1]);
-
-        let (field_ids, column_indices) = versions::data_file_columns(version, &schema);
-        assert_eq!(field_ids.len(), 2);
-        assert_eq!(column_indices, vec![0, 1]);
-        assert_eq!(
-            schema
-                .fields
-                .iter()
-                .map(|field| versions::physical_column_count(version, field))
-                .sum::<usize>(),
-            2
-        );
-    }
-
-    #[rstest]
-    #[case::v1(ConcreteFileVersion::V1, &[0, 1, 2], &[0, 1, 2])]
-    #[case::v2_0(ConcreteFileVersion::V2_0, &[0, 1, 2], &[0, 1, 2])]
-    #[case::v2_1(ConcreteFileVersion::V2_1, &[1, 2], &[0, 1])]
-    #[case::v2_2(ConcreteFileVersion::V2_2, &[1, 2], &[0, 1])]
-    #[case::v2_3(ConcreteFileVersion::V2_3, &[1, 2], &[0, 1])]
-    fn data_file_mapping_tracks_only_version_physical_fields(
-        #[case] version: ConcreteFileVersion,
-        #[case] expected_field_ids: &[i32],
-        #[case] expected_column_indices: &[i32],
-    ) {
-        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
-            ArrowField::new(
-                "nested",
-                DataType::Struct(vec![ArrowField::new("child", DataType::Int32, true)].into()),
-                true,
-            ),
-            ArrowField::new("tail", DataType::Int32, true),
-        ]))
-        .unwrap();
-
-        let (field_ids, column_indices) = versions::data_file_columns(version, &schema);
-        assert_eq!(field_ids, expected_field_ids);
-        assert_eq!(column_indices, expected_column_indices);
-    }
-
-    fn compatibility_fixture_batch() -> RecordBatch {
-        let row_count = 4097;
-        let ids = Arc::new(Int32Array::from_iter_values(0..row_count)) as ArrayRef;
-        let names = Arc::new(StringArray::from_iter((0..row_count).map(|index| {
-            (index % 7 != 0).then(|| format!("value-{index:04}-deterministic-fixture"))
-        }))) as ArrayRef;
-        let items = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
-            (0..row_count).map(|index| {
-                (index % 11 != 0).then(|| {
-                    vec![
-                        Some(index),
-                        (index % 5 != 0).then_some(index * 2),
-                        Some(index * 3),
-                    ]
-                })
-            }),
-        )) as ArrayRef;
-        let mut categories = StringDictionaryBuilder::<Int8Type>::new();
-        for index in 0..row_count {
-            if index % 13 == 0 {
-                categories.append_null();
-            } else {
-                categories
-                    .append(match index % 3 {
-                        0 => "red",
-                        1 => "green",
-                        _ => "blue",
-                    })
-                    .unwrap();
-            }
-        }
-        let categories = Arc::new(categories.finish()) as ArrayRef;
-        let blobs = Arc::new(LargeBinaryArray::from_iter_values(
-            (0..row_count)
-                .map(|index| format!("blob-{index:04}-deterministic-payload").into_bytes()),
-        )) as ArrayRef;
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
-                "lance-encoding:compression".to_string(),
-                "none".to_string(),
-            )])),
-            ArrowField::new(
-                "items",
-                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
-                true,
-            ),
-            ArrowField::new(
-                "category",
-                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-                true,
-            )
-            .with_metadata(HashMap::from([(
-                "lance-encoding:dict-values-compression".to_string(),
-                "none".to_string(),
-            )])),
-            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(HashMap::from([(
-                "lance-encoding:blob".to_string(),
-                "true".to_string(),
-            )])),
-        ]));
-        RecordBatch::try_new(schema, vec![ids, names, items, categories, blobs]).unwrap()
-    }
-
-    fn stable_current_fixture(version: ConcreteFileVersion) -> &'static [u8] {
-        match version {
-            ConcreteFileVersion::V1 => unreachable!("v1 uses the legacy writer fixture"),
-            ConcreteFileVersion::V2_0 => {
-                include_bytes!("../test_data/exact_versions/v2_0.lance")
-            }
-            ConcreteFileVersion::V2_1 => {
-                include_bytes!("../test_data/exact_versions/v2_1.lance")
-            }
-            ConcreteFileVersion::V2_2 => {
-                include_bytes!("../test_data/exact_versions/v2_2.lance")
-            }
-            ConcreteFileVersion::V2_3 => {
-                unreachable!("v2.3 is unstable and does not have a compatibility fixture")
-            }
-        }
-    }
-
-    fn assert_blob_column_eq(actual: &dyn Array, expected: &dyn Array) {
-        let actual = actual.as_binary::<i64>();
-        let expected = expected.as_binary::<i64>();
-        assert_eq!(actual.len(), expected.len());
-        for index in 0..actual.len() {
-            assert_eq!(
-                actual.is_null(index),
-                expected.is_null(index),
-                "blob validity differs at row {index}"
-            );
-            if actual.is_valid(index) {
-                assert_eq!(
-                    actual.value(index),
-                    expected.value(index),
-                    "blob payload differs at row {index}"
-                );
-            }
-        }
-    }
-
-    fn assert_wire_bytes_equal(actual: &[u8], expected: &[u8]) {
-        if let Some(offset) = actual
-            .iter()
-            .zip(expected)
-            .position(|(actual, expected)| actual != expected)
-        {
-            panic!(
-                "wire fixture first differs at byte {offset}: actual={}, expected={}",
-                actual[offset], expected[offset]
-            );
-        }
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "wire fixture length changed after a common {}-byte prefix",
-            actual.len().min(expected.len())
-        );
-    }
-
-    #[rstest]
-    #[case::v2_0(ConcreteFileVersion::V2_0)]
-    #[case::v2_1(ConcreteFileVersion::V2_1)]
-    #[case::v2_2(ConcreteFileVersion::V2_2)]
-    #[tokio::test]
-    async fn stable_current_writer_is_byte_compatible(#[case] version: ConcreteFileVersion) {
-        use futures::TryStreamExt;
-        use lance_encoding::decoder::FilterExpression;
-
-        let batch = compatibility_fixture_batch();
-        let mut schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
-        schema.set_dictionary(&batch).unwrap();
-        let fs = FsFixture::default();
-        let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
-        let options = FileWriterOptions {
-            data_cache_bytes: Some(1),
-            max_page_bytes: Some(1024),
-            ..Default::default()
-        };
-        let mut writer: FileWriter = match version {
-            ConcreteFileVersion::V1 => unreachable!(),
-            ConcreteFileVersion::V2_0 => {
-                versions::v2_0::create_writer(object_writer, schema.clone(), options)
-                    .map(Into::into)
-            }
-            ConcreteFileVersion::V2_1 => {
-                versions::v2_1::create_writer(object_writer, schema.clone(), options)
-                    .map(Into::into)
-            }
-            ConcreteFileVersion::V2_2 => {
-                versions::v2_2::create_writer(object_writer, schema.clone(), options)
-                    .map(Into::into)
-            }
-            ConcreteFileVersion::V2_3 => unreachable!(),
-        }
-        .unwrap();
-        for offset in (0..batch.num_rows()).step_by(1024) {
-            let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
-            writer.write_batch(&slice).await.unwrap();
-        }
-        let summary = writer.finish().await.unwrap();
-        let actual = fs
-            .object_store
-            .open(&fs.tmp_path)
-            .await
-            .unwrap()
-            .get_range(0..summary.size_bytes as usize)
-            .await
-            .unwrap();
-        let expected = stable_current_fixture(version);
-        assert_wire_bytes_equal(actual.as_ref(), expected);
-
-        let fixture_fs = FsFixture::default();
-        let mut fixture_writer = fixture_fs
-            .object_store
-            .create(&fixture_fs.tmp_path)
-            .await
-            .unwrap();
-        fixture_writer.write_all(expected).await.unwrap();
-        Writer::shutdown(fixture_writer.as_mut()).await.unwrap();
-        let scheduler = fixture_fs
-            .scheduler
-            .open_file(
-                &fixture_fs.tmp_path,
-                &CachedFileSize::new(expected.len() as u64),
-            )
-            .await
-            .unwrap();
-        let reader = FileReader::try_open(
-            scheduler,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &LanceCache::no_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(reader.metadata().version, version);
-        assert!(
-            reader
-                .metadata()
-                .column_metadatas
-                .iter()
-                .any(|metadata| metadata.pages.len() > 1)
-        );
-        let batches = reader
-            .read_stream(
-                lance_io::ReadBatchParams::RangeFull,
-                1024,
-                16,
-                FilterExpression::no_filter(),
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(
-            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            batch.num_rows()
-        );
-        assert!(
-            batches
-                .iter()
-                .all(|actual| actual.schema_ref() == batch.schema_ref())
-        );
-        let mut row_offset = 0;
-        for actual in &batches {
-            let expected = batch.slice(row_offset, actual.num_rows());
-            assert_blob_column_eq(actual.column(4).as_ref(), expected.column(4).as_ref());
-            row_offset += actual.num_rows();
-        }
-        assert_eq!(row_offset, batch.num_rows());
-    }
-
-    async fn write_v2_3_fixture(batch: &RecordBatch, schema: &LanceSchema) -> Vec<u8> {
-        let fs = FsFixture::default();
-        let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
-        let mut writer = versions::v2_3::create_writer(
-            object_writer,
-            schema.clone(),
-            FileWriterOptions {
-                data_cache_bytes: Some(1),
-                max_page_bytes: Some(1024),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        for offset in (0..batch.num_rows()).step_by(1024) {
-            let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
-            writer.write_batch(&slice).await.unwrap();
-        }
-        let summary = writer.finish().await.unwrap();
-        fs.object_store
-            .open(&fs.tmp_path)
-            .await
-            .unwrap()
-            .get_range(0..summary.size_bytes as usize)
-            .await
-            .unwrap()
-            .to_vec()
-    }
-
-    #[tokio::test]
-    async fn v2_3_writer_emits_current_exact_grammar() {
-        use futures::TryStreamExt;
-        use lance_encoding::decoder::FilterExpression;
-
-        let batch = compatibility_fixture_batch();
-        let mut schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
-        schema.set_dictionary(&batch).unwrap();
-        let first = write_v2_3_fixture(&batch, &schema).await;
-        let second = write_v2_3_fixture(&batch, &schema).await;
-        assert_eq!(first, second);
-        assert_eq!(
-            &first[first.len() - 8..],
-            &[2, 0, 3, 0, b'L', b'A', b'N', b'C']
-        );
-
-        let fs = FsFixture::default();
-        let mut object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
-        object_writer.write_all(&first).await.unwrap();
-        Writer::shutdown(object_writer.as_mut()).await.unwrap();
-        let scheduler = fs
-            .scheduler
-            .open_file(&fs.tmp_path, &CachedFileSize::new(first.len() as u64))
-            .await
-            .unwrap();
-        let reader = FileReader::try_open(
-            scheduler,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &LanceCache::no_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(reader.metadata().version, ConcreteFileVersion::V2_3);
-        assert!(
-            reader
-                .metadata()
-                .column_metadatas
-                .iter()
-                .any(|metadata| metadata.pages.len() > 1)
-        );
-        let batches = reader
-            .read_stream(
-                lance_io::ReadBatchParams::RangeFull,
-                1024,
-                16,
-                FilterExpression::no_filter(),
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let mut row_offset = 0;
-        for actual in &batches {
-            let expected = batch.slice(row_offset, actual.num_rows());
-            assert_blob_column_eq(actual.column(4).as_ref(), expected.column(4).as_ref());
-            row_offset += actual.num_rows();
-        }
-        assert_eq!(row_offset, batch.num_rows());
-    }
-
-    #[tokio::test]
-    async fn v1_writer_is_byte_compatible() {
-        use crate::versions::v1::reader::FileReader as V1Reader;
-        use crate::versions::v1::writer::{
-            FileWriter as V1Writer, FileWriterOptions as V1WriterOptions, NotSelfDescribing,
-        };
-
-        let expected = include_bytes!("../test_data/exact_versions/v1.lance");
-        let batch = compatibility_fixture_batch();
-        let mut schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
-        schema.set_dictionary(&batch).unwrap();
-        let fs = FsFixture::default();
-        let mut writer = V1Writer::<NotSelfDescribing>::try_new(
-            fs.object_store.as_ref(),
-            &fs.tmp_path,
-            schema.clone(),
-            &V1WriterOptions {
-                collect_stats_for_fields: Some(Vec::new()),
-            },
-        )
-        .await
-        .unwrap();
-        for offset in (0..batch.num_rows()).step_by(1024) {
-            let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
-            writer.write(std::slice::from_ref(&slice)).await.unwrap();
-        }
-        let summary = writer.finish().await.unwrap();
-        let actual = fs
-            .object_store
-            .open(&fs.tmp_path)
-            .await
-            .unwrap()
-            .get_range(0..summary.size_bytes as usize)
-            .await
-            .unwrap();
-        assert_wire_bytes_equal(actual.as_ref(), expected);
-
-        let fixture_fs = FsFixture::default();
-        let mut fixture_writer = fixture_fs
-            .object_store
-            .create(&fixture_fs.tmp_path)
-            .await
-            .unwrap();
-        fixture_writer.write_all(expected).await.unwrap();
-        Writer::shutdown(fixture_writer.as_mut()).await.unwrap();
-        let reader = V1Reader::try_new(
-            fixture_fs.object_store.as_ref(),
-            &fixture_fs.tmp_path,
-            schema.clone(),
-        )
-        .await
-        .unwrap();
-        let actual_batch = reader
-            .read_range(0..batch.num_rows(), &schema)
-            .await
-            .unwrap();
-        assert_eq!(reader.num_batches(), 5);
-        assert_eq!(actual_batch.num_rows(), batch.num_rows());
-        assert_eq!(actual_batch.column(0).to_data(), batch.column(0).to_data());
-        assert_eq!(actual_batch.column(1).to_data(), batch.column(1).to_data());
-        assert_blob_column_eq(actual_batch.column(4).as_ref(), batch.column(4).as_ref());
+    fn reader_projection_from_column_names(
+        version: ConcreteFileVersion,
+        schema: &LanceSchema,
+        column_names: &[&str],
+    ) -> lance_core::Result<ReaderProjection> {
+        versions::reader_projection_from_column_names(version, schema, column_names)
     }
 
     #[tokio::test]
@@ -628,8 +128,7 @@ mod tests {
         use futures::TryStreamExt;
         use lance_encoding::decoder::FilterExpression;
 
-        let projection =
-            versions::reader_projection_from_column_names(version, schema, &[name]).unwrap();
+        let projection = reader_projection_from_column_names(version, schema, &[name]).unwrap();
         let batches: Vec<RecordBatch> = reader
             .read_stream_projected(params, 1024, 16, projection, FilterExpression::no_filter())
             .await
@@ -820,8 +319,7 @@ mod tests {
 
         let read = |names: &'static [&'static str], params: ReadBatchParams| {
             let projection =
-                versions::reader_projection_from_column_names(version, &lance_schema, names)
-                    .unwrap();
+                reader_projection_from_column_names(version, &lance_schema, names).unwrap();
             async {
                 match reader
                     .read_stream_projected(
@@ -993,8 +491,7 @@ mod tests {
         // column, length 6) and spuriously reject this rectangular file.
         for names in [&["a", "s", "lst"][..], &["a", "lst"][..], &["a", "s"][..]] {
             let projection =
-                versions::reader_projection_from_column_names(version, &lance_schema, names)
-                    .unwrap();
+                reader_projection_from_column_names(version, &lance_schema, names).unwrap();
             let batches: Vec<RecordBatch> = reader
                 .read_stream_projected(
                     ReadBatchParams::RangeFull,
@@ -1127,8 +624,7 @@ mod tests {
         );
 
         // Single short column: RangeFull resolves to its own length (1).
-        let proj_c =
-            versions::reader_projection_from_column_names(version, &lance_schema, &["c"]).unwrap();
+        let proj_c = reader_projection_from_column_names(version, &lance_schema, &["c"]).unwrap();
         let reader_c = reader.clone();
         let batches = tokio::task::spawn_blocking(move || {
             reader_c
@@ -1149,8 +645,7 @@ mod tests {
 
         // A mismatched projection [a, c] errors on the blocking path too.
         let proj_ac =
-            versions::reader_projection_from_column_names(version, &lance_schema, &["a", "c"])
-                .unwrap();
+            reader_projection_from_column_names(version, &lance_schema, &["a", "c"]).unwrap();
         let reader_ac = reader.clone();
         let is_err = tokio::task::spawn_blocking(move || {
             reader_ac
@@ -1498,7 +993,7 @@ mod tests {
 
         // Verify metadata
         let metadata = file_reader.metadata();
-        assert_eq!(metadata.version, ConcreteFileVersion::V2_1);
+        assert_eq!(metadata.version(), ConcreteFileVersion::V2_1);
 
         let schema = file_reader.schema();
         assert_eq!(

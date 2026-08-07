@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Exact file-format composition roots.
 //!
 //! Each version module lists the mechanisms used by that file format. Callers
@@ -342,7 +345,9 @@ pub fn encode_self_described_batch(
     batch: &EncodedBatch,
 ) -> Result<Bytes> {
     match version {
-        ConcreteFileVersion::V1 => v1::encode_self_described_batch(batch),
+        ConcreteFileVersion::V1 => Err(Error::not_supported(
+            "Lance v1 does not support self-described current-format batches".to_string(),
+        )),
         ConcreteFileVersion::V2_0 => v2_0::encode_self_described_batch(batch),
         ConcreteFileVersion::V2_1 => v2_1::encode_self_described_batch(batch),
         ConcreteFileVersion::V2_2 => v2_2::encode_self_described_batch(batch),
@@ -353,10 +358,39 @@ pub fn encode_self_described_batch(
 /// Encode a mini-lance batch for an exact file version.
 pub fn encode_mini_batch(version: ConcreteFileVersion, batch: &EncodedBatch) -> Result<Bytes> {
     match version {
-        ConcreteFileVersion::V1 => v1::encode_mini_batch(batch),
+        ConcreteFileVersion::V1 => Err(Error::not_supported(
+            "Lance v1 does not support mini-lance current-format batches".to_string(),
+        )),
         ConcreteFileVersion::V2_0 => v2_0::encode_mini_batch(batch),
         ConcreteFileVersion::V2_1 => v2_1::encode_mini_batch(batch),
         ConcreteFileVersion::V2_2 => v2_2::encode_mini_batch(batch),
         ConcreteFileVersion::V2_3 => v2_3::encode_mini_batch(batch),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn v1_rejects_current_format_embedded_batches() {
+        let batch = EncodedBatch {
+            data: Bytes::new(),
+            page_table: Vec::new(),
+            schema: Arc::new(Schema::default()),
+            top_level_columns: Vec::new(),
+            num_rows: 0,
+        };
+
+        assert!(matches!(
+            encode_self_described_batch(ConcreteFileVersion::V1, &batch),
+            Err(Error::NotSupported { .. })
+        ));
+        assert!(matches!(
+            encode_mini_batch(ConcreteFileVersion::V1, &batch),
+            Err(Error::NotSupported { .. })
+        ));
     }
 }

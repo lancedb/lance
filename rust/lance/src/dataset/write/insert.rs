@@ -12,6 +12,7 @@ use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
@@ -19,7 +20,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
 use crate::Dataset;
-use crate::blob::normalize_prepared_blob_schema;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
@@ -214,6 +215,7 @@ impl<'a> InsertBuilder<'a> {
         .await?;
 
         let (written_fragments, written_schema) = write_fragments_internal(
+            context.storage_version,
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -322,7 +324,7 @@ impl<'a> InsertBuilder<'a> {
             schema_cmp_opts.allow_missing_if_nullable = true;
             schema_cmp_opts.ignore_field_order = true;
 
-            let normalized_data_schema = normalize_prepared_blob_schema(data_schema)?;
+            let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
             normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 

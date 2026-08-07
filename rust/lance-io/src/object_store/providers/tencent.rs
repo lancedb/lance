@@ -80,8 +80,7 @@ impl ObjectStoreProvider for TencentStoreProvider {
         }
 
         let operator = Operator::from_iter::<Cos>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create COS operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create COS operator: {:?}", e)))?;
 
         let opendal_store = Arc::new(OpendalStore::new(operator));
 

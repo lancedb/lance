@@ -14,11 +14,10 @@ use futures::stream::FuturesOrdered;
 use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
-use lance_encoding::array_encoding::ArrayFieldEncodingStrategy;
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
-    BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
-    FieldEncodingStrategy, OutOfLineBuffers,
+    ArrayFieldEncodingStrategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
+    EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_io::object_store::ObjectStore;
@@ -246,7 +245,7 @@ impl Writer {
             Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
         let encoded_encoding = match encoded_page.description {
-            PageEncoding::Array(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
+            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
             PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
         };
         let page = pbfile::column_metadata::Page {
@@ -887,7 +886,7 @@ pub fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<B
             .iter()
             .map(|page_info| {
                 let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Array(array_encoding) => {
+                    PageEncoding::Legacy(array_encoding) => {
                         Any::from_msg(array_encoding)?.encode_to_vec()
                     }
                     PageEncoding::Structural(page_layout) => {

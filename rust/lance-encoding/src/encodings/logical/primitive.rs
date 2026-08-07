@@ -33,7 +33,7 @@ use itertools::Itertools;
 use lance_arrow::DataTypeExt;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
-    cache::{CacheKey, Context, DeepSizeOf},
+    cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder},
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
@@ -55,7 +55,7 @@ use crate::{
     encodings::logical::primitive::fullzip::PerValueDataBlock,
 };
 use crate::{
-    encodings::logical::primitive::miniblock::MiniBlockCompressed,
+    encodings::logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressionContext},
     statistics::{ComputeStat, GetStat, Stat},
 };
 use crate::{
@@ -174,6 +174,19 @@ struct DecodeMiniBlockTask {
 }
 
 impl DecodeMiniBlockTask {
+    fn decoded_size_bytes(&self) -> Option<u64> {
+        if self.rep_decompressor.is_some() || self.def_decompressor.is_some() {
+            return None;
+        }
+        let num_values = self
+            .instructions
+            .iter()
+            .try_fold(0_u64, |total, (instruction, _)| {
+                total.checked_add(instruction.rows_to_take)
+            })?;
+        self.value_decompressor.decoded_size_bytes(num_values)
+    }
+
     fn decode_levels(
         rep_decompressor: &dyn BlockDecompressor,
         levels: LanceBuffer,
@@ -556,15 +569,15 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         let max_rep = self.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
 
-        // This is probably an over-estimate but it's quick and easy to calculate
-        let estimated_size_bytes = self
-            .instructions
-            .iter()
-            .map(|(_, chunk)| chunk.data.len())
-            .sum::<usize>()
-            * 2;
-        let mut data_builder =
-            DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
+        let estimated_size_bytes = self.decoded_size_bytes().unwrap_or_else(|| {
+            // Variable-width and rep/def encoded output sizes are not known before decoding.
+            self.instructions
+                .iter()
+                .map(|(_, chunk)| chunk.data.len() as u64)
+                .sum::<u64>()
+                * 2
+        });
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
         // We need to keep track of the offset into repbuf/defbuf that we are building up
         let mut level_offset = 0;
@@ -629,7 +642,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             Self::extend_levels(level_range.clone(), &mut repbuf, &rep, level_offset);
             Self::extend_levels(level_range.clone(), &mut defbuf, &def, level_offset);
             level_offset += (level_range.end - level_range.start) as usize;
-            data_builder.append(&values, item_range);
+            data_builder.append(&values, item_range)?;
         }
 
         let mut data = data_builder.finish();
@@ -2415,18 +2428,50 @@ struct FlatValueCounts {
     last_chunk_values: u64,
 }
 
-fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
+fn analyze_value_counts(words: &Words, items_in_page: u64) -> Result<FlatValueCounts> {
     let num_chunks = words.len();
     let logs = words.iter().map(|w| (w & 0x0F) as u8).collect::<Vec<_>>();
     let mut counted = 0u64;
-    for &log in logs.iter().take(num_chunks.saturating_sub(1)) {
-        // Non-last chunks always encode a positive log value count.
-        debug_assert!(log > 0);
-        counted += 1u64 << log;
+    for (chunk_index, &log) in logs.iter().take(num_chunks.saturating_sub(1)).enumerate() {
+        if log == 0 {
+            return Err(Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "non-final chunk {chunk_index} of {num_chunks} has invalid log_num_values=0"
+                ),
+            ));
+        }
+        counted = counted.checked_add(1u64 << log).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "value count overflow at chunk {chunk_index}: counted_values={counted}, \
+                     log_num_values={log}, items_in_page={items_in_page}"
+                ),
+            )
+        })?;
     }
-    let last_chunk_values = items_in_page - counted;
-    if let Some(&last_log) = logs.last() {
-        debug_assert!(last_log == 0 || (1u64 << last_log) == last_chunk_values);
+    let last_chunk_values = items_in_page.checked_sub(counted).ok_or_else(|| {
+        Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "non-final chunks account for counted_values={counted}, exceeding \
+                 items_in_page={items_in_page}"
+            ),
+        )
+    })?;
+    if let Some(&last_log) = logs.last()
+        && last_log != 0
+        && (1u64 << last_log) != last_chunk_values
+    {
+        return Err(Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "final chunk log_num_values={last_log} does not match \
+                 last_chunk_values={last_chunk_values}: counted_values={counted}, \
+                 items_in_page={items_in_page}"
+            ),
+        ));
     }
     let uniform = num_chunks <= 1 || logs[..num_chunks - 1].iter().all(|&log| log == logs[0]);
     // A single-chunk page has no "non-last" chunk to derive a stride from; use the
@@ -2436,27 +2481,24 @@ fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
     } else {
         1u64 << logs[0]
     };
-    FlatValueCounts {
+    Ok(FlatValueCounts {
         logs,
         uniform,
         values_per_chunk,
         last_chunk_values,
-    }
+    })
 }
 
 /// Iterator over per-chunk value counts for a non-uniform flat page.  Non-last
-/// chunks yield `1 << log`; the last yields the remaining items in the page.
-fn flat_value_counts_iter(logs: &[u8], items_in_page: u64) -> impl Iterator<Item = u64> + '_ {
+/// chunks yield `1 << log`; the last yields the validated remaining item count.
+fn flat_value_counts_iter(logs: &[u8], last_chunk_values: u64) -> impl Iterator<Item = u64> + '_ {
     let num_chunks = logs.len();
-    let mut counted = 0u64;
     (0..num_chunks).map(move |i| {
-        let count = if i + 1 < num_chunks {
+        if i + 1 < num_chunks {
             1u64 << logs[i]
         } else {
-            items_in_page - counted
-        };
-        counted += count;
-        count
+            last_chunk_values
+        }
     })
 }
 
@@ -2471,8 +2513,12 @@ fn build_chunk_index(
     data_buf_size: u64,
     rep_index_bytes: Option<&[u8]>,
     repetition_index_depth: u16,
-) -> MiniBlockChunkIndex {
+) -> Result<MiniBlockChunkIndex> {
     let num_chunks = words.len();
+    // Validate item counts before byte sizes because both share a metadata word,
+    // and an invalid count must not reach the final-chunk subtraction.
+    let value_counts = analyze_value_counts(words, items_in_page)?;
+
     // Each chunk stores `(divided_bytes + 1) * MINIBLOCK_ALIGNMENT` bytes, so the
     // deltas are the chunk sizes and their grand total is the data buffer size.
     let byte_starts = PrefixSums::from_deltas(
@@ -2489,7 +2535,6 @@ fn build_chunk_index(
         assert!(rep_index_data.len() % 8 == 0);
         let stride = repetition_index_depth as usize + 1;
         let (row_starts, has_trailer) = parse_nested_rep(rep_index_data, stride);
-        let value_counts = analyze_value_counts(words, items_in_page);
         let item_counts = if value_counts.uniform {
             ItemCounts::Uniform {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -2507,7 +2552,6 @@ fn build_chunk_index(
             item_counts,
         }
     } else {
-        let value_counts = analyze_value_counts(words, items_in_page);
         if value_counts.uniform {
             RowMapping::UniformFlat {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -2516,7 +2560,7 @@ fn build_chunk_index(
             }
         } else {
             let value_starts = PrefixSums::from_deltas(
-                flat_value_counts_iter(&value_counts.logs, items_in_page),
+                flat_value_counts_iter(&value_counts.logs, value_counts.last_chunk_values),
                 num_chunks,
                 items_in_page,
             );
@@ -2524,7 +2568,7 @@ fn build_chunk_index(
         }
     };
 
-    MiniBlockChunkIndex::new(base, byte_starts, rows)
+    Ok(MiniBlockChunkIndex::new(base, byte_starts, rows))
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
@@ -2574,7 +2618,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 data_buf_size,
                 rep_index_bytes.as_deref(),
                 self.repetition_index_depth,
-            );
+            )?;
 
             // decode dictionary
             let dictionary = if let Some(ref mut dictionary) = self.dictionary {
@@ -2952,7 +2996,7 @@ impl FullZipScheduler {
                     num_rows,
                     bits_per_offset,
                     bits_per_offset,
-                )))
+                )?))
             }
         }
     }
@@ -3367,7 +3411,7 @@ impl VariableFullZipDecoder {
         num_rows: u64,
         in_bits_per_length: u8,
         out_bits_per_offset: u8,
-    ) -> Self {
+    ) -> Result<Self> {
         let decompressor = match details.value_decompressor {
             PerValueDecompressor::Variable(ref d) => d.clone(),
             _ => unreachable!(),
@@ -3412,9 +3456,9 @@ impl VariableFullZipDecoder {
         //   - We could force each decode task to do a full unzip of all the data.  Each decode task now
         //     has to do more work but the work is all fused.
         //   - We could just try doing this work on the decode thread and see if it is a problem.
-        decoder.unzip(data, in_bits_per_length, out_bits_per_offset, num_rows);
+        decoder.unzip(data, in_bits_per_length, out_bits_per_offset, num_rows)?;
 
-        decoder
+        Ok(decoder)
     }
 
     fn slice_batch_data_and_rebase_offsets_typed<T>(
@@ -3489,28 +3533,33 @@ impl VariableFullZipDecoder {
         }
     }
 
-    unsafe fn parse_length(data: &[u8], bits_per_offset: u8) -> u64 {
-        match bits_per_offset {
-            8 => *data.get_unchecked(0) as u64,
-            16 => u16::from_le_bytes([*data.get_unchecked(0), *data.get_unchecked(1)]) as u64,
-            32 => u32::from_le_bytes([
-                *data.get_unchecked(0),
-                *data.get_unchecked(1),
-                *data.get_unchecked(2),
-                *data.get_unchecked(3),
-            ]) as u64,
-            64 => u64::from_le_bytes([
-                *data.get_unchecked(0),
-                *data.get_unchecked(1),
-                *data.get_unchecked(2),
-                *data.get_unchecked(3),
-                *data.get_unchecked(4),
-                *data.get_unchecked(5),
-                *data.get_unchecked(6),
-                *data.get_unchecked(7),
-            ]),
-            _ => unreachable!(),
+    /// Reads a single length prefix from the front of `data`.
+    ///
+    /// The bytes come from the file. A page whose item walk ends with a partial
+    /// trailing item leaves fewer than `bits_per_offset / 8` bytes here, so this
+    /// is bounds checked and reports a corrupt file rather than reading past the
+    /// end of the buffer.
+    fn parse_length(data: &[u8], bits_per_offset: u8) -> Result<u64> {
+        let width = bits_per_offset as usize / 8;
+        if data.len() < width {
+            return Err(Error::corrupt_file_named(
+                "variable_full_zip",
+                format!(
+                    "truncated length prefix: {} byte(s) remain in the page buffer but a \
+                     {}-bit length prefix requires {}",
+                    data.len(),
+                    bits_per_offset,
+                    width
+                ),
+            ));
         }
+        Ok(match bits_per_offset {
+            8 => data[0] as u64,
+            16 => u16::from_le_bytes(data[..2].try_into().unwrap()) as u64,
+            32 => u32::from_le_bytes(data[..4].try_into().unwrap()) as u64,
+            64 => u64::from_le_bytes(data[..8].try_into().unwrap()),
+            _ => unreachable!(),
+        })
     }
 
     fn unzip(
@@ -3519,7 +3568,7 @@ impl VariableFullZipDecoder {
         in_bits_per_length: u8,
         out_bits_per_offset: u8,
         num_rows: u64,
-    ) {
+    ) -> Result<()> {
         // This undercounts if there are lists but, at this point, we don't really know how many items we have
         let mut rep = Vec::with_capacity(num_rows as usize);
         let mut def = Vec::with_capacity(num_rows as usize);
@@ -3570,9 +3619,7 @@ impl VariableFullZipDecoder {
                 if ctrl_desc.is_visible {
                     visible_item_count += 1;
                     if ctrl_desc.is_valid_item {
-                        // Safety: Data should have at least bytes_per_length bytes remaining
-                        debug_assert!(databuf.len() >= bytes_per_length);
-                        let length = unsafe { Self::parse_length(databuf, in_bits_per_length) };
+                        let length = Self::parse_length(databuf, in_bits_per_length)?;
                         match out_bits_per_offset {
                             32 => offsets_data
                                 .extend_from_slice(&(current_offset as u32).to_le_bytes()),
@@ -3608,6 +3655,7 @@ impl VariableFullZipDecoder {
         self.def = ScalarBuffer::from(def);
         self.data = LanceBuffer::from(unzipped_data);
         self.offsets = LanceBuffer::from(offsets_data);
+        Ok(())
     }
 }
 
@@ -3724,15 +3772,31 @@ struct FixedFullZipDecodeTask {
 
 impl DecodePageTask for FixedFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        // Multiply by 2 to make a stab at the size of the output buffer (which will be decompressed and thus bigger)
-        let estimated_size_bytes = self
-            .data
-            .iter()
-            .map(|task_item| task_item.data.data_size() as usize)
-            .sum::<usize>()
-            * 2;
-        let mut data_builder =
-            DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
+        let estimated_size_bytes = if self.details.ctrl_word_parser.bytes_per_word() == 0 {
+            let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor else {
+                return Err(Error::internal(
+                    "FixedFullZipDecodeTask requires a fixed-width decompressor",
+                ));
+            };
+            decompressor
+                .decoded_size_bytes(self.num_rows as u64)
+                .unwrap_or_else(|| {
+                    self.data
+                        .iter()
+                        .map(|task_item| task_item.data.data_size())
+                        .sum::<u64>()
+                        * 2
+                })
+        } else {
+            // Rep/def levels can suppress values, so the exact output size is not known
+            // until they are decoded. Keep the existing conservative estimate.
+            self.data
+                .iter()
+                .map(|task_item| task_item.data.data_size())
+                .sum::<u64>()
+                * 2
+        };
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
         if self.details.ctrl_word_parser.bytes_per_word() == 0 {
             // Fast path, no need to unzip because there is no rep/def
@@ -3748,7 +3812,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 };
                 debug_assert_eq!(fixed_data.num_values, task_item.rows_in_buf);
                 let decompressed = decompressor.decompress(fixed_data, task_item.rows_in_buf)?;
-                data_builder.append(&decompressed, 0..task_item.rows_in_buf);
+                data_builder.append(&decompressed, 0..task_item.rows_in_buf)?;
             }
 
             let unraveler = RepDefUnraveler::new(
@@ -3812,7 +3876,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                     unreachable!()
                 };
                 let decompressed = decompressor.decompress(fixed_data, visible_items)?;
-                data_builder.append(&decompressed, 0..visible_items);
+                data_builder.append(&decompressed, 0..visible_items)?;
             }
 
             let repetition = if rep.is_empty() { None } else { Some(rep) };
@@ -4176,6 +4240,15 @@ impl CacheKey for FieldDataCacheKey {
 
     fn type_name() -> &'static str {
         "FieldData"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.encoding.logical.primitive.field-data-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.column_index);
+        builder.write_str(&self.view_tag);
     }
 }
 
@@ -5401,7 +5474,12 @@ impl PrimitiveStructuralEncoder {
         let num_items = data.num_values();
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
-        let (compressed_data, value_encoding) = compressor.compress(data)?;
+        let common_chunk_buffers =
+            u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
+        let support_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
+        let compression_context =
+            MiniBlockCompressionContext::new(common_chunk_buffers, support_large_chunk, true);
+        let (compressed_data, value_encoding) = compressor.compress(compression_context, data)?;
 
         let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
 
@@ -6919,16 +6997,19 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::{
-        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FixedWidthDictionaryEncoding, FullZipCacheableState,
-        FullZipDecodeDetails, FullZipReadSource, FullZipRepIndexDetails, FullZipScheduler,
-        LazyLevels, LevelCodec, LevelCursor, LevelPlan, MiniBlockChunk, MiniBlockChunkIndex,
-        MiniBlockCompressed, MiniblockChunkSize, PerValueDecompressor, PreambleAction,
-        RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler, VariableFullZipDecoder,
-        dense_levels_from_block, validate_complex_all_null_levels,
+        ChunkInstructions, DataBlock, DecodeMiniBlockTask, DecodePageTask, FixedFullZipDecodeTask,
+        FixedPerValueDecompressor, FixedWidthDataBlock, FixedWidthDictionaryEncoding,
+        FullZipCacheableState, FullZipDecodeDetails, FullZipDecodeTaskItem, FullZipReadSource,
+        FullZipRepIndexDetails, FullZipScheduler, LazyLevels, LevelCodec, LevelCursor, LevelPlan,
+        MiniBlockChunk, MiniBlockChunkIndex, MiniBlockCompressed, MiniblockChunkSize,
+        PerValueDataBlock, PerValueDecompressor, PreambleAction, RunEndsBuilder, RunPosition,
+        RunStorage, StructuralPageScheduler, VariableFullZipDecoder, dense_levels_from_block,
+        validate_complex_all_null_levels,
     };
     use crate::buffer::LanceBuffer;
-    use crate::compression::{BlockCompressor, DefaultDecompressionStrategy};
+    use crate::compression::{
+        BlockCompressor, DefaultDecompressionStrategy, MiniBlockDecompressor,
+    };
     use crate::constants::{
         COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
         DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
@@ -6936,17 +7017,23 @@ mod tests {
     };
     use crate::data::BlockInfo;
     use crate::decoder::{PageEncoding, StructuralFieldDecoder};
+    use crate::encodings::logical::primitive::fullzip::PerValueCompressor;
     use crate::encodings::logical::primitive::{
-        ChunkDrainInstructions, PrimitiveStructuralEncoder, StructuralPrimitiveFieldDecoder,
+        ChunkDrainInstructions, LoadedChunk, PrimitiveStructuralEncoder,
+        StructuralPrimitiveFieldDecoder,
     };
     use crate::encodings::physical::rle::{RleDecompressor, RleEncoder, RleRuns, RunLengthWidth};
+    use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::repdef::build_control_word_iterator;
     use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_array::{
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int8Array, StringArray, UInt8Array,
+        make_array,
+    };
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
@@ -7016,6 +7103,312 @@ mod tests {
         assert!(
             err.to_string().contains("byte aligned"),
             "unexpected error: {err}"
+        );
+    }
+
+    fn decode_fixed_fullzip_no_levels(
+        decompressor: Arc<dyn FixedPerValueDecompressor>,
+        data: Vec<FullZipDecodeTaskItem>,
+        num_rows: usize,
+        bytes_per_value: usize,
+    ) -> DataBlock {
+        Box::new(FixedFullZipDecodeTask {
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(decompressor),
+                def_meaning: Arc::from([]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+                max_rep: 0,
+                max_visible_def: u16::MAX,
+            }),
+            data,
+            num_rows,
+            bytes_per_value,
+        })
+        .decode()
+        .unwrap()
+        .data
+    }
+
+    #[test]
+    fn test_fixed_fullzip_decode_preallocates_exact_output_size() {
+        #[derive(Debug)]
+        struct IdentityFixedDecompressor;
+
+        impl FixedPerValueDecompressor for IdentityFixedDecompressor {
+            fn decompress(
+                &self,
+                data: FixedWidthDataBlock,
+                num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                assert_eq!(data.num_values, num_rows);
+                Ok(DataBlock::FixedWidth(data))
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+
+            fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+                num_values.checked_mul(4)
+            }
+        }
+
+        let make_item = |num_rows: u64| FullZipDecodeTaskItem {
+            data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                data: LanceBuffer::from(vec![7_u8; num_rows as usize * 4]),
+                bits_per_value: 32,
+                num_values: num_rows,
+                block_info: BlockInfo::new(),
+            }),
+            rows_in_buf: num_rows,
+        };
+
+        let num_rows = 512;
+        let decoded = decode_fixed_fullzip_no_levels(
+            Arc::new(IdentityFixedDecompressor),
+            vec![make_item(128), make_item(384)],
+            num_rows,
+            4,
+        );
+        let values = decoded.as_fixed_width_ref().unwrap();
+        let expected_size = num_rows * 4;
+        assert_eq!(values.data.len(), expected_size);
+        assert_eq!(values.data.clone().into_buffer().capacity(), expected_size);
+    }
+
+    #[test]
+    fn test_fixed_fullzip_decode_falls_back_when_output_size_is_not_exact() {
+        #[derive(Debug)]
+        struct FallbackFixedDecompressor;
+
+        impl FixedPerValueDecompressor for FallbackFixedDecompressor {
+            fn decompress(
+                &self,
+                data: FixedWidthDataBlock,
+                num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                assert_eq!(data.num_values, num_rows);
+                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::from(vec![7_u8; num_rows as usize * 4]),
+                    bits_per_value: 32,
+                    num_values: num_rows,
+                    block_info: BlockInfo::new(),
+                }))
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                // This deliberately cannot be multiplied by num_rows. If FullZip treats
+                // bits_per_value as an exact decoded-size estimate, decoding will fail.
+                u64::MAX - 7
+            }
+        }
+
+        let num_rows = 2;
+        let decoded = decode_fixed_fullzip_no_levels(
+            Arc::new(FallbackFixedDecompressor),
+            vec![FullZipDecodeTaskItem {
+                data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                    data: LanceBuffer::from(vec![0_u8; num_rows * 4]),
+                    bits_per_value: 32,
+                    num_values: num_rows as u64,
+                    block_info: BlockInfo::new(),
+                }),
+                rows_in_buf: num_rows as u64,
+            }],
+            num_rows,
+            4,
+        );
+        let values = decoded.as_fixed_width_ref().unwrap();
+        assert_eq!(values.num_values, num_rows as u64);
+        assert_eq!(values.data.len(), num_rows * 4);
+    }
+
+    #[test]
+    fn test_fixed_fullzip_real_fsl_preallocates_exact_output_size() {
+        let num_rows = 64;
+        let dimension = 32;
+        let items = Arc::new(Float32Array::from_iter_values(
+            (0..num_rows * dimension).map(|value| value as f32),
+        ));
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, false));
+        let sample = FixedSizeListArray::new(item_field, dimension as i32, items, None);
+
+        let (data, compression) = PerValueCompressor::compress(
+            &ValueEncoder::default(),
+            DataBlock::from_array(sample.clone()),
+        )
+        .unwrap();
+        let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
+            panic!("expected fixed-size-list compression");
+        };
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let expected_size = num_rows * dimension * size_of::<f32>();
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
+            Some(expected_size as u64)
+        );
+
+        let decoded = decode_fixed_fullzip_no_levels(
+            Arc::new(decompressor),
+            vec![FullZipDecodeTaskItem {
+                data,
+                rows_in_buf: num_rows as u64,
+            }],
+            num_rows,
+            dimension * size_of::<f32>(),
+        );
+        let fsl = decoded.as_fixed_size_list_ref().unwrap();
+        let values = fsl.child.as_fixed_width_ref().unwrap();
+        assert_eq!(values.data.len(), expected_size);
+        assert_eq!(values.data.clone().into_buffer().capacity(), expected_size);
+
+        let decoded_array = make_array(
+            decoded
+                .into_arrow(sample.data_type().clone(), true)
+                .unwrap(),
+        );
+        assert_eq!(decoded_array.as_ref(), &sample);
+    }
+
+    #[test]
+    fn test_fixed_fullzip_nullable_fsl_uses_fallback_end_to_end() {
+        #[derive(Debug)]
+        struct NullableFslDecompressor {
+            inner: ValueDecompressor,
+        }
+
+        impl FixedPerValueDecompressor for NullableFslDecompressor {
+            fn decompress(
+                &self,
+                data: FixedWidthDataBlock,
+                num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                FixedPerValueDecompressor::decompress(&self.inner, data, num_rows)
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                // FullZip must not use this physical row width as an exact decoded-size
+                // estimate for the nullable, multi-buffer Arrow output.
+                u64::MAX - 7
+            }
+
+            fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+                FixedPerValueDecompressor::decoded_size_bytes(&self.inner, num_values)
+            }
+        }
+
+        let num_rows = 64;
+        let items = Arc::new(UInt8Array::from_iter(
+            (0..num_rows).map(|value| (value % 3 != 0).then_some(value as u8)),
+        ));
+        let item_field = Arc::new(ArrowField::new("item", DataType::UInt8, true));
+        let sample = FixedSizeListArray::new(item_field, 1, items, None);
+
+        let (data, compression) = PerValueCompressor::compress(
+            &ValueEncoder::default(),
+            DataBlock::from_array(sample.clone()),
+        )
+        .unwrap();
+        let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
+            panic!("expected fixed-size-list compression");
+        };
+        let decompressor = NullableFslDecompressor {
+            inner: ValueDecompressor::from_fsl(fsl.as_ref()),
+        };
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
+            None
+        );
+
+        let decoded = decode_fixed_fullzip_no_levels(
+            Arc::new(decompressor),
+            vec![FullZipDecodeTaskItem {
+                data,
+                rows_in_buf: num_rows as u64,
+            }],
+            num_rows,
+            2,
+        );
+        let decoded_array = make_array(
+            decoded
+                .into_arrow(sample.data_type().clone(), true)
+                .unwrap(),
+        );
+        assert_eq!(decoded_array.as_ref(), &sample);
+    }
+
+    #[test]
+    fn test_miniblock_decode_uses_exact_fixed_width_output_size() {
+        #[derive(Debug)]
+        struct FixedWidthMiniBlockDecompressor;
+
+        impl MiniBlockDecompressor for FixedWidthMiniBlockDecompressor {
+            fn decompress(
+                &self,
+                data: Vec<LanceBuffer>,
+                num_values: u64,
+            ) -> crate::Result<DataBlock> {
+                assert_eq!(data.len(), 1);
+                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: data.into_iter().next().unwrap(),
+                    bits_per_value: 32,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                }))
+            }
+
+            fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+                num_values.checked_mul(4)
+            }
+        }
+
+        let num_rows = 512;
+        let expected_size = num_rows * 4;
+        let mut chunk_data = Vec::new();
+        chunk_data.extend_from_slice(&0_u16.to_le_bytes());
+        chunk_data.extend_from_slice(&(expected_size as u16).to_le_bytes());
+        let header_padding =
+            lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk_data.len());
+        chunk_data.resize(chunk_data.len() + header_padding, 0);
+        chunk_data.resize(chunk_data.len() + expected_size as usize, 7);
+
+        let task = DecodeMiniBlockTask {
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(FixedWidthMiniBlockDecompressor),
+            dictionary_data: None,
+            def_meaning: Arc::from([]),
+            num_buffers: 1,
+            max_visible_level: 0,
+            instructions: vec![(
+                ChunkDrainInstructions {
+                    chunk_instructions: ChunkInstructions {
+                        chunk_idx: 0,
+                        preamble: PreambleAction::Absent,
+                        rows_to_skip: 0,
+                        rows_to_take: num_rows,
+                        take_trailer: false,
+                    },
+                    rows_to_skip: 0,
+                    rows_to_take: num_rows,
+                    preamble_action: PreambleAction::Absent,
+                },
+                LoadedChunk {
+                    byte_range: 0..chunk_data.len() as u64,
+                    data: LanceBuffer::from(chunk_data),
+                    items_in_chunk: num_rows,
+                    chunk_idx: 0,
+                },
+            )],
+            has_large_chunk: false,
+        };
+
+        let decoded = Box::new(task).decode().unwrap();
+        let values = decoded.data.as_fixed_width_ref().unwrap();
+        assert_eq!(values.data.len(), expected_size as usize);
+        assert_eq!(
+            values.data.clone().into_buffer().capacity(),
+            expected_size as usize
         );
     }
 
@@ -7770,7 +8163,7 @@ mod tests {
     ) {
         let base = 100u64;
         let (words, data_buf_size) = words_from(entries);
-        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0);
+        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0).unwrap();
 
         assert_eq!(index.row_mapping_debug(), expected_kind);
         assert_eq!(index.num_chunks(), entries.len());
@@ -7801,7 +8194,7 @@ mod tests {
 
         // Uniform leaf chunking: value counts 4, 4, 2.
         let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1);
+        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1).unwrap();
         assert_eq!(index.row_mapping_debug(), "nested");
         assert_eq!(index.num_chunks(), 3);
         // Rows come from the repetition index, not the value counts.
@@ -7818,7 +8211,7 @@ mod tests {
 
         // Non-uniform leaf chunking: value counts 8, 2, 5.
         let (words_nu, dbs_nu) = words_from(&[(3, 8), (1, 8), (0, 8)]);
-        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1);
+        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1).unwrap();
         assert_eq!(index_nu.row_mapping_debug(), "nested");
         assert_eq!(index_nu.items_in_chunk(0), 8);
         assert_eq!(index_nu.items_in_chunk(1), 2);
@@ -7831,7 +8224,7 @@ mod tests {
     fn test_uniform_flat_matches_prefix_sum_flat() {
         // Distribution: 4 chunks of 4 values, last chunk 3 (15 items total).
         let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (2, 8), (0, 8)]);
-        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0);
+        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
 
         // The same distribution expressed as a non-uniform Flat prefix-sum index.
@@ -7882,12 +8275,12 @@ mod tests {
         let heap = |index: &MiniBlockChunkIndex| index.deep_size_of_children(&mut Context::new());
 
         let (uniform_words, uniform_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0);
+        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
         assert!(heap(&uniform) < LEGACY_PER_CHUNK * num_chunks);
 
         let (flat_words, flat_dbs) = words_from(&[(3, 8), (1, 8), (0, 8)]);
-        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0);
+        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0).unwrap();
         assert_eq!(flat.row_mapping_debug(), "flat");
         assert!(heap(&flat) < LEGACY_PER_CHUNK * num_chunks);
         // Flat carries a value-starts array that UniformFlat derives arithmetically.
@@ -7895,7 +8288,7 @@ mod tests {
 
         let rep = rep_bytes_from(&[4, 0, 3, 0, 3, 0]);
         let (nested_words, nested_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1);
+        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1).unwrap();
         assert_eq!(nested.row_mapping_debug(), "nested");
         assert!(heap(&nested) < LEGACY_PER_CHUNK * num_chunks);
     }
@@ -9840,5 +10233,75 @@ mod tests {
 
         let test_cases = TestCases::default().with_structural_encodings();
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    fn truncated_tail_details() -> std::sync::Arc<super::FullZipDecodeDetails> {
+        use crate::compression::VariablePerValueDecompressor;
+        use crate::encodings::physical::binary::VariableDecoder;
+        use crate::repdef::{ControlWordParser, DefinitionInterpretation};
+        use std::sync::Arc;
+        Arc::new(super::FullZipDecodeDetails {
+            value_decompressor: super::PerValueDecompressor::Variable(Arc::new(
+                VariableDecoder::default(),
+            )
+                as Arc<dyn VariablePerValueDecompressor>),
+            def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
+            ctrl_word_parser: ControlWordParser::new(0, 0),
+            max_rep: 0,
+            max_visible_def: 0,
+        })
+    }
+
+    fn decode_variable_full_zip(
+        buf: Vec<u8>,
+        bits_per_offset: u8,
+    ) -> lance_core::Result<super::VariableFullZipDecoder> {
+        use std::collections::VecDeque;
+        let mut data = VecDeque::new();
+        data.push_back(crate::buffer::LanceBuffer::from(buf));
+        super::VariableFullZipDecoder::new(
+            truncated_tail_details(),
+            data,
+            1,
+            bits_per_offset,
+            bits_per_offset,
+        )
+    }
+
+    /// A well-formed length prefix decodes without incident, for both widths.
+    #[test]
+    fn variable_full_zip_wellformed_length_prefix() {
+        assert!(decode_variable_full_zip(0u32.to_le_bytes().to_vec(), 32).is_ok());
+        assert!(decode_variable_full_zip(0u64.to_le_bytes().to_vec(), 64).is_ok());
+    }
+
+    /// A page whose item walk ends with a partial length prefix must surface a
+    /// corrupt-file error rather than read past the end of the buffer.
+    ///
+    /// This asserts the error variant and message rather than merely expecting a
+    /// panic: before the length prefix was bounds checked, the read was
+    /// `get_unchecked` behind a `debug_assert!`, so a debug build panicked here
+    /// (which a `#[should_panic]` test would have accepted as a pass) while a
+    /// release build read up to 8 bytes out of a 4 byte allocation.
+    #[test]
+    fn variable_full_zip_truncated_length_prefix_is_corrupt_file() {
+        use lance_core::Error;
+
+        for (bits, buf_len) in [(32u8, 3usize), (64u8, 4usize)] {
+            let err = decode_variable_full_zip(vec![0xAA; buf_len], bits)
+                .expect_err("a truncated length prefix must not decode");
+            assert!(
+                matches!(err, Error::CorruptFile { .. }),
+                "expected CorruptFile for a {}-bit prefix with {} byte(s), got: {:?}",
+                bits,
+                buf_len,
+                err
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("truncated length prefix"),
+                "error should say what is wrong, got: {msg}"
+            );
+        }
     }
 }

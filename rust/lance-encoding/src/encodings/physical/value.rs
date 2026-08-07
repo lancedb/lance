@@ -13,7 +13,7 @@ use crate::data::{
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor,
+    MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -471,7 +471,11 @@ impl BlockCompressor for ValueEncoder {
 }
 
 impl MiniBlockCompressor for ValueEncoder {
-    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        chunk: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
@@ -606,6 +610,15 @@ impl MiniBlockDecompressor for ValueDecompressor {
         assert_eq!(lists.num_values(), num_values);
         Ok(lists)
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 struct FslDecompressorValidityBuilder {
@@ -734,6 +747,15 @@ impl FixedPerValueDecompressor for ValueDecompressor {
     fn bits_per_value(&self) -> u64 {
         self.bits_per_value
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl PerValueCompressor for ValueEncoder {
@@ -775,7 +797,7 @@ mod tests {
         encodings::{
             logical::primitive::{
                 fullzip::{PerValueCompressor, PerValueDataBlock},
-                miniblock::MiniBlockCompressor,
+                miniblock::{MiniBlockCompressionContext, MiniBlockCompressor},
             },
             physical::value::ValueDecompressor,
         },
@@ -787,6 +809,10 @@ mod tests {
     };
 
     use super::ValueEncoder;
+
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
+    }
 
     const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Null,
@@ -968,7 +994,8 @@ mod tests {
         let starting_data = DataBlock::from_array(sample_list.clone());
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) =
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         assert_eq!(data.num_values, 3);
         assert_eq!(data.data.len(), 3);
@@ -1029,7 +1056,7 @@ mod tests {
         let starting_data = DataBlock::from_array(array);
 
         let encoder = ValueEncoder::default();
-        let result = MiniBlockCompressor::compress(&encoder, starting_data);
+        let result = MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data);
 
         let err = result.expect_err("wide values should not be encodable as miniblock");
         assert!(
@@ -1071,6 +1098,11 @@ mod tests {
         let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
 
         let num_values = data.num_values;
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_values),
+            None,
+            "nullable FSL output uses multiple buffers and requires the fallback estimate"
+        );
         let decompressed =
             FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
 
@@ -1141,7 +1173,8 @@ mod tests {
         );
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) =
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!()

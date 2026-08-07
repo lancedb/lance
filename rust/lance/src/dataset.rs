@@ -42,7 +42,7 @@ use lance_io::utils::{
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb, populate_manifest_schema_dictionary,
+    pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -112,8 +112,8 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
 use crate::io::commit::{
-    commit_detached_transaction, commit_new_dataset, commit_transaction,
-    detect_overlapping_fragments,
+    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
+    commit_transaction, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -772,7 +772,7 @@ impl Dataset {
                 .await;
         }
 
-        populate_manifest_schema_dictionary(&mut manifest, object_reader.as_ref()).await?;
+        populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
 
         Ok(manifest)
     }
@@ -1176,7 +1176,7 @@ impl Dataset {
             } else {
                 self.object_store.open(&location.path).await?
             };
-            populate_manifest_schema_dictionary(&mut manifest, reader.as_ref()).await?;
+            populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
         }
         let manifest_arc = Arc::new(manifest);
         self.metadata_cache
@@ -1608,6 +1608,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
+            DEFAULT_COMMIT_RETRY_TIMEOUT,
             self.manifest_location.naming_scheme,
             None,
         )
@@ -2233,15 +2234,15 @@ impl Dataset {
         fn field_names_match(
             fields: &[lance_core::datatypes::Field],
             start: usize,
-            names: &[&str],
+            expected: &arrow_schema::Fields,
         ) -> bool {
             fields
-                .get(start..start + names.len())
+                .get(start..start + expected.len())
                 .is_some_and(|candidate| {
                     candidate
                         .iter()
-                        .zip(names)
-                        .all(|(field, name)| field.name == *name)
+                        .zip(expected.iter())
+                        .all(|(field, expected)| field.name == expected.name().as_str())
                 })
         }
 
@@ -2249,14 +2250,10 @@ impl Dataset {
             fields: &[lance_core::datatypes::Field],
             start: usize,
         ) -> usize {
-            const BLOB_V2_DESCRIPTOR_FIELDS: &[&str] =
-                &["kind", "position", "size", "blob_id", "blob_uri"];
-            const BLOB_V1_DESCRIPTOR_FIELDS: &[&str] = &["position", "size"];
-
-            if field_names_match(fields, start, BLOB_V2_DESCRIPTOR_FIELDS) {
-                BLOB_V2_DESCRIPTOR_FIELDS.len()
-            } else if field_names_match(fields, start, BLOB_V1_DESCRIPTOR_FIELDS) {
-                BLOB_V1_DESCRIPTOR_FIELDS.len()
+            if field_names_match(fields, start, &lance_core::datatypes::BLOB_V2_DESC_FIELDS) {
+                lance_core::datatypes::BLOB_V2_DESC_FIELDS.len()
+            } else if field_names_match(fields, start, &lance_core::datatypes::BLOB_DESC_FIELDS) {
+                lance_core::datatypes::BLOB_DESC_FIELDS.len()
             } else {
                 0
             }
@@ -2974,6 +2971,8 @@ impl Dataset {
             .try_collect::<Vec<()>>()
             .await?;
 
+        rowids::validate_stable_row_ids(self).await?;
+
         // Validate indices
         let indices = self.load_indices().await?;
         self.validate_indices(&indices)?;
@@ -3242,7 +3241,7 @@ impl Dataset {
                     external_file.path
                 )));
             }
-            for data_file in fragment.files.iter() {
+            for data_file in fragment.referenced_lance_files() {
                 let base_root = if let Some(base_id) = data_file.base_id {
                     let base_path =
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {
@@ -3875,6 +3874,12 @@ impl ManifestWriteConfig {
     pub fn disable_transaction_file(&self) -> bool {
         self.disable_transaction_file
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
+        self.disable_transaction_file = true;
+        self
+    }
 }
 
 /// Commit a manifest file and create a copy at the latest manifest path.
@@ -3887,7 +3892,7 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
-    mut transaction: Option<&Transaction>,
+    transaction: Option<lance_table::format::Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
@@ -3913,7 +3918,7 @@ pub(crate) async fn write_manifest_file(
             object_store,
             write_manifest_file_to_path,
             naming_scheme,
-            transaction.take().map(|tx| tx.into()),
+            transaction,
         )
         .await
 }
