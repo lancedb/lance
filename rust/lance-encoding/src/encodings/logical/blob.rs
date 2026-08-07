@@ -91,6 +91,7 @@ impl BlobStructuralEncoder {
                     Ok(EncodedPage {
                         column_idx: encoded_page.column_idx,
                         data: encoded_page.data,
+                        shared_buffers: encoded_page.shared_buffers,
                         description: PageEncoding::Structural(wrapped),
                         num_rows: encoded_page.num_rows,
                         row_number: encoded_page.row_number,

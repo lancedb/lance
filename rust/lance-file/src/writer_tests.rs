@@ -14,16 +14,18 @@ mod tests {
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::types::{Float64Type, Int32Type};
     use arrow_array::{
-        Array, ArrayRef, DictionaryArray, Int32Array, RecordBatch, RecordBatchReader, StringArray,
-        UInt64Array,
+        Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, RecordBatch, RecordBatchReader,
+        StringArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
+    use futures::TryStreamExt;
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
-    use lance_encoding::decoder::DecoderPlugins;
+    use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+    use lance_io::ReadBatchParams;
     use lance_io::object_store::ObjectStore;
     use lance_io::traits::Writer;
     use lance_io::utils::CachedFileSize;
@@ -39,6 +41,7 @@ mod tests {
     }
 
     struct WrittenPage {
+        buffer_offsets: Vec<u64>,
         buffer_sizes: Vec<u64>,
         encoding: String,
     }
@@ -48,6 +51,16 @@ mod tests {
         version: ConcreteFileVersion,
         max_page_bytes: u64,
     ) -> Vec<Vec<WrittenPage>> {
+        write_batch_pages_and_size(batch, version, max_page_bytes)
+            .await
+            .0
+    }
+
+    async fn write_batch_pages_and_size(
+        batch: &RecordBatch,
+        version: ConcreteFileVersion,
+        max_page_bytes: u64,
+    ) -> (Vec<Vec<WrittenPage>>, u64, FileReader) {
         let mut lance_schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
         lance_schema.set_dictionary(batch).unwrap();
         let path = TempObjFile::default();
@@ -65,6 +78,7 @@ mod tests {
 
         writer.write_batch(batch).await.unwrap();
         writer.finish().await.unwrap();
+        let file_size = object_store.size(&path).await.unwrap();
 
         let fs = FsFixture::default();
         let file_scheduler = fs
@@ -82,7 +96,7 @@ mod tests {
         .await
         .unwrap();
 
-        file_reader
+        let pages = file_reader
             .metadata()
             .column_metadatas
             .iter()
@@ -91,12 +105,14 @@ mod tests {
                     .pages
                     .iter()
                     .map(|page| WrittenPage {
+                        buffer_offsets: page.buffer_offsets.clone(),
                         buffer_sizes: page.buffer_sizes.clone(),
                         encoding: describe_encoding(page),
                     })
                     .collect()
             })
-            .collect()
+            .collect();
+        (pages, file_size, file_reader)
     }
 
     fn create_v2_1_writer_with_compression(
@@ -847,25 +863,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oversized_automatic_dictionary_batch_splits_without_dictionary() {
-        let unique_values = (0..128)
-            .map(|index| format!("{index:04}-{}", "x".repeat(2043)))
+    async fn test_oversized_automatic_dictionary_batch_shares_dictionary() {
+        let mut state = 0x9e3779b97f4a7c15_u64;
+        let unique_values = (0..100)
+            .map(|_| {
+                (0..1024)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
-        let values = StringArray::from_iter_values(
-            (0..2048).map(|index| unique_values[index % unique_values.len()].as_str()),
+        let values = BinaryArray::from_iter_values(
+            (0..10_000).map(|index| unique_values[index % unique_values.len()].as_slice()),
         );
-        assert!(values.get_array_memory_size() > 1024 * 1024);
-        let arrow_schema = Schema::new(vec![Field::new("data", DataType::Utf8, false)]);
+        assert!(values.get_array_memory_size() > 2 * 1024 * 1024);
+        let arrow_schema = Schema::new(vec![Field::new("data", DataType::Binary, false)]);
         let batch = RecordBatch::try_new(arrow_schema.into(), vec![Arc::new(values)]).unwrap();
 
-        let pages = write_batch_pages(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
+        let (unsplit_pages, unsplit_size, _) =
+            write_batch_pages_and_size(&batch, ConcreteFileVersion::V2_3, 64 * 1024 * 1024).await;
+        let (pages, split_size, file_reader) =
+            write_batch_pages_and_size(&batch, ConcreteFileVersion::V2_3, 2 * 1024 * 1024).await;
 
+        assert_eq!(unsplit_pages[0].len(), 1);
         assert!(pages[0].len() > 1);
         assert!(
             pages[0]
                 .iter()
-                .all(|page| !page.encoding.contains("dictionary: Some"))
+                .all(|page| page.encoding.contains("dictionary: Some"))
         );
+        let dictionary_offsets = pages[0]
+            .iter()
+            .map(|page| page.buffer_offsets[2])
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(dictionary_offsets.len(), 1);
+        assert!(
+            split_size <= unsplit_size * 2,
+            "split file size {split_size} exceeded twice the unsplit size {unsplit_size}"
+        );
+
+        let expected = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let read_batches: Vec<RecordBatch> = file_reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                4,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut row_offset = 0;
+        for read_batch in read_batches {
+            let actual = read_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            for row in 0..actual.len() {
+                assert_eq!(actual.value(row), expected.value(row_offset + row));
+            }
+            row_offset += actual.len();
+        }
+        assert_eq!(row_offset, expected.len());
     }
 
     #[tokio::test]

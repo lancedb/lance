@@ -68,6 +68,7 @@ pub(crate) fn encode_constant_page(
     Ok(EncodedPage {
         column_idx,
         data,
+        shared_buffers: Vec::new(),
         description: PageEncoding::Structural(description),
         num_rows,
         row_number,

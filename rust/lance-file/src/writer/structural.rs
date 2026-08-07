@@ -150,6 +150,7 @@ pub struct StructuralFileSink {
     column_metadata: Vec<pbfile::ColumnMetadata>,
     num_columns: u32,
     global_buffers: Vec<(u64, u64)>,
+    shared_page_buffers: HashMap<(u32, u64), (u64, u64)>,
     page_spill: Option<PageSpillState>,
 }
 
@@ -160,6 +161,7 @@ impl StructuralFileSink {
             column_metadata: Vec::new(),
             num_columns: 0,
             global_buffers: Vec::new(),
+            shared_page_buffers: HashMap::new(),
             page_spill: None,
         }
     }
@@ -171,6 +173,7 @@ impl StructuralFileSink {
     pub fn initialize_columns(&mut self, num_columns: u32) {
         self.num_columns = num_columns;
         self.column_metadata = vec![initial_column_metadata(); num_columns as usize];
+        self.shared_page_buffers.clear();
     }
 
     pub fn initialize_with_external_metadata(
@@ -179,6 +182,7 @@ impl StructuralFileSink {
     ) {
         self.num_columns = column_metadata.len() as u32;
         self.column_metadata = column_metadata;
+        self.shared_page_buffers.clear();
     }
 
     async fn write_aligned_buffer_to(
@@ -201,13 +205,54 @@ impl StructuralFileSink {
     }
 
     pub async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
+        let column_index = encoded_page.column_idx;
+        let mut shared_buffers = HashMap::with_capacity(encoded_page.shared_buffers.len());
+        for (buffer_index, sharing_id) in encoded_page.shared_buffers {
+            if shared_buffers.insert(buffer_index, sharing_id).is_some() {
+                return Err(Error::internal(format!(
+                    "Encoded page for column {} assigned buffer index {} more than one sharing ID",
+                    column_index, buffer_index
+                )));
+            }
+        }
         let buffers = encoded_page.data;
+        if let Some(buffer_index) = shared_buffers
+            .keys()
+            .find(|buffer_index| **buffer_index >= buffers.len())
+        {
+            return Err(Error::internal(format!(
+                "Encoded page for column {} marked missing buffer index {} as shared",
+                column_index, buffer_index
+            )));
+        }
         let mut buffer_offsets = Vec::with_capacity(buffers.len());
         let mut buffer_sizes = Vec::with_capacity(buffers.len());
-        for buffer in buffers {
-            buffer_offsets.push(self.tell().await?);
-            buffer_sizes.push(buffer.len() as u64);
+        for (buffer_index, buffer) in buffers.into_iter().enumerate() {
+            let buffer_size = buffer.len() as u64;
+            let shared_position_and_size = shared_buffers
+                .get(&buffer_index)
+                .and_then(|sharing_id| self.shared_page_buffers.get(&(column_index, *sharing_id)))
+                .copied();
+            if let Some((position, existing_size)) = shared_position_and_size {
+                if existing_size != buffer_size {
+                    return Err(Error::internal(format!(
+                        "Shared page buffer {} for column {} changed size from {} to {} bytes",
+                        shared_buffers[&buffer_index], column_index, existing_size, buffer_size
+                    )));
+                }
+                buffer_offsets.push(position);
+                buffer_sizes.push(existing_size);
+                continue;
+            }
+
+            let position = self.tell().await?;
+            buffer_offsets.push(position);
+            buffer_sizes.push(buffer_size);
             self.write_aligned_buffer(&buffer).await?;
+            if let Some(sharing_id) = shared_buffers.get(&buffer_index) {
+                self.shared_page_buffers
+                    .insert((column_index, *sharing_id), (position, buffer_size));
+            }
         }
         let encoded_encoding = match encoded_page.description {
             PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
@@ -224,7 +269,7 @@ impl StructuralFileSink {
             length: encoded_page.num_rows,
             priority: encoded_page.row_number,
         };
-        let column_index = encoded_page.column_idx as usize;
+        let column_index = column_index as usize;
         if matches!(&self.page_spill, Some(PageSpillState::Pending(..))) {
             let Some(PageSpillState::Pending(store, path)) = self.page_spill.take() else {
                 unreachable!()

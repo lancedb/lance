@@ -958,6 +958,7 @@ impl ListOffsetsEncoder {
             let (data, description) = array.into_buffers();
             Ok(EncodedPage {
                 data,
+                shared_buffers: Vec::new(),
                 description: PageEncoding::Legacy(description),
                 num_rows,
                 column_idx,

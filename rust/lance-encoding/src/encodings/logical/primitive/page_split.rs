@@ -68,8 +68,8 @@ pub(super) fn split_dense_pages(
         .map(|pages| pages.into_iter().flatten().collect::<Vec<_>>())?;
 
     if pages.len() > 1 {
-        // Automatic dictionary selection is page-local. Disable it after splitting so that the
-        // same logical dictionary is not independently constructed and serialized in every page.
+        // Defer automatic dictionary selection to the flush-wide preparation task. Page-local
+        // selection would independently construct and serialize the same dictionary per page.
         for page in &mut pages {
             page.disable_automatic_dictionary = true;
         }
@@ -87,6 +87,7 @@ fn split_dense_page(
         row_number,
         num_rows,
         disable_automatic_dictionary,
+        prepared_dictionary: _,
     } = page;
     let PrimitivePageStructure::Dense {
         repdef,
@@ -236,6 +237,7 @@ fn split_non_repeated_page(
             row_number: page_row_number,
             num_rows: page_num_rows,
             disable_automatic_dictionary,
+            prepared_dictionary: None,
         });
         row_start = row_start.checked_add(page_num_rows).ok_or_else(|| {
             Error::internal("Row offset overflowed u64 while splitting a primitive page")
@@ -261,5 +263,6 @@ fn unsplit_dense_page(
         row_number,
         num_rows,
         disable_automatic_dictionary,
+        prepared_dictionary: None,
     }]
 }

@@ -870,6 +870,7 @@ pub(in crate::encodings::logical::primitive) fn encode_page(
     page_data.extend(structural.buffers);
     Ok(EncodedPage {
         data: page_data,
+        shared_buffers: Vec::new(),
         description: PageEncoding::Structural(description),
         num_rows,
         row_number,

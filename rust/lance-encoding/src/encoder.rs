@@ -81,6 +81,12 @@ pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
 pub struct EncodedPage {
     // The encoded page buffers
     pub data: Vec<LanceBuffer>,
+    /// Buffers that may reuse the physical storage of the same buffer in another page.
+    ///
+    /// Each entry is `(buffer_index, sharing_id)`. Writers that support shared page buffers use
+    /// the column index and sharing ID to write the first copy and point later pages at it.
+    /// Writers that do not support sharing may safely write every buffer normally.
+    pub shared_buffers: Vec<(usize, u64)>,
     // A description of the encoding used to encode the page
     pub description: PageEncoding,
     /// The number of rows in the encoded page

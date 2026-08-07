@@ -2592,12 +2592,19 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         }
         let mut required_ranges = Vec::with_capacity(bufs_needed);
         required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
+        let mut separate_dictionary_request = None;
         if let Some(ref dictionary) = self.dictionary {
-            required_ranges.push(
-                dictionary.dictionary_buf_position_and_size.0
-                    ..dictionary.dictionary_buf_position_and_size.0
-                        + dictionary.dictionary_buf_position_and_size.1,
-            );
+            let dictionary_range = dictionary.dictionary_buf_position_and_size.0
+                ..dictionary.dictionary_buf_position_and_size.0
+                    + dictionary.dictionary_buf_position_and_size.1;
+            if dictionary_range.start < meta_buf_position {
+                // Shared dictionaries are stored with the first page, so later pages refer to a
+                // range before their local metadata. Encoding I/O requires each request's ranges
+                // to remain in file order.
+                separate_dictionary_request = Some(io.submit_request(vec![dictionary_range], 0));
+            } else {
+                required_ranges.push(dictionary_range);
+            }
         }
         if self.repetition_index_depth > 0 {
             let (rep_index_pos, rep_index_size) = self.buffer_offsets_and_sizes.last().unwrap();
@@ -2608,7 +2615,18 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         async move {
             let mut buffers = io_req.await?.into_iter().fuse();
             let meta_bytes = buffers.next().unwrap();
-            let dictionary_bytes = self.dictionary.as_ref().and_then(|_| buffers.next());
+            let dictionary_bytes = if let Some(dictionary_request) = separate_dictionary_request {
+                let mut dictionary_buffers = dictionary_request.await?;
+                if dictionary_buffers.len() != 1 {
+                    return Err(Error::internal(format!(
+                        "Encoding I/O returned {} buffers for one shared dictionary range",
+                        dictionary_buffers.len()
+                    )));
+                }
+                dictionary_buffers.pop()
+            } else {
+                self.dictionary.as_ref().and_then(|_| buffers.next())
+            };
             let rep_index_bytes = buffers.next();
 
             let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
@@ -4539,6 +4557,10 @@ trait PrimitivePageEncodingBehavior: Send + Sync + Debug {
     ) -> Result<PrimitiveEncodeAttempt> {
         Ok(PrimitiveEncodeAttempt::Unhandled(page))
     }
+
+    fn shared_dictionary_compression(&self) -> Option<Arc<dyn CompressionStrategy>> {
+        None
+    }
 }
 
 /// One executable primitive-page behavior selected by an exact file
@@ -4632,6 +4654,7 @@ pub struct PrimitiveStructuralEncoder {
     column_index: u32,
     field: Field,
     encoding_metadata: Arc<HashMap<String, String>>,
+    next_shared_dictionary_id: u64,
 }
 
 struct CompressedLevelsChunk {
@@ -4680,6 +4703,34 @@ struct PrimitivePageData {
     num_rows: u64,
     // Page-local automatic dictionaries are disabled when dense splitting would duplicate them.
     disable_automatic_dictionary: bool,
+    // A slice of a dictionary prepared once for all pages in an oversized flush.
+    prepared_dictionary: Option<PreparedDictionaryPage>,
+}
+
+struct PreparedDictionaryPage {
+    indices: FixedWidthDataBlock,
+    dictionary_buffer: LanceBuffer,
+    dictionary_encoding: pb21::CompressiveEncoding,
+    num_dictionary_items: u64,
+    sharing_id: u64,
+}
+
+struct PreparedAutomaticDictionary {
+    indices: FixedWidthDataBlock,
+    dictionary_buffer: LanceBuffer,
+    dictionary_encoding: pb21::CompressiveEncoding,
+    num_dictionary_items: u64,
+    sharing_id: u64,
+}
+
+enum DictionaryPayload {
+    Inline(DataBlock),
+    Shared {
+        buffer: LanceBuffer,
+        encoding: pb21::CompressiveEncoding,
+        num_items: u64,
+        sharing_id: u64,
+    },
 }
 
 struct PrimitivePlanContext<'a> {
@@ -4734,6 +4785,7 @@ impl PrimitiveStructuralEncoder {
             page_encodings,
             field,
             encoding_metadata,
+            next_shared_dictionary_id: 0,
         })
     }
 
@@ -5152,6 +5204,7 @@ impl PrimitiveStructuralEncoder {
         Ok(EncodedPage {
             column_idx,
             data: vec![],
+            shared_buffers: Vec::new(),
             description: PageEncoding::Structural(description),
             num_rows,
             row_number,
@@ -5207,6 +5260,7 @@ impl PrimitiveStructuralEncoder {
             return Ok(EncodedPage {
                 column_idx,
                 data: vec![rep_bytes, def_bytes],
+                shared_buffers: Vec::new(),
                 description: PageEncoding::Structural(description),
                 num_rows,
                 row_number,
@@ -5243,6 +5297,7 @@ impl PrimitiveStructuralEncoder {
         Ok(EncodedPage {
             column_idx,
             data: vec![rep_bytes, def_bytes],
+            shared_buffers: Vec::new(),
             description: PageEncoding::Structural(description),
             num_rows,
             row_number,
@@ -5482,7 +5537,7 @@ impl PrimitiveStructuralEncoder {
         data: DataBlock,
         repdef: crate::repdef::SerializedRepDefs,
         row_number: u64,
-        dictionary_data: Option<DataBlock>,
+        dictionary: Option<DictionaryPayload>,
         num_rows: u64,
         miniblock_chunk_size: MiniblockChunkSize,
     ) -> Result<EncodedPage> {
@@ -5557,13 +5612,28 @@ impl PrimitiveStructuralEncoder {
         data.push(serialized.metadata);
         data.push(serialized.data);
 
-        if let Some(dictionary_data) = dictionary_data {
-            let num_dictionary_items = dictionary_data.num_values();
-            let dict_values_field = Self::build_dict_values_compressor_field(field)?;
-
-            let (compressor, dictionary_encoding) = compression_strategy
-                .create_block_compressor(&dict_values_field, &dictionary_data)?;
-            let dictionary_buffer = compressor.compress(dictionary_data)?;
+        if let Some(dictionary) = dictionary {
+            let (dictionary_buffer, dictionary_encoding, num_dictionary_items, sharing_id) =
+                match dictionary {
+                    DictionaryPayload::Inline(dictionary_data) => {
+                        let num_dictionary_items = dictionary_data.num_values();
+                        let dictionary_field = Self::build_dict_values_compressor_field(field)?;
+                        let (compressor, dictionary_encoding) = compression_strategy
+                            .create_block_compressor(&dictionary_field, &dictionary_data)?;
+                        (
+                            compressor.compress(dictionary_data)?,
+                            dictionary_encoding,
+                            num_dictionary_items,
+                            None,
+                        )
+                    }
+                    DictionaryPayload::Shared {
+                        buffer,
+                        encoding,
+                        num_items,
+                        sharing_id,
+                    } => (buffer, encoding, num_items, Some(sharing_id)),
+                };
 
             data.push(dictionary_buffer);
             if let Some(rep_index) = rep_index {
@@ -5585,6 +5655,9 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 column_idx,
                 data,
+                shared_buffers: sharing_id
+                    .map(|sharing_id| vec![(2, sharing_id)])
+                    .unwrap_or_default(),
                 description: PageEncoding::Structural(description),
                 row_number,
             })
@@ -5613,6 +5686,7 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 column_idx,
                 data,
+                shared_buffers: Vec::new(),
                 description: PageEncoding::Structural(description),
                 row_number,
             })
@@ -5922,8 +5996,126 @@ impl PrimitiveStructuralEncoder {
             num_rows: num_lists,
             column_idx,
             data,
+            shared_buffers: Vec::new(),
             description: PageEncoding::Structural(description),
             row_number,
+        })
+    }
+
+    fn is_automatic_dictionary_candidate(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Binary
+                | DataType::BinaryView
+                | DataType::LargeBinary
+                | DataType::Utf8
+                | DataType::Utf8View
+                | DataType::LargeUtf8
+                | DataType::Date64
+                | DataType::Decimal64(_, _)
+                | DataType::Decimal128(_, _)
+                | DataType::Duration(_)
+                | DataType::Float64
+                | DataType::Int64
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+                | DataType::UInt64
+        ) || matches!(data_type, DataType::FixedSizeBinary(size) if *size == 8 || *size == 16)
+            || matches!(data_type, DataType::Interval(_) if matches!(data_type.byte_width(), 8 | 16))
+    }
+
+    fn prepare_automatic_dictionary(
+        arrays: Vec<ArrayRef>,
+        num_values: u64,
+        field: Field,
+        compression_strategy: Arc<dyn CompressionStrategy>,
+        sharing_id: u64,
+    ) -> Result<Option<PreparedAutomaticDictionary>> {
+        let data_block = DataBlock::from_arrays(&arrays, num_values);
+        let Some(budget) = Self::should_dictionary_encode(
+            &data_block,
+            &field,
+            FixedWidthDictionaryEncoding::Include64Bit,
+        ) else {
+            return Ok(None);
+        };
+        let Some((indices, dictionary)) = dict::dictionary_encode(
+            &data_block,
+            budget.max_dict_entries,
+            budget.max_encoded_size,
+        ) else {
+            return Ok(None);
+        };
+        let DataBlock::FixedWidth(indices) = indices else {
+            return Err(Error::internal(
+                "Automatic dictionary preparation did not produce fixed-width indices",
+            ));
+        };
+        let num_dictionary_items = dictionary.num_values();
+        let dictionary_field = Self::build_dict_values_compressor_field(&field)?;
+        let (compressor, dictionary_encoding) =
+            compression_strategy.create_block_compressor(&dictionary_field, &dictionary)?;
+        let dictionary_buffer = compressor.compress(dictionary)?;
+        Ok(Some(PreparedAutomaticDictionary {
+            indices,
+            dictionary_buffer,
+            dictionary_encoding,
+            num_dictionary_items,
+            sharing_id,
+        }))
+    }
+
+    fn prepare_dictionary_page(
+        prepared: &PreparedAutomaticDictionary,
+        value_start: u64,
+        num_values: u64,
+    ) -> Result<PreparedDictionaryPage> {
+        if !prepared.indices.bits_per_value.is_multiple_of(8) {
+            return Err(Error::internal(format!(
+                "Prepared dictionary index width {} is not byte aligned",
+                prepared.indices.bits_per_value
+            )));
+        }
+        let bytes_per_value = usize::try_from(prepared.indices.bits_per_value / 8)
+            .map_err(|_| Error::internal("Dictionary index width does not fit in usize"))?;
+        let value_start = usize::try_from(value_start)
+            .map_err(|_| Error::internal("Dictionary page value start does not fit in usize"))?;
+        let num_values_usize = usize::try_from(num_values)
+            .map_err(|_| Error::internal("Dictionary page value count does not fit in usize"))?;
+        let byte_start = value_start
+            .checked_mul(bytes_per_value)
+            .ok_or_else(|| Error::internal("Dictionary page byte start overflowed usize"))?;
+        let byte_len = num_values_usize
+            .checked_mul(bytes_per_value)
+            .ok_or_else(|| Error::internal("Dictionary page byte length overflowed usize"))?;
+        let byte_end = byte_start
+            .checked_add(byte_len)
+            .ok_or_else(|| Error::internal("Dictionary page byte end overflowed usize"))?;
+        if byte_end > prepared.indices.data.len() {
+            return Err(Error::internal(format!(
+                "Dictionary page byte range {}..{} exceeds the {}-byte index buffer",
+                byte_start,
+                byte_end,
+                prepared.indices.data.len()
+            )));
+        }
+
+        let mut indices = FixedWidthDataBlock {
+            data: prepared
+                .indices
+                .data
+                .slice_with_length(byte_start, byte_len),
+            bits_per_value: prepared.indices.bits_per_value,
+            num_values,
+            block_info: BlockInfo::new(),
+        };
+        indices.compute_stat();
+        Ok(PreparedDictionaryPage {
+            indices,
+            dictionary_buffer: prepared.dictionary_buffer.clone(),
+            dictionary_encoding: prepared.dictionary_encoding.clone(),
+            num_dictionary_items: prepared.num_dictionary_items,
+            sharing_id: prepared.sharing_id,
         })
     }
 
@@ -6226,6 +6418,7 @@ impl PrimitiveStructuralEncoder {
                 row_number,
                 num_rows,
                 disable_automatic_dictionary: false,
+                prepared_dictionary: None,
             }]);
         }
         if let MiniBlockRepDefBudget::SingleRowOverBudget(num_levels) = budget {
@@ -6238,6 +6431,7 @@ impl PrimitiveStructuralEncoder {
                 row_number,
                 num_rows,
                 disable_automatic_dictionary: false,
+                prepared_dictionary: None,
             }]);
         }
 
@@ -6258,6 +6452,7 @@ impl PrimitiveStructuralEncoder {
                 row_number: row_number + split.row_start,
                 num_rows: split.num_rows,
                 disable_automatic_dictionary: false,
+                prepared_dictionary: None,
             });
         }
         Ok(pages)
@@ -6284,6 +6479,7 @@ impl PrimitiveStructuralEncoder {
             row_number,
             num_rows,
             disable_automatic_dictionary,
+            prepared_dictionary,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
 
@@ -6360,7 +6556,43 @@ impl PrimitiveStructuralEncoder {
             return Self::encode_simple_all_null(column_idx, num_values, row_number);
         }
 
-        let data_block = DataBlock::from_arrays(&arrays, num_values);
+        let (data_block, shared_dictionary) = match prepared_dictionary {
+            Some(PreparedDictionaryPage {
+                indices,
+                dictionary_buffer,
+                dictionary_encoding,
+                num_dictionary_items,
+                sharing_id,
+            }) => (
+                DataBlock::FixedWidth(indices),
+                Some(DictionaryPayload::Shared {
+                    buffer: dictionary_buffer,
+                    encoding: dictionary_encoding,
+                    num_items: num_dictionary_items,
+                    sharing_id,
+                }),
+            ),
+            None => (DataBlock::from_arrays(&arrays, num_values), None),
+        };
+
+        if let Some(dictionary) = shared_dictionary {
+            log::debug!(
+                "Encoding column {} with {} items using a shared dictionary (mini-block layout)",
+                column_idx,
+                num_values
+            );
+            return Self::encode_miniblock(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data_block,
+                repdef,
+                row_number,
+                Some(dictionary),
+                num_rows,
+                miniblock_chunk_size,
+            );
+        }
 
         if let Some(num_levels) = single_row_miniblock_repdef_levels {
             let requested_encoding = encoding_metadata
@@ -6508,7 +6740,7 @@ impl PrimitiveStructuralEncoder {
                 indices_data_block,
                 repdef,
                 row_number,
-                Some(dictionary_data_block),
+                Some(DictionaryPayload::Inline(dictionary_data_block)),
                 num_rows,
                 miniblock_chunk_size,
             );
@@ -6546,7 +6778,7 @@ impl PrimitiveStructuralEncoder {
                 indices_data_block,
                 repdef,
                 row_number,
-                Some(dictionary_data_block),
+                Some(DictionaryPayload::Inline(dictionary_data_block)),
                 num_rows,
                 miniblock_chunk_size,
             )
@@ -6606,6 +6838,7 @@ impl PrimitiveStructuralEncoder {
             max_page_bytes: self.max_page_bytes,
         };
         let mut pages = None;
+        let mut shared_dictionary_compression = None;
         for page_encoding in self.page_encodings.iter() {
             if let Some(planned) = page_encoding.behavior.try_plan_pages(
                 &plan_ctx,
@@ -6615,6 +6848,8 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 num_values,
             )? {
+                shared_dictionary_compression =
+                    page_encoding.behavior.shared_dictionary_compression();
                 pages = Some(planned);
                 break;
             }
@@ -6629,6 +6864,44 @@ impl PrimitiveStructuralEncoder {
             )
         })?;
 
+        let needs_dictionary_preparation = pages.len() > 1
+            && pages.iter().any(|page| page.disable_automatic_dictionary)
+            && arrays
+                .first()
+                .is_some_and(|array| Self::is_automatic_dictionary_candidate(array.data_type()));
+        let dictionary_preparation = if needs_dictionary_preparation {
+            let sharing_id = self.next_shared_dictionary_id;
+            self.next_shared_dictionary_id = self
+                .next_shared_dictionary_id
+                .checked_add(1)
+                .ok_or_else(|| Error::internal("Shared dictionary ID overflowed u64"))?;
+            let field = self.field.clone();
+            let compression_strategy = shared_dictionary_compression.ok_or_else(|| {
+                Error::internal(
+                    "Oversized page splitting did not provide shared dictionary compression",
+                )
+            })?;
+            Some(
+                spawn_cpu(move || {
+                    Self::prepare_automatic_dictionary(
+                        arrays,
+                        num_values,
+                        field,
+                        compression_strategy,
+                        sharing_id,
+                    )
+                })
+                .map(|result| {
+                    result
+                        .map(Arc::new)
+                        .map_err(|error| Arc::<str>::from(error.to_string()))
+                })
+                .shared(),
+            )
+        } else {
+            None
+        };
+
         let mut tasks = Vec::with_capacity(pages.len());
         let ctx = PrimitiveEncodeContext {
             column_idx: self.column_index,
@@ -6637,13 +6910,46 @@ impl PrimitiveStructuralEncoder {
             is_simple_validity,
             has_repdef_info,
         };
-        for page in pages {
+        let mut value_start = 0_u64;
+        for mut page in pages {
+            let page_num_values = page.arrays.iter().try_fold(0_u64, |total, array| {
+                total
+                    .checked_add(array.len() as u64)
+                    .ok_or_else(|| Error::internal("Primitive page value count overflowed u64"))
+            })?;
             let ctx = ctx.clone();
             let page_encodings = self.page_encodings.clone();
-            let task =
-                spawn_cpu(move || Self::encode_page(page_encodings.as_ref(), &ctx, page)).boxed();
+            let page_dictionary_preparation = dictionary_preparation.clone();
+            let page_value_start = value_start;
+            let task = async move {
+                let prepared = if let Some(preparation) = page_dictionary_preparation {
+                    Some(preparation.await.map_err(|message| {
+                        Error::internal(format!(
+                            "Automatic dictionary preparation failed: {message}"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                spawn_cpu(move || {
+                    if let Some(prepared) = prepared.as_deref().and_then(Option::as_ref) {
+                        page.prepared_dictionary = Some(Self::prepare_dictionary_page(
+                            prepared,
+                            page_value_start,
+                            page_num_values,
+                        )?);
+                    }
+                    Self::encode_page(page_encodings.as_ref(), &ctx, page)
+                })
+                .await
+            }
+            .boxed();
             tasks.push(task);
+            value_start = value_start
+                .checked_add(page_num_values)
+                .ok_or_else(|| Error::internal("Primitive page value offset overflowed u64"))?;
         }
+        debug_assert_eq!(value_start, num_values);
         Ok(tasks)
     }
 
@@ -6769,6 +7075,11 @@ impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
 }
 
 impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
+    fn shared_dictionary_compression(&self) -> Option<Arc<dyn CompressionStrategy>> {
+        self.should_split_oversized_pages
+            .then(|| self.compression.clone())
+    }
+
     fn try_plan_pages(
         &self,
         ctx: &PrimitivePlanContext<'_>,
@@ -6841,6 +7152,7 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                 row_number,
                 num_rows,
                 disable_automatic_dictionary: false,
+                prepared_dictionary: None,
             }]));
         }
 
@@ -6889,6 +7201,7 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                 row_number,
                 num_rows,
                 disable_automatic_dictionary: false,
+                prepared_dictionary: None,
             }]
         }))
     }
