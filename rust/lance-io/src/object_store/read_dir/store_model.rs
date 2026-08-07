@@ -3,8 +3,8 @@
 
 //! How an object store answers a list request, as a model the tests can vary.
 //!
-//! Two things a paginated listing rests on are not pinned down by any API: what a resume
-//! position means, and what a page limit is spent on. Both are choices a store makes, and a
+//! Two things a paginated listing rests on are not pinned down by any API: the order a store
+//! lists its keys in, and what a page limit is spent on. Both are choices a store makes, and a
 //! listing that only works for one of the choices is not a working listing. Holding them here
 //! lets the fake lister in [`read_dir`](super) and the wire-level [`emulator`](super::emulator)
 //! put the same store behaviours under test.
@@ -13,20 +13,6 @@
 /// S3 caps `max-keys` at a thousand — and it is the reason a listing cannot page by asking for
 /// ever more at once.
 const DEFAULT_PAGE_BOUND: usize = 1000;
-
-/// What a store's resume position means, which is not the same everywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OffsetMode {
-    /// Keys strictly after the position, as S3's `start-after` does, and GCS's too since
-    /// `object_store` lists it over the S3-compatible XML API.
-    Exclusive,
-    /// Keys at or after the position, as Azure's `startFrom` does.
-    Inclusive,
-    /// The position is dropped and the listing starts from the top, as Azurite does with
-    /// `startFrom`. A listing has to stay correct and still finish, which is the point of
-    /// having this here.
-    Ignored,
-}
 
 /// The order a store lists its keys in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +67,6 @@ pub enum BudgetMode {
 pub struct StoreModel {
     /// Every key in the store, in the order the store would return them.
     keys: Vec<String>,
-    offset: OffsetMode,
     budget: BudgetMode,
     order: KeyOrder,
     page_bound: usize,
@@ -92,7 +77,6 @@ impl StoreModel {
         let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
         Self {
             keys,
-            offset: OffsetMode::Exclusive,
             budget: BudgetMode::PerEntry,
             order: KeyOrder::ByKey,
             page_bound: DEFAULT_PAGE_BOUND,
@@ -103,11 +87,6 @@ impl StoreModel {
     fn sorted(mut self) -> Self {
         let order = self.order;
         self.keys.sort_by(|left, right| order.cmp(left, right));
-        self
-    }
-
-    pub fn with_offset(mut self, offset: OffsetMode) -> Self {
-        self.offset = offset;
         self
     }
 
@@ -130,9 +109,9 @@ impl StoreModel {
 
     /// One page of the immediate children of `prefix`.
     ///
-    /// `resume` is a position within the listing: a continuation token if the request
-    /// carried one, which is exact and always exclusive, otherwise the caller's offset,
-    /// which [`OffsetMode`] interprets.
+    /// `resume` is a position within the listing: the store's own continuation token, which is
+    /// exact and always exclusive, or the start of the directory. Nothing else — a caller
+    /// never supplies a position of its own.
     ///
     /// The delimiter is always applied. Every request this crate makes sets one, and a
     /// recursive listing would not exercise anything a paginated directory listing does.
@@ -152,7 +131,7 @@ impl StoreModel {
                 idx += 1;
                 continue;
             };
-            if resume.consumes(key, self.offset, self.order) {
+            if resume.consumes(key, self.order) {
                 idx += 1;
                 continue;
             }
@@ -193,23 +172,15 @@ impl StoreModel {
 #[derive(Debug, Clone, Copy)]
 pub enum Resume<'a> {
     Start,
-    /// The caller's offset, whose meaning is the store's to decide.
-    Offset(&'a str),
     /// The store's own continuation token, which it always honours exactly.
     Token(&'a str),
 }
 
 impl Resume<'_> {
-    fn consumes(&self, key: &str, offset: OffsetMode, order: KeyOrder) -> bool {
-        use std::cmp::Ordering::{Equal, Less};
+    fn consumes(&self, key: &str, order: KeyOrder) -> bool {
         match self {
             Self::Start => false,
             Self::Token(token) => order.cmp(key, token) != std::cmp::Ordering::Greater,
-            Self::Offset(offset_key) => match offset {
-                OffsetMode::Exclusive => matches!(order.cmp(key, offset_key), Less | Equal),
-                OffsetMode::Inclusive => order.cmp(key, offset_key) == Less,
-                OffsetMode::Ignored => false,
-            },
         }
     }
 }
@@ -238,36 +209,8 @@ mod tests {
         "db/loose.txt",
     ];
 
-    fn model(offset: OffsetMode, budget: BudgetMode) -> StoreModel {
-        StoreModel::new(KEYS.to_vec())
-            .with_offset(offset)
-            .with_budget(budget)
-    }
-
-    /// What an offset excludes is the store's choice, and all three choices are real: S3 and
-    /// GCS exclude the position itself, Azure includes it, and Azurite ignores it. A file key
-    /// shows the difference; a directory's prefix cannot, since the keys inside it sort after
-    /// it and come back under every mode.
-    #[rstest]
-    #[case::exclusive(OffsetMode::Exclusive, vec![], vec![])]
-    #[case::inclusive(OffsetMode::Inclusive, vec![], vec!["db/loose.txt"])]
-    #[case::ignored(
-        OffsetMode::Ignored,
-        vec!["db/a.lance/", "db/b.lance/"],
-        vec!["db/loose.txt"]
-    )]
-    fn test_offset_modes_differ_at_the_position_itself(
-        #[case] offset: OffsetMode,
-        #[case] prefixes: Vec<&str>,
-        #[case] objects: Vec<&str>,
-    ) {
-        let page = model(offset, BudgetMode::PerEntry).list_level(
-            "db/",
-            Resume::Offset("db/loose.txt"),
-            Some(4),
-        );
-        assert_eq!(page.prefixes, prefixes);
-        assert_eq!(page.objects, objects);
+    fn model(budget: BudgetMode) -> StoreModel {
+        StoreModel::new(KEYS.to_vec()).with_budget(budget)
     }
 
     /// A collapsed prefix costs one entry on a store that counts entries and everything it
@@ -280,19 +223,16 @@ mod tests {
         #[case] budget: BudgetMode,
         #[case] expected: Vec<&str>,
     ) {
-        let page = model(OffsetMode::Exclusive, budget).list_level("db/", Resume::Start, Some(2));
+        let page = model(budget).list_level("db/", Resume::Start, Some(2));
         assert_eq!(page.prefixes, expected);
         assert!(page.truncated, "loose.txt is still to come");
     }
 
-    /// A continuation token is the store's own position and is exact, so it resumes the same
-    /// way whatever the store does with a caller-supplied offset.
-    #[rstest]
-    fn test_a_token_resumes_exactly(
-        #[values(OffsetMode::Exclusive, OffsetMode::Inclusive, OffsetMode::Ignored)]
-        offset: OffsetMode,
-    ) {
-        let model = model(offset, BudgetMode::PerScannedKey);
+    /// A continuation token is the store's own position and is exact: it resumes strictly after
+    /// the key the page stopped on, whatever the store collapsed to get there.
+    #[test]
+    fn test_a_token_resumes_exactly() {
+        let model = model(BudgetMode::PerScannedKey);
         let first = model.list_level("db/", Resume::Start, Some(1));
         assert_eq!(first.prefixes, vec!["db/a.lance/"]);
         assert!(first.truncated);

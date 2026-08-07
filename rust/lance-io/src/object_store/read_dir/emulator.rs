@@ -103,10 +103,16 @@ async fn list(
         Wire::Azure => ("startFrom", "maxresults", "marker"),
     };
     let prefix = params.get("prefix").map(String::as_str).unwrap_or_default();
-    let resume = match (params.get(token_param), params.get(offset_param)) {
-        (Some(token), _) => Resume::Token(token),
-        (None, Some(offset)) => Resume::Offset(offset),
-        (None, None) => Resume::Start,
+    // A listing resumes from the store's own token and nothing else. What an offset excludes
+    // is the store's choice — S3 excludes the position, Azure includes it, Azurite drops it —
+    // so sending one would make the listing depend on which store answered.
+    assert!(
+        !params.contains_key(offset_param),
+        "a listing must not resume by offset, but sent {offset_param}"
+    );
+    let resume = match params.get(token_param) {
+        Some(token) => Resume::Token(token),
+        None => Resume::Start,
     };
     let max_keys = params.get(limit_param).and_then(|keys| keys.parse().ok());
     state.limits.lock().unwrap().push(max_keys);

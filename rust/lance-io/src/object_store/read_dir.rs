@@ -63,17 +63,19 @@ const TOKEN_VERSION: char = '1';
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirCursor(Resume);
 
-/// The two things a store can give a listing to resume from.
+/// The two things a listing can resume from, one for each path that serves a page.
+///
+/// A cursor is only ever handed back to the path that minted it. The tag is what makes the
+/// other path reject it rather than read it as something it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resume {
-    /// The store's own continuation token, which resumes exactly where the page stopped.
+    /// The backend's own continuation token, which resumes exactly where the page stopped.
     ///
     /// Nothing is compared against it, so a store whose listings are not in key order — S3
     /// Express, or an Azure account with a hierarchical namespace — pages correctly on one.
     Backend(String),
     /// A key within the directory, which the next page resumes strictly after: the last key
-    /// the page reported. For stores with no continuation token of their own, which can only
-    /// be paged when they list in key order.
+    /// the page reported. What the full-listing fallback mints, having no token of its own.
     Key(String),
 }
 
@@ -86,14 +88,19 @@ impl DirCursor {
         Self(Resume::Key(key.into()))
     }
 
-    /// Only the native lister takes both kinds; everything else goes through
-    /// [`Self::expect_key`].
+    /// The continuation token to resume from, for a backend that pages by its own token.
     #[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
-    pub(crate) fn resume(&self) -> &Resume {
-        &self.0
+    pub(crate) fn expect_backend(&self) -> Result<&str> {
+        match &self.0 {
+            Resume::Backend(token) => Ok(token),
+            Resume::Key(_) => Err(Error::invalid_input(
+                "this page token came from a store that lists a directory in full, \
+                 which this one cannot resume from",
+            )),
+        }
     }
 
-    /// The key to resume after, for a backend that can only resume from one.
+    /// The key to resume after, for a store that lists a directory in full.
     pub(crate) fn expect_key(&self) -> Result<&str> {
         match &self.0 {
             Resume::Key(key) => Ok(key),
@@ -185,10 +192,12 @@ pub struct DirPage {
 /// `ObjectStore` trait and so cannot be reached through a `dyn ObjectStore`.
 ///
 /// This is where a backend joins the fast path: implement it, hand one to
-/// [`ObjectStore::paginated_lister`], and pages are pushed down instead of listed in full. A
-/// backend that resumes from its own continuation token mints [`DirCursor::backend`] and needs
-/// no ordering at all; one that can only resume from a key mints [`DirCursor::key`], which is
-/// sound only where the backend lists in key order and reports its pages in that same order.
+/// [`ObjectStore::paginated_lister`], and pages are pushed down instead of listed in full.
+///
+/// A backend mints [`DirCursor::backend`] and resumes from its own token, which is exact and
+/// needs no key order to be correct. A cursor minted by the full-listing fallback is not one
+/// of its own: a walk cannot start on one path and finish on the other, and
+/// [`DirCursor::expect_backend`] says so rather than guessing at a position.
 #[async_trait::async_trait]
 pub trait PaginatedDirLister: std::fmt::Debug + Send + Sync + 'static {
     /// One page of the immediate children of `prefix`, resuming after `resume`.
@@ -477,7 +486,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::native::NativeDirLister;
-    use super::store_model::{BudgetMode, KeyOrder, OffsetMode, Resume as ModelResume, StoreModel};
+    use super::store_model::{BudgetMode, KeyOrder, Resume as ModelResume, StoreModel};
     use super::*;
     use crate::object_store::throttle::{AimdThrottleConfig, AimdThrottledStore};
     use crate::object_store::{ObjectStoreParams, ObjectStoreRegistry};
@@ -492,18 +501,16 @@ mod tests {
     enum Backend {
         /// No paginated API: list the whole directory and page it locally.
         FullListing,
-        /// A paginated API whose offset is exclusive: `start-after`, which S3 takes and which
-        /// GCS takes too, since `object_store` lists it over the S3-compatible XML API.
-        ExclusiveOffset,
-        /// A paginated API whose offset is inclusive, like Azure's `startFrom`.
-        InclusiveOffset,
+        /// A paginated API over a store that lists in key order, like S3, GCS, or Azure over a
+        /// flat namespace.
+        KeyOrdered,
         /// A paginated API over a store that orders each directory level by child name rather
         /// than by whole key, which Azure documents for accounts with a hierarchical namespace.
         NameOrdered,
         /// A paginated API over a store that lists in no particular order, like S3 Express.
         Unordered,
     }
-    use Backend::{ExclusiveOffset, FullListing, InclusiveOffset, NameOrdered, Unordered};
+    use Backend::{FullListing, KeyOrdered, NameOrdered, Unordered};
 
     /// One list request, as the backend saw it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,15 +547,9 @@ mod tests {
                 limit,
             });
             let prefix = prefix.unwrap_or("");
-            // The cursor is relative to the prefix, and the backend joins the two.
-            let offset = match resume.map(DirCursor::resume) {
-                Some(super::Resume::Key(key)) => Some(format!("{prefix}{key}")),
-                _ => None,
-            };
-            let resume = match (resume.map(DirCursor::resume), &offset) {
-                (Some(super::Resume::Backend(token)), _) => ModelResume::Token(token),
-                (_, Some(offset)) => ModelResume::Offset(offset),
-                _ => ModelResume::Start,
+            let resume = match resume {
+                Some(cursor) => ModelResume::Token(cursor.expect_backend()?),
+                None => ModelResume::Start,
             };
             let page = self.model.list_level(prefix, resume, limit);
 
@@ -574,15 +575,6 @@ mod tests {
                     .collect(),
             };
             let entries = keyed_entries(&listed, Some(prefix).filter(|p| !p.is_empty()));
-            let entries = match &offset {
-                // The offset is a key, so anything at or before it has already been handed
-                // over: a resumed directory comes back as its own prefix again.
-                Some(offset) => entries
-                    .into_iter()
-                    .filter(|child| format!("{prefix}{}", child.key).as_str() > offset.as_str())
-                    .collect(),
-                None => entries,
-            };
             Ok(DirPage {
                 entries: entries.into_iter().map(|child| child.entry).collect(),
                 next: page.next_token.map(DirCursor::backend),
@@ -661,10 +653,6 @@ mod tests {
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         if backend != FullListing {
-            let offset = match backend {
-                InclusiveOffset => OffsetMode::Inclusive,
-                _ => OffsetMode::Exclusive,
-            };
             let order = match backend {
                 NameOrdered => KeyOrder::DelimiterLowest,
                 Unordered => KeyOrder::Reversed,
@@ -672,7 +660,6 @@ mod tests {
             };
             store.paginated_lister = Some(Arc::new(FakeDirLister {
                 model: StoreModel::new(keys.to_vec())
-                    .with_offset(offset)
                     .with_order(order)
                     .with_budget(BudgetMode::PerScannedKey),
                 requests: requests.clone(),
@@ -690,8 +677,8 @@ mod tests {
         "other/d.lance/data/1.lance",
     ];
 
-    /// Walking a directory hands back every child exactly once, whatever the store does with a
-    /// resume position, whatever order it lists in, and however small the pages are.
+    /// Walking a directory hands back every child exactly once, however the store resolves the
+    /// listing, whatever order it lists in, and however small the pages are.
     #[rstest]
     #[case::whole_directory(TABLES, "db", vec!["a.lance", "b.lance", "c.lance", "loose.txt"])]
     #[case::empty_directory(TABLES, "nonexistent", vec![])]
@@ -711,8 +698,7 @@ mod tests {
     #[case::an_encodable_name(&["db/az", "db/a~"], "db", vec!["az", "a~"])]
     #[tokio::test]
     async fn test_walking_a_directory_is_complete(
-        #[values(FullListing, ExclusiveOffset, InclusiveOffset, NameOrdered, Unordered)]
-        backend: Backend,
+        #[values(FullListing, KeyOrdered, NameOrdered, Unordered)] backend: Backend,
         #[values(None, Some(1), Some(2), Some(3))] limit: Option<usize>,
         #[case] keys: &[&str],
         #[case] dir: &str,
@@ -750,7 +736,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_a_bounded_page_makes_one_request(
-        #[values(ExclusiveOffset, InclusiveOffset, NameOrdered, Unordered)] backend: Backend,
+        #[values(KeyOrdered, NameOrdered, Unordered)] backend: Backend,
     ) {
         let store = test_store(backend, TABLES).await;
 
@@ -771,15 +757,12 @@ mod tests {
     /// delimiter the backend spends its limit on keys it collapses away, so a page can hold one
     /// entry, be nowhere near the limit, and still be followed by more; a caller that stopped
     /// there would see a page far smaller than the one it asked for.
-    #[rstest]
     #[tokio::test]
-    async fn test_a_short_backend_page_is_filled_from_the_next(
-        #[values(ExclusiveOffset, InclusiveOffset)] backend: Backend,
-    ) {
+    async fn test_a_short_backend_page_is_filled_from_the_next() {
         // `big.lance` holds more keys than a page is allowed to scan, so the page that reports
         // it comes back with a single entry and more to come.
         let store = test_store(
-            backend,
+            KeyOrdered,
             &[
                 "db/big.lance/data/1.lance",
                 "db/big.lance/data/2.lance",
@@ -812,7 +795,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_a_page_of_no_entries_keeps_going(
-        #[values(ExclusiveOffset, InclusiveOffset, NameOrdered)] backend: Backend,
+        #[values(KeyOrdered, NameOrdered)] backend: Backend,
     ) {
         let store = test_store(backend, &["db/marked/", "db/marked/a.txt"]).await;
 
@@ -833,7 +816,7 @@ mod tests {
     /// comes before the store is consulted, so one backend covers it.
     #[tokio::test]
     async fn test_zero_limit_is_rejected() {
-        let store = test_store(ExclusiveOffset, TABLES).await;
+        let store = test_store(KeyOrdered, TABLES).await;
 
         let err = store.walk("db", Some(0)).await.unwrap_err();
 
@@ -851,7 +834,7 @@ mod tests {
     #[case::empty("")]
     #[tokio::test]
     async fn test_a_token_from_nowhere_is_rejected(#[case] page_token: &str) {
-        let store = test_store(ExclusiveOffset, TABLES).await;
+        let store = test_store(KeyOrdered, TABLES).await;
 
         let err = store
             .store
@@ -880,7 +863,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_entry_kinds(#[values(FullListing, ExclusiveOffset)] backend: Backend) {
+    async fn test_entry_kinds(#[values(FullListing, KeyOrdered)] backend: Backend) {
         let store = test_store(backend, TABLES).await;
 
         let page = store.first_page("db", None).await;
@@ -901,7 +884,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_listing_is_recorded_in_io_stats(
-        #[values(FullListing, ExclusiveOffset)] backend: Backend,
+        #[values(FullListing, KeyOrdered)] backend: Backend,
     ) {
         let store = test_store(backend, TABLES).await;
         assert_eq!(store.store.io_tracker().stats().read_iops, 0);
@@ -945,7 +928,7 @@ mod tests {
         let lister = Arc::new(StuckLister {
             calls: AtomicUsize::new(0),
         });
-        let mut store = test_store(ExclusiveOffset, TABLES).await;
+        let mut store = test_store(KeyOrdered, TABLES).await;
         store.store.paginated_lister = Some(lister.clone());
 
         let err = store.walk("db", Some(1)).await.unwrap_err();
@@ -1023,26 +1006,26 @@ mod tests {
         assert_eq!(page.next.is_some(), has_more);
     }
 
-    /// A key cursor is what a listing resumed from a store with no continuation token brings,
-    /// and the native API takes it as an offset. The entry it names comes back again on a
-    /// store whose offset is inclusive, and always for a directory, so it is dropped here.
+    /// A key cursor is what the full-listing fallback mints, and a walk cannot cross from one
+    /// path to the other. Resuming from it would mean sending the store an offset, which every
+    /// store interprets its own way, so the listing fails instead of guessing at a position.
     #[tokio::test]
-    async fn test_native_lister_takes_a_key_cursor_as_an_offset() {
+    async fn test_native_lister_rejects_a_key_cursor() {
         let store = recording_store(None);
         let lister = NativeDirLister::for_store(store.clone());
 
-        let page = lister
+        let err = lister
             .list_page(Some("db/"), Some(&DirCursor::key("a.lance/")), Some(7))
             .await
-            .unwrap();
+            .expect_err("a key cursor is not this lister's to resume from");
 
-        let calls = store.calls.lock().unwrap();
-        // The cursor arrives relative to the prefix and is resolved against it here.
-        assert_eq!(calls[0].1.offset.as_deref(), Some("db/a.lance/"));
-        assert_eq!(calls[0].1.page_token, None);
         assert!(
-            page.entries.is_empty(),
-            "the resumed directory is not handed over twice"
+            err.to_string().contains("lists a directory in full"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            store.calls.lock().unwrap().is_empty(),
+            "the listing has to fail before it reaches the store"
         );
     }
 
@@ -1052,7 +1035,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_throttling_does_not_change_the_listing(#[values(false, true)] throttled: bool) {
-        let mut store = test_store(ExclusiveOffset, TABLES).await;
+        let mut store = test_store(KeyOrdered, TABLES).await;
         let lister = Arc::new(FakeDirLister {
             model: StoreModel::new(TABLES.to_vec()).with_budget(BudgetMode::PerScannedKey),
             requests: store.requests.clone(),

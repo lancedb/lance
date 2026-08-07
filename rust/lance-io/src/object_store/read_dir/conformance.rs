@@ -29,7 +29,7 @@ use rstest::rstest;
 use super::super::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use super::emulator::{ListEmulator, Wire};
 use super::native::NativeDirLister;
-use super::store_model::{BudgetMode, OffsetMode, StoreModel};
+use super::store_model::{BudgetMode, StoreModel};
 use super::{DirEntry, PaginatedDirLister, ReadDirOptions};
 
 /// The directory under test. Kept free of characters that need encoding: it is the caller's
@@ -267,19 +267,16 @@ async fn emulated(client: Client, model: StoreModel) -> (Conformance, ListEmulat
     (stores, emulator)
 }
 
-/// Every client, against every way a store is allowed to treat a resume position and a page
-/// limit. A listing that only works when the store is generous is not a working listing.
+/// Every client, against every way a store is allowed to spend a page limit. A listing that
+/// only works when the store is generous is not a working listing.
 #[rstest]
 #[tokio::test]
 async fn test_paging_is_invisible_over_the_wire(
     #[values(Client::S3, Client::Gcs, Client::Azure)] client: Client,
-    #[values(OffsetMode::Exclusive, OffsetMode::Inclusive, OffsetMode::Ignored)] offset: OffsetMode,
     #[values(BudgetMode::PerEntry, BudgetMode::PerScannedKey)] budget: BudgetMode,
 ) {
     let keys: Vec<&str> = SHAPES.iter().chain(MARKED_CHILDREN).copied().collect();
-    let model = StoreModel::new(keys)
-        .with_offset(offset)
-        .with_budget(budget);
+    let model = StoreModel::new(keys).with_budget(budget);
     let (stores, emulator) = emulated(client, model).await;
 
     // A listing that cannot make progress would spin rather than fail, so bound the wait
@@ -333,17 +330,14 @@ async fn test_a_page_of_one_asks_the_backend_for_one(
 /// A caller that asks for no page size at all, over a directory larger than the store will
 /// return in one request.
 ///
-/// Nothing then bounds a page but the store's own limit, so the resume position is the only
-/// thing carrying the listing forward and there is no page size to widen when it does not
-/// work. The listing still has to be complete, whatever the store does with that position.
+/// Nothing then bounds a page but the store's own limit, so the continuation token is the only
+/// thing carrying the listing forward. The listing still has to be complete.
 #[rstest]
 #[tokio::test]
 async fn test_a_listing_without_a_page_size_is_complete(
     #[values(Client::S3, Client::Gcs, Client::Azure)] client: Client,
-    #[values(OffsetMode::Exclusive, OffsetMode::Inclusive, OffsetMode::Ignored)] offset: OffsetMode,
 ) {
     let model = StoreModel::new(SHAPES.to_vec())
-        .with_offset(offset)
         // Small enough that the fixture takes several pages, so the listing has to resume.
         .with_page_bound(4);
     let (stores, _emulator) = emulated(client, model).await;

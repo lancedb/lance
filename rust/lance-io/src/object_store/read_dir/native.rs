@@ -9,7 +9,7 @@ use object_store::list::{PaginatedListOptions, PaginatedListStore};
 
 use lance_core::Result;
 
-use super::{DELIMITER, DirCursor, DirPage, PaginatedDirLister, Resume, keyed_entries};
+use super::{DELIMITER, DirCursor, DirPage, PaginatedDirLister, keyed_entries};
 
 /// [`PaginatedDirLister`] over `object_store`'s paginated listing API, used by the native S3,
 /// GCS and Azure stores.
@@ -39,21 +39,18 @@ impl PaginatedDirLister for NativeDirLister {
         resume: Option<&DirCursor>,
         limit: Option<usize>,
     ) -> Result<DirPage> {
-        // A key cursor only ever starts a listing: it comes from a caller resuming a walk that
-        // began on a store with no continuation token of its own. Every page after the first
-        // resumes from the token this one hands back. `object_store` addresses keys by their
-        // `Path` spelling, which is also how it reported the key, so the two join as they are.
-        let (page_token, offset) = match resume.map(DirCursor::resume) {
-            Some(Resume::Backend(token)) => (Some(token.to_string()), None),
-            Some(Resume::Key(key)) => (None, Some(format!("{}{key}", prefix.unwrap_or_default()))),
-            None => (None, None),
+        // Only this lister's own token. `offset` is left unset: a caller-supplied key means
+        // something different on every store — S3 excludes it, Azure includes it, Azurite
+        // drops it — and a continuation token needs none of that.
+        let page_token = match resume {
+            Some(cursor) => Some(cursor.expect_backend()?.to_string()),
+            None => None,
         };
         let page = self
             .0
             .list_paginated(
                 prefix,
                 PaginatedListOptions {
-                    offset,
                     delimiter: Some(DELIMITER.into()),
                     max_keys: limit,
                     page_token,
@@ -62,13 +59,7 @@ impl PaginatedDirLister for NativeDirLister {
             )
             .await?;
 
-        let mut entries = keyed_entries(&page.result, prefix);
-        // An offset is a key, and the entry it names can come back anyway: Azure's `startFrom`
-        // is inclusive, and a directory is a prefix whose keys all sort after it, so it
-        // collapses back into the same entry even under an exclusive `start-after`.
-        if let Some(Resume::Key(key)) = resume.map(DirCursor::resume) {
-            entries.retain(|child| child.key.as_str() > key.as_str());
-        }
+        let entries = keyed_entries(&page.result, prefix);
         Ok(DirPage {
             entries: entries.into_iter().map(|child| child.entry).collect(),
             next: page.page_token.map(DirCursor::backend),

@@ -161,7 +161,7 @@ pub struct ObjectStore {
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
     /// The backend's paginated listing API, when it has one. `None` means
-    /// [`Self::read_dir_stream`] has to list a directory in full to page through it.
+    /// [`Self::read_dir_page`] has to list a directory in full to page through it.
     pub(crate) paginated_lister: Option<Arc<dyn PaginatedDirLister>>,
 }
 
