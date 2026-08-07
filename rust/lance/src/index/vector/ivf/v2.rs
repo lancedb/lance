@@ -5588,6 +5588,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_legacy_non_divisible_pq_search() {
+        const DIM: usize = 64;
+        const PERSISTED_DIM: usize = 56;
+
+        let test_dir = copy_test_data_to_tmp("v0.10.15/non_divisible_pq").unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+        let query = Float32Array::from(
+            (1..=DIM)
+                .map(|value| value as f32 + if value <= PERSISTED_DIM { 1.0 } else { 1_000.0 })
+                .collect::<Vec<_>>(),
+        );
+
+        let result = dataset
+            .scan()
+            .nearest("vector", &query, 1)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(
+            result[DIST_COL].as_primitive::<Float32Type>().values(),
+            &[PERSISTED_DIM as f32]
+        );
+    }
+
+    #[tokio::test]
     async fn test_pq_storage_backwards_compat() {
         let test_dir = copy_test_data_to_tmp("v0.27.1/pq_in_schema").unwrap();
         let test_uri = test_dir.path_str();
