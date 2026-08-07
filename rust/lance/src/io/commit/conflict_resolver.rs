@@ -1517,9 +1517,11 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        // Activation rebases like any other MemWAL state update; its preconditions
+        // are re-checked against the rebased index list when the commit applies.
         if let Operation::UpdateMemWalState {
             compacted_sstables: self_compacted_sstables,
-            activate_safe_retirement: false,
+            ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {

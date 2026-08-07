@@ -486,6 +486,20 @@ pub trait DatasetMemWalExt {
         Ok(None)
     }
 
+    /// Switch this table to safe SSTable retirement.
+    ///
+    /// Until this is called, a missing index-coverage entry reads as "fully
+    /// caught up". Afterwards it reads as "not proved", so an SSTable is served
+    /// until some commit shows the indexes contain its rows.
+    ///
+    /// One-way: there is no matching deactivate, because a table that has
+    /// already retired SSTables against proved coverage cannot go back to
+    /// treating missing coverage as caught up. Calling it on an already-active
+    /// table succeeds and changes nothing.
+    async fn activate_mem_wal_safe_retirement(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// List current MemWAL shard IDs from object storage directory listing.
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
         Ok(Vec::new())
@@ -564,6 +578,28 @@ impl DatasetMemWalExt for Dataset {
         };
 
         load_mem_wal_index_details(index_meta).map(Some)
+    }
+
+    async fn activate_mem_wal_safe_retirement(&self) -> Result<()> {
+        if self.load_index_by_name(MEM_WAL_INDEX_NAME).await?.is_none() {
+            return Err(Error::invalid_input(
+                "Cannot activate MemWAL safe retirement: MemWAL is not initialized on \
+                 this dataset.",
+            ));
+        }
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: Vec::new(),
+                activate_safe_retirement: true,
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(self.clone()))
+            .execute(transaction)
+            .await?;
+        Ok(())
     }
 
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
