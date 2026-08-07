@@ -3710,6 +3710,14 @@ def test_fts_backward_v0_27_0(tmp_path: Path):
         "frodo was a happy puppy",
     }
 
+    # "happy" is exhausted at document 1 before "tail" produces document 2.
+    # Legacy WAND searches must discard the exhausted posting instead of reading it.
+    results = ds.to_table(full_text_query=MatchQuery("happy tail", "text"))
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a happy puppy",
+        "frodo was a puppy with a tail",
+    }
+
     data = pa.table(
         {
             "text": [
