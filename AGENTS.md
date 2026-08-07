@@ -138,3 +138,12 @@ Contributor and maintainer attention is the most valuable resource. Less is more
 - Be concise and clear. Focus on P0/P1 issues: severe bugs, performance degradation, security concerns.
 - Do not reiterate detailed changes or repeat what's already well done.
 - Check naming consistency, error handling patterns, and test coverage.
+
+## Cursor Cloud specific instructions
+
+Scope: the Cloud image is provisioned for the two primary surfaces, **Rust core** (`rust/`, root `Cargo.toml`) and the flagship **Python bindings** (`pylance`, `python/`). Java, docs, and the Docker-based S3/DDB integration tests are optional and not provisioned by default.
+
+- Toolchains and system libraries are baked into the image: `uv` (symlinked into `/usr/local/bin`), `protoc`, `pkg-config` + `libssl-dev` (the root Rust build links system OpenSSL via `openssl-sys`), and a C++ toolchain with `libstdc++-14-dev` (the root build compiles the `esaxx-rs` tokenizer C++; clang selects GCC 14, so the matching `libstdc++-14-dev` headers must be present). Don't re-install these; the startup update script only runs `uv sync` in `python/`.
+- Python: follow `python/AGENTS.md`. Always use `uv run ...`. The startup update script already runs `uv sync`, so a fresh checkout is ready — do not run `make install` (it fails at `pre-commit install` because `core.hooksPath` is managed by Cursor). Use `uv sync` directly if you need to re-sync. After editing Rust code that `pylance` depends on, rebuild the extension with `uv run maturin develop --uv` (i.e. `make build`); `uv sync` only rebuilds when `pyproject.toml`/`uv.lock` change.
+- Rust and Python keep **separate** Cargo build caches (`/workspace/target` vs `/workspace/python/target`); building one does not warm the other, and a first `cargo build`/`cargo test` in the root workspace (or a first `maturin develop`) recompiles the whole dependency tree and is slow — let it finish.
+- Commands are documented above (root `## Development Commands`) and in `python/AGENTS.md`; lint/test/build/run for both surfaces were verified working in this image.
