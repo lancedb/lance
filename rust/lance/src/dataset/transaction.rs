@@ -60,6 +60,10 @@ use uuid::Uuid;
 /// Version 1 is the initial dataset version in the Lance format.
 const UNKNOWN_CREATED_AT_VERSION: u64 = 1;
 
+/// Ephemeral transaction property used to preserve create-only intent while a write is staged.
+/// CommitBuilder removes this before persisting the transaction.
+const CREATE_ONLY_TRANSACTION_PROPERTY: &str = "__lance_internal_create_only";
+
 /// Look up the `created_at` version for a single UPDATE-branch row ID.
 ///
 /// Callers must only call this for row IDs that are confirmed to be present in
@@ -1709,6 +1713,19 @@ impl TransactionBuilder {
         self
     }
 
+    pub(crate) fn create_only(mut self, is_create_only: bool) -> Self {
+        if is_create_only {
+            let properties = self
+                .transaction_properties
+                .get_or_insert_with(|| Arc::new(HashMap::new()));
+            Arc::make_mut(properties)
+                .insert(CREATE_ONLY_TRANSACTION_PROPERTY.to_string(), String::new());
+        } else if let Some(properties) = self.transaction_properties.as_mut() {
+            Arc::make_mut(properties).remove(CREATE_ONLY_TRANSACTION_PROPERTY);
+        }
+        self
+    }
+
     pub fn build(self) -> Transaction {
         let uuid = self
             .uuid
@@ -1732,6 +1749,19 @@ impl Transaction {
         TransactionBuilder::new(read_version, operation)
             .tag(tag)
             .build()
+    }
+
+    pub(crate) fn take_create_only(&mut self) -> bool {
+        let Some(properties) = self.transaction_properties.as_mut() else {
+            return false;
+        };
+        let is_create_only = Arc::make_mut(properties)
+            .remove(CREATE_ONLY_TRANSACTION_PROPERTY)
+            .is_some();
+        if properties.is_empty() {
+            self.transaction_properties = None;
+        }
+        is_create_only
     }
 
     fn fragments_with_ids<'a, T>(

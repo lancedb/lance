@@ -52,7 +52,6 @@ pub struct CommitBuilder<'a> {
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     timeout: Option<Duration>,
-    is_create_only: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -76,7 +75,6 @@ impl<'a> CommitBuilder<'a> {
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
-            is_create_only: false,
         }
     }
 
@@ -191,12 +189,6 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Require the destination to remain absent until this commit.
-    pub(crate) fn with_create_only(mut self, is_create_only: bool) -> Self {
-        self.is_create_only = is_create_only;
-        self
-    }
-
     /// Set the wall-clock budget used by commit conflict backoff.
     ///
     /// The first commit attempt is always allowed to complete. If it conflicts,
@@ -285,7 +277,8 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+    async fn execute_inner(self, mut transaction: Transaction) -> Result<Dataset> {
+        let is_create_only = transaction.take_create_only();
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -357,9 +350,7 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
-        if self.is_create_only
-            && let WriteDestination::Dataset(dataset) = &dest
-        {
+        if is_create_only && let WriteDestination::Dataset(dataset) = &dest {
             return Err(Error::dataset_already_exists(dataset.uri()));
         }
 

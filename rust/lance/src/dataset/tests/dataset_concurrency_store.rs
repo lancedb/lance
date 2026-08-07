@@ -7,7 +7,7 @@ use std::vec;
 use crate::dataset::WriteDestination;
 use crate::{Dataset, Error, Result};
 
-use crate::dataset::write::{WriteMode, WriteParams};
+use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use arrow_array::RecordBatch;
 use arrow_array::{Int32Array, RecordBatchIterator};
@@ -16,6 +16,10 @@ use futures::TryStreamExt;
 use futures::future::join_all;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+fn staged_write_batch(value: i32) -> RecordBatch {
+    arrow_array::record_batch!(("a", Int32, [value])).unwrap()
+}
 
 #[tokio::test]
 async fn concurrent_create() {
@@ -51,6 +55,82 @@ async fn concurrent_create() {
             );
         }
     }
+}
+
+#[rstest::rstest]
+#[case::batches(false)]
+#[case::stream(true)]
+#[tokio::test]
+async fn staged_create_is_atomic(#[case] use_stream: bool) {
+    let test_uri = TempStrDir::default();
+    let staged_batch = staged_write_batch(1);
+    let schema = staged_batch.schema();
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        ..Default::default()
+    };
+    let builder = InsertBuilder::new(test_uri.as_str()).with_params(&params);
+    let transaction = if use_stream {
+        builder
+            .execute_uncommitted_stream(RecordBatchIterator::new(
+                vec![Ok(staged_batch)],
+                schema.clone(),
+            ))
+            .await
+    } else {
+        builder.execute_uncommitted(vec![staged_batch]).await
+    }
+    .unwrap();
+
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(staged_write_batch(2))], schema),
+        test_uri.as_str(),
+        Some(params),
+    )
+    .await
+    .unwrap();
+
+    let error = CommitBuilder::new(test_uri.as_str())
+        .execute(transaction)
+        .await
+        .expect_err("a staged create must not overwrite a competing creator");
+    assert!(
+        matches!(&error, Error::DatasetAlreadyExists { .. }),
+        "unexpected staged create error: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("Dataset already exists"),
+        "unexpected staged create error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn staged_overwrite_can_replace_competing_create() {
+    let test_uri = TempStrDir::default();
+    let staged_batch = staged_write_batch(1);
+    let schema = staged_batch.schema();
+    let transaction = InsertBuilder::new(test_uri.as_str())
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![staged_batch])
+        .await
+        .unwrap();
+
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(staged_write_batch(2))], schema),
+        test_uri.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let overwritten = CommitBuilder::new(test_uri.as_str())
+        .execute(transaction)
+        .await
+        .unwrap();
+    assert_eq!(overwritten.version().version, 2);
 }
 
 #[tokio::test]
