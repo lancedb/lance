@@ -2943,6 +2943,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![referenced_index],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3148,6 +3149,7 @@ mod tests {
                     Operation::CreateIndex {
                         new_indices: vec![old_index.clone()],
                         removed_indices: vec![],
+                        mem_wal_index_catchup_advances: Vec::new(),
                     },
                     None,
                 ),
@@ -3166,6 +3168,7 @@ mod tests {
                     Operation::CreateIndex {
                         new_indices: vec![current_index],
                         removed_indices: vec![old_index],
+                        mem_wal_index_catchup_advances: Vec::new(),
                     },
                     None,
                 ),
