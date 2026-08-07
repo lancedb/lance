@@ -1365,7 +1365,7 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use arrow::datatypes::{Float32Type, UInt32Type};
+    use arrow::datatypes::{Float32Type, Int32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
         Array, ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator,
@@ -1377,12 +1377,14 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
-    use lance_datagen::{Dimension, RowCount, array};
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        IndexType,
-        scalar::{BuiltinIndexType, ScalarIndexParams, SearchResult, TextQuery},
+        IndexParams, IndexType,
+        scalar::{
+            BuiltinIndexType, InvertedIndexParams, ScalarIndexParams, SearchResult, TextQuery,
+        },
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
@@ -3388,6 +3390,173 @@ mod tests {
             .unwrap()
             .num_rows();
         assert_eq!(rows, 2, "value 'd' lives in appended fragment");
+    }
+
+    #[tokio::test]
+    async fn test_optimize_append_many_mixed_indices_completes() {
+        const BTREE_INDICES: usize = 6;
+        const BITMAP_INDICES: usize = 6;
+        const LABEL_LIST_INDICES: usize = 3;
+        const FTS_INDICES: usize = 2;
+        const ROWS_PER_FRAGMENT: u64 = 256;
+
+        async fn create_named_indices(
+            dataset: &mut Dataset,
+            prefix: &str,
+            count: usize,
+            index_type: IndexType,
+            params: &dyn IndexParams,
+        ) {
+            for index in 0..count {
+                let column = format!("{prefix}_{index}");
+                dataset
+                    .create_index(
+                        &[column.as_str()],
+                        index_type,
+                        Some(column.clone()),
+                        params,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let make_reader = |batch_count: u32| {
+            let mut data = lance_datagen::gen_batch();
+            for index in 0..BTREE_INDICES {
+                data = data.col(format!("btree_{index}"), array::step::<Int32Type>());
+            }
+            for index in 0..BITMAP_INDICES {
+                data = data.col(
+                    format!("bitmap_{index}"),
+                    array::cycle_utf8_literals(&["alpha", "beta", "gamma", "delta"]),
+                );
+            }
+            for index in 0..LABEL_LIST_INDICES {
+                let labels = array::cycle_utf8_literals(&["red", "green", "blue", "yellow"])
+                    .with_random_nulls(0.1);
+                data = data.col(
+                    format!("list_{index}"),
+                    array::rand_list_any(labels, false).with_random_nulls(0.1),
+                );
+            }
+            for index in 0..FTS_INDICES {
+                data = data.col(format!("fts_{index}"), array::random_sentence(3, 8, false));
+            }
+            data.col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
+                .into_reader_rows(
+                    RowCount::from(ROWS_PER_FRAGMENT),
+                    BatchCount::from(batch_count),
+                )
+        };
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            make_reader(4),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        create_named_indices(
+            &mut dataset,
+            "btree",
+            BTREE_INDICES,
+            IndexType::BTree,
+            &btree_params,
+        )
+        .await;
+
+        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        create_named_indices(
+            &mut dataset,
+            "bitmap",
+            BITMAP_INDICES,
+            IndexType::Bitmap,
+            &bitmap_params,
+        )
+        .await;
+
+        let label_list_params = ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList);
+        create_named_indices(
+            &mut dataset,
+            "list",
+            LABEL_LIST_INDICES,
+            IndexType::LabelList,
+            &label_list_params,
+        )
+        .await;
+
+        let fts_params = InvertedIndexParams::default();
+        create_named_indices(
+            &mut dataset,
+            "fts",
+            FTS_INDICES,
+            IndexType::Inverted,
+            &fts_params,
+        )
+        .await;
+
+        let vector_params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut dataset = Dataset::write(
+            make_reader(1),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The regression is a silent scheduler deadlock, so bound the operation
+        // instead of relying on the test runner's much longer global timeout.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dataset.optimize_indices(&OptimizeOptions::append()),
+        )
+        .await
+        .expect("incremental optimization of mixed indices timed out")
+        .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let segment_counts = indices.iter().fold(
+            std::collections::BTreeMap::<String, usize>::new(),
+            |mut counts, index| {
+                *counts.entry(index.name.clone()).or_default() += 1;
+                counts
+            },
+        );
+        assert_eq!(segment_counts.len(), 18);
+        assert!(
+            segment_counts.values().all(|count| *count == 2),
+            "append optimization should create one delta segment per index: {segment_counts:?}"
+        );
     }
 
     #[tokio::test]
