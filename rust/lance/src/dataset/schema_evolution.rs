@@ -806,14 +806,34 @@ pub(super) async fn alter_columns(
         )
     } else {
         // Otherwise, we need to re-write the relevant fields.
-        let read_columns = cast_fields
+        let field_order = dataset
+            .schema()
+            .fields_pre_order()
+            .enumerate()
+            .map(|(position, field)| (field.id, position))
+            .collect::<HashMap<_, _>>();
+        let mut ordered_cast_fields = cast_fields
             .iter()
-            .map(|(old, _new)| dataset.schema().field_path_minimal(old.id))
+            .map(|(old, new)| {
+                let position = field_order.get(&old.id).copied().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Could not find field id {} for column {} while casting",
+                        old.id, old.name
+                    ))
+                })?;
+                Ok((position, old, new))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered_cast_fields.sort_by_key(|(position, _, _)| *position);
+
+        let read_columns = ordered_cast_fields
+            .iter()
+            .map(|(_, old, _)| dataset.schema().field_path_minimal(old.id))
             .collect::<Result<Vec<_>>>()?;
 
-        let new_ids = cast_fields
+        let new_ids = ordered_cast_fields
             .iter()
-            .map(|(_old, new)| new.id)
+            .map(|(_, _, new)| new.id)
             .collect::<Vec<_>>();
         // This schema contains the exact field ids we want to write the new fields with.
         let new_col_schema = new_schema.project_by_ids(&new_ids, true);
@@ -3098,6 +3118,54 @@ mod test {
         )?;
         let actual_data = dataset.scan().try_into_batch().await?;
         assert_eq!(actual_data, expected_data);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cast_columns_reversed_order(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::Int64Array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )?;
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("b".into()).cast_to(DataType::Int64),
+                ColumnAlteration::new("a".into()).cast_to(DataType::Int64),
+            ])
+            .await?;
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data["a"].as_ref(), &Int64Array::from(vec![1, 2]));
+        assert_eq!(data["b"].as_ref(), &Int64Array::from(vec![10, 20]));
 
         Ok(())
     }
