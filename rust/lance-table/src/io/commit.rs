@@ -659,7 +659,7 @@ fn current_manifest_local(
     let path = object_store.to_local_path(&base.clone().join(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;
 
-    let mut latest_entry: Option<(u64, DirEntry)> = None;
+    let mut latest_entry: Option<(u64, DirEntry, ManifestNamingScheme)> = None;
 
     let mut scheme: Option<ManifestNamingScheme> = None;
 
@@ -692,24 +692,22 @@ fn current_manifest_local(
             continue;
         };
 
-        if let Some((latest_version, _)) = &latest_entry {
+        if let Some((latest_version, _, _)) = &latest_entry {
             if version > *latest_version {
-                latest_entry = Some((version, entry));
+                latest_entry = Some((version, entry, entry_scheme));
             }
         } else {
-            latest_entry = Some((version, entry));
+            latest_entry = Some((version, entry, entry_scheme));
         }
     }
 
-    if let Some((version, entry)) = latest_entry {
-        let path = Path::from_filesystem_path(entry.path())
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    if let Some((version, entry, naming_scheme)) = latest_entry {
         let metadata = entry.metadata()?;
         Ok(Some(ManifestLocation {
             version,
-            path,
+            path: naming_scheme.manifest_path(base, version),
             size: Some(metadata.len()),
-            naming_scheme: scheme.unwrap(),
+            naming_scheme,
             e_tag: Some(get_etag(&metadata)),
         }))
     } else {

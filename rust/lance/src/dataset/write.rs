@@ -1867,6 +1867,8 @@ async fn resolve_commit_handler(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    #[cfg(windows)]
+    use std::path::{Component, Prefix};
 
     use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -1915,6 +1917,51 @@ mod tests {
         let params = WriteParams::default();
         assert!(params.auto_cleanup.is_none());
         assert!(!params.skip_auto_cleanup);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_create_and_reopen_from_unc_uri() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let dataset_path = tempdir.path().join("dataset with spaces");
+        let mut components = dataset_path.components();
+        let drive_letter = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+                other => panic!("expected a disk path, found {other:?}"),
+            },
+            other => panic!("expected a disk path, found {other:?}"),
+        };
+        assert!(matches!(components.next(), Some(Component::RootDir)));
+
+        // The administrative disk share provides a real loopback UNC path without
+        // requiring an external SMB service.
+        let computer_name = std::env::var("COMPUTERNAME").unwrap();
+        let mut dataset_uri = url::Url::parse(&format!("file://{computer_name}/")).unwrap();
+        let share = format!("{}$", char::from(drive_letter));
+        {
+            let mut segments = dataset_uri.path_segments_mut().unwrap();
+            segments.pop_if_empty().push(&share);
+            for component in components {
+                let Component::Normal(segment) = component else {
+                    panic!("unexpected dataset path component: {component:?}");
+                };
+                segments.push(segment.to_str().unwrap());
+            }
+        }
+        assert!(dataset_uri.as_str().contains("%20"));
+
+        let reader = gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+        let dataset = Dataset::write(reader, dataset_uri.as_str(), None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        drop(dataset);
+
+        let reopened = Dataset::open(dataset_uri.as_str()).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 3);
     }
 
     #[tokio::test]

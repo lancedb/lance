@@ -3,9 +3,6 @@
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-#[cfg(windows)]
-use std::path::{Component, Prefix};
-
 use crate::object_store::{
     DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -38,45 +35,37 @@ fn extract_unc_path(url: &Url) -> Result<Option<UncPath>> {
             return Ok(None);
         };
         let encoded_path = url.path().strip_prefix('/').unwrap_or(url.path());
-        let (share, relative_path) = encoded_path.split_once('/').unwrap_or((encoded_path, ""));
-        if share.is_empty() {
+        let (encoded_share, relative_path) =
+            encoded_path.split_once('/').unwrap_or((encoded_path, ""));
+        if encoded_share.is_empty() {
             return Err(Error::invalid_input(format!(
                 "UNC URL '{}' is missing a share name",
                 url
             )));
         }
 
-        // `Url::to_file_path` only accepts authorities for the `file` scheme.
-        // The other local schemes share the same filesystem path semantics.
-        let mut file_url = url.clone();
-        file_url.set_scheme("file").map_err(|_| {
-            Error::invalid_input(format!("Failed to convert '{}' to a file URL", url))
+        let share = Path::from_url_path(encoded_share).map_err(|error| {
+            Error::invalid_input(format!(
+                "Failed to parse share name from UNC URL '{}': {}",
+                url, error
+            ))
         })?;
-        let filesystem_path = file_url.to_file_path().map_err(|_| {
-            Error::invalid_input(format!("Failed to convert UNC URL '{}' to a path", url))
-        })?;
-        let Some(Component::Prefix(prefix)) = filesystem_path.components().next() else {
+        if share.parts_count() != 1 || share.as_ref().contains('\\') {
             return Err(Error::invalid_input(format!(
-                "UNC URL '{}' did not produce a UNC path",
-                url
-            )));
-        };
-        if !matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _)) {
-            return Err(Error::invalid_input(format!(
-                "UNC URL '{}' did not produce a UNC path",
+                "UNC URL '{}' has an invalid share name",
                 url
             )));
         }
 
         Ok(Some(UncPath {
-            root: PathBuf::from(prefix.as_os_str()),
+            root: PathBuf::from(format!(r"\\{}\{}", host, share)),
             relative_path: Path::from_url_path(relative_path).map_err(|error| {
                 Error::invalid_input(format!(
                     "Failed to parse path '{}' from UNC URL '{}': {}",
                     relative_path, url, error
                 ))
             })?,
-            store_prefix: format!("{}${}/{}", url.scheme(), host, share),
+            store_prefix: format!("{}${}/{}", url.scheme(), host, encoded_share),
         }))
     }
 }
