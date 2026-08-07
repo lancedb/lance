@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{Array, ArrayRef};
+use arrow_schema::DataType;
 use lance_core::{Error, Result};
 
 use super::{
@@ -28,6 +29,14 @@ pub(super) fn split_dense_pages(
     if num_rows <= 1 || num_values <= 1 {
         return Ok(pages);
     }
+    // Arrow dictionary slices retain their complete values array. Splitting one would encode the
+    // same dictionary payload in every page until the encoder can share or compact dictionaries.
+    if arrays
+        .iter()
+        .any(|array| matches!(array.data_type(), DataType::Dictionary(_, _)))
+    {
+        return Ok(pages);
+    }
 
     let total_size_bytes = arrays.iter().try_fold(0_u64, |total, array| {
         let array_size = u64::try_from(array.get_array_memory_size()).map_err(|_| {
@@ -51,12 +60,6 @@ pub(super) fn split_dense_pages(
         .div_ceil(max_page_bytes)
         .min(num_rows)
         .min(num_values);
-    // A page cannot split an individual value. Avoid producing one-value pages when every
-    // requested partition would still exceed the target, and keep the existing jumbo-value
-    // encoding path intact.
-    if desired_pages <= 1 || desired_pages == num_values {
-        return Ok(pages);
-    }
     let target_values_per_page = num_values.div_ceil(desired_pages);
 
     pages

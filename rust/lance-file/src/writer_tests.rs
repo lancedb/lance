@@ -12,9 +12,10 @@ mod tests {
     use crate::versions;
     use crate::writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriter, FileWriterOptions};
     use arrow_array::builder::{Float32Builder, Int32Builder};
-    use arrow_array::types::Float64Type;
+    use arrow_array::types::{Float64Type, Int32Type};
     use arrow_array::{
-        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchReader, StringArray, UInt64Array,
+        Array, ArrayRef, DictionaryArray, Int32Array, RecordBatch, RecordBatchReader, StringArray,
+        UInt64Array,
     };
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
@@ -35,6 +36,59 @@ mod tests {
         options: FileWriterOptions,
     ) -> lance_core::Result<FileWriter> {
         versions::create_writer(version, object_writer, schema, options)
+    }
+
+    async fn write_batch_page_sizes(
+        batch: &RecordBatch,
+        version: ConcreteFileVersion,
+        max_page_bytes: u64,
+    ) -> Vec<Vec<Vec<u64>>> {
+        let mut lance_schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+        lance_schema.set_dictionary(batch).unwrap();
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_writer(
+            object_store.create(&path).await.unwrap(),
+            lance_schema,
+            version,
+            FileWriterOptions {
+                max_page_bytes: Some(max_page_bytes),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        writer.write_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        file_reader
+            .metadata()
+            .column_metadatas
+            .iter()
+            .map(|column| {
+                column
+                    .pages
+                    .iter()
+                    .map(|page| page.buffer_sizes.clone())
+                    .collect()
+            })
+            .collect()
     }
 
     fn create_v2_1_writer_with_compression(
@@ -720,61 +774,21 @@ mod tests {
     async fn test_oversized_batch_split_into_pages(#[case] version: ConcreteFileVersion) {
         let arrow_field = Field::new("data", DataType::UInt64, false);
         let arrow_schema = Schema::new(vec![arrow_field]);
-        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         // 8MiB
         let data: Vec<u64> = (0..1_000_000).collect();
         let array = UInt64Array::from(data);
         let batch =
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
-
-        let options = FileWriterOptions {
-            max_page_bytes: Some(1024 * 1024), // 1MB
-            ..Default::default()
-        };
-
-        let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
-        let mut writer = create_writer(
-            object_store.create(&path).await.unwrap(),
-            lance_schema,
-            version,
-            options,
-        )
-        .unwrap();
-
-        writer.write_batch(&batch).await.unwrap();
-        writer.finish().await.unwrap();
-
-        let fs = FsFixture::default();
-        let file_scheduler = fs
-            .scheduler
-            .open_file(&path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let file_reader = FileReader::try_open(
-            file_scheduler,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &LanceCache::no_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        let column_meta = file_reader.metadata();
+        let page_buffer_sizes = write_batch_page_sizes(&batch, version, 1024 * 1024).await;
 
         let mut total_page_num: u32 = 0;
-        for (col_idx, col_metadata) in column_meta.column_metadatas.iter().enumerate() {
-            assert!(
-                !col_metadata.pages.is_empty(),
-                "Column {} has no pages",
-                col_idx
-            );
+        for (col_idx, pages) in page_buffer_sizes.iter().enumerate() {
+            assert!(!pages.is_empty(), "Column {} has no pages", col_idx);
 
-            for (page_idx, page) in col_metadata.pages.iter().enumerate() {
+            for (page_idx, buffer_sizes) in pages.iter().enumerate() {
                 total_page_num += 1;
-                let total_size: u64 = page.buffer_sizes.iter().sum();
+                let total_size: u64 = buffer_sizes.iter().sum();
                 assert!(
                     total_size <= 1024 * 1024,
                     "Column {} Page {} size {} exceeds 1MB limit",
@@ -786,6 +800,44 @@ mod tests {
         }
 
         assert_eq!(total_page_num, 8)
+    }
+
+    #[tokio::test]
+    async fn test_oversized_two_row_batch_splits_at_row_boundary() {
+        let arrow_schema = Schema::new(vec![Field::new("data", DataType::Utf8, false)]);
+        let values = vec!["a".repeat(768 * 1024), "b".repeat(768 * 1024)];
+        let batch = RecordBatch::try_new(
+            arrow_schema.into(),
+            vec![Arc::new(StringArray::from(values))],
+        )
+        .unwrap();
+
+        let page_buffer_sizes =
+            write_batch_page_sizes(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
+
+        assert_eq!(page_buffer_sizes[0].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_dictionary_batch_remains_single_page() {
+        let dictionary_values = StringArray::from_iter_values(
+            (0..512).map(|index| format!("{index:04}-{}", "x".repeat(4091))),
+        );
+        let keys = Int32Array::from_iter_values((0..1024).map(|index| index % 512));
+        let dictionary =
+            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(dictionary_values)).unwrap();
+        assert!(dictionary.get_array_memory_size() > 1024 * 1024);
+        let arrow_schema = Schema::new(vec![Field::new(
+            "data",
+            dictionary.data_type().clone(),
+            false,
+        )]);
+        let batch = RecordBatch::try_new(arrow_schema.into(), vec![Arc::new(dictionary)]).unwrap();
+
+        let page_buffer_sizes =
+            write_batch_page_sizes(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
+
+        assert_eq!(page_buffer_sizes[0].len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
