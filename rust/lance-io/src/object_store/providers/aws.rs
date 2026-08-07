@@ -13,11 +13,11 @@ use object_store::ObjectStore as OSObjectStore;
 use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::S3};
 
-use aws_config::Region;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::ecs::EcsCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
+use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
@@ -59,7 +59,13 @@ impl AwsStoreProvider {
         };
 
         let mut s3_storage_options = storage_options.as_s3_options();
-        let region = resolve_s3_region(base_path, &s3_storage_options).await?;
+        let profile_config = if std::env::var_os("AWS_PROFILE").is_some() {
+            Some(aws_config::load_defaults(BehaviorVersion::latest()).await)
+        } else {
+            None
+        };
+        let region =
+            resolve_s3_region(base_path, &mut s3_storage_options, profile_config.as_ref()).await?;
 
         // Get accessor from params
         let accessor = params.get_accessor();
@@ -234,13 +240,28 @@ fn check_s3_express(url: &Url, storage_options: &StorageOptions) -> bool {
 ///
 /// This resolves in order of precedence:
 /// 1. The region provided in the storage options
-/// 2. (If endpoint is not set), the region returned by the S3 API for the bucket
+/// 2. The region and endpoint from the selected AWS profile
+/// 3. (If endpoint is not set), the region returned by the S3 API for the bucket
 ///
 /// It can return None if no region is provided and the endpoint is set.
 async fn resolve_s3_region(
     url: &Url,
-    storage_options: &HashMap<AmazonS3ConfigKey, String>,
+    storage_options: &mut HashMap<AmazonS3ConfigKey, String>,
+    profile_config: Option<&SdkConfig>,
 ) -> Result<Option<String>> {
+    if let Some(profile_config) = profile_config {
+        if let Some(endpoint) = profile_config.endpoint_url() {
+            storage_options
+                .entry(AmazonS3ConfigKey::Endpoint)
+                .or_insert_with(|| endpoint.to_string());
+        }
+        if let Some(region) = profile_config.region() {
+            storage_options
+                .entry(AmazonS3ConfigKey::Region)
+                .or_insert_with(|| region.as_ref().to_string());
+        }
+    }
+
     if let Some(region) = storage_options.get(&AmazonS3ConfigKey::Region) {
         Ok(Some(region.clone()))
     } else if storage_options.get(&AmazonS3ConfigKey::Endpoint).is_none() {
@@ -580,6 +601,8 @@ pub type DynamicStorageOptionsCredentialProvider =
 mod tests {
     use crate::object_store::ObjectStoreRegistry;
     use crate::object_store::StorageOptionsProvider;
+    #[allow(deprecated)]
+    use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -632,6 +655,55 @@ mod tests {
 
         // Not called yet
         assert!(mock_provider.called.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_s3_region_from_aws_profile() {
+        #[allow(deprecated)]
+        let profile_files = ProfileFiles::builder()
+            .with_contents(
+                ProfileFileKind::Config,
+                "[profile backblaze]\n\
+                 region = us-west-004\n\
+                 endpoint_url = https://s3.us-west-004.backblazeb2.com\n\
+                 aws_access_key_id = test-key\n\
+                 aws_secret_access_key = test-secret",
+            )
+            .build();
+        let profile_config = aws_config::defaults(BehaviorVersion::latest())
+            .profile_name("backblaze")
+            .profile_files(profile_files)
+            .load()
+            .await;
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+
+        let mut storage_options = HashMap::new();
+        let region = resolve_s3_region(&url, &mut storage_options, Some(&profile_config))
+            .await
+            .unwrap();
+
+        assert_eq!(region.as_deref(), Some("us-west-004"));
+        assert_eq!(
+            storage_options.get(&AmazonS3ConfigKey::Endpoint),
+            Some(&"https://s3.us-west-004.backblazeb2.com".to_string())
+        );
+
+        let mut explicit_options = HashMap::from([
+            (AmazonS3ConfigKey::Region, "explicit-region".to_string()),
+            (
+                AmazonS3ConfigKey::Endpoint,
+                "https://explicit.example.com".to_string(),
+            ),
+        ]);
+        let region = resolve_s3_region(&url, &mut explicit_options, Some(&profile_config))
+            .await
+            .unwrap();
+
+        assert_eq!(region.as_deref(), Some("explicit-region"));
+        assert_eq!(
+            explicit_options.get(&AmazonS3ConfigKey::Endpoint),
+            Some(&"https://explicit.example.com".to_string())
+        );
     }
 
     #[test]
