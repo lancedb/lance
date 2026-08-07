@@ -97,8 +97,6 @@ fn message_is_throttle(message: &str) -> bool {
         || lowercase.contains("slowdown")
         || lowercase.contains("please reduce your request rate")
         || lowercase.contains("rate limit")
-        // OpenDAL renders `ErrorKind::RateLimited` without a separator.
-        || lowercase.contains("ratelimited")
         || lowercase.contains("throttling")
         || lowercase.contains("throttled")
 }
@@ -1158,10 +1156,6 @@ mod tests {
         assert!(is_throttle_error_lance(&wrapped));
         assert!(!is_throttle_error_lance(&lance_core::Error::from(
             make_generic_error("Access denied")
-        )));
-        // OpenDAL errors arrive as text rather than as an `object_store::Error`.
-        assert!(is_throttle_error_lance(&lance_core::Error::io(
-            "failed to list 'db/': RateLimited (temporary) at list"
         )));
     }
 
