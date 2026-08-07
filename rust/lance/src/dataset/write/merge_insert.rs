@@ -65,14 +65,13 @@ use crate::{
         filtered_read::{FilteredReadExec, FilteredReadOptions},
         project,
         scalar_index::{IndexLookup, MapIndexExec},
-        utils::ReplayExec,
     },
 };
 use arrow_array::{
     BooleanArray, RecordBatch, RecordBatchIterator, StructArray, UInt32Array, UInt64Array,
     cast::AsArray, types::UInt64Type,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
 use arrow_select::take::take_record_batch;
 use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -87,20 +86,15 @@ use datafusion::{
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
         ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
-        display::DisplayableExecutionPlan,
-        joins::{HashJoinExec, PartitionMode},
-        projection::ProjectionExec,
-        repartition::RepartitionExec,
-        sorts::sort::SortExec,
-        stream::RecordBatchStreamAdapter,
-        streaming::PartitionStream,
-        union::UnionExec,
+        display::DisplayableExecutionPlan, joins::SortMergeJoinExec, projection::ProjectionExec,
+        repartition::RepartitionExec, sorts::sort::SortExec, stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream, union::UnionExec,
     },
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::DataFrame,
     scalar::ScalarValue,
 };
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
 use futures::{
     Stream, StreamExt, TryStreamExt,
     stream::{self},
@@ -113,14 +107,14 @@ use lance_core::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result,
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{InvalidInputSnafu, box_error},
-    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::tokio::get_num_compute_intensive_cpus,
 };
 use lance_datafusion::{
     chunker::chunk_stream,
     dataframe::BatchStreamGrouper,
     exec::{
-        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, OneShotPartitionStream,
-        analyze_plan, execute_plan, get_session_context, provider_to_stream,
+        HardCapBatchSizeExec, LanceExecutionOptions, OneShotPartitionStream, analyze_plan,
+        execute_plan, get_session_context, provider_to_stream,
     },
     spill::spilling_table_provider,
     utils::{StreamingWriteSource, reader_to_stream},
@@ -1057,35 +1051,62 @@ impl MergeInsertJob {
             SchemaComparison::Subschema => true,
         };
 
-        // 1 - Input from user
-        let input = Arc::new(OneShotExec::new(source));
-
-        // 2 - Fork/Replay the input
-        // Regrettably, this needs to have unbounded capacity, and so we need to fully read
-        // the new data into memory.  In the future, we can do better
-        let shared_input = Arc::new(ReplayExec::new(Capacity::Unbounded, input));
+        // 1 - Make the one-shot source replayable for the index probe and the
+        //     final join. Keep only a small, pool-relative buffer in memory;
+        //     larger sources spill to disk.
+        /// Row cap for external-sort output batches; payload rows may be wide.
+        const JOIN_BATCH_ROWS: usize = 128;
+        /// Byte cap for sort input batches and in-memory replay buffers.
+        const MAX_JOIN_BATCH_BYTES: usize = 25 * 1024 * 1024;
+        let execution_options = LanceExecutionOptions {
+            use_spilling: true,
+            batch_size: Some(JOIN_BATCH_ROWS),
+            ..Default::default()
+        };
+        let max_batch_bytes =
+            ((execution_options.mem_pool_size() as usize) / 8).clamp(1, MAX_JOIN_BATCH_BYTES);
+        let replayable_source = spilling_table_provider(source, max_batch_bytes).await?;
+        let session_ctx = SessionContext::new();
+        let source_input = replayable_source
+            .scan(&session_ctx.state(), None, &[], None)
+            .await?;
+        let index_input = replayable_source
+            .scan(&session_ctx.state(), None, &[], None)
+            .await?;
 
         // 3 - Probe every indexed join column.  For composite keys this is
         //     the AND of one `IsIn` query per indexed column, which yields
         //     a tighter candidate set than probing a single column.  The
-        //     downstream hash join still filters by the full composite key,
+        //     downstream join still filters by the full composite key,
         //     so unindexed `on` columns simply do not prune the candidates.
         let lookup_fields = indexed_keys
             .iter()
             .map(|(col, _)| Ok(schema.field_with_name(col)?.clone()))
             .collect::<Result<Vec<_>>>()?;
-        let index_mapper_input =
-            Arc::new(project(shared_input.clone(), &Schema::new(lookup_fields))?);
+        let index_mapper_input = Arc::new(project(index_input, &Schema::new(lookup_fields))?);
 
         let lookups = indexed_keys
             .iter()
             .map(|(col, idx)| IndexLookup::new(col.clone(), idx.name.clone()))
             .collect::<Vec<_>>();
-        let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
+        let index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
             self.dataset.clone(),
             lookups,
             index_mapper_input,
         ));
+
+        // Finish the compact index probe before sorting wide source/target
+        // rows. Otherwise its retained candidate set competes with both sorts
+        // for the same pool. Replaying these row addresses is inexpensive and
+        // spills when needed.
+        let mapped_rows = execute_plan(index_mapper, execution_options.clone())?;
+        let mapped_rows = spilling_table_provider(mapped_rows, max_batch_bytes).await?;
+        let mut initial_scan = provider_to_stream(mapped_rows.clone()).await?;
+        while initial_scan.try_next().await?.is_some() {}
+        drop(initial_scan);
+        let mut index_mapper = mapped_rows
+            .scan(&session_ctx.state(), None, &[], None)
+            .await?;
 
         // 4 - Take the mapped row ids (TakeExec stays for legacy storage:
         //     the v1 reader cannot serve a FilteredReadExec)
@@ -1180,7 +1201,7 @@ impl MergeInsertJob {
             .on
             .iter()
             .map(|col| {
-                let source_key = Column::new_with_schema(col, shared_input.schema().as_ref())?;
+                let source_key = Column::new_with_schema(col, source_input.schema().as_ref())?;
                 let target_key =
                     Column::new_with_schema(&format!("target_{}", col), target.schema().as_ref())?;
                 Ok::<_, Error>((
@@ -1200,27 +1221,44 @@ impl MergeInsertJob {
             NullEquality::NullEqualsNothing
         };
 
-        let joined = Arc::new(
-            HashJoinExec::try_new(
-                shared_input,
-                target,
-                on_keys,
-                None,
-                &JoinType::Full,
-                None,
-                PartitionMode::CollectLeft,
-                null_equality,
-                false,
-            )
-            .unwrap(),
-        );
-        execute_plan(
-            joined,
-            LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            },
-        )
+        // HashJoinExec cannot spill its build side. Sort both inputs instead,
+        // capping oversized batches so the sorts and the join can spill within
+        // the configured fair memory pool.
+        let sort_options = vec![SortOptions::default(); on_keys.len()];
+        let source_ordering = on_keys
+            .iter()
+            .zip(sort_options.iter())
+            .map(|((source_key, _), options)| PhysicalSortExpr {
+                expr: source_key.clone(),
+                options: *options,
+            })
+            .collect::<Vec<_>>();
+        let target_ordering = on_keys
+            .iter()
+            .zip(sort_options.iter())
+            .map(|((_, target_key), options)| PhysicalSortExpr {
+                expr: target_key.clone(),
+                options: *options,
+            })
+            .collect::<Vec<_>>();
+        let source_ordering = LexOrdering::new(source_ordering)
+            .ok_or_else(|| Error::internal("merge-insert source join ordering is empty"))?;
+        let target_ordering = LexOrdering::new(target_ordering)
+            .ok_or_else(|| Error::internal("merge-insert target join ordering is empty"))?;
+        let source_input = Arc::new(HardCapBatchSizeExec::new(source_input, max_batch_bytes));
+        let target = Arc::new(HardCapBatchSizeExec::new(target, max_batch_bytes));
+        let source_input = Arc::new(SortExec::new(source_ordering, source_input));
+        let target = Arc::new(SortExec::new(target_ordering, target));
+        let joined = Arc::new(SortMergeJoinExec::try_new(
+            source_input,
+            target,
+            on_keys,
+            None,
+            JoinType::Full,
+            sort_options,
+            null_equality,
+        )?);
+        execute_plan(joined, execution_options)
     }
 
     fn prefix_columns(df: DataFrame, prefix: &str) -> DataFrame {
