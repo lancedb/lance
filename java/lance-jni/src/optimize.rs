@@ -362,8 +362,6 @@ impl IntoJava for &CompactionOptions {
         let batch_size_opt = to_java_optional(env, batch_size)?;
         let defer_index_remap = to_java_boolean_obj(env, Some(self.defer_index_remap))?;
         let defer_index_remap_opt = to_java_optional(env, defer_index_remap)?;
-        // The Java field is Optional<CompactionMode>; type erasure would let a
-        // plain String slip through the constructor, so fetch the enum constant.
         let compaction_mode_obj = match self.compaction_mode {
             Some(mode) => {
                 let name = match mode {
