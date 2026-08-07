@@ -84,17 +84,25 @@ impl BranchLocation {
     }
 
     fn branch_boundary(path: &str) -> Option<usize> {
-        let mut markers = vec![
-            format!("/{}/", BRANCH_DIR),
-            format!("/{}/", BRANCH_GENERATIONS_DIR),
-        ];
-        if cfg!(windows) {
-            markers.extend([
-                format!("\\{}\\", BRANCH_DIR),
-                format!("\\{}\\", BRANCH_GENERATIONS_DIR),
-            ]);
+        let windows_separators = ['/', '\\'];
+        let other_separators = ['/'];
+        let separators = if cfg!(windows) {
+            windows_separators.as_slice()
+        } else {
+            other_separators.as_slice()
+        };
+
+        let mut boundary = None;
+        for directory in [BRANCH_DIR, BRANCH_GENERATIONS_DIR] {
+            for leading_separator in separators {
+                for trailing_separator in separators {
+                    let marker =
+                        format!("{}{}{}", leading_separator, directory, trailing_separator);
+                    boundary = boundary.max(path.rfind(&marker));
+                }
+            }
         }
-        markers.iter().filter_map(|marker| path.rfind(marker)).max()
+        boundary
     }
 
     /// The branch a location under `root` targets: the inverse of
@@ -450,5 +458,29 @@ mod tests {
                 .as_ref()
         );
         assert_eq!(new_branch.branch.as_deref(), Some("feature/nathan/A"));
+
+        let mixed_separator_location = BranchLocation {
+            path: Path::parse("C:\\Users\\Username\\Documents\\dataset\\tree/feature/new").unwrap(),
+            uri: "C:\\Users\\Username\\Documents\\dataset\\tree/feature/new".to_string(),
+            branch: Some("feature/new".to_string()),
+        };
+        assert_eq!(
+            mixed_separator_location.find_main().unwrap().uri,
+            "C:\\Users\\Username\\Documents\\dataset"
+        );
+
+        let mixed_generation_location = BranchLocation {
+            path: Path::parse(
+                "C:\\Users\\Username\\Documents\\dataset\\_branch_generations/generation",
+            )
+            .unwrap(),
+            uri: "C:\\Users\\Username\\Documents\\dataset\\_branch_generations/generation"
+                .to_string(),
+            branch: Some("feature".to_string()),
+        };
+        assert_eq!(
+            mixed_generation_location.find_main().unwrap().uri,
+            "C:\\Users\\Username\\Documents\\dataset"
+        );
     }
 }

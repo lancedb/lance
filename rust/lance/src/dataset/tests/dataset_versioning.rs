@@ -1344,6 +1344,44 @@ async fn test_branch() {
 }
 
 #[tokio::test]
+async fn test_concurrent_tag_create_serializes_with_branch_delete() {
+    let tempdir = TempDir::default();
+    let uri = tempdir.path_str();
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+    dataset.create_branch("race", 1, None).await.unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let tag_dataset = Dataset::open(&uri).await.unwrap();
+    let mut delete_dataset = Dataset::open(&uri).await.unwrap();
+
+    let create_task = tokio::spawn({
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            tag_dataset.tags().create("race-tag", ("race", 1)).await
+        }
+    });
+    let delete_task = tokio::spawn({
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            delete_dataset.delete_branch("race").await
+        }
+    });
+    barrier.wait().await;
+
+    assert!(create_task.await.unwrap().is_ok());
+    assert!(matches!(
+        delete_task.await.unwrap(),
+        Err(Error::RefConflict { .. })
+    ));
+    dataset.checkout_version("race-tag").await.unwrap();
+}
+
+#[tokio::test]
 async fn test_tree_main_dataset_root_is_not_a_branch_alias() {
     let tempdir = TempStdDir::default();
     let source_path = tempdir.join("source");

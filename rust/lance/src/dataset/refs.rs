@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::future::Future;
 use std::ops::Range;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -10,7 +12,7 @@ use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::manifest::read_manifest;
-use object_store::{Error as ObjectStoreError, PutMode, PutOptions, path::Path};
+use object_store::{Error as ObjectStoreError, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -26,6 +28,11 @@ use std::fmt::Formatter;
 use uuid::Uuid;
 
 pub const MAIN_BRANCH: &str = "main";
+
+const REF_MUTATION_LOCK_FILE: &str = "mutation.json";
+const TAG_MUTATION_INTENTS_DIR: &str = "tag_mutations";
+const REF_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const REF_MUTATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Lance Ref
 #[derive(Debug, Clone)]
@@ -119,6 +126,259 @@ impl Refs {
 
     pub fn root(&self) -> Result<BranchLocation> {
         self.base_location.find_main()
+    }
+
+    async fn run_mutation<T>(&self, mutation: impl Future<Output = Result<T>>) -> Result<T> {
+        let mut lease = RefMutationLease::acquire(self).await?;
+        let mutation_result = mutation.await;
+        Self::finish_mutation(&mut lease, mutation_result).await
+    }
+
+    async fn run_tag_mutation<T>(&self, mutation: impl Future<Output = Result<T>>) -> Result<T> {
+        let mut intent = TagMutationIntent::acquire(self).await?;
+        let mutation_result = self.run_mutation(mutation).await;
+        match intent.release().await {
+            Ok(()) => mutation_result,
+            Err(release_error) => match mutation_result {
+                Ok(_) => Err(release_error),
+                Err(mutation_error) => {
+                    log::warn!(
+                        "Failed to release tag mutation intent after mutation error: {}",
+                        release_error
+                    );
+                    Err(mutation_error)
+                }
+            },
+        }
+    }
+
+    async fn run_branch_deletion<T>(&self, mutation: impl Future<Output = Result<T>>) -> Result<T> {
+        // Give already-scheduled tag mutations a chance to publish their durable intent before
+        // deletion takes the exclusive mutation lock. This gives durable references priority
+        // when both operations begin together.
+        tokio::task::yield_now().await;
+        let deadline = tokio::time::Instant::now() + REF_MUTATION_LOCK_TIMEOUT;
+        let mut lease = loop {
+            while self.has_tag_mutation_intents().await? {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::RefConflict {
+                        message: format!(
+                            "a tag mutation did not finish within {} seconds",
+                            REF_MUTATION_LOCK_TIMEOUT.as_secs()
+                        ),
+                    });
+                }
+                tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
+            }
+
+            let mut lease = RefMutationLease::acquire(self).await?;
+            if !self.has_tag_mutation_intents().await? {
+                break lease;
+            }
+            lease.release().await?;
+            tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
+        };
+
+        let mutation_result = mutation.await;
+        Self::finish_mutation(&mut lease, mutation_result).await
+    }
+
+    async fn has_tag_mutation_intents(&self) -> Result<bool> {
+        let path = base_tag_mutation_intents_path(&self.root()?.path);
+        Ok(!self.object_store.read_dir(path).await?.is_empty())
+    }
+
+    async fn finish_mutation<T>(
+        lease: &mut RefMutationLease,
+        mutation_result: Result<T>,
+    ) -> Result<T> {
+        match lease.release().await {
+            Ok(()) => mutation_result,
+            Err(release_error) => match mutation_result {
+                Ok(_) => Err(release_error),
+                Err(mutation_error) => {
+                    log::warn!(
+                        "Failed to release reference mutation lock after mutation error: {}",
+                        release_error
+                    );
+                    Err(mutation_error)
+                }
+            },
+        }
+    }
+}
+
+struct TagMutationIntent {
+    object_store: Arc<ObjectStore>,
+    path: Path,
+    is_held: bool,
+}
+
+impl TagMutationIntent {
+    async fn acquire(refs: &Refs) -> Result<Self> {
+        let path = base_tag_mutation_intents_path(&refs.root()?.path)
+            .join(format!("{}.json", Uuid::new_v4().simple()));
+        refs.object_store
+            .inner
+            .put_opts(
+                &path,
+                Bytes::new().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(Self {
+            object_store: refs.object_store.clone(),
+            path,
+            is_held: true,
+        })
+    }
+
+    async fn release(&mut self) -> Result<()> {
+        if !self.is_held {
+            return Ok(());
+        }
+        self.object_store.delete(&self.path).await?;
+        self.is_held = false;
+        Ok(())
+    }
+}
+
+impl Drop for TagMutationIntent {
+    fn drop(&mut self) {
+        if !self.is_held {
+            return;
+        }
+        self.is_held = false;
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = object_store.delete(&path).await
+                    && !matches!(error, Error::NotFound { .. })
+                {
+                    log::warn!("Failed to release cancelled tag mutation intent: {}", error);
+                }
+            });
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefMutationLockState {
+    owner: String,
+}
+
+impl RefMutationLockState {
+    fn locked(owner: String) -> Self {
+        Self { owner }
+    }
+
+    fn serialize(&self) -> Result<Bytes> {
+        Ok(Bytes::from(serde_json::to_vec(self)?))
+    }
+}
+
+struct RefMutationLease {
+    object_store: Arc<ObjectStore>,
+    path: Path,
+    owner: String,
+    is_held: bool,
+}
+
+impl RefMutationLease {
+    async fn acquire(refs: &Refs) -> Result<Self> {
+        let path = ref_mutation_lock_path(&refs.root()?.path);
+        let owner = Uuid::new_v4().simple().to_string();
+        let locked_payload = RefMutationLockState::locked(owner.clone()).serialize()?;
+        let deadline = tokio::time::Instant::now() + REF_MUTATION_LOCK_TIMEOUT;
+
+        loop {
+            let create_result = refs
+                .object_store
+                .inner
+                .put_opts(
+                    &path,
+                    locked_payload.clone().into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match create_result {
+                Ok(_) => {
+                    return Ok(Self {
+                        object_store: refs.object_store.clone(),
+                        path,
+                        owner,
+                        is_held: true,
+                    });
+                }
+                Err(
+                    ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. },
+                ) => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::RefConflict {
+                    message: format!(
+                        "another reference mutation did not finish within {} seconds",
+                        REF_MUTATION_LOCK_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+            tokio::time::sleep(REF_MUTATION_LOCK_RETRY_DELAY).await;
+        }
+    }
+
+    async fn release_owned(object_store: &ObjectStore, path: &Path, owner: &str) -> Result<()> {
+        let current = match object_store.inner.get(path).await {
+            Ok(current) => current,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let current_state: RefMutationLockState = serde_json::from_slice(&current.bytes().await?)?;
+        if current_state.owner != owner {
+            return Err(Error::RefConflict {
+                message: "reference mutation lock ownership changed before release".to_string(),
+            });
+        }
+        object_store.delete(path).await
+    }
+
+    async fn release(&mut self) -> Result<()> {
+        if !self.is_held {
+            return Ok(());
+        }
+        Self::release_owned(&self.object_store, &self.path, &self.owner).await?;
+        self.is_held = false;
+        Ok(())
+    }
+}
+
+impl Drop for RefMutationLease {
+    fn drop(&mut self) {
+        if !self.is_held {
+            return;
+        }
+        self.is_held = false;
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        let owner = self.owner.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = Self::release_owned(&object_store, &path, &owner).await
+                    && !matches!(error, Error::RefConflict { .. })
+                {
+                    log::warn!("Failed to release cancelled reference mutation: {}", error);
+                }
+            });
+        }
     }
 }
 
@@ -216,70 +476,81 @@ impl Tags<'_> {
 
     pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
+        self.refs
+            .run_tag_mutation(async {
+                let root_location = self.refs.root()?;
+                let tag_file = tag_path(&root_location.path, tag);
 
-        if self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefConflict {
-                message: format!("tag {} already exists", tag),
-            });
-        }
-        let now = utc_now();
-        let tag_contents = self
-            .build_tag_content_by_ref(reference, Some(now), Some(now))
-            .await?;
+                if self.object_store().exists(&tag_file).await? {
+                    return Err(Error::RefConflict {
+                        message: format!("tag {} already exists", tag),
+                    });
+                }
+                let now = utc_now();
+                let tag_contents = self
+                    .build_tag_content_by_ref(reference, Some(now), Some(now))
+                    .await?;
 
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
+                self.object_store()
+                    .put(
+                        &tag_file,
+                        serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+                    )
+                    .await
+                    .map(|_| ())
+            })
             .await
-            .map(|_| ())
     }
 
     pub async fn delete(&self, tag: &str) -> Result<()> {
         check_valid_tag(tag)?;
+        self.refs
+            .run_tag_mutation(async {
+                let root_location = self.refs.root()?;
+                let tag_file = tag_path(&root_location.path, tag);
 
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
+                if !self.object_store().exists(&tag_file).await? {
+                    return Err(Error::RefNotFound {
+                        message: format!("tag {} does not exist", tag),
+                    });
+                }
 
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-
-        self.object_store().delete(&tag_file).await
+                self.object_store().delete(&tag_file).await
+            })
+            .await
     }
 
     pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
+        self.refs
+            .run_tag_mutation(async {
+                let root_location = self.refs.root()?;
+                let tag_file = tag_path(&root_location.path, tag);
+                if !self.object_store().exists(&tag_file).await? {
+                    return Err(Error::RefNotFound {
+                        message: format!("tag {} does not exist", tag),
+                    });
+                }
+                let mut tag_contents =
+                    TagContents::from_path(&tag_file, self.object_store()).await?;
+                let updated_reference = self
+                    .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
+                    .await?;
+                tag_contents.branch = updated_reference.branch;
+                tag_contents.version = updated_reference.version;
+                tag_contents.created_at = updated_reference.created_at;
+                tag_contents.updated_at = updated_reference.updated_at;
+                tag_contents.manifest_size = updated_reference.manifest_size;
 
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        let updated_reference = self
-            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
-            .await?;
-        tag_contents.branch = updated_reference.branch;
-        tag_contents.version = updated_reference.version;
-        tag_contents.created_at = updated_reference.created_at;
-        tag_contents.updated_at = updated_reference.updated_at;
-        tag_contents.manifest_size = updated_reference.manifest_size;
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
+                self.object_store()
+                    .put(
+                        &tag_file,
+                        serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+                    )
+                    .await
+                    .map(|_| ())
+            })
             .await
-            .map(|_| ())
     }
 
     pub async fn replace_metadata(
@@ -288,25 +559,29 @@ impl Tags<'_> {
         metadata: HashMap<String, String>,
     ) -> Result<()> {
         check_valid_tag(tag)?;
+        self.refs
+            .run_tag_mutation(async {
+                let root_location = self.refs.root()?;
+                let tag_file = tag_path(&root_location.path, tag);
+                if !self.object_store().exists(&tag_file).await? {
+                    return Err(Error::RefNotFound {
+                        message: format!("tag {} does not exist", tag),
+                    });
+                }
 
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
+                let mut tag_contents =
+                    TagContents::from_path(&tag_file, self.object_store()).await?;
+                tag_contents.metadata = metadata;
 
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        tag_contents.metadata = metadata;
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
+                self.object_store()
+                    .put(
+                        &tag_file,
+                        serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+                    )
+                    .await
+                    .map(|_| ())
+            })
             .await
-            .map(|_| ())
     }
 
     async fn build_tag_content_by_ref(
@@ -577,35 +852,38 @@ impl Branches<'_> {
         branch_name: &str,
         branch_contents: BranchContents,
     ) -> Result<()> {
-        let root_location = self.refs.root()?;
-        let branch_file = branch_contents_path(&root_location.path, branch_name);
-        if self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefConflict {
-                message: format!("branch {} already exists", branch_name),
-            });
-        }
-
-        let serialized = serde_json::to_vec_pretty(&branch_contents)?;
-        self.object_store()
-            .inner
-            .put_opts(
-                &branch_file,
-                Bytes::from(serialized).into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| match error {
-                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
-                    Error::RefConflict {
+        self.refs
+            .run_mutation(async {
+                let root_location = self.refs.root()?;
+                let branch_file = branch_contents_path(&root_location.path, branch_name);
+                if self.object_store().exists(&branch_file).await? {
+                    return Err(Error::RefConflict {
                         message: format!("branch {} already exists", branch_name),
-                    }
+                    });
                 }
-                error => error.into(),
+
+                let serialized = serde_json::to_vec_pretty(&branch_contents)?;
+                self.object_store()
+                    .inner
+                    .put_opts(
+                        &branch_file,
+                        Bytes::from(serialized).into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| match error {
+                        ObjectStoreError::AlreadyExists { .. }
+                        | ObjectStoreError::Precondition { .. } => Error::RefConflict {
+                            message: format!("branch {} already exists", branch_name),
+                        },
+                        error => error.into(),
+                    })
             })
+            .await
     }
 
     pub async fn replace_metadata(
@@ -614,26 +892,29 @@ impl Branches<'_> {
         metadata: HashMap<String, String>,
     ) -> Result<()> {
         check_valid_branch(branch)?;
+        self.refs
+            .run_mutation(async {
+                let root_location = self.refs.root()?;
+                let branch_file = branch_contents_path(&root_location.path, branch);
+                if !self.object_store().exists(&branch_file).await? {
+                    return Err(Error::RefNotFound {
+                        message: format!("branch {} does not exist", branch),
+                    });
+                }
 
-        let root_location = self.refs.root()?;
-        let branch_file = branch_contents_path(&root_location.path, branch);
-        if !self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("branch {} does not exist", branch),
-            });
-        }
+                let mut branch_contents =
+                    BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
+                branch_contents.metadata = metadata;
 
-        let mut branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
-        branch_contents.metadata = metadata;
-
-        self.object_store()
-            .put(
-                &branch_file,
-                serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
-            )
+                self.object_store()
+                    .put(
+                        &branch_file,
+                        serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
+                    )
+                    .await
+                    .map(|_| ())
+            })
             .await
-            .map(|_| ())
     }
 
     /// Delete a branch
@@ -643,6 +924,12 @@ impl Branches<'_> {
     pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
+        self.refs
+            .run_branch_deletion(self.delete_unlocked(branch, force))
+            .await
+    }
+
+    async fn delete_unlocked(&self, branch: &str, force: bool) -> Result<()> {
         let mut referencing_tags = self
             .refs
             .tags()
@@ -1109,6 +1396,17 @@ pub fn base_tags_path(base_path: &Path) -> Path {
 
 pub fn base_branches_contents_path(base_path: &Path) -> Path {
     base_path.clone().join("_refs").join("branches")
+}
+
+fn ref_mutation_lock_path(base_path: &Path) -> Path {
+    base_path.clone().join("_refs").join(REF_MUTATION_LOCK_FILE)
+}
+
+fn base_tag_mutation_intents_path(base_path: &Path) -> Path {
+    base_path
+        .clone()
+        .join("_refs")
+        .join(TAG_MUTATION_INTENTS_DIR)
 }
 
 pub fn tag_path(base_path: &Path, branch: &str) -> Path {

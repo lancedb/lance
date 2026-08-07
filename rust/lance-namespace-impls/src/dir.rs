@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::check_valid_branch;
+use lance::dataset::refs::{BranchStorageLayout, check_valid_branch};
 use lance::dataset::scanner::Scanner;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
@@ -1613,10 +1613,14 @@ impl DirectoryNamespace {
             })?;
         match main.branches().get(branch).await {
             Ok(contents) => {
-                let branch_location = self
-                    .open_validated_branch(table_uri, branch)
-                    .await?
-                    .branch_location();
+                let branch_location = match contents.storage.as_ref() {
+                    Some(storage) => match storage.layout {
+                        BranchStorageLayout::Detached => main
+                            .branch_location()
+                            .find_branch_generation(branch, &storage.generation)?,
+                    },
+                    None => main.branch_location().find_branch(Some(branch))?,
+                };
                 Self::validate_requested_branch_base(
                     branch,
                     requested_base,
@@ -15105,7 +15109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_referenced_branch_conflict() {
+    async fn test_delete_referenced_detached_branch_preserves_child() {
         let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
 
         // A child forked from `parent` (via from_branch) makes `parent` a referenced branch.
@@ -15150,27 +15154,34 @@ mod tests {
             child.parent_version
         );
 
-        // Deleting a branch that still has dependents is refused. The delete spec has no 409,
-        // so it surfaces as a documented InvalidInput (400), not a conflict status.
-        let err = namespace
+        let table_uri = namespace
+            .resolve_table_location(&Some(table_id.clone()))
+            .await
+            .unwrap();
+        namespace
             .delete_table_branch(DeleteTableBranchRequest {
-                id: Some(table_id),
+                id: Some(table_id.clone()),
                 name: "parent".to_string(),
                 ..Default::default()
             })
             .await
-            .unwrap_err();
-        assert_eq!(
-            namespace_code(&err),
-            Some(ErrorCode::InvalidInput),
-            "expected InvalidInput for deleting a referenced branch, got: {}",
-            err
-        );
-        assert!(
-            err.to_string().to_lowercase().contains("referenced"),
-            "error should explain the branch is still referenced, got: {}",
-            err
-        );
+            .unwrap();
+
+        let listed = namespace
+            .list_table_branches(ListTableBranchesRequest {
+                id: Some(table_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!listed.branches.contains_key("parent"));
+        assert!(listed.branches.contains_key("child"));
+
+        let child = namespace
+            .open_validated_branch(&table_uri, "child")
+            .await
+            .unwrap();
+        assert_eq!(child.count_rows(None).await.unwrap(), 5);
     }
 
     #[tokio::test]
@@ -15246,8 +15257,8 @@ mod tests {
     async fn test_create_branch_nonexistent_from_version() {
         let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
 
-        // Version 999 does not exist (the table has 2 versions). create_branch's clone phase
-        // raises DatasetNotFound, which we map to a documented InvalidInput (400).
+        // Version 999 does not exist (the table has 2 versions), so the namespace returns its
+        // specific version-not-found code.
         let err = namespace
             .create_table_branch(CreateTableBranchRequest {
                 id: Some(table_id),
@@ -15259,12 +15270,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             namespace_code(&err),
-            Some(ErrorCode::InvalidInput),
-            "non-existent from_version should map to InvalidInput, got: {}",
+            Some(ErrorCode::TableVersionNotFound),
+            "non-existent from_version should map to TableVersionNotFound, got: {}",
             err
         );
         assert!(
-            err.to_string().to_lowercase().contains("does not exist"),
+            err.to_string().to_lowercase().contains("not found"),
             "error should name the missing source, got: {}",
             err
         );
