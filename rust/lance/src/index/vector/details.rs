@@ -32,7 +32,9 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 
-use super::{CUVS_LIBRARY_RUNTIME_HINT, StageParams, VectorIndexParams};
+use super::{
+    CUVS_LIBRARY_RUNTIME_HINT, CUVS_REQUIRED_RUNTIME_HINT, StageParams, VectorIndexParams,
+};
 use crate::dataset::Dataset;
 use crate::index::open_index_proto;
 use crate::{Error, Result};
@@ -96,6 +98,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
     let mut compression = None;
     let mut runtime_hints: HashMap<String, String> = params.runtime_hints.clone();
     runtime_hints.remove(CUVS_LIBRARY_RUNTIME_HINT);
+    runtime_hints.remove(CUVS_REQUIRED_RUNTIME_HINT);
 
     for stage in &params.stages {
         match stage {
@@ -1137,6 +1140,9 @@ mod tests {
             CUVS_LIBRARY_RUNTIME_HINT.to_string(),
             "/opt/libcuvs_c.so".to_string(),
         );
+        params
+            .runtime_hints
+            .insert(CUVS_REQUIRED_RUNTIME_HINT.to_string(), "true".to_string());
 
         let any = vector_index_details(&params);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
@@ -1204,6 +1210,11 @@ mod tests {
             !details
                 .runtime_hints
                 .contains_key(CUVS_LIBRARY_RUNTIME_HINT)
+        );
+        assert!(
+            !details
+                .runtime_hints
+                .contains_key(CUVS_REQUIRED_RUNTIME_HINT)
         );
 
         // Roundtrip: apply hints back to a fresh params struct

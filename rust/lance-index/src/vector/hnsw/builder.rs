@@ -1525,13 +1525,27 @@ impl IvfSubIndex for HNSW {
     {
         match accelerator {
             SubIndexBuildAccelerator::Cagra(accelerator) => {
-                if accelerator.is_disabled()
-                    || !super::cagra::supports_partition(storage.len(), &params)
-                {
+                if accelerator.is_disabled() {
+                    debug_assert!(
+                        !accelerator.is_required(),
+                        "required CAGRA acceleration cannot be disabled"
+                    );
+                    return Self::index_vectors(storage, params);
+                }
+                if !super::cagra::supports_partition(storage.len(), &params) {
+                    if accelerator.is_required() {
+                        return Err(Error::not_supported(format!(
+                            "CAGRA was required, but partition with {} rows is too small for HNSW parameters m={} and ef_construction={}",
+                            storage.len(),
+                            params.m,
+                            params.ef_construction
+                        )));
+                    }
                     return Self::index_vectors(storage, params);
                 }
                 match super::cagra::build(storage, params.clone(), accelerator.library_path()) {
                     Ok(index) => Ok(index),
+                    Err(error) if accelerator.is_required() => Err(error),
                     Err(error) => {
                         if accelerator.disable() {
                             log::warn!(
@@ -2259,6 +2273,39 @@ mod tests {
         assert_eq!(hnsw.len(), 8);
         let SubIndexBuildAccelerator::Cagra(accelerator) = accelerator;
         assert!(accelerator.is_disabled());
+    }
+
+    #[test]
+    fn test_cagra_missing_library_errors_when_required() {
+        let storage = make_sq_storage(8);
+        let accelerator = SubIndexBuildAccelerator::cagra_required("/missing/libcuvs_c.so");
+
+        let error = HNSW::index_vectors_with_accelerator(
+            &storage,
+            HnswBuildParams::default().num_edges(4).ef_construction(10),
+            &accelerator,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::IO { .. }));
+        let SubIndexBuildAccelerator::Cagra(accelerator) = accelerator;
+        assert!(!accelerator.is_disabled());
+    }
+
+    #[test]
+    fn test_cagra_small_partition_errors_when_required() {
+        let storage = make_sq_storage(4);
+        let accelerator = SubIndexBuildAccelerator::cagra_required("/missing/libcuvs_c.so");
+
+        let error = HNSW::index_vectors_with_accelerator(
+            &storage,
+            HnswBuildParams::default().num_edges(4).ef_construction(10),
+            &accelerator,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("partition with 4 rows"));
     }
 
     #[test]

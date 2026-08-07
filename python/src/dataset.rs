@@ -5162,6 +5162,13 @@ fn prepare_vector_index_params(
                 .runtime_hints
                 .insert("lancedb.cuvs_library".to_string(), library_path.extract()?);
         }
+        if let Some(required) = kwargs.get_item("_require_cagra")?
+            && required.extract::<bool>()?
+        {
+            params
+                .runtime_hints
+                .insert("lancedb.cuvs_required".to_string(), "true".to_string());
+        }
     }
     Ok(params)
 }

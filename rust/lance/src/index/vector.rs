@@ -77,6 +77,9 @@ pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
 /// details are persisted.
 pub(crate) const CUVS_LIBRARY_RUNTIME_HINT: &str = "lancedb.cuvs_library";
 
+/// Transient test mode requiring each HNSW partition build to use CAGRA or fail.
+pub(crate) const CUVS_REQUIRED_RUNTIME_HINT: &str = "lancedb.cuvs_required";
+
 /// A materialized snapshot of one logical vector index and all of its segments.
 #[derive(Debug)]
 pub struct LogicalVectorIndex {
@@ -514,7 +517,16 @@ fn cagra_accelerator(params: &VectorIndexParams) -> Option<SubIndexBuildAccelera
     params
         .runtime_hints
         .get(CUVS_LIBRARY_RUNTIME_HINT)
-        .map(|library_path| SubIndexBuildAccelerator::cagra(library_path.clone()))
+        .map(|library_path| {
+            if params
+                .runtime_hints
+                .contains_key(CUVS_REQUIRED_RUNTIME_HINT)
+            {
+                SubIndexBuildAccelerator::cagra_required(library_path.clone())
+            } else {
+                SubIndexBuildAccelerator::cagra(library_path.clone())
+            }
+        })
 }
 
 /// Prepare the shared build inputs used by both direct local builds and

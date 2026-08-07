@@ -784,9 +784,26 @@ def test_create_index_cagra_accelerator_dispatch(tmp_path, caplog, monkeypatch):
     )
 
 
+def test_create_index_cagra_required_disables_fallback(tmp_path, monkeypatch):
+    dataset_module = importlib.import_module("lance.dataset")
+    monkeypatch.setattr(
+        dataset_module, "_locate_cuvs_library", lambda: "/missing/libcuvs_c.so"
+    )
+    dataset = lance.write_dataset(create_table(), tmp_path)
+
+    with pytest.raises(OSError, match="failed to load cuVS library"):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_HNSW_SQ",
+            num_partitions=1,
+            accelerator="cuda",
+            _require_cagra=True,
+        )
+
+
 @pytest.mark.cuda
 @pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
-def test_create_index_cagra_accelerated_recall(tmp_path, caplog, metric):
+def test_create_index_cagra_accelerated_recall(tmp_path, metric):
     dataset_module = importlib.import_module("lance.dataset")
     if dataset_module._locate_cuvs_library() is None:
         pytest.skip(
@@ -804,17 +821,13 @@ def test_create_index_cagra_accelerated_recall(tmp_path, caplog, metric):
     nearest = {"column": "vector", "q": query, "k": 10, "metric": metric}
     ground_truth = dataset.to_table(columns=["id"], nearest=nearest)["id"].to_numpy()
 
-    with caplog.at_level(logging.WARNING):
-        indexed = dataset.create_index(
-            "vector",
-            index_type="IVF_HNSW_SQ",
-            metric=metric,
-            num_partitions=1,
-            accelerator="cuda",
-        )
-    assert not any(
-        "CAGRA HNSW build failed; falling back to CPU" in record.message
-        for record in caplog.records
+    indexed = dataset.create_index(
+        "vector",
+        index_type="IVF_HNSW_SQ",
+        metric=metric,
+        num_partitions=1,
+        accelerator="cuda",
+        _require_cagra=True,
     )
 
     result = indexed.to_table(columns=["id"], nearest=nearest)["id"].to_numpy()

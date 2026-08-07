@@ -35,6 +35,16 @@ impl SubIndexBuildAccelerator {
         Self::Cagra(CagraBuildAccelerator {
             library_path: library_path.into(),
             is_disabled: Arc::new(AtomicBool::new(false)),
+            is_required: false,
+        })
+    }
+
+    /// Create a cuVS CAGRA accelerator that does not fall back to CPU.
+    pub fn cagra_required(library_path: impl Into<String>) -> Self {
+        Self::Cagra(CagraBuildAccelerator {
+            library_path: library_path.into(),
+            is_disabled: Arc::new(AtomicBool::new(false)),
+            is_required: true,
         })
     }
 }
@@ -47,6 +57,7 @@ impl SubIndexBuildAccelerator {
 pub struct CagraBuildAccelerator {
     library_path: String,
     is_disabled: Arc<AtomicBool>,
+    is_required: bool,
 }
 
 impl CagraBuildAccelerator {
@@ -56,6 +67,10 @@ impl CagraBuildAccelerator {
 
     pub(crate) fn is_disabled(&self) -> bool {
         self.is_disabled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_required(&self) -> bool {
+        self.is_required
     }
 
     /// Disable the accelerator and return whether this call changed its state.

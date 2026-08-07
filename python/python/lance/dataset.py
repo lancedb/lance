@@ -3815,6 +3815,19 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Only {valid_index_types} index types supported. Got {index_type}"
             )
 
+        require_cagra = kwargs.pop("_require_cagra", False)
+        if not isinstance(require_cagra, bool):
+            raise TypeError(f"_require_cagra must be bool, got {type(require_cagra)}")
+        if require_cagra and (
+            index_type != "IVF_HNSW_SQ"
+            or accelerator is None
+            or str(accelerator).lower() != "cuda"
+        ):
+            raise ValueError(
+                "_require_cagra requires index_type='IVF_HNSW_SQ' "
+                "and accelerator='cuda'"
+            )
+
         # Handle timing for various parts of accelerated builds
         timers = {}
         cagra_library = None
@@ -3827,12 +3840,19 @@ class LanceDataset(pa.dataset.Dataset):
             else:
                 cagra_library = _locate_cuvs_library()
                 if cagra_library is None:
+                    if require_cagra:
+                        raise RuntimeError(
+                            "CAGRA was required, but a compatible cuVS library "
+                            "was not found"
+                        )
                     LOGGER.warning(
                         "A compatible cuVS CAGRA library was not found; falling back "
                         "to CPU for IVF_HNSW_SQ"
                     )
                 else:
                     kwargs["cuvs_library"] = cagra_library
+                    if require_cagra:
+                        kwargs["_require_cagra"] = True
             # CAGRA accelerates only the per-partition HNSW graph build. The
             # one-pass Torch path below applies exclusively to IVF_PQ.
             accelerator = None
