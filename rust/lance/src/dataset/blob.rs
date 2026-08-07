@@ -4452,25 +4452,42 @@ mod tests {
 
         // Row indices
         assert_eq!(indices, [2, 12, 22, 32, 42, 52, 62, 72, 82]);
-        let blobs = fixture
-            .dataset
-            .take_blobs_by_indices(&indices, "blobs")
-            .await
-            .unwrap();
-
         // Row IDs
         let row_ids = fragments
             .iter()
+            .take(indices.len())
             .map(|frag| (frag.id << 32) + 2)
             .collect::<Vec<_>>();
-        let blobs2 = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
 
-        for (blob1, blob2) in blobs.iter().zip(blobs2.iter()) {
-            let blob1 = blob1.as_ref().unwrap();
-            let blob2 = blob2.as_ref().unwrap();
-            assert_eq!(blob1.position(), blob2.position());
-            assert_eq!(blob1.size(), blob2.size());
-            assert_eq!(blob1.data_path(), blob2.data_path());
+        // Reverse the cross-fragment selection to exercise take's remapping path,
+        // where `_rowaddr` is already present before the final projection.
+        for is_reversed in [false, true] {
+            let mut requested_indices = indices.clone();
+            let mut requested_row_ids = row_ids.clone();
+            if is_reversed {
+                requested_indices.reverse();
+                requested_row_ids.reverse();
+            }
+
+            let blobs = fixture
+                .dataset
+                .take_blobs_by_indices(&requested_indices, "blobs")
+                .await
+                .unwrap();
+            let blobs_by_id = fixture
+                .dataset
+                .take_blobs(&requested_row_ids, "blobs")
+                .await
+                .unwrap();
+
+            assert_eq!(blobs.len(), blobs_by_id.len());
+            for (blob, blob_by_id) in blobs.iter().zip(blobs_by_id.iter()) {
+                let blob = blob.as_ref().unwrap();
+                let blob_by_id = blob_by_id.as_ref().unwrap();
+                assert_eq!(blob.position(), blob_by_id.position());
+                assert_eq!(blob.size(), blob_by_id.size());
+                assert_eq!(blob.data_path(), blob_by_id.data_path());
+            }
         }
     }
 
