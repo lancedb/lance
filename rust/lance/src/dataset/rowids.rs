@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod validate;
+
 use super::Dataset;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
@@ -12,6 +14,8 @@ use lance_table::{
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
 use std::sync::Arc;
+
+pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -902,7 +906,7 @@ mod test {
         build_rowid_to_i_map(row_ids, i)
     }
 
-    async fn compact(dataset: &mut Dataset, target_rows: usize) {
+    pub(super) async fn compact(dataset: &mut Dataset, target_rows: usize) {
         let options = CompactionOptions {
             target_rows_per_fragment: target_rows,
             ..Default::default()
@@ -910,7 +914,7 @@ mod test {
         let _ = compact_files(dataset, options, None).await.unwrap();
     }
 
-    async fn delete(dataset: &mut Dataset, expr: &str) {
+    pub(super) async fn delete(dataset: &mut Dataset, expr: &str) {
         dataset.delete(expr).await.unwrap();
     }
 
