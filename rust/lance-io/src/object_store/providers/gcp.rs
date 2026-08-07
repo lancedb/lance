@@ -3,9 +3,14 @@
 
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
-use object_store::ObjectStore as OSObjectStore;
+use object_store::{CredentialProvider, ObjectStore as OSObjectStore, Result as ObjectStoreResult};
 use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Gcs};
+use reqsign_core::{Context as ReqsignContext, OsEnv, ProvideCredential};
+use reqsign_file_read_tokio::TokioFileRead;
+use reqsign_google::{Credential as ReqsignCredential, FileCredentialProvider};
+use reqsign_http_send_reqwest::ReqwestHttpSend;
+use tokio::sync::RwLock;
 
 use object_store::{
     RetryConfig, StaticCredentialProvider,
@@ -23,6 +28,114 @@ use lance_core::error::{Error, Result};
 
 #[derive(Default, Debug)]
 pub struct GcsStoreProvider;
+
+#[derive(Debug)]
+struct WorkloadIdentityCredentialProvider {
+    provider: FileCredentialProvider,
+    context: ReqsignContext,
+    cached_credential: RwLock<Option<ReqsignCredential>>,
+}
+
+impl WorkloadIdentityCredentialProvider {
+    fn new(application_credentials_path: String) -> Self {
+        let context = ReqsignContext::new()
+            .with_file_read(TokioFileRead)
+            .with_http_send(ReqwestHttpSend::new(reqwest::Client::new()))
+            .with_env(OsEnv);
+        Self {
+            provider: FileCredentialProvider::new(application_credentials_path),
+            context,
+            cached_credential: RwLock::new(None),
+        }
+    }
+}
+
+fn usable_gcp_credential(credential: &ReqsignCredential) -> Option<GcpCredential> {
+    credential
+        .token
+        .as_ref()
+        .filter(|_| credential.has_valid_token())
+        .map(|token| GcpCredential {
+            bearer: token.access_token.clone(),
+        })
+}
+
+fn workload_identity_error(
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "GCS workload identity credentials",
+        source: Box::new(source),
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialProvider for WorkloadIdentityCredentialProvider {
+    type Credential = GcpCredential;
+
+    async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
+        if let Some(credential) = self
+            .cached_credential
+            .read()
+            .await
+            .as_ref()
+            .and_then(usable_gcp_credential)
+        {
+            return Ok(Arc::new(credential));
+        }
+
+        let mut cached_credential = self.cached_credential.write().await;
+        if let Some(credential) = cached_credential.as_ref().and_then(usable_gcp_credential) {
+            return Ok(Arc::new(credential));
+        }
+
+        let credential = self
+            .provider
+            .provide_credential(&self.context)
+            .await
+            .map_err(workload_identity_error)?
+            .ok_or_else(|| {
+                workload_identity_error(std::io::Error::other(
+                    "application credentials did not provide a Google access token",
+                ))
+            })?;
+        let gcp_credential = usable_gcp_credential(&credential).ok_or_else(|| {
+            workload_identity_error(std::io::Error::other(
+                "application credentials provided an expired or unusable Google access token",
+            ))
+        })?;
+        *cached_credential = Some(credential);
+        Ok(Arc::new(gcp_credential))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApplicationCredentialKind {
+    #[serde(rename = "type")]
+    credential_type: String,
+}
+
+fn workload_identity_credential_provider(
+    storage_options: &StorageOptions,
+) -> Option<Arc<dyn CredentialProvider<Credential = GcpCredential>>> {
+    let gcs_options = storage_options.as_gcs_options();
+    if gcs_options.contains_key(&GoogleConfigKey::ServiceAccount)
+        || gcs_options.contains_key(&GoogleConfigKey::ServiceAccountKey)
+    {
+        return None;
+    }
+
+    let application_credentials_path = gcs_options.get(&GoogleConfigKey::ApplicationCredentials)?;
+    let contents = std::fs::read(application_credentials_path).ok()?;
+    let credential_kind = serde_json::from_slice::<ApplicationCredentialKind>(&contents).ok()?;
+    if credential_kind.credential_type != "external_account" {
+        return None;
+    }
+
+    Some(Arc::new(WorkloadIdentityCredentialProvider::new(
+        application_credentials_path.clone(),
+    )))
+}
 
 impl GcsStoreProvider {
     async fn build_opendal_gcs_store(
@@ -86,6 +199,12 @@ impl GcsStoreProvider {
                 bearer: storage_token.clone(),
             };
             let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
+            builder = builder.with_credentials(credential_provider);
+        } else if let Some(credential_provider) =
+            workload_identity_credential_provider(storage_options)
+        {
+            // object_store cannot exchange external-account ADC files, while reqsign supports
+            // the workload identity format emitted by google-github-actions/auth.
             builder = builder.with_credentials(credential_provider);
         }
 
@@ -198,11 +317,14 @@ impl StorageOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{collections::HashMap, fs, sync::Arc};
 
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
-    use std::collections::HashMap;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     #[test]
     fn test_gcs_store_path() {
@@ -258,5 +380,68 @@ mod tests {
             .expect("expected gcp credential");
 
         assert_eq!(credentials.bearer, "gcp-token");
+    }
+
+    #[tokio::test]
+    async fn test_external_account_application_credentials() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "federated-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let subject_token_path = temp_dir.path().join("oidc-token");
+        fs::write(&subject_token_path, "github-oidc-token").unwrap();
+        let application_credentials_path = temp_dir.path().join("credentials.json");
+        fs::write(
+            &application_credentials_path,
+            serde_json::to_vec(&serde_json::json!({
+                "type": "external_account",
+                "audience": "test-audience",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": format!("{}/token", mock_server.uri()),
+                "credential_source": {
+                    "file": subject_token_path.to_string_lossy(),
+                    "format": { "type": "text" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let storage_options = HashMap::from([(
+            "google_application_credentials".to_string(),
+            application_credentials_path.to_string_lossy().into_owned(),
+        )]);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                storage_options.clone(),
+            ))),
+            ..Default::default()
+        };
+
+        let store = GcsStoreProvider
+            .new_store(Url::parse("gs://test-bucket/path").unwrap(), &params)
+            .await
+            .expect("external account credentials should build a GCS store");
+        assert_eq!(store.scheme, "gs");
+
+        let credential_provider =
+            workload_identity_credential_provider(&StorageOptions::new(storage_options))
+                .expect("external account credentials should select the reqsign provider");
+        for _ in 0..2 {
+            let credential = credential_provider
+                .get_credential()
+                .await
+                .expect("workload identity token exchange should succeed");
+            assert_eq!(credential.bearer, "federated-token");
+        }
+        mock_server.verify().await;
     }
 }

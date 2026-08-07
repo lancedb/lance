@@ -36,12 +36,18 @@ moka.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+reqsign-core = { version = "3.2.0", optional = true }
+reqsign-file-read-tokio = { version = "3.0.3", optional = true }
+reqsign-google = { version = "3.0.3", optional = true }
+reqsign-http-send-reqwest = { version = "4.0.3", optional = true }
+reqwest = { version = "0.13.1", default-features = false, features = ["rustls"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
@@ -56,6 +62,7 @@ mock_instant.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-mock = { workspace = true }
 metrics-util = { workspace = true }
+wiremock.workspace = true
 
 [[bench]]
 name = "scheduler"
@@ -66,7 +73,18 @@ default = ["aws", "azure", "gcp"]
 metrics = ["dep:metrics"]
 gcs-test = []
 goosefs-test = []
-gcp = ["object_store/gcp", "dep:opendal", "opendal/services-gcs", "dep:object_store_opendal"]
+gcp = [
+    "object_store/gcp",
+    "dep:opendal",
+    "opendal/services-gcs",
+    "dep:object_store_opendal",
+    "dep:reqsign-core",
+    "dep:reqsign-file-read-tokio",
+    "dep:reqsign-google",
+    "dep:reqsign-http-send-reqwest",
+    "dep:reqwest",
+    "dep:serde_json",
+]
 aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal"]
 azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "opendal/services-azdls", "dep:object_store_opendal"]
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
