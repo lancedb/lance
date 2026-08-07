@@ -65,7 +65,7 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::time::{MissedTickBehavior, interval};
@@ -475,6 +475,11 @@ impl<'a> CleanupTask<'a> {
             .collect();
 
         let version_lease_store = VersionLeaseStore::for_dataset(self.dataset).await?;
+        let forced_retirement_versions = if self.action.deletes_files() {
+            version_lease_store.clone().recover_retirements().await?
+        } else {
+            HashSet::new()
+        };
         // Execute establishes storage-clock retirement fences before deciding
         // which leases are active. Explain remains read-only and conservatively
         // treats every published lease as active.
@@ -485,7 +490,11 @@ impl<'a> CleanupTask<'a> {
         };
 
         let mut inspection = self
-            .process_manifests(&tagged_versions, &leased_versions)
+            .process_manifests(
+                &tagged_versions,
+                &leased_versions,
+                &forced_retirement_versions,
+            )
             .await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
@@ -502,12 +511,21 @@ impl<'a> CleanupTask<'a> {
                 .cloned()
                 .collect();
             inspection = self
-                .retain_branch_lineage_files(inspection, &referenced_branches, &ignored_manifests)
+                .retain_branch_lineage_files(
+                    inspection,
+                    &referenced_branches,
+                    &ignored_manifests,
+                    &forced_retirement_versions,
+                )
                 .await?
         };
 
         let (inspection, mut retirement) = self
-            .fence_old_versions_and_retain_new_leases(inspection, &version_lease_store)
+            .fence_old_versions_and_retain_new_leases(
+                inspection,
+                &version_lease_store,
+                &forced_retirement_versions,
+            )
             .await?;
 
         let cleanup_result = self.delete_unreferenced_files(inspection).await?;
@@ -526,6 +544,7 @@ impl<'a> CleanupTask<'a> {
         &'a self,
         tagged_versions: &HashSet<u64>,
         leased_versions: &HashSet<u64>,
+        forced_retirement_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
@@ -533,7 +552,13 @@ impl<'a> CleanupTask<'a> {
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions, leased_versions)
+                self.process_manifest_file(
+                    location,
+                    &inspection,
+                    tagged_versions,
+                    leased_versions,
+                    forced_retirement_versions,
+                )
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -545,6 +570,7 @@ impl<'a> CleanupTask<'a> {
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
         leased_versions: &HashSet<u64>,
+        forced_retirement_versions: &HashSet<u64>,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
@@ -581,13 +607,14 @@ impl<'a> CleanupTask<'a> {
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let is_leased = leased_versions.contains(&manifest.version);
-        let in_working_set =
-            is_latest || !self.policy.should_clean(&manifest) || is_tagged || is_leased;
+        let is_forced_retirement = forced_retirement_versions.contains(&manifest.version);
+        let in_working_set = !is_forced_retirement
+            && (is_latest || !self.policy.should_clean(&manifest) || is_tagged || is_leased);
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
-        if is_tagged && !is_latest && self.policy.should_clean(&manifest) {
+        if is_tagged && !is_forced_retirement && !is_latest && self.policy.should_clean(&manifest) {
             inspection.tagged_old_versions.insert(manifest.version);
         }
 
@@ -606,14 +633,25 @@ impl<'a> CleanupTask<'a> {
         &self,
         mut inspection: CleanupInspection,
         version_lease_store: &VersionLeaseStore,
+        forced_retirement_versions: &HashSet<u64>,
     ) -> Result<(CleanupInspection, Option<CleanupRetirement>)> {
         if !self.action.deletes_files() {
             return Ok((inspection, None));
         }
 
-        let versions_to_delete: HashSet<u64> = inspection.old_manifests.values().copied().collect();
+        let mut manifest_paths_to_delete = HashMap::<u64, Vec<Path>>::new();
+        for (path, version) in &inspection.old_manifests {
+            manifest_paths_to_delete
+                .entry(*version)
+                .or_default()
+                .push(path.clone());
+        }
+        let versions_to_delete = manifest_paths_to_delete
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
         let mut guard = version_lease_store
-            .fence_versions(&versions_to_delete)
+            .fence_versions(&manifest_paths_to_delete)
             .await?;
 
         let result = async {
@@ -625,6 +663,7 @@ impl<'a> CleanupTask<'a> {
                 .await?;
             let retained_versions: HashSet<_> = versions_to_delete
                 .intersection(&leased_versions)
+                .filter(|version| !forced_retirement_versions.contains(version))
                 .copied()
                 .collect();
             for version in &retained_versions {
@@ -644,6 +683,7 @@ impl<'a> CleanupTask<'a> {
                 .await?;
             let retained_versions: HashSet<_> = versions_to_seal
                 .intersection(&leased_versions)
+                .filter(|version| !forced_retirement_versions.contains(version))
                 .copied()
                 .collect();
             for version in &retained_versions {
@@ -1304,28 +1344,42 @@ impl<'a> CleanupTask<'a> {
         inspection: CleanupInspection,
         referenced_branches: &[(String, u64)],
         removed_branch_manifests: &HashSet<Path>,
+        forced_retirement_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
-        let inspection = Mutex::new(inspection);
-        for (branch, root_version_number) in referenced_branches {
+        let inspection = Arc::new(Mutex::new(inspection));
+        let removed_branch_manifests = Arc::new(removed_branch_manifests.clone());
+        let forced_retirement_versions = Arc::new(forced_retirement_versions.clone());
+        for (branch, referenced_version) in referenced_branches.iter().cloned() {
             // Use find_branch to get the branch path directly without checkout.
             // This avoids creating a dataset instance and prevents manifest deletion
             // during the retain operation.
-            let branch_location = self.dataset.branch_location().find_branch(Some(branch))?;
+            let branch_location = self.dataset.branch_location().find_branch(Some(&branch))?;
+            let removed_branch_manifests = Arc::clone(&removed_branch_manifests);
+            let forced_retirement_versions = Arc::clone(&forced_retirement_versions);
+            let branch_inspection = Arc::clone(&inspection);
             self.dataset
                 .commit_handler
                 .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
-                .try_filter(|location| {
+                .try_filter(move |location| {
                     future::ready(!removed_branch_manifests.contains(&location.path))
                 })
                 .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                    self.process_branch_referenced_manifests(
-                        location,
-                        *root_version_number,
-                        &inspection,
-                    )
+                    let forced_retirement_versions = Arc::clone(&forced_retirement_versions);
+                    let branch_inspection = Arc::clone(&branch_inspection);
+                    async move {
+                        self.process_branch_referenced_manifests(
+                            location,
+                            referenced_version,
+                            branch_inspection.as_ref(),
+                            forced_retirement_versions.as_ref(),
+                        )
+                        .await
+                    }
                 })
                 .await?;
         }
+        let inspection = Arc::try_unwrap(inspection)
+            .map_err(|_| Error::internal("branch retention inspection still has active owners"))?;
         Ok(inspection.into_inner().unwrap())
     }
 
@@ -1334,6 +1388,7 @@ impl<'a> CleanupTask<'a> {
         location: ManifestLocation,
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
+        forced_retirement_versions: &HashSet<u64>,
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
@@ -1403,7 +1458,7 @@ impl<'a> CleanupTask<'a> {
                 }
             }
         }
-        if is_referenced {
+        if is_referenced && !forced_retirement_versions.contains(&referenced_version) {
             inspection
                 .old_manifests
                 .retain(|_path, version_number| *version_number != referenced_version);
@@ -2286,6 +2341,7 @@ mod tests {
                 &Mutex::new(CleanupInspection::default()),
                 &HashSet::new(),
                 &HashSet::new(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -2360,7 +2416,7 @@ mod tests {
             .acquire_version_lease(Duration::from_millis(10))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         fixture.overwrite_some_data().await.unwrap();
         MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
@@ -2374,6 +2430,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("no longer exists"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cleanup_resumes_sealed_retirement() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let historical = fixture.load().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+
+        let version_lease_store = VersionLeaseStore::for_dataset(&historical).await.unwrap();
+        let manifest_paths = HashMap::from([(
+            historical.version().version,
+            vec![historical.manifest_location.path.clone()],
+        )]);
+        let mut guard = version_lease_store
+            .fence_versions(&manifest_paths)
+            .await
+            .unwrap();
+        guard
+            .seal_versions(&HashSet::from([historical.version().version]))
+            .await
+            .unwrap();
+        drop(guard);
+
+        // This policy would normally retain version 1. The durable sealed state
+        // must resume the already-started retirement instead.
+        let removed = fixture
+            .run_cleanup_with_policy(CleanupPolicy {
+                before_version: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 1);
+        assert!(
+            !historical
+                .object_store
+                .exists(&manifest_paths[&1][0])
+                .await
+                .unwrap()
+        );
+        let marker_prefix = historical
+            .refs
+            .root()
+            .unwrap()
+            .path
+            .join("_refs/version_lease_gc/main/1");
+        assert!(
+            historical
+                .object_store
+                .list(Some(marker_prefix))
+                .try_next()
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3053,12 +3165,17 @@ mod tests {
             CleanupAction::Execute,
         );
         let inspection = task
-            .process_manifests(&HashSet::new(), &HashSet::new())
+            .process_manifests(&HashSet::new(), &HashSet::new(), &HashSet::new())
             .await
             .unwrap();
         let referenced_branches = task.find_referenced_branches().await.unwrap();
         let inspection = task
-            .retain_branch_lineage_files(inspection, &referenced_branches, &HashSet::new())
+            .retain_branch_lineage_files(
+                inspection,
+                &referenced_branches,
+                &HashSet::new(),
+                &HashSet::new(),
+            )
             .await
             .unwrap();
 
@@ -3120,7 +3237,7 @@ mod tests {
             CleanupAction::Execute,
         );
         let inspection = task
-            .process_manifests(&HashSet::new(), &HashSet::new())
+            .process_manifests(&HashSet::new(), &HashSet::new(), &HashSet::new())
             .await
             .unwrap();
         let kept: HashSet<&Path> = inspection

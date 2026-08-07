@@ -5,15 +5,17 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
+use dashmap::DashSet;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_io::object_store::ObjectStore;
 use object_store::{ObjectMeta, ObjectStoreExt, PutMode, PutOptions, path::Path};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{Dataset, refs::MAIN_BRANCH};
@@ -24,6 +26,21 @@ const LEASE_GC_MARKERS_DIR: &str = "_refs/version_lease_gc";
 const LEASE_FILE_SUFFIX: &str = ".lease";
 const DRAINING_MARKER_SUFFIX: &str = ".draining";
 const SEALED_MARKER_SUFFIX: &str = ".sealed";
+const STORAGE_CLOCK_PATH: &str = "_clock";
+
+/// HTTP `Last-Modified`, used by supported cloud stores, has whole-second precision.
+/// Adding one interval guarantees a lease is never shortened by timestamp truncation.
+const STORAGE_TIMESTAMP_PRECISION: Duration = Duration::from_secs(1);
+
+/// Draining does no deletion and must complete within this ownership window.
+/// A cleaner that exceeds the window fails before sealing; another actor may then
+/// ignore and remove the abandoned drain without racing a live deletion.
+const DRAINING_OWNERSHIP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Drains whose in-process owner was dropped before sealing. The operation UUID
+/// makes each path unique across stores, while process-wide scope lets a fresh
+/// dataset handle immediately disregard a drain that can no longer delete.
+static LOCALLY_ABANDONED_DRAINS: LazyLock<DashSet<Path>> = LazyLock::new(DashSet::new);
 
 /// A renewable advisory lease that protects one dataset version from cleanup.
 ///
@@ -140,6 +157,20 @@ struct RetirementFence {
     draining_path: Option<Path>,
     sealed_path: Option<Path>,
     observed_at: DateTime<Utc>,
+    manifest_paths: Vec<Path>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RetirementMarker {
+    manifest_paths: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RetirementMarkerMetadata {
+    version: u64,
+    operation_id: String,
+    is_sealed: bool,
+    metadata: ObjectMeta,
 }
 
 /// Per-cleanup retirement markers for versions selected for deletion.
@@ -277,16 +308,24 @@ impl VersionLeaseStore {
         Ok(active_versions)
     }
 
-    pub(super) async fn fence_versions(&self, versions: &HashSet<u64>) -> Result<RetirementGuard> {
+    pub(super) async fn fence_versions(
+        &self,
+        manifest_paths: &HashMap<u64, Vec<Path>>,
+    ) -> Result<RetirementGuard> {
         let operation_id = Uuid::new_v4().simple().to_string();
-        let results = stream::iter(versions.iter().copied())
-            .map(|version| {
+        let version_manifests = manifest_paths
+            .iter()
+            .map(|(version, paths)| (*version, paths.clone()))
+            .collect::<Vec<_>>();
+        let results = stream::iter(version_manifests)
+            .map(|(version, manifest_paths)| {
                 let path = self
                     .marker_version_path(version)
                     .join(format!("{operation_id}{DRAINING_MARKER_SUFFIX}"));
                 async move {
-                    let metadata = self.create_marker(&path).await?;
-                    Ok::<_, Error>((version, path, metadata.last_modified))
+                    let payload = retirement_marker_payload(&manifest_paths)?;
+                    let metadata = self.create_marker(&path, payload).await?;
+                    Ok::<_, Error>((version, path, metadata.last_modified, manifest_paths))
                 }
             })
             .buffer_unordered(self.object_store.io_parallelism())
@@ -297,13 +336,14 @@ impl VersionLeaseStore {
         let mut first_error = None;
         for result in results {
             match result {
-                Ok((version, path, observed_at)) => {
+                Ok((version, path, observed_at, manifest_paths)) => {
                     fences.insert(
                         version,
                         RetirementFence {
                             draining_path: Some(path),
                             sealed_path: None,
                             observed_at,
+                            manifest_paths,
                         },
                     );
                 }
@@ -329,7 +369,7 @@ impl VersionLeaseStore {
             Err(Error::VersionNotFound {
                 message: format!("version {version} no longer exists and cannot be leased"),
             })
-        } else if self.has_marker(version, None).await? {
+        } else if self.has_active_retirement_marker(version).await? {
             Err(retiring_version_error(version))
         } else {
             Ok(())
@@ -337,28 +377,240 @@ impl VersionLeaseStore {
     }
 
     async fn ensure_not_sealed(&self, version: u64) -> Result<()> {
-        if self.has_marker(version, Some(SEALED_MARKER_SUFFIX)).await? {
+        if self.has_sealed_marker(version).await? {
             Err(retiring_version_error(version))
         } else {
             Ok(())
         }
     }
 
-    async fn has_marker(&self, version: u64, suffix: Option<&str>) -> Result<bool> {
-        let mut markers = self
-            .object_store
-            .list(Some(self.marker_version_path(version)));
-        while let Some(metadata) = markers.try_next().await? {
-            if suffix.is_none_or(|suffix| {
-                metadata
-                    .location
-                    .filename()
-                    .is_some_and(|name| name.ends_with(suffix))
-            }) {
-                return Ok(true);
+    async fn has_sealed_marker(&self, version: u64) -> Result<bool> {
+        Ok(self
+            .version_marker_metadata(version)
+            .await?
+            .iter()
+            .any(|marker| marker.is_sealed))
+    }
+
+    async fn has_active_retirement_marker(&self, version: u64) -> Result<bool> {
+        let markers = self.version_marker_metadata(version).await?;
+        if markers.iter().any(|marker| marker.is_sealed) {
+            return Ok(true);
+        }
+
+        let mut draining_markers = Vec::new();
+        for marker in markers {
+            if LOCALLY_ABANDONED_DRAINS.contains(&marker.metadata.location) {
+                match self.object_store.delete(&marker.metadata.location).await {
+                    Ok(()) => {
+                        LOCALLY_ABANDONED_DRAINS.remove(&marker.metadata.location);
+                    }
+                    Err(error) if error.is_not_found() => {
+                        LOCALLY_ABANDONED_DRAINS.remove(&marker.metadata.location);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %marker.metadata.location,
+                            error = %error,
+                            "Failed to remove locally abandoned version retirement drain"
+                        );
+                    }
+                }
+            } else {
+                draining_markers.push(marker);
             }
         }
+        if draining_markers.is_empty() {
+            return Ok(false);
+        }
+
+        let observed_at = self.storage_observed_at().await?;
+        let mut stale_paths = Vec::new();
+        for marker in draining_markers {
+            if draining_owner_is_active(marker.metadata.last_modified, observed_at)? {
+                return Ok(true);
+            }
+            stale_paths.push(marker.metadata.location);
+        }
+        self.delete_paths(stale_paths).await?;
         Ok(false)
+    }
+
+    async fn version_marker_metadata(&self, version: u64) -> Result<Vec<RetirementMarkerMetadata>> {
+        let metadata = self
+            .object_store
+            .list(Some(self.marker_version_path(version)))
+            .try_collect::<Vec<_>>()
+            .await?;
+        metadata
+            .into_iter()
+            .map(|metadata| self.parse_retirement_marker_metadata(metadata))
+            .collect()
+    }
+
+    async fn all_marker_metadata(&self) -> Result<Vec<RetirementMarkerMetadata>> {
+        let metadata = self
+            .object_store
+            .list(Some(self.markers_path.clone()))
+            .try_collect::<Vec<_>>()
+            .await?;
+        metadata
+            .into_iter()
+            .filter(|metadata| metadata.location != self.storage_clock_path())
+            .map(|metadata| self.parse_retirement_marker_metadata(metadata))
+            .collect()
+    }
+
+    fn parse_retirement_marker_metadata(
+        &self,
+        metadata: ObjectMeta,
+    ) -> Result<RetirementMarkerMetadata> {
+        let relative_parts = metadata
+            .location
+            .prefix_match(&self.markers_path)
+            .ok_or_else(|| {
+                Error::corrupt_file(
+                    metadata.location.clone(),
+                    "retirement marker is outside its namespace",
+                )
+            })?
+            .map(|part| part.as_ref().to_string())
+            .collect::<Vec<_>>();
+        if relative_parts.len() != 2 {
+            return Err(Error::corrupt_file(
+                metadata.location,
+                "retirement marker path must contain a version and operation filename",
+            ));
+        }
+        let version = relative_parts[0].parse::<u64>().map_err(|error| {
+            Error::corrupt_file(
+                metadata.location.clone(),
+                format!("retirement marker has invalid version: {error}"),
+            )
+        })?;
+        let file_name = &relative_parts[1];
+        let (operation_id, is_sealed) =
+            if let Some(operation_id) = file_name.strip_suffix(DRAINING_MARKER_SUFFIX) {
+                (operation_id, false)
+            } else if let Some(operation_id) = file_name.strip_suffix(SEALED_MARKER_SUFFIX) {
+                (operation_id, true)
+            } else {
+                return Err(Error::corrupt_file(
+                    metadata.location,
+                    "retirement marker filename has an unknown state suffix",
+                ));
+            };
+        Uuid::parse_str(operation_id).map_err(|error| {
+            Error::corrupt_file(
+                metadata.location.clone(),
+                format!("retirement marker has invalid operation id: {error}"),
+            )
+        })?;
+        Ok(RetirementMarkerMetadata {
+            version,
+            operation_id: operation_id.to_string(),
+            is_sealed,
+            metadata,
+        })
+    }
+
+    async fn storage_observed_at(&self) -> Result<DateTime<Utc>> {
+        let path = self.storage_clock_path();
+        self.object_store
+            .inner
+            .put(&path, Bytes::new().into())
+            .await?;
+        Ok(self.object_store.inner.head(&path).await?.last_modified)
+    }
+
+    fn storage_clock_path(&self) -> Path {
+        self.markers_path.clone().join(STORAGE_CLOCK_PATH)
+    }
+
+    pub(super) async fn recover_retirements(self) -> Result<HashSet<u64>> {
+        let markers = self.all_marker_metadata().await?;
+        if markers.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let sealed_operations: HashSet<_> = markers
+            .iter()
+            .filter(|marker| marker.is_sealed)
+            .map(|marker| (marker.version, marker.operation_id.clone()))
+            .collect();
+        let observed_at = self.storage_observed_at().await?;
+        let sealed_observation = markers
+            .iter()
+            .filter(|marker| marker.is_sealed)
+            .map(|marker| (marker.version, observed_at))
+            .collect::<HashMap<_, _>>();
+        let actively_leased_versions = self.active_versions_at(&sealed_observation, true).await?;
+        let mut stale_drains = Vec::new();
+        let mut sealed_manifest_paths = HashMap::<u64, HashSet<Path>>::new();
+        for marker in markers {
+            if marker.is_sealed {
+                let manifest_paths = self.read_retirement_marker(&marker.metadata).await?;
+                sealed_manifest_paths
+                    .entry(marker.version)
+                    .or_default()
+                    .extend(manifest_paths);
+            } else if sealed_operations.contains(&(marker.version, marker.operation_id))
+                || LOCALLY_ABANDONED_DRAINS.contains(&marker.metadata.location)
+                || !draining_owner_is_active(marker.metadata.last_modified, observed_at)?
+            {
+                stale_drains.push(marker.metadata.location);
+            }
+        }
+        self.delete_paths(stale_drains.clone()).await?;
+        for path in stale_drains {
+            LOCALLY_ABANDONED_DRAINS.remove(&path);
+        }
+
+        let mut terminal_manifests = HashMap::new();
+        let mut versions_to_resume = HashSet::new();
+        for (version, manifest_paths) in sealed_manifest_paths {
+            let manifest_paths = manifest_paths.into_iter().collect::<Vec<_>>();
+            let mut has_existing_manifest = false;
+            for path in &manifest_paths {
+                has_existing_manifest |= self.object_store.exists(path).await?;
+            }
+            if has_existing_manifest {
+                // A seal is the renewal cutoff. If its owner disappeared before
+                // confirming the final lease scan, wait out every lease that was
+                // still entitled to its published TTL before resuming deletion.
+                if !actively_leased_versions.contains(&version) {
+                    versions_to_resume.insert(version);
+                }
+            } else {
+                terminal_manifests.insert(version, manifest_paths);
+            }
+        }
+        self.finalize_versions(&terminal_manifests).await?;
+        Ok(versions_to_resume)
+    }
+
+    async fn read_retirement_marker(&self, metadata: &ObjectMeta) -> Result<Vec<Path>> {
+        let bytes = self
+            .object_store
+            .inner
+            .get(&metadata.location)
+            .await?
+            .bytes()
+            .await?;
+        let marker: RetirementMarker = serde_json::from_slice(&bytes)
+            .map_err(|error| Error::corrupt_file(metadata.location.clone(), error.to_string()))?;
+        if marker.manifest_paths.is_empty() {
+            return Err(Error::corrupt_file(
+                metadata.location.clone(),
+                "retirement marker has no manifest identity",
+            ));
+        }
+        marker
+            .manifest_paths
+            .into_iter()
+            .map(Path::parse)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
     }
 
     async fn lease_metadata(&self) -> Result<Vec<ObjectMeta>> {
@@ -372,12 +624,12 @@ impl VersionLeaseStore {
         self.markers_path.clone().join(version.to_string())
     }
 
-    async fn create_marker(&self, path: &Path) -> Result<ObjectMeta> {
+    async fn create_marker(&self, path: &Path, payload: Bytes) -> Result<ObjectMeta> {
         self.object_store
             .inner
             .put_opts(
                 path,
-                Bytes::new().into(),
+                payload.into(),
                 PutOptions {
                     mode: PutMode::Create,
                     ..Default::default()
@@ -407,30 +659,46 @@ impl RetirementGuard {
     }
 
     pub(super) async fn seal_versions(&mut self, versions: &HashSet<u64>) -> Result<()> {
-        let marker_paths = versions
-            .iter()
-            .filter_map(|version| {
-                self.fences.get(version).and_then(|fence| {
-                    fence.draining_path.as_ref().and_then(|draining_path| {
-                        let file_name = draining_path.filename()?;
-                        let operation_id = file_name.strip_suffix(DRAINING_MARKER_SUFFIX)?;
-                        Some((
-                            *version,
-                            self.store
-                                .marker_version_path(*version)
-                                .join(format!("{operation_id}{SEALED_MARKER_SUFFIX}")),
-                        ))
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut marker_paths = Vec::with_capacity(versions.len());
+        for version in versions {
+            let fence = self.fences.get(version).ok_or_else(|| {
+                Error::internal(format!("missing draining fence for version {version}"))
+            })?;
+            let draining_path = fence.draining_path.as_ref().ok_or_else(|| {
+                Error::internal(format!("version {version} has no draining marker"))
+            })?;
+            let file_name = draining_path.filename().ok_or_else(|| {
+                Error::internal(format!("draining marker {draining_path} has no filename"))
+            })?;
+            let operation_id = file_name
+                .strip_suffix(DRAINING_MARKER_SUFFIX)
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "draining marker {draining_path} has an invalid suffix"
+                    ))
+                })?;
+            marker_paths.push((
+                *version,
+                self.store
+                    .marker_version_path(*version)
+                    .join(format!("{operation_id}{SEALED_MARKER_SUFFIX}")),
+                retirement_marker_payload(&fence.manifest_paths)?,
+                fence.observed_at,
+            ));
+        }
 
         let store = self.store.clone();
         let results = stream::iter(marker_paths)
-            .map(move |(version, path)| {
+            .map(move |(version, path, payload, draining_observed_at)| {
                 let store = store.clone();
                 async move {
-                    let metadata = store.create_marker(&path).await?;
+                    let metadata = store.create_marker(&path, payload).await?;
+                    if !draining_owner_is_active(draining_observed_at, metadata.last_modified)? {
+                        let _ = store.object_store.delete(&path).await;
+                        return Err(Error::internal(format!(
+                            "version {version} retirement ownership expired before sealing"
+                        )));
+                    }
                     Ok::<_, Error>((version, path, metadata.last_modified))
                 }
             })
@@ -497,14 +765,75 @@ impl RetirementGuard {
         &mut self,
         manifest_paths: &HashMap<u64, Vec<Path>>,
     ) -> Result<()> {
-        for version in self.fences.keys() {
-            let paths = manifest_paths.get(version).ok_or_else(|| {
-                Error::internal(format!(
+        let guarded_manifest_paths = self
+            .fences
+            .keys()
+            .map(|version| {
+                manifest_paths
+                    .get(version)
+                    .map(|paths| (*version, paths.clone()))
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "missing manifest identity for retiring version {version}"
+                        ))
+                    })
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        self.store
+            .finalize_versions(&guarded_manifest_paths)
+            .await?;
+        self.fences.clear();
+        Ok(())
+    }
+}
+
+impl Drop for RetirementGuard {
+    fn drop(&mut self) {
+        let draining_paths = self
+            .fences
+            .values()
+            .filter_map(|fence| fence.draining_path.clone())
+            .collect::<Vec<_>>();
+        if draining_paths.is_empty() {
+            return;
+        }
+        for path in &draining_paths {
+            LOCALLY_ABANDONED_DRAINS.insert(path.clone());
+        }
+        let store = self.store.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                match store.delete_paths(draining_paths.clone()).await {
+                    Ok(()) => {
+                        for path in draining_paths {
+                            LOCALLY_ABANDONED_DRAINS.remove(&path);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to remove abandoned version retirement drains"
+                        );
+                    }
+                }
+            });
+        }
+    }
+}
+
+impl VersionLeaseStore {
+    async fn finalize_versions(&self, manifest_paths: &HashMap<u64, Vec<Path>>) -> Result<()> {
+        if manifest_paths.is_empty() {
+            return Ok(());
+        }
+        for (version, paths) in manifest_paths {
+            if paths.is_empty() {
+                return Err(Error::internal(format!(
                     "missing manifest identity for retiring version {version}"
-                ))
-            })?;
+                )));
+            }
             for path in paths {
-                if self.store.object_store.exists(path).await? {
+                if self.object_store.exists(path).await? {
                     return Err(Error::internal(format!(
                         "cannot finalize retirement for version {version}: manifest {path} still exists"
                     )));
@@ -512,32 +841,28 @@ impl RetirementGuard {
             }
         }
 
-        let versions: HashSet<_> = self.fences.keys().copied().collect();
+        let versions: HashSet<_> = manifest_paths.keys().copied().collect();
         let marker_prefixes = versions
             .iter()
-            .map(|version| self.store.marker_version_path(*version))
+            .map(|version| self.marker_version_path(*version))
             .collect::<Vec<_>>();
         let marker_streams = marker_prefixes
             .into_iter()
-            .map(|prefix| self.store.object_store.list(Some(prefix)));
+            .map(|prefix| self.object_store.list(Some(prefix)));
         let mut paths = stream::iter(marker_streams)
             .flatten()
             .map_ok(|metadata| metadata.location)
             .try_collect::<Vec<_>>()
             .await?;
-        for metadata in self.store.lease_metadata().await? {
+        for metadata in self.lease_metadata().await? {
             let (version, _) = parse_lease_metadata(&metadata)?;
             if versions.contains(&version) {
                 paths.push(metadata.location);
             }
         }
-        self.store.delete_paths(paths).await?;
-        self.fences.clear();
-        Ok(())
+        self.delete_paths(paths).await
     }
-}
 
-impl VersionLeaseStore {
     async fn delete_paths(&self, paths: Vec<Path>) -> Result<()> {
         stream::iter(paths)
             .map(Ok)
@@ -624,16 +949,47 @@ fn ttl_micros(ttl: Duration) -> Result<i64> {
 }
 
 fn expiration_from_ttl(observed_at: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
-    let ttl = TimeDelta::from_std(ttl).map_err(|error| {
+    let conservative_ttl = ttl
+        .checked_add(STORAGE_TIMESTAMP_PRECISION)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "version lease TTL {ttl:?} overflows the storage timestamp precision interval"
+            ))
+        })?;
+    let ttl_delta = TimeDelta::from_std(conservative_ttl).map_err(|error| {
         Error::invalid_input(format!(
             "version lease TTL {ttl:?} is out of range: {error}"
         ))
     })?;
-    observed_at.checked_add_signed(ttl).ok_or_else(|| {
+    observed_at.checked_add_signed(ttl_delta).ok_or_else(|| {
         Error::invalid_input(format!(
             "version lease TTL {ttl:?} overflows its expiration"
         ))
     })
+}
+
+fn draining_owner_is_active(
+    draining_observed_at: DateTime<Utc>,
+    current_observed_at: DateTime<Utc>,
+) -> Result<bool> {
+    Ok(
+        expiration_from_ttl(draining_observed_at, DRAINING_OWNERSHIP_TIMEOUT)?
+            > current_observed_at,
+    )
+}
+
+fn retirement_marker_payload(manifest_paths: &[Path]) -> Result<Bytes> {
+    if manifest_paths.is_empty() {
+        return Err(Error::internal(
+            "cannot create a retirement marker without a manifest identity",
+        ));
+    }
+    let marker = RetirementMarker {
+        manifest_paths: manifest_paths.iter().map(ToString::to_string).collect(),
+    };
+    serde_json::to_vec(&marker)
+        .map(Bytes::from)
+        .map_err(|error| Error::internal(format!("failed to serialize retirement marker: {error}")))
 }
 
 fn parse_lease_metadata(metadata: &ObjectMeta) -> Result<(u64, Duration)> {
@@ -707,6 +1063,23 @@ mod tests {
         }
     }
 
+    fn manifest_paths(version: u64) -> HashMap<u64, Vec<Path>> {
+        HashMap::from([(
+            version,
+            vec![Path::from(format!("manifests/{version}.manifest"))],
+        )])
+    }
+
+    fn assert_send<T: Send>(_: T) {}
+
+    #[test]
+    fn retirement_futures_are_send() {
+        let store = memory_store();
+        let manifests = manifest_paths(42);
+        assert_send(store.clone().recover_retirements());
+        assert_send(store.fence_versions(&manifests));
+    }
+
     #[test]
     fn parses_lease_file_name() {
         let lease_id = Uuid::nil().simple();
@@ -720,7 +1093,7 @@ mod tests {
     async fn draining_lease_remains_renewable() {
         let store = memory_store();
         let mut lease = store.acquire(42, Duration::from_secs(60)).await.unwrap();
-        let mut guard = store.fence_versions(&HashSet::from([42])).await.unwrap();
+        let mut guard = store.fence_versions(&manifest_paths(42)).await.unwrap();
 
         assert!(
             store
@@ -742,7 +1115,7 @@ mod tests {
         // Moving the cleanup host clock ahead does not affect the storage
         // timestamps used for lease liveness.
         MockClock::set_system_time(Duration::from_secs(160));
-        let mut guard = store.fence_versions(&HashSet::from([42])).await.unwrap();
+        let mut guard = store.fence_versions(&manifest_paths(42)).await.unwrap();
         assert!(
             store
                 .active_versions_at(&guard.observed_at(), false)
@@ -757,13 +1130,106 @@ mod tests {
     async fn sealed_version_rejects_renewal() {
         let store = memory_store();
         let mut lease = store.acquire(42, Duration::from_secs(60)).await.unwrap();
-        let mut guard = store.fence_versions(&HashSet::from([42])).await.unwrap();
+        let mut guard = store.fence_versions(&manifest_paths(42)).await.unwrap();
         guard.seal_versions(&HashSet::from([42])).await.unwrap();
 
         let error = lease.renew(Duration::from_secs(60)).await.unwrap_err();
         assert!(matches!(error, Error::VersionNotFound { .. }));
         assert!(error.to_string().contains("retiring"), "{error}");
         guard.cancel_all().await.unwrap();
+    }
+
+    #[test]
+    fn lease_ttl_survives_coarse_storage_timestamps() {
+        let storage_second = DateTime::from_timestamp(100, 0).unwrap();
+        let acquired_at = storage_second + TimeDelta::try_milliseconds(900).unwrap();
+        let cleanup_started_at = storage_second + TimeDelta::try_milliseconds(1_001).unwrap();
+        let ttl = Duration::from_millis(900);
+
+        assert!(
+            cleanup_started_at < acquired_at + TimeDelta::from_std(ttl).unwrap(),
+            "the requested TTL is still active"
+        );
+        let marker_last_modified = storage_second + TimeDelta::try_seconds(1).unwrap();
+        assert!(
+            expiration_from_ttl(storage_second, ttl).unwrap() > marker_last_modified,
+            "coarse Last-Modified timestamps must not expire the lease early"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_drain_does_not_block_future_acquire() {
+        let store = memory_store();
+        let guard = store.fence_versions(&manifest_paths(42)).await.unwrap();
+        let draining_path = guard.fences[&42].draining_path.clone().unwrap();
+
+        // Dropping the owner proves this in-process drain cannot proceed to deletion.
+        drop(guard);
+        assert!(LOCALLY_ABANDONED_DRAINS.contains(&draining_path));
+
+        store.acquire(42, Duration::from_secs(60)).await.unwrap();
+    }
+
+    #[test]
+    fn draining_ownership_is_bounded() {
+        let started_at = DateTime::from_timestamp(100, 0).unwrap();
+        let ownership_expired_at =
+            expiration_from_ttl(started_at, DRAINING_OWNERSHIP_TIMEOUT).unwrap();
+
+        assert!(!draining_owner_is_active(started_at, ownership_expired_at).unwrap());
+    }
+
+    #[tokio::test]
+    async fn sealed_retirement_is_recovered() {
+        let store = memory_store();
+        let manifest_paths = manifest_paths(42);
+        let manifest_path = manifest_paths[&42][0].clone();
+        store.object_store.put(&manifest_path, &[]).await.unwrap();
+        let mut guard = store.fence_versions(&manifest_paths).await.unwrap();
+        guard.seal_versions(&HashSet::from([42])).await.unwrap();
+        drop(guard);
+
+        let versions_to_resume = store.clone().recover_retirements().await.unwrap();
+        assert_eq!(versions_to_resume, HashSet::from([42]));
+
+        store.object_store.delete(&manifest_path).await.unwrap();
+        assert!(
+            store
+                .clone()
+                .recover_retirements()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.version_marker_metadata(42).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sealed_recovery_waits_for_active_lease() {
+        let store = memory_store();
+        let manifest_paths = manifest_paths(42);
+        let manifest_path = manifest_paths[&42][0].clone();
+        store.object_store.put(&manifest_path, &[]).await.unwrap();
+        let lease = store.acquire(42, Duration::from_secs(60)).await.unwrap();
+        let mut guard = store.fence_versions(&manifest_paths).await.unwrap();
+        guard.seal_versions(&HashSet::from([42])).await.unwrap();
+        drop(guard);
+
+        assert!(
+            store
+                .clone()
+                .recover_retirements()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.object_store.exists(&manifest_path).await.unwrap());
+
+        lease.release().await.unwrap();
+        assert_eq!(
+            store.clone().recover_retirements().await.unwrap(),
+            HashSet::from([42])
+        );
     }
 
     #[tokio::test]
