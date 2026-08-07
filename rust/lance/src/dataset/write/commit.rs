@@ -52,6 +52,7 @@ pub struct CommitBuilder<'a> {
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     timeout: Option<Duration>,
+    is_create_only: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -75,6 +76,7 @@ impl<'a> CommitBuilder<'a> {
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
+            is_create_only: false,
         }
     }
 
@@ -186,6 +188,12 @@ impl<'a> CommitBuilder<'a> {
     /// If a commit operation fails, it will be retried up to `max_retries` times.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.commit_config.num_retries = max_retries;
+        self
+    }
+
+    /// Require the destination to remain absent until this commit.
+    pub(crate) fn with_create_only(mut self, is_create_only: bool) -> Self {
+        self.is_create_only = is_create_only;
         self
     }
 
@@ -348,6 +356,12 @@ impl<'a> CommitBuilder<'a> {
                 }
             }
         };
+
+        if self.is_create_only
+            && let WriteDestination::Dataset(dataset) = &dest
+        {
+            return Err(Error::dataset_already_exists(dataset.uri()));
+        }
 
         if dest.dataset().is_none()
             && !matches!(

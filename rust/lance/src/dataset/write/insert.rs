@@ -142,7 +142,8 @@ impl<'a> InsertBuilder<'a> {
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
             .with_object_store(context.object_store.clone())
-            .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
+            .with_skip_auto_cleanup(context.params.skip_auto_cleanup)
+            .with_create_only(context.is_create_only);
 
         if let Some(params) = context.params.store_params.as_ref() {
             commit_builder = commit_builder.with_store_params(params.clone());
@@ -362,6 +363,7 @@ impl<'a> InsertBuilder<'a> {
 
     async fn resolve_context(&self) -> Result<WriteContext<'a>> {
         let mut params = self.params.cloned().unwrap_or_default();
+        let is_create_only = matches!(params.mode, WriteMode::Create);
         if let Some(cb) = self.write_progress.clone() {
             params.write_progress = Some(cb);
         }
@@ -438,6 +440,7 @@ impl<'a> InsertBuilder<'a> {
             base_path,
             commit_handler,
             storage_version,
+            is_create_only,
         })
     }
 }
@@ -450,6 +453,7 @@ struct WriteContext<'a> {
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: ConcreteFileVersion,
+    is_create_only: bool,
 }
 
 #[cfg(test)]

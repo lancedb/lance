@@ -13,6 +13,7 @@ use arrow_array::RecordBatch;
 use arrow_array::{Int32Array, RecordBatchIterator};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
+use futures::future::join_all;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::{IndexType, scalar::ScalarIndexParams};
 
@@ -32,23 +33,22 @@ async fn concurrent_create() {
     for _ in 0..5 {
         let test_uri = TempStrDir::default();
 
-        let (res1, res2) = tokio::join!(write(&test_uri), write(&test_uri));
+        let results = join_all((0..10).map(|_| write(&test_uri))).await;
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "expected exactly one creator to succeed: {results:?}"
+        );
 
-        assert!(res1.is_ok() || res2.is_ok());
-        if res1.is_err() {
+        for error in results.into_iter().filter_map(Result::err) {
             assert!(
-                matches!(res1, Err(Error::DatasetAlreadyExists { .. })),
-                "{:?}",
-                res1
+                matches!(&error, Error::DatasetAlreadyExists { .. }),
+                "unexpected concurrent create error: {error:?}"
             );
-        } else if res2.is_err() {
             assert!(
-                matches!(res2, Err(Error::DatasetAlreadyExists { .. })),
-                "{:?}",
-                res2
+                error.to_string().contains("Dataset already exists"),
+                "unexpected concurrent create error: {error}"
             );
-        } else {
-            assert!(res1.is_ok() && res2.is_ok());
         }
     }
 }
