@@ -38,6 +38,8 @@ use lance_core::{
     utils::bit::pad_bytes,
 };
 use log::{debug, trace};
+use prost::Message;
+use tokio::sync::OnceCell;
 
 use crate::encodings::logical::primitive::miniblock::MiniBlockChunk;
 use crate::encodings::physical::rle::{RleDecompressor, RleRuns};
@@ -1898,6 +1900,15 @@ struct MiniBlockSchedulerDictionary {
     dictionary_buf_position_and_size: (u64, u64),
     dictionary_data_alignment: u64,
     num_dictionary_items: u64,
+    // Pages that reference the same dictionary share one fetch and decompression result.
+    initialized_data: Arc<OnceCell<Arc<DataBlock>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MiniBlockDictionaryCacheKey {
+    buffer_position_and_size: (u64, u64),
+    encoding: Vec<u8>,
+    num_dictionary_items: u64,
 }
 
 /// State that is loaded once and cached for future lookups
@@ -1915,7 +1926,13 @@ impl DeepSizeOf for MiniBlockCacheableState {
             + self
                 .dictionary
                 .as_ref()
-                .map(|dict| dict.data_size() as usize)
+                .map(|dict| {
+                    if context.mark_seen(Arc::as_ptr(dict) as *const () as usize) {
+                        dict.data_size() as usize
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
     }
 }
@@ -1977,6 +1994,7 @@ impl MiniBlockScheduler {
         items_in_page: u64,
         layout: &pb21::MiniBlockLayout,
         decompressors: &dyn DecompressionStrategy,
+        dictionary_cache: &mut HashMap<MiniBlockDictionaryCacheKey, Arc<OnceCell<Arc<DataBlock>>>>,
     ) -> Result<Self> {
         let rep_decompressor = layout
             .rep_compression
@@ -2008,6 +2026,12 @@ impl MiniBlockScheduler {
 
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
             let num_dictionary_items = layout.num_dictionary_items;
+            let dictionary_buf_position_and_size =
+                buffer_offsets_and_sizes.get(2).copied().ok_or_else(|| {
+                    Error::invalid_input_source(
+                        "Mini-block dictionary layout is missing its data buffer".into(),
+                    )
+                })?;
             let dictionary_decompressor = decompressors
                 .create_block_decompressor(dictionary_encoding)?
                 .into();
@@ -2029,11 +2053,20 @@ impl MiniBlockScheduler {
                     ));
                 }
             };
+            let initialized_data = dictionary_cache
+                .entry(MiniBlockDictionaryCacheKey {
+                    buffer_position_and_size: dictionary_buf_position_and_size,
+                    encoding: dictionary_encoding.encode_to_vec(),
+                    num_dictionary_items,
+                })
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone();
             Some(MiniBlockSchedulerDictionary {
                 dictionary_decompressor,
-                dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                dictionary_buf_position_and_size,
                 dictionary_data_alignment,
                 num_dictionary_items,
+                initialized_data,
             })
         } else {
             None
@@ -2584,49 +2617,22 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let base = self.buffer_offsets_and_sizes[1].0;
         let data_buf_size = self.buffer_offsets_and_sizes[1].1;
         let mut bufs_needed = 1;
-        if self.dictionary.is_some() {
-            bufs_needed += 1;
-        }
         if self.repetition_index_depth > 0 {
             bufs_needed += 1;
         }
         let mut required_ranges = Vec::with_capacity(bufs_needed);
         required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
-        let mut separate_dictionary_request = None;
-        if let Some(ref dictionary) = self.dictionary {
-            let dictionary_range = dictionary.dictionary_buf_position_and_size.0
-                ..dictionary.dictionary_buf_position_and_size.0
-                    + dictionary.dictionary_buf_position_and_size.1;
-            if dictionary_range.start < meta_buf_position {
-                // Shared dictionaries are stored with the first page, so later pages refer to a
-                // range before their local metadata. Encoding I/O requires each request's ranges
-                // to remain in file order.
-                separate_dictionary_request = Some(io.submit_request(vec![dictionary_range], 0));
-            } else {
-                required_ranges.push(dictionary_range);
-            }
-        }
         if self.repetition_index_depth > 0 {
             let (rep_index_pos, rep_index_size) = self.buffer_offsets_and_sizes.last().unwrap();
             required_ranges.push(*rep_index_pos..*rep_index_pos + *rep_index_size);
         }
         let io_req = io.submit_request(required_ranges, 0);
+        let io = io.clone();
+        let dictionary = self.dictionary.clone();
 
         async move {
             let mut buffers = io_req.await?.into_iter().fuse();
             let meta_bytes = buffers.next().unwrap();
-            let dictionary_bytes = if let Some(dictionary_request) = separate_dictionary_request {
-                let mut dictionary_buffers = dictionary_request.await?;
-                if dictionary_buffers.len() != 1 {
-                    return Err(Error::internal(format!(
-                        "Encoding I/O returned {} buffers for one shared dictionary range",
-                        dictionary_buffers.len()
-                    )));
-                }
-                dictionary_buffers.pop()
-            } else {
-                self.dictionary.as_ref().and_then(|_| buffers.next())
-            };
             let rep_index_bytes = buffers.next();
 
             let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
@@ -2639,13 +2645,32 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 self.repetition_index_depth,
             )?;
 
-            // decode dictionary
-            let dictionary = if let Some(ref mut dictionary) = self.dictionary {
-                let dictionary_data = dictionary_bytes.unwrap();
-                Some(Arc::new(dictionary.dictionary_decompressor.decompress(
-                    LanceBuffer::from_bytes(dictionary_data, dictionary.dictionary_data_alignment),
-                    dictionary.num_dictionary_items,
-                )?))
+            let dictionary = if let Some(dictionary) = dictionary {
+                let initialized = dictionary
+                    .initialized_data
+                    .get_or_try_init(|| async {
+                        let (position, size) = dictionary.dictionary_buf_position_and_size;
+                        let mut dictionary_buffers = io
+                            .submit_request(vec![position..position + size], 0)
+                            .await?;
+                        if dictionary_buffers.len() != 1 {
+                            return Err(Error::internal(format!(
+                                "Encoding I/O returned {} buffers for one dictionary range",
+                                dictionary_buffers.len()
+                            )));
+                        }
+                        let dictionary_data = dictionary_buffers.pop().unwrap();
+                        Ok(Arc::new(dictionary.dictionary_decompressor.decompress(
+                            LanceBuffer::from_bytes(
+                                dictionary_data,
+                                dictionary.dictionary_data_alignment,
+                            ),
+                            dictionary.num_dictionary_items,
+                        )?))
+                    })
+                    .await?
+                    .clone();
+                Some(initialized)
             } else {
                 None
             };
@@ -4053,6 +4078,7 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<Self> {
+        let mut dictionary_cache = HashMap::new();
         let page_schedulers = column_info
             .page_infos
             .iter()
@@ -4064,6 +4090,7 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    &mut dictionary_cache,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -4080,6 +4107,7 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        dictionary_cache: &mut HashMap<MiniBlockDictionaryCacheKey, Arc<OnceCell<Arc<DataBlock>>>>,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
@@ -4089,6 +4117,7 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block.num_items,
                 mini_block,
                 decompressors,
+                dictionary_cache,
             )?),
             Layout::SparseLayout(sparse_layout) => {
                 Box::new(sparse::SparseStructuralScheduler::try_new(
@@ -4160,6 +4189,7 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    dictionary_cache,
                 )?;
                 let def_meaning = blob
                     .layers
@@ -4191,6 +4221,7 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        dictionary_cache: &mut HashMap<MiniBlockDictionaryCacheKey, Arc<OnceCell<Arc<DataBlock>>>>,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
@@ -4199,6 +4230,7 @@ impl StructuralPrimitiveFieldScheduler {
             decompressors,
             cache_repetition_index,
             target_field,
+            dictionary_cache,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,
@@ -9439,12 +9471,14 @@ mod tests {
         };
 
         let buffer_offsets_and_sizes = vec![(0, 0), (0, 0), (0, 0)];
+        let mut dictionary_cache = HashMap::new();
         let scheduler = super::MiniBlockScheduler::try_new(
             &buffer_offsets_and_sizes,
             /*priority=*/ 0,
             /*items_in_page=*/ rows,
             &layout,
             &DefaultDecompressionStrategy::default(),
+            &mut dictionary_cache,
         )
         .unwrap();
 

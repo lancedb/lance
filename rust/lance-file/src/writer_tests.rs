@@ -27,6 +27,7 @@ mod tests {
     use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
     use lance_io::ReadBatchParams;
     use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::IoStats;
     use lance_io::traits::Writer;
     use lance_io::utils::CachedFileSize;
     use rstest::rstest;
@@ -911,7 +912,9 @@ mod tests {
             .as_any()
             .downcast_ref::<BinaryArray>()
             .unwrap();
-        let read_batches: Vec<RecordBatch> = file_reader
+        let stats = IoStats::new();
+        let reader = file_reader.with_io_stats(stats.recorder());
+        let read_batches: Vec<RecordBatch> = reader
             .read_stream(
                 ReadBatchParams::RangeFull,
                 1024,
@@ -936,6 +939,14 @@ mod tests {
             row_offset += actual.len();
         }
         assert_eq!(row_offset, expected.len());
+        let read_stats = stats.snapshot();
+        assert!(
+            read_stats.bytes_read <= split_size * 2,
+            "full scan read {} bytes from a {}-byte file across {} pages",
+            read_stats.bytes_read,
+            split_size,
+            pages[0].len()
+        );
     }
 
     #[tokio::test]
