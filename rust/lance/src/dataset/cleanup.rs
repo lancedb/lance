@@ -34,7 +34,7 @@
 //! happening at the same time)
 
 use super::refs::TagContents;
-use super::version_lease::VersionLeaseStore;
+use super::version_lease::{RetirementGuard, VersionLeaseStore};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -315,6 +315,12 @@ struct CleanupInspection {
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug)]
+struct CleanupRetirement {
+    guard: RetirementGuard,
+    manifest_paths: HashMap<u64, Vec<Path>>,
+}
+
 /// If a file cannot be verified then it will only be deleted if it is at least
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
@@ -469,9 +475,14 @@ impl<'a> CleanupTask<'a> {
             .collect();
 
         let version_lease_store = VersionLeaseStore::for_dataset(self.dataset).await?;
-        let leased_versions = version_lease_store
-            .active_versions(self.action.deletes_files())
-            .await?;
+        // Execute establishes storage-clock retirement fences before deciding
+        // which leases are active. Explain remains read-only and conservatively
+        // treats every published lease as active.
+        let leased_versions = if self.action.deletes_files() {
+            HashSet::new()
+        } else {
+            version_lease_store.all_lease_versions().await?
+        };
 
         let mut inspection = self
             .process_manifests(&tagged_versions, &leased_versions)
@@ -495,14 +506,18 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
 
-        inspection = self
+        let (inspection, mut retirement) = self
             .fence_old_versions_and_retain_new_leases(inspection, &version_lease_store)
             .await?;
 
-        final_result.merge(
-            self.delete_unreferenced_files(inspection).await?,
-            candidate_file_limit,
-        );
+        let cleanup_result = self.delete_unreferenced_files(inspection).await?;
+        if let Some(retirement) = retirement.as_mut() {
+            retirement
+                .guard
+                .finalize(&retirement.manifest_paths)
+                .await?;
+        }
+        final_result.merge(cleanup_result, candidate_file_limit);
         Ok(final_result)
     }
 
@@ -591,24 +606,81 @@ impl<'a> CleanupTask<'a> {
         &self,
         mut inspection: CleanupInspection,
         version_lease_store: &VersionLeaseStore,
-    ) -> Result<CleanupInspection> {
+    ) -> Result<(CleanupInspection, Option<CleanupRetirement>)> {
         if !self.action.deletes_files() {
-            return Ok(inspection);
+            return Ok((inspection, None));
         }
 
         let versions_to_delete: HashSet<u64> = inspection.old_manifests.values().copied().collect();
-        version_lease_store
+        let mut guard = version_lease_store
             .fence_versions(&versions_to_delete)
             .await?;
 
-        // A lease acquired between the initial list and the fence either sees
-        // the fence and fails, or appears here and conservatively retains this
-        // version for the current cleanup pass.
-        let leased_versions = version_lease_store.active_versions(true).await?;
-        for version in versions_to_delete.intersection(&leased_versions) {
-            self.retain_version(&mut inspection, *version).await?;
+        let result = async {
+            // Draining blocks new acquisitions but permits leases admitted before
+            // the marker to renew. Storage timestamps on the marker and lease
+            // provide a clock-skew-independent liveness comparison.
+            let leased_versions = version_lease_store
+                .active_versions_at(&guard.observed_at(), true)
+                .await?;
+            let retained_versions: HashSet<_> = versions_to_delete
+                .intersection(&leased_versions)
+                .copied()
+                .collect();
+            for version in &retained_versions {
+                self.retain_version(&mut inspection, *version).await?;
+            }
+            guard.cancel_versions(&retained_versions).await?;
+
+            let versions_to_seal: HashSet<u64> =
+                inspection.old_manifests.values().copied().collect();
+            guard.seal_versions(&versions_to_seal).await?;
+
+            // Recheck after sealing. A lease published across the draining
+            // transition either appears here and cancels this retirement, or
+            // observes the seal and fails before cleanup begins deletion.
+            let leased_versions = version_lease_store
+                .active_versions_at(&guard.observed_at(), true)
+                .await?;
+            let retained_versions: HashSet<_> = versions_to_seal
+                .intersection(&leased_versions)
+                .copied()
+                .collect();
+            for version in &retained_versions {
+                self.retain_version(&mut inspection, *version).await?;
+            }
+            guard.cancel_versions(&retained_versions).await?;
+
+            let mut manifest_paths = HashMap::<u64, Vec<Path>>::new();
+            for (path, version) in &inspection.old_manifests {
+                manifest_paths
+                    .entry(*version)
+                    .or_default()
+                    .push(path.clone());
+            }
+            Ok::<_, Error>((inspection, manifest_paths))
         }
-        Ok(inspection)
+        .await;
+
+        match result {
+            Ok((inspection, _)) if guard.is_empty() => Ok((inspection, None)),
+            Ok((inspection, manifest_paths)) => Ok((
+                inspection,
+                Some(CleanupRetirement {
+                    guard,
+                    manifest_paths,
+                }),
+            )),
+            Err(error) => {
+                if let Err(cancel_error) = guard.cancel_all().await {
+                    warn!(
+                        error = %cancel_error,
+                        "Failed to cancel version retirement before deletion"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn retain_version(&self, inspection: &mut CleanupInspection, version: u64) -> Result<()> {
@@ -2241,6 +2313,10 @@ mod tests {
             .unwrap();
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.data_files_removed, 0);
+        lease
+            .renew(Duration::from_secs(30 * 24 * 60 * 60))
+            .await
+            .unwrap();
         historical.scan().try_into_batch().await.unwrap();
 
         lease.release().await.unwrap();
@@ -2249,6 +2325,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed.old_versions, 1);
+        let marker_prefix = historical
+            .refs
+            .root()
+            .unwrap()
+            .path
+            .join("_refs/version_lease_gc/main/1");
+        assert!(
+            historical
+                .object_store
+                .list(Some(marker_prefix))
+                .try_next()
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             fixture
                 .load()
@@ -2266,9 +2357,10 @@ mod tests {
         fixture.create_some_data().await.unwrap();
         let historical = fixture.load().await.unwrap();
         let _lease = historical
-            .acquire_version_lease(Duration::from_secs(1))
+            .acquire_version_lease(Duration::from_millis(10))
             .await
             .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
         fixture.overwrite_some_data().await.unwrap();
         MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
@@ -2281,7 +2373,7 @@ mod tests {
             .acquire_version_lease(Duration::from_secs(60))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("fenced for cleanup"), "{error}");
+        assert!(error.to_string().contains("no longer exists"), "{error}");
     }
 
     #[tokio::test]

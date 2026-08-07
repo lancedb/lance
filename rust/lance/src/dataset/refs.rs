@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
+use crate::dataset::version_lease::remove_branch_state;
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
@@ -555,7 +556,7 @@ impl Branches<'_> {
         let branch_id = all_branches
             .get(branch)
             .map(|contents| contents.identifier.clone());
-        if let Some(branch_id) = branch_id {
+        if let Some(branch_id) = branch_id.as_ref() {
             let referenced_versions = branch_id.collect_referenced_versions(&all_branches);
             if !referenced_versions.is_empty() {
                 return Err(Error::RefConflict {
@@ -579,8 +580,17 @@ impl Branches<'_> {
             self.object_store().delete(&branch_file).await?;
         }
 
-        // Clean up branch directories
-        self.cleanup_branch_directories(branch).await
+        // Clean up branch directories and operational state scoped to this
+        // branch incarnation. The identifier prevents a recreated branch with
+        // the same name from inheriting leases or retirement markers.
+        self.cleanup_branch_directories(branch).await?;
+        if let Some(namespace) = branch_id
+            .as_ref()
+            .and_then(|identifier| identifier.version_mapping.last().map(|(_, id)| id.as_str()))
+        {
+            remove_branch_state(self.object_store(), &root_location.path, namespace).await?;
+        }
+        Ok(())
     }
 
     pub async fn list_ordered(

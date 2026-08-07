@@ -3110,10 +3110,15 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
-        >>> historical = dataset.checkout_version(1)
-        >>> with historical.acquire_version_lease(timedelta(minutes=5)) as lease:
-        ...     table = historical.to_table()
-        ...     lease.renew(timedelta(minutes=5))
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> from datetime import timedelta
+        >>> from tempfile import TemporaryDirectory
+        >>> with TemporaryDirectory() as tmp:
+        ...     historical = lance.write_dataset(pa.table({"id": [1]}), tmp)
+        ...     with historical.acquire_version_lease(timedelta(minutes=5)) as lease:
+        ...         table = historical.to_table()
+        ...         lease.renew(timedelta(minutes=5))
         """
         return self._ds.acquire_version_lease(td_to_micros(ttl))
 
