@@ -773,8 +773,14 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
-                Operation::Append { .. }
-                | Operation::ReserveFragments { .. }
+                // A rewrite allocates replacement fragment ids above the current
+                // high-water mark. If an append landed after the rewrite was
+                // planned, rebasing would place the replacement after the newly
+                // appended rows and violate insertion order.
+                Operation::Append { .. } => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -2837,7 +2843,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Compatible,    // append
+                    Retryable,     // append
                     Retryable,     // create index
                     Compatible,    // delete
                     Retryable,     // merge
@@ -2859,7 +2865,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Compatible,    // append
+                    Retryable,     // append
                     Retryable,     // create index
                     Retryable,     // delete
                     Retryable,     // merge

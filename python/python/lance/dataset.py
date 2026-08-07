@@ -7108,12 +7108,12 @@ class DatasetOptimizer:
          * Removes dropped columns from fragments
          * Merges small fragments into larger ones
 
-        This method preserves the insertion order of the dataset. This may mean
-        it leaves small fragments in the dataset if they are not adjacent to
-        other fragments that need compaction. For example, if you have fragments
-        with row counts 5 million, 100, and 5 million, the middle fragment will
-        not be compacted because the fragments it is adjacent to do not need
-        compaction.
+        Row order is preserved when compaction rewrites a contiguous suffix,
+        including the entire dataset. In other partial or gapped plans, each
+        rewritten range keeps its internal order, but the ranges move after
+        untouched fragments because replacement fragment IDs are allocated
+        monotonically. ``max_source_fragments`` limits work to a suffix so that
+        bounded compaction preserves row order.
 
         Default values for these options can be stored in the dataset manifest
         config using keys prefixed with ``lance.compaction.``. For example,

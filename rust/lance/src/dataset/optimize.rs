@@ -808,9 +808,30 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let all_tasks: Vec<TaskData> = candidate_bins
+        let compactable_bins = if self.options.max_source_fragments.is_some() {
+            // New fragment ids are allocated above the manifest high-water mark,
+            // so a bounded replacement before an untouched fragment would move
+            // behind it. Select a contiguous suffix when bounding the work.
+            let mut suffix_start = i;
+            let mut suffix_bins = Vec::new();
+            for bin in candidate_bins.into_iter().rev() {
+                if bin.pos_range.end != suffix_start || bin.is_noop() {
+                    break;
+                }
+                suffix_start = bin.pos_range.start;
+                suffix_bins.push(bin);
+            }
+            suffix_bins.reverse();
+            suffix_bins
+        } else {
+            candidate_bins
+                .into_iter()
+                .filter(|bin| !bin.is_noop())
+                .collect()
+        };
+
+        let all_tasks: Vec<TaskData> = compactable_bins
             .into_iter()
-            .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
             .map(|bin| TaskData {
                 fragments: bin.fragments,
@@ -819,13 +840,16 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let tasks = if let Some(max_frags) = self.options.max_source_fragments {
             let mut total_frags = 0;
-            all_tasks
+            let mut tasks = all_tasks
                 .into_iter()
+                .rev()
                 .take_while(|task| {
                     total_frags += task.fragments.len();
                     total_frags <= max_frags
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            tasks.reverse();
+            tasks
         } else {
             all_tasks
         };
@@ -838,14 +862,17 @@ impl CompactionPlanner for DefaultCompactionPlanner {
     }
 }
 
-/// Compacts the files in the dataset without reordering them.
+/// Compacts files in the dataset.
 ///
 /// By default, this does a few things:
 ///  * Removes deleted rows from fragments.
 ///  * Removes dropped columns from fragments.
 ///  * Merges fragments that are too small.
 ///
-/// This method tries to preserve the insertion order of rows in the dataset.
+/// Row order is preserved when the selected fragments form a contiguous suffix,
+/// including a full-dataset compaction. Within other partial or gapped plans,
+/// rewritten ranges retain their relative order but move after untouched
+/// fragments because fragment ids are monotonically allocated.
 ///
 /// If no compaction is needed, this method will not make a new version of the table.
 pub async fn compact_files(
@@ -2045,6 +2072,11 @@ async fn recalc_versions_for_rewritten_fragments(
 /// they can be omitted and the successful tasks can be committed. However, once
 /// some of the tasks have been committed, the remainder of the tasks will not
 /// be able to be committed and should be considered cancelled.
+///
+/// Completed tasks are ordered by their source fragments. This preserves row
+/// order when they collectively replace a contiguous suffix. A partial or
+/// gapped set is appended after untouched fragments because replacement ids are
+/// monotonically allocated.
 pub async fn commit_compaction(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
@@ -7086,6 +7118,17 @@ mod tests {
             bounded_source_frags > 0,
             "expected at least 1 source fragment in bounded plan"
         );
+        let bounded_fragment_ids = plan_bounded
+            .tasks()
+            .iter()
+            .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
+            .collect::<Vec<_>>();
+        let expected_fragment_ids = dataset.manifest.fragments
+            [dataset.manifest.fragments.len() - bounded_source_frags..]
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(bounded_fragment_ids, expected_fragment_ids);
         assert!(
             plan_bounded.num_tasks() < plan_all.num_tasks(),
             "bounded plan ({}) should have fewer tasks than unbounded ({})",
@@ -7098,6 +7141,8 @@ mod tests {
         compact_files(&mut dataset, opts_bounded, None)
             .await
             .unwrap();
+        let after_first_data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(after_first_data, data.slice(0, 1_000));
         let after_first = dataset.get_fragments().len();
         assert!(
             after_first < 10,
@@ -7117,11 +7162,71 @@ mod tests {
         compact_files(&mut dataset, opts_bounded, None)
             .await
             .unwrap();
+        let after_second_data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(after_second_data, data.slice(0, 1_000));
         let after_second = dataset.get_fragments().len();
         assert!(
             after_second <= after_first,
             "expected progress: {after_second} should be <= {after_first}"
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_bounded_compaction_preserves_order_across_candidate_gap(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let data = sample_data();
+        let schema = data.schema();
+        let fragment_rows = [100, 100, 1_000, 100, 100];
+        let write_params = WriteParams {
+            max_rows_per_file: 1_000,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(0, fragment_rows[0]))], schema.clone()),
+            test_uri,
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        let mut offset = fragment_rows[0];
+        for row_count in fragment_rows.iter().copied().skip(1) {
+            let mut append_params = write_params.clone();
+            append_params.mode = WriteMode::Append;
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(data.slice(offset, row_count))], schema.clone()),
+                test_uri,
+                Some(append_params),
+            )
+            .await
+            .unwrap();
+            offset += row_count;
+        }
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(2),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let planned_fragment_ids = plan
+            .tasks()
+            .iter()
+            .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
+            .collect::<Vec<_>>();
+        assert_eq!(planned_fragment_ids, vec![3, 4]);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let compacted = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(compacted, data.slice(0, offset));
     }
 
     #[tokio::test]
