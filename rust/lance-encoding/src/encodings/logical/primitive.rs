@@ -6774,6 +6774,7 @@ impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
             Ok(Some(page_split::split_dense_pages(
                 pages,
                 arrays,
+                ctx.field,
                 ctx.max_page_bytes,
                 num_rows,
                 num_values,

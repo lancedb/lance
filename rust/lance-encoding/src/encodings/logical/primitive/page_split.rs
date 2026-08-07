@@ -3,11 +3,13 @@
 
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, datatypes::Field};
 
 use super::{
-    PrimitivePageData, PrimitivePageStructure, PrimitiveStructuralEncoder, SerializedRepDefs,
+    FixedWidthDictionaryEncoding, PrimitivePageData, PrimitivePageStructure,
+    PrimitiveStructuralEncoder, SerializedRepDefs,
 };
+use crate::data::DataBlock;
 
 /// Split dense pages into independently encodable tasks using the unencoded byte size.
 ///
@@ -17,6 +19,7 @@ use super::{
 pub(super) fn split_dense_pages(
     pages: Vec<PrimitivePageData>,
     arrays: &[ArrayRef],
+    field: &Field,
     max_page_bytes: u64,
     num_rows: u64,
     num_values: u64,
@@ -53,6 +56,18 @@ pub(super) fn split_dense_pages(
         })
     })?;
     if total_size_bytes <= max_page_bytes {
+        return Ok(pages);
+    }
+    // Automatic dictionary selection happens while encoding each page. Splitting first would
+    // cause every page to build and serialize its own copy of the dictionary payload.
+    let data_block = DataBlock::from_arrays(arrays, num_values);
+    if PrimitiveStructuralEncoder::should_dictionary_encode(
+        &data_block,
+        field,
+        FixedWidthDictionaryEncoding::Include64Bit,
+    )
+    .is_some()
+    {
         return Ok(pages);
     }
 

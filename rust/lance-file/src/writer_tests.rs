@@ -840,6 +840,24 @@ mod tests {
         assert_eq!(page_buffer_sizes[0].len(), 1);
     }
 
+    #[tokio::test]
+    async fn test_oversized_automatic_dictionary_batch_remains_single_page() {
+        let unique_values = (0..128)
+            .map(|index| format!("{index:04}-{}", "x".repeat(2043)))
+            .collect::<Vec<_>>();
+        let values = StringArray::from_iter_values(
+            (0..2048).map(|index| unique_values[index % unique_values.len()].as_str()),
+        );
+        assert!(values.get_array_memory_size() > 1024 * 1024);
+        let arrow_schema = Schema::new(vec![Field::new("data", DataType::Utf8, false)]);
+        let batch = RecordBatch::try_new(arrow_schema.into(), vec![Arc::new(values)]).unwrap();
+
+        let page_buffer_sizes =
+            write_batch_page_sizes(&batch, ConcreteFileVersion::V2_3, 1024 * 1024).await;
+
+        assert_eq!(page_buffer_sizes[0].len(), 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_max_page_bytes_env_var() {
         let arrow_field = Field::new("data", DataType::UInt64, false);
