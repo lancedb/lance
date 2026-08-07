@@ -35,10 +35,15 @@ impl IntoJava for &Arc<dyn IndexDescription> {
         let metadata_list = export_vec(env, self.metadata())?;
         let details_json = self.details()?;
         let details = env.new_string(details_json)?;
+        let total_size_bytes = if let Some(size) = self.total_size_bytes() {
+            env.new_object("java/lang/Long", "(J)V", &[JValue::Long(size as i64)])?
+        } else {
+            JObject::null()
+        };
 
         let j_index_desc = env.new_object(
             "org/lance/index/IndexDescription",
-            "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;JLjava/util/List;Ljava/lang/String;)V",
+            "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;JLjava/util/List;Ljava/lang/String;Ljava/lang/Long;)V",
             &[
                 JValue::Object(&name),
                 JValue::Object(&field_ids_list),
@@ -47,6 +52,7 @@ impl IntoJava for &Arc<dyn IndexDescription> {
                 JValue::Long(rows_indexed),
                 JValue::Object(&metadata_list),
                 JValue::Object(&details),
+                JValue::Object(&total_size_bytes),
             ],
         )?;
         Ok(j_index_desc)
@@ -125,13 +131,19 @@ impl IntoJava for &IndexMetadata {
             JObject::null()
         };
 
+        let size_bytes = if let Some(size) = self.total_size_bytes() {
+            env.new_object("java/lang/Long", "(J)V", &[JValue::Long(size as i64)])?
+        } else {
+            JObject::null()
+        };
+
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
 
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Lorg/lance/index/IndexType;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -142,6 +154,7 @@ impl IntoJava for &IndexMetadata {
                 JValue::Int(self.index_version),
                 JValue::Object(&created_at),
                 JValue::Object(&base_id),
+                JValue::Object(&size_bytes),
                 JValue::Object(&index_type),
             ],
         )?)
