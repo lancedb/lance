@@ -74,5 +74,8 @@ debug-assertions = false
 strip = "debuginfo"
 incremental = false
 
+[profile.release]
+strip = true
+
 [lints.clippy]
 disallowed_macros = "deny"
