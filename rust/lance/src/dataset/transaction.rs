@@ -1755,7 +1755,7 @@ impl Transaction {
         if let Some(file_version) = Fragment::try_infer_version(fragments)? {
             // Ensure user-requested matches data files
             if let Some(user_requested) = user_requested
-                && ConcreteFileVersion::from(user_requested) != file_version
+                && user_requested != file_version
             {
                 return Err(Error::invalid_input(format!(
                     "User requested data storage version ({}) does not match version in data files ({})",
@@ -1766,7 +1766,6 @@ impl Transaction {
         } else {
             // If no files use user-requested or default
             Ok(user_requested
-                .map(ConcreteFileVersion::from)
                 .map(DataStorageFormat::new)
                 .unwrap_or_default())
         }
@@ -2518,8 +2517,7 @@ impl Transaction {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format =
-                    DataStorageFormat::new(ConcreteFileVersion::from(user_requested_version));
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
             }
 
             prev_manifest

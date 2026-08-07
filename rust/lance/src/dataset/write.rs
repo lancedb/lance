@@ -766,44 +766,6 @@ where
     Ok(fragments)
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-async fn do_write_fragments(
-    dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
-    base_dir: &Path,
-    schema: &Schema,
-    data: SendableRecordBatchStream,
-    params: WriteParams,
-    storage_version: ConcreteFileVersion,
-    target_bases_info: Option<Vec<TargetBaseInfo>>,
-    seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
-) -> Result<Vec<Fragment>> {
-    versions::write_fragments_direct(
-        storage_version,
-        dataset,
-        object_store,
-        base_dir,
-        schema,
-        data,
-        params,
-        target_bases_info,
-        seed_writers,
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn open_writer_with_options(
-    object_store: &ObjectStore,
-    schema: &Schema,
-    base_dir: &Path,
-    storage_version: ConcreteFileVersion,
-    options: WriterOptions,
-) -> Result<Box<dyn GenericWriter>> {
-    versions::open_writer(storage_version, object_store, schema, base_dir, options).await
-}
-
 /// Flush all seed writers into the given file writer, embedding seed buffers
 /// and schema metadata before `finish()` is called.
 async fn flush_seed_writers(

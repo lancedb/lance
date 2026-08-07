@@ -282,7 +282,8 @@ pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
 fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
     for fragment in manifest.fragments.iter() {
         for data_file in &fragment.files {
-            if data_file.is_legacy_file() || data_file.column_indices.is_empty() {
+            let file_version = data_file.file_version()?;
+            if file_version == ConcreteFileVersion::V1 || data_file.column_indices.is_empty() {
                 continue;
             }
             if data_file.fields.len() != data_file.column_indices.len() {
@@ -294,10 +295,7 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
                     data_file.column_indices.len()
                 )));
             }
-            if matches!(
-                data_file.file_version()?,
-                ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0
-            ) {
+            if file_version == ConcreteFileVersion::V2_0 {
                 continue;
             }
             for (field_id, column_index) in

@@ -112,7 +112,8 @@ impl<'a> FragmentCreateBuilder<'a> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
         // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
         // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
-        // multi-fragment and dataset write paths perform this through `do_write_fragments`;
+        // multi-fragment and dataset write paths perform this through
+        // `versions::write_fragments_direct`;
         // the single-fragment create path must do the same or the raw UTF-8 string bytes
         // would be written into a column whose schema declares JSONB, corrupting reads.
         let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);

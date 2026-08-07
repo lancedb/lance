@@ -2161,7 +2161,7 @@ mod tests {
 
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+        use lance_file::version::LanceFileVersion;
 
         use crate::format::DataStorageFormat;
 
@@ -2218,7 +2218,7 @@ mod tests {
 
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+        use lance_file::version::LanceFileVersion;
 
         use crate::format::DataStorageFormat;
 
