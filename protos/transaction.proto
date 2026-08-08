@@ -144,12 +144,24 @@ message Transaction {
     repeated lance.file.Field schema = 2;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
+    // Set when this merge makes no nullability-affecting schema change: it
+    // introduces no field that data staged against an earlier schema could
+    // not safely omit. Without the assertion (including transactions written
+    // before this field existed) the merge conservatively conflicts with
+    // concurrent value-writes, which can only cause a retry.
+    bool preserves_nullability = 4;
   }
 
   // An operation that projects a subset of columns, altering the schema.
   message Project {
     // The new schema
     repeated lance.file.Field schema = 1;
+    // Set when this projection makes no nullability-affecting schema change,
+    // as a rename or a drop does not. Without the assertion (including
+    // transactions written before this field existed) the projection
+    // conservatively conflicts with concurrent value-writes, which can only
+    // cause a retry. A nullability tightening must not set this.
+    bool preserves_nullability = 2;
   }
 
   // An operation that restores a dataset to a previous version.

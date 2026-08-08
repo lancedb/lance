@@ -52,7 +52,8 @@ use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
 use lance_index::scalar::registry::{
-    ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
+    ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
@@ -128,6 +129,12 @@ impl TrainingRequest {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Overrides the scalar training scan's I/O budget without mutating process-wide state.
+    pub(crate) static TEST_TRAINING_IO_BUFFER_SIZE: u64;
+}
+
 pub(crate) async fn scan_training_data(
     dataset: &Dataset,
     column: &str,
@@ -137,6 +144,10 @@ pub(crate) async fn scan_training_data(
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
+    #[cfg(test)]
+    if let Ok(io_buffer_size) = TEST_TRAINING_IO_BUFFER_SIZE.try_with(|size| *size) {
+        scan.io_buffer_size(io_buffer_size);
+    }
     // Fragment filtering is now handled in load_training_data function
     // This function just processes the fragments passed to it
 
@@ -578,6 +589,17 @@ pub async fn open_scalar_index(
     plugin
         .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
         .await
+}
+
+pub(crate) async fn cached_scalar_index_container(
+    dataset: &Dataset,
+    uuid: &Uuid,
+) -> Option<Arc<dyn ScalarIndex>> {
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let index_cache = dataset
+        .index_cache
+        .for_index(uuid, frag_reuse_uuid.as_ref());
+    index_cache.get_unsized_with_key(&ScalarIndexCacheKey).await
 }
 
 pub(crate) async fn infer_scalar_index_details(

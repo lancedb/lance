@@ -3048,6 +3048,8 @@ impl Dataset {
             .try_collect::<Vec<()>>()
             .await?;
 
+        rowids::validate_stable_row_ids(self).await?;
+
         // Validate indices
         let indices = self.load_indices().await?;
         self.validate_indices(&indices)?;
@@ -3636,11 +3638,14 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
 
+        let preserves_nullability =
+            !schema_evolution::merge_introduces_required_field(self.schema(), &new_schema);
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Merge {
                 fragments: updated_fragments,
                 schema: new_schema,
+                preserves_nullability,
             },
             None,
         );
