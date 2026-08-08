@@ -602,12 +602,12 @@ impl Cosine for f32 {
             // a plain AVX2 load) and only adds dispatch + eager-collect overhead.
             // Only the larger-dim path routes to AVX-512 on capable hosts — that's
             // where the wider lanes actually pay off.
-            return match dimension {
+            match dimension {
                 8 => Box::new(
                     batch
                         .chunks_exact(8)
                         .map(move |y| f32_baseline::cosine_once_8(x, x_norm, y)),
-                ) as Box<dyn Iterator<Item = f32> + 'a>,
+                ),
                 16 => Box::new(
                     batch
                         .chunks_exact(16)
@@ -619,7 +619,7 @@ impl Cosine for f32 {
                         unsafe {
                             f32::cosine_batch_avx512(x, x_norm, batch, dimension, &mut distances);
                         }
-                        Box::new(distances.into_iter()) as Box<dyn Iterator<Item = f32> + 'a>
+                        Box::new(distances.into_iter())
                     } else {
                         Box::new(
                             batch
@@ -628,7 +628,7 @@ impl Cosine for f32 {
                         )
                     }
                 }
-            };
+            }
         }
 
         // Sub-AVX2 build: select once. Dimension 8 uses an inlined SSE
@@ -673,7 +673,7 @@ impl Cosine for f32 {
                     batch
                         .chunks_exact(dimension)
                         .map(move |y| f32::cosine_once_8(x, x_norm, y)),
-                ) as Box<dyn Iterator<Item = f32> + 'a>,
+                ),
                 16 => Box::new(
                     batch
                         .chunks_exact(dimension)
