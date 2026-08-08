@@ -33,6 +33,14 @@ impl ObjectStoreProvider for FileStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            // Local filesystems have no storage-atomic compare-and-unlink
+            // primitive, so production reference mutations fail closed. The
+            // test utility feature serializes the complete in-process writer
+            // population used by reference integration tests.
+            #[cfg(feature = "test-util")]
+            conditional_delete: Some(super::super::ConditionalDeleteConfig::Serialized),
+            #[cfg(not(feature = "test-util"))]
+            conditional_delete: None,
         })
     }
 

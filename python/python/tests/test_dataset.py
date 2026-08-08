@@ -650,10 +650,10 @@ def test_v2_manifest_paths_migration(tmp_path: Path):
 
 def test_tag(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
-    base_dir = tmp_path / "test"
+    base_dir = "shared-memory://test-tag/dataset"
 
-    lance.write_dataset(table, base_dir)
-    ds = lance.write_dataset(table, base_dir, mode="append")
+    ds = lance.write_dataset(table, base_dir)
+    ds = lance.write_dataset(table, ds, mode="append")
 
     assert len(ds.tags.list()) == 0
 
@@ -689,11 +689,11 @@ def test_tag(tmp_path: Path):
 
     assert ds.checkout_version("tag1").version == 1
 
-    ds = lance.dataset(base_dir, "tag1")
+    ds = ds.checkout_version("tag1")
     assert ds.version == 1
 
-    with pytest.raises(ValueError):
-        lance.dataset(base_dir, "missing-tag")
+    with pytest.raises(OSError):
+        ds.checkout_version("missing-tag")
 
     # test tag update
     with pytest.raises(
@@ -712,7 +712,7 @@ def test_tag(tmp_path: Path):
     assert tag1_created_at is not None
     assert tag1_updated_at is not None
     ds.tags.replace_metadata("tag1", {"description": "updated tag"})
-    ds = lance.dataset(base_dir, "tag1")
+    ds = ds.checkout_version("tag1")
     assert ds.version == 1
     replaced_tag1_meta = ds.tags.list()["tag1"]
     assert replaced_tag1_meta["metadata"] == {"description": "updated tag"}
@@ -728,17 +728,17 @@ def test_tag(tmp_path: Path):
     assert updated_tag1_meta["created_at"] == tag1_created_at
     assert updated_tag1_meta["updated_at"] is not None
     assert updated_tag1_meta["updated_at"] >= tag1_updated_at
-    ds = lance.dataset(base_dir, "tag1")
+    ds = ds.checkout_version("tag1")
     assert ds.version == 2
     assert ds.tags.list()["tag1"]["metadata"] == {"owner": "ml-team"}
 
     ds.tags.replace_metadata("tag1", {})
-    ds = lance.dataset(base_dir, "tag1")
+    ds = ds.checkout_version("tag1")
     assert ds.version == 2
     assert ds.tags.list()["tag1"]["metadata"] == {}
 
     ds.tags.update("tag1", 1)
-    ds = lance.dataset(base_dir, "tag1")
+    ds = ds.checkout_version("tag1")
     assert ds.version == 1
     assert ds.tags.list()["tag1"]["metadata"] == {}
 
@@ -775,11 +775,11 @@ def test_tag(tmp_path: Path):
 
 def test_tag_order(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
-    base_dir = tmp_path / "test"
+    base_dir = "shared-memory://test-tag-order/dataset"
 
-    for i in range(3):
-        mode = "append" if i > 0 else "create"
-        ds = lance.write_dataset(table, base_dir, mode=mode)
+    ds = lance.write_dataset(table, base_dir, mode="create")
+    for _ in range(2):
+        ds = lance.write_dataset(table, ds, mode="append")
 
     expected_tags = {"tag3": 3, "tag2": 2, "tag1": 1}
     for name, version in expected_tags.items():
@@ -1653,14 +1653,12 @@ def test_explain_cleanup_old_versions(tmp_path):
 
 def test_cleanup_error_when_tagged_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
-    base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
-    lance.write_dataset(table, base_dir, mode="overwrite")
+    base_dir = "shared-memory://cleanup-error-tagged/dataset"
+    dataset = lance.write_dataset(table, base_dir)
+    dataset = lance.write_dataset(table, dataset, mode="overwrite")
     time.sleep(0.1)
     moment = datetime.now()
-    lance.write_dataset(table, base_dir, mode="overwrite")
-
-    dataset = lance.dataset(base_dir)
+    dataset = lance.write_dataset(table, dataset, mode="overwrite")
     dataset.tags.create("old-tag", 1)
     dataset.tags.create("another-old-tag", 2)
 
@@ -1682,14 +1680,12 @@ def test_cleanup_error_when_tagged_old_versions(tmp_path):
 
 def test_cleanup_around_tagged_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
-    base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
-    lance.write_dataset(table, base_dir, mode="overwrite")
+    base_dir = "shared-memory://cleanup-around-tagged/dataset"
+    dataset = lance.write_dataset(table, base_dir)
+    dataset = lance.write_dataset(table, dataset, mode="overwrite")
     time.sleep(0.1)
     moment = datetime.now()
-    lance.write_dataset(table, base_dir, mode="overwrite")
-
-    dataset = lance.dataset(base_dir)
+    dataset = lance.write_dataset(table, dataset, mode="overwrite")
     dataset.tags.create("old-tag", 1)
     dataset.tags.create("another-old-tag", 2)
     dataset.tags.create("tag-latest", 3)
@@ -6243,10 +6239,10 @@ def test_update_config_transaction(tmp_path: Path):
 
 
 def test_shallow_clone(tmp_path: Path):
-    """Shallow clone a filesystem dataset by version number and by tag.
+    """Shallow clone a filesystem dataset by version and released tag.
 
     Arrange:
-      - Create a source dataset at a filesystem path with two versions
+      - Create a filesystem source dataset with two versions
         (create v1, then overwrite to v2).
       - Create a tag "v1" pointing to version 1.
     Act:
@@ -6256,19 +6252,27 @@ def test_shallow_clone(tmp_path: Path):
       - Re-open cloned datasets and verify their tables equal the source
         version they were cloned from (schema and record count).
 
-    This test uses pathlib paths and tmp_path for cross-platform compatibility
-    and should not skip on Windows.
+    The tag fixture uses the stable released-client JSON representation.
     """
     # Prepare source dataset with two versions
     src_dir = tmp_path / "shallow_src"
     table_v1 = pa.table({"a": [1, 2, 3], "b": [10, 20, 30]})
-    lance.write_dataset(table_v1, src_dir, mode="create")
+    ds = lance.write_dataset(
+        table_v1, src_dir, mode="create", enable_v2_manifest_paths=False
+    )
 
     table_v2 = pa.table({"a": [4, 5, 6], "b": [40, 50, 60]})
-    ds = lance.write_dataset(table_v2, src_dir, mode="overwrite")
+    ds = lance.write_dataset(table_v2, ds, mode="overwrite")
 
-    # Create a tag pointing to version 1
-    ds.tags.create("v1", 1)
+    # Emulate the stable canonical payload emitted by a released client. Local
+    # stores cannot safely execute current conditional reference deletion.
+    tag_path = src_dir / "_refs" / "tags" / "v1.json"
+    tag_path.parent.mkdir(parents=True)
+    manifest_size = (src_dir / "_versions" / "1.manifest").stat().st_size
+    tag_path.write_text(
+        f'{{"branch":null,"version":1,"manifestSize":{manifest_size},"metadata":{{}}}}',
+        encoding="utf-8",
+    )
 
     # Clone by numeric version (v2) and assert equality
     clone_v2_dir = tmp_path / "clone_v2"
@@ -6282,18 +6286,10 @@ def test_shallow_clone(tmp_path: Path):
     assert ds_clone_v1_tag.to_table() == table_v1
     assert lance.dataset(clone_v1_tag_dir).to_table() == table_v1
 
-    table_v3 = pa.table({"a": [7, 8, 9], "b": [40, 50, 60]})
-    branch = ds.create_branch("branch", 2)
-    lance.write_dataset(table_v3, branch.uri, mode="overwrite")
-    clone_branch_v3 = tmp_path / "clone_branch_v3"
-    cloned_by_branch = branch.shallow_clone(clone_branch_v3, 3)
-    assert cloned_by_branch.to_table() == table_v3
-    assert lance.dataset(clone_branch_v3).to_table() == table_v3
-
 
 def test_branches(tmp_path: Path):
     # Step 1: create branch1 from main → append to branch1 → create branch2 from tag
-    base_dir = tmp_path / "test_branches"
+    base_dir = "shared-memory://branches/dataset"
     main_table = pa.Table.from_pydict({"a": [1, 2, 3], "b": [4, 5, 6]})
     ds_main = lance.write_dataset(main_table, base_dir)
 

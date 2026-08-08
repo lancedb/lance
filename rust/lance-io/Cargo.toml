@@ -41,6 +41,7 @@ tracing.workspace = true
 url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

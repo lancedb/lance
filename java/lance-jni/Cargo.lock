@@ -4103,6 +4103,7 @@ dependencies = [
  "pin-project",
  "prost",
  "rand 0.9.5",
+ "reqwest 0.12.28",
  "serde",
  "tempfile",
  "tokio",

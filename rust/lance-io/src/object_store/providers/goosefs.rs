@@ -190,6 +190,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            conditional_delete: None,
         })
     }
 

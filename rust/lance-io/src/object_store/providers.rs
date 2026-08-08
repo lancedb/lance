@@ -276,6 +276,8 @@ impl ObjectStoreRegistry {
         // Always wrap with IO tracking
         store.inner = store.io_tracker.wrap("", store.inner);
 
+        store.install_conditional_delete_layer();
+
         let store = Arc::new(store);
 
         {

@@ -23,7 +23,7 @@ use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
     StaticCredentialProvider,
     aws::{
-        AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
+        AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
         AwsCredentialProvider,
     },
 };
@@ -31,8 +31,9 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    ConditionalDeleteConfig, DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM,
+    DEFAULT_MAX_IOP_SIZE, ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
     throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
 };
@@ -49,7 +50,7 @@ impl AwsStoreProvider {
         storage_options: &StorageOptions,
         is_s3_express: bool,
         throttle_state: Option<&AimdThrottleState>,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<AmazonS3>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -104,7 +105,7 @@ impl AwsStoreProvider {
 
         builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 
     async fn build_opendal_s3_store(
@@ -179,20 +180,28 @@ impl ObjectStoreProvider for AwsStoreProvider {
             Some(AimdThrottleState::new(throttle_config)?)
         };
 
-        let inner = if use_opendal {
+        let (inner, conditional_delete) = if use_opendal {
             // Use OpenDAL implementation
-            self.build_opendal_s3_store(&base_path, &storage_options)
-                .await?
+            (
+                self.build_opendal_s3_store(&base_path, &storage_options)
+                    .await?,
+                None,
+            )
         } else {
             // Use default Amazon S3 implementation
-            self.build_amazon_s3_store(
-                &mut base_path,
-                params,
-                &storage_options,
-                is_s3_express,
-                throttle_state.as_ref(),
+            let native = self
+                .build_amazon_s3_store(
+                    &mut base_path,
+                    params,
+                    &storage_options,
+                    is_s3_express,
+                    throttle_state.as_ref(),
+                )
+                .await?;
+            (
+                Arc::clone(&native) as Arc<dyn OSObjectStore>,
+                Some(ConditionalDeleteConfig::SignedUrl(native)),
             )
-            .await?
         };
         let inner = if let Some(throttle_state) = throttle_state {
             Arc::new(AimdThrottledStore::new_with_state(
@@ -216,6 +225,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            conditional_delete,
         })
     }
 }

@@ -14,13 +14,14 @@ use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
     RetryConfig,
-    azure::{AzureConfigKey, AzureCredential, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, AzureCredential, MicrosoftAzure, MicrosoftAzureBuilder},
 };
 use url::Url;
 
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    ConditionalDeleteConfig, DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM,
+    DEFAULT_MAX_IOP_SIZE, ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
     throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
 };
@@ -163,7 +164,7 @@ impl AzureBlobStoreProvider {
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
         throttle_state: Option<&AimdThrottleState>,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<MicrosoftAzure>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -190,7 +191,7 @@ impl AzureBlobStoreProvider {
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
         builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 
     fn calculate_object_store_prefix_with_env(
@@ -262,19 +263,27 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             Some(AimdThrottleState::new(throttle_config)?)
         };
 
-        let inner: Arc<dyn OSObjectStore> = if use_opendal {
+        let (inner, conditional_delete) = if use_opendal {
             // OpenDAL Azure intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
-            self.build_opendal_azure_store(&base_path, &storage_options)
-                .await?
-        } else {
-            self.build_microsoft_azure_store(
-                &base_path,
-                &storage_options,
-                accessor,
-                throttle_state.as_ref(),
+            (
+                self.build_opendal_azure_store(&base_path, &storage_options)
+                    .await?,
+                None,
             )
-            .await?
+        } else {
+            let native = self
+                .build_microsoft_azure_store(
+                    &base_path,
+                    &storage_options,
+                    accessor,
+                    throttle_state.as_ref(),
+                )
+                .await?;
+            (
+                Arc::clone(&native) as Arc<dyn OSObjectStore>,
+                Some(ConditionalDeleteConfig::SignedUrl(native)),
+            )
         };
         let inner = if let Some(throttle_state) = throttle_state {
             Arc::new(AimdThrottledStore::new_with_state(
@@ -298,6 +307,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            conditional_delete,
         })
     }
 

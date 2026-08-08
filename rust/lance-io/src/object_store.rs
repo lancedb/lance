@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,9 +24,14 @@ use object_store::DynObjectStore;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
+use object_store::signer::Signer;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, UpdateVersion, path::Path,
+};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -156,6 +161,363 @@ pub struct ObjectStore {
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
+    /// Whether this store can atomically delete one observed object incarnation.
+    conditional_delete: Option<ConditionalDeleteConfig>,
+}
+
+#[derive(Debug, Clone)]
+enum ConditionalDeleteConfig {
+    Serialized,
+    SignedUrl(Arc<dyn Signer>),
+}
+
+/// Result of deleting one object only if its storage identity still matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalDeleteResult {
+    /// The observed object incarnation was deleted.
+    Deleted,
+    /// The object was already absent.
+    NotFound,
+    /// A different object incarnation now occupies the path.
+    IdentityMismatch,
+}
+
+/// Internal marker carried through ordinary object-store wrappers so failure
+/// injection, tracing, and accounting still observe the conditional operation.
+#[derive(Debug, Clone)]
+struct ConditionalDeleteRequest;
+
+static CONDITIONAL_DELETE_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Adds an atomic compare-and-delete operation to stores whose complete writer
+/// population is in this process, such as the in-memory test stores.
+///
+/// The upstream object-store trait has conditional puts but no conditional
+/// delete. Encoding the operation as an implementation-specific put extension
+/// lets it pass through all outer wrappers before this layer performs the
+/// comparison and delete under the same lock used by ordinary mutations.
+#[derive(Debug)]
+struct ConditionalDeleteStore {
+    target: Arc<dyn OSObjectStore>,
+    mutation_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Performs a provider-native conditional DELETE through a short-lived signed
+/// URL. S3, GCS, and Azure all enforce `If-Match` at the deletion linearization
+/// point, including against writers using older Lance clients.
+#[derive(Debug)]
+struct SignedConditionalDeleteStore {
+    target: Arc<dyn OSObjectStore>,
+    signer: Arc<dyn Signer>,
+    client: reqwest::Client,
+}
+
+impl SignedConditionalDeleteStore {
+    fn new(target: Arc<dyn OSObjectStore>, signer: Arc<dyn Signer>) -> Self {
+        Self {
+            target,
+            signer,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for SignedConditionalDeleteStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SignedConditionalDeleteStore({})", self.target)
+    }
+}
+
+#[async_trait]
+impl OSObjectStore for SignedConditionalDeleteStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if opts.extensions.get::<ConditionalDeleteRequest>().is_some() {
+            let PutMode::Update(expected) = &opts.mode else {
+                return Err(ConditionalDeleteStore::precondition_error(
+                    location,
+                    "conditional delete requires an observed object identity",
+                ));
+            };
+            let Some(e_tag) = expected.e_tag.as_ref() else {
+                return Err(object_store::Error::NotSupported {
+                    source: std::io::Error::other(
+                        "signed conditional delete requires an object ETag",
+                    )
+                    .into(),
+                });
+            };
+            let url = self
+                .signer
+                .signed_url(reqwest::Method::DELETE, location, Duration::from_secs(300))
+                .await?;
+            let response = self
+                .client
+                .delete(url)
+                .header(reqwest::header::IF_MATCH, e_tag)
+                .send()
+                .await
+                .map_err(|source| object_store::Error::Generic {
+                    store: "signed conditional delete",
+                    source: source.into(),
+                })?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(PutResult {
+                    e_tag: None,
+                    version: None,
+                });
+            }
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "object is already absent",
+                    )
+                    .into(),
+                });
+            }
+            if status == reqwest::StatusCode::PRECONDITION_FAILED
+                || status == reqwest::StatusCode::CONFLICT
+            {
+                return Err(ConditionalDeleteStore::precondition_error(
+                    location,
+                    "object identity changed before conditional delete",
+                ));
+            }
+            Err(object_store::Error::Generic {
+                store: "signed conditional delete",
+                source: std::io::Error::other(format!(
+                    "conditional delete for {location} failed with HTTP status {status}"
+                ))
+                .into(),
+            })
+        } else {
+            self.target.put_opts(location, payload, opts).await
+        }
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.target.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.target.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: RenameOptions,
+    ) -> object_store::Result<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+impl ConditionalDeleteStore {
+    fn new(target: Arc<dyn OSObjectStore>, store_prefix: &str) -> Self {
+        let mutation_lock = CONDITIONAL_DELETE_LOCKS
+            .lock()
+            .expect("conditional delete lock registry poisoned")
+            .entry(store_prefix.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        Self {
+            target,
+            mutation_lock,
+        }
+    }
+
+    fn precondition_error(path: &Path, message: &'static str) -> object_store::Error {
+        object_store::Error::Precondition {
+            path: path.to_string(),
+            source: std::io::Error::other(message).into(),
+        }
+    }
+
+    fn metadata_matches(metadata: &ObjectMeta, expected: &UpdateVersion) -> bool {
+        let has_identity = expected.e_tag.is_some() || expected.version.is_some();
+        has_identity
+            && expected
+                .e_tag
+                .as_ref()
+                .is_none_or(|e_tag| metadata.e_tag.as_ref() == Some(e_tag))
+            && expected
+                .version
+                .as_ref()
+                .is_none_or(|version| metadata.version.as_ref() == Some(version))
+    }
+}
+
+impl std::fmt::Display for ConditionalDeleteStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConditionalDeleteStore({})", self.target)
+    }
+}
+
+#[async_trait]
+impl OSObjectStore for ConditionalDeleteStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let _guard = self.mutation_lock.lock().await;
+        if opts.extensions.get::<ConditionalDeleteRequest>().is_some() {
+            let PutMode::Update(expected) = &opts.mode else {
+                return Err(Self::precondition_error(
+                    location,
+                    "conditional delete requires an observed object identity",
+                ));
+            };
+            let metadata = match self.target.head(location).await {
+                Ok(metadata) => metadata,
+                Err(object_store::Error::NotFound { .. }) => {
+                    return Err(object_store::Error::NotFound {
+                        path: location.to_string(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "object is already absent",
+                        )
+                        .into(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            if !Self::metadata_matches(&metadata, expected) {
+                return Err(Self::precondition_error(
+                    location,
+                    "object identity changed before conditional delete",
+                ));
+            }
+            self.target.delete(location).await?;
+            return Ok(PutResult {
+                e_tag: None,
+                version: None,
+            });
+        }
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.target.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let target = Arc::clone(&self.target);
+        let mutation_lock = Arc::clone(&self.mutation_lock);
+        locations
+            .then(move |location| {
+                let target = Arc::clone(&target);
+                let mutation_lock = Arc::clone(&mutation_lock);
+                async move {
+                    let location = location?;
+                    let _guard = mutation_lock.lock().await;
+                    target.delete(&location).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> object_store::Result<()> {
+        let _guard = self.mutation_lock.lock().await;
+        self.target.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: RenameOptions,
+    ) -> object_store::Result<()> {
+        let _guard = self.mutation_lock.lock().await;
+        self.target.rename_opts(from, to, opts).await
+    }
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -522,6 +884,7 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
+                conditional_delete: None,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -581,11 +944,13 @@ impl ObjectStore {
     /// Create a in-memory object store directly for testing.
     pub fn memory() -> Self {
         let provider = MemoryStoreProvider;
-        provider
+        let mut store = provider
             .new_store(Url::parse("memory:///").unwrap(), &Default::default())
             .now_or_never()
             .unwrap()
-            .unwrap()
+            .unwrap();
+        store.install_conditional_delete_layer();
+        store
     }
 
     /// Returns true if the object store pointed to a local file system.
@@ -610,6 +975,66 @@ impl ObjectStore {
 
     pub fn scheme(&self) -> &str {
         &self.scheme
+    }
+
+    fn install_conditional_delete_layer(&mut self) {
+        match self.conditional_delete.clone() {
+            Some(ConditionalDeleteConfig::Serialized) => {
+                self.inner = Arc::new(ConditionalDeleteStore::new(
+                    Arc::clone(&self.inner),
+                    &self.store_prefix,
+                ));
+            }
+            Some(ConditionalDeleteConfig::SignedUrl(signer)) => {
+                self.inner = Arc::new(SignedConditionalDeleteStore::new(
+                    Arc::clone(&self.inner),
+                    signer,
+                ));
+            }
+            None => {}
+        }
+    }
+
+    /// Whether this store can atomically remove one observed object incarnation.
+    pub fn supports_conditional_delete(&self) -> bool {
+        self.conditional_delete.is_some()
+    }
+
+    /// Delete `path` only if it still has the identity in `metadata`.
+    pub async fn delete_if_matches(
+        &self,
+        path: &Path,
+        expected: &UpdateVersion,
+    ) -> Result<ConditionalDeleteResult> {
+        if self.conditional_delete.is_none() {
+            return Err(Error::not_supported(format!(
+                "object store {} does not support atomic conditional delete for {path}",
+                self.scheme
+            )));
+        }
+        if expected.e_tag.is_none() && expected.version.is_none() {
+            return Err(Error::not_supported(format!(
+                "object store {} did not provide an identity for conditional delete of {path}",
+                self.scheme
+            )));
+        }
+        let mut options = PutOptions {
+            mode: PutMode::Update(expected.clone()),
+            ..Default::default()
+        };
+        options.extensions.insert(ConditionalDeleteRequest);
+        match self
+            .inner
+            .put_opts(path, Bytes::new().into(), options)
+            .await
+        {
+            Ok(_) => Ok(ConditionalDeleteResult::Deleted),
+            Err(object_store::Error::NotFound { .. }) => Ok(ConditionalDeleteResult::NotFound),
+            Err(object_store::Error::Precondition { .. }) => {
+                Ok(ConditionalDeleteResult::IdentityMismatch)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn block_size(&self) -> usize {
@@ -1226,6 +1651,7 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            conditional_delete: None,
         }
     }
 }
@@ -1323,6 +1749,52 @@ mod tests {
         assert!(
             store.io_parallelism() >= 1,
             "the configured default parallelism must be at least 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conditional_delete_preserves_newer_incarnation() {
+        let store = ObjectStore::memory();
+        let path = Path::from("conditional-delete");
+        store.put(&path, b"first").await.unwrap();
+        let first = store.inner.head(&path).await.unwrap();
+
+        store.put(&path, b"second").await.unwrap();
+        let stale_identity = UpdateVersion {
+            e_tag: first.e_tag,
+            version: first.version,
+        };
+        assert_eq!(
+            store
+                .delete_if_matches(&path, &stale_identity)
+                .await
+                .unwrap(),
+            ConditionalDeleteResult::IdentityMismatch
+        );
+        assert_eq!(
+            store.read_one_all(&path).await.unwrap(),
+            b"second".as_slice()
+        );
+
+        let second = store.inner.head(&path).await.unwrap();
+        let current_identity = UpdateVersion {
+            e_tag: second.e_tag,
+            version: second.version,
+        };
+        assert_eq!(
+            store
+                .delete_if_matches(&path, &current_identity)
+                .await
+                .unwrap(),
+            ConditionalDeleteResult::Deleted
+        );
+        assert!(!store.exists(&path).await.unwrap());
+        assert_eq!(
+            store
+                .delete_if_matches(&path, &current_identity)
+                .await
+                .unwrap(),
+            ConditionalDeleteResult::NotFound
         );
     }
 
