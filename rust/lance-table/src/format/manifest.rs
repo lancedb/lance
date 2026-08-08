@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
+use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -275,8 +276,11 @@ impl Manifest {
             index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            // Not derivable from the manifest, so it would be lost like any
+            // other zeroed word -- and a clone of a table that requires index
+            // catch-up would silently come back as legacy.
+            reader_feature_flags: self.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            writer_feature_flags: self.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,

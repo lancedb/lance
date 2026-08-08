@@ -89,7 +89,9 @@ use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{
+    IndexCatchupAdvance, Operation, Transaction, TransactionBuilder,
+};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
@@ -100,6 +102,7 @@ use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_in
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
+use lance_table::system_index::mem_wal::CompactedSsTable;
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     if segments.is_empty() {
@@ -1431,6 +1434,53 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 }
 
+/// Describe, for each index this commit republishes, the segments it will
+/// consist of afterwards and the catch-up generations to record for it.
+///
+/// Built here rather than by the caller: an advance must name the exact segments
+/// it describes, and those do not exist until the merge runs. The final segment
+/// set for a name is what survives the `CreateIndex` apply -- the existing
+/// segments this commit neither removes nor replaces, plus the ones it adds.
+fn build_index_catchup_advances(
+    existing: &[IndexMetadata],
+    new_indices: &[IndexMetadata],
+    removed_indices: &[IndexMetadata],
+    generations: &[CompactedSsTable],
+    inspected_fragments: &RoaringBitmap,
+) -> Vec<IndexCatchupAdvance> {
+    let replaced: HashSet<Uuid> = removed_indices
+        .iter()
+        .chain(new_indices.iter())
+        .map(|idx| idx.uuid)
+        .collect();
+
+    new_indices
+        .iter()
+        .map(|added| &added.name)
+        .unique()
+        .map(|name| {
+            let segments: Vec<&IndexMetadata> = existing
+                .iter()
+                .filter(|idx| &idx.name == name && !replaced.contains(&idx.uuid))
+                .chain(new_indices.iter().filter(|idx| &idx.name == name))
+                .collect();
+            let mut expected_fragment_bitmap = RoaringBitmap::new();
+            for segment in &segments {
+                if let Some(bitmap) = segment.fragment_bitmap.as_ref() {
+                    expected_fragment_bitmap |= bitmap;
+                }
+            }
+            IndexCatchupAdvance {
+                index_name: name.clone(),
+                expected_index_segment_uuids: segments.iter().map(|s| s.uuid).collect(),
+                caught_up_generations: generations.to_vec(),
+                expected_fragment_bitmap,
+                inspected_fragments: inspected_fragments.clone(),
+            }
+        })
+        .collect()
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
@@ -2081,6 +2131,7 @@ impl DatasetIndexExt for Dataset {
     }
 
     #[instrument(skip_all)]
+
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
@@ -2142,12 +2193,35 @@ impl DatasetIndexExt for Dataset {
             return Ok(());
         }
 
+        // Built here rather than by the caller: an advance must name the exact
+        // segments it describes, and those only exist now. Recording it in this
+        // commit is what keeps the index result and its catch-up from
+        // disagreeing.
+        let mem_wal_index_catchup_advances = if options.mem_wal_index_catchup.is_empty() {
+            Vec::new()
+        } else {
+            build_index_catchup_advances(
+                &indices,
+                &new_indices,
+                &removed_indices,
+                &options.mem_wal_index_catchup,
+                // The table as this call read it; anything appended since is a
+                // later catch-up gap, not something these generations claim.
+                &self
+                    .manifest
+                    .fragments
+                    .iter()
+                    .map(|f| f.id as u32)
+                    .collect(),
+            )
+        };
+
         let transaction = TransactionBuilder::new(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
-                mem_wal_index_catchup_advances: Vec::new(),
+                mem_wal_index_catchup_advances,
             },
         )
         .transaction_properties(options.transaction_properties.clone())

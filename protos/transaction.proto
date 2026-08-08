@@ -106,6 +106,15 @@ message Transaction {
       // UUID, so a claim made before the prune would still match. The commit
       // fails unless the published segments cover exactly these fragments.
       bytes expected_fragment_bitmap = 4;
+
+      // Serialized roaring bitmap: every fragment live in the table when the
+      // repair inspected it. The index must cover all of them, which is what
+      // ties the claim to the generations it names -- there is no mapping from
+      // a generation to the fragments its rows landed in, so covering the whole
+      // inspected table is how the repair shows it covered those rows.
+      // Fragments appended after that snapshot are a later catch-up gap and are
+      // not required.
+      bytes inspected_fragments = 5;
     }
 
     // Empty for every ordinary index operation. Creating, reindexing,

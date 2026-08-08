@@ -496,7 +496,7 @@ pub trait DatasetMemWalExt {
     /// already retired SSTables against a recorded catch-up cannot go back to
     /// treating missing coverage as caught up. Calling it on an already-active
     /// table succeeds and changes nothing.
-    async fn require_mem_wal_index_catchup(&self) -> Result<()> {
+    async fn require_mem_wal_index_catchup(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -580,7 +580,7 @@ impl DatasetMemWalExt for Dataset {
         load_mem_wal_index_details(index_meta).map(Some)
     }
 
-    async fn require_mem_wal_index_catchup(&self) -> Result<()> {
+    async fn require_mem_wal_index_catchup(&mut self) -> Result<()> {
         if self.load_index_by_name(MEM_WAL_INDEX_NAME).await?.is_none() {
             return Err(Error::invalid_input(
                 "Cannot require MemWAL index catch-up: MemWAL is not initialized on \
@@ -596,7 +596,9 @@ impl DatasetMemWalExt for Dataset {
             },
             None,
         );
-        CommitBuilder::new(Arc::new(self.clone()))
+        // Assigned back: leaving the receiver on the pre-activation manifest
+        // would report success while `self` still reads as legacy.
+        *self = CommitBuilder::new(Arc::new(self.clone()))
             .execute(transaction)
             .await?;
         Ok(())

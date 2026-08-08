@@ -346,6 +346,8 @@ What an absent entry means depends on the `FLAG_MEM_WAL_INDEX_CATCHUP` feature b
 - **Without the bit**, a shard absent from `index_catchup` for an index means that index is assumed fully caught up for the shard.
 - **With the bit**, absence means the opposite: the index is *not* known to have caught up, so the shard's SSTables must be retained until some commit records that it has.
 
+A commit records catch-up by attaching an `IndexCatchupAdvance` to the index operation that publishes the work, so the index result and the position recorded for it land together. The advance names the index, the exact segments it expects that index to consist of, the fragments those segments covered when it inspected them, and every fragment live in the table at that moment. The commit fails unless the published segments match all three, which is what ties the recorded generations to an index that actually covers them — nothing maps a generation to the fragments its rows landed in. Fragments appended after the repair's snapshot are a later catch-up gap and are not required.
+
 Setting the bit is one-way. Once SSTables have stopped being served against a recorded catch-up position, reading absence as "caught up" again could drop rows that only those SSTables still hold, so the bit is never cleared as a rollback. Writers must also hold the bit: a writer that does not maintain `index_catchup` can change an index without withdrawing the position recorded for it, leaving a position that no longer describes the index it names.
 
 Shard snapshots, when present, use the following Lance file schema:

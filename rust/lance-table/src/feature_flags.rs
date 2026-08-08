@@ -56,6 +56,26 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
+    // Carried across the reset. This bit is not derivable from the manifest --
+    // it depends on the `__lance_mem_wal` index details, which a manifest only
+    // points at -- and this function runs twice per commit: once in
+    // `build_manifest` and again in `write_manifest_file`. Dropping it here
+    // would clear it immediately before the write, so an activated table would
+    // report success and stay legacy.
+    //
+    // Only a consistent state carries: one bit set is neither mode, and
+    // `inherit_mem_wal_index_catchup` refuses it at the boundary where a
+    // manifest is derived from another. Reaching here half-set means the
+    // manifest was already written that way, so leave it for the reader check
+    // rather than silently completing it.
+    let mem_wal_index_catchup = if manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
+        && manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
+    {
+        FLAG_MEM_WAL_INDEX_CATCHUP
+    } else {
+        0
+    };
+
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -114,19 +134,20 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
 
+    manifest.reader_feature_flags |= mem_wal_index_catchup;
+    manifest.writer_feature_flags |= mem_wal_index_catchup;
+
     Ok(())
 }
 
 /// Carry [`FLAG_MEM_WAL_INDEX_CATCHUP`] from the manifest a new one is derived
 /// from.
 ///
-/// This bit cannot be derived like the others: it depends on the
-/// `__lance_mem_wal` index details, and a manifest carries only a byte offset to
-/// its index section. It also cannot be preserved inside
-/// [`apply_feature_flags`], which sees only the destination -- and
-/// `Manifest::new_from_previous` zeroes both feature words before that runs, so
-/// reading them there always yields zero and every ordinary commit would
-/// silently downgrade the table to legacy semantics.
+/// [`apply_feature_flags`] carries this bit across its own reset, but it only
+/// ever sees one manifest. It cannot help where a *new* manifest is derived from
+/// an existing one -- `Manifest::new_from_previous` and `shallow_clone` both
+/// zero the feature words -- because the destination starts with nothing to
+/// carry. That transition is this function's job.
 ///
 /// A half-set state is refused rather than normalized: one bit set means a
 /// legacy reader or a legacy writer is still permitted, which is neither mode.
@@ -189,6 +210,24 @@ pub fn can_write_dataset(writer_flags: u64) -> bool {
 
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
     writer_flags & FLAG_USE_V2_FORMAT_DEPRECATED != 0
+}
+
+/// Refuse a manifest whose MemWAL index-catchup bits disagree.
+///
+/// One word set and the other not is neither mode: it would let a legacy reader
+/// or a legacy writer through on a table where the other half is enforcing. The
+/// commit path refuses to *produce* this, so seeing it on read means the
+/// manifest was written by something that did not.
+pub fn validate_mem_wal_index_catchup_flags(manifest: &Manifest) -> Result<()> {
+    let reader = manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
+    let writer = manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
+    if reader != writer {
+        return Err(Error::invalid_input(
+            "Manifest has only one of the MemWAL index-catchup reader and writer \
+             feature bits set, so its catch-up semantics are undefined",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -393,12 +432,31 @@ mod tests {
     }
 
     #[test]
-    fn apply_feature_flags_does_not_carry_the_mem_wal_bit() {
-        // It only ever sees the destination, whose words are already zeroed, so
-        // inheriting is `inherit_mem_wal_index_catchup`'s job, not its own.
+    fn apply_feature_flags_carries_the_mem_wal_bit_across_its_reset() {
+        // It runs twice per commit -- `build_manifest` and `write_manifest_file`
+        // -- so dropping the bit here would clear it immediately before the
+        // write, and an activated table would report success and stay legacy.
         let mut manifest = empty_manifest();
         manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
         manifest.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_ne!(
+            manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0
+        );
+    }
+
+    #[test]
+    fn apply_feature_flags_drops_a_half_set_mem_wal_bit() {
+        // Neither mode, so leave it for the reader check rather than completing it.
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
 
         apply_feature_flags(&mut manifest, false, false).unwrap();
 
