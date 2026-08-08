@@ -2229,9 +2229,14 @@ impl Transaction {
         Ok(())
     }
 
-    /// Require a coverage-only advance to name an index that spans every live
-    /// fragment. Such a commit publishes no index work of its own, so without
-    /// this an incomplete or untrained index could be handed a coverage claim.
+    /// Reject a coverage-only advance whose target index cannot back any claim.
+    ///
+    /// Such a commit publishes no index work of its own, so an untrained or
+    /// empty index would otherwise be handed a coverage claim. What it does
+    /// *not* check is that the index spans the whole table: the claim is only
+    /// about generations already compacted, and fragments appended since are a
+    /// later catch-up gap. Requiring full coverage would fail every repair on a
+    /// table still taking writes.
     fn validate_coverage_only_target(
         index_name: &str,
         segments: &[IndexMetadata],
@@ -2248,14 +2253,13 @@ impl Transaction {
             };
             covered |= bitmap;
         }
-        // `covered` is already clipped to the live set, so equality means the
-        // index spans all of it.
-        if &covered != live_fragments {
+        // An index covering nothing that still exists has indexed nothing a
+        // reader could use, so it cannot stand in for the SSTables.
+        if covered.is_empty() && !live_fragments.is_empty() {
             return Err(Error::invalid_input(format!(
-                "Cannot advance coverage for index {}: it covers {} of the {} live \
-                 fragments, so it cannot stand in for the SSTables",
+                "Cannot advance coverage for index {}: it covers none of the {} live \
+                 fragments",
                 index_name,
-                covered.len(),
                 live_fragments.len()
             )));
         }
@@ -8153,10 +8157,13 @@ mod tests {
         }
 
         #[test]
-        fn a_coverage_only_advance_requires_the_index_to_span_the_table() {
+        fn a_coverage_only_advance_survives_a_concurrent_append() {
             let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
             let before = table(shard, 10, "vec_idx", 5, uuid);
             let mut after = before.clone();
+            // The index spans the table the repair read; fragment 1 landed while
+            // the repair ran. A table still taking writes always looks like this,
+            // and the claim is only about generations already compacted.
             after[0].fragment_bitmap = Some(RoaringBitmap::from_iter([0u32]));
 
             let advance = IndexCatchupAdvance {
@@ -8165,6 +8172,37 @@ mod tests {
                 caught_up_generations: vec![CompactedSsTable::new(shard, 9)],
             };
             let fragments = vec![Fragment::new(0), Fragment::new(1)];
+            Transaction::apply_mem_wal_index_coverage(
+                &mut after,
+                &fragments,
+                &segments_before(&before),
+                &[advance],
+                true,
+                true,
+                2,
+            )
+            .unwrap();
+
+            assert_eq!(
+                coverage_for(&after, "vec_idx"),
+                Some(vec![CompactedSsTable::new(shard, 9)])
+            );
+        }
+
+        #[test]
+        fn a_coverage_only_advance_rejects_an_index_covering_nothing_live() {
+            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
+            let before = table(shard, 10, "vec_idx", 5, uuid);
+            let mut after = before.clone();
+            // Declared but never trained, or covering only fragments since gone.
+            after[0].fragment_bitmap = Some(RoaringBitmap::new());
+
+            let advance = IndexCatchupAdvance {
+                index_name: "vec_idx".to_string(),
+                expected_index_segment_uuids: vec![uuid],
+                caught_up_generations: vec![CompactedSsTable::new(shard, 9)],
+            };
+            let fragments = vec![Fragment::new(0)];
             let err = Transaction::apply_mem_wal_index_coverage(
                 &mut after,
                 &fragments,
@@ -8176,7 +8214,7 @@ mod tests {
             )
             .unwrap_err();
 
-            assert!(err.to_string().contains("live fragments"), "{err}");
+            assert!(err.to_string().contains("covers none"), "{err}");
         }
 
         #[test]
