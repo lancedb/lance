@@ -2471,16 +2471,25 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> ObjectStoreResult<GetResult> {
-            if location.as_ref().contains("/_refs/catalog/")
-                && self
+            if location.as_ref().contains("/_refs/catalog/") && {
+                let mut remaining = self
                     .remaining_catalog_get_failures
-                    .try_update(
+                    .load(AtomicOrdering::SeqCst);
+                loop {
+                    let Some(next) = remaining.checked_sub(1) else {
+                        break false;
+                    };
+                    match self.remaining_catalog_get_failures.compare_exchange_weak(
+                        remaining,
+                        next,
                         AtomicOrdering::SeqCst,
                         AtomicOrdering::SeqCst,
-                        |remaining| remaining.checked_sub(1),
-                    )
-                    .is_ok()
-            {
+                    ) {
+                        Ok(_) => break true,
+                        Err(actual) => remaining = actual,
+                    }
+                }
+            } {
                 return Err(ObjectStoreError::NotFound {
                     path: location.to_string(),
                     source: "catalog was compacted before GET".into(),
