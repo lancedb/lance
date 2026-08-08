@@ -127,6 +127,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 
 ## Pull Requests
 
+- Before creating a PR, search for similar PRs and inspect any PRs linked to the issue being addressed. If a matching PR exists, verify its current status and scope before proceeding to avoid creating duplicate work.
 - PR titles must follow the Conventional Commits specification because `.github/workflows/pr-title.yml` validates the PR title and body with commitlint. Use prefixes like `feat:`, `fix:`, `docs:`, `perf:`, `ci:`, `test:`, `build:`, `style:`, or `chore:`; add a scope when useful.
 - Before creating or updating a PR, run the lint checks for every touched language surface, even when they are expensive. For Rust changes, run `cargo fmt --all` and `cargo clippy --all --tests --benches -- -D warnings`. For Python changes, follow the environment workflow in `python/AGENTS.md` and run `uv run make lint` from `python/`. If a required lint check cannot be run, state the blocker explicitly in the PR summary.
 

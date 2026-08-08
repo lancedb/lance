@@ -148,9 +148,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "approx"
@@ -1685,7 +1685,7 @@ dependencies = [
  "crc",
  "digest 0.10.7",
  "rustversion",
- "spin 0.10.0",
+ "spin 0.10.1",
 ]
 
 [[package]]
@@ -2666,7 +2666,6 @@ version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
- "powerfmt",
  "serde_core",
 ]
 
@@ -2958,11 +2957,10 @@ checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -3104,7 +3102,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -4424,7 +4422,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4527,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4576,7 +4574,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrayref",
  "bitpacking",
@@ -4587,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4630,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4663,7 +4661,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4682,7 +4680,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4691,7 +4689,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4726,7 +4724,6 @@ dependencies = [
  "rand_xoshiro",
  "rstest",
  "serial_test",
- "strum 0.26.3",
  "test-log",
  "tokio",
  "tracing",
@@ -4736,7 +4733,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4762,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4803,7 +4800,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4817,7 +4814,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4896,7 +4893,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4918,7 +4915,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4962,7 +4959,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4983,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4995,7 +4992,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5011,7 +5008,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5050,7 +5047,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "time",
  "tokio",
  "tower",
  "tower-http 0.5.2",
@@ -5075,7 +5071,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5093,7 +5089,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5103,6 +5099,7 @@ dependencies = [
  "async-trait",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",
@@ -5139,7 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5148,7 +5145,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5161,7 +5158,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -5174,7 +5171,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "10.1.0-beta.2"
+version = "11.0.0-beta.3"
 dependencies = [
  "clap",
  "lance-core",
@@ -5191,7 +5188,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin 0.9.8",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -5300,8 +5297,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "strum 0.28.0",
- "strum_macros 0.28.0",
+ "strum",
+ "strum_macros",
  "unicode-blocks",
  "unicode-normalization",
  "unicode-segmentation",
@@ -5330,8 +5327,8 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
- "strum 0.28.0",
- "strum_macros 0.28.0",
+ "strum",
+ "strum_macros",
  "thiserror 2.0.18",
 ]
 
@@ -5531,9 +5528,9 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "memmap2"
-version = "0.9.10"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
@@ -6842,7 +6839,7 @@ dependencies = [
  "nix",
  "once_cell",
  "smallvec",
- "spin 0.10.0",
+ "spin 0.10.1",
  "symbolic-demangle",
  "tempfile",
  "thiserror 2.0.18",
@@ -7776,9 +7773,9 @@ dependencies = [
 
 [[package]]
 name = "rkyv"
-version = "0.8.16"
+version = "0.8.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73389e0c99e664f919275ab5b5b0471391fe9a8de61e1dff9b1eaf56a90f16e3"
+checksum = "815cc8a37159a463064825246cadb07961e25cd9885908606f6d08a98d8f8874"
 dependencies = [
  "bytecheck",
  "bytes",
@@ -7795,9 +7792,9 @@ dependencies = [
 
 [[package]]
 name = "rkyv_derive"
-version = "0.8.16"
+version = "0.8.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2ed0b54125315fb36bd021e82d314d1c126548f871634b483f46b31d13cac6"
+checksum = "c0ed1a78a1b19d184b0daa629dd9a024573173ec7d485b287cb369fb3607cc1c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8555,15 +8552,15 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spin"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 dependencies = [
  "lock_api",
 ]
@@ -8688,33 +8685,11 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
-dependencies = [
- "strum_macros 0.26.4",
-]
-
-[[package]]
-name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
 dependencies = [
- "strum_macros 0.28.0",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "rustversion",
- "syn 2.0.119",
+ "strum_macros",
 ]
 
 [[package]]
@@ -8897,7 +8872,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -9012,12 +8987,11 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.47"
+version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
- "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
@@ -9027,15 +9001,15 @@ dependencies = [
 
 [[package]]
 name = "time-core"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
+checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.27"
+version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
+checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
