@@ -3710,6 +3710,14 @@ def test_fts_backward_v0_27_0(tmp_path: Path):
         "frodo was a happy puppy",
     }
 
+    # Requiring both disjoint terms advances "happy" past its final document while
+    # "tail" remains live. Legacy WAND must terminate without reading the exhausted
+    # posting.
+    results = ds.to_table(
+        full_text_query=MatchQuery("happy tail", "text", operator=FullTextOperator.AND)
+    )
+    assert results.num_rows == 0
+
     data = pa.table(
         {
             "text": [

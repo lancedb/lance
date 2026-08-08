@@ -3048,6 +3048,8 @@ impl Dataset {
             .try_collect::<Vec<()>>()
             .await?;
 
+        rowids::validate_stable_row_ids(self).await?;
+
         // Validate indices
         let indices = self.load_indices().await?;
         self.validate_indices(&indices)?;
@@ -3316,7 +3318,7 @@ impl Dataset {
                     external_file.path
                 )));
             }
-            for data_file in fragment.files.iter() {
+            for data_file in fragment.referenced_lance_files() {
                 let base_root = if let Some(base_id) = data_file.base_id {
                     let base_path =
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {
@@ -3636,11 +3638,14 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
 
+        let preserves_nullability =
+            !schema_evolution::merge_introduces_required_field(self.schema(), &new_schema);
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::Merge {
                 fragments: updated_fragments,
                 schema: new_schema,
+                preserves_nullability,
             },
             None,
         );
@@ -3990,7 +3995,7 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
-    mut transaction: Option<&Transaction>,
+    transaction: Option<lance_table::format::Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
@@ -4016,7 +4021,7 @@ pub(crate) async fn write_manifest_file(
             object_store,
             write_manifest_file_to_path,
             naming_scheme,
-            transaction.take().map(|tx| tx.into()),
+            transaction,
         )
         .await
 }

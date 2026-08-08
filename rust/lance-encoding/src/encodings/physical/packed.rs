@@ -447,7 +447,7 @@ impl FieldAccumulator {
     // In full-zip variable packed decoding, rep/def may produce a visible row
     // with an empty payload (e.g. null/invalid item). We still need to append
     // one placeholder per child so child row counts remain aligned.
-    fn append_empty(&mut self) {
+    fn append_empty(&mut self) -> Result<()> {
         match self {
             Self::Fixed {
                 builder,
@@ -563,7 +563,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
             }
             if row_start == row_end {
                 for accumulator in accumulators.iter_mut() {
-                    accumulator.append_empty();
+                    accumulator.append_empty()?;
                 }
                 continue;
             }
@@ -592,7 +592,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.append(&value_block, 0..1);
+                        builder.append(&value_block, 0..1)?;
                         cursor = end;
                     }
                     (
@@ -631,7 +631,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.append(&value_block, 0..1);
+                        builder.append(&value_block, 0..1)?;
                         cursor = value_end;
                     }
                     (
@@ -670,7 +670,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.append(&value_block, 0..1);
+                        builder.append(&value_block, 0..1)?;
                         cursor = value_end;
                     }
                     _ => {

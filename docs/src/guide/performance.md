@@ -141,7 +141,7 @@ Keys are often a composite of multiple fields and all keys are scoped to the dat
 | Deletion Files    | Dataset URI, fragment_id, version, id, file_type | The deletion vector for a frag      |
 | Row Id Mask       | Dataset URI, version                             | The row id sequence for the dataset |
 | Row Id Index      | Dataset URI, version                             | The row id index for the dataset    |
-| Row Id Sequence   | Dataset URI, fragment_id                         | The row id sequence for a fragment  |
+| Row Id Sequence   | Dataset URI, fragment_id, row_id_meta            | The row id sequence for a fragment  |
 | Index Metadata    | Dataset URI, version                             | The index metadata for the dataset  |
 | Index Details¹    | Dataset URI, index uuid                          | The index details for an index      |
 | File Global Meta  | Dataset URI, file path                           | The global metadata for a file      |

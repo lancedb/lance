@@ -750,6 +750,14 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """Mark MemWAL SSTables as compacted into the base table.
 
         Call this before executing merge_insert when it compacts MemWAL SSTables.
+        The progress is recorded in the same commit as the data.
+
+        For multi-pass compaction, call this only on the final successful
+        data-changing pass. Intermediate passes must not carry compaction
+        progress. Lance cannot tell whether a caller has another pass planned,
+        so it cannot enforce this: if a delete pass carried the marker and the
+        process then died before the matching upsert, the recorded progress
+        would claim rows were copied in that never were.
 
         Parameters
         ----------
@@ -5592,6 +5600,21 @@ class SqlQueryBuilder:
         self._builder = self._builder.with_row_addr(with_row_addr)
         return self
 
+    def blob_handling(
+        self,
+        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
+    ) -> "SqlQueryBuilder":
+        """
+        Control how blob columns are returned by this SQL query.
+
+        - ``"all_binary"`` materializes blob columns as binary values.
+        - ``"blobs_descriptions"`` returns blob descriptors (the default).
+        - ``"all_descriptions"`` returns descriptions for all binary-like
+          columns.
+        """
+        self._builder = self._builder.blob_handling(blob_handling)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
@@ -5793,7 +5816,13 @@ class LanceOperation:
         new_schema: pyarrow.Schema
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
-            The fragments that make up the new dataset.
+            The newly written fragments that make up the new dataset. They are
+            assigned fresh ids when the operation is committed, continuing from
+            the highest id the dataset has ever used, so any id they carry is
+            ignored. Since we reassign fragment ids, a fragment with a deletion
+            file is rejected: use :class:`LanceOperation.Delete` to commit
+            deletions, or :class:`LanceOperation.Merge` to change the schema of
+            existing fragments.
         initial_bases: list[DatasetBasePath], optional
             Base paths to register when creating a new dataset (CREATE mode only).
             **Only valid in CREATE mode**. Will raise an error if used with
@@ -6003,6 +6032,14 @@ class LanceOperation:
         schema: LanceSchema or pyarrow.Schema
             The schema of the new dataset. Passing a LanceSchema is preferred,
             and passing a pyarrow.Schema is deprecated.
+        preserves_nullability: bool
+            True when this merge makes no nullability-affecting schema change:
+            it introduces no field that data staged against an earlier schema
+            could not safely omit. Without the assertion (the default) the
+            merge conservatively conflicts with concurrent appends, whose
+            fragments would omit new columns and read as null; that can only
+            cause a retry. Pass True when every column this merge introduces
+            is nullable to let concurrent appends commit without conflict.
 
         Warning
         -------
@@ -6048,6 +6085,7 @@ class LanceOperation:
 
         fragments: Iterable[FragmentMetadata]
         schema: LanceSchema | pa.Schema
+        preserves_nullability: bool = False
 
         def __post_init__(self):
             if isinstance(self.schema, pa.Schema):
@@ -6220,6 +6258,11 @@ class LanceOperation:
         ----------
         schema: LanceSchema
             The lance schema of the new dataset.
+        preserves_nullability: bool
+            True when this projection makes no nullability-affecting schema
+            change, as a rename or a drop does not. Without the assertion
+            (the default) the projection conservatively conflicts with
+            concurrent writes, which can only cause a retry.
 
         Examples
         --------
@@ -6248,6 +6291,7 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+        preserves_nullability: bool = False
 
     @dataclass
     class UpdateMap:

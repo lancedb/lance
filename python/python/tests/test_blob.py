@@ -182,6 +182,29 @@ def test_scan_blob_as_binary(tmp_path):
     assert tbl.column("blobs").to_pylist() == values
 
 
+def test_sql_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    table = pa.table(
+        [pa.array(values, pa.large_binary())],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    batches = (
+        ds.sql("SELECT blobs FROM dataset")
+        .blob_handling("all_binary")
+        .build()
+        .to_batch_records()
+    )
+    assert pa.Table.from_batches(batches).column("blobs").to_pylist() == values
+
+
 def test_v2_0_blob_descriptor_projection_and_reads(tmp_path):
     values = [b"abc", b"defgh", b"ijklmnop"]
     blob_field = pa.field(
@@ -731,6 +754,61 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
     with blobs[1] as f:
         assert f.seek(1) == 1
         assert f.read(1) == b"a"
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        pytest.param([], id="empty_list"),
+        pytest.param([(0, 0), (4, 0)], id="empty_ranges"),
+        pytest.param([(2, 1), (0, 1), (1, 1)], id="non_monotonic"),
+        pytest.param([(1, 2), (0, 4), (1, 2), (0, 0), (2, 2)], id="dup_overlap"),
+    ],
+)
+def test_blob_file_read_ranges_matches_read_range(dataset_with_blobs, ranges):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[4] as f:
+        expected = [f.read_range(offset, length) for offset, length in ranges]
+        assert f.read_ranges(ranges) == expected
+
+
+def test_blob_file_read_ranges_preserves_input_order(dataset_with_blobs):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[1] as f:
+        assert f.read_ranges([(2, 1), (0, 1), (1, 2)]) == [b"r", b"b", b"ar"]
+
+
+def test_blob_file_read_ranges_does_not_change_cursor(dataset_with_blobs):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[1] as f:
+        assert f.tell() == 0
+        assert f.read_ranges([(0, 3)]) == [b"bar"]
+        assert f.tell() == 0
+        f.seek(2)
+        assert f.read_ranges([(2, 1), (0, 3)]) == [b"r", b"bar"]
+        assert f.tell() == 2
+        assert f.read(1) == b"r"
+
+
+@pytest.mark.parametrize(
+    ("ranges", "message"),
+    [
+        pytest.param([(2**64 - 1, 2)], "offset \\+ length overflowed", id="overflow"),
+        pytest.param([(0, 1), (1, 100)], "exceeds blob size", id="out_of_bounds"),
+    ],
+)
+def test_blob_file_read_ranges_rejects_invalid_ranges(
+    dataset_with_blobs, ranges, message
+):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[0] as f:
+        with pytest.raises(ValueError, match=message):
+            f.read_ranges(ranges)
+        assert f.tell() == 0
 
 
 def test_null_blobs(tmp_path):

@@ -138,6 +138,10 @@ impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
 
         self.inner.decompress(data, num_values)
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        self.inner.decoded_size_bytes(num_values)
+    }
 }
 
 #[cfg(test)]

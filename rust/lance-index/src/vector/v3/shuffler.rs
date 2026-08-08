@@ -20,9 +20,9 @@ use lance_core::{
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
+use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::writer::FileWriterOptions;
 use lance_io::{

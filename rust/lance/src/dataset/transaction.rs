@@ -42,6 +42,7 @@ use lance_table::{
     },
     io::{
         commit::CommitHandler,
+        deletion::relative_deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
     rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
@@ -336,6 +337,16 @@ pub enum Operation {
     },
     /// Overwrite the entire dataset with the given fragments. This is also
     /// used when initially creating a table.
+    ///
+    /// The fragments are newly written ones and are assigned fresh ids at commit
+    /// time, continuing from the dataset's highest id ever used; the ids they
+    /// arrive with are ignored.
+    ///
+    /// A fragment carrying a deletion file is rejected. A deletion file's path
+    /// embeds the fragment id, so it cannot follow its fragment to the new id:
+    /// minting a fragment and giving it a deletion file are mutually exclusive in
+    /// one transaction. Use [`Self::Delete`] to commit deletions against existing
+    /// fragments, or [`Self::Merge`] to change their schema.
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
@@ -395,6 +406,12 @@ pub enum Operation {
     Merge {
         fragments: Vec<Fragment>,
         schema: Schema,
+        /// Set when this merge makes no nullability-affecting schema change:
+        /// it introduces no field that data staged against an earlier schema
+        /// could not safely omit. Without the assertion the merge conflicts
+        /// with concurrent appends in either commit order, since a stale
+        /// append omits new columns entirely and its rows read as null.
+        preserves_nullability: bool,
     },
     /// Restore an old version of the database
     Restore { version: u64 },
@@ -444,8 +461,16 @@ pub enum Operation {
         updated_fragment_offsets: Option<UpdatedFragmentOffsets>,
     },
 
-    /// Project to a new schema. This only changes the schema, not the data.
-    Project { schema: Schema },
+    /// Project to a new schema.
+    Project {
+        schema: Schema,
+        /// Set when this projection makes no nullability-affecting schema
+        /// change, as a rename or a drop does not. A nullability tightening
+        /// must not set this: its producer proved the claim by scanning at its
+        /// read version, so a concurrent write can falsify it and the
+        /// projection conflicts with value-writes in either commit order.
+        preserves_nullability: bool,
+    },
 
     /// Update the dataset configuration.
     UpdateConfig {
@@ -638,12 +663,18 @@ impl PartialEq for Operation {
                 Self::Merge {
                     fragments: a_fragments,
                     schema: a_schema,
+                    preserves_nullability: a_preserves,
                 },
                 Self::Merge {
                     fragments: b_fragments,
                     schema: b_schema,
+                    preserves_nullability: b_preserves,
                 },
-            ) => compare_vec(a_fragments, b_fragments) && a_schema == b_schema,
+            ) => {
+                compare_vec(a_fragments, b_fragments)
+                    && a_schema == b_schema
+                    && a_preserves == b_preserves
+            }
             (Self::Restore { version: a }, Self::Restore { version: b }) => a == b,
             (
                 Self::ReserveFragments { num_fragments: a },
@@ -686,7 +717,16 @@ impl PartialEq for Operation {
                     && a_inserted_rows_filter == b_inserted_rows_filter
                     && a_updated_fragment_offsets == b_updated_fragment_offsets
             }
-            (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
+            (
+                Self::Project {
+                    schema: a,
+                    preserves_nullability: a_preserves,
+                },
+                Self::Project {
+                    schema: b,
+                    preserves_nullability: b_preserves,
+                },
+            ) => a == b && a_preserves == b_preserves,
             (
                 Self::UpdateConfig {
                     config_updates: a_config,
@@ -1852,14 +1892,14 @@ impl Transaction {
             }
         };
 
-        let mut fragment_id = if matches!(self.operation, Operation::Overwrite { .. }) {
-            0
-        } else {
-            current_manifest
-                .and_then(|m| m.max_fragment_id())
-                .map(|id| id + 1)
-                .unwrap_or(0)
-        };
+        // Fragment ids are a high water mark for the whole dataset history: an id
+        // must never name two different sets of rows, or per-fragment state keyed
+        // by id (caches, deletion files, row addresses) can be attributed to the
+        // wrong rows.
+        let mut fragment_id = current_manifest
+            .and_then(|m| m.max_fragment_id())
+            .map(|id| id + 1)
+            .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
 
@@ -2103,9 +2143,16 @@ impl Transaction {
                 }
             }
             Operation::Overwrite { fragments, .. } => {
-                let mut new_fragments =
-                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                // Every fragment in an overwrite is newly written, so all of them
+                // take fresh ids regardless of the id they arrive with. Fragments
+                // carried over from the dataset being replaced are rejected by
+                // `validate_operation`, which is what makes ignoring the incoming
+                // id safe here.
+                let mut new_fragments = fragments.clone();
+                for fragment in new_fragments.iter_mut() {
+                    fragment.id = fragment_id;
+                    fragment_id += 1;
+                }
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -2385,6 +2432,22 @@ impl Transaction {
                     .filter(|f| fragments_changed.contains(&f.id))
                     .cloned()
                     .collect();
+
+                // A replacement changes what its rows read as, so stamp them
+                // updated. Without this, get_updated_rows never reports them and
+                // an incremental consumer skips them for good.
+                if next_row_id.is_some() {
+                    let new_version = current_manifest.map_or(1, |m| m.version + 1);
+                    for fragment in final_fragments
+                        .iter_mut()
+                        .filter(|f| fragments_changed.contains(&f.id))
+                    {
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                            fragment,
+                            new_version,
+                        )?;
+                    }
+                }
 
                 Self::prune_updated_fields_from_indices(
                     &mut final_indices,
@@ -3236,7 +3299,7 @@ impl Transaction {
                         let combined_sequence = RowIdSequence::from(row_ids.as_slice());
 
                         let serialized = write_row_ids(&combined_sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                         *next_row_id += remaining_rows;
                     }
                     Ordering::Greater => {
@@ -3252,7 +3315,7 @@ impl Transaction {
                 let sequence = RowIdSequence::from(row_ids);
                 // TODO: write to a separate file if large. Possibly share a file with other fragments.
                 let serialized = write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                 *next_row_id += physical_rows;
             }
         }
@@ -3434,12 +3497,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                 fragments,
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
+                preserves_nullability,
             })) => Operation::Merge {
                 fragments: fragments
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 schema: Schema::try_from(&Fields(schema))?,
+                // False for a writer that predates the field: no assertion, so
+                // a legacy required-field merge still conflicts and a legacy
+                // nullable merge over-conflicts, which only retries.
+                preserves_nullability,
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
@@ -3491,11 +3559,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 },
             },
-            Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
-                Operation::Project {
-                    schema: Schema::try_from(&Fields(schema))?,
-                }
-            }
+            Some(pb::transaction::Operation::Project(pb::transaction::Project {
+                schema,
+                preserves_nullability,
+            })) => Operation::Project {
+                schema: Schema::try_from(&Fields(schema))?,
+                // False for a writer that predates the field: no assertion, so
+                // a legacy tightening still conflicts and a legacy rename
+                // over-conflicts, which only retries.
+                preserves_nullability,
+            },
             Some(pb::transaction::Operation::UpdateConfig(update_config)) => {
                 // Check if new-style fields are present
                 let has_new_fields = update_config.config_updates.is_some()
@@ -3781,13 +3854,16 @@ impl From<&Transaction> for pb::Transaction {
                     .map(pb::IndexMetadata::from)
                     .collect(),
             }),
-            Operation::Merge { fragments, schema } => {
-                pb::transaction::Operation::Merge(pb::transaction::Merge {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    schema: Fields::from(schema).0,
-                    schema_metadata: Default::default(), // TODO: handle metadata
-                })
-            }
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability,
+            } => pb::transaction::Operation::Merge(pb::transaction::Merge {
+                fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                schema: Fields::from(schema).0,
+                schema_metadata: Default::default(), // TODO: handle metadata
+                preserves_nullability: *preserves_nullability,
+            }),
             Operation::Restore { version } => {
                 pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
@@ -3835,11 +3911,13 @@ impl From<&Transaction> for pb::Transaction {
                     })
                     .unwrap_or_default(),
             }),
-            Operation::Project { schema } => {
-                pb::transaction::Operation::Project(pb::transaction::Project {
-                    schema: Fields::from(schema).0,
-                })
-            }
+            Operation::Project {
+                schema,
+                preserves_nullability,
+            } => pb::transaction::Operation::Project(pb::transaction::Project {
+                schema: Fields::from(schema).0,
+                preserves_nullability: *preserves_nullability,
+            }),
             Operation::UpdateConfig {
                 config_updates,
                 table_metadata_updates,
@@ -3968,6 +4046,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             },
         ) => {
             // Validate here because we are going to return early.
+            overwrite_fragments_valid(fragments)?;
             schema_fragments_valid(None, schema, fragments)?;
 
             return Ok(());
@@ -3987,19 +4066,19 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             // Fragments must contain all fields in the schema
             schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }
-        Operation::Project { schema } => {
+        Operation::Project { schema, .. } => {
             schema_fragments_valid(Some(manifest), schema, manifest.fragments.as_ref())
         }
-        Operation::Merge { fragments, schema } => {
+        Operation::Merge {
+            fragments, schema, ..
+        } => {
             merge_fragments_valid(manifest, fragments)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
-            fragments,
-            schema,
-            config_upsert_values: None,
-            initial_bases: _,
+            fragments, schema, ..
         } => {
+            overwrite_fragments_valid(fragments)?;
             // Pass None for manifest because Overwrite replaces all fragments.
             // The old manifest's storage format is irrelevant for validating
             // the new fragments (e.g., LEGACY→STABLE transitions).
@@ -4015,6 +4094,25 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         }
         _ => Ok(()),
     }
+}
+
+// An overwrite's fragments are newly written, so they are given fresh ids at
+// commit time. A deletion file cannot come along for that ride: its path embeds
+// the fragment id, so renumbering the fragment would orphan the deletion vector
+// and silently resurrect deleted rows.
+fn overwrite_fragments_valid(fragments: &[Fragment]) -> Result<()> {
+    for fragment in fragments {
+        if let Some(deletion_file) = &fragment.deletion_file {
+            return Err(Error::invalid_input(format!(
+                "Overwrite fragments must be newly written, but fragment {} carries \
+                 deletion file {}. Use Delete to commit deletions against existing \
+                 fragments, or Merge to change their schema.",
+                fragment.id,
+                relative_deletion_file_path(fragment.id, deletion_file)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn schema_fragments_valid(
@@ -4590,7 +4688,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50),
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4623,7 +4721,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50), // More physical rows than existing row IDs
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4659,7 +4757,7 @@ mod tests {
         let mut fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50), // Less physical rows than existing row IDs
-            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
             files: vec![],
             overlays: vec![],
             deletion_file: None,
@@ -4698,7 +4796,7 @@ mod tests {
             Fragment {
                 id: 2,
                 physical_rows: Some(25), // Partial existing row IDs
-                row_id_meta: Some(RowIdMeta::Inline(serialized)),
+                row_id_meta: Some(RowIdMeta::Inline(serialized.into())),
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
@@ -5256,7 +5354,7 @@ mod tests {
     #[test]
     fn test_partial_rewrite_skips_fragment_with_no_version_meta() {
         let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let data_file = DataFile::new(
             "data.lance",
@@ -5634,7 +5732,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         let row_ids = RowIdSequence::from([100u64, 101, 102, 103, 104].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let prev_fragment = Fragment {
             id: 0,
@@ -5666,6 +5764,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5710,7 +5809,7 @@ mod tests {
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
 
         let row_ids = RowIdSequence::from([200u64, 201, 202, 203, 204].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
         let uniform_v1 = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
         let meta_v1 = RowDatasetVersionMeta::from_sequence(&uniform_v1).unwrap();
@@ -5751,6 +5850,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5826,6 +5926,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![merged_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5871,7 +5972,7 @@ mod tests {
             files: vec![mk_file("existing.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0).into())),
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -5894,7 +5995,7 @@ mod tests {
             files: vec![mk_file("new.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1).into())),
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -5905,6 +6006,7 @@ mod tests {
             Operation::Merge {
                 fragments: vec![existing_fragment, new_fragment],
                 schema: lance_schema,
+                preserves_nullability: true,
             },
             None,
         );
@@ -5957,7 +6059,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
@@ -5971,7 +6073,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6014,7 +6116,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq).into())),
                 physical_rows: Some(2),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
@@ -6026,7 +6128,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
@@ -6042,7 +6144,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6084,7 +6186,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
@@ -6099,7 +6201,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6144,7 +6246,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
@@ -6158,7 +6260,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(4),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6192,7 +6294,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6204,7 +6306,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6233,7 +6335,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6275,7 +6377,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(RowDatasetVersionMeta::Inline(Arc::from(
                 vec![0xFFu8; 8].as_slice(),
@@ -6289,7 +6391,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6331,7 +6433,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
@@ -6352,7 +6454,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
@@ -6367,7 +6469,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6406,7 +6508,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
             last_updated_at_version_meta: None,
@@ -6419,7 +6521,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6468,7 +6570,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
@@ -6483,7 +6585,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6531,7 +6633,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
@@ -6543,7 +6645,7 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b))),
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b).into())),
                 physical_rows: Some(3),
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
@@ -6559,7 +6661,7 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
@@ -6930,5 +7032,47 @@ mod tests {
             frag_reuse_index: None,
         };
         assert_ne!(overlay(1), rewrite);
+    }
+
+    #[test]
+    fn test_nullability_assertion_defaults_conservative() {
+        // A writer that predates the field encodes nothing, which decodes as
+        // false: no assertion, so a legacy tightening or required-field merge
+        // still conflicts. Only an explicit true skips the barrier.
+        for encoded in [false, true] {
+            let txn = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::Project(
+                    pb::transaction::Project {
+                        schema: vec![],
+                        preserves_nullability: encoded,
+                    },
+                )),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                matches!(txn.operation, Operation::Project { preserves_nullability, .. } if preserves_nullability == encoded),
+                "encoded={encoded:?}"
+            );
+
+            let txn = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
+                    fragments: vec![],
+                    schema: vec![],
+                    schema_metadata: Default::default(),
+                    preserves_nullability: encoded,
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                matches!(txn.operation, Operation::Merge { preserves_nullability, .. } if preserves_nullability == encoded),
+                "encoded={encoded:?}"
+            );
+        }
     }
 }

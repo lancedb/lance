@@ -768,6 +768,8 @@ pub fn greedy_search_borrowed(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     struct ChainGraph {
@@ -794,6 +796,63 @@ mod tests {
         fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
             Vec::new()
         }
+    }
+
+    struct CountingDistCalculator<'a> {
+        distances: &'a [f32],
+        computations: Cell<usize>,
+    }
+
+    impl DistCalculator for CountingDistCalculator<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.computations.set(self.computations.get() + 1);
+            self.distances[id as usize]
+        }
+
+        fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+            self.distances.to_vec()
+        }
+    }
+
+    #[test]
+    fn test_beam_search_refreshes_furthest_neighbor_bound() {
+        // The entry point is closer than the first candidates. Once those
+        // candidates fill W, its furthest distance grows from 1 to 10. The
+        // next neighbor must be compared with that new bound so it can enter
+        // the candidate queue and lead the search to node 4.
+        let graph = ChainGraph {
+            neighbors: vec![vec![1, 2, 3], vec![], vec![], vec![4], vec![]],
+        };
+        let distances = [1.0, 10.0, 9.0, 8.0, 7.0];
+        let dist_calc = CountingDistCalculator {
+            distances: &distances,
+            computations: Cell::new(0),
+        };
+        let params = HnswQueryParams {
+            ef: 3,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let entry = OrderedNode::new(0, distances[0].into());
+        let mut visited_generator = VisitedGenerator::new(graph.len());
+
+        let results = beam_search_borrowed(
+            &graph,
+            &entry,
+            &params,
+            &dist_calc,
+            None,
+            None,
+            &mut visited_generator.generate(graph.len()),
+        );
+
+        assert_eq!(
+            results.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![0, 4, 3]
+        );
+        assert_eq!(dist_calc.computations.get(), 4);
     }
 
     /// Passing components joined only through chains of two masked nodes

@@ -22,7 +22,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleConfig, AimdThrottledStore},
+    throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
 };
 use lance_core::error::{Error, Result};
 
@@ -162,6 +162,7 @@ impl AzureBlobStoreProvider {
         base_path: &Url,
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
+        throttle_state: Option<&AimdThrottleState>,
     ) -> Result<Arc<dyn OSObjectStore>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
@@ -185,14 +186,9 @@ impl AzureBlobStoreProvider {
             builder = builder.with_credentials(credentials);
         }
 
-        #[cfg(feature = "metrics")]
-        {
-            builder = builder.with_http_connector(
-                crate::object_store::metrics::MeteringHttpConnector::new(
-                    self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?,
-                ),
-            );
-        }
+        let store_prefix =
+            self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
+        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
 
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
     }
@@ -259,20 +255,35 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
 
         let accessor = params.get_accessor();
 
+        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+        let throttle_state = if throttle_config.is_disabled() {
+            None
+        } else {
+            Some(AimdThrottleState::new(throttle_config)?)
+        };
+
         let inner: Arc<dyn OSObjectStore> = if use_opendal {
             // OpenDAL Azure intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
             self.build_opendal_azure_store(&base_path, &storage_options)
                 .await?
         } else {
-            self.build_microsoft_azure_store(&base_path, &storage_options, accessor)
-                .await?
+            self.build_microsoft_azure_store(
+                &base_path,
+                &storage_options,
+                accessor,
+                throttle_state.as_ref(),
+            )
+            .await?
         };
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let inner = if throttle_config.is_disabled() {
-            inner
+        let inner = if let Some(throttle_state) = throttle_state {
+            Arc::new(AimdThrottledStore::new_with_state(
+                inner,
+                throttle_state,
+                !use_opendal,
+            )) as Arc<dyn OSObjectStore>
         } else {
-            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
+            inner
         };
 
         Ok(ObjectStore {
