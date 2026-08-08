@@ -101,9 +101,10 @@ message Transaction {
       repeated CompactedSsTable caught_up_generations = 3;
     }
 
-    // Empty for every ordinary index operation, which is why an ordinary
-    // create, reindex, append, or remap conservatively loses whatever coverage
-    // its index had recorded. Empty means "this operation reports no new
+    // Empty for every ordinary index operation. Creating, reindexing,
+    // appending to, or remapping an index changes it without saying how far it
+    // has caught up, so that index's index_catchup entry is removed and a later
+    // repair records a fresh one. Empty means "this operation reports no new
     // coverage"; it never means "inherit the previous index's catch-up".
     repeated IndexCatchupAdvance mem_wal_index_catchup_advances = 3;
   }

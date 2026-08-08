@@ -444,10 +444,11 @@ pub enum Operation {
         removed_indices: Vec<IndexMetadata>,
         /// MemWAL index catch-up this operation reports, if any.
         ///
-        /// Empty for every ordinary index operation. An ordinary create,
-        /// reindex, append, or remap therefore loses whatever coverage its
-        /// index had recorded, and the agent schedules a repair — conservative,
-        /// but it can never make an uncovered index look covered.
+        /// Empty for every ordinary index operation. Creating, reindexing,
+        /// appending to, or remapping an index changes it without saying how far
+        /// it has caught up, so that index's `index_catchup` entry is removed and
+        /// a later repair records a fresh one. Conservative, but it can never
+        /// leave a lagging index looking caught up.
         mem_wal_index_catchup_advances: Vec<IndexCatchupAdvance>,
     },
     /// Data is rewritten but *not* modified. This is used for things like
