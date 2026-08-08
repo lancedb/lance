@@ -489,11 +489,11 @@ pub trait DatasetMemWalExt {
     /// Switch this table to safe SSTable retirement.
     ///
     /// Until this is called, a missing index-coverage entry reads as "fully
-    /// caught up". Afterwards it reads as "not proved", so an SSTable is served
+    /// caught up". Afterwards it reads as "not caught up", so an SSTable is served
     /// until some commit shows the indexes contain its rows.
     ///
     /// One-way: there is no matching deactivate, because a table that has
-    /// already retired SSTables against proved coverage cannot go back to
+    /// already retired SSTables against a recorded catch-up cannot go back to
     /// treating missing coverage as caught up. Calling it on an already-active
     /// table succeeds and changes nothing.
     async fn activate_mem_wal_safe_retirement(&self) -> Result<()> {

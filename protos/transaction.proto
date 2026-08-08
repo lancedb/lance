@@ -82,7 +82,7 @@ message Transaction {
     repeated IndexMetadata new_indices = 1;
     repeated IndexMetadata removed_indices = 2;
 
-    // Proof that one logical index now covers named per-shard compaction
+    // Records that one logical index now covers named per-shard compaction
     // generations, published in the same commit as the index change it
     // describes.
     message IndexCatchupAdvance {
@@ -103,8 +103,8 @@ message Transaction {
 
     // Empty for every ordinary index operation, which is why an ordinary
     // create, reindex, append, or remap conservatively loses whatever coverage
-    // its index had proved. Empty means "this operation proves no new
-    // coverage"; it never means "inherit what the previous index proved".
+    // its index had recorded. Empty means "this operation reports no new
+    // coverage"; it never means "inherit the previous index's catch-up".
     repeated IndexCatchupAdvance mem_wal_index_catchup_advances = 3;
   }
 
@@ -386,7 +386,7 @@ message Transaction {
     //
     // The migration is one-way because returning to legacy semantics — where a
     // missing coverage entry reads as "fully caught up" — is unsafe once any
-    // SSTable has been retired against proved coverage.
+    // SSTable has been retired against a recorded catch-up position.
     optional bool activate_safe_retirement = 2;
   }
 

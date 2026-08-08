@@ -333,11 +333,11 @@ pub struct UpdateMap {
 /// base fragments.
 type LogicalIndexSegments = BTreeMap<String, Vec<IndexMetadata>>;
 
-/// Proof that one logical index covers named per-shard compaction generations.
+/// Records that one logical index covers named per-shard compaction generations.
 ///
 /// Supplied only by the WAL index-repair worker, and published in the same
 /// commit as the index change it describes so the index result and the coverage
-/// it proves can never disagree.
+/// it reports can never disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCatchupAdvance {
     /// One user-visible logical index, possibly backed by several segments.
@@ -442,11 +442,11 @@ pub enum Operation {
         new_indices: Vec<IndexMetadata>,
         /// The indices that have been modified.
         removed_indices: Vec<IndexMetadata>,
-        /// MemWAL coverage this operation proves, if any.
+        /// MemWAL index catch-up this operation reports, if any.
         ///
         /// Empty for every ordinary index operation. An ordinary create,
         /// reindex, append, or remap therefore loses whatever coverage its
-        /// index had proved, and the agent schedules a repair — conservative,
+        /// index had recorded, and the agent schedules a repair — conservative,
         /// but it can never make an uncovered index look covered.
         mem_wal_index_catchup_advances: Vec<IndexCatchupAdvance>,
     },
@@ -578,7 +578,7 @@ pub enum Operation {
         ///
         /// One-way because returning to legacy semantics — where a missing
         /// coverage entry reads as "fully caught up" — is unsafe once any
-        /// SSTable has been retired against proved coverage.
+        /// SSTable has been retired against a recorded catch-up position.
         activate_safe_retirement: bool,
     },
 
@@ -1932,7 +1932,7 @@ impl Transaction {
     ///
     /// One-way, because returning to legacy semantics -- where a missing
     /// coverage entry reads as "fully caught up" -- is unsafe once any SSTable
-    /// has been retired against proved coverage.
+    /// has been retired against a recorded catch-up position.
     fn activate_safe_retirement(
         final_indices: &mut [IndexMetadata],
         new_version: u64,
@@ -1951,7 +1951,7 @@ impl Transaction {
         let mut details = load_mem_wal_index_details(final_indices[pos].clone())?;
 
         // The beta protocol wrote compaction progress that was never an active
-        // retirement proof, and Lance cannot check those numbers against WAL
+        // retirement record, and Lance cannot check those numbers against WAL
         // shard manifests. Trusting them would let the first trim after
         // activation delete SSTables no commit copied in, so a table carrying
         // them must be drained through an explicit migration instead.
@@ -1964,7 +1964,7 @@ impl Transaction {
         }
 
         // Beta coverage was written under rules this protocol does not enforce,
-        // so it is not proof. Left in place, a later compaction would find it
+        // so it is not trustworthy. Left in place, a later compaction would find it
         // already satisfied and could retire an SSTable that no index covers.
         if details.index_catchup.is_empty() {
             return Ok(());
@@ -2001,14 +2001,14 @@ impl Transaction {
     ///
     /// Coverage records that a base-table index contains the rows a compaction
     /// copied in, and the WAL pod retires SSTables against it. So any index
-    /// change this transaction does not explicitly prove must drop that
+    /// change this transaction does not explicitly report must drop that
     /// index's coverage: an ordinary create, reindex, append, replacement or
     /// remap carries no advance and is therefore conservative. The rule lives
     /// here rather than in each caller so an ordinary index job cannot forget it
-    /// and leave stale proof behind.
+    /// and leave a stale catch-up position behind.
     ///
     /// Dropping coverage is only conservative under safe retirement, where a
-    /// missing entry means "not proved" and the SSTables stay. A legacy table
+    /// missing entry means "not caught up" and the SSTables stay. A legacy table
     /// reads a missing entry as "fully caught up", so this leaves legacy
     /// progress untouched rather than making the table look more covered.
     fn apply_mem_wal_index_coverage(
@@ -2061,7 +2061,7 @@ impl Transaction {
         let segments_after = Self::logical_index_segments(final_indices);
         let advanced_names: HashSet<&str> =
             advances.iter().map(|a| a.index_name.as_str()).collect();
-        // Kept so an advance can merge onto what the index already proved, and so
+        // Kept so an advance can merge onto what the index already recorded, and so
         // an unchanged result can skip rewriting the system index entirely.
         let catchup_before = details.index_catchup.clone();
 
@@ -2072,10 +2072,10 @@ impl Transaction {
             )
         };
 
-        // --- invalidate coverage the transaction changed but did not prove ---
+        // --- invalidate coverage the transaction changed but did not report ---
 
         details.index_catchup.retain(|entry| {
-            // A name this transaction proves is rebuilt below from the advance.
+            // A name this transaction reports is rebuilt below from the advance.
             if advanced_names.contains(entry.index_name.as_str()) {
                 return false;
             }
@@ -2087,7 +2087,7 @@ impl Transaction {
                 (_, None) => false,
                 // Present before and after: keep only if physically unchanged.
                 (Some(before), Some(after)) => before == after,
-                // Absent before, present now: a brand-new index proves nothing.
+                // Absent before, present now: a brand-new index has no catch-up position.
                 (None, Some(_)) => false,
             }
         });
@@ -2181,10 +2181,10 @@ impl Transaction {
             }
 
             // Shards this advance does not name keep the generation they already
-            // proved, so repairing one shard does not erase another and two
+            // recorded, so repairing one shard does not erase another and two
             // repairs on different shards do not overwrite each other. Only an
-            // index that is physically unchanged may carry its old proof forward;
-            // otherwise it was proved against an index that no longer exists.
+            // index that is physically unchanged may carry its old position forward;
+            // otherwise it was recorded against an index that no longer exists.
             let mut merged = if index_unchanged(&advance.index_name) {
                 catchup_before
                     .iter()
@@ -7733,12 +7733,12 @@ mod tests {
             assert_eq!(
                 coverage_for(&after, "vec_idx").unwrap()[0].generation,
                 10,
-                "an index this transaction did not touch must keep its proof"
+                "an index this transaction did not touch must keep its catch-up position"
             );
         }
 
         /// An ordinary reindex/append/replacement mints new segment UUIDs and
-        /// supplies no advance, so its old proof must not survive.
+        /// supplies no advance, so its old catch-up position must not survive.
         #[test]
         fn a_changed_index_loses_its_coverage() {
             let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
@@ -7750,7 +7750,7 @@ mod tests {
 
             assert!(
                 coverage_for(&after, "vec_idx").is_none(),
-                "a rebuilt index must not inherit the previous index's proof"
+                "a rebuilt index must not inherit the previous index's catch-up position"
             );
         }
 
@@ -7799,7 +7799,7 @@ mod tests {
         }
 
         #[test]
-        fn an_advance_publishes_the_coverage_it_proves() {
+        fn an_advance_publishes_the_catch_up_it_reports() {
             let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
             let before = table(shard, 10, "vec_idx", 3, uuid);
             let mut after = before.clone();
@@ -8126,7 +8126,7 @@ mod tests {
             };
             apply_coverage(&mut after, &segments_before(&before), &[advance], true).unwrap();
 
-            // Shard B was proved against the index this commit replaced.
+            // Shard B was recorded against the index this commit replaced.
             assert_eq!(
                 coverage_for(&after, "vec_idx"),
                 Some(vec![CompactedSsTable::new(shard_a, 9)])
@@ -8249,7 +8249,7 @@ mod tests {
             Transaction::activate_safe_retirement(&mut indices, 2).unwrap();
 
             // Beta coverage was written under rules this protocol does not
-            // enforce, so keeping it would let the first trim run unproved.
+            // enforce, so keeping it would let the first trim run without a catch-up check.
             assert!(details_of(&indices).index_catchup.is_empty());
         }
 

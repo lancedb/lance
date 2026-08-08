@@ -30,12 +30,13 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
-/// MemWAL SSTables are retired only against proved index coverage.
+/// MemWAL SSTables are retired only against a recorded index catch-up position.
 ///
 /// A reader without this bit would read a missing `index_catchup` entry as
 /// "fully caught up" and could answer an index-only query without the SSTables
 /// holding the newest rows. A writer without it would change an index without
-/// invalidating the coverage that index had proved, leaving stale proof behind.
+/// invalidating the catch-up position recorded for that index, leaving a stale
+/// position behind.
 /// Both must refuse the table.
 pub const FLAG_MEM_WAL_SAFE_RETIREMENT: u64 = 128;
 /// The first bit that is unknown as a feature flag

@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(compacted_generation(&indices, shard), Some(10));
     }
 
-    /// Equal is also refused: it proves nothing new, and accepting it would let
+    /// Equal is also refused: it reports nothing new, and accepting it would let
     /// a retry publish a second set of row mutations under the same marker.
     #[test]
     fn an_equal_generation_rejects() {
@@ -631,7 +631,7 @@ mod tests {
     fn recording_progress_keeps_the_system_index_position() {
         let shard = Uuid::new_v4();
         let mut indices = indices_with(MemWalIndexDetails::default());
-        // A neighbour to prove the entry is replaced in place, not moved.
+        // A neighbour to show the entry is replaced in place, not moved.
         indices.push(IndexMetadata {
             name: "other_index".to_string(),
             ..indices[0].clone()
@@ -772,7 +772,7 @@ mod tests {
         );
     }
 
-    /// The system index holds the proof the WAL pod retires SSTables against.
+    /// The system index holds the catch-up positions the WAL pod retires SSTables against.
     /// Erasing it through the ordinary index API would leave the table claiming
     /// nothing was ever compacted while the SSTables are already gone.
     #[tokio::test]
