@@ -8567,6 +8567,50 @@ mod tests {
             assert!(err.to_string().contains("covers none"), "{err}");
         }
 
+        /// An ordinary index job on a table that requires catch-up must still
+        /// commit -- it loses the coverage entry, it is never refused.
+        #[test]
+        fn an_ordinary_index_job_is_never_blocked() {
+            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
+            let before = table(shard, 10, "vec_idx", 5, uuid);
+            let mut after = before.clone();
+            after[0] = user_index("vec_idx", Uuid::new_v4());
+
+            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
+
+            assert_eq!(coverage_for(&after, "vec_idx"), None, "coverage dropped");
+        }
+
+        /// A table with no MemWAL system index never reaches the protocol, so an
+        /// index job on an ordinary table is untouched by any of this.
+        #[test]
+        fn a_table_without_mem_wal_is_untouched() {
+            let uuid = Uuid::new_v4();
+            let before = vec![user_index("vec_idx", uuid)];
+            let mut after = before.clone();
+            after[0] = user_index("vec_idx", Uuid::new_v4());
+            let expected = after.clone();
+
+            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
+
+            assert_eq!(after, expected, "index list must be byte-identical");
+        }
+
+        /// A MemWAL table that has not been migrated keeps legacy behaviour: an
+        /// index job neither loses coverage nor is refused.
+        #[test]
+        fn a_legacy_mem_wal_table_is_untouched_by_an_index_job() {
+            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
+            let before = table(shard, 10, "vec_idx", 5, uuid);
+            let mut after = before.clone();
+            after[0] = user_index("vec_idx", Uuid::new_v4());
+            let expected = after.clone();
+
+            apply_coverage(&mut after, &segments_before(&before), &[], false).unwrap();
+
+            assert_eq!(after, expected, "index list must be byte-identical");
+        }
+
         #[test]
         fn index_catchup_advance_round_trips_through_protobuf() {
             let advance = IndexCatchupAdvance {
