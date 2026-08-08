@@ -35,6 +35,7 @@ const TAG_MUTATION_INTENTS_DIR: &str = "tag_mutations";
 const REF_CATALOG_DIR: &str = "catalog";
 const LEASE_FILE: &str = "lease.json";
 const LEASE_HEARTBEATS_DIR: &str = "heartbeats";
+const LEASE_PUBLICATION_FILE: &str = "publication.json";
 const LEASE_RELEASED_FILE: &str = "released.json";
 const LEASE_RECONCILED_FILE: &str = "reconciled.json";
 const REF_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -358,13 +359,39 @@ struct DurableRefPublication {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "state", content = "publication")]
+#[serde(rename_all = "camelCase", tag = "state", content = "digest")]
 enum LeaseEpochDecision {
-    Publish(DurableRefPublication),
+    Publish(String),
     Closed,
 }
 
+fn validate_publication_decision(
+    epoch: u64,
+    actual: &LeaseEpochDecision,
+    expected_digest: &str,
+) -> Result<()> {
+    match actual {
+        LeaseEpochDecision::Publish(actual_digest) if actual_digest == expected_digest => Ok(()),
+        LeaseEpochDecision::Closed => Err(Error::RefConflict {
+            message: format!(
+                "reference mutation lease epoch {epoch} closed before its publication intent"
+            ),
+        }),
+        LeaseEpochDecision::Publish(_) => Err(Error::RefConflict {
+            message: format!(
+                "reference mutation lease epoch {epoch} already has a different publication intent"
+            ),
+        }),
+    }
+}
+
 impl DurableRefPublication {
+    fn digest(&self) -> Result<String> {
+        Ok(blake3::hash(&serde_json::to_vec(self)?)
+            .to_hex()
+            .to_string())
+    }
+
     fn catalog(&self) -> Result<(Path, Path, RefCatalog)> {
         let path = Path::parse(&self.path)?;
         let catalog: RefCatalog = serde_json::from_str(&self.body)?;
@@ -532,24 +559,36 @@ impl DurableLeaseFence {
     }
 
     async fn record_publication(&self, publication: &DurableRefPublication) -> Result<()> {
-        let expected = LeaseEpochDecision::Publish(publication.clone());
-        let decision_path = lease_epoch_decision_path(&self.fence_path, self.epoch)?;
-        let actual = record_epoch_decision(&self.object_store, &decision_path, &expected).await?;
-        match actual {
-            LeaseEpochDecision::Publish(actual) if actual == *publication => Ok(()),
-            LeaseEpochDecision::Closed => Err(Error::RefConflict {
-                message: format!(
-                    "reference mutation lease epoch {} closed before its publication intent",
-                    self.epoch
-                ),
-            }),
-            LeaseEpochDecision::Publish(_) => Err(Error::RefConflict {
-                message: format!(
-                    "reference mutation lease epoch {} already has a different publication intent",
-                    self.epoch
-                ),
-            }),
+        if publication.epoch != self.epoch {
+            return Err(Error::internal(format!(
+                "reference publication epoch {} does not match lease epoch {}",
+                publication.epoch, self.epoch
+            )));
         }
+        let digest = publication.digest()?;
+        let decision_path = lease_epoch_decision_path(&self.fence_path, self.epoch)?;
+        if let Some(actual) =
+            read_serialized_file::<LeaseEpochDecision>(&self.object_store, &decision_path).await?
+        {
+            return validate_publication_decision(self.epoch, &actual, &digest);
+        }
+
+        let publication_path = lease_epoch_publication_path(&self.fence_path, self.epoch);
+        create_serialized_file(&self.object_store, &publication_path, publication).await?;
+        let proposed = LeaseEpochDecision::Publish(digest.clone());
+        let actual = record_epoch_decision(&self.object_store, &decision_path, &proposed).await?;
+        let result = validate_publication_decision(self.epoch, &actual, &digest);
+        if result.is_err()
+            && let Err(error) = self.object_store.delete(&publication_path).await
+            && !matches!(error, Error::NotFound { .. })
+        {
+            log::warn!(
+                "Failed to remove rejected reference publication {}: {}",
+                publication_path,
+                error
+            );
+        }
+        result
     }
 
     async fn apply_committed_publication(&self, publication: &DurableRefPublication) -> Result<()> {
@@ -563,7 +602,7 @@ impl DurableLeaseFence {
                     );
                     return Ok(());
                 }
-                let expected = LeaseEpochDecision::Publish(publication.clone());
+                let expected = LeaseEpochDecision::Publish(publication.digest()?);
                 let decision_path = lease_epoch_decision_path(&self.fence_path, self.epoch)?;
                 if read_serialized_file::<LeaseEpochDecision>(&self.object_store, &decision_path)
                     .await?
@@ -627,7 +666,29 @@ impl DurableLeaseFence {
                 &LeaseEpochDecision::Closed,
             )
             .await?;
-            if let LeaseEpochDecision::Publish(publication) = decision {
+            if let LeaseEpochDecision::Publish(digest) = decision {
+                let publication_path = lease_epoch_publication_path(&self.fence_path, epoch);
+                let publication = read_serialized_file::<DurableRefPublication>(
+                    &self.object_store,
+                    &publication_path,
+                )
+                .await?
+                .ok_or_else(|| {
+                    Error::corrupt_file(
+                        publication_path.clone(),
+                        format!(
+                            "reference mutation epoch {epoch} has a publish decision but no replay body"
+                        ),
+                    )
+                })?;
+                if publication.epoch != epoch || publication.digest()? != digest {
+                    return Err(Error::corrupt_file(
+                        publication_path,
+                        format!(
+                            "reference mutation epoch {epoch} replay body does not match its durable decision"
+                        ),
+                    ));
+                }
                 publication.apply(&self.object_store).await?;
             }
         }
@@ -1044,6 +1105,10 @@ async fn latest_lease_epoch(object_store: &ObjectStore, path: &Path) -> Result<O
 
 fn lease_epoch_path(base_path: &Path, epoch: u64) -> Path {
     base_path.clone().join(format!("{epoch:020}"))
+}
+
+fn lease_epoch_publication_path(base_path: &Path, epoch: u64) -> Path {
+    lease_epoch_path(base_path, epoch).join(LEASE_PUBLICATION_FILE)
 }
 
 fn lease_epoch_decision_path(lease_path: &Path, epoch: u64) -> Result<Path> {
@@ -3321,6 +3386,119 @@ mod tests {
             "renewal should not traverse immutable decision history"
         );
         current_handle.is_held = false;
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_publish_decisions_do_not_retain_catalogs() {
+        let object_store = Arc::new(ObjectStore::memory());
+        let root = Path::from("dataset");
+        let fence_path = base_ref_mutation_leases_path(&root);
+        let first_state = DurableLeaseState::acquired("owner-1".to_string(), 1).unwrap();
+        assert!(
+            create_lease_file(
+                &object_store,
+                &lease_epoch_path(&fence_path, 1),
+                &first_state,
+            )
+            .await
+            .unwrap()
+        );
+
+        let mut latest_publication_size = 0;
+        for epoch in 1..=10 {
+            let tags = (0..100)
+                .map(|index| {
+                    (
+                        format!("tag-{index:03}"),
+                        serde_json::json!({
+                            "version": epoch * 100 + index,
+                            "metadata": "x".repeat(128),
+                        }),
+                    )
+                })
+                .collect();
+            let publication = DurableRefPublication {
+                epoch,
+                path: ref_catalog_version_path(&root, epoch).to_string(),
+                body: serde_json::to_string_pretty(&RefCatalog {
+                    mutation_epoch: epoch,
+                    tags,
+                    ..Default::default()
+                })
+                .unwrap(),
+            };
+            latest_publication_size = serde_json::to_vec(&publication).unwrap().len();
+            DurableLeaseFence {
+                object_store: object_store.clone(),
+                path: lease_epoch_path(&fence_path, epoch),
+                fence_path: fence_path.clone(),
+                epoch,
+            }
+            .record_publication(&publication)
+            .await
+            .unwrap();
+
+            let successor_epoch = epoch + 1;
+            let successor_state =
+                DurableLeaseState::acquired(format!("owner-{successor_epoch}"), successor_epoch)
+                    .unwrap();
+            let successor_path = lease_epoch_path(&fence_path, successor_epoch);
+            assert!(
+                create_lease_file(&object_store, &successor_path, &successor_state)
+                    .await
+                    .unwrap()
+            );
+            DurableLeaseFence {
+                object_store: object_store.clone(),
+                path: successor_path,
+                fence_path: fence_path.clone(),
+                epoch: successor_epoch,
+            }
+            .reconcile_prior_publications()
+            .await
+            .unwrap();
+            cleanup_old_lease_epochs(&object_store, &fence_path, successor_epoch).await;
+        }
+
+        let decisions_path = lease_epoch_decision_path(&fence_path, 1)
+            .unwrap()
+            .parent()
+            .unwrap();
+        let decisions = object_store.read_dir(decisions_path.clone()).await.unwrap();
+        assert_eq!(decisions.len(), 10);
+        let mut decision_bytes = 0;
+        for decision in decisions {
+            decision_bytes += object_store
+                .inner
+                .get(&decisions_path.clone().join(decision))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .len();
+        }
+        assert!(
+            decision_bytes < latest_publication_size,
+            "ten permanent decisions used {decision_bytes} bytes, one replay body used {latest_publication_size} bytes"
+        );
+        for epoch in 1..=10 {
+            assert!(
+                !object_store
+                    .exists(&lease_epoch_publication_path(&fence_path, epoch))
+                    .await
+                    .unwrap(),
+                "reconciled replay body for epoch {epoch} was not reclaimed"
+            );
+        }
+        assert_eq!(
+            object_store
+                .read_dir(base_ref_catalog_path(&root))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

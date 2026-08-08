@@ -45,6 +45,7 @@ arrow-select = { workspace = true }
 async-recursion.workspace = true
 async-trait.workspace = true
 byteorder.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
