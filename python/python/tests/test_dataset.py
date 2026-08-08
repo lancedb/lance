@@ -1551,13 +1551,20 @@ def test_get_fragments(tmp_path: Path):
 def test_pickle_fragment(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
+    storage_options = {"allow_http": "true"}
+    lance.write_dataset(table, base_dir, storage_options=storage_options)
 
-    dataset = lance.dataset(base_dir)
+    dataset = lance.dataset(base_dir, storage_options=storage_options)
     fragment = dataset.get_fragments()[0]
-    pickled = pickle.dumps(fragment)
+    with mock.patch.object(
+        lance.LanceDataset,
+        "__init__",
+        side_effect=AssertionError("pickling reopened the dataset"),
+    ):
+        pickled = pickle.dumps(fragment)
     unpickled = pickle.loads(pickled)
 
+    assert unpickled._ds._storage_options == storage_options
     assert fragment.to_table() == unpickled.to_table()
 
 
