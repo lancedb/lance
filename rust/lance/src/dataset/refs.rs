@@ -2474,7 +2474,7 @@ mod tests {
             if location.as_ref().contains("/_refs/catalog/")
                 && self
                     .remaining_catalog_get_failures
-                    .fetch_update(
+                    .try_update(
                         AtomicOrdering::SeqCst,
                         AtomicOrdering::SeqCst,
                         |remaining| remaining.checked_sub(1),
