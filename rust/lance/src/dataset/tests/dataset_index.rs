@@ -4123,6 +4123,120 @@ async fn test_fts_phrase_query_preserves_stop_word_gaps() {
     assert!(!ids.contains(&3), "ids={ids:?}");
 }
 
+fn json_batch(values: Vec<&str>) -> RecordBatch {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("json", DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+}
+
+async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
+    let initial = json_batch(initial_values);
+    let initial_schema = initial.schema();
+    let reader = RecordBatchIterator::new([Ok(initial)], initial_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "path": "val",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+#[rstest]
+#[case::merge(false)]
+#[case::append_rebuild(true)]
+#[tokio::test]
+async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1000}"#]).await;
+
+    for values in [
+        vec![r#"{"val": null}"#, r#"{"val": 2000}"#],
+        vec![r#"{"other": 1}"#, r#"{"val": 3000}"#],
+    ] {
+        let batch = json_batch(values);
+        let schema = batch.schema();
+        dataset
+            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+            .await
+            .unwrap();
+    }
+
+    let options = if append_rebuild {
+        OptimizeOptions::append()
+    } else {
+        OptimizeOptions::default()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let indexed_fragments = dataset
+        .load_indices_by_name("json_idx")
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+        .collect::<HashSet<_>>();
+    assert_eq!(indexed_fragments, HashSet::from([0, 1, 2]));
+
+    let result = dataset
+        .scan()
+        .filter("json_get_int(json, 'val') >= 2000")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+}
+
+#[tokio::test]
+async fn test_optimize_append_json_btree_preserves_float_type() {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1.5}"#]).await;
+    let appended = json_batch(vec![r#"{"val": 2}"#]);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let predicate = "json_get_float(json, 'val') = 2.0";
+    let indexed = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 1);
+    assert_eq!(indexed.num_rows(), baseline.num_rows());
+}
+
 async fn prepare_json_dataset() -> (Dataset, String) {
     let text_col = Arc::new(StringArray::from(vec![
         r#"{
