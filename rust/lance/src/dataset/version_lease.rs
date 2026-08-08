@@ -247,9 +247,14 @@ enum ReferenceLifecycleState {
         canonical_path: String,
         live: ReferenceLiveState,
     },
+    Legacy {
+        canonical_path: String,
+    },
     Deleting {
         canonical_path: String,
         operation_id: String,
+        previous: Option<ReferenceLiveState>,
+        previous_was_legacy: bool,
     },
 }
 
@@ -444,6 +449,7 @@ impl VersionLeaseStore {
         let recorded_path = match &state {
             ReferenceLifecycleState::Pending { canonical_path, .. }
             | ReferenceLifecycleState::Live { canonical_path, .. }
+            | ReferenceLifecycleState::Legacy { canonical_path }
             | ReferenceLifecycleState::Deleting { canonical_path, .. } => canonical_path,
         };
         if recorded_path != canonical_path.as_ref() {
@@ -542,13 +548,23 @@ impl VersionLeaseStore {
     ) -> Result<()> {
         let local_lock = lock_local_reference(&self.object_store, canonical_path).await?;
         let current = self.reference_lifecycle_snapshot(canonical_path).await?;
-        let previous = match current.as_ref().map(|snapshot| &snapshot.state) {
-            None => None,
-            Some(ReferenceLifecycleState::Live { live, .. }) => Some(live.clone()),
+        let (previous, previous_was_legacy) = match current.as_ref().map(|snapshot| &snapshot.state)
+        {
+            None => (None, previous_was_legacy),
+            Some(ReferenceLifecycleState::Live { live, .. }) => (Some(live.clone()), false),
+            Some(ReferenceLifecycleState::Legacy { .. }) => (None, true),
             Some(ReferenceLifecycleState::Pending { .. }) => {
                 return Err(Error::RefConflict {
                     message: format!("reference {canonical_path} has an in-flight mutation"),
                 });
+            }
+            Some(ReferenceLifecycleState::Deleting { .. })
+                if !self.object_store.exists(canonical_path).await? =>
+            {
+                // A crash after canonical deletion can leave the sidecar in
+                // Deleting. Reusing that generation directly avoids requiring
+                // an unsafe delete/recreate race on the lifecycle object.
+                (None, false)
             }
             Some(ReferenceLifecycleState::Deleting { .. }) => {
                 return Err(Error::RefConflict {
@@ -642,6 +658,21 @@ impl VersionLeaseStore {
             };
             return Ok(self
                 .put_reference_lifecycle(canonical_path, Some(&current), &live, has_local_lock)
+                .await?
+                .is_some());
+        }
+        if matches!(
+            &current.state,
+            ReferenceLifecycleState::Pending {
+                previous_was_legacy: true,
+                ..
+            }
+        ) {
+            let legacy = ReferenceLifecycleState::Legacy {
+                canonical_path: canonical_path.to_string(),
+            };
+            return Ok(self
+                .put_reference_lifecycle(canonical_path, Some(&current), &legacy, has_local_lock)
                 .await?
                 .is_some());
         }
@@ -769,7 +800,10 @@ impl VersionLeaseStore {
                 let target = match state {
                     ReferenceLifecycleState::Pending { target, .. } => Some(target),
                     ReferenceLifecycleState::Live { live, .. } => Some(live.target),
-                    ReferenceLifecycleState::Deleting { .. } => None,
+                    ReferenceLifecycleState::Deleting { previous, .. } => {
+                        previous.map(|live| live.target)
+                    }
+                    ReferenceLifecycleState::Legacy { .. } => None,
                 };
                 Ok::<_, Error>(target.and_then(|target| {
                     (target.namespace == self.namespace).then_some(target.version)
@@ -804,7 +838,8 @@ impl VersionLeaseStore {
                 let generation = match state {
                     ReferenceLifecycleState::Pending { operation_id, .. } => Some(operation_id),
                     ReferenceLifecycleState::Live { live, .. } => Some(live.generation),
-                    ReferenceLifecycleState::Deleting { .. } => None,
+                    ReferenceLifecycleState::Deleting { operation_id, .. } => Some(operation_id),
+                    ReferenceLifecycleState::Legacy { .. } => Some("legacy".to_string()),
                 };
                 Ok::<_, Error>(generation.map(|generation| (metadata.location, generation)))
             })
@@ -846,7 +881,12 @@ impl VersionLeaseStore {
                     ReferenceLifecycleState::Live { live, .. } => {
                         (live.generation, Some(live.target))
                     }
-                    ReferenceLifecycleState::Deleting { operation_id, .. } => (operation_id, None),
+                    ReferenceLifecycleState::Deleting {
+                        operation_id,
+                        previous,
+                        ..
+                    } => (operation_id, previous.map(|live| live.target)),
+                    ReferenceLifecycleState::Legacy { .. } => ("legacy".to_string(), None),
                 };
                 let changed = observed_generations.get(&metadata.location) != Some(&generation);
                 Ok::<_, Error>(target.and_then(|target| {
@@ -1041,11 +1081,12 @@ impl VersionLeaseStore {
                 },
                 Some((metadata, current_payload)),
             ) if current_payload.as_ref() == expected_payload => {
+                let fenced_payload = fenced_reference_payload(&current_payload);
                 self.rewrite_reference_payload(
                     &path,
                     &metadata,
                     &current_payload,
-                    &current_payload,
+                    &fenced_payload,
                     local_lock.is_some(),
                 )
                 .await?;
@@ -1163,7 +1204,7 @@ impl VersionLeaseStore {
         has_local_lock: bool,
         expected_operation_id: Option<&str>,
     ) -> Result<ReferenceMutationOutcome> {
-        if let Some(expected_operation_id) = expected_operation_id {
+        let pending_version = if let Some(expected_operation_id) = expected_operation_id {
             self.ensure_branch_incarnation_active().await?;
             let canonical_path = match mutation {
                 ReferenceMutation::Create { path, .. } | ReferenceMutation::Update { path, .. } => {
@@ -1171,16 +1212,17 @@ impl VersionLeaseStore {
                 }
             };
             let lifecycle = self.reference_lifecycle_snapshot(&canonical_path).await?;
-            if !matches!(
-                lifecycle.as_ref().map(|snapshot| &snapshot.state),
+            match lifecycle.as_ref().map(|snapshot| &snapshot.state) {
                 Some(ReferenceLifecycleState::Pending {
                     operation_id,
+                    target,
                     ..
-                }) if operation_id == expected_operation_id
-            ) {
-                return Ok(ReferenceMutationOutcome::Conflict);
+                }) if operation_id == expected_operation_id => Some(target.version),
+                _ => return Ok(ReferenceMutationOutcome::Conflict),
             }
-        }
+        } else {
+            None
+        };
         let (path, payload, result) = match mutation {
             ReferenceMutation::Create { path, payload } => {
                 let path = Path::parse(path)?;
@@ -1250,18 +1292,117 @@ impl VersionLeaseStore {
             }
         };
 
-        match result {
-            Ok(_) => Ok(ReferenceMutationOutcome::Published),
+        let outcome = match result {
+            Ok(_) => ReferenceMutationOutcome::Published,
             Err(
                 object_store::Error::AlreadyExists { .. }
                 | object_store::Error::Precondition { .. },
             ) => {
                 self.reference_mutation_conflict_outcome(&path, payload)
-                    .await
+                    .await?
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(ReferenceMutationOutcome::Conflict),
-            Err(error) => Err(error.into()),
+            Err(object_store::Error::NotFound { .. }) => ReferenceMutationOutcome::Conflict,
+            Err(error) => return Err(error.into()),
+        };
+        if outcome == ReferenceMutationOutcome::Published
+            && let (Some(operation_id), Some(version)) = (expected_operation_id, pending_version)
+        {
+            self.finish_reference_mutation(mutation, operation_id, version, has_local_lock)
+                .await
+        } else {
+            Ok(outcome)
         }
+    }
+
+    async fn finish_reference_mutation(
+        &self,
+        mutation: &ReferenceMutation,
+        operation_id: &str,
+        version: u64,
+        has_local_lock: bool,
+    ) -> Result<ReferenceMutationOutcome> {
+        let canonical_path = match mutation {
+            ReferenceMutation::Create { path, .. } | ReferenceMutation::Update { path, .. } => {
+                Path::parse(path)?
+            }
+        };
+        let branch_is_active = match self.ensure_branch_incarnation_active().await {
+            Ok(()) => true,
+            Err(Error::RefConflict { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        let lifecycle_completed = branch_is_active
+            && self
+                .complete_reference_lifecycle(
+                    &canonical_path,
+                    operation_id,
+                    version,
+                    has_local_lock,
+                )
+                .await?;
+        if lifecycle_completed {
+            return Ok(ReferenceMutationOutcome::Published);
+        }
+
+        self.rollback_lost_reference_mutation(mutation, has_local_lock)
+            .await?;
+        self.cancel_reference_lifecycle(&canonical_path, operation_id, has_local_lock)
+            .await?;
+        Ok(ReferenceMutationOutcome::Conflict)
+    }
+
+    async fn rollback_lost_reference_mutation(
+        &self,
+        mutation: &ReferenceMutation,
+        has_local_lock: bool,
+    ) -> Result<()> {
+        let (path, intended_payload) = match mutation {
+            ReferenceMutation::Create { path, payload }
+            | ReferenceMutation::Update { path, payload, .. } => {
+                (Path::parse(path)?, payload.as_slice())
+            }
+        };
+        let result = match self.object_store.inner.get(&path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = result.meta.clone();
+        let current_payload = result.bytes().await?;
+        if current_payload.as_ref() != intended_payload {
+            return Ok(());
+        }
+
+        let replacement = match mutation {
+            ReferenceMutation::Create { payload, .. } => {
+                set_payload_reference_generation(payload, &Uuid::new_v4().simple().to_string())?
+            }
+            ReferenceMutation::Update {
+                expected_payload, ..
+            } => expected_payload.clone(),
+        };
+        match self
+            .rewrite_reference_payload(
+                &path,
+                &metadata,
+                &current_payload,
+                &replacement,
+                has_local_lock,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(Error::RefConflict { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        if matches!(mutation, ReferenceMutation::Create { .. }) {
+            match self.object_store.delete(&path).await {
+                Ok(()) => {}
+                Err(error) if error.is_not_found() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     async fn reference_mutation_conflict_outcome(
@@ -2305,24 +2446,8 @@ impl ReferenceAdmission {
             .await
         {
             Ok(ReferenceMutationOutcome::Published) => {
-                if self
-                    .store
-                    .complete_reference_lifecycle(
-                        &canonical_path,
-                        &self.operation_id,
-                        self.version,
-                        local_lock.is_some(),
-                    )
-                    .await?
-                {
-                    self.complete().await;
-                    Ok(())
-                } else {
-                    self.cancel_before_publish_inner(local_lock.is_some()).await;
-                    Err(Error::RefConflict {
-                        message: conflict_message,
-                    })
-                }
+                self.complete().await;
+                Ok(())
             }
             Ok(ReferenceMutationOutcome::Conflict) => {
                 self.cancel_before_publish_inner(local_lock.is_some()).await;
@@ -2471,6 +2596,13 @@ fn set_payload_reference_generation(payload: &[u8], generation: &str) -> Result<
     Ok(serde_json::to_vec_pretty(&value)?)
 }
 
+fn fenced_reference_payload(payload: &[u8]) -> Vec<u8> {
+    let mut fenced = Vec::with_capacity(payload.len() + 1);
+    fenced.extend_from_slice(payload);
+    fenced.push(b'\n');
+    fenced
+}
+
 pub(super) async fn canonical_reference_is_visible(
     object_store: Arc<ObjectStore>,
     root_path: &Path,
@@ -2478,23 +2610,27 @@ pub(super) async fn canonical_reference_is_visible(
     payload: &[u8],
 ) -> Result<bool> {
     let generation = payload_reference_generation(payload)?;
+    // Released writers do not preserve fields they do not know about. Their
+    // rewrites remain authoritative canonical references and must stay visible
+    // while the sidecar is reconciled by a later current-client mutation.
+    if generation.is_none() {
+        return Ok(true);
+    }
     let store = VersionLeaseStore::lifecycle_only(object_store, root_path.clone());
     let Some(snapshot) = store.reference_lifecycle_snapshot(canonical_path).await? else {
-        return Ok(generation.is_none());
+        return Ok(false);
     };
     Ok(match snapshot.state {
         ReferenceLifecycleState::Live { live, .. } => {
             generation.as_deref() == Some(live.generation.as_str())
         }
-        ReferenceLifecycleState::Pending {
-            previous,
-            previous_was_legacy,
-            ..
-        } => match previous {
+        ReferenceLifecycleState::Legacy { .. } => false,
+        ReferenceLifecycleState::Pending { previous, .. } => match previous {
             Some(previous) => generation.as_deref() == Some(previous.generation.as_str()),
-            None => previous_was_legacy && generation.is_none(),
+            None => false,
         },
-        ReferenceLifecycleState::Deleting { .. } => false,
+        ReferenceLifecycleState::Deleting { previous, .. } => previous
+            .is_some_and(|previous| generation.as_deref() == Some(previous.generation.as_str())),
     })
 }
 
@@ -2534,21 +2670,22 @@ pub(super) async fn delete_canonical_reference(
     }
 
     let lifecycle = store.reference_lifecycle_snapshot(canonical_path).await?;
+    let canonical_generation = payload_reference_generation(&current_payload)?;
     match lifecycle.as_ref().map(|snapshot| &snapshot.state) {
         Some(ReferenceLifecycleState::Pending { .. }) => {
             return Err(Error::RefConflict {
                 message: format!("reference {canonical_path} has an in-flight mutation"),
             });
         }
-        Some(ReferenceLifecycleState::Deleting { .. }) => {
+        Some(ReferenceLifecycleState::Live { live, .. })
+            if canonical_generation.as_deref().is_some()
+                && canonical_generation.as_deref() != Some(live.generation.as_str()) =>
+        {
             return Err(Error::RefConflict {
-                message: format!("reference {canonical_path} is already being deleted"),
+                message: format!("reference {canonical_path} lifecycle changed during deletion"),
             });
         }
-        Some(ReferenceLifecycleState::Live { live, .. })
-            if payload_reference_generation(&current_payload)?.as_deref()
-                != Some(live.generation.as_str()) =>
-        {
+        Some(ReferenceLifecycleState::Legacy { .. }) if canonical_generation.is_some() => {
             return Err(Error::RefConflict {
                 message: format!("reference {canonical_path} lifecycle changed during deletion"),
             });
@@ -2556,32 +2693,114 @@ pub(super) async fn delete_canonical_reference(
         _ => {}
     }
 
-    let deleting = ReferenceLifecycleState::Deleting {
-        canonical_path: canonical_path.to_string(),
-        operation_id: Uuid::new_v4().simple().to_string(),
+    let is_retry = lifecycle
+        .as_ref()
+        .is_some_and(|snapshot| matches!(snapshot.state, ReferenceLifecycleState::Deleting { .. }));
+    let deleting_snapshot = if is_retry {
+        let Some(snapshot) = lifecycle else {
+            return Err(Error::internal(format!(
+                "reference {canonical_path} lost its deleting lifecycle state"
+            )));
+        };
+        snapshot
+    } else {
+        let previous = lifecycle
+            .as_ref()
+            .and_then(|snapshot| match &snapshot.state {
+                ReferenceLifecycleState::Live { live, .. } => Some(live.clone()),
+                _ => None,
+            });
+        let deleting = ReferenceLifecycleState::Deleting {
+            canonical_path: canonical_path.to_string(),
+            operation_id: Uuid::new_v4().simple().to_string(),
+            previous,
+            previous_was_legacy: canonical_generation.is_none(),
+        };
+        let Some(snapshot) = store
+            .put_reference_lifecycle(
+                canonical_path,
+                lifecycle.as_ref(),
+                &deleting,
+                local_lock.is_some(),
+            )
+            .await?
+        else {
+            return Err(Error::RefConflict {
+                message: format!("reference {canonical_path} lifecycle changed during deletion"),
+            });
+        };
+        snapshot
     };
-    if store
-        .put_reference_lifecycle(
-            canonical_path,
-            lifecycle.as_ref(),
-            &deleting,
-            local_lock.is_some(),
-        )
-        .await?
-        .is_none()
-    {
-        return Err(Error::RefConflict {
-            message: format!("reference {canonical_path} lifecycle changed during deletion"),
-        });
-    }
 
-    object_store.delete(canonical_path).await?;
+    if let Err(delete_error) = object_store.delete(canonical_path).await {
+        match object_store.inner.get(canonical_path).await {
+            Ok(_) => {
+                restore_reference_lifecycle(
+                    &store,
+                    canonical_path,
+                    &deleting_snapshot,
+                    local_lock.is_some(),
+                )
+                .await?;
+                return Err(delete_error);
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(_) => return Err(delete_error),
+        }
+    }
     let state_path = store.reference_state_path(canonical_path);
     match object_store.delete(&state_path).await {
         Ok(()) => Ok(()),
         Err(error) if error.is_not_found() => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+async fn restore_reference_lifecycle(
+    store: &VersionLeaseStore,
+    canonical_path: &Path,
+    deleting_snapshot: &ReferenceLifecycleSnapshot,
+    has_local_lock: bool,
+) -> Result<()> {
+    let ReferenceLifecycleState::Deleting {
+        previous,
+        previous_was_legacy,
+        ..
+    } = &deleting_snapshot.state
+    else {
+        return Err(Error::internal(format!(
+            "reference {canonical_path} has non-deleting rollback state"
+        )));
+    };
+    let restored = if let Some(previous) = previous {
+        ReferenceLifecycleState::Live {
+            canonical_path: canonical_path.to_string(),
+            live: previous.clone(),
+        }
+    } else if *previous_was_legacy {
+        ReferenceLifecycleState::Legacy {
+            canonical_path: canonical_path.to_string(),
+        }
+    } else {
+        return Err(Error::internal(format!(
+            "reference {canonical_path} deletion has no state to restore"
+        )));
+    };
+    if store
+        .put_reference_lifecycle(
+            canonical_path,
+            Some(deleting_snapshot),
+            &restored,
+            has_local_lock,
+        )
+        .await?
+        .is_none()
+    {
+        return Err(Error::RefConflict {
+            message: format!("reference {canonical_path} lifecycle changed during rollback"),
+        });
+    }
+    Ok(())
 }
 
 async fn ensure_reference_available(
@@ -2965,6 +3184,105 @@ mod tests {
         assert!(serde_json::from_slice::<BranchContents>(&branch).is_ok());
     }
 
+    #[tokio::test]
+    async fn released_client_rewrite_keeps_generated_references_visible() {
+        let store = memory_store();
+        let manifest_path = Path::from("manifests/42.manifest");
+        store.object_store.put(&manifest_path, &[]).await.unwrap();
+
+        let tag_path = Path::from("tags/released.json");
+        create_test_reference_admission(
+            &store,
+            42,
+            &manifest_path,
+            &tag_path,
+            br#"{"branch":null,"version":42,"manifestSize":0,"metadata":{}}"#,
+        )
+        .await
+        .publish("conflict".to_string())
+        .await
+        .unwrap();
+        let generated_tag = store
+            .object_store
+            .inner
+            .get(&tag_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let released_tag = serde_json::to_vec_pretty(
+            &serde_json::from_slice::<TagContents>(&generated_tag).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            payload_reference_generation(&released_tag)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .object_store
+            .put(&tag_path, &released_tag)
+            .await
+            .unwrap();
+        assert!(
+            canonical_reference_is_visible(
+                Arc::clone(&store.object_store),
+                &store.root_path,
+                &tag_path,
+                &released_tag,
+            )
+            .await
+            .unwrap()
+        );
+
+        let branch_path = Path::from("branches/released.json");
+        create_test_reference_admission(
+            &store,
+            42,
+            &manifest_path,
+            &branch_path,
+            br#"{"parentBranch":null,"identifier":{"version_mapping":[]},"parentVersion":42,"createAt":0,"manifestSize":0,"metadata":{}}"#,
+        )
+        .await
+        .publish("conflict".to_string())
+        .await
+        .unwrap();
+        let generated_branch = store
+            .object_store
+            .inner
+            .get(&branch_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let released_branch = serde_json::to_vec_pretty(
+            &serde_json::from_slice::<BranchContents>(&generated_branch).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            payload_reference_generation(&released_branch)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .object_store
+            .put(&branch_path, &released_branch)
+            .await
+            .unwrap();
+        assert!(
+            canonical_reference_is_visible(
+                Arc::clone(&store.object_store),
+                &store.root_path,
+                &branch_path,
+                &released_branch,
+            )
+            .await
+            .unwrap()
+        );
+    }
+
     #[test]
     fn parses_lease_file_name() {
         let lease_id = Uuid::nil().simple();
@@ -3286,12 +3604,6 @@ mod tests {
                 .unwrap(),
             ReferenceMutationOutcome::Published
         );
-        assert!(
-            store
-                .complete_reference_lifecycle(&canonical_path, &admission.operation_id, 42, false,)
-                .await
-                .unwrap()
-        );
         admission
             .store
             .object_store
@@ -3415,11 +3727,7 @@ mod tests {
         .await;
         assert_eq!(
             store
-                .apply_reference_mutation_inner(
-                    &admission.mutation,
-                    false,
-                    Some(&admission.operation_id),
-                )
+                .apply_reference_mutation_inner(&admission.mutation, false, None,)
                 .await
                 .unwrap(),
             ReferenceMutationOutcome::Published
@@ -3490,18 +3798,19 @@ mod tests {
                 .unwrap(),
             ReferenceMutationOutcome::Conflict
         );
+        let fenced_payload = store
+            .object_store
+            .inner
+            .get(&canonical_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_ne!(fenced_payload.as_ref(), original_payload);
         assert_eq!(
-            store
-                .object_store
-                .inner
-                .get(&canonical_path)
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap()
-                .as_ref(),
-            original_payload
+            serde_json::from_slice::<serde_json::Value>(&fenced_payload).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(original_payload).unwrap()
         );
     }
 
@@ -3662,6 +3971,134 @@ mod tests {
                 .unwrap(),
             ReferenceMutationOutcome::Conflict
         );
+        assert!(!store.object_store.exists(&canonical_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn checked_child_create_is_rolled_back_after_parent_state_removal() {
+        let root = Path::from("dataset");
+        let namespace = "branch-id";
+        let store = VersionLeaseStore {
+            object_store: Arc::new(ObjectStore::memory()),
+            root_path: root.clone(),
+            namespace: namespace.to_string(),
+            leases_path: root.clone().join(LEASES_DIR).join(namespace),
+            markers_path: root.clone().join(LEASE_GC_MARKERS_DIR).join(namespace),
+            reference_intents_path: root.clone().join(REFERENCE_INTENTS_DIR).join(namespace),
+            manifest_path: None,
+            canonical_references: None,
+        };
+        let manifest_path = Path::from("dataset/branches/parent/versions/42.manifest");
+        let canonical_path = Path::from("dataset/_refs/branches/child.json");
+        store.object_store.put(&manifest_path, &[]).await.unwrap();
+        let admission = create_test_reference_admission(
+            &store,
+            42,
+            &manifest_path,
+            &canonical_path,
+            br#"{"parentVersion":42}"#,
+        )
+        .await;
+        admission.ensure_owned().await.unwrap();
+
+        remove_branch_state(&store.object_store, &root, namespace)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .apply_reference_mutation_inner(&admission.mutation, false, None)
+                .await
+                .unwrap(),
+            ReferenceMutationOutcome::Published
+        );
+        assert_eq!(
+            store
+                .finish_reference_mutation(&admission.mutation, &admission.operation_id, 42, false,)
+                .await
+                .unwrap(),
+            ReferenceMutationOutcome::Conflict
+        );
+        assert!(!store.object_store.exists(&canonical_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deletion_failure_restores_reference_lifecycle() {
+        let failing_store = Arc::new(FailingProxyStore::new());
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = failing_store.wrap("memory", Arc::clone(&object_store.inner));
+        let store = VersionLeaseStore {
+            object_store: Arc::new(object_store),
+            root_path: Path::from(""),
+            namespace: MAIN_BRANCH.to_string(),
+            leases_path: Path::from("leases"),
+            markers_path: Path::from("markers"),
+            reference_intents_path: Path::from("reference_intents"),
+            manifest_path: None,
+            canonical_references: None,
+        };
+        let manifest_path = Path::from("manifests/42.manifest");
+        let canonical_path = Path::from("tags/deletion-failure.json");
+        store.object_store.put(&manifest_path, &[]).await.unwrap();
+        create_test_reference_admission(
+            &store,
+            42,
+            &manifest_path,
+            &canonical_path,
+            br#"{"branch":null,"version":42,"manifestSize":0,"metadata":{}}"#,
+        )
+        .await
+        .publish("conflict".to_string())
+        .await
+        .unwrap();
+        let result = store.object_store.inner.get(&canonical_path).await.unwrap();
+        let metadata = result.meta.clone();
+        let payload = result.bytes().await.unwrap();
+        failing_store.fail_when(
+            "delete",
+            "deletion-failure.json",
+            "injected canonical deletion failure",
+        );
+
+        let error = delete_canonical_reference(
+            Arc::clone(&store.object_store),
+            &store.root_path,
+            &canonical_path,
+            &metadata,
+            &payload,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected canonical deletion failure"),
+            "{error}"
+        );
+        failing_store.clear_fail_when("delete", "deletion-failure.json");
+
+        let remaining = store.object_store.inner.get(&canonical_path).await.unwrap();
+        let remaining_metadata = remaining.meta.clone();
+        let remaining_payload = remaining.bytes().await.unwrap();
+        assert!(
+            canonical_reference_is_visible(
+                Arc::clone(&store.object_store),
+                &store.root_path,
+                &canonical_path,
+                &remaining_payload,
+            )
+            .await
+            .unwrap(),
+            "a failed delete must not hide the still-present reference"
+        );
+        delete_canonical_reference(
+            Arc::clone(&store.object_store),
+            &store.root_path,
+            &canonical_path,
+            &remaining_metadata,
+            &remaining_payload,
+        )
+        .await
+        .unwrap();
         assert!(!store.object_store.exists(&canonical_path).await.unwrap());
     }
 }
