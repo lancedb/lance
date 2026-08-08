@@ -35,6 +35,9 @@ from .lance import (
 from .lance import (
     RowIdMeta as RowIdMeta,
 )
+from .lance import (
+    RowIdSequence as RowIdSequence,
+)
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
@@ -339,10 +342,7 @@ class LanceFragment(pa.dataset.Fragment):
         return self._fragment.__repr__()
 
     def __reduce__(self):
-        from .dataset import LanceDataset
-
-        ds = LanceDataset(self._ds.uri, self._ds.version)
-        return LanceFragment, (ds, self.fragment_id)
+        return LanceFragment, (self._ds, self.fragment_id)
 
     @staticmethod
     def create_from_file(

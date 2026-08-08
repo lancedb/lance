@@ -177,6 +177,11 @@ async fn do_write_manifest(
         let pb_tx: pb::Transaction = tx.into();
         let pos = writer.write_protobuf(&pb_tx).await?;
         manifest.transaction_section = Some(pos);
+    } else {
+        // No inline copy is written to this file. Clear any offset inherited
+        // from a previous manifest (e.g. via restore or clone), which would
+        // otherwise point at arbitrary bytes of the file being written.
+        manifest.transaction_section = None;
     }
 
     writer.write_struct(manifest).await

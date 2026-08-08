@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod validate;
+
 use super::Dataset;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
@@ -13,29 +15,32 @@ use lance_table::{
 };
 use std::sync::Arc;
 
+pub(super) use validate::validate_stable_row_ids;
+
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
-    // Virtual path to prevent collisions in the cache.
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
-        Some(RowIdMeta::Inline(data)) => {
+        Some(row_id_meta @ RowIdMeta::Inline(data)) => {
             let data = data.clone();
             let key = RowIdSequenceKey {
                 fragment_id: fragment.id,
+                row_id_meta,
             };
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
                 .await
         }
-        Some(RowIdMeta::External(file_slice)) => {
+        Some(row_id_meta @ RowIdMeta::External(file_slice)) => {
             let file_slice = file_slice.clone();
             let dataset_clone = dataset.clone();
             let key = RowIdSequenceKey {
                 fragment_id: fragment.id,
+                row_id_meta,
             };
             dataset
                 .metadata_cache
@@ -246,10 +251,14 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
             let fragment_clone = (*fragment).clone();
             async move {
                 let deletion_vector = if has_deletion_file {
-                    match fragment_clone.get_deletion_vector().await {
-                        Ok(Some(dv)) => dv,
-                        Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
-                    }
+                    fragment_clone
+                        .get_deletion_vector()
+                        .await?
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "fragment_id={fragment_id} has deletion-file metadata but no deletion vector"
+                            ))
+                        })?
                 } else {
                     Arc::new(DeletionVector::default())
                 };
@@ -274,13 +283,16 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder};
+    use crate::dataset::{
+        ReadParams, UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder,
+    };
 
     use super::*;
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::session::Session;
+    use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
@@ -290,6 +302,7 @@ mod test {
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_io::object_store::ObjectStoreParams;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -385,6 +398,59 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_row_id_index_propagates_deletion_vector_read_error() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let test_uri = temp_dir.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+        let mut dataset = Dataset::write(
+            reader,
+            &routed_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 3").await.unwrap();
+        drop(dataset);
+
+        let failing_store = Arc::new(FailingProxyStore::new());
+        failing_store.fail_when(
+            "get_opts",
+            "_deletions",
+            "injected deletion-vector read failure",
+        );
+        let dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing_store.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let error = get_row_id_index(&dataset).await.unwrap_err();
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected deletion-vector read failure")
+        );
+
+        failing_store.clear_fail_when("get_opts", "_deletions");
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(index.get(2).is_some());
+        assert!(index.get(3).is_none());
+    }
+
+    #[tokio::test]
     async fn test_row_addrs_to_row_ids() {
         let num_rows = 25u64;
         let batch = sequence_batch(0..num_rows as i32);
@@ -459,10 +525,128 @@ mod test {
 
         // Overwriting should NOT reset the row id counter.
         assert_eq!(dataset.manifest().next_row_id, 2 * num_rows);
+        // Nor the fragment id counter: ids are a high water mark, so the
+        // overwritten fragment cannot alias the one it replaced.
+        assert_eq!(dataset.manifest.fragments[0].id, 1);
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
         assert!(index.get(num_rows).is_some());
+    }
+
+    /// Fragment ids are a high water mark within one dataset, but a dataset
+    /// dropped and recreated at the same URI restarts them at 0 while sharing the
+    /// cache namespace of its predecessor (see #7645). The two generations must
+    /// still be told apart.
+    #[tokio::test]
+    async fn test_row_ids_recreate_at_same_uri() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        // Shared so the cache stays warm across the drop, as it would for a host
+        // that keeps one session open for the lifetime of the process.
+        let session = Arc::new(Session::default());
+        let write = |rows: Range<i32>| {
+            let batch = sequence_batch(rows);
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let params = WriteParams {
+                enable_stable_row_ids: true,
+                session: Some(session.clone()),
+                ..Default::default()
+            };
+            async move {
+                Dataset::write(reader, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let dataset = write(0..100).await;
+        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(sequence.len(), 100);
+
+        // Reloading the unchanged fragment must still hit: keying on contents has
+        // to leave the sequence cacheable, not just make it distinguishable.
+        let hits_before = session.metadata_cache_stats().await.hits;
+        load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(session.metadata_cache_stats().await.hits, hits_before + 1);
+
+        drop(dataset);
+        std::fs::remove_dir_all(tmp_path.as_str()).unwrap();
+
+        // Shorter than the dataset it replaces, so a stale hit is observable: an
+        // equal-length sequence would be byte-identical and harmless.
+        let dataset = write(0..60).await;
+        assert_eq!(dataset.manifest.fragments[0].id, 0);
+
+        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            sequence.iter().collect::<Vec<_>>(),
+            (0..60).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_after_recreate() {
+        // Compaction rechunks the row id sequences of the fragments it merges, so
+        // a sequence cached for a dropped dataset does not just misreport ids, it
+        // writes ids the fragments do not hold back into the manifest.
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let session = Arc::new(Session::default());
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+
+        let write = |rows: Range<i32>, mode: WriteMode| {
+            let batch = sequence_batch(rows);
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let params = WriteParams {
+                mode,
+                ..params.clone()
+            };
+            async move {
+                Dataset::write(reader, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let dataset = write(0..100, WriteMode::Create).await;
+        load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+
+        drop(dataset);
+        std::fs::remove_dir_all(tmp_path.as_str()).unwrap();
+
+        // The recreated dataset holds 60 rows in fragment 0, not the 100 cached
+        // above, and a second fragment so compaction has something to merge.
+        write(0..60, WriteMode::Create).await;
+        let mut dataset = write(0..100, WriteMode::Append).await;
+
+        compact(&mut dataset, 1024).await;
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 160);
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let batch = scan.try_into_batch().await.unwrap();
+        let row_ids = batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        // A stale 100-long sequence would rechunk 0..100 onto the 60 rows of
+        // fragment 0 and shift everything after it.
+        assert_eq!(row_ids, (0..160).collect::<HashSet<_>>());
     }
 
     #[tokio::test]
@@ -722,7 +906,7 @@ mod test {
         build_rowid_to_i_map(row_ids, i)
     }
 
-    async fn compact(dataset: &mut Dataset, target_rows: usize) {
+    pub(super) async fn compact(dataset: &mut Dataset, target_rows: usize) {
         let options = CompactionOptions {
             target_rows_per_fragment: target_rows,
             ..Default::default()
@@ -730,7 +914,7 @@ mod test {
         let _ = compact_files(dataset, options, None).await.unwrap();
     }
 
-    async fn delete(dataset: &mut Dataset, expr: &str) {
+    pub(super) async fn delete(dataset: &mut Dataset, expr: &str) {
         dataset.delete(expr).await.unwrap();
     }
 

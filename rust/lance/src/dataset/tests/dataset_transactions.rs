@@ -382,10 +382,13 @@ async fn test_inline_transaction() {
     // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
-    let tx_file =
-        crate::io::commit::write_transaction_file(ds.object_store.as_ref(), &ds.base, &tx)
-            .await
-            .unwrap();
+    let tx_file = crate::io::commit::write_transaction_file(
+        ds.object_store.as_ref(),
+        &ds.base,
+        &lance_table::format::pb::Transaction::from(&tx),
+    )
+    .await
+    .unwrap();
     let (mut manifest, indices) = tx
         .build_manifest(
             Some(ds.manifest.as_ref()),
@@ -725,4 +728,163 @@ async fn test_list_detached_manifests() {
     let versions = dataset.versions().await.unwrap();
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].version, 1);
+}
+
+/// Transaction properties large enough to push the transaction over the
+/// inline threshold.
+fn large_props(key: &str) -> Option<Arc<HashMap<String, String>>> {
+    use crate::io::commit::MAX_INLINE_TRANSACTION_BYTES;
+    let mut props = HashMap::new();
+    props.insert(
+        key.to_string(),
+        "x".repeat(2 * MAX_INLINE_TRANSACTION_BYTES),
+    );
+    Some(Arc::new(props))
+}
+
+fn spill_test_batch() -> (Arc<ArrowSchema>, RecordBatch) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    (schema, batch)
+}
+
+/// Load the dataset with a fresh session so assertions hit storage, not caches.
+async fn reopen(uri: &str) -> Dataset {
+    DatasetBuilder::from_uri(uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_large_transaction_spills_to_external_file() {
+    use crate::io::commit::MAX_INLINE_TRANSACTION_BYTES;
+
+    let (schema, batch) = spill_test_batch();
+    let test_uri = TempStrDir::default();
+
+    // New-dataset commit path: a transaction too large to inline is written
+    // only to the external transaction file.
+    Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            transaction_properties: large_props("payload"),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let ds = reopen(&test_uri).await;
+    assert!(ds.manifest.transaction_section.is_none());
+    assert!(matches!(ds.manifest.transaction_file.as_deref(), Some(f) if !f.is_empty()));
+    let tx = ds.read_transaction().await.unwrap().unwrap();
+    assert_eq!(
+        tx.transaction_properties
+            .unwrap()
+            .get("payload")
+            .unwrap()
+            .len(),
+        2 * MAX_INLINE_TRANSACTION_BYTES
+    );
+
+    // Normal commit path: a small append is still inlined.
+    Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let ds = reopen(&test_uri).await;
+    assert!(ds.manifest.transaction_section.is_some());
+}
+
+#[tokio::test]
+async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
+    // Restore and deep clone both rebuild the new manifest from an existing
+    // manifest file, inheriting its inline transaction offset and external
+    // transaction file name. When the new transaction is too large to inline,
+    // readers fall back to exactly those fields, so the stale inherited values
+    // must not leak into the new manifest.
+    use crate::dataset::transaction::TransactionBuilder;
+
+    let (schema, batch) = spill_test_batch();
+    let source_uri = TempStrDir::default();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &source_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    // The manifests restored from / cloned from below carry an inline
+    // transaction offset and their own transaction file.
+    assert!(ds.manifest.transaction_section.is_some());
+    let source_version = ds.manifest().version;
+    let source_ref_path = ds.uri().to_string();
+    let source_tx_file = ds.manifest.transaction_file.clone();
+    assert!(matches!(source_tx_file.as_deref(), Some(f) if !f.is_empty()));
+
+    // Restore with a spilled transaction: the stale inline offset must be
+    // cleared and the transaction read back from the external file.
+    let restore_tx = TransactionBuilder::new(source_version, Operation::Restore { version: 1 })
+        .transaction_properties(large_props("payload"))
+        .build();
+    CommitBuilder::new(Arc::new(ds))
+        .execute(restore_tx.clone())
+        .await
+        .unwrap();
+    let restored = reopen(&source_uri).await;
+    assert!(restored.manifest.transaction_section.is_none());
+    assert_eq!(
+        restored.read_transaction().await.unwrap().unwrap(),
+        restore_tx
+    );
+
+    // Deep clone with a spilled transaction: the manifest must reference the
+    // clone's own transaction file, not the source's.
+    let clone_tx = TransactionBuilder::new(
+        source_version,
+        Operation::Clone {
+            is_shallow: false,
+            ref_name: None,
+            ref_version: source_version,
+            ref_path: source_ref_path,
+            branch_name: None,
+        },
+    )
+    .transaction_properties(large_props("payload"))
+    .build();
+    let clone_uri = TempStrDir::default();
+    CommitBuilder::new(&clone_uri)
+        .execute(clone_tx.clone())
+        .await
+        .unwrap();
+    let cloned = reopen(&clone_uri).await;
+    assert!(cloned.manifest.transaction_section.is_none());
+    assert_ne!(cloned.manifest.transaction_file, source_tx_file);
+    assert_eq!(cloned.read_transaction().await.unwrap().unwrap(), clone_tx);
 }

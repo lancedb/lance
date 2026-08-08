@@ -40,14 +40,15 @@ use lance_core::{
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{
-    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
+    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader,
 };
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
-use lance_file::{LanceEncodingsIo, determine_file_version};
+use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
@@ -370,7 +371,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
+                let projection = file_versions::reader_projection_from_field_ids(
                     self.reader.version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
@@ -400,7 +401,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
+                let projection = file_versions::reader_projection_from_field_ids(
                     self.reader.version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
@@ -429,7 +430,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
+                let projection = file_versions::reader_projection_from_field_ids(
                     self.reader.version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
@@ -461,7 +462,7 @@ mod v2_adapter {
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             let indices = UInt32Array::from(indices.to_vec());
             async move {
-                let projection = ReaderProjection::from_field_ids(
+                let projection = file_versions::reader_projection_from_field_ids(
                     self.reader.version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
@@ -783,7 +784,9 @@ impl FileFragment {
         let file_version =
             determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
 
-        if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
+        if file_version
+            != ConcreteFileVersion::from(dataset.manifest.data_storage_format.lance_file_version()?)
+        {
             return Err(Error::invalid_input(format!(
                 "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
                 dataset.manifest.data_storage_format.lance_file_version()?,
@@ -791,7 +794,7 @@ impl FileFragment {
             )));
         }
 
-        if file_version == LanceFileVersion::Legacy {
+        if file_version == ConcreteFileVersion::V1 {
             let fragment = Fragment::with_file_legacy(
                 fragment_id as u64,
                 filename,
@@ -822,7 +825,7 @@ impl FileFragment {
             reader
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
-            let projection = lance_file::reader::ReaderProjection::from_whole_schema(
+            let projection = file_versions::reader_projection_from_whole_schema(
                 dataset.schema(),
                 reader.metadata().version(),
             );
@@ -840,7 +843,7 @@ impl FileFragment {
                 filename,
                 dataset.schema().field_ids(),
                 column_indices,
-                ConcreteFileVersion::from(file_version),
+                file_version,
                 None,
             );
             Ok(frag)
@@ -987,23 +990,6 @@ impl FileFragment {
         data_file.fields.first().copied().unwrap_or(0) as u32
     }
 
-    fn should_try_indexed_metadata(
-        data_file: &DataFile,
-        projection: &ReaderProjection,
-        file_version: LanceFileVersion,
-    ) -> bool {
-        if !ProjectedFileReader::supports_projection(projection, file_version) {
-            return false;
-        }
-        let total_columns = data_file
-            .column_indices
-            .iter()
-            .filter(|column_index| **column_index >= 0)
-            .count();
-        let selected_columns = projection.column_indices.len();
-        selected_columns.saturating_mul(4) < total_columns
-    }
-
     pub(super) async fn open_reader(
         &self,
         data_file: &DataFile,
@@ -1128,8 +1114,8 @@ impl FileFragment {
                             }
                         }),
                 ));
-                let file_version: LanceFileVersion = data_file.file_version()?.into();
-                let reader_projection = ReaderProjection::from_field_ids(
+                let file_version = data_file.file_version()?;
+                let reader_projection = file_versions::reader_projection_from_field_ids(
                     file_version,
                     schema_per_file.as_ref(),
                     field_id_to_column_idx.as_ref(),
@@ -1139,58 +1125,62 @@ impl FileFragment {
                     .clone()
                     .or_else(|| self.dataset.file_reader_options.clone())
                     .unwrap_or_default();
-                let metadata_index = if metadata_mode == MetadataMode::LazyAllowed
-                    && Self::should_try_indexed_metadata(
-                        data_file,
-                        &reader_projection,
-                        file_version,
-                    ) {
-                    let known_schema = self
-                        .metadata
-                        .physical_rows
-                        .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
-                    let metadata_index = self
-                        .get_file_metadata_index(&file_scheduler, known_schema)
-                        .await?;
-                    if (reader_projection.column_indices.len() as u32).saturating_mul(4)
-                        < metadata_index.num_columns()
-                    {
-                        Some(metadata_index)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
+                let prefer_indexed = metadata_mode == MetadataMode::LazyAllowed
+                    && reader_projection.column_indices.len().saturating_mul(4)
+                        < data_file
+                            .column_indices
+                            .iter()
+                            .filter(|column_index| **column_index >= 0)
+                            .count();
+                let known_schema = self
+                    .metadata
+                    .physical_rows
+                    .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
                 let encodings_io = Arc::new(
                     LanceEncodingsIo::new(file_scheduler.clone())
                         .with_read_chunk_size(file_reader_options.read_chunk_size),
                 );
-                let reader = if let Some(metadata_index) = metadata_index {
-                    ProjectedFileReader::try_open_with_metadata_index(
-                        encodings_io.clone(),
-                        path.clone(),
-                        Some(reader_projection.clone()),
-                        Arc::<DecoderPlugins>::default(),
-                        metadata_index,
-                        &metadata_cache,
-                        file_reader_options.clone(),
-                    )
-                    .await?
-                } else {
-                    let file_metadata = self.get_file_metadata(&file_scheduler).await?;
-                    ProjectedFileReader::try_open_with_file_metadata(
-                        encodings_io,
-                        path.clone(),
-                        None,
-                        Arc::<DecoderPlugins>::default(),
-                        file_metadata,
-                        &metadata_cache,
-                        file_reader_options,
-                    )
-                    .await?
-                };
+                let reader = file_versions::open_projected_reader(
+                    file_version,
+                    &reader_projection,
+                    prefer_indexed,
+                    || async {
+                        let metadata_index = self
+                            .get_file_metadata_index(&file_scheduler, known_schema)
+                            .await?;
+                        if (reader_projection.column_indices.len() as u32).saturating_mul(4)
+                            >= metadata_index.num_columns()
+                        {
+                            return Ok(None);
+                        }
+                        Ok(Some(
+                            ProjectedFileReader::try_open_with_metadata_index(
+                                encodings_io.clone(),
+                                path.clone(),
+                                Some(reader_projection.clone()),
+                                Arc::<DecoderPlugins>::default(),
+                                metadata_index,
+                                &metadata_cache,
+                                file_reader_options.clone(),
+                            )
+                            .await?,
+                        ))
+                    },
+                    || async {
+                        let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+                        ProjectedFileReader::try_open_with_file_metadata(
+                            encodings_io.clone(),
+                            path.clone(),
+                            None,
+                            Arc::<DecoderPlugins>::default(),
+                            file_metadata,
+                            &metadata_cache,
+                            file_reader_options.clone(),
+                        )
+                        .await
+                    },
+                )
+                .await?;
                 let reader = v2_adapter::Reader::new(
                     Arc::new(reader),
                     schema_per_file,
@@ -1418,6 +1408,11 @@ impl FileFragment {
         for data_file in &self.metadata.files {
             let last = -1;
             for field_id in data_file.fields.iter() {
+                // A tombstone marks a field superseded by a later data file.
+                // It is not a field id: it has no ordering and can repeat.
+                if *field_id == TOMBSTONE_FIELD_ID {
+                    continue;
+                }
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
@@ -2004,7 +1999,7 @@ impl FileFragment {
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> Result<(Fragment, Schema)> {
-        let (fragments, schema, _) = schema_evolution::add_columns_to_fragments(
+        let (fragments, schema, _, _) = schema_evolution::add_columns_to_fragments(
             self.dataset.as_ref(),
             transforms,
             read_columns,
@@ -3262,9 +3257,6 @@ mod tests {
         /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `val` (field 1)
         /// = id * 10, written 6 rows per file (fragments 0 and 1).
         ///
-        /// Uses an in-memory store so the test can write overlay files with a
-        /// store-relative `data/<name>.lance` path and commit against the returned
-        /// dataset directly.
         async fn create_base_dataset(version: LanceFileVersion) -> Dataset {
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("id", DataType::Int32, true),
@@ -3307,7 +3299,9 @@ mod tests {
             let overlay_schema = dataset.schema().project_by_ids(fields, true);
 
             let filename = format!("{name}.lance");
-            let path = Path::from(format!("data/{filename}"));
+            // The manifest records the bare filename; only the physical write is
+            // data-dir qualified.
+            let path = dataset.data_dir().join(filename.as_str());
             let obj_writer = dataset.object_store.create(&path).await.unwrap();
             let file_version = ConcreteFileVersion::from(version);
             let mut writer = lance_file::versions::create_writer(
@@ -3358,6 +3352,161 @@ mod tests {
             )
             .await
             .unwrap()
+        }
+
+        /// `collect_paths` feeds `deep_clone`'s copy loop, so an overlay data file
+        /// it omits is referenced by the clone's manifest but never copied. The
+        /// clone then fails to read the overlaid values.
+        #[tokio::test]
+        async fn deep_clone_copies_overlay_files() {
+            use lance_core::utils::tempfile::TempStdDir;
+
+            let version = LanceFileVersion::Stable;
+            let test_dir = TempStdDir::default();
+            let source_uri = test_dir.join("source").to_str().unwrap().to_string();
+            let clone_uri = test_dir.join("clone").to_str().unwrap().to_string();
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(
+                reader,
+                &source_uri,
+                Some(WriteParams {
+                    max_rows_per_file: 6,
+                    max_rows_per_group: 6,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            // Overlay `val` on offsets 0 and 1 of fragment 0.
+            let mut dataset = commit_overlay(
+                dataset,
+                "overlay0",
+                0,
+                &[1],
+                OverlayCoverage::Shared(Arc::new(bitmap([0, 1]))),
+                vec![i32_array([Some(700), Some(701)])],
+                version,
+            )
+            .await;
+
+            let source_version = dataset.version().version;
+            dataset
+                .tags()
+                .create("clone-me", source_version)
+                .await
+                .unwrap();
+            let cloned = dataset
+                .deep_clone(&clone_uri, "clone-me", None)
+                .await
+                .unwrap();
+
+            let batch = cloned
+                .scan()
+                .try_into_batch()
+                .await
+                .expect("the clone must be readable, including its overlay files");
+            let val = col(&batch, "val");
+            assert_eq!(
+                val.values()[..2],
+                [700, 701],
+                "the clone must return the overlaid values, not the base ones"
+            );
+        }
+
+        /// Deep-cloning a shallow clone has to drop every `base_id`, since the
+        /// result owns its files. An overlay whose `base_id` survives points at a
+        /// base the new manifest no longer lists.
+        #[tokio::test]
+        async fn deep_clone_of_shallow_clone_clears_overlay_base_id() {
+            use lance_core::utils::tempfile::TempStdDir;
+
+            let version = LanceFileVersion::Stable;
+            let test_dir = TempStdDir::default();
+            let source_uri = test_dir.join("source").to_str().unwrap().to_string();
+            let shallow_uri = test_dir.join("shallow").to_str().unwrap().to_string();
+            let deep_uri = test_dir.join("deep").to_str().unwrap().to_string();
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(
+                reader,
+                &source_uri,
+                Some(WriteParams {
+                    max_rows_per_file: 6,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let mut dataset = commit_overlay(
+                dataset,
+                "overlay0",
+                0,
+                &[1],
+                OverlayCoverage::Shared(Arc::new(bitmap([0, 1]))),
+                vec![i32_array([Some(700), Some(701)])],
+                version,
+            )
+            .await;
+
+            let source_version = dataset.version().version;
+            dataset.tags().create("v", source_version).await.unwrap();
+            let mut shallow = dataset
+                .shallow_clone(&shallow_uri, "v", None)
+                .await
+                .unwrap();
+            // The shallow clone reaches the overlay through the parent.
+            assert!(
+                shallow.get_fragments()[0].metadata().overlays[0]
+                    .data_file
+                    .base_id
+                    .is_some(),
+                "the shallow clone must reference the parent's overlay by base_id"
+            );
+
+            let shallow_version = shallow.version().version;
+            shallow.tags().create("v", shallow_version).await.unwrap();
+            let deep = shallow.deep_clone(&deep_uri, "v", None).await.unwrap();
+
+            assert_eq!(
+                deep.get_fragments()[0].metadata().overlays[0]
+                    .data_file
+                    .base_id,
+                None,
+                "a deep clone owns its files, so the overlay must carry no base_id"
+            );
+            assert!(
+                deep.manifest.base_paths.is_empty(),
+                "a deep clone lists no external bases"
+            );
         }
 
         fn full_schema(dataset: &Dataset) -> Schema {
@@ -5537,48 +5686,65 @@ mod tests {
                 assert_eq!(dataset.count_rows(None).await.unwrap(), 195);
             }
 
-            let fragment = &mut dataset.get_fragment(0).unwrap();
-            let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
             let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "double_i",
                 DataType::Int32,
                 true,
             )]));
-            while let Some(batch) = updater.next().await.unwrap() {
-                let input_col = batch.column_by_name("i").unwrap();
-                let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
-                let batch = RecordBatch::try_new(
-                    new_schema.clone(),
-                    vec![Arc::new(result_col) as ArrayRef],
-                )
-                .unwrap();
-                updater.update(batch).await.unwrap();
-            }
-            let new_fragment = updater.finish().await.unwrap();
+            // Merge keeps the fragment list intact, so every fragment gets the new
+            // column. Fragment 0 is the one carrying the deletions.
+            let fragment_ids = dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as usize)
+                .collect::<Vec<_>>();
+            let mut merged_fragments = Vec::new();
+            for fragment_id in fragment_ids {
+                let fragment = &mut dataset.get_fragment(fragment_id).unwrap();
+                let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
+                while let Some(batch) = updater.next().await.unwrap() {
+                    let input_col = batch.column_by_name("i").unwrap();
+                    let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
+                    let batch = RecordBatch::try_new(
+                        new_schema.clone(),
+                        vec![Arc::new(result_col) as ArrayRef],
+                    )
+                    .unwrap();
+                    updater.update(batch).await.unwrap();
+                }
+                let new_fragment = updater.finish().await.unwrap();
 
-            assert_eq!(new_fragment.files.len(), 2);
+                assert_eq!(new_fragment.files.len(), 2);
+                merged_fragments.push(new_fragment);
+            }
 
             // Scan again
             let mut full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
             full_schema.set_field_id(None);
             let before_version = dataset.version().version;
 
-            let op = Operation::Overwrite {
-                fragments: vec![new_fragment],
+            let op = Operation::Merge {
+                fragments: merged_fragments,
                 schema: full_schema.clone(),
-                config_upsert_values: None,
-                initial_bases: None,
+                preserves_nullability: true,
             };
 
-            let dataset =
-                Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
-                    .await
-                    .unwrap();
+            let dataset = Dataset::commit(
+                test_uri,
+                op,
+                Some(before_version),
+                None,
+                None,
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
 
-            // We only kept the first fragment of 40 rows
             assert_eq!(
                 dataset.count_rows(None).await.unwrap(),
-                if with_delete { 35 } else { 40 }
+                if with_delete { 195 } else { 200 }
             );
             assert_eq!(dataset.version().version, before_version + 1);
             dataset.validate().await.unwrap();
@@ -5805,6 +5971,7 @@ mod tests {
             Operation::Merge {
                 schema,
                 fragments: vec![frag],
+                preserves_nullability: true,
             },
             Some(dataset.manifest.version),
             None,
@@ -6059,54 +6226,6 @@ mod tests {
                 .contains("storage_stats requires full file metadata"),
             "expected storage_stats to reject projected metadata, got {err:?}"
         );
-    }
-
-    #[test]
-    fn test_indexed_metadata_heuristic_counts_selected_physical_columns() {
-        let schema = Schema::try_from(&ArrowSchema::new(vec![
-            ArrowField::new(
-                "s",
-                DataType::Struct(
-                    vec![
-                        ArrowField::new("x", DataType::Int32, true),
-                        ArrowField::new("y", DataType::Int32, true),
-                    ]
-                    .into(),
-                ),
-                true,
-            ),
-            ArrowField::new("a", DataType::Int32, true),
-            ArrowField::new("b", DataType::Int32, true),
-            ArrowField::new("c", DataType::Int32, true),
-        ]))
-        .unwrap();
-        let data_file = DataFile {
-            path: "wide.lance".to_string(),
-            fields: Arc::from([0, 1, 2, 3, 4, 5]),
-            column_indices: Arc::from([-1, 0, 1, 2, 3, 4]),
-            file_major_version: 2,
-            file_minor_version: 1,
-            file_size_bytes: CachedFileSize::unknown(),
-            base_id: None,
-        };
-
-        let full_struct =
-            ReaderProjection::from_column_names(LanceFileVersion::V2_1, &schema, &["s"]).unwrap();
-        assert_eq!(full_struct.column_indices.len(), 2);
-        assert!(!FileFragment::should_try_indexed_metadata(
-            &data_file,
-            &full_struct,
-            LanceFileVersion::V2_1
-        ));
-
-        let partial_struct =
-            ReaderProjection::from_column_names(LanceFileVersion::V2_1, &schema, &["s.x"]).unwrap();
-        assert_eq!(partial_struct.column_indices.len(), 1);
-        assert!(FileFragment::should_try_indexed_metadata(
-            &data_file,
-            &partial_struct,
-            LanceFileVersion::V2_1
-        ));
     }
 
     #[tokio::test]

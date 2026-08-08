@@ -274,9 +274,53 @@ fn is_encodable_pk_type(data_type: &DataType) -> bool {
     )
 }
 
-/// Configuration for an index in MemWAL.
+/// The index kinds a MemTable can maintain — the registry of MemWAL index
+/// support. Data-free because indexes are identified by type url before any
+/// [`MemIndexConfig`] exists.
 ///
-/// Each variant contains all the configuration needed for that index type.
+/// Adding a variant is a compile error in [`details_suffix`](Self::details_suffix),
+/// `MemIndexConfig::kind`, and `Dataset::mem_wal_writer` until each handles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemIndexKind {
+    /// BTree index for scalar fields (point lookups, range queries).
+    BTree,
+    /// HNSW vector index built incrementally, queryable while building.
+    Hnsw,
+    /// Full-text search index.
+    Fts,
+}
+
+impl MemIndexKind {
+    /// Every maintainable kind. A kind missing here is never detected, so it
+    /// goes unmaintained rather than reaching a memtable that cannot build it.
+    pub const ALL: &'static [Self] = &[Self::BTree, Self::Hnsw, Self::Fts];
+
+    /// Suffix of the protobuf details message identifying this kind.
+    ///
+    /// Only the suffix: the prefix varies by dataset version
+    /// (`/lance.table.`, `/lance.index.pb.`, and the `type.googleapis.com/`
+    /// form MemWAL flush once wrote), and all must resolve.
+    pub const fn details_suffix(self) -> &'static str {
+        match self {
+            Self::BTree => "BTreeIndexDetails",
+            Self::Hnsw => "VectorIndexDetails",
+            Self::Fts => "InvertedIndexDetails",
+        }
+    }
+
+    /// The kind a base-table index of this protobuf type maps to, or `None`
+    /// when a memtable cannot maintain it.
+    pub fn from_type_url(type_url: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| type_url.ends_with(kind.details_suffix()))
+    }
+}
+
+/// Configuration for an index in MemWAL. Pairs 1:1 with [`MemIndexKind`] via
+/// [`kind`](Self::kind).
+///
 /// `Hnsw` is boxed because `HnswBuildParams` is small but the variant may
 /// grow with future config (e.g. shard-specific tuning).
 #[derive(Debug, Clone)]
@@ -290,6 +334,16 @@ pub enum MemIndexConfig {
 }
 
 impl MemIndexConfig {
+    /// The kind this config builds. Links the config enum to the registry, so
+    /// a new variant must declare its kind.
+    pub const fn kind(&self) -> MemIndexKind {
+        match self {
+            Self::BTree(_) => MemIndexKind::BTree,
+            Self::Hnsw(_) => MemIndexKind::Hnsw,
+            Self::Fts(_) => MemIndexKind::Fts,
+        }
+    }
+
     /// Get the index name.
     pub fn name(&self) -> &str {
         match self {
@@ -386,22 +440,6 @@ impl MemIndexConfig {
         ))
     }
 
-    /// Detect index type from protobuf type_url.
-    pub fn detect_index_type(type_url: &str) -> Result<&'static str> {
-        if type_url.ends_with("BTreeIndexDetails") {
-            Ok("btree")
-        } else if type_url.ends_with("InvertedIndexDetails") {
-            Ok("fts")
-        } else if type_url.ends_with("VectorIndexDetails") {
-            Ok("vector")
-        } else {
-            Err(Error::invalid_input(format!(
-                "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
-                type_url
-            )))
-        }
-    }
-
     /// Extract field ID and column name from index metadata.
     fn extract_field_info(
         index_meta: &IndexMetadata,
@@ -420,6 +458,15 @@ impl MemIndexConfig {
 
         Ok((*field_id, column))
     }
+}
+
+/// Names the index, not just its type: a caller validating a maintained set
+/// needs to know which one to drop.
+pub(crate) fn unsupported_index_type(index_name: &str, type_url: &str) -> Error {
+    Error::invalid_input(format!(
+        "index '{}' has type {}, which the MemWAL cannot maintain. Supported: BTree, Inverted, Vector",
+        index_name, type_url
+    ))
 }
 
 /// Registry managing all in-memory indexes for a MemTable.
@@ -1186,6 +1233,24 @@ impl IndexStore {
         self.btree_indexes.is_empty() && self.hnsw_indexes.is_empty() && self.fts_indexes.is_empty()
     }
 
+    /// Name every index this memtable carries, for diagnostics.
+    ///
+    /// Answers "is my fresh-tier vector search brute-force" — an absent
+    /// name is the whole explanation, and there is no other way to see it
+    /// from outside. Sorted so repeated calls compare cleanly; `HashMap`
+    /// iteration order alone would not.
+    pub fn index_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .btree_indexes
+            .keys()
+            .chain(self.hnsw_indexes.keys())
+            .chain(self.fts_indexes.keys())
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Get the total number of indexes.
     pub fn len(&self) -> usize {
         self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
@@ -1230,26 +1295,58 @@ mod tests {
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use lance_index::scalar::inverted::InvertedListFormatVersion;
-    use log::warn;
     use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
 
-    /// Check if an index type is supported and log warning if not.
-    fn check_index_type_supported(index_type: &str) -> bool {
-        match index_type.to_lowercase().as_str() {
-            "btree" | "scalar" => true,
-            "hnsw" | "vector" => true,
-            "fts" | "inverted" | "fulltext" => true,
-            _ => {
-                warn!(
-                    "Index type '{}' is not supported for MemWAL. \
-                     Supported types: btree, hnsw, fts. Skipping.",
-                    index_type
-                );
-                false
-            }
+    /// Matching is on the message-name suffix, not the whole url: `Any::from_msg`
+    /// emits the package (`/lance.table.`, `/lance.index.pb.`), while MemWAL flush
+    /// used to hand-write a `type.googleapis.com/` url that existing datasets
+    /// still carry.
+    #[rstest]
+    #[case::btree("/lance.table.BTreeIndexDetails", Some(MemIndexKind::BTree))]
+    #[case::fts("/lance.table.InvertedIndexDetails", Some(MemIndexKind::Fts))]
+    #[case::fts_legacy("/lance.index.pb.InvertedIndexDetails", Some(MemIndexKind::Fts))]
+    #[case::vector("/lance.index.pb.VectorIndexDetails", Some(MemIndexKind::Hnsw))]
+    // What MemWAL flush wrote before it switched to `Any::from_msg`.
+    #[case::vector_legacy_flush(
+        "type.googleapis.com/lance.index.VectorIndexDetails",
+        Some(MemIndexKind::Hnsw)
+    )]
+    #[case::bitmap("/lance.table.BitmapIndexDetails", None)]
+    #[case::label_list("/lance.table.LabelListIndexDetails", None)]
+    #[case::ngram("/lance.table.NGramIndexDetails", None)]
+    #[case::zone_map("/lance.table.ZoneMapIndexDetails", None)]
+    #[case::bloom_filter("/lance.index.pb.BloomFilterIndexDetails", None)]
+    #[case::json("/lance.index.pb.JsonIndexDetails", None)]
+    #[case::fm("/lance.index.pb.FMIndexDetails", None)]
+    #[case::absent("", None)]
+    fn type_urls_resolve_to_the_kind_the_writer_builds(
+        #[case] type_url: &str,
+        #[case] expected: Option<MemIndexKind>,
+    ) {
+        assert_eq!(MemIndexKind::from_type_url(type_url), expected);
+    }
+
+    /// `ALL` is hand-maintained, so a kind left out of it stops resolving.
+    #[test]
+    fn every_kind_is_registered_and_uniquely_identified() {
+        for kind in MemIndexKind::ALL {
+            assert_eq!(
+                MemIndexKind::from_type_url(&format!("/lance.table.{}", kind.details_suffix())),
+                Some(*kind),
+                "{kind:?} does not resolve from its own suffix",
+            );
         }
+        let suffixes: std::collections::HashSet<_> = MemIndexKind::ALL
+            .iter()
+            .map(|k| k.details_suffix())
+            .collect();
+        assert_eq!(
+            suffixes.len(),
+            MemIndexKind::ALL.len(),
+            "two kinds share a details suffix, so one can never be resolved",
+        );
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1638,18 +1735,6 @@ mod tests {
                 .column_name(),
             "tags"
         );
-    }
-
-    #[test]
-    fn test_check_index_type_supported() {
-        assert!(check_index_type_supported("btree"));
-        assert!(check_index_type_supported("BTree"));
-        assert!(check_index_type_supported("hnsw"));
-        assert!(check_index_type_supported("vector"));
-        assert!(check_index_type_supported("fts"));
-        assert!(check_index_type_supported("inverted"));
-
-        assert!(!check_index_type_supported("unknown"));
     }
 
     #[test]

@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::vec;
 
@@ -29,7 +32,9 @@ use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
 };
 use lance_arrow::ARROW_EXT_NAME_KEY;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{
+    CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, LanceCache, QuickCacheBackend,
+};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
@@ -41,12 +46,12 @@ use lance_index::metrics::{
     COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
+use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -961,6 +966,175 @@ async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: us
     assert_eq!(limited, exhaustive[..limit]);
 }
 
+fn expected_must_score_sum(left: Vec<(u64, f32)>, right: Vec<(u64, f32)>) -> Vec<(u64, f32)> {
+    let right = right.into_iter().collect::<HashMap<_, _>>();
+    let mut expected = left
+        .into_iter()
+        .filter_map(|(row_id, left_score)| {
+            right
+                .get(&row_id)
+                .map(|right_score| (row_id, left_score + right_score))
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_row_id.cmp(right_row_id))
+    });
+    expected
+}
+
+#[tokio::test]
+async fn test_boolean_must_scores_sum_across_execution_paths() {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "alpha beta delta",
+                "alpha alpha beta delta delta",
+                "alpha delta",
+                "beta delta",
+                "alpha beta beta delta delta delta"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            ["gamma", "gamma gamma", "gamma", "gamma", "other"]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+    const LIMIT: usize = 2;
+
+    let match_query = |term: &str, column: &str, boost: f32| -> FtsQuery {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some(column.to_owned()))
+            .with_boost(boost)
+            .into()
+    };
+
+    let same_column_left = match_query("alpha", "title", 2.0);
+    let same_column_right = match_query("beta", "title", 3.0);
+    let expected = expected_must_score_sum(
+        compound_fts_results(&dataset, same_column_left.clone(), None).await,
+        compound_fts_results(&dataset, same_column_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let same_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, same_column_left.clone()),
+        (Occur::Must, same_column_right.clone()),
+    ])
+    .into();
+    let actual =
+        compound_fts_results(&dataset, same_column_query.clone(), Some(LIMIT as i64)).await;
+    assert_eq!(actual, expected[..LIMIT]);
+    let reversed_same_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, same_column_right),
+        (Occur::Must, same_column_left),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_same_column_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let nested_left = match_query("alpha", "title", 2.0);
+    let nested_middle = match_query("beta", "title", 3.0);
+    let nested_right = match_query("delta", "title", 5.0);
+    let expected = expected_must_score_sum(
+        expected_must_score_sum(
+            compound_fts_results(&dataset, nested_left.clone(), None).await,
+            compound_fts_results(&dataset, nested_middle.clone(), None).await,
+        ),
+        compound_fts_results(&dataset, nested_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let nested_pair: FtsQuery =
+        BooleanQuery::new([(Occur::Must, nested_left), (Occur::Must, nested_middle)]).into();
+    let nested_query: FtsQuery =
+        BooleanQuery::new([(Occur::Must, nested_pair), (Occur::Must, nested_right)]).into();
+    assert_eq!(
+        compound_fts_results(&dataset, nested_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+    let reversed_nested_pair: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("beta", "title", 3.0)),
+        (Occur::Must, match_query("alpha", "title", 2.0)),
+    ])
+    .into();
+    let reversed_nested_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("delta", "title", 5.0)),
+        (Occur::Must, reversed_nested_pair),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_nested_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(same_column_query))
+        .unwrap();
+    scanner.limit(Some(LIMIT as i64), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column MUST should exercise the composable scorer:\n{plan}"
+    );
+
+    let cross_column_left = match_query("alpha", "title", 2.0);
+    let cross_column_right = match_query("gamma", "body", 3.0);
+    let expected = expected_must_score_sum(
+        compound_fts_results(&dataset, cross_column_left.clone(), None).await,
+        compound_fts_results(&dataset, cross_column_right.clone(), None).await,
+    );
+    assert!(expected.len() > LIMIT);
+    let cross_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, cross_column_left.clone()),
+        (Occur::Must, cross_column_right.clone()),
+    ])
+    .into();
+    let actual =
+        compound_fts_results(&dataset, cross_column_query.clone(), Some(LIMIT as i64)).await;
+    assert_eq!(actual, expected[..LIMIT]);
+    let reversed_cross_column_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, cross_column_right),
+        (Occur::Must, cross_column_left),
+    ])
+    .into();
+    assert_eq!(
+        compound_fts_results(&dataset, reversed_cross_column_query, Some(LIMIT as i64)).await,
+        expected[..LIMIT]
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(cross_column_query))
+        .unwrap();
+    scanner.limit(Some(LIMIT as i64), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("HashJoinExec"),
+        "cross-column MUST should exercise the exact fallback:\n{plan}"
+    );
+}
+
 #[tokio::test]
 async fn test_nested_multimatch_limit_propagation() {
     let batch = arrow_array::record_batch!(
@@ -1145,6 +1319,54 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
         plan.contains("CompoundFtsScorer"),
         "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
     );
+}
+
+#[tokio::test]
+async fn test_compound_phrase_confirmation_short_circuit_is_exact() {
+    let texts = (0..100)
+        .map(|row| {
+            if row % 10 == 0 {
+                "high cost phrase check cheap reject bonus"
+            } else if row % 5 == 0 {
+                "high cost phrase check cheap reject"
+            } else {
+                "high cost phrase check cheap filler reject"
+            }
+        })
+        .collect::<Vec<_>>();
+    let batch = arrow_array::record_batch!(("text", Utf8, texts)).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 25,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let phrase_query = |terms: &str| -> FtsQuery {
+        PhraseQuery::new(terms.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, phrase_query("high cost phrase check")),
+        (Occur::Must, phrase_query("cheap reject")),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, query.clone(), 10).await;
+
+    let nested: FtsQuery = BooleanQuery::new([
+        (Occur::Must, query.clone()),
+        (Occur::Should, compound_match_query("bonus", "text", 1.0)),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, nested, 10).await;
 }
 
 #[tokio::test]
@@ -2420,6 +2642,33 @@ async fn assert_fts_list_phrase_query_can_cross_elements<Offset: arrow::array::O
     let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
     let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
 
+    let cases: [(&str, &[u64]); 3] = [
+        ("alpha beta", &[0]),
+        ("want the apple", &[1]),
+        ("want apple", &[2]),
+    ];
+    let mut flat_results = Vec::with_capacity(cases.len());
+    for (terms, expected) in cases {
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new(terms.to_owned())
+                        .with_column(Some("doc".to_owned()))
+                        .into(),
+                )
+                .limit(Some(10)),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), expected);
+        flat_results.push(result);
+    }
+
     let params = InvertedIndexParams::default()
         .with_position(true)
         .remove_stop_words(true);
@@ -2428,47 +2677,33 @@ async fn assert_fts_list_phrase_query_can_cross_elements<Offset: arrow::array::O
         .await
         .unwrap();
 
-    let result = dataset
-        .scan()
-        .project(&["id"])
-        .unwrap()
-        .full_text_search(
-            FullTextSearchQuery::new_query(PhraseQuery::new("alpha beta".to_owned()).into())
+    for ((terms, expected), flat_result) in cases.into_iter().zip(flat_results) {
+        let indexed_result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new(terms.to_owned())
+                        .with_column(Some("doc".to_owned()))
+                        .into(),
+                )
                 .limit(Some(10)),
-        )
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[0]);
-
-    let result = dataset
-        .scan()
-        .project(&["id"])
-        .unwrap()
-        .full_text_search(
-            FullTextSearchQuery::new_query(PhraseQuery::new("want the apple".to_owned()).into())
-                .limit(Some(10)),
-        )
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[1]);
-
-    let result = dataset
-        .scan()
-        .project(&["id"])
-        .unwrap()
-        .full_text_search(
-            FullTextSearchQuery::new_query(PhraseQuery::new("want apple".to_owned()).into())
-                .limit(Some(10)),
-        )
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[2]);
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed_result["id"].as_primitive::<UInt64Type>().values(),
+            expected
+        );
+        assert_eq!(
+            indexed_result["id"].as_primitive::<UInt64Type>().values(),
+            flat_result["id"].as_primitive::<UInt64Type>().values(),
+            "query={terms}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2832,6 +3067,290 @@ async fn test_prewarm_index_with_position_validation() {
     assert_contains!(
         err,
         "FTS prewarm options are only supported for inverted indices"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_best_effort_prewarm_result_reports_dataset_partial_residency() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from_iter_values(
+        (0..4096).map(|row| format!("cache pressure token {row}")),
+    ));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let session = Arc::new(Session::with_index_cache_backend(
+        Arc::new(QuickCacheBackend::with_capacity(8 * 1024)),
+        8 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    let options = PrewarmOptions::Fts(FtsPrewarmOptions::default().best_effort());
+
+    dataset
+        .prewarm_index_with_options("fts_idx", &options)
+        .await
+        .unwrap();
+    let result = dataset
+        .prewarm_index_with_options_result("fts_idx", &options)
+        .await
+        .unwrap();
+
+    assert!(
+        !result.fully_resident,
+        "tiny cache should make best-effort dataset prewarm report partial residency"
+    );
+    let diagnostics = result
+        .diagnostics
+        .expect("partial dataset prewarm should return aggregate diagnostics");
+    assert!(diagnostics.partition_count > 0);
+    assert!(!diagnostics.failing_segments.is_empty() || !diagnostics.failing_partitions.is_empty());
+    assert!(
+        diagnostics
+            .failing_partitions
+            .iter()
+            .all(|partition| partition.segment_id.is_some()),
+        "dataset aggregation should attach segment ids to partition diagnostics"
+    );
+}
+
+#[derive(Debug)]
+struct SingleScalarContainerCacheBackend {
+    inner: QuickCacheBackend,
+    scalar_container_inserts: AtomicUsize,
+}
+
+impl SingleScalarContainerCacheBackend {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: QuickCacheBackend::with_capacity(capacity),
+            scalar_container_inserts: AtomicUsize::new(0),
+        }
+    }
+
+    fn rejects_scalar_container(entry: &CacheEntry, codec: Option<&CacheCodec>) -> bool {
+        codec.is_none() && entry.as_ref().is::<Arc<dyn ScalarIndex>>()
+    }
+}
+
+#[async_trait::async_trait]
+impl CacheBackend for SingleScalarContainerCacheBackend {
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        self.inner.get(key, codec).await
+    }
+
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        codec: Option<CacheCodec>,
+    ) {
+        if Self::rejects_scalar_container(&entry, codec.as_ref())
+            && self
+                .scalar_container_inserts
+                .fetch_add(1, Ordering::Relaxed)
+                > 0
+        {
+            return;
+        }
+        self.inner.insert(key, entry, size_bytes, codec).await;
+    }
+
+    async fn get_or_insert<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+        codec: Option<CacheCodec>,
+    ) -> Result<(CacheEntry, bool)> {
+        if codec.is_none() {
+            if let Some(entry) = self.inner.get(key, None).await {
+                return Ok((entry, true));
+            }
+            let (entry, size_bytes) = loader.await?;
+            if Self::rejects_scalar_container(&entry, None)
+                && self
+                    .scalar_container_inserts
+                    .fetch_add(1, Ordering::Relaxed)
+                    > 0
+            {
+                return Ok((entry, false));
+            }
+            self.inner
+                .insert(key, entry.clone(), size_bytes, codec)
+                .await;
+            return Ok((entry, false));
+        }
+        self.inner.get_or_insert(key, loader, codec).await
+    }
+
+    async fn clear(&self) {
+        self.inner.clear().await;
+    }
+
+    async fn num_entries(&self) -> usize {
+        self.inner.num_entries().await
+    }
+
+    async fn size_bytes(&self) -> usize {
+        self.inner.size_bytes().await
+    }
+
+    fn approx_num_entries(&self) -> usize {
+        self.inner.approx_num_entries()
+    }
+
+    fn approx_size_bytes(&self) -> usize {
+        self.inner.approx_size_bytes()
+    }
+}
+
+async fn two_segment_fts_dataset(uri: &str) -> Dataset {
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("doc", DataType::Utf8, true),
+        arrow_schema::Field::new("id", DataType::UInt64, false),
+    ]));
+    let make_batch = |fragment: u64| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(GenericStringArray::<i32>::from_iter_values(
+                    (0..32u64).map(|row| format!("segment {fragment} token {row}")),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from_iter_values(
+                    (0..32u64).map(|row| fragment * 32 + row),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![make_batch(0)].into_iter().map(Ok), schema.clone()),
+        uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![make_batch(1)].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.load_indices_by_name("fts_idx").await.unwrap().len(),
+        2
+    );
+    dataset
+}
+
+async fn open_with_single_scalar_container_cache(uri: &str) -> Dataset {
+    let session = Arc::new(Session::with_index_cache_backend(
+        Arc::new(SingleScalarContainerCacheBackend::new(128 * 1024 * 1024)),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    DatasetBuilder::from_uri(uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_fts_best_effort_prewarm_reports_missing_scalar_container() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    two_segment_fts_dataset(&uri).await;
+    let dataset = open_with_single_scalar_container_cache(&uri).await;
+    let options = PrewarmOptions::Fts(FtsPrewarmOptions::default().best_effort());
+
+    let result = dataset
+        .prewarm_index_with_options_result("fts_idx", &options)
+        .await
+        .unwrap();
+
+    assert!(
+        !result.fully_resident,
+        "dataset prewarm must be partial when a selected segment's scalar index \
+         container is not cache-resident"
+    );
+    let diagnostics = result
+        .diagnostics
+        .expect("missing scalar container should produce aggregate diagnostics");
+    assert_eq!(
+        diagnostics.failing_segments.len(),
+        1,
+        "only the rejected scalar container should be reported as missing"
+    );
+    assert!(
+        diagnostics.failing_partitions.is_empty(),
+        "a missing scalar container should not be represented as a partition failure"
+    );
+    let failure = &diagnostics.failing_segments[0];
+    assert!(!failure.scalar_index_container_resident);
+    assert!(!failure.scalar_index_container_matches_prewarmed);
+}
+
+#[tokio::test]
+async fn test_fts_strict_prewarm_fails_missing_scalar_container() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    two_segment_fts_dataset(&uri).await;
+    let dataset = open_with_single_scalar_container_cache(&uri).await;
+    let options = PrewarmOptions::Fts(FtsPrewarmOptions::default());
+
+    let err = dataset
+        .prewarm_index_with_options_result("fts_idx", &options)
+        .await
+        .expect_err("strict prewarm should fail after final scalar-container audit");
+    assert!(
+        err.to_string().contains("resident scalar index container"),
+        "strict error should describe the missing scalar container: {err}"
     );
 }
 
@@ -3422,6 +3941,130 @@ async fn test_fts_phrase_query_with_removed_stop_words() {
 }
 
 #[tokio::test]
+async fn test_fts_without_index_on_zero_fragment_dataset_is_empty() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::UInt64, false),
+        ArrowField::new("doc", DataType::Utf8, true),
+    ]));
+    let empty_reader = RecordBatchIterator::new(vec![], schema);
+    let dataset = Dataset::write(empty_reader, "memory://", None)
+        .await
+        .unwrap();
+    assert!(dataset.fragments().is_empty());
+
+    let mut scan = dataset.scan();
+    scan.project(&["id"]).unwrap();
+    scan.full_text_search(FullTextSearchQuery::new_query(
+        MatchQuery::new("alpha".to_owned())
+            .with_column(Some("doc".to_owned()))
+            .into(),
+    ))
+    .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("EmptyExec"), "unexpected plan: {plan}");
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let mut phrase_scan = dataset.scan();
+    phrase_scan.project(&["id"]).unwrap();
+    phrase_scan
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("alpha beta".to_owned())
+                .with_column(Some("doc".to_owned()))
+                .into(),
+        ))
+        .unwrap();
+    let phrase_plan = phrase_scan.explain_plan(false).await.unwrap();
+    assert!(
+        phrase_plan.contains("EmptyExec"),
+        "unexpected phrase plan: {phrase_plan}"
+    );
+    assert_eq!(phrase_scan.try_into_batch().await.unwrap().num_rows(), 0);
+}
+
+#[tokio::test]
+async fn test_fts_phrase_query_normalizes_leading_stop_word_position() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let initial = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(UInt64Array::from(vec![99])) as ArrayRef),
+        (
+            "doc",
+            Arc::new(StringArray::from(vec!["placeholder"])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let initial_reader = RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema());
+    let mut dataset = Dataset::write(initial_reader, &uri, None).await.unwrap();
+    let index_params = InvertedIndexParams::default()
+        .with_position(true)
+        .remove_stop_words(true);
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &index_params, true)
+        .await
+        .unwrap();
+
+    let appended = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(UInt64Array::from(vec![0, 1, 2])) as ArrayRef),
+        (
+            "doc",
+            Arc::new(StringArray::from(vec![
+                "alpha beta",
+                "the alpha beta",
+                "alpha gap beta",
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let appended_reader = RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema());
+    dataset = Dataset::write(
+        appended_reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let appended_fragment = dataset.fragments().last().unwrap().clone();
+    let query = FullTextSearchQuery::new_query(
+        PhraseQuery::new("the alpha beta".to_owned())
+            .with_column(Some("doc".to_owned()))
+            .into(),
+    );
+
+    let mut flat_scan = dataset.scan();
+    flat_scan.with_fragments(vec![appended_fragment.clone()]);
+    flat_scan.project(&["id"]).unwrap();
+    flat_scan.full_text_search(query.clone()).unwrap();
+    let flat_result = flat_scan.try_into_batch().await.unwrap();
+    let mut flat_ids = flat_result["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    flat_ids.sort_unstable();
+    assert_eq!(flat_ids, vec![0, 1]);
+
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &index_params, true)
+        .await
+        .unwrap();
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.with_fragments(vec![appended_fragment]);
+    indexed_scan.project(&["id"]).unwrap();
+    indexed_scan.full_text_search(query).unwrap();
+    let indexed_result = indexed_scan.try_into_batch().await.unwrap();
+    let mut indexed_ids = indexed_result["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    indexed_ids.sort_unstable();
+    assert_eq!(indexed_ids, flat_ids);
+}
+
+#[tokio::test]
 async fn test_fts_phrase_query_preserves_stop_word_gaps() {
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -3478,6 +4121,120 @@ async fn test_fts_phrase_query_preserves_stop_word_gaps() {
     assert!(ids.contains(&1), "ids={ids:?}");
     assert!(!ids.contains(&2), "ids={ids:?}");
     assert!(!ids.contains(&3), "ids={ids:?}");
+}
+
+fn json_batch(values: Vec<&str>) -> RecordBatch {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("json", DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+}
+
+async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
+    let initial = json_batch(initial_values);
+    let initial_schema = initial.schema();
+    let reader = RecordBatchIterator::new([Ok(initial)], initial_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "path": "val",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+#[rstest]
+#[case::merge(false)]
+#[case::append_rebuild(true)]
+#[tokio::test]
+async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1000}"#]).await;
+
+    for values in [
+        vec![r#"{"val": null}"#, r#"{"val": 2000}"#],
+        vec![r#"{"other": 1}"#, r#"{"val": 3000}"#],
+    ] {
+        let batch = json_batch(values);
+        let schema = batch.schema();
+        dataset
+            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+            .await
+            .unwrap();
+    }
+
+    let options = if append_rebuild {
+        OptimizeOptions::append()
+    } else {
+        OptimizeOptions::default()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let indexed_fragments = dataset
+        .load_indices_by_name("json_idx")
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+        .collect::<HashSet<_>>();
+    assert_eq!(indexed_fragments, HashSet::from([0, 1, 2]));
+
+    let result = dataset
+        .scan()
+        .filter("json_get_int(json, 'val') >= 2000")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 2);
+}
+
+#[tokio::test]
+async fn test_optimize_append_json_btree_preserves_float_type() {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1.5}"#]).await;
+    let appended = json_batch(vec![r#"{"val": 2}"#]);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let predicate = "json_get_float(json, 'val') = 2.0";
+    let indexed = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 1);
+    assert_eq!(indexed.num_rows(), baseline.num_rows());
 }
 
 async fn prepare_json_dataset() -> (Dataset, String) {
@@ -4293,7 +5050,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Verify that the index file uses the same version as the dataset
     assert_eq!(
         index_reader.metadata().version(),
-        dataset_version,
+        dataset_version.into(),
         "Index file should use the same format version as the dataset"
     );
 
@@ -4322,7 +5079,7 @@ async fn test_index_inherits_dataset_file_version() {
 
         assert_eq!(
             aux_reader.metadata().version(),
-            dataset_version,
+            dataset_version.into(),
             "Auxiliary index file should use the same format version as the dataset"
         );
     }
@@ -4401,7 +5158,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Verify that the index file uses V2_0 (not legacy)
     assert_eq!(
         index_reader.metadata().version(),
-        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_0.into(),
         "Index files should never use legacy format, even for legacy datasets"
     );
 }
