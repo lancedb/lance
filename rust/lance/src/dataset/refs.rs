@@ -220,6 +220,9 @@ impl Refs {
         T: Send,
         F: Future<Output = Result<T>> + Send,
     {
+        // Lease acquisition can perform synchronous cleanup. Renew and revalidate after that
+        // work so an expired owner never polls the protected mutation.
+        handle.renew().await?;
         tokio::pin!(mutation);
         loop {
             tokio::select! {
@@ -393,9 +396,9 @@ impl DurableRefPublication {
 
         // A complete catalog snapshot is the atomically discoverable state for point reads and
         // enumeration. Delayed lower epochs are harmless because readers select the greatest
-        // epoch, and the next successful publication compacts them.
+        // epoch, and the next successful publication compacts them. Everything after this create
+        // is best-effort cleanup: a committed mutation must never report failure.
         create_immutable_body(object_store, &path, self.body.as_bytes()).await?;
-        remove_legacy_ref_files(object_store, &root).await?;
         if let Err(error) = compact_ref_catalog(object_store, &root, self.epoch).await {
             log::warn!("Failed to compact superseded reference catalogs: {}", error);
         }
@@ -412,6 +415,49 @@ struct RefCatalog {
     tags: HashMap<String, serde_json::Value>,
     #[serde(default)]
     branches: HashMap<String, serde_json::Value>,
+    // Legacy files remain as a durable migration baseline. Current readers compare the live
+    // files with this snapshot so a released writer cannot successfully update a flat ref and
+    // then have that update silently ignored by the catalog.
+    #[serde(rename = "_legacyBaseline", default)]
+    legacy_baseline: LegacyRefState,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyRefState {
+    #[serde(default)]
+    tags: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    branches: HashMap<String, serde_json::Value>,
+}
+
+impl RefCatalog {
+    fn reconcile_legacy_changes(&mut self, legacy: LegacyRefState) {
+        reconcile_legacy_entries(&mut self.tags, &self.legacy_baseline.tags, &legacy.tags);
+        reconcile_legacy_entries(
+            &mut self.branches,
+            &self.legacy_baseline.branches,
+            &legacy.branches,
+        );
+        self.legacy_baseline = legacy;
+    }
+}
+
+fn reconcile_legacy_entries(
+    current: &mut HashMap<String, serde_json::Value>,
+    baseline: &HashMap<String, serde_json::Value>,
+    legacy: &HashMap<String, serde_json::Value>,
+) {
+    for name in baseline.keys() {
+        if !legacy.contains_key(name) {
+            current.remove(name);
+        }
+    }
+    for (name, value) in legacy {
+        if baseline.get(name) != Some(value) {
+            current.insert(name.clone(), value.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2038,14 +2084,9 @@ async fn read_latest_ref_catalog(
     root: &Path,
 ) -> Result<Option<RefCatalog>> {
     let catalog_path = base_ref_catalog_path(root);
-    for attempt in 0..3 {
+    loop {
         let entries = match object_store.read_dir(catalog_path.clone()).await {
             Ok(entries) => entries,
-            Err(error) if attempt < 2 => {
-                tokio::task::yield_now().await;
-                log::debug!("Retrying reference catalog listing after: {}", error);
-                continue;
-            }
             Err(error) => return Err(error),
         };
         let Some((epoch, file_name)) = entries
@@ -2063,11 +2104,10 @@ async fn read_latest_ref_catalog(
         let path = catalog_path.clone().join(file_name);
         let result = match object_store.inner.get(&path).await {
             Ok(result) => result,
-            Err(ObjectStoreError::NotFound { .. }) if attempt < 2 => {
+            Err(ObjectStoreError::NotFound { .. }) => {
                 tokio::task::yield_now().await;
                 continue;
             }
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let catalog: RefCatalog = serde_json::from_slice(&result.bytes().await?)?;
@@ -2082,7 +2122,6 @@ async fn read_latest_ref_catalog(
         }
         return Ok(Some(catalog));
     }
-    Ok(None)
 }
 
 async fn read_legacy_ref_entries(
@@ -2128,37 +2167,31 @@ async fn read_legacy_ref_entries(
 }
 
 async fn read_ref_catalog(object_store: &ObjectStore, root: &Path) -> Result<RefCatalog> {
-    if let Some(catalog) = read_latest_ref_catalog(object_store, root).await? {
-        return Ok(catalog);
-    }
-    let legacy = RefCatalog {
-        mutation_epoch: 0,
+    let latest = read_latest_ref_catalog(object_store, root).await?;
+    let legacy = LegacyRefState {
         tags: read_legacy_ref_entries(object_store, &base_tags_path(root), false).await?,
         branches: read_legacy_ref_entries(object_store, &base_branches_contents_path(root), true)
             .await?,
     };
-    // If a writer crossed the migration boundary while legacy files were being read, prefer its
-    // complete catalog rather than returning a partial legacy view.
-    Ok(read_latest_ref_catalog(object_store, root)
-        .await?
-        .unwrap_or(legacy))
-}
-
-async fn remove_legacy_ref_files(object_store: &ObjectStore, root: &Path) -> Result<()> {
-    for base_path in [base_tags_path(root), base_branches_contents_path(root)] {
-        for file_name in object_store.read_dir(base_path.clone()).await? {
-            if !file_name.ends_with(".json") {
-                continue;
-            }
-            let path = base_path.clone().join(file_name);
-            if let Err(error) = object_store.delete(&path).await
-                && !matches!(error, Error::NotFound { .. })
-            {
-                return Err(error);
-            }
-        }
+    if let Some(mut catalog) = latest {
+        catalog.reconcile_legacy_changes(legacy);
+        return Ok(catalog);
     }
-    Ok(())
+
+    // A catalog may be published while the legacy snapshot is being read. Prefer that complete
+    // snapshot and reconcile changes observed at the old paths instead of returning a partial
+    // legacy view.
+    if let Some(mut catalog) = read_latest_ref_catalog(object_store, root).await? {
+        catalog.reconcile_legacy_changes(legacy);
+        return Ok(catalog);
+    }
+
+    Ok(RefCatalog {
+        mutation_epoch: 0,
+        tags: legacy.tags.clone(),
+        branches: legacy.branches.clone(),
+        legacy_baseline: legacy,
+    })
 }
 
 async fn compact_ref_catalog(
@@ -2167,16 +2200,23 @@ async fn compact_ref_catalog(
     current_epoch: u64,
 ) -> Result<()> {
     let catalog_path = base_ref_catalog_path(root);
-    for file_name in object_store.read_dir(catalog_path.clone()).await? {
-        let Some(epoch) = file_name
-            .strip_suffix(".json")
-            .and_then(|epoch| epoch.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        if epoch >= current_epoch {
-            continue;
-        }
+    let mut prior_epochs = object_store
+        .read_dir(catalog_path.clone())
+        .await?
+        .into_iter()
+        .filter_map(|file_name| {
+            file_name
+                .strip_suffix(".json")
+                .and_then(|epoch| epoch.parse::<u64>().ok())
+                .filter(|epoch| *epoch < current_epoch)
+                .map(|epoch| (epoch, file_name))
+        })
+        .collect_vec();
+    prior_epochs.sort_unstable_by_key(|(epoch, _)| *epoch);
+    // Keep the immediate predecessor so a reader that listed it before this publication can
+    // still fetch it. Raced readers also restart until a listed catalog is fetched.
+    prior_epochs.pop();
+    for (_, file_name) in prior_epochs {
         let path = catalog_path.clone().join(file_name);
         if let Err(error) = object_store.delete(&path).await
             && !matches!(error, Error::NotFound { .. })
@@ -2375,32 +2415,36 @@ pub fn check_valid_tag(s: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test::FailingProxyStore;
     use datafusion::common::assert_contains;
     use futures::stream::BoxStream;
+    use lance_io::object_store::WrappingObjectStore;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult,
     };
 
     use rstest::rstest;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
     #[derive(Debug)]
-    struct DelayedHeartbeatStore {
+    struct RefTestStore {
         target: Arc<dyn object_store::ObjectStore>,
         heartbeat_started: Arc<tokio::sync::Notify>,
         release_heartbeat: Arc<tokio::sync::Notify>,
+        remaining_catalog_get_failures: AtomicUsize,
     }
 
-    impl fmt::Display for DelayedHeartbeatStore {
+    impl fmt::Display for RefTestStore {
         fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-            write!(formatter, "DelayedHeartbeatStore({})", self.target)
+            write!(formatter, "RefTestStore({})", self.target)
         }
     }
 
     #[async_trait::async_trait]
     #[deny(clippy::missing_trait_methods)]
     #[cfg_attr(coverage, coverage(off))]
-    impl object_store::ObjectStore for DelayedHeartbeatStore {
+    impl object_store::ObjectStore for RefTestStore {
         async fn put_opts(
             &self,
             location: &Path,
@@ -2427,6 +2471,21 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> ObjectStoreResult<GetResult> {
+            if location.as_ref().contains("/_refs/catalog/")
+                && self
+                    .remaining_catalog_get_failures
+                    .fetch_update(
+                        AtomicOrdering::SeqCst,
+                        AtomicOrdering::SeqCst,
+                        |remaining| remaining.checked_sub(1),
+                    )
+                    .is_ok()
+            {
+                return Err(ObjectStoreError::NotFound {
+                    path: location.to_string(),
+                    source: "catalog was compacted before GET".into(),
+                });
+            }
             self.target.get_opts(location, options).await
         }
 
@@ -2605,10 +2664,11 @@ mod tests {
         let target: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let mut object_store = ObjectStore::memory();
-        object_store.inner = Arc::new(DelayedHeartbeatStore {
+        object_store.inner = Arc::new(RefTestStore {
             target,
             heartbeat_started: heartbeat_started.clone(),
             release_heartbeat: release_heartbeat.clone(),
+            remaining_catalog_get_failures: AtomicUsize::new(0),
         });
         let object_store = Arc::new(object_store);
         let fence_path = Path::from("dataset/_refs/mutation_leases");
@@ -2647,6 +2707,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_expired_lease_does_not_start_mutation() {
+        let object_store = Arc::new(ObjectStore::memory());
+        let fence_path = Path::from("dataset/_refs/mutation_leases");
+        let state = DurableLeaseState {
+            owner: "expired".to_string(),
+            epoch: 1,
+            expires_at_millis: 0,
+        };
+        let mut handle = DurableLeaseHandle::new(
+            object_store,
+            lease_epoch_path(&fence_path, 1),
+            state,
+            Some(fence_path),
+        );
+        let was_polled = Arc::new(AtomicBool::new(false));
+        let mutation_was_polled = was_polled.clone();
+        let mutation = std::future::poll_fn(move |_| {
+            mutation_was_polled.store(true, AtomicOrdering::SeqCst);
+            std::task::Poll::Ready(Ok::<_, Error>(()))
+        });
+
+        let error = Refs::drive_with_lease(&mut handle, mutation)
+            .await
+            .unwrap_err();
+        handle.is_held = false;
+
+        assert!(matches!(error, Error::RefConflict { .. }));
+        assert!(error.to_string().contains("expired before renewal"));
+        assert!(!was_polled.load(AtomicOrdering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn test_reference_publication_ignores_delayed_older_epoch() {
         let object_store = ObjectStore::memory();
         let root = Path::from("dataset");
@@ -2673,6 +2765,7 @@ mod tests {
                     serde_json::to_value(&older_contents).unwrap(),
                 )]),
                 branches: HashMap::new(),
+                legacy_baseline: LegacyRefState::default(),
             })
             .unwrap(),
         };
@@ -2686,6 +2779,7 @@ mod tests {
                     serde_json::to_value(&newer_contents).unwrap(),
                 )]),
                 branches: HashMap::new(),
+                legacy_baseline: LegacyRefState::default(),
             })
             .unwrap(),
         };
@@ -2696,6 +2790,7 @@ mod tests {
                 mutation_epoch: 3,
                 tags: HashMap::new(),
                 branches: HashMap::new(),
+                legacy_baseline: LegacyRefState::default(),
             })
             .unwrap(),
         };
@@ -2762,6 +2857,7 @@ mod tests {
                         serde_json::to_value(&tag_contents).unwrap(),
                     )]),
                     branches: HashMap::new(),
+                    legacy_baseline: LegacyRefState::default(),
                 })
                 .unwrap(),
             },
@@ -2820,6 +2916,7 @@ mod tests {
                     serde_json::to_value(&contents).unwrap(),
                 )]),
                 branches: HashMap::new(),
+                legacy_baseline: LegacyRefState::default(),
             })
             .unwrap(),
         };
@@ -2841,7 +2938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_catalog_migration_removes_legacy_flat_refs() {
+    async fn test_catalog_migration_preserves_legacy_baseline() {
         let object_store = ObjectStore::memory();
         let root = Path::from("dataset");
         let legacy_path = tag_path(&root, "legacy");
@@ -2865,20 +2962,89 @@ mod tests {
             path: ref_catalog_version_path(&root, 1).to_string(),
             body: serde_json::to_string_pretty(&RefCatalog {
                 mutation_epoch: 1,
-                tags: HashMap::new(),
+                tags: HashMap::from([(
+                    "legacy".to_string(),
+                    serde_json::to_value(&contents).unwrap(),
+                )]),
                 branches: HashMap::new(),
+                legacy_baseline: LegacyRefState {
+                    tags: HashMap::from([(
+                        "legacy".to_string(),
+                        serde_json::to_value(&contents).unwrap(),
+                    )]),
+                    branches: HashMap::new(),
+                },
             })
             .unwrap(),
         };
 
         publication.apply(&object_store).await.unwrap();
 
-        assert!(!object_store.exists(&legacy_path).await.unwrap());
-        assert!(
+        assert!(object_store.exists(&legacy_path).await.unwrap());
+        assert_eq!(
             read_stored_ref::<TagContents>(&legacy_path, &object_store)
                 .await
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .contents
+                .unwrap()
+                .version,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_writer_is_not_ignored_after_catalog_migration() {
+        let object_store = ObjectStore::memory();
+        let root = Path::from("dataset");
+        let release_path = tag_path(&root, "release");
+        let contents = TagContents {
+            branch: None,
+            version: 1,
+            created_at: None,
+            updated_at: None,
+            manifest_size: 1,
+            metadata: HashMap::new(),
+        };
+        DurableRefPublication {
+            epoch: 1,
+            path: ref_catalog_version_path(&root, 1).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 1,
+                tags: HashMap::from([(
+                    "release".to_string(),
+                    serde_json::to_value(&contents).unwrap(),
+                )]),
+                branches: HashMap::new(),
+                legacy_baseline: LegacyRefState::default(),
+            })
+            .unwrap(),
+        }
+        .apply(&object_store)
+        .await
+        .unwrap();
+
+        let legacy_contents = TagContents {
+            version: 99,
+            ..contents
+        };
+        object_store
+            .put(
+                &release_path,
+                serde_json::to_vec(&legacy_contents).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_stored_ref::<TagContents>(&release_path, &object_store)
+                .await
+                .unwrap()
+                .unwrap()
+                .contents
+                .unwrap()
+                .version,
+            99
         );
     }
 
@@ -2905,6 +3071,7 @@ mod tests {
                         serde_json::to_value(contents).unwrap(),
                     )]),
                     branches: HashMap::new(),
+                    legacy_baseline: LegacyRefState::default(),
                 })
                 .unwrap(),
             }
@@ -2918,7 +3085,7 @@ mod tests {
                 .read_dir(base_ref_catalog_path(&root))
                 .await
                 .unwrap(),
-            vec!["00000000000000000100.json"]
+            vec!["00000000000000000099.json", "00000000000000000100.json"]
         );
         assert_eq!(
             read_stored_ref::<TagContents>(&tag_path(&root, "release"), &object_store)
@@ -2929,6 +3096,102 @@ mod tests {
                 .unwrap()
                 .version,
             100
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_reader_survives_compaction_churn() {
+        let target: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let mut writer = ObjectStore::memory();
+        writer.inner = target.clone();
+        let root = Path::from("dataset");
+        DurableRefPublication {
+            epoch: 7,
+            path: ref_catalog_version_path(&root, 7).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 7,
+                tags: HashMap::new(),
+                branches: HashMap::new(),
+                legacy_baseline: LegacyRefState::default(),
+            })
+            .unwrap(),
+        }
+        .apply(&writer)
+        .await
+        .unwrap();
+
+        let mut reader = ObjectStore::memory();
+        reader.inner = Arc::new(RefTestStore {
+            target,
+            heartbeat_started: Arc::new(tokio::sync::Notify::new()),
+            release_heartbeat: Arc::new(tokio::sync::Notify::new()),
+            remaining_catalog_get_failures: AtomicUsize::new(4),
+        });
+
+        assert_eq!(
+            read_latest_ref_catalog(&reader, &root)
+                .await
+                .unwrap()
+                .unwrap()
+                .mutation_epoch,
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_cleanup_failure_does_not_fail_committed_mutation() {
+        let target: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let failing = Arc::new(FailingProxyStore::new());
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = failing.wrap("", target);
+        let root = Path::from("dataset");
+
+        for epoch in 1..=2 {
+            DurableRefPublication {
+                epoch,
+                path: ref_catalog_version_path(&root, epoch).to_string(),
+                body: serde_json::to_string_pretty(&RefCatalog {
+                    mutation_epoch: epoch,
+                    tags: HashMap::new(),
+                    branches: HashMap::new(),
+                    legacy_baseline: LegacyRefState::default(),
+                })
+                .unwrap(),
+            }
+            .apply(&object_store)
+            .await
+            .unwrap();
+        }
+        failing.fail_when(
+            "delete",
+            "_refs/catalog",
+            "injected catalog cleanup failure",
+        );
+
+        DurableRefPublication {
+            epoch: 3,
+            path: ref_catalog_version_path(&root, 3).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 3,
+                tags: HashMap::new(),
+                branches: HashMap::new(),
+                legacy_baseline: LegacyRefState::default(),
+            })
+            .unwrap(),
+        }
+        .apply(&object_store)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_latest_ref_catalog(&object_store, &root)
+                .await
+                .unwrap()
+                .unwrap()
+                .mutation_epoch,
+            3
         );
     }
 

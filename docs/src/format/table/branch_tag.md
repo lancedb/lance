@@ -52,21 +52,33 @@ Each catalog contains the epoch encoded by its file name and complete live tag a
       "createAt": 1775600000,
       "manifestSize": 1024
     }
+  },
+  "_legacyBaseline": {
+    "tags": {},
+    "branches": {}
   }
 }
 ```
 
 Deletion removes a name from the next complete catalog instead of publishing a per-name tombstone.
-After publishing a catalog, writers remove superseded lower-epoch catalogs. A lower epoch that
-finishes after compaction remains harmless and is reclaimed by the next successful reference
-publication. Thus normal sustained churn retains one catalog plus only records from delayed
-writers that have not yet crossed another publication boundary.
+After publishing a catalog, writers retain its immediate predecessor and remove older epochs on a
+best-effort basis. The predecessor remains available to a reader that listed it immediately before
+the new publication; a reader whose selected object was concurrently compacted restarts discovery.
+A lower epoch that finishes after compaction remains harmless and is reclaimed by the next
+successful reference publication. Thus normal sustained churn retains two catalogs plus only
+records from delayed writers that have not yet crossed another publication boundary.
 
 When no catalog exists, readers load legacy `_refs/tags/*.json` and `_refs/branches/*.json` files.
-The first catalog publication is an explicit migration boundary: it imports every legacy reference
-into the catalog and removes the flat files. Clients that only understand flat reference files must
-not access a dataset after this boundary. Catalog writers never expose tombstones or new state at
-the legacy paths.
+The first catalog publication imports every legacy reference and records those flat files in the
+catalog's `_legacyBaseline`. The flat files remain unchanged as a durable migration fence. Current
+readers compare them with the baseline and reconcile any later create, update, or delete performed
+by a released writer, so a successful legacy mutation is never silently ignored. Each catalog
+publication incorporates the observed legacy state into its next baseline.
+
+Operators must quiesce clients that only understand flat reference files before allowing catalog
+writers to mutate references: catalog state is not mirrored back to the legacy paths. Retaining the
+baseline makes rollback state recoverable and lets a current client detect and incorporate a legacy
+writer that was not quiesced; no automatic migration deletes released-format state.
 
 ### Branch Metadata File Format
 
