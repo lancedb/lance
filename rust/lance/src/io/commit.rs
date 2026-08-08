@@ -431,7 +431,7 @@ async fn do_commit_new_dataset(
                 (!transaction_file.is_empty()).then_some(transaction_file.clone());
             let mut new_frags = new_manifest.fragments.as_ref().clone();
             for f in &mut new_frags {
-                for df in &mut f.files {
+                for df in f.referenced_lance_files_mut() {
                     df.base_id = None;
                 }
                 if let Some(d) = f.deletion_file.as_mut() {
@@ -1672,6 +1672,7 @@ mod tests {
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
+        commit_handler_from_url,
     };
     use lance_testing::datagen::generate_random_array;
 
@@ -2362,6 +2363,44 @@ mod tests {
             extra = txn_files_after.saturating_sub(txn_files_before),
         );
     }
+
+    #[tokio::test]
+    async fn test_cos_commit_failure_preserves_error_and_cleans_up_transaction() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let batch = simple_batch(&schema, vec![1, 2, 3]);
+        let commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+            .await
+            .unwrap();
+        let params = WriteParams {
+            commit_handler: Some(commit_handler),
+            ..Default::default()
+        };
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(params),
+        )
+        .await
+        .expect_err("the default Tencent COS handler should reject writes");
+
+        assert!(
+            matches!(&error, Error::NotSupported { .. }),
+            "expected NotSupported, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("distributed commit_lock"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            count_txn_files(uri),
+            0,
+            "a definitively failed COS commit must clean up its transaction file"
+        );
+    }
+
     fn simple_batch(schema: &Arc<ArrowSchema>, values: Vec<i32>) -> RecordBatch {
         RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
     }

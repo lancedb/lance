@@ -254,7 +254,7 @@ pub(super) async fn add_columns_to_fragments(
     read_columns: Option<Vec<String>>,
     fragments: &[FileFragment],
     batch_size: Option<u32>,
-) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>)> {
+) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>, bool)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
     let version = dataset.manifest.data_storage_format.lance_file_version()?;
@@ -415,7 +415,58 @@ pub(super) async fn add_columns_to_fragments(
     };
     schema.set_field_id(Some(dataset.manifest.max_field_id()));
 
-    Ok((new_fragments, schema, fragments_to_cleanup))
+    let preserves_nullability = !merge_introduces_required_field(dataset.schema(), &schema);
+
+    Ok((
+        new_fragments,
+        schema,
+        fragments_to_cleanup,
+        preserves_nullability,
+    ))
+}
+
+/// Whether `merged` introduces a field that data staged against `old` cannot
+/// safely omit. The first new node on each path decides: a non-nullable new
+/// field beneath an existing ancestor reads as unmasked null for stale rows,
+/// which do supply the ancestor, while a nullable new field masks its whole
+/// subtree whatever the nullability inside, the same rule the AllNulls
+/// transform enforces at the top level.
+///
+/// A new node under a non-nullable top-level column claims even when the node
+/// itself is nullable: the reader synthesizes missing subcolumns against the
+/// column's declared nullability, so a stale fragment cannot be read at all
+/// under such a column, nullable child or not.
+pub(super) fn merge_introduces_required_field(old: &Schema, merged: &Schema) -> bool {
+    /// (any node in `merged` is new, any first-new node is non-nullable)
+    fn subtree_new_nodes(old: &[Field], merged: &[Field]) -> (bool, bool) {
+        let mut any_new = false;
+        let mut any_required = false;
+        for field in merged {
+            match old.iter().find(|o| o.name == field.name) {
+                Some(old_field) => {
+                    let (new, required) = subtree_new_nodes(&old_field.children, &field.children);
+                    any_new |= new;
+                    any_required |= required;
+                }
+                None => {
+                    any_new = true;
+                    any_required |= !field.nullable;
+                }
+            }
+        }
+        (any_new, any_required)
+    }
+
+    merged.fields.iter().any(
+        |field| match old.fields.iter().find(|o| o.name == field.name) {
+            Some(old_field) => {
+                let (any_new, any_required) =
+                    subtree_new_nodes(&old_field.children, &field.children);
+                any_required || (any_new && !field.nullable)
+            }
+            None => !field.nullable,
+        },
+    )
 }
 
 pub(super) async fn add_columns(
@@ -424,16 +475,21 @@ pub(super) async fn add_columns(
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
 ) -> Result<()> {
-    let (fragments, schema, _fragments_to_cleanup) = add_columns_to_fragments(
-        dataset,
-        transforms,
-        read_columns,
-        &dataset.get_fragments(),
-        batch_size,
-    )
-    .await?;
+    let (fragments, schema, _fragments_to_cleanup, preserves_nullability) =
+        add_columns_to_fragments(
+            dataset,
+            transforms,
+            read_columns,
+            &dataset.get_fragments(),
+            batch_size,
+        )
+        .await?;
 
-    let operation = Operation::Merge { fragments, schema };
+    let operation = Operation::Merge {
+        fragments,
+        schema,
+        preserves_nullability,
+    };
     let transaction = Transaction::new(dataset.manifest.version, operation, None);
     // Once the manifest commit has been attempted, an error does not prove
     // that the new files are unreferenced: the commit may have landed and only
@@ -708,6 +764,7 @@ pub(super) async fn alter_columns(
 
     // Mapping of old to new fields that need to be casted.
     let mut cast_fields: Vec<(Field, Field)> = Vec::new();
+    let mut tightens_nullability = false;
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
     let version = dataset.manifest.data_storage_format.lance_file_version()?;
@@ -725,6 +782,9 @@ pub(super) async fn alter_columns(
             && !nullable
         {
             validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
+            // A write since this version can falsify it, so withhold the
+            // preserves_nullability assertion from the transaction.
+            tightens_nullability = true;
         }
 
         let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
@@ -796,11 +856,21 @@ pub(super) async fn alter_columns(
         }
     }
 
+    if tightens_nullability && !cast_fields.is_empty() {
+        return Err(Error::invalid_input(
+            "cannot make a column non-nullable and cast columns in the same call: \
+             apply the cast first, then the nullability change",
+        ));
+    }
+
     // If we aren't casting a column, we don't need to touch the fragments.
     let transaction = if cast_fields.is_empty() {
         Transaction::new(
             dataset.manifest.version,
-            Operation::Project { schema: new_schema },
+            Operation::Project {
+                schema: new_schema,
+                preserves_nullability: !tightens_nullability,
+            },
             // TODO: Make it possible to alter blob columns
             /*blob_op= */ None,
         )
@@ -821,6 +891,12 @@ pub(super) async fn alter_columns(
             .collect::<Vec<_>>();
         // This schema contains the exact field ids we want to write the new fields with.
         let new_col_schema = new_schema.project_by_ids(&new_ids, true);
+
+        // A cast rewrites the column under a new field id, so data staged
+        // against the pre-cast schema omits that id and its rows read as null.
+        // Withhold the assertion when any recast field is non-nullable, at any
+        // depth: a nested field sits under parent values stale rows do supply.
+        let cast_touches_required = cast_fields.iter().any(|(_old, new)| !new.nullable);
 
         let mapper = move |batch: &RecordBatch| {
             let mut fields = Vec::with_capacity(cast_fields.len());
@@ -875,6 +951,7 @@ pub(super) async fn alter_columns(
             Operation::Merge {
                 schema: new_schema,
                 fragments,
+                preserves_nullability: !cast_touches_required,
             },
             /*blob_op= */ None,
         )
@@ -918,7 +995,10 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
 
     let transaction = Transaction::new(
         dataset.manifest.version,
-        Operation::Project { schema: new_schema },
+        Operation::Project {
+            schema: new_schema,
+            preserves_nullability: true,
+        },
         /*blob_op= */ None,
     );
 
@@ -955,6 +1035,86 @@ pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> R
 #[cfg(test)]
 mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
+
+    #[test]
+    fn test_merge_introduces_required_field() {
+        let schema = |fields: Vec<ArrowField>| Schema::try_from(&ArrowSchema::new(fields)).unwrap();
+        let strukt = |name: &str, nullable: bool, children: Vec<ArrowField>| {
+            ArrowField::new(
+                name,
+                DataType::Struct(ArrowFields::from(children)),
+                nullable,
+            )
+        };
+        let int = |name: &str, nullable: bool| ArrowField::new(name, DataType::Int32, nullable);
+
+        let old = schema(vec![
+            strukt("s", true, vec![int("a", true)]),
+            strukt("r", false, vec![int("a", true)]),
+        ]);
+        // The first new node on each path decides, at any depth; any new node
+        // under a non-nullable top-level column claims regardless.
+        for (merged, expected) in [
+            // A nullable new child under a non-nullable top-level column: the
+            // reader cannot synthesize the missing subcolumn, so claim.
+            (
+                schema(vec![
+                    strukt("s", true, vec![int("a", true)]),
+                    strukt("r", false, vec![int("a", true), int("b", true)]),
+                ]),
+                true,
+            ),
+            // Required new child under an existing parent: stale rows supply
+            // the parent, so the child would read as unmasked null.
+            (
+                schema(vec![strukt(
+                    "s",
+                    true,
+                    vec![int("a", true), int("b", false)],
+                )]),
+                true,
+            ),
+            (
+                schema(vec![strukt(
+                    "s",
+                    true,
+                    vec![int("a", true), int("b", true)],
+                )]),
+                false,
+            ),
+            // A wholly new nullable container masks its required inside.
+            (
+                schema(vec![
+                    strukt("s", true, vec![int("a", true)]),
+                    strukt("t", true, vec![int("c", false)]),
+                ]),
+                false,
+            ),
+            // Same, when the new container hangs under an existing parent.
+            (
+                schema(vec![strukt(
+                    "s",
+                    true,
+                    vec![int("a", true), strukt("t", true, vec![int("c", false)])],
+                )]),
+                false,
+            ),
+            (
+                schema(vec![
+                    strukt("s", true, vec![int("a", true)]),
+                    int("b", false),
+                ]),
+                true,
+            ),
+            (schema(vec![strukt("s", true, vec![int("a", true)])]), false),
+        ] {
+            assert_eq!(
+                merge_introduces_required_field(&old, &merged),
+                expected,
+                "merged={merged:?}"
+            );
+        }
+    }
 
     use crate::dataset::WriteParams;
     use arrow_array::{
