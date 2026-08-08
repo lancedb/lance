@@ -696,25 +696,6 @@ fn segment_merge_requires_rebuild(dataset: &Dataset, index: &IndexMetadata) -> b
         .or_else(|| index.fragment_bitmap.clone())
         .unwrap_or_default();
 
-    if dataset.manifest.uses_stable_row_ids()
-        && dataset.get_fragments().iter().any(|fragment| {
-            owned_fragments.contains(fragment.id() as u32)
-                && fragment
-                    .metadata()
-                    .deletion_file
-                    .as_ref()
-                    .is_some_and(|deletion_file| {
-                        deletion_file.read_version >= index.dataset_version
-                    })
-        })
-    {
-        // Fragment coverage cannot distinguish deleted and replacement rows
-        // that share a stable row id. A deletion older than the segment was
-        // already applied when it was built; rebuild only for later deletions
-        // so stale values cannot be copied into the merged segment.
-        return true;
-    }
-
     let Some(physical_fragments) = physical_fragment_bitmap(index) else {
         return true;
     };
