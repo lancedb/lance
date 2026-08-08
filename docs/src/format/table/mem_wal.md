@@ -341,7 +341,12 @@ Important fields:
 - `index_catchup`: per-index coverage progress after data has been compacted into the base table.
 - `snapshot_ts_millis`, `num_shards`, and `inline_snapshots`: optional shard snapshot fields for read optimization.
 
-If a shard is absent from `index_catchup` for an index, that index is assumed to be fully caught up for the shard.
+What an absent entry means depends on the `FLAG_MEM_WAL_INDEX_CATCHUP` feature bit:
+
+- **Without the bit**, a shard absent from `index_catchup` for an index means that index is assumed fully caught up for the shard.
+- **With the bit**, absence means the opposite: the index is *not* known to have caught up, so the shard's SSTables must be retained until some commit records that it has.
+
+Setting the bit is one-way. Once SSTables have stopped being served against a recorded catch-up position, reading absence as "caught up" again could drop rows that only those SSTables still hold, so the bit is never cleared as a rollback. Writers must also hold the bit: a writer that does not maintain `index_catchup` can change an index without withdrawing the position recorded for it, leaving a position that no longer describes the index it names.
 
 Shard snapshots, when present, use the following Lance file schema:
 
@@ -494,7 +499,7 @@ On commit conflict, a compactor reloads the conflicting base-table version:
 The garbage collector may remove obsolete SSTables after:
 
 1. The SSTable has been compacted into the base table.
-2. Every maintained index has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads.
+2. Every index a query may rely on has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads. With `FLAG_MEM_WAL_INDEX_CATCHUP` set, an index absent from `index_catchup` has *not* caught up, so this condition is not met for it.
 3. No retained base-table version needs the SSTable for time travel or consistency.
 
 !!! warning
