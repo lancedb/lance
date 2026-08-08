@@ -690,19 +690,29 @@ async fn build_fresh_vector_segment(
     .await
 }
 
-fn segment_merge_requires_rebuild(
-    index: &IndexMetadata,
-    current_fragments: &RoaringBitmap,
-) -> bool {
+fn segment_merge_requires_rebuild(dataset: &Dataset, index: &IndexMetadata) -> bool {
+    let owned_fragments = index
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .or_else(|| index.fragment_bitmap.clone())
+        .unwrap_or_default();
+
+    if dataset.manifest.uses_stable_row_ids()
+        && dataset.get_fragments().iter().any(|fragment| {
+            owned_fragments.contains(fragment.id() as u32)
+                && fragment.metadata().deletion_file.is_some()
+        })
+    {
+        // Fragment coverage cannot distinguish deleted and replacement rows
+        // that share a stable row id. Rebuild this source from current rows so
+        // stale values cannot be copied into the merged segment.
+        return true;
+    }
+
     let Some(physical_fragments) = physical_fragment_bitmap(index) else {
         return true;
     };
-    let owned_fragments = index
-        .effective_fragment_bitmap(current_fragments)
-        .or_else(|| index.fragment_bitmap.clone())
-        .unwrap_or_default();
     let unowned_physical_fragments = &physical_fragments - &owned_fragments;
-    unowned_physical_fragments.intersection_len(current_fragments) > 0
+    unowned_physical_fragments.intersection_len(&dataset.fragment_bitmap) > 0
 }
 
 async fn scan_vector_fragments(
@@ -1025,7 +1035,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .effective_fragment_bitmap(&dataset.fragment_bitmap)
                     .or_else(|| removed_segment.fragment_bitmap.clone())
                     .unwrap_or_default();
-                if segment_merge_requires_rebuild(removed_segment, &dataset.fragment_bitmap) {
+                if segment_merge_requires_rebuild(dataset.as_ref(), removed_segment) {
                     let segment = build_fresh_vector_segment(
                         dataset.as_ref(),
                         &selected_logical_index,
@@ -1092,9 +1102,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         .collect(),
                 )?;
                 let selected_segments = &old_indices[merge_start..];
-                if selected_segments.iter().any(|segment| {
-                    segment_merge_requires_rebuild(segment, &dataset.fragment_bitmap)
-                }) {
+                if selected_segments
+                    .iter()
+                    .any(|segment| segment_merge_requires_rebuild(dataset.as_ref(), segment))
+                {
                     let mut fragment_bitmap = base_unindexed_bitmap.clone();
                     for segment in selected_segments {
                         if let Some(effective) =
@@ -2799,6 +2810,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_vector_merge_filters_stable_row_id_replacements() {
+        const DIMENSION: usize = 4;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIMENSION as i32,
+                ),
+                false,
+            ),
+        ]));
+        let initial_values = (0..40)
+            .flat_map(|row| [if row < 20 { 1.0 } else { 0.0 }; DIMENSION])
+            .collect::<Vec<_>>();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..40)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(initial_values),
+                        DIMENSION as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let replacements = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(20..40)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(vec![10.0; 20 * DIMENSION]),
+                        DIMENSION as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let (dataset, stats) = merge_job
+            .execute(reader_to_stream(Box::new(RecordBatchIterator::new(
+                [Ok(replacements)],
+                schema,
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 20);
+
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        assert_eq!(logical_index.num_segments(), 1);
+        assert_eq!(
+            logical_index
+                .num_rows_per_segment()
+                .into_iter()
+                .map(|(_, rows)| rows)
+                .sum::<u64>(),
+            40,
+            "the merged index must contain one current copy of every stable row id"
+        );
+
+        let query = arrow_array::Float32Array::from(vec![0.0; DIMENSION]);
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .nprobes(1)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = result["id"].as_primitive::<arrow::datatypes::Int32Type>();
+        assert!(
+            ids.values().iter().all(|id| *id < 20),
+            "stale pre-update vectors must not survive the optimize merge: {ids:?}"
+        );
     }
 
     #[tokio::test]

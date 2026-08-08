@@ -429,6 +429,35 @@ pub async fn write_partition_rows(
     Ok(())
 }
 
+/// Stream a partition range, retain its owned rows, and return the number written.
+async fn write_filtered_partition_rows(
+    reader: &V2Reader,
+    w: &mut FileWriter,
+    range: Range<usize>,
+    row_filter: &OldIndexDataFilter,
+) -> Result<usize> {
+    let mut stream = reader
+        .read_stream(
+            lance_io::ReadBatchParams::Range(range),
+            u32::MAX,
+            4,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
+    let mut written_rows = 0usize;
+    while let Some(batch) = stream.next().await {
+        let batch = filter_batch_to_owned_rows(&batch?, row_filter)?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        written_rows = written_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+            Error::index("Filtered partition row count exceeds usize capacity".to_string())
+        })?;
+        w.write_batch(&batch).await?;
+    }
+    Ok(written_rows)
+}
+
 /// Transpose the PQ code column for a batch and write it to the unified writer.
 ///
 /// This helper assumes `batch` contains a contiguous range of rows for a single
@@ -1625,25 +1654,45 @@ async fn merge_partial_vector_auxiliary_files_inner(
             }
         }
         _ => {
-            let partition_window_size = *PARTITION_WINDOW_SIZE;
-            let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
-            let mut shard_merge_reader = ShardMergeReader::new(
-                shard_infos,
-                nlist,
-                partition_window_size,
-                prefetch_window_count,
-            );
-            while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
-                let partition_len = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            // FLAT, SQ, and their HNSW variants do not need whole-partition
+            // transforms. Stream one shard partition at a time so filtering
+            // never materializes a multi-partition window in memory.
+            for (pid, merged_length) in merged_lengths.iter_mut().enumerate() {
+                let mut partition_len = 0usize;
+                for shard in &shard_infos {
+                    let source_len = shard.lengths[pid] as usize;
+                    if source_len == 0 {
+                        continue;
+                    }
+                    let offset = shard.partition_offsets[pid];
+                    let writer = v2w_opt.as_mut().ok_or_else(|| {
+                        Error::index("Failed to initialize unified writer".to_string())
+                    })?;
+                    let written = if let Some(row_filter) = shard.row_filter.as_deref() {
+                        write_filtered_partition_rows(
+                            shard.reader.as_ref(),
+                            writer,
+                            offset..offset + source_len,
+                            row_filter,
+                        )
+                        .await?
+                    } else {
+                        write_partition_rows(
+                            shard.reader.as_ref(),
+                            writer,
+                            offset..offset + source_len,
+                        )
+                        .await?;
+                        source_len
+                    };
+                    partition_len = partition_len.checked_add(written).ok_or_else(|| {
+                        Error::index(format!("Merged partition {pid} exceeds usize row capacity"))
+                    })?;
+                }
                 if partition_len == 0 {
                     continue;
                 }
-                if let Some(w) = v2w_opt.as_mut() {
-                    for batch in batches {
-                        w.write_batch(&batch).await?;
-                    }
-                }
-                merged_lengths[pid] = u32::try_from(partition_len).map_err(|_| {
+                *merged_length = u32::try_from(partition_len).map_err(|_| {
                     Error::index(format!("Merged partition {pid} exceeds u32 row capacity"))
                 })?;
                 merged_rows = merged_rows.saturating_add(partition_len as u64);

@@ -2972,13 +2972,16 @@ mod tests {
         dataset.append(second, None).await.unwrap();
         let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
         let dataset = Arc::new(dataset);
+        let configured_details = crate::index::vector::details::vector_index_details(
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+        );
         let old_details = crate::index::vector::details::with_physical_fragment_bitmap(
-            crate::index::vector_index_details_default(),
+            configured_details.clone(),
             Some(&first_fragments),
         )
         .unwrap();
         let new_details = crate::index::vector::details::with_physical_fragment_bitmap(
-            crate::index::vector_index_details_default(),
+            configured_details.clone(),
             Some(&appended_fragments),
         )
         .unwrap();
@@ -3014,7 +3017,7 @@ mod tests {
 
         let merged_physical_fragments = &first_fragments | &appended_fragments;
         let merged_details = crate::index::vector::details::with_physical_fragment_bitmap(
-            crate::index::vector_index_details_default(),
+            configured_details,
             Some(&merged_physical_fragments),
         )
         .unwrap();
