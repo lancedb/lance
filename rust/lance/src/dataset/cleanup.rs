@@ -740,6 +740,7 @@ impl<'a> CleanupTask<'a> {
                 .commit_versions(
                     &versions_to_commit,
                     &reference_census.completed_intent_paths,
+                    &reference_census.lifecycle_generations,
                 )
                 .await?;
             for version in &late_reference_versions {
