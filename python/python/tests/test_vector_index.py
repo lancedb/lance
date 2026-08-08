@@ -2012,17 +2012,23 @@ def test_segment_ownership_filter_precedes_partition_topk(
     dataset.optimize.optimize_indices(num_indices_to_merge=0)
     dataset = lance.dataset(dataset.uri)
 
-    result = dataset.to_table(
-        columns=["id"],
-        nearest={
-            "column": "vector",
-            "q": np.zeros(ndim, dtype=np.float32),
-            "k": 5,
-        },
-    )
+    def assert_current_nearest_rows():
+        result = dataset.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": np.zeros(ndim, dtype=np.float32),
+                "k": 5,
+            },
+        )
 
-    assert all(row_id < 20 for row_id in result["id"].to_pylist())
-    assert result["_distance"].to_pylist() == pytest.approx([4.0] * 5)
+        assert all(row_id < 20 for row_id in result["id"].to_pylist())
+        assert result["_distance"].to_pylist() == pytest.approx([4.0] * 5)
+
+    assert_current_nearest_rows()
+    dataset.optimize.optimize_indices(num_indices_to_merge=2)
+    dataset = lance.dataset(dataset.uri)
+    assert_current_nearest_rows()
 
 
 @pytest.mark.skip(reason="retrain is deprecated")

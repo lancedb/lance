@@ -40,6 +40,7 @@ use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::{
     IndexDetails, fetch_index_details, load_fts_training_data, load_training_data,
 };
+use crate::index::vector::details::physical_fragment_bitmap;
 use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,8 @@ pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
     pub new_fragment_bitmap: RoaringBitmap,
+    /// Exact physical coverage when the output was rebuilt from current rows.
+    pub new_physical_fragment_bitmap: Option<RoaringBitmap>,
     pub new_dataset_version: u64,
     pub new_index_version: i32,
     pub new_index_details: prost_types::Any,
@@ -687,6 +690,21 @@ async fn build_fresh_vector_segment(
     .await
 }
 
+fn segment_merge_requires_rebuild(
+    index: &IndexMetadata,
+    current_fragments: &RoaringBitmap,
+) -> bool {
+    let Some(physical_fragments) = physical_fragment_bitmap(index) else {
+        return true;
+    };
+    let owned_fragments = index
+        .effective_fragment_bitmap(current_fragments)
+        .or_else(|| index.fragment_bitmap.clone())
+        .unwrap_or_default();
+    let unowned_physical_fragments = &physical_fragments - &owned_fragments;
+    unowned_physical_fragments.intersection_len(current_fragments) > 0
+}
+
 async fn scan_vector_fragments(
     dataset: &Dataset,
     field_path: &str,
@@ -731,6 +749,7 @@ fn fresh_vector_segment_result<'a>(
     Ok(IndexMergeResults {
         new_uuid: segment.uuid,
         removed_indices,
+        new_physical_fragment_bitmap: Some(fragment_bitmap.clone()),
         new_fragment_bitmap: fragment_bitmap,
         new_dataset_version: segment.dataset_version,
         new_index_version: segment.index_version,
@@ -943,6 +962,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     new_uuid,
                     removed_indices: Vec::new(),
                     new_fragment_bitmap: base_unindexed_bitmap,
+                    new_physical_fragment_bitmap: None,
                     new_dataset_version: dataset.manifest.version,
                     new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?
                         .version(),
@@ -1001,6 +1021,26 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     field_path.clone(),
                     vec![(selected_metadata, selected_index)],
                 )?;
+                let new_fragment_bitmap = removed_segment
+                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                    .or_else(|| removed_segment.fragment_bitmap.clone())
+                    .unwrap_or_default();
+                if segment_merge_requires_rebuild(removed_segment, &dataset.fragment_bitmap) {
+                    let segment = build_fresh_vector_segment(
+                        dataset.as_ref(),
+                        &selected_logical_index,
+                        &field_path,
+                        &new_fragment_bitmap,
+                        options.progress.clone(),
+                    )
+                    .await?;
+                    return fresh_vector_segment_result(
+                        segment,
+                        &new_fragment_bitmap,
+                        vec![removed_segment],
+                    )
+                    .map(Some);
+                }
                 let selected_ivf_view = selected_logical_index.as_ivf()?;
                 let (new_uuid, indices_merged, files) = Box::pin(optimize_vector_indices(
                     dataset.as_ref().clone(),
@@ -1017,11 +1057,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 if indices_merged == 0 {
                     return Ok(None);
                 }
-
-                let new_fragment_bitmap = removed_segment
-                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
-                    .or_else(|| removed_segment.fragment_bitmap.clone())
-                    .unwrap_or_default();
 
                 Ok((
                     new_uuid,
@@ -1056,6 +1091,33 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         .map(|(metadata, index)| (metadata.clone(), index.clone()))
                         .collect(),
                 )?;
+                let selected_segments = &old_indices[merge_start..];
+                if selected_segments.iter().any(|segment| {
+                    segment_merge_requires_rebuild(segment, &dataset.fragment_bitmap)
+                }) {
+                    let mut fragment_bitmap = base_unindexed_bitmap.clone();
+                    for segment in selected_segments {
+                        if let Some(effective) =
+                            segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                        {
+                            fragment_bitmap |= effective;
+                        }
+                    }
+                    let segment = build_fresh_vector_segment(
+                        dataset.as_ref(),
+                        &merge_logical_index,
+                        &field_path,
+                        &fragment_bitmap,
+                        options.progress.clone(),
+                    )
+                    .await?;
+                    return fresh_vector_segment_result(
+                        segment,
+                        &fragment_bitmap,
+                        selected_segments.to_vec(),
+                    )
+                    .map(Some);
+                }
                 let merge_ivf_view = merge_logical_index.as_ivf()?;
 
                 let new_data_stream = if unindexed.is_empty() {
@@ -1218,6 +1280,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             new_uuid,
                             removed_indices: old_indices.to_vec(),
                             new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
+                            new_physical_fragment_bitmap: None,
                             new_dataset_version: dataset.manifest.version,
                             new_index_version: created_index.index_version as i32,
                             new_index_details: created_index.index_details,
@@ -1352,6 +1415,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_uuid,
         removed_indices,
         new_fragment_bitmap,
+        new_physical_fragment_bitmap: None,
         new_dataset_version,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,

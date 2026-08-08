@@ -132,6 +132,24 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     Ok(())
 }
 
+fn project_index_through_fragment_reuse(
+    index: &mut IndexMetadata,
+    frag_reuse_index: &FragReuseIndex,
+) -> Result<()> {
+    let Some(fragment_bitmap) = index.fragment_bitmap.as_mut() else {
+        return Ok(());
+    };
+    frag_reuse_index.remap_fragment_bitmap(fragment_bitmap)?;
+    index.index_details = index
+        .index_details
+        .as_deref()
+        .cloned()
+        .map(|details| with_physical_fragment_bitmap(details, None))
+        .transpose()?
+        .map(Arc::new);
+    Ok(())
+}
+
 fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
     field_ids.insert(field.id);
     for child in &field.children {
@@ -1553,9 +1571,7 @@ impl DatasetIndexExt for Dataset {
                 .await?;
             let mut indices = indices.as_ref().clone();
             for idx in indices.iter_mut() {
-                if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
-                    frag_reuse_index.remap_fragment_bitmap(bitmap)?;
-                }
+                project_index_through_fragment_reuse(idx, &frag_reuse_index)?;
             }
             Ok(Arc::new(indices))
         } else {
@@ -1639,12 +1655,7 @@ impl DatasetIndexExt for Dataset {
         };
 
         let mut merged_segment = if all_vector {
-            crate::index::vector::ivf::merge_segments(
-                self.object_store.as_ref(),
-                &self.indices_dir(),
-                source_segments,
-            )
-            .await?
+            crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
@@ -1947,10 +1958,12 @@ impl DatasetIndexExt for Dataset {
             };
 
             let last_idx = deltas.last().expect("Delta indices should not be empty");
-            let physical_fragment_bitmap = merged_physical_fragment_bitmap(
-                res.removed_indices.iter().copied(),
-                &res.new_fragment_bitmap,
-            );
+            let physical_fragment_bitmap = res.new_physical_fragment_bitmap.or_else(|| {
+                merged_physical_fragment_bitmap(
+                    res.removed_indices.iter().copied(),
+                    &res.new_fragment_bitmap,
+                )
+            });
             let new_index_details = with_physical_fragment_bitmap(
                 res.new_index_details,
                 physical_fragment_bitmap.as_ref(),
@@ -3192,6 +3205,11 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
+    use lance_index::frag_reuse::{
+        FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
+    };
+    use lance_index::pb::VectorIndexDetails;
+    use lance_index::pb::vector_index_details::{Compression, FlatCompression};
     use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
@@ -3213,6 +3231,63 @@ mod tests {
     use object_store::ObjectStoreExt;
     use rstest::rstest;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn test_fragment_reuse_projection_invalidates_vector_physical_coverage() {
+        let physical_fragments = RoaringBitmap::from_iter([0_u32]);
+        let details = prost_types::Any::from_msg(&VectorIndexDetails {
+            compression: Some(Compression::Flat(FlatCompression {})),
+            ..Default::default()
+        })
+        .unwrap();
+        let details = with_physical_fragment_bitmap(details, Some(&physical_fragments)).unwrap();
+        let mut index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "vector_idx".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some(physical_fragments),
+            index_details: Some(Arc::new(details)),
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let digest = |id| FragDigest {
+            id,
+            physical_rows: 1,
+            num_deleted_rows: 0,
+        };
+        let frag_reuse_index = FragReuseIndex::new(
+            Uuid::new_v4(),
+            Vec::new(),
+            FragReuseIndexDetails {
+                versions: vec![FragReuseVersion {
+                    dataset_version: 2,
+                    groups: vec![FragReuseGroup {
+                        changed_row_addrs: Vec::new(),
+                        old_frags: vec![digest(0)],
+                        new_frags: vec![digest(1)],
+                    }],
+                }],
+            },
+        );
+
+        project_index_through_fragment_reuse(&mut index, &frag_reuse_index).unwrap();
+
+        assert_eq!(index.fragment_bitmap, Some(RoaringBitmap::from_iter([1])));
+        assert_eq!(vector::details::physical_fragment_bitmap(&index), None);
+        let remapped_details = index
+            .index_details
+            .as_deref()
+            .unwrap()
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
+        assert!(matches!(
+            remapped_details.compression,
+            Some(Compression::Flat(_))
+        ));
+    }
 
     async fn write_vector_segment_metadata(
         dataset: &Dataset,

@@ -70,7 +70,9 @@ pub fn with_physical_fragment_bitmap(
             "Failed to deserialize VectorIndexDetails while recording physical fragment coverage: {error}"
         ))
     })?;
-    vector_details.physical_fragment_bitmap = if let Some(bitmap) = physical_fragments {
+    vector_details.physical_fragment_bitmap = if let Some(bitmap) = physical_fragments
+        && has_vector_index_configuration(&vector_details)
+    {
         let mut encoded = Vec::with_capacity(bitmap.serialized_size());
         bitmap.serialize_into(&mut encoded)?;
         Some(encoded)
@@ -412,17 +414,21 @@ pub fn metric_type_from_index_metadata(index: &IndexMetadata) -> Option<Distance
 ///
 /// Physical fragment coverage is independent provenance, so a details message
 /// that contains only that field still needs its index configuration inferred.
+fn has_vector_index_configuration(details: &VectorIndexDetails) -> bool {
+    details.metric_type != VectorMetricType::L2 as i32
+        || details.target_partition_size != 0
+        || details.hnsw_index_config.is_some()
+        || details.compression.is_some()
+        || !details.runtime_hints.is_empty()
+}
+
 fn is_empty_vector_details(details: &prost_types::Any) -> bool {
     if details.value.is_empty() {
         return true;
     }
-    details.to_msg::<VectorIndexDetails>().is_ok_and(|details| {
-        details.metric_type == VectorMetricType::L2 as i32
-            && details.target_partition_size == 0
-            && details.hnsw_index_config.is_none()
-            && details.compression.is_none()
-            && details.runtime_hints.is_empty()
-    })
+    details
+        .to_msg::<VectorIndexDetails>()
+        .is_ok_and(|details| !has_vector_index_configuration(&details))
 }
 
 /// Returns true if this is a vector index whose details need to be inferred from disk.
@@ -1137,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn test_physical_coverage_does_not_suppress_details_inference() {
+    fn test_physical_coverage_preserves_empty_details_sentinel() {
         let schema = schema_with_vector_and_scalar();
         let vec_id = schema.field("vec").unwrap().id;
         let physical_fragments = RoaringBitmap::from_iter([1, 3]);
@@ -1146,9 +1152,9 @@ mod tests {
             Some(&physical_fragments),
         )
         .unwrap();
+        assert!(details.value.is_empty());
         let index = index_over_field(vec_id, Some(details));
-
-        assert_eq!(physical_fragment_bitmap(&index), Some(physical_fragments));
+        assert_eq!(physical_fragment_bitmap(&index), None);
         assert!(needs_vector_details_inference(&index, &schema));
         assert_eq!(metric_type_from_index_metadata(&index), None);
         assert_eq!(
