@@ -75,10 +75,22 @@ impl LanceTableProvider {
     }
 
     /// Overrides how blob columns are read during [`TableProvider::scan`].
-    ///
     /// When unset, the underlying dataset scan uses its default
     /// [`BlobHandling`](lance_core::datatypes::BlobHandling) policy.
     pub fn with_blob_handling(mut self, handling: lance_core::datatypes::BlobHandling) -> Self {
+        let converted = self
+            .dataset
+            .full_projection()
+            .with_blob_handling(handling.clone())
+            .to_bare_schema();
+        let mut full_schema = Schema::from(&converted);
+        if self.row_id_idx.is_some() {
+            full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
+        }
+        if self.row_addr_idx.is_some() {
+            full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
+        }
+        self.full_schema = Arc::new(full_schema);
         self.blob_handling = Some(handling);
         self
     }

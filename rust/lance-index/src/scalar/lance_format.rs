@@ -12,9 +12,9 @@ use futures::TryStreamExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_encoding::version::LanceFileVersion;
-use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions, ReaderProjection};
+use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
+use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::writer as current_writer;
@@ -232,13 +232,16 @@ impl IndexReader for CurrentIndexReader {
             )));
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
+            versions::reader_projection_from_column_names(
                 self.0.metadata().version(),
                 self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
         let batches = self
             .0
@@ -270,13 +273,16 @@ impl IndexReader for CurrentIndexReader {
             return empty_batch();
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
+            versions::reader_projection_from_column_names(
                 self.0.metadata().version(),
                 self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
         // `DecodeBatchScheduler::schedule_ranges` requires sorted,
         // non-overlapping ranges; sort internally and permute the
@@ -348,13 +354,16 @@ impl IndexReader for CurrentIndexReader {
             )));
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
+            versions::reader_projection_from_column_names(
                 self.0.metadata().version(),
                 self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
         self.0
             .read_stream_projected(

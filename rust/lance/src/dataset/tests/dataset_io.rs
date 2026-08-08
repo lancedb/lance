@@ -2234,9 +2234,10 @@ async fn overwrite_dataset(
 
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    // Fragment ids reset after overwrite.
-    assert_eq!(fragments[0].id(), 0);
-    assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
+    // Fragment ids continue from the dataset's high water mark after an
+    // overwrite; they are never reused.
+    assert_eq!(fragments[0].id(), 1);
+    assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
 
     let actual_ds = Dataset::open(&test_uri).await.unwrap();
     assert_eq!(actual_ds.version().version, 2);

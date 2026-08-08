@@ -62,6 +62,7 @@ use lance_index::scalar::inverted::{
     compound_search_with_base_scorer, flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
+use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
@@ -301,6 +302,36 @@ fn batch_scored_document_keys(batch: &RecordBatch) -> Result<Vec<(DocumentKey, f
         .enumerate()
         .map(|(index, key)| (key, scores.value(index)))
         .collect())
+}
+
+fn batch_scored_document_keys_sum_scores(batch: &RecordBatch) -> Result<Vec<(DocumentKey, f32)>> {
+    let keys = batch_document_keys(batch)?;
+    let schema = batch.schema();
+    let score_columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() == SCORE_COL)
+        .map(|(index, _)| batch.column(index).as_primitive::<Float32Type>())
+        .collect::<Vec<_>>();
+    if score_columns.is_empty() {
+        return Err(Error::internal(format!(
+            "Boolean MUST result is missing required {SCORE_COL} columns"
+        )));
+    }
+    keys.into_iter()
+        .enumerate()
+        .map(|(row, key)| {
+            let score: f32 = score_columns.iter().map(|scores| scores.value(row)).sum();
+            if !score.is_finite() {
+                return Err(Error::internal(format!(
+                    "Boolean MUST score sum must be finite, got {score} for row_id={}",
+                    key.row_id
+                )));
+            }
+            Ok((key, score))
+        })
+        .collect()
 }
 
 fn document_key_scores_batch(
@@ -561,8 +592,14 @@ impl ExecutionPlan for CompoundQueryExec {
             let _details = load_segment_details(&dataset, column, &segments).await?;
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
-            let mut prefilter =
-                build_prefilter(context, partition, &prefilter_source, dataset, &segments)?;
+            let mut prefilter = build_prefilter(
+                context,
+                partition,
+                &prefilter_source,
+                dataset,
+                &segments,
+                None,
+            )?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -951,6 +988,8 @@ pub struct MatchQueryExec {
     /// Corpus-wide scorer published by the flat branch of a mixed search.
     shared_scorer: Option<Arc<SharedFtsScorer>>,
     segment_selection: FtsSegmentSelection,
+    /// Rows whose indexed values were superseded by newer data overlays.
+    overlay_block: Option<RowAddrMask>,
     document_granularity: DocumentGranularity,
     schema: SchemaRef,
 
@@ -1032,6 +1071,7 @@ impl MatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::AllCommitted,
+            overlay_block: None,
             document_granularity,
             schema,
             properties,
@@ -1092,6 +1132,7 @@ impl MatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+            overlay_block: None,
             document_granularity,
             schema,
             properties,
@@ -1132,6 +1173,7 @@ impl MatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
+            overlay_block: None,
             document_granularity,
             schema,
             properties,
@@ -1158,6 +1200,12 @@ impl MatchQueryExec {
 
     pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
         self.shared_scorer = Some(scorer);
+        self
+    }
+
+    /// Exclude rows whose indexed text was superseded by a newer data overlay.
+    pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
         self
     }
 
@@ -1236,6 +1284,7 @@ impl ExecutionPlan for MatchQueryExec {
                     base_scorer: self.base_scorer.clone(),
                     shared_scorer: self.shared_scorer.clone(),
                     segment_selection: self.segment_selection.clone(),
+                    overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
                     properties: self.properties.clone(),
@@ -1266,6 +1315,7 @@ impl ExecutionPlan for MatchQueryExec {
                     base_scorer: self.base_scorer.clone(),
                     shared_scorer: self.shared_scorer.clone(),
                     segment_selection: self.segment_selection.clone(),
+                    overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
                     properties: self.properties.clone(),
@@ -1294,6 +1344,7 @@ impl ExecutionPlan for MatchQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
+        let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
@@ -1314,8 +1365,14 @@ impl ExecutionPlan for MatchQueryExec {
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter =
-                build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
+            let mut pre_filter = build_prefilter(
+                context.clone(),
+                partition,
+                &prefilter_source,
+                ds,
+                &segments,
+                overlay_block,
+            )?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -1412,7 +1469,7 @@ impl ExecutionPlan for MatchQueryExec {
     }
 }
 
-/// Filters the input, removing rows that do not share tokens with the query
+/// Filters the input according to a match query's token operator.
 #[derive(Debug)]
 pub struct FlatMatchFilterExec {
     dataset: Arc<Dataset>,
@@ -1448,17 +1505,20 @@ fn document_matches_query(
     match operator {
         Operator::Or => has_query_token(text, tokenizer, query_tokens),
         Operator::And => {
-            let mut remaining = query_tokens
-                .into_iter()
-                .map(String::as_str)
+            let mut remaining_positions = (0..query_tokens.len())
+                .map(|index| query_tokens.position(index))
                 .collect::<HashSet<_>>();
-            if remaining.is_empty() {
+            if remaining_positions.is_empty() {
                 return false;
             }
             let mut stream = tokenizer.token_stream_for_doc(text);
             while let Some(token) = stream.next() {
-                remaining.remove(token.text.as_str());
-                if remaining.is_empty() {
+                for index in 0..query_tokens.len() {
+                    if token.text == query_tokens.get_token(index) {
+                        remaining_positions.remove(&query_tokens.position(index));
+                    }
+                }
+                if remaining_positions.is_empty() {
                     return true;
                 }
             }
@@ -1656,6 +1716,12 @@ impl FlatMatchFilterExec {
                 "column not set for MatchQuery {}",
                 query.terms
             )))?;
+        if query.fuzziness != Some(0) {
+            return Err(DataFusionError::NotImplemented(format!(
+                "Fuzzy MatchQuery is not supported when FTS is used as a post-filter: column={}, fuzziness={:?}",
+                column, query.fuzziness
+            )));
+        }
         let document_granularity = resolved_field
             .as_ref()
             .map(|resolved| resolved.document_granularity)
@@ -1854,7 +1920,6 @@ pub struct FlatMatchQueryExec {
     preset_segments: Option<Vec<IndexMetadata>>,
     document_granularity: DocumentGranularity,
     document_column: String,
-    phrase_slop: Option<u32>,
     schema: SchemaRef,
 
     properties: Arc<PlanProperties>,
@@ -1930,7 +1995,6 @@ impl FlatMatchQueryExec {
             preset_segments: None,
             document_granularity,
             document_column,
-            phrase_slop: None,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -1986,7 +2050,6 @@ impl FlatMatchQueryExec {
             preset_segments: Some(segments),
             document_granularity,
             document_column,
-            phrase_slop: None,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2001,11 +2064,6 @@ impl FlatMatchQueryExec {
 
     pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
         self.shared_scorer = Some(scorer);
-        self
-    }
-
-    pub(crate) fn with_phrase_slop(mut self, phrase_slop: u32) -> Self {
-        self.phrase_slop = Some(phrase_slop);
         self
     }
 
@@ -2067,7 +2125,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
             preset_segments: self.preset_segments.clone(),
             document_granularity: self.document_granularity,
             document_column: self.document_column.clone(),
-            phrase_slop: self.phrase_slop,
             schema: self.schema.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2090,7 +2147,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let target_batch_size = context.session_config().batch_size();
         let document_granularity = self.document_granularity;
         let document_column = self.document_column.clone();
-        let phrase_slop = self.phrase_slop;
+        let phrase_slop = self.params.phrase_slop;
 
         // CPU time accumulator passed into `flat_bm25_search_stream_with_metrics`
         // so it can attribute the spawn_cpu tokenize work and synchronous
@@ -2232,6 +2289,8 @@ pub struct PhraseQueryExec {
     /// Corpus-wide scorer published by the flat branch of a mixed search.
     shared_scorer: Option<Arc<SharedFtsScorer>>,
     segment_selection: FtsSegmentSelection,
+    /// Rows whose indexed values were superseded by newer data overlays.
+    overlay_block: Option<RowAddrMask>,
     document_granularity: DocumentGranularity,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -2304,6 +2363,7 @@ impl PhraseQueryExec {
             base_scorer: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::AllCommitted,
+            overlay_block: None,
             document_granularity,
             schema,
             properties,
@@ -2357,6 +2417,7 @@ impl PhraseQueryExec {
             base_scorer: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+            overlay_block: None,
             document_granularity,
             schema,
             properties,
@@ -2398,6 +2459,7 @@ impl PhraseQueryExec {
             base_scorer: None,
             shared_scorer: None,
             segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
+            overlay_block: None,
             document_granularity,
             schema,
             properties,
@@ -2413,6 +2475,12 @@ impl PhraseQueryExec {
 
     pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
         self.shared_scorer = Some(scorer);
+        self
+    }
+
+    /// Exclude rows whose indexed text was superseded by a newer data overlay.
+    pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
         self
     }
 
@@ -2484,6 +2552,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 base_scorer: self.base_scorer.clone(),
                 shared_scorer: self.shared_scorer.clone(),
                 segment_selection: self.segment_selection.clone(),
+                overlay_block: self.overlay_block.clone(),
                 document_granularity: self.document_granularity,
                 schema: self.schema.clone(),
                 properties: self.properties.clone(),
@@ -2512,6 +2581,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     base_scorer: self.base_scorer.clone(),
                     shared_scorer: self.shared_scorer.clone(),
                     segment_selection: self.segment_selection.clone(),
+                    overlay_block: self.overlay_block.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
                     properties: self.properties.clone(),
@@ -2540,6 +2610,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let segment_selection = self.segment_selection.clone();
+        let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
@@ -2560,8 +2631,14 @@ impl ExecutionPlan for PhraseQueryExec {
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter =
-                build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
+            let mut pre_filter = build_prefilter(
+                context.clone(),
+                partition,
+                &prefilter_source,
+                ds,
+                &segments,
+                overlay_block,
+            )?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -3088,7 +3165,7 @@ impl ExecutionPlan for BooleanQueryExec {
             if let Some(mut must) = must {
                 while let Some(batch) = must.try_next().await? {
                     let _timer = elapsed_time.timer();
-                    res.extend(batch_scored_document_keys(&batch)?);
+                    res.extend(batch_scored_document_keys_sum_scores(&batch)?);
                 }
             }
 

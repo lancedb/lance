@@ -39,9 +39,9 @@ use crate::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions};
 use lance_file::version::ConcreteFileVersion;
+use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::writer::{FileWriter as V2Writer, FileWriter, FileWriterOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -845,7 +845,7 @@ pub async fn merge_partial_vector_auxiliary_files(
 
         // Inherit format version from the first shard file
         if format_version.is_none() {
-            format_version = Some(meta.version());
+            format_version = Some(meta.version().into());
         }
 
         // Read distance type

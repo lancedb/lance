@@ -60,6 +60,19 @@ SOURCE_SIZES = [1_000, 10_000, 100_000]
 
 NARROW_KEYS = ["id_int", "id_uuid7", "id_uuid4"]
 
+# DataFusion accounts each 8,192-row slice of the 1.32 GiB full-schema source
+# for its shared backing buffers. Budget the resulting ~159 GiB of reservations
+# without changing the source layout measured by this benchmark.
+_MEM_POOL_SIZE = 160 * 1024**3
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _merge_insert_mem_pool() -> Iterable[None]:
+    """Use a bounded pool large enough for every merge_insert benchmark."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("LANCE_MEM_POOL_SIZE", str(_MEM_POOL_SIZE))
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Target management

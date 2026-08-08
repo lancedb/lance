@@ -21,7 +21,9 @@ use crate::{
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
+use lance_index::{
+    IndexParams, IndexType, registry::plugin_name_from_details_url, scalar::CreatedIndex,
+};
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{
@@ -268,7 +270,10 @@ impl<'a> CreateIndexBuilder<'a> {
         let index_name = if let Some(name) = self.name.take() {
             name
         } else {
-            // Generate default name with collision handling
+            // Generate default name with collision handling.
+            // A name is available when there is no existing index with:
+            //   - the same name AND different fields, OR
+            //   - the same name AND same field BUT a different index kind
             let column_path = resolved_fts_field
                 .as_ref()
                 .map(|resolved| {
@@ -282,11 +287,11 @@ impl<'a> CreateIndexBuilder<'a> {
             let base_name = format!("{column_path}_idx");
             let mut candidate = base_name.clone();
             let mut counter = 2; // Start with no suffix, then use _2, _3, ...
-            // Find unique name by appending numeric suffix if needed
-            while indices
-                .iter()
-                .any(|idx| idx.name == candidate && idx.fields != [field.id])
-            {
+            while indices.iter().any(|idx| {
+                idx.name == candidate
+                    && (idx.fields != [field.id]
+                        || !index_matches_type(idx, self.index_type, self.params))
+            }) {
                 candidate = format!("{base_name}_{counter}");
                 counter += 1;
             }
@@ -841,8 +846,6 @@ impl<'a> CreateIndexBuilder<'a> {
             build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
                 .await?;
 
-        // Collect all same-name indices for removal when replace is set,
-        // matching the standard execute() path behavior.
         let removed_indices = if self.replace {
             existing_named_indices
                 .into_iter()
@@ -874,6 +877,31 @@ impl<'a> CreateIndexBuilder<'a> {
             ))
         })
     }
+}
+
+/// Returns true if an existing `IndexMetadata` matches the given type
+fn index_matches_type(
+    idx: &IndexMetadata,
+    index_type: IndexType,
+    params: &dyn IndexParams,
+) -> bool {
+    let Some(d) = &idx.index_details else {
+        // Fallback for legacy indexes, assume we are not trying to change the type
+        return true;
+    };
+    // When index_type is Scalar the actual type is carried in ScalarIndexParams as a
+    // plugin name string (e.g. "zonemap").  The registry uses the same normalization
+    // for type_url lookup: lowercase the last path segment and strip "indexdetails".
+    // Compare directly instead of going through IndexType so this path stays valid
+    // as we move away from the IndexType enum.
+    if index_type == IndexType::Scalar
+        && let Some(scalar_params) = params.as_any().downcast_ref::<ScalarIndexParams>()
+    {
+        return scalar_params.index_type.to_lowercase()
+            == plugin_name_from_details_url(&d.type_url);
+    }
+
+    index_type.matches_details(d)
 }
 
 fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> bool {
