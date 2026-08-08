@@ -696,7 +696,7 @@ impl<'a> CleanupTask<'a> {
             // intent admitted before the draining marker must win. Descendant
             // retention is based on actual lineage file references rather than
             // cleanup policy or branch metadata alone.
-            let intent_versions = version_lease_store
+            let reference_census = version_lease_store
                 .reference_versions_before_canonical_census()
                 .await?;
             let tags = self.dataset.tags().list().await?;
@@ -710,7 +710,7 @@ impl<'a> CleanupTask<'a> {
                 })
                 .map(|tag| tag.version)
                 .collect::<HashSet<_>>();
-            referenced_versions.extend(intent_versions);
+            referenced_versions.extend(reference_census.versions.iter().copied());
             let mut retained_versions = versions_to_seal
                 .intersection(&referenced_versions)
                 .copied()
@@ -736,7 +736,12 @@ impl<'a> CleanupTask<'a> {
                 .values()
                 .copied()
                 .collect::<HashSet<_>>();
-            let late_reference_versions = guard.commit_versions(&versions_to_commit).await?;
+            let late_reference_versions = guard
+                .commit_versions(
+                    &versions_to_commit,
+                    &reference_census.completed_intent_paths,
+                )
+                .await?;
             for version in &late_reference_versions {
                 self.retain_version(&mut inspection, *version).await?;
             }

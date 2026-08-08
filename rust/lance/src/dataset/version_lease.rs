@@ -5,6 +5,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
+    path::PathBuf,
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -33,6 +35,11 @@ const DRAINING_MARKER_SUFFIX: &str = ".draining";
 const SEALED_MARKER_SUFFIX: &str = ".sealed";
 const COMMITTED_MARKER_SUFFIX: &str = ".committed";
 const STORAGE_CLOCK_PATH: &str = "_clock";
+
+/// A deleted canonical reference remains as a tombstone so an abandoned
+/// `PutMode::Create` publication cannot recreate the name after deletion.
+pub(super) const REFERENCE_TOMBSTONE_PAYLOAD: &[u8] =
+    br#"{"_lanceReferenceState":"deleted","formatVersion":1}"#;
 
 /// HTTP `Last-Modified`, used by supported cloud stores, has whole-second precision.
 /// Adding one interval guarantees a lease is never shortened by timestamp truncation.
@@ -172,6 +179,16 @@ pub(super) struct ReferenceAdmission {
     mutation: ReferenceMutation,
 }
 
+/// An operating-system advisory lock for one local canonical reference.
+///
+/// The lock file is intentionally retained after unlock. Reusing one inode
+/// avoids a delete/recreate race between local processes, while the OS releases
+/// the held lock automatically if its owner exits.
+#[derive(Debug)]
+pub(super) struct LocalReferenceLock {
+    _file: File,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub(super) enum ReferenceMutation {
@@ -258,6 +275,12 @@ struct ReferenceIntentMetadata {
     version: u64,
     metadata: ObjectMeta,
     intent: ReferenceIntent,
+}
+
+#[derive(Debug)]
+pub(super) struct CanonicalReferenceCensus {
+    pub(super) versions: HashSet<u64>,
+    pub(super) completed_intent_paths: HashSet<Path>,
 }
 
 /// Per-cleanup retirement markers for versions selected for deletion.
@@ -376,28 +399,45 @@ impl VersionLeaseStore {
     }
 
     pub(super) async fn active_reference_versions(&self) -> Result<HashSet<u64>> {
-        self.reference_versions(CompletedReferenceIntentHandling::RetainForCurrentScan)
-            .await
+        Ok(self
+            .reference_versions(
+                CompletedReferenceIntentHandling::RetainForCurrentScan,
+                &HashSet::new(),
+            )
+            .await?
+            .versions)
     }
 
     /// Fence in-flight publication before the caller scans canonical tags and
     /// branches. Completed intents can be removed without retaining their
     /// target because the following canonical census observes their result.
-    pub(super) async fn reference_versions_before_canonical_census(&self) -> Result<HashSet<u64>> {
-        self.reference_versions(CompletedReferenceIntentHandling::DeferToCanonicalCensus)
-            .await
+    pub(super) async fn reference_versions_before_canonical_census(
+        &self,
+    ) -> Result<CanonicalReferenceCensus> {
+        self.reference_versions(
+            CompletedReferenceIntentHandling::DeferToCanonicalCensus,
+            &HashSet::new(),
+        )
+        .await
     }
 
     async fn reference_versions(
         &self,
         completed_handling: CompletedReferenceIntentHandling,
-    ) -> Result<HashSet<u64>> {
+        completed_intents_observed_before_census: &HashSet<Path>,
+    ) -> Result<CanonicalReferenceCensus> {
         let observed_at = self.storage_observed_at().await?;
         let mut active_versions = HashSet::new();
+        let mut completed_intent_paths = HashSet::new();
         let mut stale_paths = Vec::new();
         for intent in self.reference_intent_metadata().await? {
             match intent.intent.state {
                 ReferenceIntentState::Completed => {
+                    if completed_intents_observed_before_census.contains(&intent.metadata.location)
+                    {
+                        stale_paths.push(intent.metadata.location);
+                        continue;
+                    }
                     // The completed intent is the durable handoff from an
                     // in-flight publication to its canonical object. A caller
                     // that already completed its canonical census retains a
@@ -419,7 +459,19 @@ impl VersionLeaseStore {
                             active_versions.insert(intent.version);
                         }
                     }
-                    stale_paths.push(intent.metadata.location);
+                    // The pre-census scan must not consume the only durable
+                    // handoff while a pre-commit seal exists. If cleanup is
+                    // interrupted before its canonical census cancels that
+                    // seal, recovery still needs the completed intent to
+                    // recognize that the canonical reference won.
+                    if completed_handling
+                        == CompletedReferenceIntentHandling::DeferToCanonicalCensus
+                        && self.has_precommit_sealed_marker(intent.version).await?
+                    {
+                        completed_intent_paths.insert(intent.metadata.location);
+                    } else {
+                        stale_paths.push(intent.metadata.location);
+                    }
                 }
                 ReferenceIntentState::Pending
                     if reference_owner_is_active(intent.metadata.last_modified, observed_at)? =>
@@ -427,16 +479,16 @@ impl VersionLeaseStore {
                     active_versions.insert(intent.version);
                 }
                 ReferenceIntentState::Pending => {
-                    // The intent contains the exact conditional mutation, so an
-                    // expired owner cannot resume a different or unconditional
-                    // publication after recovery removes its intent. Applying the
-                    // same mutation either publishes the reference or proves that
-                    // its original precondition can no longer succeed.
+                    // Never replay an expired publication: an absent canonical
+                    // path cannot distinguish an operation that never published
+                    // from one that published and was subsequently deleted.
+                    // An abandoned create instead installs a durable tombstone,
+                    // atomically fencing any owner that resumes after expiry.
                     let manifest_path = Path::parse(&intent.intent.manifest_path)?;
                     if self.object_store.exists(&manifest_path).await?
                         && !self.has_committed_marker(intent.version).await?
                         && self
-                            .apply_reference_mutation(&intent.intent.mutation)
+                            .expired_reference_mutation_outcome(&intent.intent.mutation)
                             .await?
                             == ReferenceMutationOutcome::Published
                     {
@@ -447,7 +499,51 @@ impl VersionLeaseStore {
             }
         }
         self.delete_paths(stale_paths).await?;
-        Ok(active_versions)
+        Ok(CanonicalReferenceCensus {
+            versions: active_versions,
+            completed_intent_paths,
+        })
+    }
+
+    async fn expired_reference_mutation_outcome(
+        &self,
+        mutation: &ReferenceMutation,
+    ) -> Result<ReferenceMutationOutcome> {
+        match mutation {
+            ReferenceMutation::Create { path, payload } => {
+                let path = Path::parse(path)?;
+                let _local_lock = lock_local_reference(&self.object_store, &path).await?;
+                match self
+                    .object_store
+                    .inner
+                    .put_opts(
+                        &path,
+                        Bytes::from_static(REFERENCE_TOMBSTONE_PAYLOAD).into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    // The tombstone won the create race, so this abandoned
+                    // operation can never publish the deleted name.
+                    Ok(_) => Ok(ReferenceMutationOutcome::Conflict),
+                    Err(
+                        object_store::Error::AlreadyExists { .. }
+                        | object_store::Error::Precondition { .. },
+                    ) => {
+                        self.reference_mutation_conflict_outcome(&path, payload)
+                            .await
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            ReferenceMutation::Update { path, payload, .. } => {
+                self.reference_mutation_conflict_outcome(&Path::parse(path)?, payload)
+                    .await
+            }
+        }
     }
 
     async fn create_reference_intent(
@@ -482,9 +578,10 @@ impl VersionLeaseStore {
         Ok((path, metadata.last_modified))
     }
 
-    async fn apply_reference_mutation(
+    async fn apply_reference_mutation_inner(
         &self,
         mutation: &ReferenceMutation,
+        has_local_lock: bool,
     ) -> Result<ReferenceMutationOutcome> {
         let (path, payload, result) = match mutation {
             ReferenceMutation::Create { path, payload } => {
@@ -530,10 +627,7 @@ impl VersionLeaseStore {
                     Err(
                         object_store::Error::NotSupported { .. }
                         | object_store::Error::NotImplemented { .. },
-                    ) => {
-                        // Local object stores do not implement UpdateVersion.
-                        // Preserve their existing update support while checking
-                        // the exact prior contents immediately before overwrite.
+                    ) if has_local_lock => {
                         let current = self.object_store.inner.get(&path).await?.bytes().await?;
                         if current.as_ref() != expected_payload {
                             return Ok(ReferenceMutationOutcome::Conflict);
@@ -542,6 +636,15 @@ impl VersionLeaseStore {
                             .inner
                             .put(&path, Bytes::from(payload.clone()).into())
                             .await
+                    }
+                    Err(
+                        object_store::Error::NotSupported { .. }
+                        | object_store::Error::NotImplemented { .. },
+                    ) => {
+                        return Err(Error::not_supported(format!(
+                            "object store {} does not support atomic conditional reference updates for {path}",
+                            self.object_store.scheme()
+                        )));
                     }
                     result => result,
                 };
@@ -776,6 +879,14 @@ impl VersionLeaseStore {
             .await?
             .iter()
             .any(|marker| marker.state != RetirementState::Draining))
+    }
+
+    async fn has_precommit_sealed_marker(&self, version: u64) -> Result<bool> {
+        Ok(self
+            .version_marker_metadata(version)
+            .await?
+            .iter()
+            .any(|marker| marker.state == RetirementState::Sealed))
     }
 
     async fn has_committed_marker(&self, version: u64) -> Result<bool> {
@@ -1166,11 +1277,19 @@ impl RetirementGuard {
     pub(super) async fn commit_versions(
         &mut self,
         versions: &HashSet<u64>,
+        completed_intents_observed_before_census: &HashSet<Path>,
     ) -> Result<HashSet<u64>> {
         // This scan runs inside the commit operation, after the caller's final
         // reference census. An admission that won that narrow race remains
         // cancellable and cannot cross the irreversible committed boundary.
-        let active_reference_versions = self.store.active_reference_versions().await?;
+        let active_reference_versions = self
+            .store
+            .reference_versions(
+                CompletedReferenceIntentHandling::RetainForCurrentScan,
+                completed_intents_observed_before_census,
+            )
+            .await?
+            .versions;
         let retained_versions = versions
             .intersection(&active_reference_versions)
             .copied()
@@ -1510,11 +1629,21 @@ impl ReferenceAdmission {
     }
 
     pub(super) async fn publish(self, conflict_message: String) -> Result<()> {
+        let canonical_path = match &self.mutation {
+            ReferenceMutation::Create { path, .. } | ReferenceMutation::Update { path, .. } => {
+                Path::parse(path)?
+            }
+        };
+        let local_lock = lock_local_reference(&self.store.object_store, &canonical_path).await?;
         if let Err(error) = self.ensure_owned().await {
             self.cancel_before_publish().await;
             return Err(error);
         }
-        match self.store.apply_reference_mutation(&self.mutation).await {
+        match self
+            .store
+            .apply_reference_mutation_inner(&self.mutation, local_lock.is_some())
+            .await
+        {
             Ok(ReferenceMutationOutcome::Published) => {
                 self.complete().await;
                 Ok(())
@@ -1526,8 +1655,8 @@ impl ReferenceAdmission {
                 })
             }
             // A transport failure can be ambiguous after the server accepted
-            // the conditional mutation. Recovery retains and replays the exact
-            // operation recorded in the intent.
+            // the conditional mutation. Recovery retains the intent and
+            // verifies canonical state without replaying the operation.
             Err(error) => Err(error),
         }
     }
@@ -1569,6 +1698,39 @@ impl ReferenceAdmission {
             );
         }
     }
+}
+
+pub(super) async fn lock_local_reference(
+    object_store: &ObjectStore,
+    path: &Path,
+) -> Result<Option<LocalReferenceLock>> {
+    if !object_store.is_local() && object_store.scheme() != "file-object-store" {
+        return Ok(None);
+    }
+
+    let path = PathBuf::from(path.as_ref());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        PathBuf::from(std::path::MAIN_SEPARATOR_STR).join(path)
+    };
+    let lock_path = PathBuf::from(format!("{}.lance-reference.lock", path.display()));
+    tokio::task::spawn_blocking(move || -> Result<LocalReferenceLock> {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        file.lock()?;
+        Ok(LocalReferenceLock { _file: file })
+    })
+    .await
+    .map_err(|error| Error::internal(format!("failed to acquire local reference lock: {error}")))?
+    .map(Some)
 }
 
 async fn ensure_reference_available(
@@ -1885,7 +2047,7 @@ mod tests {
         guard.seal_versions(&HashSet::from([42])).await.unwrap();
         assert!(
             guard
-                .commit_versions(&HashSet::from([42]))
+                .commit_versions(&HashSet::from([42]), &HashSet::new())
                 .await
                 .unwrap()
                 .is_empty()
@@ -1913,7 +2075,10 @@ mod tests {
         let mut guard = store.fence_versions(&manifest_paths(42)).await.unwrap();
         guard.seal_versions(&HashSet::from([42])).await.unwrap();
 
-        let retained_versions = guard.commit_versions(&HashSet::from([42])).await.unwrap();
+        let retained_versions = guard
+            .commit_versions(&HashSet::from([42]), &HashSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(retained_versions, HashSet::from([42]));
         assert!(guard.fences[&42].committed_path.is_none());
@@ -1940,7 +2105,7 @@ mod tests {
         guard.seal_versions(&HashSet::from([42])).await.unwrap();
         assert!(
             guard
-                .commit_versions(&HashSet::from([42]))
+                .commit_versions(&HashSet::from([42]), &HashSet::new())
                 .await
                 .unwrap()
                 .is_empty()
@@ -2139,7 +2304,10 @@ mod tests {
         admission.complete().await;
 
         assert_eq!(
-            guard.commit_versions(&HashSet::from([42])).await.unwrap(),
+            guard
+                .commit_versions(&HashSet::from([42]), &HashSet::new())
+                .await
+                .unwrap(),
             HashSet::from([42])
         );
         assert!(!store.object_store.exists(&intent_path).await.unwrap());
@@ -2211,13 +2379,12 @@ mod tests {
             .unwrap();
         admission.complete().await;
 
-        assert!(
-            store
-                .reference_versions_before_canonical_census()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let census = store
+            .reference_versions_before_canonical_census()
+            .await
+            .unwrap();
+        assert!(census.versions.is_empty());
+        assert!(census.completed_intent_paths.is_empty());
         assert!(store.object_store.exists(&canonical_path).await.unwrap());
         assert!(!store.object_store.exists(&intent_path).await.unwrap());
     }
@@ -2242,10 +2409,157 @@ mod tests {
         store.object_store.delete(&canonical_path).await.unwrap();
 
         assert_eq!(
-            store.apply_reference_mutation(&mutation).await.unwrap(),
+            store
+                .apply_reference_mutation_inner(&mutation, false)
+                .await
+                .unwrap(),
             ReferenceMutationOutcome::Conflict
         );
         assert!(!store.object_store.exists(&canonical_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn expired_pending_create_intent_does_not_resurrect_deleted_reference() {
+        let store = memory_store();
+        let canonical_path = Path::from("tags/deleted.json");
+        let mutation = ReferenceMutation::Create {
+            path: canonical_path.to_string(),
+            payload: b"reference".to_vec(),
+        };
+        store
+            .object_store
+            .put(&canonical_path, b"reference")
+            .await
+            .unwrap();
+        store.object_store.delete(&canonical_path).await.unwrap();
+
+        assert_eq!(
+            store
+                .expired_reference_mutation_outcome(&mutation)
+                .await
+                .unwrap(),
+            ReferenceMutationOutcome::Conflict
+        );
+        assert_eq!(
+            store
+                .object_store
+                .inner
+                .get(&canonical_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            REFERENCE_TOMBSTONE_PAYLOAD
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_conditional_reference_update_is_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+        let (object_store, base_path) = ObjectStore::from_uri(&uri).await.unwrap();
+        let store = VersionLeaseStore {
+            object_store,
+            leases_path: base_path.clone().join("leases"),
+            markers_path: base_path.clone().join("markers"),
+            reference_intents_path: base_path.clone().join("reference_intents"),
+            manifest_path: None,
+        };
+        let canonical_path = base_path.join("branches/child.json");
+        let original = store
+            .object_store
+            .inner
+            .put(&canonical_path, Bytes::from_static(b"original").into())
+            .await
+            .unwrap();
+        let mutation = ReferenceMutation::Update {
+            path: canonical_path.to_string(),
+            expected_payload: b"original".to_vec(),
+            expected_etag: original.e_tag,
+            expected_version: original.version,
+            payload: b"updated".to_vec(),
+        };
+
+        let error = store
+            .apply_reference_mutation_inner(&mutation, false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("atomic conditional"), "{error}");
+        assert_eq!(
+            store
+                .object_store
+                .inner
+                .get(&canonical_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"original"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_only_recovery_cancels_seal_after_completed_handoff() {
+        let store = memory_store();
+        let manifest_path = Path::from("manifests/42.manifest");
+        let canonical_path = Path::from("tags/recovery.json");
+        store.object_store.put(&manifest_path, &[]).await.unwrap();
+        let intent = ReferenceIntent {
+            manifest_path: manifest_path.to_string(),
+            mutation: ReferenceMutation::Create {
+                path: canonical_path.to_string(),
+                payload: b"reference".to_vec(),
+            },
+            state: ReferenceIntentState::Pending,
+        };
+        let (intent_path, created_at) = store.create_reference_intent(42, &intent).await.unwrap();
+        let admission = ReferenceAdmission {
+            store: store.clone(),
+            path: intent_path.clone(),
+            manifest_path: manifest_path.clone(),
+            version: 42,
+            created_at,
+            mutation: intent.mutation,
+        };
+        store
+            .object_store
+            .put(&canonical_path, b"reference")
+            .await
+            .unwrap();
+        admission.complete().await;
+
+        let manifests = HashMap::from([(42, vec![manifest_path])]);
+        let mut guard = store.fence_versions(&manifests).await.unwrap();
+        guard.seal_versions(&HashSet::from([42])).await.unwrap();
+        let census = store
+            .reference_versions_before_canonical_census()
+            .await
+            .unwrap();
+        assert!(census.versions.is_empty());
+        assert_eq!(
+            census.completed_intent_paths,
+            HashSet::from([intent_path.clone()])
+        );
+        assert!(store.object_store.exists(&intent_path).await.unwrap());
+        drop(guard);
+
+        assert!(
+            store
+                .clone()
+                .recover_retirements()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.version_marker_metadata(42).await.unwrap().is_empty());
+        assert!(!store.object_store.exists(&intent_path).await.unwrap());
+        store.acquire(42, Duration::from_secs(60)).await.unwrap();
     }
 
     #[tokio::test]

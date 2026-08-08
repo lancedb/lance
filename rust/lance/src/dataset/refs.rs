@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
-
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::CommitHandler;
-use object_store::{ObjectStoreExt, path::Path};
+use object_store::{ObjectMeta, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::dataset::version_lease::{
-    ReferenceMutation, begin_reference_admission, remove_branch_state,
+    REFERENCE_TOMBSTONE_PAYLOAD, ReferenceMutation, begin_reference_admission,
+    lock_local_reference, remove_branch_state,
 };
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
@@ -135,6 +135,91 @@ pub struct Branches<'a> {
     refs: &'a Refs,
 }
 
+struct ReferenceSnapshot {
+    metadata: ObjectMeta,
+    payload: Bytes,
+}
+
+impl ReferenceSnapshot {
+    fn is_tombstone(&self) -> bool {
+        self.payload.as_ref() == REFERENCE_TOMBSTONE_PAYLOAD
+    }
+}
+
+async fn reference_snapshot(
+    object_store: &ObjectStore,
+    path: &Path,
+) -> Result<Option<ReferenceSnapshot>> {
+    let result = match object_store.inner.get(path).await {
+        Ok(result) => result,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = result.meta.clone();
+    let payload = result.bytes().await?;
+    Ok(Some(ReferenceSnapshot { metadata, payload }))
+}
+
+async fn tombstone_reference(
+    object_store: &ObjectStore,
+    path: &Path,
+    snapshot: &ReferenceSnapshot,
+) -> Result<()> {
+    let local_lock = lock_local_reference(object_store, path).await?;
+    let Some(current) = reference_snapshot(object_store, path).await? else {
+        return Err(Error::RefConflict {
+            message: format!("reference {path} changed during conditional deletion"),
+        });
+    };
+    if current.payload != snapshot.payload {
+        return Err(Error::RefConflict {
+            message: format!("reference {path} changed during conditional deletion"),
+        });
+    }
+    let result = object_store
+        .inner
+        .put_opts(
+            path,
+            Bytes::from_static(REFERENCE_TOMBSTONE_PAYLOAD).into(),
+            PutOptions {
+                mode: PutMode::Update(UpdateVersion {
+                    e_tag: snapshot.metadata.e_tag.clone(),
+                    version: snapshot.metadata.version.clone(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(
+            object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented { .. },
+        ) if local_lock.is_some() => {
+            // Local reference mutations hold the same OS advisory lock, so an
+            // atomic overwrite cannot race another supported local mutation.
+            // The durable tombstone prevents later creates from reusing this
+            // path without a locked conditional mutation.
+            object_store
+                .inner
+                .put(path, Bytes::from_static(REFERENCE_TOMBSTONE_PAYLOAD).into())
+                .await?;
+            Ok(())
+        }
+        Err(
+            object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented { .. },
+        ) => Err(Error::not_supported(format!(
+            "object store {} does not support atomic conditional reference deletion for {path}",
+            object_store.scheme()
+        ))),
+        Err(object_store::Error::NotFound { .. } | object_store::Error::Precondition { .. }) => {
+            Err(Error::RefConflict {
+                message: format!("reference {path} changed during conditional deletion"),
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Tags<'_> {
     fn object_store(&self) -> &ObjectStore {
         &self.refs.object_store
@@ -162,14 +247,20 @@ impl Tags<'_> {
         let root_path = &root_location.path;
         futures::stream::iter(tag_names)
             .map(|tag_name| async move {
-                let contents =
-                    TagContents::from_path(&tag_path(root_path, &tag_name), self.object_store())
-                        .await?;
-                Ok((tag_name, contents))
+                let path = tag_path(root_path, &tag_name);
+                let Some(snapshot) = reference_snapshot(self.object_store(), &path).await? else {
+                    return Ok(None);
+                };
+                if snapshot.is_tombstone() {
+                    return Ok(None);
+                }
+                let contents = serde_json::from_slice(&snapshot.payload)?;
+                Ok(Some((tag_name, contents)))
             })
             .buffer_unordered(10)
-            .try_collect()
+            .try_collect::<Vec<_>>()
             .await
+            .map(|tags| tags.into_iter().flatten().collect())
     }
 
     pub async fn list(&self) -> Result<HashMap<String, TagContents>> {
@@ -205,13 +296,18 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        if !self.object_store().exists(&tag_file).await? {
+        let Some(snapshot) = reference_snapshot(self.object_store(), &tag_file).await? else {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        };
+        if snapshot.is_tombstone() {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
 
-        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let tag_contents = serde_json::from_slice(&snapshot.payload)?;
         Ok(tag_contents)
     }
 
@@ -220,7 +316,11 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        if self.object_store().exists(&tag_file).await? {
+        let previous = reference_snapshot(self.object_store(), &tag_file).await?;
+        if previous
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.is_tombstone())
+        {
             return Err(Error::RefConflict {
                 message: format!("tag {} already exists", tag),
             });
@@ -230,9 +330,18 @@ impl Tags<'_> {
             .build_tag_content_by_ref(reference, Some(now), Some(now))
             .await?;
         let payload = serde_json::to_vec_pretty(&tag_contents)?;
-        let mutation = ReferenceMutation::Create {
-            path: tag_file.to_string(),
-            payload,
+        let mutation = match previous {
+            Some(snapshot) => ReferenceMutation::Update {
+                path: tag_file.to_string(),
+                expected_payload: snapshot.payload.to_vec(),
+                expected_etag: snapshot.metadata.e_tag,
+                expected_version: snapshot.metadata.version,
+                payload,
+            },
+            None => ReferenceMutation::Create {
+                path: tag_file.to_string(),
+                payload,
+            },
         };
         let admission = begin_reference_admission(
             self.refs,
@@ -250,13 +359,18 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        if !self.object_store().exists(&tag_file).await? {
+        let Some(snapshot) = reference_snapshot(self.object_store(), &tag_file).await? else {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        };
+        if snapshot.is_tombstone() {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
 
-        self.object_store().delete(&tag_file).await
+        tombstone_reference(self.object_store(), &tag_file, &snapshot).await
     }
 
     pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
@@ -264,15 +378,19 @@ impl Tags<'_> {
 
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
+        let Some(snapshot) = reference_snapshot(self.object_store(), &tag_file).await? else {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        };
+        if snapshot.is_tombstone() {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let original_get = self.object_store().inner.get(&tag_file).await?;
-        let expected_etag = original_get.meta.e_tag.clone();
-        let expected_version = original_get.meta.version.clone();
-        let original_payload = original_get.bytes().await?;
+        let expected_etag = snapshot.metadata.e_tag.clone();
+        let expected_version = snapshot.metadata.version.clone();
+        let original_payload = snapshot.payload;
         let original_tag_contents: TagContents = serde_json::from_slice(&original_payload)?;
         let updated_reference = self
             .build_tag_content_by_ref(reference, original_tag_contents.created_at, Some(utc_now()))
@@ -312,16 +430,20 @@ impl Tags<'_> {
 
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
+        let Some(snapshot) = reference_snapshot(self.object_store(), &tag_file).await? else {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        };
+        if snapshot.is_tombstone() {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
 
-        let original_get = self.object_store().inner.get(&tag_file).await?;
-        let expected_etag = original_get.meta.e_tag.clone();
-        let expected_version = original_get.meta.version.clone();
-        let original_payload = original_get.bytes().await?;
+        let expected_etag = snapshot.metadata.e_tag.clone();
+        let expected_version = snapshot.metadata.version.clone();
+        let original_payload = snapshot.payload;
         let mut tag_contents: TagContents = serde_json::from_slice(&original_payload)?;
         tag_contents.metadata = metadata;
         let payload = serde_json::to_vec_pretty(&tag_contents)?;
@@ -430,17 +552,21 @@ impl Branches<'_> {
         let branch_path = &root_location.path;
         futures::stream::iter(branch_names)
             .map(|name| async move {
-                let contents = BranchContents::from_path(
-                    &branch_contents_path(branch_path, &name),
-                    self.object_store(),
-                    &name,
-                )
-                .await?;
-                Ok((name, contents))
+                let path = branch_contents_path(branch_path, &name);
+                let Some(snapshot) = reference_snapshot(self.object_store(), &path).await? else {
+                    return Ok(None);
+                };
+                if snapshot.is_tombstone() {
+                    return Ok(None);
+                }
+                let mut contents: BranchContents = serde_json::from_slice(&snapshot.payload)?;
+                contents.ensure_identifier(&name);
+                Ok(Some((name, contents)))
             })
             .buffer_unordered(10)
-            .try_collect()
+            .try_collect::<Vec<_>>()
             .await
+            .map(|branches| branches.into_iter().flatten().collect())
     }
 
     pub async fn list(&self) -> Result<HashMap<String, BranchContents>> {
@@ -455,14 +581,19 @@ impl Branches<'_> {
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
 
-        if !self.object_store().exists(&branch_file).await? {
+        let Some(snapshot) = reference_snapshot(self.object_store(), &branch_file).await? else {
+            return Err(Error::RefNotFound {
+                message: format!("branch {} does not exist", branch),
+            });
+        };
+        if snapshot.is_tombstone() {
             return Err(Error::RefNotFound {
                 message: format!("branch {} does not exist", branch),
             });
         }
 
-        let branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
+        let mut branch_contents: BranchContents = serde_json::from_slice(&snapshot.payload)?;
+        branch_contents.ensure_identifier(branch);
 
         Ok(branch_contents)
     }
@@ -488,7 +619,11 @@ impl Branches<'_> {
         let source_branch = source_branch.and_then(standardize_branch);
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch_name);
-        if self.object_store().exists(&branch_file).await? {
+        let previous = reference_snapshot(self.object_store(), &branch_file).await?;
+        if previous
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.is_tombstone())
+        {
             return Err(Error::RefConflict {
                 message: format!("branch {} already exists", branch_name),
             });
@@ -542,9 +677,18 @@ impl Branches<'_> {
             metadata: HashMap::new(),
         };
         let payload = serde_json::to_vec_pretty(&branch_contents)?;
-        let mutation = ReferenceMutation::Create {
-            path: branch_file.to_string(),
-            payload,
+        let mutation = match previous {
+            Some(snapshot) => ReferenceMutation::Update {
+                path: branch_file.to_string(),
+                expected_payload: snapshot.payload.to_vec(),
+                expected_etag: snapshot.metadata.e_tag,
+                expected_version: snapshot.metadata.version,
+                payload,
+            },
+            None => ReferenceMutation::Create {
+                path: branch_file.to_string(),
+                payload,
+            },
         };
         let admission = begin_reference_admission(
             self.refs,
@@ -567,16 +711,20 @@ impl Branches<'_> {
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
-        if !self.object_store().exists(&branch_file).await? {
+        let Some(snapshot) = reference_snapshot(self.object_store(), &branch_file).await? else {
+            return Err(Error::RefNotFound {
+                message: format!("branch {} does not exist", branch),
+            });
+        };
+        if snapshot.is_tombstone() {
             return Err(Error::RefNotFound {
                 message: format!("branch {} does not exist", branch),
             });
         }
 
-        let original_get = self.object_store().inner.get(&branch_file).await?;
-        let expected_etag = original_get.meta.e_tag.clone();
-        let expected_version = original_get.meta.version.clone();
-        let original_payload = original_get.bytes().await?;
+        let expected_etag = snapshot.metadata.e_tag.clone();
+        let expected_version = snapshot.metadata.version.clone();
+        let original_payload = snapshot.payload;
         let mut branch_contents: BranchContents = serde_json::from_slice(&original_payload)?;
         if branch_contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
             branch_contents.identifier = BranchIdentifier::synthetic_identifier(
@@ -637,8 +785,10 @@ impl Branches<'_> {
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
-        if self.object_store().exists(&branch_file).await? {
-            self.object_store().delete(&branch_file).await?;
+        if let Some(snapshot) = reference_snapshot(self.object_store(), &branch_file).await?
+            && !snapshot.is_tombstone()
+        {
+            tombstone_reference(self.object_store(), &branch_file, &snapshot).await?;
         }
 
         // Clean up branch directories and operational state scoped to this
@@ -987,16 +1137,17 @@ async fn from_path<T>(path: &Path, object_store: &ObjectStore) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let tag_reader = object_store.open(path).await?;
-    let tag_bytes = tag_reader
-        .get_range(Range {
-            start: 0,
-            end: tag_reader.size().await?,
-        })
-        .await?;
-    let json_str = String::from_utf8(tag_bytes.to_vec())
-        .map_err(|e| Error::corrupt_file(path.clone(), e.to_string()))?;
-    Ok(serde_json::from_str(&json_str)?)
+    let Some(snapshot) = reference_snapshot(object_store, path).await? else {
+        return Err(Error::RefNotFound {
+            message: format!("reference {path} does not exist"),
+        });
+    };
+    if snapshot.is_tombstone() {
+        return Err(Error::RefNotFound {
+            message: format!("reference {path} does not exist"),
+        });
+    }
+    Ok(serde_json::from_slice(&snapshot.payload)?)
 }
 
 impl TagContents {
@@ -1012,18 +1163,22 @@ impl BranchContents {
         branch_name: &str,
     ) -> Result<Self> {
         let mut contents: Self = from_path(path, object_store).await?;
-        if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
+        contents.ensure_identifier(branch_name);
+        Ok(contents)
+    }
+
+    fn ensure_identifier(&mut self, branch_name: &str) {
+        if self.identifier == BranchIdentifier::missing_identifier_sentinel() {
             // Legacy branch files do not store an identifier. Derive a deterministic fallback
             // from stable branch metadata so repeated reads expose the same public
             // branch_identifier.
-            contents.identifier = BranchIdentifier::synthetic_identifier(
+            self.identifier = BranchIdentifier::synthetic_identifier(
                 branch_name,
-                contents.parent_branch.as_deref(),
-                contents.parent_version,
-                contents.create_at,
+                self.parent_branch.as_deref(),
+                self.parent_version,
+                self.create_at,
             );
         }
-        Ok(contents)
     }
 }
 
