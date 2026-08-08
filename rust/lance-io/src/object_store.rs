@@ -24,6 +24,7 @@ use object_store::DynObjectStore;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::signer::Signer;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
@@ -168,6 +169,7 @@ pub struct ObjectStore {
 #[derive(Debug, Clone)]
 enum ConditionalDeleteConfig {
     Serialized,
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     SignedUrl(Arc<dyn Signer>),
 }
 
@@ -207,12 +209,14 @@ struct ConditionalDeleteStore {
 /// URL. S3, GCS, and Azure all enforce `If-Match` at the deletion linearization
 /// point, including against writers using older Lance clients.
 #[derive(Debug)]
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 struct SignedConditionalDeleteStore {
     target: Arc<dyn OSObjectStore>,
     signer: Arc<dyn Signer>,
     client: reqwest::Client,
 }
 
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 impl SignedConditionalDeleteStore {
     fn new(target: Arc<dyn OSObjectStore>, signer: Arc<dyn Signer>) -> Self {
         Self {
@@ -223,6 +227,7 @@ impl SignedConditionalDeleteStore {
     }
 }
 
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 impl std::fmt::Display for SignedConditionalDeleteStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SignedConditionalDeleteStore({})", self.target)
@@ -230,6 +235,7 @@ impl std::fmt::Display for SignedConditionalDeleteStore {
 }
 
 #[async_trait]
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 impl OSObjectStore for SignedConditionalDeleteStore {
     async fn put_opts(
         &self,
@@ -985,6 +991,7 @@ impl ObjectStore {
                     &self.store_prefix,
                 ));
             }
+            #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
             Some(ConditionalDeleteConfig::SignedUrl(signer)) => {
                 self.inner = Arc::new(SignedConditionalDeleteStore::new(
                     Arc::clone(&self.inner),

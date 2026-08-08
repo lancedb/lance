@@ -259,6 +259,15 @@ def memory_ns_client(request):
     yield _wrap_if_custom(ns_client, use_custom)
 
 
+@pytest.fixture(params=[False, True], ids=["DirectoryNamespace", "CustomNamespace"])
+def shared_memory_ns_client(request):
+    """Create a memory namespace shared across object-store instances."""
+    use_custom = request.param
+    unique_id = uuid.uuid4().hex[:8]
+    ns_client = connect("dir", {"root": f"shared-memory://test-{unique_id}"})
+    yield _wrap_if_custom(ns_client, use_custom)
+
+
 class TestCreateTable:
     """Tests for create_table operation - mirrors Rust test_create_table."""
 
@@ -591,17 +600,17 @@ class TestTableBranchOperations:
     """Branch CRUD through the python bindings - mirrors the Rust branch
     CRUD tests."""
 
-    def test_branch_crud_round_trip(self, temp_ns_client):
+    def test_branch_crud_round_trip(self, shared_memory_ns_client):
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        temp_ns_client.create_namespace(create_ns_req)
+        shared_memory_ns_client.create_namespace(create_ns_req)
         ipc_data = table_to_ipc_bytes(create_test_data())
         table_id = ["workspace", "branched_table"]
-        temp_ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
+        shared_memory_ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
 
-        temp_ns_client.create_table_branch(
+        shared_memory_ns_client.create_table_branch(
             CreateTableBranchRequest(id=table_id, name="dev")
         )
-        listed = temp_ns_client.list_table_branches(
+        listed = shared_memory_ns_client.list_table_branches(
             ListTableBranchesRequest(id=table_id)
         )
         assert "dev" in listed.branches
@@ -609,41 +618,41 @@ class TestTableBranchOperations:
 
         # Duplicate creation and deleting a missing branch surface the typed
         # branch errors (codes 23 and 22), not InternalError.
-        temp_ns_client.create_table_branch(
+        shared_memory_ns_client.create_table_branch(
             CreateTableBranchRequest(id=table_id, name="dev2")
         )
         with pytest.raises(TableBranchAlreadyExistsError):
-            temp_ns_client.create_table_branch(
+            shared_memory_ns_client.create_table_branch(
                 CreateTableBranchRequest(id=table_id, name="dev2")
             )
 
-        temp_ns_client.delete_table_branch(
+        shared_memory_ns_client.delete_table_branch(
             DeleteTableBranchRequest(id=table_id, name="dev")
         )
-        listed = temp_ns_client.list_table_branches(
+        listed = shared_memory_ns_client.list_table_branches(
             ListTableBranchesRequest(id=table_id)
         )
         assert "dev" not in listed.branches
         with pytest.raises(TableBranchNotFoundError):
-            temp_ns_client.delete_table_branch(
+            shared_memory_ns_client.delete_table_branch(
                 DeleteTableBranchRequest(id=table_id, name="dev")
             )
 
-    def test_create_branch_from_other_branch(self, temp_ns_client):
+    def test_create_branch_from_other_branch(self, shared_memory_ns_client):
         """Forking from a non-main source branch records the right parent."""
         create_ns_req = CreateNamespaceRequest(id=["workspace"])
-        temp_ns_client.create_namespace(create_ns_req)
+        shared_memory_ns_client.create_namespace(create_ns_req)
         ipc_data = table_to_ipc_bytes(create_test_data())
         table_id = ["workspace", "fork_table"]
-        temp_ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
+        shared_memory_ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
 
-        temp_ns_client.create_table_branch(
+        shared_memory_ns_client.create_table_branch(
             CreateTableBranchRequest(id=table_id, name="dev")
         )
-        temp_ns_client.create_table_branch(
+        shared_memory_ns_client.create_table_branch(
             CreateTableBranchRequest(id=table_id, name="child", from_branch="dev")
         )
-        listed = temp_ns_client.list_table_branches(
+        listed = shared_memory_ns_client.list_table_branches(
             ListTableBranchesRequest(id=table_id)
         )
         assert listed.branches["child"].parent_branch == "dev"

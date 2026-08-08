@@ -67,6 +67,10 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestUtils {
+  public static String sharedMemoryUri(Path tempDir, String datasetName) {
+    return String.format("shared-memory://%s/%s", tempDir.getFileName(), datasetName);
+  }
+
   private abstract static class TestDataset {
     protected final BufferAllocator allocator;
     protected final String datasetPath;

@@ -114,7 +114,7 @@ public class CleanupTest {
 
   @Test
   public void testCleanupTaggedVersion(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
+    String datasetPath = TestUtils.sharedMemoryUri(tempDir, "test_dataset_for_cleanup");
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);

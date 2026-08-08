@@ -308,7 +308,7 @@ public class DatasetTest {
 
   @Test
   void testTags(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("dataset_tags").toString();
+    String datasetPath = TestUtils.sharedMemoryUri(tempDir, "dataset_tags");
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
@@ -453,7 +453,7 @@ public class DatasetTest {
 
   @Test
   void testDatasetRestore(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("dataset_restore").toString();
+    String datasetPath = TestUtils.sharedMemoryUri(tempDir, "dataset_restore");
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
@@ -1785,9 +1785,9 @@ public class DatasetTest {
 
   @Test
   void testShallowClone(@TempDir Path tempDir) {
-    String srcPath = tempDir.resolve("shallow_clone_version_src").toString();
-    String dstPathByVersion = tempDir.resolve("shallow_clone_version_dst").toString();
-    String dstPathByTag = tempDir.resolve("shallow_clone_tag_dst").toString();
+    String srcPath = TestUtils.sharedMemoryUri(tempDir, "shallow_clone_version_src");
+    String dstPathByVersion = TestUtils.sharedMemoryUri(tempDir, "shallow_clone_version_dst");
+    String dstPathByTag = TestUtils.sharedMemoryUri(tempDir, "shallow_clone_tag_dst");
 
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       // Prepare a simple source dataset with some rows
@@ -1841,7 +1841,7 @@ public class DatasetTest {
 
   @Test
   void testBranches(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("testBranches").toString();
+    String datasetPath = TestUtils.sharedMemoryUri(tempDir, "testBranches");
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, datasetPath);
 
