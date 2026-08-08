@@ -30,12 +30,12 @@ pub const MAIN_BRANCH: &str = "main";
 
 const REF_MUTATION_LOCK_FILE: &str = "mutation.json";
 const REF_MUTATION_LEASES_DIR: &str = "mutation_leases";
+const REF_MUTATION_DECISIONS_DIR: &str = "mutation_decisions";
 const TAG_MUTATION_INTENTS_DIR: &str = "tag_mutations";
 const REF_CATALOG_DIR: &str = "catalog";
 const LEASE_FILE: &str = "lease.json";
 const LEASE_HEARTBEATS_DIR: &str = "heartbeats";
 const LEASE_RELEASED_FILE: &str = "released.json";
-const LEASE_DECISION_FILE: &str = "decision.json";
 const LEASE_RECONCILED_FILE: &str = "reconciled.json";
 const REF_MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const REF_MUTATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -533,7 +533,8 @@ impl DurableLeaseFence {
 
     async fn record_publication(&self, publication: &DurableRefPublication) -> Result<()> {
         let expected = LeaseEpochDecision::Publish(publication.clone());
-        let actual = record_epoch_decision(&self.object_store, &self.path, &expected).await?;
+        let decision_path = lease_epoch_decision_path(&self.fence_path, self.epoch)?;
+        let actual = record_epoch_decision(&self.object_store, &decision_path, &expected).await?;
         match actual {
             LeaseEpochDecision::Publish(actual) if actual == *publication => Ok(()),
             LeaseEpochDecision::Closed => Err(Error::RefConflict {
@@ -555,21 +556,21 @@ impl DurableLeaseFence {
         let had_current_fence = match self.ensure_current().await {
             Ok(()) => true,
             Err(error) if matches!(&error, Error::RefConflict { .. }) => {
-                let expected = LeaseEpochDecision::Publish(publication.clone());
-                let decision_path = self.path.clone().join(LEASE_DECISION_FILE);
-                if read_serialized_file::<LeaseEpochDecision>(&self.object_store, &decision_path)
-                    .await?
-                    .as_ref()
-                    != Some(&expected)
-                {
-                    return Err(error);
-                }
                 if publication.is_committed(&self.object_store).await? {
                     log::warn!(
                         "Reference mutation lease lost its fence after a successor committed its publication: {}",
                         error
                     );
                     return Ok(());
+                }
+                let expected = LeaseEpochDecision::Publish(publication.clone());
+                let decision_path = lease_epoch_decision_path(&self.fence_path, self.epoch)?;
+                if read_serialized_file::<LeaseEpochDecision>(&self.object_store, &decision_path)
+                    .await?
+                    .as_ref()
+                    != Some(&expected)
+                {
+                    return Err(error);
                 }
                 // The immutable publish decision won before the successor could close this epoch.
                 // The successor must replay it before advancing reconciliation, so the original
@@ -619,10 +620,13 @@ impl DurableLeaseFence {
             if epoch <= reconciled_through {
                 continue;
             }
-            let path = lease_epoch_path(&self.fence_path, epoch);
-            let decision =
-                record_epoch_decision(&self.object_store, &path, &LeaseEpochDecision::Closed)
-                    .await?;
+            let decision_path = lease_epoch_decision_path(&self.fence_path, epoch)?;
+            let decision = record_epoch_decision(
+                &self.object_store,
+                &decision_path,
+                &LeaseEpochDecision::Closed,
+            )
+            .await?;
             if let LeaseEpochDecision::Publish(publication) = decision {
                 publication.apply(&self.object_store).await?;
             }
@@ -940,15 +944,14 @@ where
 
 async fn record_epoch_decision(
     object_store: &ObjectStore,
-    epoch_path: &Path,
+    path: &Path,
     proposed: &LeaseEpochDecision,
 ) -> Result<LeaseEpochDecision> {
-    let path = epoch_path.clone().join(LEASE_DECISION_FILE);
     let body = serde_json::to_vec(proposed)?;
     match object_store
         .inner
         .put_opts(
-            &path,
+            path,
             Bytes::from(body).into(),
             PutOptions {
                 mode: PutMode::Create,
@@ -959,11 +962,9 @@ async fn record_epoch_decision(
     {
         Ok(_) => Ok(proposed.clone()),
         Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => {
-            read_serialized_file(object_store, &path)
+            read_serialized_file(object_store, path)
                 .await?
-                .ok_or_else(|| {
-                    Error::internal(format!("lease epoch decision vanished at {}", path))
-                })
+                .ok_or_else(|| Error::internal(format!("lease epoch decision vanished at {path}")))
         }
         Err(error) => Err(error.into()),
     }
@@ -1045,6 +1046,22 @@ fn lease_epoch_path(base_path: &Path, epoch: u64) -> Path {
     base_path.clone().join(format!("{epoch:020}"))
 }
 
+fn lease_epoch_decision_path(lease_path: &Path, epoch: u64) -> Result<Path> {
+    if lease_path.filename() != Some(REF_MUTATION_LEASES_DIR) {
+        return Err(Error::internal(format!(
+            "reference mutation lease path {lease_path} does not end in {REF_MUTATION_LEASES_DIR}"
+        )));
+    }
+    let refs_path = lease_path.parent().ok_or_else(|| {
+        Error::internal(format!(
+            "reference mutation lease path {lease_path} has no parent"
+        ))
+    })?;
+    Ok(refs_path
+        .join(REF_MUTATION_DECISIONS_DIR)
+        .join(format!("{epoch:020}.json")))
+}
+
 async fn cleanup_old_lease_epochs(
     object_store: &ObjectStore,
     base_path: &Path,
@@ -1061,27 +1078,14 @@ async fn cleanup_old_lease_epochs(
             continue;
         }
         let path = base_path.clone().join(entry);
-        // Keep the immutable decision forever: removing it would reopen the epoch and let a
-        // suspended writer publish after a successor had already advanced reconciliation.
-        for file_name in [LEASE_FILE, LEASE_RELEASED_FILE, LEASE_RECONCILED_FILE] {
-            let file_path = path.clone().join(file_name);
-            if let Err(error) = object_store.delete(&file_path).await
-                && !matches!(error, Error::NotFound { .. })
-            {
-                log::warn!(
-                    "Failed to clean up old reference mutation lease file {}: {}",
-                    file_path,
-                    error
-                );
-            }
-        }
-        let heartbeats_path = path.join(LEASE_HEARTBEATS_DIR);
-        if let Err(error) = object_store.remove_dir_all(heartbeats_path.clone()).await
+        // Immutable decisions live outside the numeric lease directories, so each superseded
+        // lease can be removed once without reopening its epoch to a suspended writer.
+        if let Err(error) = object_store.remove_dir_all(path.clone()).await
             && !matches!(error, Error::NotFound { .. })
         {
             log::warn!(
-                "Failed to clean up old reference mutation heartbeats {}: {}",
-                heartbeats_path,
+                "Failed to clean up old reference mutation lease {}: {}",
+                path,
                 error
             );
         }
@@ -2605,6 +2609,9 @@ mod tests {
     use crate::utils::test::FailingProxyStore;
     use datafusion::common::assert_contains;
     use futures::stream::BoxStream;
+    use lance_core::utils::testing::{
+        CountingObjectStore, ProxyObjectStore, ProxyObjectStorePolicy,
+    };
     use lance_io::object_store::WrappingObjectStore;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
@@ -2612,6 +2619,7 @@ mod tests {
     };
 
     use rstest::rstest;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
     #[derive(Debug)]
@@ -3195,12 +3203,188 @@ mod tests {
         assert_eq!(
             read_serialized_file::<LeaseEpochDecision>(
                 &object_store,
-                &first_path.join(LEASE_DECISION_FILE),
+                &lease_epoch_decision_path(&fence_path, 1).unwrap(),
             )
             .await
             .unwrap(),
             Some(LeaseEpochDecision::Closed)
         );
+    }
+
+    #[tokio::test]
+    async fn test_lease_coordination_is_bounded_by_active_epochs() {
+        let listings = Arc::new(AtomicUsize::new(0));
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let mut policy = ProxyObjectStorePolicy::new();
+        let observed_deletes = deletes.clone();
+        policy.set_before_policy(
+            "count_deletes",
+            Arc::new(move |method, _| {
+                if method == "delete" {
+                    observed_deletes.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let target: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let proxy: Arc<dyn object_store::ObjectStore> =
+            Arc::new(ProxyObjectStore::new(target, Arc::new(Mutex::new(policy))));
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = Arc::new(CountingObjectStore::new(proxy, listings.clone()));
+        let fence_path = Path::from("dataset/_refs/mutation_leases");
+
+        for epoch in 1..=11 {
+            let state = DurableLeaseState {
+                owner: format!("owner-{epoch}"),
+                epoch,
+                expires_at_millis: 0,
+            };
+            assert!(
+                create_lease_file(&object_store, &lease_epoch_path(&fence_path, epoch), &state,)
+                    .await
+                    .unwrap()
+            );
+            if epoch < 11 {
+                record_epoch_decision(
+                    &object_store,
+                    &lease_epoch_decision_path(&fence_path, epoch).unwrap(),
+                    &LeaseEpochDecision::Closed,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        cleanup_old_lease_epochs(&object_store, &fence_path, 11).await;
+
+        listings.store(0, AtomicOrdering::SeqCst);
+        deletes.store(0, AtomicOrdering::SeqCst);
+        cleanup_old_lease_epochs(&object_store, &fence_path, 11).await;
+        assert!(
+            listings.load(AtomicOrdering::SeqCst) <= 2,
+            "cleaned lease history should take bounded listings"
+        );
+        assert_eq!(deletes.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            read_serialized_file::<LeaseEpochDecision>(
+                &object_store,
+                &lease_epoch_decision_path(&fence_path, 1).unwrap(),
+            )
+            .await
+            .unwrap(),
+            Some(LeaseEpochDecision::Closed)
+        );
+        assert_eq!(
+            read_serialized_file::<LeaseEpochDecision>(
+                &object_store,
+                &lease_epoch_decision_path(&fence_path, 10).unwrap(),
+            )
+            .await
+            .unwrap(),
+            Some(LeaseEpochDecision::Closed)
+        );
+
+        let current_epoch = 12;
+        let current_state =
+            DurableLeaseState::acquired("current".to_string(), current_epoch).unwrap();
+        let current_path = lease_epoch_path(&fence_path, current_epoch);
+        assert!(
+            create_lease_file(&object_store, &current_path, &current_state)
+                .await
+                .unwrap()
+        );
+        listings.store(0, AtomicOrdering::SeqCst);
+        DurableLeaseFence {
+            object_store: Arc::new(object_store.clone()),
+            path: current_path.clone(),
+            fence_path: fence_path.clone(),
+            epoch: current_epoch,
+        }
+        .reconcile_prior_publications()
+        .await
+        .unwrap();
+        assert!(
+            listings.load(AtomicOrdering::SeqCst) <= 2,
+            "reconciliation should list only active lease state"
+        );
+
+        let mut current_handle = DurableLeaseHandle::new(
+            Arc::new(object_store),
+            current_path,
+            current_state,
+            Some(fence_path),
+        );
+        listings.store(0, AtomicOrdering::SeqCst);
+        current_handle.renew().await.unwrap();
+        assert!(
+            listings.load(AtomicOrdering::SeqCst) <= 2,
+            "renewal should not traverse immutable decision history"
+        );
+        current_handle.is_held = false;
+    }
+
+    #[tokio::test]
+    async fn test_committed_publication_survives_decision_read_failure() {
+        let target: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let failing = Arc::new(FailingProxyStore::new());
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = failing.wrap("", target);
+        let object_store = Arc::new(object_store);
+        let root = Path::from("dataset");
+        let fence_path = base_ref_mutation_leases_path(&root);
+        let first_path = lease_epoch_path(&fence_path, 1);
+        assert!(
+            create_lease_file(
+                &object_store,
+                &first_path,
+                &DurableLeaseState {
+                    owner: "expired".to_string(),
+                    epoch: 1,
+                    expires_at_millis: 0,
+                },
+            )
+            .await
+            .unwrap()
+        );
+        let first_fence = DurableLeaseFence {
+            object_store: object_store.clone(),
+            path: first_path,
+            fence_path: fence_path.clone(),
+            epoch: 1,
+        };
+        let publication = DurableRefPublication {
+            epoch: 1,
+            path: ref_catalog_version_path(&root, 1).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        };
+        first_fence.record_publication(&publication).await.unwrap();
+        publication.apply(&object_store).await.unwrap();
+
+        let second_path = lease_epoch_path(&fence_path, 2);
+        assert!(
+            create_lease_file(
+                &object_store,
+                &second_path,
+                &DurableLeaseState::acquired("successor".to_string(), 2).unwrap(),
+            )
+            .await
+            .unwrap()
+        );
+        failing.fail_when(
+            "get_opts",
+            REF_MUTATION_DECISIONS_DIR,
+            "injected decision read failure",
+        );
+
+        first_fence
+            .apply_committed_publication(&publication)
+            .await
+            .expect("the exact catalog is already committed");
     }
 
     #[tokio::test]

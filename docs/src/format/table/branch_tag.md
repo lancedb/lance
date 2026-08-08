@@ -71,8 +71,10 @@ records from delayed writers that have not yet crossed another publication bound
 Reference mutation lease epochs have one immutable decision: the owner atomically records a
 commit-ready publication, or its successor atomically closes the expired epoch. A successor applies
 every publication decision before advancing its reconciled epoch, while a closed decision rejects a
-late owner. Decision records remain after other lease state is reclaimed so a suspended writer
-cannot reopen an epoch whose reconciliation already completed.
+late owner. Decision records use `_refs/mutation_decisions/`, separate from active
+`_refs/mutation_leases/` directories, so superseded lease state can be removed once and normal lease
+discovery remains bounded while a suspended writer still cannot reopen an epoch whose reconciliation
+already completed.
 
 When no catalog exists, readers load legacy `_refs/tags/*.json` and `_refs/branches/*.json` files.
 The first catalog publication imports every legacy reference and records those flat files in the
