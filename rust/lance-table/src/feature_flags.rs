@@ -56,15 +56,6 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
-    // Preserved rather than derived: this bit depends on the `__lance_mem_wal`
-    // index details, and a manifest carries only a byte offset to its index
-    // section, not the indices themselves. Whoever holds the final index list
-    // sets it; every other recomputation must leave it alone, or an unrelated
-    // transaction would silently downgrade the table to legacy semantics.
-    // Clearing it is an explicit MemWAL disable, never a side effect.
-    let mem_wal_index_catchup = (manifest.reader_feature_flags | manifest.writer_feature_flags)
-        & FLAG_MEM_WAL_INDEX_CATCHUP;
-
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -123,9 +114,37 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
 
-    manifest.reader_feature_flags |= mem_wal_index_catchup;
-    manifest.writer_feature_flags |= mem_wal_index_catchup;
     Ok(())
+}
+
+/// Carry [`FLAG_MEM_WAL_INDEX_CATCHUP`] from the manifest a new one is derived
+/// from.
+///
+/// This bit cannot be derived like the others: it depends on the
+/// `__lance_mem_wal` index details, and a manifest carries only a byte offset to
+/// its index section. It also cannot be preserved inside
+/// [`apply_feature_flags`], which sees only the destination -- and
+/// `Manifest::new_from_previous` zeroes both feature words before that runs, so
+/// reading them there always yields zero and every ordinary commit would
+/// silently downgrade the table to legacy semantics.
+///
+/// A half-set state is refused rather than normalized: one bit set means a
+/// legacy reader or a legacy writer is still permitted, which is neither mode.
+pub fn inherit_mem_wal_index_catchup(destination: &mut Manifest, source: &Manifest) -> Result<()> {
+    let reader = source.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
+    let writer = source.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
+    match (reader, writer) {
+        (false, false) => Ok(()),
+        (true, true) => {
+            destination.reader_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
+            destination.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
+            Ok(())
+        }
+        _ => Err(Error::invalid_input(
+            "Manifest has only one of the MemWAL index-catchup reader and writer \
+             feature bits set, so its catch-up semantics are undefined",
+        )),
+    }
 }
 
 /// Whether this build understands data overlay files: always in debug builds,
@@ -337,7 +356,63 @@ mod tests {
     /// it, or a later transaction would silently downgrade the table to legacy
     /// semantics and a reader would treat missing coverage as complete.
     #[test]
-    fn an_unrelated_recomputation_preserves_the_mem_wal_bit() {
+    fn inheriting_carries_the_mem_wal_bit_from_the_source() {
+        let mut source = empty_manifest();
+        source.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+        source.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+        // What `Manifest::new_from_previous` hands us: both words zeroed.
+        let mut destination = empty_manifest();
+
+        inherit_mem_wal_index_catchup(&mut destination, &source).unwrap();
+
+        assert_ne!(
+            destination.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0
+        );
+        assert_ne!(
+            destination.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0
+        );
+    }
+
+    #[test]
+    fn inheriting_refuses_a_half_set_source() {
+        for (reader, writer) in [
+            (FLAG_MEM_WAL_INDEX_CATCHUP, 0),
+            (0, FLAG_MEM_WAL_INDEX_CATCHUP),
+        ] {
+            let mut source = empty_manifest();
+            source.reader_feature_flags = reader;
+            source.writer_feature_flags = writer;
+            let mut destination = empty_manifest();
+
+            let err = inherit_mem_wal_index_catchup(&mut destination, &source).unwrap_err();
+
+            assert!(err.to_string().contains("only one of"), "{err}");
+        }
+    }
+
+    #[test]
+    fn apply_feature_flags_does_not_carry_the_mem_wal_bit() {
+        // It only ever sees the destination, whose words are already zeroed, so
+        // inheriting is `inherit_mem_wal_index_catchup`'s job, not its own.
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+        manifest.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0
+        );
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0
+        );
+    }
+
+    fn empty_manifest() -> Manifest {
         use crate::format::DataStorageFormat;
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
@@ -345,25 +420,12 @@ mod tests {
         use std::sync::Arc;
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
-        let mut manifest = Manifest::new(
+        Manifest::new(
             Schema::try_from(&arrow_schema).unwrap(),
             Arc::new(vec![]),
             DataStorageFormat::default(),
             HashMap::new(),
-        );
-        manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-        manifest.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-
-        apply_feature_flags(&mut manifest, false, false).unwrap();
-
-        assert_ne!(
-            manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            0
-        );
-        assert_ne!(
-            manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            0
-        );
+        )
     }
 
     /// A build that does not know the bit must refuse the table rather than

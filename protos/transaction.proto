@@ -99,6 +99,13 @@ message Transaction {
       // Recording only these, rather than whatever is current at commit time,
       // keeps the claim to what the job actually indexed.
       repeated CompactedSsTable caught_up_generations = 3;
+
+      // Serialized roaring bitmap: the fragments the named segments covered
+      // when the repair inspected them. UUIDs alone are not a fence -- an
+      // operation can prune a segment's fragment bitmap while keeping its
+      // UUID, so a claim made before the prune would still match. The commit
+      // fails unless the published segments cover exactly these fragments.
+      bytes expected_fragment_bitmap = 4;
     }
 
     // Empty for every ordinary index operation. Creating, reindexing,
