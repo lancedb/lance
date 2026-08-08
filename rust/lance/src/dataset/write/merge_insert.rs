@@ -56,7 +56,7 @@ use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
         fragment::FileFragment,
-        transaction::{Operation, Transaction},
+        transaction::{Operation, Transaction, UpdatedFragmentOffsets},
         versions,
         write::merge_insert::logical_plan::{MergeInsertPlanner, WriteSink},
     },
@@ -131,7 +131,7 @@ use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{
@@ -533,6 +533,39 @@ struct MergeInsertParams {
     // Target all registered bases, mirroring WriteParams::target_all_bases.
     // Some(include_primary); resolved at execution time.
     target_all_bases: Option<bool>,
+}
+
+/// Where the per-fragment patch tasks in
+/// [`MergeInsertJob::update_fragments`] deposit their results.
+#[derive(Debug, Default)]
+struct PatchSink {
+    /// Fragments that gained a data file, one entry per task.
+    fragments: Mutex<Vec<Fragment>>,
+    /// Physical offsets each fragment had patched. Only populated under stable
+    /// row ids, which is the only thing that reads the row-version metadata
+    /// these correct.
+    offsets: Mutex<HashMap<u64, RoaringBitmap>>,
+}
+
+/// What [`MergeInsertJob::update_fragments`] wrote.
+#[derive(Debug)]
+pub(super) struct PatchedFragments {
+    /// Existing fragments that gained a data file for the patched columns.
+    pub updated_fragments: Vec<Fragment>,
+    /// Fragments written for rows that carried no target address.
+    pub new_fragments: Vec<Fragment>,
+    /// Ids of the fields written, so the caller can prune indices covering them.
+    pub fields_modified: Vec<u32>,
+    /// Physical row offsets patched in each updated fragment.
+    ///
+    /// `update_fragments` stamps row-level version metadata with the version it
+    /// was given, which is only a guess: a compatible transaction can commit
+    /// first, making the real commit version later. Handing these offsets to
+    /// `Operation::Update`'s `updated_fragment_offsets` lets `build_manifest`
+    /// re-stamp exactly the patched rows with the version the commit actually
+    /// got. Empty when the dataset does not use stable row ids, since nothing
+    /// reads the metadata then.
+    pub matched_offsets: UpdatedFragmentOffsets,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -1423,15 +1456,13 @@ impl MergeInsertJob {
     /// fragments.
     ///
     /// `source` must carry `_rowaddr` plus the columns to write. A null
-    /// `_rowaddr` routes the row to a new fragment. Returns the updated
-    /// fragments, the new fragments, and the ids of the fields written (so the
-    /// caller can prune indices covering them).
+    /// `_rowaddr` routes the row to a new fragment.
     pub(super) async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
+    ) -> Result<PatchedFragments> {
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
         let target_bases_info = Arc::new(target_bases_info);
@@ -1475,7 +1506,7 @@ impl MergeInsertJob {
         let mut group_stream = BatchStreamGrouper::new(capped_stream, "_fragment_id".into());
 
         // Can update the fragments in parallel.
-        let updated_fragments = Arc::new(Mutex::new(Vec::new()));
+        let patched = Arc::new(PatchSink::default());
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
         let task_limit = dataset.object_store.as_ref().io_parallelism();
@@ -1519,7 +1550,7 @@ impl MergeInsertJob {
                 fragment: FileFragment,
                 mut metadata: Fragment,
                 mut batches: Vec<RecordBatch>,
-                updated_fragments: Arc<Mutex<Vec<Fragment>>>,
+                patched: Arc<PatchSink>,
                 reservation_size: usize,
                 current_version: u64,
             ) -> Result<usize> {
@@ -1563,6 +1594,23 @@ impl MergeInsertJob {
                     && get_row_addr_iter(&batches)
                         .map(|(row_addr, _)| row_addr)
                         .eq(RowAddress::address_range(metadata.id as u32).take(updated_rows));
+
+                // Record which offsets this fragment patched before the write
+                // paths below consume `_rowaddr`. Only stable row ids read the
+                // row-version metadata these drive, so skip the work otherwise.
+                if dataset.manifest.uses_stable_row_ids() {
+                    let offsets: RoaringBitmap = get_row_addr_iter(&batches)
+                        .map(|(row_addr, _)| RowAddress::from(row_addr).row_offset())
+                        .collect();
+                    patched
+                        .offsets
+                        .lock()
+                        .unwrap()
+                        .entry(metadata.id)
+                        .or_default()
+                        .extend(offsets);
+                }
+
                 if has_full_fragment_coverage {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
@@ -1637,7 +1685,7 @@ impl MergeInsertJob {
                         )?;
                     }
 
-                    updated_fragments.lock().unwrap().push(metadata);
+                    patched.fragments.lock().unwrap().push(metadata);
                 } else {
                     // TODO: we could skip scanning row addresses we don't need.
                     let update_schema = batches[0].schema();
@@ -1719,7 +1767,7 @@ impl MergeInsertJob {
                         )?;
                     }
 
-                    updated_fragments.lock().unwrap().push(updated_fragment);
+                    patched.fragments.lock().unwrap().push(updated_fragment);
                 }
                 Ok(reservation_size)
             }
@@ -1841,7 +1889,7 @@ impl MergeInsertJob {
                         fragment,
                         metadata,
                         batches,
-                        updated_fragments.clone(),
+                        patched.clone(),
                         memory_size,
                         current_version,
                     );
@@ -1878,10 +1926,12 @@ impl MergeInsertJob {
                 }
             }
         }
-        let mut updated_fragments = Arc::try_unwrap(updated_fragments)
-            .unwrap()
-            .into_inner()
-            .unwrap();
+        let PatchSink {
+            fragments: updated_fragments,
+            offsets: matched_offsets,
+        } = Arc::try_unwrap(patched).unwrap();
+        let mut updated_fragments = updated_fragments.into_inner().unwrap();
+        let matched_offsets = matched_offsets.into_inner().unwrap();
 
         // We keep track of all fields that are updated so we can prune the indices.
         // We could maybe be more precise since some fields are not modified in some
@@ -1916,11 +1966,12 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        Ok((
+        Ok(PatchedFragments {
             updated_fragments,
             new_fragments,
-            all_fields_updated.into_iter().collect(),
-        ))
+            fields_modified: all_fields_updated.into_iter().collect(),
+            matched_offsets: UpdatedFragmentOffsets(matched_offsets),
+        })
     }
 
     /// Executes the merge insert job from a one-shot stream source.
@@ -2665,7 +2716,12 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let (updated_fragments, new_fragments, fields_modified) = Self::update_fragments(
+            let PatchedFragments {
+                updated_fragments,
+                new_fragments,
+                fields_modified,
+                matched_offsets,
+            } = Self::update_fragments(
                 self.dataset.clone(),
                 Box::pin(stream),
                 self.dataset.manifest.version + 1,
@@ -2682,7 +2738,10 @@ impl MergeInsertJob {
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
-                updated_fragment_offsets: None,
+                // The version stamped above is a guess; carry the patched offsets
+                // so `build_manifest` can re-stamp them at the real commit
+                // version after a rebase.
+                updated_fragment_offsets: Some(matched_offsets),
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -7213,6 +7272,365 @@ mod tests {
                     "key {key} has the wrong last-updated version"
                 );
             }
+        }
+
+        /// The version `update_fragments` stamps into the row-version metadata is
+        /// only the version this transaction expected at prepare time. A
+        /// compatible commit can land first, making the real commit version
+        /// later, so the operation carries the patched offsets and
+        /// `build_manifest` re-stamps exactly those rows with the version the
+        /// commit actually got.
+        #[rstest]
+        #[tokio::test]
+        async fn test_merge_insert_subcols_in_place_stable_row_id_rebase(
+            #[values(false, true)] full_fragment: bool,
+        ) {
+            use lance_core::ROW_LAST_UPDATED_AT_VERSION;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("tag", DataType::Utf8, true),
+                Field::new("other", DataType::Utf8, true),
+            ]));
+            let rows = |keys: Vec<u32>, tag: &str| {
+                let n = keys.len();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(keys)),
+                        Arc::new(StringArray::from(vec![tag; n])),
+                        Arc::new(StringArray::from(vec!["o"; n])),
+                    ],
+                )
+                .unwrap()
+            };
+            let ds = Dataset::write(
+                Box::new(RecordBatchIterator::new(
+                    [Ok(rows(vec![0, 1], "t"))],
+                    schema.clone(),
+                )),
+                "memory://",
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ds.version().version, 1);
+            let ds = Arc::new(ds);
+
+            // Either both rows of the only fragment (the no-read-back write
+            // path) or one of them (the updater path). Both stamp the version.
+            let keys: Vec<u32> = if full_fragment { vec![0, 1] } else { vec![0] };
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("tag", DataType::Utf8, true),
+            ]));
+            let source = RecordBatch::try_new(
+                source_schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(keys.clone())),
+                    Arc::new(StringArray::from(vec!["patched"; keys.len()])),
+                ],
+            )
+            .unwrap();
+            let stream = RecordBatchStreamAdapter::new(
+                source_schema.clone(),
+                futures::stream::iter([Ok(source)]),
+            );
+
+            // Prepare against v1 but do not commit yet.
+            let UncommittedMergeInsert { transaction, .. } =
+                MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .write_mode(MergeInsertWriteMode::RewriteColumns)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+                    .await
+                    .unwrap();
+            match &transaction.operation {
+                Operation::Update {
+                    updated_fragment_offsets,
+                    ..
+                } => {
+                    let UpdatedFragmentOffsets(off_map) = updated_fragment_offsets
+                        .as_ref()
+                        .expect("a RewriteColumns update must carry its patched offsets");
+                    let frag_id = ds.get_fragments()[0].id() as u64;
+                    let offsets = off_map
+                        .get(&frag_id)
+                        .expect("the patched fragment must be present");
+                    assert_eq!(
+                        offsets.iter().collect::<Vec<u32>>(),
+                        keys.clone(),
+                        "the offsets must name exactly the patched rows"
+                    );
+                }
+                other => panic!("expected Operation::Update, got: {other:?}"),
+            }
+
+            // A concurrent append commits as v2, so the prepared transaction
+            // lands on v3 rather than the v2 it stamped.
+            let mut appended = ds.as_ref().clone();
+            appended
+                .append(
+                    RecordBatchIterator::new([Ok(rows(vec![2], "t"))], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(appended.version().version, 2);
+
+            let committed = CommitBuilder::new(Arc::new(appended))
+                .execute(transaction)
+                .await
+                .unwrap();
+            let commit_version = committed.version().version;
+            assert_eq!(commit_version, 3);
+
+            let mut scanner = committed.scan();
+            scanner
+                .project(&["key", "tag", ROW_LAST_UPDATED_AT_VERSION])
+                .unwrap();
+            let result = scanner.try_into_batch().await.unwrap();
+            assert_eq!(result.num_rows(), 3);
+
+            let result_keys = result
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let tags = result
+                .column_by_name("tag")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let versions = result
+                .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+                .expect("stable row ids must expose the last-updated version")
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap();
+
+            for i in 0..result.num_rows() {
+                let key = result_keys.value(i);
+                let was_patched = keys.contains(&key);
+                assert_eq!(
+                    tags.value(i),
+                    if was_patched { "patched" } else { "t" },
+                    "key {key} has the wrong tag"
+                );
+                let expected = if was_patched {
+                    // Patched by the rebased transaction: the version it landed
+                    // on, not the version it guessed.
+                    commit_version
+                } else if key == 2 {
+                    // Appended by the concurrent commit.
+                    2
+                } else {
+                    // Untouched by either.
+                    1
+                };
+                assert_eq!(
+                    versions.value(i),
+                    expected,
+                    "key {key} has the wrong last-updated version"
+                );
+            }
+        }
+
+        /// An in-place column rewrite fills a replacement file covering every row
+        /// of each fragment it touches, from the snapshot it read, and
+        /// `build_manifest` then tombstones every overlay for the fields it
+        /// rewrote. So committing one over a concurrent overlay would drop that
+        /// overlay's value on a row the merge never matched. The conflict
+        /// resolver must retry instead, and the retry re-reads the overlaid
+        /// value.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_in_place_rebase_over_overlay() {
+            use crate::dataset::WriteDestination;
+            use crate::dataset::transaction::DataOverlayGroup;
+            use arrow_array::ArrayRef;
+            use lance_file::writer::FileWriterOptions;
+            use lance_io::utils::CachedFileSize;
+            use lance_table::format::DataFile;
+            use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("tag", DataType::Utf8, true),
+                // Omitted by the source, so `RewriteColumns` has something to skip.
+                Field::new("other", DataType::Utf8, true),
+            ]));
+            let initial = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0, 1])),
+                    Arc::new(StringArray::from(vec!["base0", "base1"])),
+                    Arc::new(StringArray::from(vec!["o", "o"])),
+                ],
+            )
+            .unwrap();
+            let ds = Arc::new(
+                Dataset::write(
+                    Box::new(RecordBatchIterator::new([Ok(initial)], schema.clone())),
+                    "memory://",
+                    Some(WriteParams {
+                        data_storage_version: Some(LanceFileVersion::V2_1),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(ds.version().version, 1);
+            let tag_field_id = ds.schema().field("tag").unwrap().id;
+            let fragment_id = ds.get_fragments()[0].id() as u64;
+
+            // Prepare an in-place patch of key 0 against v1, without committing.
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("tag", DataType::Utf8, true),
+            ]));
+            let source = RecordBatch::try_new(
+                source_schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0])),
+                    Arc::new(StringArray::from(vec!["merge0"])),
+                ],
+            )
+            .unwrap();
+            let stream = RecordBatchStreamAdapter::new(
+                source_schema.clone(),
+                futures::stream::iter([Ok(source)]),
+            );
+            let UncommittedMergeInsert { transaction, .. } =
+                MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .write_mode(MergeInsertWriteMode::RewriteColumns)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+                    .await
+                    .unwrap();
+
+            // A concurrent overlay commits as v2, changing `tag` on key 1, which
+            // the prepared merge did not match.
+            let overlay_schema = ds.schema().project_by_ids(&[tag_field_id], true);
+            let path = ds.base.clone().join("data").join("overlay.lance");
+            let obj_writer = ds.object_store.create(&path).await.unwrap();
+            let mut writer = lance_file::versions::v2_1::create_writer(
+                obj_writer,
+                overlay_schema,
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            writer
+                .write_column(0, Arc::new(StringArray::from(vec!["overlay1"])) as ArrayRef)
+                .await
+                .unwrap();
+            let summary = writer.finish().await.unwrap();
+            let mut data_file = DataFile::new_unstarted(
+                "overlay.lance".to_string(),
+                lance_file::version::ConcreteFileVersion::V2_1,
+            );
+            data_file.fields = vec![tag_field_id].into();
+            data_file.column_indices = vec![0].into();
+            data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+            let overlaid = Dataset::commit(
+                WriteDestination::Dataset(ds.clone()),
+                Operation::DataOverlay {
+                    groups: vec![DataOverlayGroup {
+                        fragment_id,
+                        overlays: vec![DataOverlayFile {
+                            data_file,
+                            // Physical offset 1 is key 1.
+                            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([1u32])),
+                            committed_version: 0,
+                        }],
+                    }],
+                },
+                Some(1),
+                None,
+                None,
+                Arc::new(Default::default()),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(overlaid.version().version, 2);
+            let tag_of = |ds: &Dataset, key: u32| {
+                let ds = ds.clone();
+                async move {
+                    let mut scanner = ds.scan();
+                    scanner
+                        .filter(&format!("key = {key}"))
+                        .unwrap()
+                        .project(&["tag"])
+                        .unwrap();
+                    let batch = scanner.try_into_batch().await.unwrap();
+                    batch
+                        .column_by_name("tag")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0)
+                        .to_string()
+                }
+            };
+            assert_eq!(tag_of(&overlaid, 1).await, "overlay1");
+
+            // The prepared transaction must not be able to commit as-is: doing so
+            // would tombstone the overlay and resurrect "base1".
+            let error = CommitBuilder::new(Arc::new(overlaid.clone()))
+                .with_max_retries(0)
+                .execute(transaction)
+                .await
+                .expect_err("committing over an overlapping overlay must conflict");
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "expected a retryable conflict, got: {error:?}"
+            );
+
+            // Re-running the merge against the overlaid dataset patches key 0 and
+            // leaves the overlay on key 1 intact.
+            let source = RecordBatch::try_new(
+                source_schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0])),
+                    Arc::new(StringArray::from(vec!["merge0"])),
+                ],
+            )
+            .unwrap();
+            let (retried, _) =
+                MergeInsertBuilder::try_new(Arc::new(overlaid), vec!["key".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .write_mode(MergeInsertWriteMode::RewriteColumns)
+                    .try_build()
+                    .unwrap()
+                    .execute_reader(Box::new(RecordBatchIterator::new(
+                        [Ok(source)],
+                        source_schema,
+                    )))
+                    .await
+                    .unwrap();
+            assert_eq!(tag_of(&retried, 0).await, "merge0");
+            assert_eq!(
+                tag_of(&retried, 1).await,
+                "overlay1",
+                "the overlay on an unmatched row must survive the retried merge"
+            );
         }
 
         /// The overlay resolution rules require an in-place column rewrite to

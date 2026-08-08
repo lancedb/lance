@@ -27,7 +27,7 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::write::merge_insert::assign_action::Action;
 use crate::dataset::write::merge_insert::{
     MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertJob, MergeInsertParams, MergeStats,
-    SourceDedupeBehavior, create_duplicate_row_error, resolve_target_bases,
+    PatchedFragments, SourceDedupeBehavior, create_duplicate_row_error, resolve_target_bases,
 };
 
 use super::MergeInsertMetrics;
@@ -439,15 +439,22 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
 
         let result_stream = stream::once(async move {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
+            // A guess: a compatible transaction can commit before this one, in
+            // which case the real commit version is later. `matched_offsets`
+            // below is what lets `build_manifest` correct the stamp.
             let current_version = dataset.manifest.version + 1;
-            let (updated_fragments, new_fragments, fields_modified) =
-                MergeInsertJob::update_fragments(
-                    dataset.clone(),
-                    patch_stream,
-                    current_version,
-                    target_bases_info,
-                )
-                .await?;
+            let PatchedFragments {
+                updated_fragments,
+                new_fragments,
+                fields_modified,
+                matched_offsets,
+            } = MergeInsertJob::update_fragments(
+                dataset.clone(),
+                patch_stream,
+                current_version,
+                target_bases_info,
+            )
+            .await?;
 
             // Eligibility forbids inserts and the join is therefore an inner
             // join, so every row carries a target address and no row is routed
@@ -481,7 +488,10 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None,
-                updated_fragment_offsets: None,
+                // Which rows were patched, so `build_manifest` re-stamps their
+                // `_row_last_updated_at_version` with the version this commit
+                // actually lands on rather than the one guessed above.
+                updated_fragment_offsets: Some(matched_offsets),
             };
             let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
