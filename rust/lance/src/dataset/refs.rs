@@ -160,19 +160,10 @@ impl Refs {
             let mut intent = TagMutationIntent::acquire(self).await?;
             let mutation_result =
                 Self::drive_with_lease(&mut intent.handle, self.run_mutation(mutation)).await;
-            match intent.release().await {
-                Ok(()) => mutation_result,
-                Err(release_error) => match mutation_result {
-                    Ok(_) => Err(release_error),
-                    Err(mutation_error) => {
-                        log::warn!(
-                            "Failed to release tag mutation intent after mutation error: {}",
-                            release_error
-                        );
-                        Err(mutation_error)
-                    }
-                },
+            if let Err(error) = intent.release().await {
+                log::warn!("Failed to release tag mutation intent: {}", error);
             }
+            mutation_result
         })
     }
 
@@ -256,19 +247,10 @@ impl Refs {
         lease: &mut RefMutationLease,
         mutation_result: Result<T>,
     ) -> Result<T> {
-        match lease.release().await {
-            Ok(()) => mutation_result,
-            Err(release_error) => match mutation_result {
-                Ok(_) => Err(release_error),
-                Err(mutation_error) => {
-                    log::warn!(
-                        "Failed to release reference mutation lock after mutation error: {}",
-                        release_error
-                    );
-                    Err(mutation_error)
-                }
-            },
+        if let Err(error) = lease.release().await {
+            log::warn!("Failed to release reference mutation lease: {}", error);
         }
+        mutation_result
     }
 }
 
@@ -378,7 +360,7 @@ struct DurableRefPublication {
 impl DurableRefPublication {
     async fn apply(&self, object_store: &ObjectStore) -> Result<()> {
         let path = Path::parse(&self.path)?;
-        let catalog: RefCatalog = serde_json::from_str(&self.body)?;
+        let mut catalog: RefCatalog = serde_json::from_str(&self.body)?;
         if catalog.mutation_epoch != self.epoch {
             return Err(Error::internal(format!(
                 "reference catalog epoch {} does not match publication epoch {}",
@@ -394,11 +376,17 @@ impl DurableRefPublication {
             )));
         }
 
+        // Snapshot released-format refs immediately before the atomic create. A legacy mutation
+        // that completed before this publication becomes part of the boundary and cannot override
+        // the newer catalog; a later legacy mutation differs from this baseline and is reconciled.
+        // A concurrent legacy mutation overlaps this publication and may be ordered either way.
+        catalog.legacy_baseline = read_legacy_ref_state(object_store, &root).await?;
+
         // A complete catalog snapshot is the atomically discoverable state for point reads and
         // enumeration. Delayed lower epochs are harmless because readers select the greatest
         // epoch, and the next successful publication compacts them. Everything after this create
         // is best-effort cleanup: a committed mutation must never report failure.
-        create_immutable_body(object_store, &path, self.body.as_bytes()).await?;
+        create_ref_catalog(object_store, &path, &catalog).await?;
         if let Err(error) = compact_ref_catalog(object_store, &root, self.epoch).await {
             log::warn!("Failed to compact superseded reference catalogs: {}", error);
         }
@@ -518,7 +506,13 @@ impl DurableLeaseFence {
         create_serialized_file(&self.object_store, &intent_path, &publication).await?;
         self.ensure_current().await?;
         publication.apply(&self.object_store).await?;
-        self.ensure_current().await
+        if let Err(error) = self.ensure_current().await {
+            log::warn!(
+                "Reference mutation lease lost its fence after catalog publication: {}",
+                error
+            );
+        }
+        Ok(())
     }
 
     async fn reconcile_prior_publications(&self) -> Result<()> {
@@ -865,12 +859,17 @@ where
     }
 }
 
-async fn create_immutable_body(object_store: &ObjectStore, path: &Path, body: &[u8]) -> Result<()> {
+async fn create_ref_catalog(
+    object_store: &ObjectStore,
+    path: &Path,
+    catalog: &RefCatalog,
+) -> Result<()> {
+    let body = serde_json::to_vec_pretty(catalog)?;
     match object_store
         .inner
         .put_opts(
             path,
-            Bytes::copy_from_slice(body).into(),
+            Bytes::from(body).into(),
             PutOptions {
                 mode: PutMode::Create,
                 ..Default::default()
@@ -881,11 +880,17 @@ async fn create_immutable_body(object_store: &ObjectStore, path: &Path, body: &[
         Ok(_) => Ok(()),
         Err(ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. }) => {
             let current = object_store.inner.get(path).await?.bytes().await?;
-            if current.as_ref() == body {
+            let current: RefCatalog = serde_json::from_slice(&current)?;
+            if current.mutation_epoch == catalog.mutation_epoch
+                && current.tags == catalog.tags
+                && current.branches == catalog.branches
+            {
+                // Recovery may replay an intent after the first attempt committed with an earlier
+                // publication-time legacy baseline. The immutable committed baseline wins.
                 Ok(())
             } else {
                 Err(Error::RefConflict {
-                    message: format!("immutable coordination record changed at {}", path),
+                    message: format!("reference catalog already exists at {}", path),
                 })
             }
         }
@@ -1537,13 +1542,31 @@ impl Branches<'_> {
             .is_some_and(|stored| stored.contents.is_some())
         {
             fence.publish::<BranchContents>(&branch_file, None).await?;
+            let branch_contents = branch_contents.ok_or_else(|| {
+                Error::internal("live branch reference lost its contents during deletion")
+            })?;
+            if let Err(error) = self
+                .cleanup_committed_branch_storage(branch, branch_contents)
+                .await
+            {
+                log::warn!(
+                    "Failed to clean up storage after deleting branch '{}': {}",
+                    branch,
+                    error
+                );
+            }
+            return Ok(());
         }
 
-        let Some(branch_contents) = branch_contents else {
-            self.cleanup_branch_directories(branch).await?;
-            return self.cleanup_generation_directories(branch).await;
-        };
+        self.cleanup_branch_directories(branch).await?;
+        self.cleanup_generation_directories(branch).await
+    }
 
+    async fn cleanup_committed_branch_storage(
+        &self,
+        branch: &str,
+        branch_contents: BranchContents,
+    ) -> Result<()> {
         if branch_contents.storage.is_none() {
             return self.cleanup_branch_directories(branch).await;
         }
@@ -2166,13 +2189,17 @@ async fn read_legacy_ref_entries(
     Ok(entries)
 }
 
-async fn read_ref_catalog(object_store: &ObjectStore, root: &Path) -> Result<RefCatalog> {
-    let latest = read_latest_ref_catalog(object_store, root).await?;
-    let legacy = LegacyRefState {
+async fn read_legacy_ref_state(object_store: &ObjectStore, root: &Path) -> Result<LegacyRefState> {
+    Ok(LegacyRefState {
         tags: read_legacy_ref_entries(object_store, &base_tags_path(root), false).await?,
         branches: read_legacy_ref_entries(object_store, &base_branches_contents_path(root), true)
             .await?,
-    };
+    })
+}
+
+async fn read_ref_catalog(object_store: &ObjectStore, root: &Path) -> Result<RefCatalog> {
+    let latest = read_latest_ref_catalog(object_store, root).await?;
+    let legacy = read_legacy_ref_state(object_store, root).await?;
     if let Some(mut catalog) = latest {
         catalog.reconcile_legacy_changes(legacy);
         return Ok(catalog);
@@ -3058,6 +3085,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_later_catalog_commit_wins_over_earlier_legacy_write() {
+        let object_store = ObjectStore::memory();
+        let root = Path::from("dataset");
+        let release_path = tag_path(&root, "release");
+        let initial_contents = TagContents {
+            branch: None,
+            version: 1,
+            created_at: None,
+            updated_at: None,
+            manifest_size: 1,
+            metadata: HashMap::new(),
+        };
+        object_store
+            .put(
+                &release_path,
+                serde_json::to_vec(&initial_contents).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let catalog_contents = TagContents {
+            version: 2,
+            ..initial_contents.clone()
+        };
+        let publication = DurableRefPublication {
+            epoch: 1,
+            path: ref_catalog_version_path(&root, 1).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 1,
+                tags: HashMap::from([(
+                    "release".to_string(),
+                    serde_json::to_value(&catalog_contents).unwrap(),
+                )]),
+                branches: HashMap::new(),
+                legacy_baseline: LegacyRefState {
+                    tags: HashMap::from([(
+                        "release".to_string(),
+                        serde_json::to_value(&initial_contents).unwrap(),
+                    )]),
+                    branches: HashMap::new(),
+                },
+            })
+            .unwrap(),
+        };
+
+        let earlier_legacy_contents = TagContents {
+            version: 99,
+            ..initial_contents
+        };
+        object_store
+            .put(
+                &release_path,
+                serde_json::to_vec(&earlier_legacy_contents)
+                    .unwrap()
+                    .as_slice(),
+            )
+            .await
+            .unwrap();
+        publication.apply(&object_store).await.unwrap();
+
+        assert_eq!(
+            read_stored_ref::<TagContents>(&release_path, &object_store)
+                .await
+                .unwrap()
+                .unwrap()
+                .contents
+                .unwrap()
+                .version,
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn test_reference_catalog_compacts_history() {
         let object_store = ObjectStore::memory();
         let root = Path::from("dataset");
@@ -3202,6 +3302,60 @@ mod tests {
                 .mutation_epoch,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn test_release_failure_does_not_fail_committed_mutation() {
+        let target: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let failing = Arc::new(FailingProxyStore::new());
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = failing.wrap("", target);
+        let object_store = Arc::new(object_store);
+        let root = Path::from("dataset");
+        let fence_path = base_ref_mutation_leases_path(&root);
+        let lease_path = lease_epoch_path(&fence_path, 1);
+        let state = DurableLeaseState::acquired("owner".to_string(), 1).unwrap();
+        assert!(
+            create_lease_file(&object_store, &lease_path, &state)
+                .await
+                .unwrap()
+        );
+        let mut lease = RefMutationLease {
+            handle: DurableLeaseHandle::new(
+                object_store.clone(),
+                lease_path,
+                state,
+                Some(fence_path),
+            ),
+        };
+
+        DurableRefPublication {
+            epoch: 1,
+            path: ref_catalog_version_path(&root, 1).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        }
+        .apply(&object_store)
+        .await
+        .unwrap();
+        failing.fail_when("put", LEASE_RELEASED_FILE, "injected release failure");
+
+        Refs::finish_mutation(&mut lease, Ok(())).await.unwrap();
+        assert_eq!(
+            read_latest_ref_catalog(&object_store, &root)
+                .await
+                .unwrap()
+                .unwrap()
+                .mutation_epoch,
+            1
+        );
+
+        failing.clear_fail_when("put", LEASE_RELEASED_FILE);
+        lease.release().await.unwrap();
     }
 
     #[tokio::test]

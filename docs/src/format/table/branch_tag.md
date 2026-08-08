@@ -73,7 +73,10 @@ The first catalog publication imports every legacy reference and records those f
 catalog's `_legacyBaseline`. The flat files remain unchanged as a durable migration fence. Current
 readers compare them with the baseline and reconcile any later create, update, or delete performed
 by a released writer, so a successful legacy mutation is never silently ignored. Each catalog
-publication incorporates the observed legacy state into its next baseline.
+publication snapshots the legacy state immediately before its atomic create and records that state
+as the next baseline. A legacy mutation that completed before the publication is therefore ordered
+before, and superseded by, that catalog; a mutation completed afterward differs from the baseline
+and is reconciled. A legacy mutation concurrent with the publication may be ordered either way.
 
 Operators must quiesce clients that only understand flat reference files before allowing catalog
 writers to mutate references: catalog state is not mirrored back to the legacy paths. Retaining the
