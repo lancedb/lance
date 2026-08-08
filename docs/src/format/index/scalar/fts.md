@@ -9,6 +9,25 @@ It's designed for high-performance text search with support for various scoring 
 %%% proto.message.InvertedIndexDetails %%%
 ```
 
+## Format Versions
+
+The FTS index has gone through several on-disk format generations. A reader transparently
+reads any generation at or below the version it supports; the format only matters when
+*building* an index, and is selected per index build. Changing an existing index's format
+requires dropping and rebuilding it.
+
+| Version | Minimal Lance Version | Maximum Lance Version | Description |
+|---------|-----------------------|-----------------------|-------------|
+| Legacy (Arrow token set) | 0.14.1 (2024-07-11) | Any (read) | Original inverted index using the Arrow `TokenSetFormat`. |
+| v1 (FST token set + compression) | 0.28.0 (2025-05-26) | Any | FST-based token dictionary with compressed posting lists and per-document compressed positions. Current default. |
+| v2 (shared position streams) | 6.0.0 (2026-05-11) | Any | Shared posting-list position streams and a new phrase-query algorithm. |
+
+To build a new index in v2, set `LANCE_FTS_FORMAT_VERSION=2`; the default is v1. This
+environment variable is currently the only way to select the format version — there is no
+per-index creation parameter. It affects only newly built indices: a reader on 6.0.0 or
+later reads both v1 and v2 indices automatically. A v2 index cannot be read by any release
+before 6.0.0.
+
 ## Storage Layout
 
 The FTS index consists of multiple files storing the token dictionary, document information, and posting lists:
