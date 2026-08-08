@@ -35,7 +35,7 @@ use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{
-    FLAG_MEM_WAL_SAFE_RETIREMENT, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
 };
 use lance_table::rowids::read_row_ids;
 use lance_table::{
@@ -575,12 +575,12 @@ pub enum Operation {
     /// SSTables have been compacted into the base table.
     UpdateMemWalState {
         compacted_sstables: Vec<CompactedSsTable>,
-        /// Requests the one-way migration to safe retirement.
+        /// Requests the one-way migration to required index catch-up.
         ///
         /// One-way because returning to legacy semantics — where a missing
         /// coverage entry reads as "fully caught up" — is unsafe once any
         /// SSTable has been retired against a recorded catch-up position.
-        activate_safe_retirement: bool,
+        require_index_catchup: bool,
     },
 
     /// Clone a dataset.
@@ -1377,11 +1377,11 @@ impl PartialEq for Operation {
             (
                 Self::UpdateMemWalState {
                     compacted_sstables: a_compacted,
-                    activate_safe_retirement: a_activate,
+                    require_index_catchup: a_activate,
                 },
                 Self::UpdateMemWalState {
                     compacted_sstables: b_compacted,
-                    activate_safe_retirement: b_activate,
+                    require_index_catchup: b_activate,
                 },
             ) => compare_vec(a_compacted, b_compacted) && a_activate == b_activate,
             (Self::Clone { .. }, Self::Append { .. }) => {
@@ -1929,21 +1929,18 @@ impl Transaction {
         Ok((manifest, indices))
     }
 
-    /// Turn on safe retirement for a table that has never had it.
+    /// Require index catch-up on a table that has never required it.
     ///
     /// One-way, because returning to legacy semantics -- where a missing
     /// coverage entry reads as "fully caught up" -- is unsafe once any SSTable
     /// has been retired against a recorded catch-up position.
-    fn activate_safe_retirement(
-        final_indices: &mut [IndexMetadata],
-        new_version: u64,
-    ) -> Result<()> {
+    fn require_index_catchup(final_indices: &mut [IndexMetadata], new_version: u64) -> Result<()> {
         let Some(pos) = final_indices
             .iter()
             .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
         else {
             return Err(Error::invalid_input(format!(
-                "Cannot activate MemWAL safe retirement: the {} system index does \
+                "Cannot require MemWAL index catch-up: the {} system index does \
                  not exist on this table",
                 MEM_WAL_INDEX_NAME
             )));
@@ -1958,7 +1955,7 @@ impl Transaction {
         // them must be drained through an explicit migration instead.
         if !details.compacted_sstables.is_empty() {
             return Err(Error::invalid_input(
-                "Cannot activate MemWAL safe retirement: the table already records \
+                "Cannot require MemWAL index catch-up: the table already records \
                  SSTable compaction progress from the beta protocol, which cannot \
                  be validated. Drain or reset the table first.",
             ));
@@ -2008,7 +2005,7 @@ impl Transaction {
     /// here rather than in each caller so an ordinary index job cannot forget it
     /// and leave a stale catch-up position behind.
     ///
-    /// Dropping coverage is only conservative under safe retirement, where a
+    /// Dropping coverage is only conservative once catch-up is required, where a
     /// missing entry means "not caught up" and the SSTables stay. A legacy table
     /// reads a missing entry as "fully caught up", so this leaves legacy
     /// progress untouched rather than making the table look more covered.
@@ -2017,15 +2014,15 @@ impl Transaction {
         final_fragments: &[Fragment],
         segments_before: &LogicalIndexSegments,
         advances: &[IndexCatchupAdvance],
-        safe_retirement_enabled: bool,
+        index_catchup_required: bool,
         coverage_only_operation: bool,
         new_version: u64,
     ) -> Result<()> {
-        if !safe_retirement_enabled {
+        if !index_catchup_required {
             if !advances.is_empty() {
                 return Err(Error::invalid_input(
-                    "Index coverage can only be advanced on a table with MemWAL safe \
-                     retirement enabled",
+                    "Index coverage can only be advanced on a table that requires MemWAL \
+                     index catch-up",
                 ));
             }
             return Ok(());
@@ -2346,10 +2343,10 @@ impl Transaction {
 
         // Both words must agree: a reader that keeps legacy semantics would read a
         // missing entry as "fully caught up", so a half-set state is not safe mode.
-        let safe_retirement_enabled = current_manifest
+        let index_catchup_required = current_manifest
             .map(|m| {
-                m.reader_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT != 0
-                    && m.writer_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT != 0
+                m.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
+                    && m.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
             })
             .unwrap_or(false);
 
@@ -2357,7 +2354,7 @@ impl Transaction {
         // be compared against what each logical index looked like going in. Only
         // tables in safe mode maintain coverage, so every other commit -- and the
         // segment clones this costs -- pays nothing.
-        let mem_wal_segments_before = (safe_retirement_enabled
+        let mem_wal_segments_before = (index_catchup_required
             && final_indices
                 .iter()
                 .any(|idx| idx.name == MEM_WAL_INDEX_NAME))
@@ -3030,7 +3027,7 @@ impl Transaction {
                 &final_fragments,
                 mem_wal_segments_before.as_ref().unwrap_or(&empty_segments),
                 advances,
-                safe_retirement_enabled,
+                index_catchup_required,
                 coverage_only_operation,
                 new_version,
             )?;
@@ -3083,19 +3080,19 @@ impl Transaction {
         // Set after apply_feature_flags, which resets both flag words: activation
         // is the one place the bit is turned on, and it must survive that reset.
         if let Operation::UpdateMemWalState {
-            activate_safe_retirement: true,
+            require_index_catchup: true,
             ..
         } = &self.operation
         {
             let reader_set = current_manifest
-                .map(|m| m.reader_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT != 0)
+                .map(|m| m.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0)
                 .unwrap_or(false);
             let writer_set = current_manifest
-                .map(|m| m.writer_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT != 0)
+                .map(|m| m.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0)
                 .unwrap_or(false);
             match (reader_set, writer_set) {
                 (false, false) => {
-                    Self::activate_safe_retirement(&mut final_indices, new_version)?;
+                    Self::require_index_catchup(&mut final_indices, new_version)?;
                 }
                 // Already active. A retry whose first attempt landed but lost its
                 // response must not clear coverage repaired since, so this keeps
@@ -3103,14 +3100,14 @@ impl Transaction {
                 (true, true) => {}
                 _ => {
                     return Err(Error::invalid_input(
-                        "Cannot activate MemWAL safe retirement: the table has only one \
-                         of the reader and writer feature bits set, so its retirement \
+                        "Cannot require MemWAL index catch-up: the table has only one of \
+                         the reader and writer feature bits set, so its catch-up \
                          semantics are undefined",
                     ));
                 }
             }
-            manifest.reader_feature_flags |= FLAG_MEM_WAL_SAFE_RETIREMENT;
-            manifest.writer_feature_flags |= FLAG_MEM_WAL_SAFE_RETIREMENT;
+            manifest.reader_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
+            manifest.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
         }
 
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
@@ -4196,7 +4193,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::UpdateMemWalState(
                 pb::transaction::UpdateMemWalState {
                     compacted_sstables,
-                    activate_safe_retirement,
+                    require_index_catchup,
                 },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
@@ -4206,11 +4203,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                 // Absent is an ordinary progress update. Explicit `false` is
                 // refused rather than read as absent, so a caller cannot express
                 // "deactivate" -- the migration is one-way.
-                activate_safe_retirement: match activate_safe_retirement {
+                require_index_catchup: match require_index_catchup {
                     Some(false) => {
                         return Err(Error::invalid_input(
-                            "activate_safe_retirement cannot be false: MemWAL safe \
-                             retirement cannot be turned off once activated",
+                            "require_index_catchup cannot be false: MemWAL index catch-up \
+                             cannot stop being required once it is",
                         ));
                     }
                     other => other.unwrap_or(false),
@@ -4519,7 +4516,7 @@ impl From<&Transaction> for pb::Transaction {
             }
             Operation::UpdateMemWalState {
                 compacted_sstables,
-                activate_safe_retirement,
+                require_index_catchup,
             } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
@@ -4528,7 +4525,7 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<_>>(),
                     // Written only when requesting activation, so an ordinary
                     // progress update stays byte-identical to before.
-                    activate_safe_retirement: activate_safe_retirement.then_some(true),
+                    require_index_catchup: require_index_catchup.then_some(true),
                 })
             }
             Operation::UpdateBases { new_bases } => {
@@ -7685,14 +7682,14 @@ mod tests {
             final_indices: &mut [IndexMetadata],
             segments_before: &LogicalIndexSegments,
             advances: &[IndexCatchupAdvance],
-            safe_retirement_enabled: bool,
+            index_catchup_required: bool,
         ) -> Result<()> {
             Transaction::apply_mem_wal_index_coverage(
                 final_indices,
                 &[],
                 segments_before,
                 advances,
-                safe_retirement_enabled,
+                index_catchup_required,
                 false,
                 2,
             )
@@ -7900,7 +7897,7 @@ mod tests {
             let err = apply_coverage(&mut after, &segments_before(&before), &[advance], false)
                 .unwrap_err();
 
-            assert!(err.to_string().contains("safe retirement"), "{err}");
+            assert!(err.to_string().contains("index catch-up"), "{err}");
         }
 
         #[test]
@@ -7988,21 +7985,21 @@ mod tests {
                 ..Default::default()
             })];
 
-            let err = Transaction::activate_safe_retirement(&mut indices, 2).unwrap_err();
+            let err = Transaction::require_index_catchup(&mut indices, 2).unwrap_err();
 
             assert!(err.to_string().contains("beta protocol"), "{err}");
         }
 
         #[test]
         fn activation_requires_the_mem_wal_index() {
-            let err = Transaction::activate_safe_retirement(&mut [], 2).unwrap_err();
+            let err = Transaction::require_index_catchup(&mut [], 2).unwrap_err();
             assert!(err.to_string().contains("does not exist"), "{err}");
         }
 
         #[test]
         fn activation_accepts_a_clean_table() {
             let mut indices = vec![mem_wal_index(MemWalIndexDetails::default())];
-            Transaction::activate_safe_retirement(&mut indices, 2).unwrap();
+            Transaction::require_index_catchup(&mut indices, 2).unwrap();
         }
 
         #[test]
@@ -8285,7 +8282,7 @@ mod tests {
                 ..Default::default()
             })];
 
-            Transaction::activate_safe_retirement(&mut indices, 2).unwrap();
+            Transaction::require_index_catchup(&mut indices, 2).unwrap();
 
             // Beta coverage was written under rules this protocol does not
             // enforce, so keeping it would let the first trim run without a catch-up check.

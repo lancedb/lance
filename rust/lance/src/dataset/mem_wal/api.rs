@@ -486,7 +486,7 @@ pub trait DatasetMemWalExt {
         Ok(None)
     }
 
-    /// Switch this table to safe SSTable retirement.
+    /// Require a recorded index catch-up before an SSTable stops being served.
     ///
     /// Until this is called, a missing index-coverage entry reads as "fully
     /// caught up". Afterwards it reads as "not caught up", so an SSTable is served
@@ -496,7 +496,7 @@ pub trait DatasetMemWalExt {
     /// already retired SSTables against a recorded catch-up cannot go back to
     /// treating missing coverage as caught up. Calling it on an already-active
     /// table succeeds and changes nothing.
-    async fn activate_mem_wal_safe_retirement(&self) -> Result<()> {
+    async fn require_mem_wal_index_catchup(&self) -> Result<()> {
         Ok(())
     }
 
@@ -580,10 +580,10 @@ impl DatasetMemWalExt for Dataset {
         load_mem_wal_index_details(index_meta).map(Some)
     }
 
-    async fn activate_mem_wal_safe_retirement(&self) -> Result<()> {
+    async fn require_mem_wal_index_catchup(&self) -> Result<()> {
         if self.load_index_by_name(MEM_WAL_INDEX_NAME).await?.is_none() {
             return Err(Error::invalid_input(
-                "Cannot activate MemWAL safe retirement: MemWAL is not initialized on \
+                "Cannot require MemWAL index catch-up: MemWAL is not initialized on \
                  this dataset.",
             ));
         }
@@ -592,7 +592,7 @@ impl DatasetMemWalExt for Dataset {
             self.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: Vec::new(),
-                activate_safe_retirement: true,
+                require_index_catchup: true,
             },
             None,
         );

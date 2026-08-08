@@ -30,21 +30,21 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
-/// MemWAL SSTables are retired only against a recorded index catch-up position.
+/// `index_catchup` is maintained on this table, so a missing entry means the
+/// index is *not* caught up rather than fully caught up.
 ///
 /// A reader without this bit would read a missing `index_catchup` entry as
 /// "fully caught up" and could answer an index-only query without the SSTables
 /// holding the newest rows. A writer without it would change an index without
 /// invalidating the catch-up position recorded for that index, leaving a stale
-/// position behind.
-/// Both must refuse the table.
-pub const FLAG_MEM_WAL_SAFE_RETIREMENT: u64 = 128;
+/// position behind. Both must refuse the table.
+pub const FLAG_MEM_WAL_INDEX_CATCHUP: u64 = 128;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 256;
 
 // This build only understands flags below the unknown boundary, so a bit
 // allocated at or above it would be refused by the very readers meant to use it.
-const _: () = assert!(FLAG_MEM_WAL_SAFE_RETIREMENT < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP < FLAG_UNKNOWN);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -62,8 +62,8 @@ pub fn apply_feature_flags(
     // sets it; every other recomputation must leave it alone, or an unrelated
     // transaction would silently downgrade the table to legacy semantics.
     // Clearing it is an explicit MemWAL disable, never a side effect.
-    let mem_wal_safe_retirement = (manifest.reader_feature_flags | manifest.writer_feature_flags)
-        & FLAG_MEM_WAL_SAFE_RETIREMENT;
+    let mem_wal_index_catchup = (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & FLAG_MEM_WAL_INDEX_CATCHUP;
 
     // Reset flags
     manifest.reader_feature_flags = 0;
@@ -123,8 +123,8 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
 
-    manifest.reader_feature_flags |= mem_wal_safe_retirement;
-    manifest.writer_feature_flags |= mem_wal_safe_retirement;
+    manifest.reader_feature_flags |= mem_wal_index_catchup;
+    manifest.writer_feature_flags |= mem_wal_index_catchup;
     Ok(())
 }
 
@@ -351,17 +351,17 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(),
         );
-        manifest.reader_feature_flags = FLAG_MEM_WAL_SAFE_RETIREMENT;
-        manifest.writer_feature_flags = FLAG_MEM_WAL_SAFE_RETIREMENT;
+        manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+        manifest.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
 
         apply_feature_flags(&mut manifest, false, false).unwrap();
 
         assert_ne!(
-            manifest.reader_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT,
+            manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
             0
         );
         assert_ne!(
-            manifest.writer_feature_flags & FLAG_MEM_WAL_SAFE_RETIREMENT,
+            manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
             0
         );
     }
@@ -370,8 +370,8 @@ mod tests {
     /// continue with legacy semantics.
     #[test]
     fn the_mem_wal_bit_is_below_the_unknown_boundary() {
-        assert!(can_read_dataset(FLAG_MEM_WAL_SAFE_RETIREMENT));
-        assert!(can_write_dataset(FLAG_MEM_WAL_SAFE_RETIREMENT));
+        assert!(can_read_dataset(FLAG_MEM_WAL_INDEX_CATCHUP));
+        assert!(can_write_dataset(FLAG_MEM_WAL_INDEX_CATCHUP));
         // The next bit up is still unknown, so allocating this one did not
         // silently widen what this build claims to understand.
         assert!(!can_read_dataset(FLAG_UNKNOWN));

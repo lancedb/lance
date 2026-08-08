@@ -220,7 +220,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -235,7 +235,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -259,7 +259,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -273,7 +273,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -298,7 +298,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -313,7 +313,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -338,7 +338,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -353,7 +353,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -391,7 +391,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -474,7 +474,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -702,7 +702,7 @@ mod tests {
                 version,
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                    activate_safe_retirement: false,
+                    require_index_catchup: false,
                 },
                 None,
             ))
@@ -835,7 +835,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 1)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );

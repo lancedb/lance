@@ -426,7 +426,7 @@ impl MemWalIndex {
     /// semantics.
     ///
     /// A missing `index_catchup` entry is read here as "fully caught up". That
-    /// is only correct for a table without the safe-retirement feature bit. On
+    /// is only correct for a table without the index-catchup feature bit. On
     /// an activated table a missing entry means *unknown*: the index has not
     /// recorded anything, so its SSTables must be retained and a repair
     /// scheduled. This accessor cannot see the manifest, so it cannot make that

@@ -3355,7 +3355,7 @@ mod tests {
             (
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![],
-                    activate_safe_retirement: false,
+                    require_index_catchup: false,
                 },
                 NotCompatible,
             ),
@@ -4686,7 +4686,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4695,7 +4695,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4726,7 +4726,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4735,7 +4735,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4767,7 +4767,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4776,7 +4776,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4808,7 +4808,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4817,7 +4817,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4869,7 +4869,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4895,7 +4895,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
@@ -4943,7 +4943,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                activate_safe_retirement: false,
+                require_index_catchup: false,
             },
             None,
         );
