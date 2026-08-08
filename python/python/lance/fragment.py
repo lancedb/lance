@@ -347,10 +347,7 @@ class LanceFragment(pa.dataset.Fragment):
         return self._fragment.__repr__()
 
     def __reduce__(self):
-        from .dataset import LanceDataset
-
-        ds = LanceDataset(self._ds.uri, self._ds.version)
-        return LanceFragment, (ds, self.fragment_id)
+        return LanceFragment, (self._ds, self.fragment_id)
 
     @staticmethod
     def create_from_file(

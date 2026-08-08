@@ -109,6 +109,37 @@ def register_lance_metrics_recorder() -> bool: ...
 def lance_metrics_catalog() -> List[MetricDescription]: ...
 def snapshot_lance_metrics() -> List[MetricPoint]: ...
 
+class FtsToken:
+    text: str
+    position: int
+    def __repr__(self) -> str: ...
+
+def tokenize(
+    query: str,
+    *,
+    analyzer: Optional[Literal["text", "code"]] = None,
+    base_tokenizer: Optional[str] = None,
+    language: Optional[str] = None,
+    max_token_length: Optional[int] = 40,
+    lower_case: Optional[bool] = None,
+    stem: Optional[bool] = None,
+    remove_stop_words: Optional[bool] = None,
+    custom_stop_words: Optional[List[str]] = None,
+    ascii_folding: Optional[bool] = None,
+    min_ngram_length: Optional[int] = None,
+    max_ngram_length: Optional[int] = None,
+    prefix_only: Optional[bool] = None,
+    split_identifiers: Optional[bool] = None,
+    split_on_numerics: Optional[bool] = None,
+    preserve_original: Optional[bool] = None,
+    index_operators: Optional[bool] = None,
+) -> List[FtsToken]:
+    """Tokenize an FTS query without an index.
+
+    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    """
+    ...
+
 class CleanupStats:
     bytes_removed: int
     old_versions: int
