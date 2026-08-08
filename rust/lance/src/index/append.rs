@@ -699,12 +699,19 @@ fn segment_merge_requires_rebuild(dataset: &Dataset, index: &IndexMetadata) -> b
     if dataset.manifest.uses_stable_row_ids()
         && dataset.get_fragments().iter().any(|fragment| {
             owned_fragments.contains(fragment.id() as u32)
-                && fragment.metadata().deletion_file.is_some()
+                && fragment
+                    .metadata()
+                    .deletion_file
+                    .as_ref()
+                    .is_some_and(|deletion_file| {
+                        deletion_file.read_version >= index.dataset_version
+                    })
         })
     {
         // Fragment coverage cannot distinguish deleted and replacement rows
-        // that share a stable row id. Rebuild this source from current rows so
-        // stale values cannot be copied into the merged segment.
+        // that share a stable row id. A deletion older than the segment was
+        // already applied when it was built; rebuild only for later deletions
+        // so stale values cannot be copied into the merged segment.
         return true;
     }
 
@@ -2942,6 +2949,50 @@ mod tests {
         assert!(
             ids.values().iter().all(|id| *id < 20),
             "stale pre-update vectors must not survive the optimize merge: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_segment_built_after_deletion_keeps_merge_fast_path() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(4)))
+            .into_dataset_with_params(
+                "memory://",
+                FragmentCount(1),
+                FragmentRowCount(40),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 40,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset.delete("id < 20").await.unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let segment = dataset
+            .load_indices_by_name("vector_idx")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let fragments = dataset.get_fragments();
+        let deletion_file = fragments[0].metadata().deletion_file.as_ref().unwrap();
+        assert!(deletion_file.read_version < segment.dataset_version);
+        assert!(
+            !segment_merge_requires_rebuild(&dataset, &segment),
+            "a segment built after a deletion must retain the auxiliary merge fast path"
         );
     }
 
