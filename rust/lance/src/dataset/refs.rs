@@ -358,9 +358,9 @@ struct DurableRefPublication {
 }
 
 impl DurableRefPublication {
-    async fn apply(&self, object_store: &ObjectStore) -> Result<()> {
+    fn catalog(&self) -> Result<(Path, Path, RefCatalog)> {
         let path = Path::parse(&self.path)?;
-        let mut catalog: RefCatalog = serde_json::from_str(&self.body)?;
+        let catalog: RefCatalog = serde_json::from_str(&self.body)?;
         if catalog.mutation_epoch != self.epoch {
             return Err(Error::internal(format!(
                 "reference catalog epoch {} does not match publication epoch {}",
@@ -375,6 +375,24 @@ impl DurableRefPublication {
                 path, expected_path
             )));
         }
+        Ok((path, root, catalog))
+    }
+
+    async fn is_committed(&self, object_store: &ObjectStore) -> Result<bool> {
+        let (path, _, expected) = self.catalog()?;
+        let result = match object_store.inner.get(&path).await {
+            Ok(result) => result,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let actual: RefCatalog = serde_json::from_slice(&result.bytes().await?)?;
+        Ok(actual.mutation_epoch == expected.mutation_epoch
+            && actual.tags == expected.tags
+            && actual.branches == expected.branches)
+    }
+
+    async fn apply(&self, object_store: &ObjectStore) -> Result<()> {
+        let (path, root, mut catalog) = self.catalog()?;
 
         // Snapshot released-format refs immediately before the atomic create. A legacy mutation
         // that completed before this publication becomes part of the boundary and cannot override
@@ -504,9 +522,34 @@ impl DurableLeaseFence {
         };
         let intent_path = self.path.clone().join(LEASE_PUBLICATION_FILE);
         create_serialized_file(&self.object_store, &intent_path, &publication).await?;
-        self.ensure_current().await?;
+        self.apply_committed_publication(&publication).await
+    }
+
+    async fn apply_committed_publication(&self, publication: &DurableRefPublication) -> Result<()> {
+        let had_current_fence = match self.ensure_current().await {
+            Ok(()) => true,
+            Err(error) if matches!(&error, Error::RefConflict { .. }) => {
+                if publication.is_committed(&self.object_store).await? {
+                    log::warn!(
+                        "Reference mutation lease lost its fence after a successor committed its publication: {}",
+                        error
+                    );
+                    return Ok(());
+                }
+                // publication.json is the durable commit decision. A successor will replay it,
+                // so the original caller must complete the same outcome instead of reporting a
+                // conflict for an operation that can still become visible.
+                log::warn!(
+                    "Reference mutation lease lost its fence after recording a commit-ready publication; completing it: {}",
+                    error
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
+
         publication.apply(&self.object_store).await?;
-        if let Err(error) = self.ensure_current().await {
+        if had_current_fence && let Err(error) = self.ensure_current().await {
             log::warn!(
                 "Reference mutation lease lost its fence after catalog publication: {}",
                 error
@@ -2159,19 +2202,9 @@ async fn read_legacy_ref_entries(
         };
         let encoded_name = encoded_name.to_string();
         let path = base_path.clone().join(file_name);
-        let result = match object_store.inner.get(&path).await {
-            Ok(result) => result,
-            Err(ObjectStoreError::NotFound { .. }) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        let value: serde_json::Value = serde_json::from_slice(&result.bytes().await?)?;
-        if value
-            .get("_deleted")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
+        let Some(value) = read_legacy_ref_entry(object_store, &path).await? else {
             continue;
-        }
+        };
         let name = if is_branch {
             Path::from_url_path(&encoded_name)
                 .map_err(|error| Error::InvalidRef {
@@ -2187,6 +2220,27 @@ async fn read_legacy_ref_entries(
         entries.insert(name, value);
     }
     Ok(entries)
+}
+
+async fn read_legacy_ref_entry(
+    object_store: &ObjectStore,
+    path: &Path,
+) -> Result<Option<serde_json::Value>> {
+    let result = match object_store.inner.get(path).await {
+        Ok(result) => result,
+        Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&result.bytes().await?)?;
+    if value
+        .get("_deleted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 async fn read_legacy_ref_state(object_store: &ObjectStore, root: &Path) -> Result<LegacyRefState> {
@@ -2277,13 +2331,36 @@ where
     T: DeserializeOwned,
 {
     let address = RefAddress::from_path(path)?;
-    let catalog = read_ref_catalog(object_store, &address.root).await?;
-    let value = match address.kind {
-        RefKind::Tag => catalog.tags.get(&address.name),
-        RefKind::Branch => catalog.branches.get(&address.name),
+    let latest = read_latest_ref_catalog(object_store, &address.root).await?;
+    let legacy = read_legacy_ref_entry(object_store, path).await?;
+    let catalog = match latest {
+        Some(catalog) => Some(catalog),
+        None => {
+            // A catalog may be published while the flat entry is being read. Recheck once so
+            // migration cannot make a point lookup return an older partial view.
+            read_latest_ref_catalog(object_store, &address.root).await?
+        }
+    };
+    let value = if let Some(catalog) = catalog {
+        let (current, baseline) = match address.kind {
+            RefKind::Tag => (
+                catalog.tags.get(&address.name),
+                catalog.legacy_baseline.tags.get(&address.name),
+            ),
+            RefKind::Branch => (
+                catalog.branches.get(&address.name),
+                catalog.legacy_baseline.branches.get(&address.name),
+            ),
+        };
+        if baseline != legacy.as_ref() {
+            legacy
+        } else {
+            current.cloned()
+        }
+    } else {
+        legacy
     };
     value
-        .cloned()
         .map(serde_json::from_value)
         .transpose()
         .map(|contents| {
@@ -2460,6 +2537,7 @@ mod tests {
         heartbeat_started: Arc<tokio::sync::Notify>,
         release_heartbeat: Arc<tokio::sync::Notify>,
         remaining_catalog_get_failures: AtomicUsize,
+        get_count: Arc<AtomicUsize>,
     }
 
     impl fmt::Display for RefTestStore {
@@ -2498,6 +2576,7 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> ObjectStoreResult<GetResult> {
+            self.get_count.fetch_add(1, AtomicOrdering::SeqCst);
             if location.as_ref().contains("/_refs/catalog/") && {
                 let mut remaining = self
                     .remaining_catalog_get_failures
@@ -2705,6 +2784,7 @@ mod tests {
             heartbeat_started: heartbeat_started.clone(),
             release_heartbeat: release_heartbeat.clone(),
             remaining_catalog_get_failures: AtomicUsize::new(0),
+            get_count: Arc::new(AtomicUsize::new(0)),
         });
         let object_store = Arc::new(object_store);
         let fence_path = Path::from("dataset/_refs/mutation_leases");
@@ -2880,26 +2960,33 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let publication = DurableRefPublication {
+            epoch: 1,
+            path: ref_catalog_version_path(&Path::from("dataset"), 1).to_string(),
+            body: serde_json::to_string_pretty(&RefCatalog {
+                mutation_epoch: 1,
+                tags: HashMap::from([(
+                    "pending".to_string(),
+                    serde_json::to_value(&tag_contents).unwrap(),
+                )]),
+                branches: HashMap::new(),
+                legacy_baseline: LegacyRefState::default(),
+            })
+            .unwrap(),
+        };
         create_serialized_file(
             &object_store,
-            &first_path.join(LEASE_PUBLICATION_FILE),
-            &DurableRefPublication {
-                epoch: 1,
-                path: ref_catalog_version_path(&Path::from("dataset"), 1).to_string(),
-                body: serde_json::to_string_pretty(&RefCatalog {
-                    mutation_epoch: 1,
-                    tags: HashMap::from([(
-                        "pending".to_string(),
-                        serde_json::to_value(&tag_contents).unwrap(),
-                    )]),
-                    branches: HashMap::new(),
-                    legacy_baseline: LegacyRefState::default(),
-                })
-                .unwrap(),
-            },
+            &first_path.clone().join(LEASE_PUBLICATION_FILE),
+            &publication,
         )
         .await
         .unwrap();
+        let first_fence = DurableLeaseFence {
+            object_store: object_store.clone(),
+            path: first_path,
+            fence_path: fence_path.clone(),
+            epoch: 1,
+        };
 
         let second_path = lease_epoch_path(&fence_path, 2);
         let second_state = DurableLeaseState::acquired("successor".to_string(), 2).unwrap();
@@ -2911,12 +2998,17 @@ mod tests {
         DurableLeaseFence {
             object_store: object_store.clone(),
             path: second_path,
-            fence_path,
+            fence_path: fence_path.clone(),
             epoch: 2,
         }
         .reconcile_prior_publications()
         .await
         .unwrap();
+
+        first_fence
+            .apply_committed_publication(&publication)
+            .await
+            .expect("a successor-committed publication must not report failure");
 
         assert_eq!(
             read_stored_ref::<TagContents>(&tag_file, &object_store)
@@ -3027,6 +3119,65 @@ mod tests {
                 .version,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_point_read_reconciles_only_addressed_legacy_ref() {
+        let target: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let mut writer = ObjectStore::memory();
+        writer.inner = target.clone();
+        let root = Path::from("dataset");
+        for version in 1..=100_u64 {
+            let contents = TagContents {
+                branch: None,
+                version,
+                created_at: None,
+                updated_at: None,
+                manifest_size: 1,
+                metadata: HashMap::new(),
+            };
+            writer
+                .put(
+                    &tag_path(&root, &format!("legacy-{version}")),
+                    serde_json::to_vec(&contents).unwrap().as_slice(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut catalog = read_ref_catalog(&writer, &root).await.unwrap();
+        catalog.mutation_epoch = 1;
+        DurableRefPublication {
+            epoch: 1,
+            path: ref_catalog_version_path(&root, 1).to_string(),
+            body: serde_json::to_string_pretty(&catalog).unwrap(),
+        }
+        .apply(&writer)
+        .await
+        .unwrap();
+
+        let get_count = Arc::new(AtomicUsize::new(0));
+        let mut reader = ObjectStore::memory();
+        reader.inner = Arc::new(RefTestStore {
+            target,
+            heartbeat_started: Arc::new(tokio::sync::Notify::new()),
+            release_heartbeat: Arc::new(tokio::sync::Notify::new()),
+            remaining_catalog_get_failures: AtomicUsize::new(0),
+            get_count: get_count.clone(),
+        });
+
+        assert_eq!(
+            read_stored_ref::<TagContents>(&tag_path(&root, "legacy-100"), &reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .contents
+                .unwrap()
+                .version,
+            100
+        );
+        assert_eq!(get_count.load(AtomicOrdering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -3236,6 +3387,7 @@ mod tests {
             heartbeat_started: Arc::new(tokio::sync::Notify::new()),
             release_heartbeat: Arc::new(tokio::sync::Notify::new()),
             remaining_catalog_get_failures: AtomicUsize::new(4),
+            get_count: Arc::new(AtomicUsize::new(0)),
         });
 
         assert_eq!(
