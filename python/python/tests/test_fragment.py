@@ -1232,6 +1232,49 @@ def test_fragment_scanner_matches_dataset_scanner(tmp_path: Path, use_scalar_ind
     assert frag_plan == dataset_plan
 
 
+def _fragment_with_deletions(tmp_path: Path) -> LanceFragment:
+    dataset = write_dataset(pa.table({"a": range(20)}), tmp_path, max_rows_per_file=10)
+    dataset.delete("a < 3")
+    return dataset.get_fragments()[0]
+
+
+def test_fragment_scanner_include_deleted_rows(tmp_path: Path):
+    fragment = _fragment_with_deletions(tmp_path)
+    assert fragment.physical_rows == 10
+    assert fragment.num_deletions == 3
+
+    # By default the deleted rows are omitted.
+    default = fragment.to_table(with_row_id=True)
+    assert default.num_rows == 7
+    assert default["a"].to_pylist() == list(range(3, 10))
+
+    # With include_deleted_rows the deleted rows are surfaced with a null _rowid.
+    included = fragment.scanner(with_row_id=True, include_deleted_rows=True).to_table()
+    assert included.num_rows == fragment.physical_rows
+    assert included["a"].to_pylist() == list(range(10))
+    assert included["_rowid"].null_count == fragment.num_deletions
+
+
+def test_fragment_scanner_include_deleted_rows_requires_row_id(tmp_path: Path):
+    fragment = _fragment_with_deletions(tmp_path)
+    with pytest.raises(ValueError, match="with_row_id"):
+        fragment.scanner(include_deleted_rows=True).to_table()
+
+
+def test_fragment_scanner_include_deleted_rows_matches_dataset_scanner(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(20)}), tmp_path, max_rows_per_file=10)
+    dataset.delete("a < 3")
+    fragment = dataset.get_fragments()[0]
+
+    frag_plan = fragment.scanner(
+        with_row_id=True, include_deleted_rows=True
+    ).explain_plan(True)
+    dataset_plan = dataset.scanner(
+        fragments=[fragment], with_row_id=True, include_deleted_rows=True
+    ).explain_plan(True)
+    assert frag_plan == dataset_plan
+
+
 @pytest.mark.parametrize(
     ("late_materialization", "is_late"),
     [
@@ -1288,3 +1331,35 @@ def test_fragment_scanner_io_buffer_size_forwarded(tmp_path: Path):
         list(fragment.to_batches(filter=filt, io_buffer_size=4 * 1024 * 1024))
     )
     assert batched == expected
+
+
+def test_fragment_scanner_strict_batch_size(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(1000)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "a % 3 == 0"
+
+    # A filtered scan emits uneven, sub-batch_size batches by default.
+    loose = [b.num_rows for b in fragment.to_batches(batch_size=100, filter=filt)]
+    assert any(n < 100 for n in loose[:-1])
+
+    # strict_batch_size coalesces to exactly batch_size (except the last batch).
+    strict = [
+        b.num_rows
+        for b in fragment.to_batches(
+            batch_size=100, filter=filt, strict_batch_size=True
+        )
+    ]
+    assert all(n == 100 for n in strict[:-1])
+    assert sum(strict) == sum(loose)
+
+
+def test_fragment_scanner_batch_size_bytes(tmp_path: Path):
+    # A small byte budget over wide rows forces many more batches than the
+    # default, without changing the results.
+    dataset = write_dataset(pa.table({"s": ["x" * 1024] * 2000}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+
+    default_batches = list(fragment.to_batches())
+    small_budget = list(fragment.to_batches(batch_size_bytes=64 * 1024))
+    assert len(small_budget) > len(default_batches)
+    assert pa.Table.from_batches(small_budget) == fragment.to_table()

@@ -211,7 +211,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -228,6 +228,9 @@ impl FileFragment {
         use_scalar_index: Option<bool>,
         io_buffer_size: Option<u64>,
         late_materialization: Option<Bound<PyAny>>,
+        include_deleted_rows: Option<bool>,
+        batch_size_bytes: Option<u64>,
+        strict_batch_size: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -319,6 +322,15 @@ impl FileFragment {
                     "late_materialization must be a bool or a list of strings",
                 ));
             }
+        }
+        if let Some(batch_size_bytes) = batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
+        }
+        if let Some(true) = include_deleted_rows {
+            scanner.include_deleted_rows();
+        }
+        if let Some(strict_batch_size) = strict_batch_size {
+            scanner.strict_batch_size(strict_batch_size);
         }
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn))
