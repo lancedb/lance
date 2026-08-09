@@ -8887,6 +8887,30 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_filter_legacy_dataset_with_stable_row_ids() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, true)
+            .await
+            .unwrap();
+
+        let batch = test_ds
+            .dataset
+            .scan()
+            .batch_readahead(get_num_compute_intensive_cpus())
+            .project(&["vec"])
+            .unwrap()
+            .with_row_id()
+            .filter_expr(col("vec").is_not_null())
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let unique_row_ids = row_ids.values().iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(unique_row_ids.len(), 400);
+        assert_eq!(row_ids.len(), unique_row_ids.len());
+    }
+
+    #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
         // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
         let test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, false)
