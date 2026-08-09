@@ -1641,12 +1641,15 @@ impl ANNIvfSubIndexExec {
                 .unwrap_or(partitions.len())
                 .min(partitions.len());
             let min_nprobes = query.minimum_nprobes.min(max_nprobes);
+
+            // Every delta must reach the barrier, even if it has no partitions left
+            // to search, so that siblings waiting for the initial search can proceed.
+            let found_so_far = state.wait_for_minimum_to_finish().await;
             if max_nprobes <= min_nprobes {
                 // We've already searched all partitions, no late search needed
                 return futures::stream::empty().boxed();
             }
 
-            let found_so_far = state.wait_for_minimum_to_finish().await;
             if found_so_far >= query.k {
                 // We found enough results, no need for late search
                 return futures::stream::empty().boxed();
@@ -3042,6 +3045,57 @@ mod tests {
         assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
         assert_eq!(*searched_partitions.lock().unwrap(), vec![0]);
         assert_eq!(state.num_results_found.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_delta_skipping_late_search_releases_sibling() {
+        let prefilter = empty_prefilter().await;
+        let state = Arc::new(ANNIvfEarlySearchResults::new(2, 4));
+
+        let (index_a, _prepared_a, searched_a, _threads_a) = prepared_index(vec![21]);
+        let mut query_a = base_query();
+        query_a.k = 4;
+        query_a.minimum_nprobes = 1;
+        let delta_a = ANNIvfSubIndexExec::late_search(
+            index_a,
+            query_a,
+            Arc::new(UInt32Array::from(vec![0])),
+            Arc::new(Float32Array::from(vec![0.1])),
+            prefilter.clone(),
+            prepared_metrics(),
+            state.clone(),
+            usize::MAX,
+        )
+        .try_collect::<Vec<_>>();
+
+        let (index_b, _prepared_b, searched_b, _threads_b) = prepared_index(vec![31, 32, 33, 34]);
+        let mut query_b = base_query();
+        query_b.k = 4;
+        query_b.minimum_nprobes = 1;
+        query_b.maximum_nprobes = Some(4);
+        let delta_b = ANNIvfSubIndexExec::late_search(
+            index_b,
+            query_b,
+            Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3, 0.4])),
+            prefilter,
+            prepared_metrics(),
+            state,
+            usize::MAX,
+        )
+        .try_collect::<Vec<_>>();
+
+        let (result_a, result_b) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join(delta_a, delta_b),
+        )
+        .await
+        .expect("late search deadlocked because one delta skipped the shared barrier");
+
+        result_a.unwrap();
+        result_b.unwrap();
+        assert!(searched_a.lock().unwrap().is_empty());
+        assert!(!searched_b.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
