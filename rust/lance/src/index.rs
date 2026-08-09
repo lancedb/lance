@@ -1635,7 +1635,9 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn drop_index(&mut self, name: &str) -> Result<()> {
-        let indices = self.load_indices_by_name(name).await?;
+        // Removal never opens the index, so an index this build cannot read is
+        // still droppable - and has to be, since it is otherwise unremovable.
+        let indices = load_all_indices_by_name(self, name).await?;
         if indices.is_empty() {
             return Err(Error::index_not_found(format!("name={}", name)));
         }
@@ -1807,9 +1809,13 @@ impl DatasetIndexExt for Dataset {
         {
             return Ok(indices);
         }
-        let mut supported = indices.as_ref().clone();
-        retain_supported_indices(&mut supported);
-        Ok(Arc::new(supported))
+        Ok(Arc::new(
+            indices
+                .iter()
+                .filter(|idx| unsupported_index_version(idx).is_none())
+                .cloned()
+                .collect(),
+        ))
     }
 
     async fn merge_existing_index_segments(
@@ -2012,7 +2018,7 @@ impl DatasetIndexExt for Dataset {
             }
         }
 
-        let existing_named_indices = self.load_indices_by_name(index_name).await?;
+        let existing_named_indices = load_all_indices_by_name(self, index_name).await?;
         if existing_named_indices.iter().any(|idx| {
             // Same name-collision rule as `CreateIndexBuilder`'s default-name
             // loop in create.rs.
@@ -2178,7 +2184,11 @@ impl DatasetIndexExt for Dataset {
 
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
-        let indices = self.load_indices().await?;
+        // Grouped from the complete list so a name's segments are all accounted
+        // for. A segment this build cannot read is still coverage, and merging
+        // against a group whose coverage is only partly visible would commit a
+        // new segment claiming fragments an existing one already holds.
+        let indices = load_all_indices(self).await?;
 
         let indices_to_optimize = options
             .index_names
@@ -2197,7 +2207,7 @@ impl DatasetIndexExt for Dataset {
 
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
-        for deltas in name_to_indices.values() {
+        for (name, deltas) in name_to_indices.iter() {
             // Optimizing a covered index would republish its declaration on a
             // segment rebuilt without the carried values: `scan_vector_fragments`
             // projects the keyed field and `_rowid` only, and the scalar merges
@@ -2234,6 +2244,22 @@ impl DatasetIndexExt for Dataset {
                 )));
             }
 
+            // Optimizing a name means replacing its segments with one that
+            // covers their union, which this build cannot compute when it
+            // cannot read one of them: the merged segment would overlap the
+            // segment left behind, and `Dataset::validate` calls that
+            // corruption. Leave the whole name to a build that can read it.
+            if let Some(max_supported_version) =
+                deltas.iter().find_map(|idx| unsupported_index_version(idx))
+            {
+                log::warn!(
+                    "Index {} has a segment newer than version {}, which this build cannot read; \
+                     skipping its optimization",
+                    name,
+                    max_supported_version,
+                );
+                continue;
+            }
             // Scalar indices have no rebalance concept, so skip them entirely
             // when every fragment is already covered and the caller hasn't
             // asked for retrain or an explicit delta merge. Vector indices
@@ -2569,7 +2595,16 @@ async fn gather_fragment_statistics(
     )))
 }
 
-/// `None` when this build can read the index, otherwise the highest version it can.
+/// `None` when this build supports the index's version, otherwise the highest
+/// version it does support.
+///
+/// Only a version bump of a type this build already has a plugin for is caught.
+/// An index whose `type_url` resolves to no plugin at all - a wholly new index
+/// type, or a built-in behind a Cargo feature this build lacks - falls back to a
+/// ceiling of `i32::MAX` and is reported as supported, so it reaches the query
+/// planner and fails on open instead. That predates this split and is left
+/// as-is: reversing it needs the system indices exempted first, since neither
+/// the fragment-reuse nor the mem-wal details resolve to a scalar plugin either.
 pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
     let max_supported_version = index
         .index_details
@@ -2577,37 +2612,42 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
         .map(|details| {
             IndexDetails(details.clone())
                 .index_version()
-                // If we don't know how to read the index, it isn't supported
                 .unwrap_or(i32::MAX as u32)
         })
         .unwrap_or_default();
     (index.index_version > max_supported_version as i32).then_some(max_supported_version)
 }
 
-pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
-    indices.retain(|idx| match unsupported_index_version(idx) {
-        Some(max_supported_version) => {
+/// Name the indices this build has no reader for, once per manifest read.
+///
+/// Deliberately not inside the filter in [`DatasetIndexExt::load_indices`]: that
+/// runs on every call, and `load_indices` sits on the query-planning path and on
+/// merge_insert's per-batch path. Warning there would cost an operator one line
+/// per hidden index per query for as long as the dataset carries one.
+pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
+    for idx in indices {
+        if let Some(max_supported_version) = unsupported_index_version(idx) {
             log::warn!(
                 "Index {} has version {}, which is not supported (<={}), ignoring it",
                 idx.name,
                 idx.index_version,
                 max_supported_version,
             );
-            false
         }
-        None => true,
-    })
+    }
 }
 
 /// Every index the manifest names, including any this build has no reader for.
 ///
 /// Separate from [`DatasetIndexExt::load_indices`] because the two answer
 /// different questions. A reader asks which indices it may *use*, and an index
-/// it cannot decode is rightly absent. The commit path asks which indices the
-/// next manifest should *carry over*, and there the same omission is not a
-/// filter but an erasure: `build_manifest` seeds the new index list from what it
-/// is handed, so an index left out here disappears from the dataset for every
-/// build, including the one that could have read it.
+/// it cannot decode is rightly absent. Everything that decides what the *next*
+/// manifest looks like asks a different question, and there the same omission is
+/// not a filter but an erasure. `build_manifest` seeds the new index list from
+/// what it is handed, so an index left out disappears from the dataset for every
+/// build, including the one that could have read it. Index bookkeeping - name
+/// reservation, replace and removal selection, explicit drop - answers that
+/// second question too: a name it cannot see is a name it will hand out twice.
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
     let metadata_key = IndexMetadataKey {
         version: dataset.version().version,
@@ -2616,12 +2656,14 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     let mut indices = dataset
         .index_cache
         .get_or_insert_with_key(metadata_key, || async {
-            read_manifest_indexes(
+            let loaded = read_manifest_indexes(
                 &dataset.object_store,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
-            .await
+            .await?;
+            warn_about_unsupported_indices(&loaded);
+            Ok(loaded)
         })
         .await?;
 
@@ -2670,6 +2712,22 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     } else {
         Ok(indices)
     }
+}
+
+/// The segments named `name`, including any this build has no reader for.
+///
+/// The bookkeeping counterpart to [`DatasetIndexExt::load_indices_by_name`]. See
+/// [`load_all_indices`] for which of the two a call site wants.
+pub(crate) async fn load_all_indices_by_name(
+    dataset: &Dataset,
+    name: &str,
+) -> Result<Vec<IndexMetadata>> {
+    Ok(load_all_indices(dataset)
+        .await?
+        .iter()
+        .filter(|idx| idx.name == name)
+        .cloned()
+        .collect())
 }
 
 /// A trait for internal dataset utilities
@@ -10670,28 +10728,14 @@ mod tests {
             .into_reader_rows(RowCount::from(10), BatchCount::from(1))
     }
 
-    /// A dataset carrying a BTree index whose version this build has no reader
-    /// for - what an index written by a newer Lance looks like from here.
-    async fn dataset_with_an_index_from_a_newer_build(uri: &str, index_name: &str) -> Dataset {
-        let mut dataset = Dataset::write(two_column_reader(), uri, None)
-            .await
-            .unwrap();
-
-        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
-        let segment = dataset
-            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
-            .execute_uncommitted()
-            .await
-            .unwrap();
-        dataset
-            .commit_existing_index_segments(index_name, "id", vec![segment])
-            .await
-            .unwrap();
-
+    /// Raise `index_name` past the version this build can read, and give it the
+    /// full fragment coverage a real index of that name would have.
+    async fn hide_index_from_this_build(dataset: &mut Dataset, index_name: &str) {
         let current = dataset.load_indices_by_name(index_name).await.unwrap();
         assert_eq!(current.len(), 1);
         let mut from_the_future = current.clone();
         from_the_future[0].index_version = current[0].index_version + 1;
+        from_the_future[0].fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
         let transaction = Transaction::new(
             dataset.manifest.version,
             Operation::CreateIndex {
@@ -10702,6 +10746,43 @@ mod tests {
         );
         dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+    }
+
+    /// The readable companion every fixture below carries over `payload`.
+    const READABLE_INDEX: &str = "payload_idx";
+
+    /// A dataset carrying a BTree index over `id` whose version this build has
+    /// no reader for - what an index written by a newer Lance looks like from
+    /// here - beside an ordinary readable BTree index over `payload`.
+    ///
+    /// The readable companion is what makes the filter's selectivity visible:
+    /// with a single entry, "hid the one it cannot read" and "hid everything"
+    /// produce the same answer to every assertion in this module.
+    ///
+    /// Both indices are committed untrained and given their coverage by hand.
+    /// Nothing here ever reads them, and training one would take a non-spillable
+    /// 40 MB reservation out of the session's shared 150 MB pool to sort ten
+    /// rows - three of those in flight at once is all the pool has room for.
+    async fn dataset_with_an_index_from_a_newer_build(uri: &str, index_name: &str) -> Dataset {
+        let mut dataset = Dataset::write(two_column_reader(), uri, None)
+            .await
+            .unwrap();
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name(index_name.to_string())
+            .train(false)
+            .await
+            .unwrap();
+        hide_index_from_this_build(&mut dataset, index_name).await;
+
+        dataset
+            .create_index_builder(&["payload"], IndexType::BTree, &btree_params)
+            .name(READABLE_INDEX.to_string())
+            .train(false)
             .await
             .unwrap();
         dataset
@@ -10718,12 +10799,29 @@ mod tests {
         .unwrap()
     }
 
-    async fn manifest_index_names(dataset: &Dataset) -> Vec<String> {
+    /// The manifest entry named `name`, whole. Compare these, not names: a
+    /// carried-forward index that kept its name but lost its coverage or gained
+    /// a new uuid is exactly the corruption this suite exists to catch.
+    async fn manifest_index(dataset: &Dataset, name: &str) -> IndexMetadata {
         raw_manifest_indices(dataset)
             .await
             .into_iter()
+            .find(|idx| idx.name == name)
+            .unwrap_or_else(|| panic!("no index named {name} in the manifest"))
+    }
+
+    /// Sorted: a commit that replaces an entry appends the replacement, so
+    /// comparing in manifest order would break on which operation ran rather
+    /// than on what it did. Order is not meaningless in general - delta merging
+    /// selects a suffix of it - but no test here asserts on it.
+    async fn manifest_index_names(dataset: &Dataset) -> Vec<String> {
+        let mut names = raw_manifest_indices(dataset)
+            .await
+            .into_iter()
             .map(|idx| idx.name)
-            .collect()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     /// An index this build cannot read must be hidden, not erased.
@@ -10737,18 +10835,23 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
         dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
 
-        // A cold reader is the only one the filter reaches: the commit path
-        // seeds the index cache with the unfiltered list.
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert!(
+        assert_eq!(
             dataset
-                .load_indices_by_name("id_idx")
+                .load_indices()
                 .await
                 .unwrap()
-                .is_empty(),
-            "the version filter should hide an index this build cannot read"
+                .iter()
+                .map(|idx| idx.name.as_str())
+                .collect::<Vec<_>>(),
+            [READABLE_INDEX],
+            "the filter must hide the index this build cannot read, and only it"
         );
-        assert_eq!(manifest_index_names(&dataset).await, ["id_idx"]);
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx", READABLE_INDEX]
+        );
+        let before = manifest_index(&dataset, "id_idx").await;
 
         // An unrelated append. Nothing about the index is part of this operation.
         let dataset = Dataset::write(
@@ -10763,9 +10866,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            manifest_index_names(&dataset).await,
-            ["id_idx"],
-            "an unrelated append erased an index this build merely could not read"
+            manifest_index(&dataset, "id_idx").await,
+            before,
+            "an unrelated append changed an index this build merely could not read"
         );
     }
 
@@ -10778,17 +10881,19 @@ mod tests {
         dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
 
         let mut dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(
-            manifest_index_names(&dataset).await,
-            ["id_idx"],
-            "the fixture must start with the index actually present"
-        );
+        let readable_before = manifest_index(&dataset, READABLE_INDEX).await;
 
         dataset.drop_columns(&["id"]).await.unwrap();
 
-        assert!(
-            manifest_index_names(&dataset).await.is_empty(),
-            "an index over a dropped column must not be carried forward"
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            [READABLE_INDEX],
+            "dropping `id` must remove the index over it, and only that one"
+        );
+        assert_eq!(
+            manifest_index(&dataset, READABLE_INDEX).await,
+            readable_before,
+            "the index over the surviving column was rewritten"
         );
     }
 
@@ -10804,14 +10909,16 @@ mod tests {
         let mut dataset = dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
 
         // Drop the coverage too, so migration would want to rebuild it.
-        let raw = raw_manifest_indices(&dataset).await;
-        let mut without_bitmap = raw.clone();
-        without_bitmap[0].fragment_bitmap = None;
+        let hidden = manifest_index(&dataset, "id_idx").await;
+        let without_bitmap = IndexMetadata {
+            fragment_bitmap: None,
+            ..hidden.clone()
+        };
         let transaction = Transaction::new(
             dataset.manifest.version,
             Operation::CreateIndex {
-                new_indices: without_bitmap,
-                removed_indices: raw,
+                new_indices: vec![without_bitmap.clone()],
+                removed_indices: vec![hidden],
             },
             None,
         );
@@ -10824,10 +10931,512 @@ mod tests {
         dataset.delete("false").await.unwrap();
 
         assert_eq!(
-            manifest_index_names(&dataset).await,
-            ["id_idx"],
-            "a commit tried to migrate an index it cannot open"
+            manifest_index(&dataset, "id_idx").await,
+            without_bitmap,
+            "a commit rewrote an index it cannot open instead of carrying it through"
         );
+    }
+
+    /// A name an unreadable index already owns cannot be handed out again.
+    ///
+    /// Nothing in the format stops two entries from sharing a name, and the
+    /// build that can read both would take them for segments of one index.
+    #[tokio::test]
+    async fn test_unsupported_index_name_is_still_taken() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let err = dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .await
+            .expect_err("a name is taken by an index this build cannot read");
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected a name collision, got: {err}"
+        );
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx", READABLE_INDEX]
+        );
+    }
+
+    /// The generated-name loop reads the same view the collision check does, so
+    /// a name an unreadable index holds is skipped rather than reused.
+    #[tokio::test]
+    async fn test_an_auto_generated_name_skips_an_unsupported_index() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        // A different index kind on the same column: the loop steps past the
+        // taken name instead of stopping at the collision check.
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .train(false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx", "id_idx_2", READABLE_INDEX],
+            "the generated name reused one an unreadable index already holds"
+        );
+    }
+
+    /// The multi-segment FM-Index builder reserves names on its own, so it needs
+    /// the same complete view as the single-segment path.
+    ///
+    /// The hidden index is a BTree and the new one an FM index, which is what
+    /// makes this test specific to the multi-segment builder: its name loop
+    /// (`index/create.rs`) only steps past a taken name when the *fields* differ,
+    /// where the single-segment loop also steps past a different index kind. So
+    /// the single-segment path would quietly settle on `text_idx_2` and succeed;
+    /// only the multi-segment path keeps `text_idx` and hits the collision.
+    #[tokio::test]
+    async fn test_multi_segment_fmindex_respects_an_unsupported_index_name() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["text"], IndexType::BTree, &btree_params)
+            .name("text_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        hide_index_from_this_build(&mut dataset, "text_idx").await;
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let multi_segment_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm)
+            .with_params(&serde_json::json!({ "num_segments": 2 }));
+        let err = dataset
+            .create_index_builder(&["text"], IndexType::Fm, &multi_segment_params)
+            .train(false)
+            .await
+            .expect_err("a name is taken by an index this build cannot read");
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected a name collision, got: {err}"
+        );
+        assert_eq!(manifest_index_names(&dataset).await, ["text_idx"]);
+    }
+
+    /// Being unreadable must not make an index unremovable.
+    #[tokio::test]
+    async fn test_unsupported_index_can_be_dropped_by_name() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.drop_index("id_idx").await.unwrap();
+
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            [READABLE_INDEX],
+            "drop_index removed the wrong set of indices"
+        );
+    }
+
+    /// `replace` has to select the index it replaces from the same complete view
+    /// the name was reserved against, or it adds a twin instead of replacing.
+    #[tokio::test]
+    async fn test_replacing_an_unsupported_index_does_not_duplicate_it() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .replace(true)
+            .train(false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx", READABLE_INDEX],
+            "replace committed a second index under a name already taken"
+        );
+        assert!(
+            unsupported_index_version(&manifest_index(&dataset, "id_idx").await).is_none(),
+            "replace kept the unreadable index and discarded the new one"
+        );
+    }
+
+    /// The same selection, through the segment-commit path rather than the
+    /// builder: full coverage replaces the segments already under that name.
+    #[tokio::test]
+    async fn test_committing_a_segment_beside_an_unsupported_index_replaces_it() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut segment = dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .replace(true)
+            .train(false)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        // Full coverage, so the removal decision goes through the fragment
+        // overlap branch rather than the empty-bitmap shortcut. Set by hand
+        // because training it would take 40 MB of the shared pool to sort ten
+        // rows - see `dataset_with_an_index_from_a_newer_build`.
+        segment.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+        dataset
+            .commit_existing_index_segments("id_idx", "id", vec![segment])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx", READABLE_INDEX],
+            "the incoming segment was committed beside the unreadable one"
+        );
+        assert!(
+            unsupported_index_version(&manifest_index(&dataset, "id_idx").await).is_none(),
+            "the incoming segment did not replace the unreadable one"
+        );
+    }
+
+    /// A cast reassigns the field id, so no index on that column can be carried
+    /// forward. The guard that makes that explicit has to see the hidden ones
+    /// too, or they get exactly the silent drop it exists to abolish.
+    #[tokio::test]
+    async fn test_casting_a_column_with_an_unsupported_index_is_rejected() {
+        use crate::dataset::ColumnAlteration;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).cast_to(DataType::Int64)])
+            .await
+            .expect_err("a cast must not silently erase an index it cannot read");
+        assert!(
+            err.to_string().contains("id_idx"),
+            "the error should name the index, got: {err}"
+        );
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx", READABLE_INDEX],
+            "the rejected cast still changed the manifest"
+        );
+    }
+
+    /// A cache entry written under the key's previous meaning must cold-miss.
+    ///
+    /// v1 of `lance.index.metadata-key` held only the indices the writing build
+    /// could read. The key fields are identical, so on a persistent backend
+    /// shared with such a build nothing but the schema version stops this one
+    /// from reading that filtered list as the complete one.
+    #[tokio::test]
+    async fn test_a_pre_rotation_cache_entry_is_not_consulted() {
+        use lance_core::cache::{CacheCodec, CacheKey, CacheKeySchema, KeyBuilder};
+        use std::borrow::Cow;
+
+        struct PreRotationIndexMetadataKey<'a> {
+            version: u64,
+            store_identity: &'a str,
+        }
+
+        impl CacheKey for PreRotationIndexMetadataKey<'_> {
+            type ValueType = Vec<IndexMetadata>;
+
+            fn key(&self) -> Cow<'_, str> {
+                Cow::Owned(format!(
+                    "{}:{}/{}",
+                    self.store_identity.len(),
+                    self.store_identity,
+                    self.version
+                ))
+            }
+
+            fn type_name() -> &'static str {
+                "Vec<IndexMetadata>"
+            }
+
+            fn schema() -> CacheKeySchema {
+                CacheKeySchema::new("lance.index.metadata-key", 1)
+            }
+
+            fn write_key(&self, builder: &mut KeyBuilder) {
+                builder.write_str(self.store_identity);
+                builder.write_u64(self.version);
+            }
+
+            fn codec() -> Option<CacheCodec> {
+                Some(lance_table::format::index_metadata_codec())
+            }
+        }
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        let complete = raw_manifest_indices(&dataset).await;
+        let as_a_released_build_would_cache_it = complete
+            .iter()
+            .filter(|idx| unsupported_index_version(idx).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            as_a_released_build_would_cache_it.len() < complete.len(),
+            "the fixture must give the two key versions different values to cache"
+        );
+        dataset
+            .index_cache
+            .insert_with_key(
+                &PreRotationIndexMetadataKey {
+                    version: dataset.version().version,
+                    store_identity: &dataset.object_store.store_prefix,
+                },
+                Arc::new(as_a_released_build_would_cache_it),
+            )
+            .await;
+
+        dataset.delete("false").await.unwrap();
+
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx", READABLE_INDEX],
+            "a commit read a cache entry written under the key's previous meaning"
+        );
+    }
+
+    /// `validate` checks the manifest, so it has to see all of it. An index this
+    /// build cannot read is no less corrupt for being unreadable, and now that
+    /// such an index is carried forward the corrupt state is durable rather than
+    /// gone at the next commit.
+    #[tokio::test]
+    async fn test_validate_sees_an_unsupported_index() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+        dataset.validate().await.unwrap();
+
+        // A second segment under the same name covering the same fragments. Only
+        // `detect_overlapping_fragments` over the complete list can see it.
+        let hidden = manifest_index(&dataset, "id_idx").await;
+        let overlapping = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            ..hidden
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![overlapping],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let err = dataset
+            .validate()
+            .await
+            .expect_err("two segments of one name covering the same fragments is corrupt");
+        assert!(
+            err.to_string().contains("id_idx"),
+            "the error should name the index, got: {err}"
+        );
+    }
+
+    /// A detached commit builds its manifest through its own code path, and it
+    /// carries the index list forward exactly as an attached one does.
+    #[tokio::test]
+    async fn test_a_detached_commit_does_not_erase_an_unsupported_index() {
+        use crate::dataset::InsertBuilder;
+        use crate::dataset::write::CommitBuilder;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        let batches = two_column_reader()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let dataset = Arc::new(Dataset::open(test_uri).await.unwrap());
+        let before = manifest_index(&dataset, "id_idx").await;
+        let transaction = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(batches)
+            .await
+            .unwrap();
+        let detached = CommitBuilder::new(dataset.clone())
+            .with_detached(true)
+            .execute(transaction)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manifest_index_names(&detached).await,
+            ["id_idx", READABLE_INDEX],
+            "a detached commit erased an index this build merely could not read"
+        );
+        assert_eq!(
+            manifest_index(&detached, "id_idx").await,
+            before,
+            "a detached commit rewrote an index this build merely could not read"
+        );
+        assert!(lance_table::format::is_detached_version(
+            detached.manifest.version
+        ));
+        assert_eq!(detached.count_rows(None).await.unwrap(), 20);
+    }
+
+    /// Compaction bins fragments so that no rewrite group splits an index's
+    /// coverage, and `recalculate_fragment_bitmap` rejects the plan if one does.
+    /// Both sides therefore have to count the same indices: planning from the
+    /// filtered view while the commit carries the complete one makes compaction
+    /// fail outright on a dataset holding an index from a newer build.
+    #[tokio::test]
+    async fn test_compaction_survives_an_unsupported_index() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(two_column_reader(), test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        hide_index_from_this_build(&mut dataset, "id_idx").await;
+
+        // A fragment the index does not cover, so a bin holding it together with
+        // the covered ones would split the index's coverage.
+        let mut dataset = Dataset::write(
+            two_column_reader(),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..write_params
+            }),
+        )
+        .await
+        .unwrap();
+        let before = manifest_index(&dataset, "id_idx").await;
+
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // Without a real rewrite the assertions below hold vacuously: an empty
+        // plan commits nothing and re-reads the manifest it started from.
+        assert_eq!(metrics.fragments_removed, 4);
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let after = manifest_index(&dataset, "id_idx").await;
+        assert_eq!(after.uuid, before.uuid);
+        assert_eq!(after.index_version, before.index_version);
+        let live = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect::<RoaringBitmap>();
+        assert!(
+            !after.fragment_bitmap.unwrap().is_disjoint(&live),
+            "the surviving index covers only fragments the rewrite deleted"
+        );
+    }
+
+    /// Optimizing a name whose segments this build cannot all read would commit
+    /// a merged segment overlapping the one it left behind - a state
+    /// `Dataset::validate` reports as corruption and no later commit can heal.
+    #[tokio::test]
+    async fn test_optimize_skips_an_index_with_an_unsupported_segment() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        // A readable segment beside the hidden one, under the same name, so the
+        // group is exactly the mixed case: `id_idx` is now partly readable.
+        let hidden = manifest_index(&dataset, "id_idx").await;
+        let readable_sibling = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            index_version: hidden.index_version - 1,
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            ..hidden
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![readable_sibling],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        let segments_of = |indices: Vec<IndexMetadata>| {
+            indices
+                .into_iter()
+                .filter(|idx| idx.name == "id_idx")
+                .collect::<Vec<_>>()
+        };
+        let before = segments_of(raw_manifest_indices(&dataset).await);
+        assert_eq!(before.len(), 2, "the fixture must build the mixed group");
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            segments_of(raw_manifest_indices(&dataset).await),
+            before,
+            "optimize touched a name carrying a segment this build cannot read"
+        );
+        dataset.validate().await.unwrap();
     }
 
     #[tokio::test]

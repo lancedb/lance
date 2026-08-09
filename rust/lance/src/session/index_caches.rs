@@ -139,7 +139,11 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.metadata-key", 1)
+        // v2 holds every index the manifest names; v1 held only the ones the
+        // writing build could read. The fields are identical, so on a persistent
+        // backend shared with another release nothing but this version stops each
+        // build from reading the other's entry as its own meaning.
+        CacheKeySchema::new("lance.index.metadata-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {

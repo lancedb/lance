@@ -928,10 +928,12 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         }
     };
     for index in indices.iter_mut() {
-        // An index this build has no reader for is carried through the commit
-        // untouched - that is the whole point of keeping it. Migration would
-        // have to open it to recalculate anything, which is exactly what this
-        // build cannot do, and failing here would fail an unrelated commit.
+        // Migration is skipped for an index this build has no reader for: every
+        // branch below would have to open it to recalculate anything, which is
+        // exactly what this build cannot do, and failing here would fail an
+        // unrelated commit. Skipped, not untouched - `load_all_indices` still
+        // remaps its `fragment_bitmap` through the fragment-reuse index, which
+        // is what keeps its coverage pointing at the fragments its rows live in.
         if unsupported_index_version(index).is_some() {
             continue;
         }

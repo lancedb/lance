@@ -99,7 +99,7 @@ use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_inte
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::DatasetIndexExt;
+use crate::index::{DatasetIndexExt, load_all_indices};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -2064,7 +2064,16 @@ impl CandidateBin {
 }
 
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
-    let indices = dataset.load_indices().await?;
+    // Coverage, not usability: these bitmaps decide the rewrite groups. Under
+    // stable row ids `Transaction::recalculate_fragment_bitmap` then rejects any
+    // group that splits an index's coverage, and it walks every index the new
+    // manifest carries - including the ones this build cannot read. Binning from
+    // the filtered view fails that check outright on a dataset holding an index
+    // written by a newer Lance. The same bitmaps also decide, through
+    // `any_group_indexed`, whether a deferred compaction writes the
+    // fragment-reuse index that a build which can read that index needs to
+    // repair its coverage.
+    let indices = load_all_indices(dataset).await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
     // System indices (fragment-reuse, mem-wal) don't define data coverage and
     // aren't remapped per rewrite group, so they must not constrain compaction

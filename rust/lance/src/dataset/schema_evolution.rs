@@ -12,7 +12,7 @@ use super::{
     transaction::{Operation, Transaction},
     write::cleanup_data_fragments,
 };
-use crate::index::DatasetIndexExt;
+use crate::index::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
@@ -796,9 +796,12 @@ pub(super) async fn alter_columns(
     // affected column(s). The current behavior is to drop such indices without
     // warning, which has caused production incidents where vector search silently
     // regressed to brute-force scan. We require users to explicitly drop the
-    // index before altering the column type, so the action is never silent.
+    // index before altering the column type, so the action is never silent. That
+    // includes an index this build has no reader for: the cast reassigns the
+    // field id, so carrying it forward is impossible and staying quiet about it
+    // is the silent drop this guard exists to abolish.
     if !cast_fields.is_empty() {
-        let indices = dataset.load_indices().await?;
+        let indices = load_all_indices(dataset).await?;
         let affected: Vec<&lance_table::format::IndexMetadata> = indices
             .iter()
             .filter(|idx| {
@@ -1013,6 +1016,8 @@ fn exclude(source: &Schema, other: &Schema, version: &ConcreteFileVersion) -> Re
 #[cfg(test)]
 mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
+
+    use crate::index::DatasetIndexExt;
 
     #[test]
     fn test_merge_introduces_required_field() {

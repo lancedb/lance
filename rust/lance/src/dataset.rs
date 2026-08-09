@@ -14,7 +14,6 @@ use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
-use crate::index::DatasetIndexExt;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
@@ -791,6 +790,7 @@ impl Dataset {
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
+            crate::index::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
@@ -3088,8 +3088,12 @@ impl Dataset {
 
         rowids::validate_stable_row_ids(self).await?;
 
-        // Validate indices
-        let indices = self.load_indices().await?;
+        // Validate indices. Over the complete list: these checks are about what
+        // the manifest says, not about what this build can use, and duplicate
+        // uuids or overlapping coverage are no less corrupt for involving an
+        // index this build has no reader for. `migrate_indices` already runs the
+        // same overlap check over the complete list on every commit.
+        let indices = crate::index::load_all_indices(self).await?;
         self.validate_indices(&indices)?;
 
         Ok(())
