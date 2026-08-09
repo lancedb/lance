@@ -563,6 +563,9 @@ class LanceFragment(pa.dataset.Fragment):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
@@ -584,6 +587,9 @@ class LanceFragment(pa.dataset.Fragment):
             batch_readahead=batch_readahead,
             blob_handling=blob_handling,
             order_by=order_by,
+            use_scalar_index=use_scalar_index,
+            io_buffer_size=io_buffer_size,
+            late_materialization=late_materialization,
             **columns_arg,
         )
         from .dataset import LanceScanner
@@ -594,7 +600,7 @@ class LanceFragment(pa.dataset.Fragment):
             "_search_filter": None,
             "_substrait_filter": None,
             "_prefilter": False,
-            "_late_materialization": None,
+            "_late_materialization": late_materialization,
             "_blob_handling": blob_handling,
             "_offset": offset,
             "_columns": tuple(columns) if isinstance(columns, list) else None,
@@ -603,7 +609,7 @@ class LanceFragment(pa.dataset.Fragment):
             ),
             "_nearest": None,
             "_batch_size": batch_size,
-            "_io_buffer_size": None,
+            "_io_buffer_size": io_buffer_size,
             "_batch_readahead": batch_readahead,
             "_fragment_readahead": None,
             "_scan_in_order": True,
@@ -613,7 +619,7 @@ class LanceFragment(pa.dataset.Fragment):
             "_use_stats": True,
             "_fast_search": False,
             "_full_text_query": None,
-            "_use_scalar_index": None,
+            "_use_scalar_index": use_scalar_index,
             "_include_deleted_rows": None,
             "_scan_stats_callback": None,
             "_strict_batch_size": False,
@@ -667,6 +673,9 @@ class LanceFragment(pa.dataset.Fragment):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns,
@@ -679,6 +688,9 @@ class LanceFragment(pa.dataset.Fragment):
             batch_readahead=batch_readahead,
             blob_handling=blob_handling,
             order_by=order_by,
+            use_scalar_index=use_scalar_index,
+            io_buffer_size=io_buffer_size,
+            late_materialization=late_materialization,
         ).to_batches()
 
     def to_table(
@@ -693,6 +705,9 @@ class LanceFragment(pa.dataset.Fragment):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
     ) -> pa.Table:
         return self.scanner(
             columns=columns,
@@ -703,6 +718,9 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_address=with_row_address,
             blob_handling=blob_handling,
             order_by=order_by,
+            use_scalar_index=use_scalar_index,
+            io_buffer_size=io_buffer_size,
+            late_materialization=late_materialization,
         ).to_table()
 
     def to_pandas(

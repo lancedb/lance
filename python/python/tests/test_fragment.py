@@ -1184,3 +1184,107 @@ def test_fragment_validate_after_delete(tmp_path: Path):
     # A fragment carrying a deletion vector still validates.
     for fragment in dataset.get_fragments():
         fragment.validate()
+
+
+def _dataset_with_scalar_index(tmp_path: Path) -> LanceDataset:
+    dataset = write_dataset(
+        pa.table({"val": range(10000), "other": range(10000)}),
+        tmp_path,
+        max_rows_per_file=5000,
+    )
+    dataset.create_scalar_index("val", index_type="BTREE")
+    return dataset
+
+
+def test_fragment_scanner_use_scalar_index_disables_index_query(tmp_path: Path):
+    # A filtered fragment scan on an indexed column plans a dataset-wide
+    # ScalarIndexQuery (and caches its index pages) unless the scan opts out.
+    dataset = _dataset_with_scalar_index(tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val >= 10 AND val <= 20"
+
+    default_plan = fragment.scanner(filter=filt, with_row_id=True).explain_plan(True)
+    assert "ScalarIndexQuery" in default_plan
+
+    opted_out_plan = fragment.scanner(
+        filter=filt, with_row_id=True, use_scalar_index=False
+    ).explain_plan(True)
+    assert "ScalarIndexQuery" not in opted_out_plan
+
+
+@pytest.mark.parametrize("use_scalar_index", [None, True, False])
+def test_fragment_scanner_matches_dataset_scanner(tmp_path: Path, use_scalar_index):
+    # The fragment scanner must build the same plan as the dataset scanner
+    # restricted to that single fragment.
+    dataset = _dataset_with_scalar_index(tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val >= 10 AND val <= 20"
+
+    frag_plan = fragment.scanner(
+        filter=filt, with_row_id=True, use_scalar_index=use_scalar_index
+    ).explain_plan(True)
+    dataset_plan = dataset.scanner(
+        fragments=[fragment],
+        filter=filt,
+        with_row_id=True,
+        use_scalar_index=use_scalar_index,
+    ).explain_plan(True)
+    assert frag_plan == dataset_plan
+
+
+@pytest.mark.parametrize(
+    ("late_materialization", "is_late"),
+    [
+        pytest.param(None, False, id="default"),
+        pytest.param(True, True, id="all_late"),
+        pytest.param(False, False, id="all_early"),
+        pytest.param(["values"], True, id="late_column"),
+        pytest.param(["filter"], False, id="early_column"),
+    ],
+)
+def test_fragment_scanner_late_materialization(
+    tmp_path: Path, late_materialization, is_late
+):
+    # With no index, the plan shows whether `values` is fetched late (a take over
+    # the row stream) or early (materialized in the scan projection).
+    dataset = write_dataset(
+        pa.table({"filter": range(2000), "values": range(2000)}),
+        tmp_path,
+        data_storage_version="stable",
+    )
+    fragment = dataset.get_fragments()[0]
+
+    plan = fragment.scanner(
+        filter="filter % 2 == 0", late_materialization=late_materialization
+    ).explain_plan(True)
+
+    if is_late:
+        assert "projection=[values], source=stream" in plan
+    else:
+        assert "projection=[filter, values]" in plan
+
+
+def test_fragment_scanner_rejects_invalid_late_materialization(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(10)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+
+    with pytest.raises(
+        ValueError, match="late_materialization must be a bool or a list of strings"
+    ):
+        fragment.scanner(late_materialization=123)
+
+
+def test_fragment_scanner_io_buffer_size_forwarded(tmp_path: Path):
+    # io_buffer_size has no plan-visible marker, so assert it is accepted through
+    # both scan entry points and leaves results unchanged.
+    dataset = write_dataset(pa.table({"val": range(1000)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val < 100"
+    expected = fragment.to_table(filter=filt)
+
+    assert fragment.to_table(filter=filt, io_buffer_size=4 * 1024 * 1024) == expected
+
+    batched = pa.Table.from_batches(
+        list(fragment.to_batches(filter=filt, io_buffer_size=4 * 1024 * 1024))
+    )
+    assert batched == expected
