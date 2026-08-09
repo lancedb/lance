@@ -87,7 +87,7 @@ Create a file named config.json in the root directory of the current model.
 ```
 
 - The "main" field is optional. If not filled, the default is "dict.txt".
-- "users" is the path of the user dictionary. For the format of the user dictionary, please refer to https://github.com/messense/jieba-rs/blob/main/src/data/dict.txt.
+- "users" is the path of the user dictionary. For the format of the user dictionary, please refer to https://github.com/messense/jieba-rs/blob/main/jieba/src/data/dict.txt.
 
 ## Language Models of Lindera
 
