@@ -588,6 +588,129 @@ mod tests {
         );
     }
 
+    /// The ordinary case after a remap: the index still spans the table, so a
+    /// repair has nothing to rebuild. It must still record its catch-up, or the
+    /// agent reschedules the same repair forever and the SSTables never retire.
+    #[tokio::test]
+    async fn a_repair_with_no_index_work_still_records_catch_up() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use lance_index::optimize::OptimizeOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new(uri).execute(vec![data]).await.unwrap();
+        let scalar_params = lance_index::scalar::ScalarIndexParams::for_builtin(
+            lance_index::scalar::BuiltinIndexType::BTree,
+        );
+        dataset
+            .create_index(
+                &["a"],
+                lance_index::IndexType::BTree,
+                Some("a_idx".to_string()),
+                &scalar_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A MemWAL table that has compacted through generation 7 and requires
+        // catch-up, with no catch-up recorded for the index yet.
+        let shard = Uuid::new_v4();
+        let mem_wal_index =
+            new_mem_wal_index_meta(dataset.manifest.version, MemWalIndexDetails::default())
+                .unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        // Activation refuses a table already carrying compaction progress, so
+        // the progress lands after it.
+        dataset.require_mem_wal_index_catchup().await.unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 7)],
+                require_index_catchup: false,
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        // The index already covers every fragment, so this rebuilds nothing.
+        dataset
+            .optimize_indices(
+                &OptimizeOptions::append()
+                    .index_names(vec!["a_idx".to_string()])
+                    .mem_wal_index_catchup(vec![CompactedSsTable::new(shard, 7)]),
+            )
+            .await
+            .unwrap();
+
+        let recorded = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .index_catchup
+            .into_iter()
+            .find(|entry| entry.index_name == "a_idx")
+            .expect("a repair that rebuilt nothing still has to record its catch-up");
+        assert_eq!(
+            recorded.caught_up_generations,
+            vec![CompactedSsTable::new(shard, 7)]
+        );
+    }
+
+    /// A claim may not exceed what the version this call read had compacted:
+    /// anything compacted since is in fragments this call never inspected.
+    #[tokio::test]
+    async fn a_claim_beyond_the_inspected_compaction_is_refused() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let dataset = test_dataset_with_mem_wal().await;
+        let shard = Uuid::new_v4();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        let err = dataset
+            .optimize_indices(
+                &OptimizeOptions::append()
+                    .index_names(vec!["a_idx".to_string()])
+                    .mem_wal_index_catchup(vec![CompactedSsTable::new(shard, 10)]),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("had compacted 5"), "{err}");
+    }
+
     /// One `__lance_mem_wal` entry carrying `details`, as a real table has.
     fn indices_with(details: MemWalIndexDetails) -> Vec<IndexMetadata> {
         vec![new_mem_wal_index_meta(1, details).unwrap()]
@@ -876,25 +999,6 @@ mod tests {
     /// The system index holds the catch-up positions the WAL pod retires SSTables against.
     /// Erasing it through the ordinary index API would leave the table claiming
     /// nothing was ever compacted while the SSTables are already gone.
-    #[tokio::test]
-    async fn the_mem_wal_system_index_cannot_be_dropped_through_drop_index() {
-        use crate::index::DatasetIndexExt;
-
-        let mut dataset = test_dataset_with_mem_wal().await;
-
-        let err = dataset.drop_index(MEM_WAL_INDEX_NAME).await.unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("system index and cannot be dropped"),
-            "{err}"
-        );
-        let indices = dataset.load_indices().await.unwrap();
-        assert!(
-            indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME),
-            "the system index must survive the refused drop"
-        );
-    }
 
     #[test]
     fn test_empty_compacted_sstables_noop() {

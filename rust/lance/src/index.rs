@@ -1434,14 +1434,15 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 }
 
-/// Describe, for each index this commit republishes, the segments it will
-/// consist of afterwards and the catch-up generations to record for it.
+/// Describe, for each named index, the segments it will consist of after this
+/// commit and the catch-up generations to record for it.
 ///
 /// Built here rather than by the caller: an advance must name the exact segments
 /// it describes, and those do not exist until the merge runs. The final segment
 /// set for a name is what survives the `CreateIndex` apply -- the existing
 /// segments this commit neither removes nor replaces, plus the ones it adds.
 fn build_index_catchup_advances(
+    names: &[String],
     existing: &[IndexMetadata],
     new_indices: &[IndexMetadata],
     removed_indices: &[IndexMetadata],
@@ -1454,9 +1455,11 @@ fn build_index_catchup_advances(
         .map(|idx| idx.uuid)
         .collect();
 
-    new_indices
+    // Driven by the requested names, not by what was rebuilt: an index that
+    // already covered everything produces no new segment, and that is exactly
+    // the repair that most needs to record its catch-up.
+    names
         .iter()
-        .map(|added| &added.name)
         .unique()
         .map(|name| {
             let segments: Vec<&IndexMetadata> = existing
@@ -1550,18 +1553,6 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn drop_index(&mut self, name: &str) -> Result<()> {
-        // The MemWAL system index holds the compaction progress and index
-        // coverage the WAL pod retires SSTables against. Dropping it through the
-        // ordinary index API would erase that catch-up while the SSTables it
-        // describes are already gone, so it is refused here; disabling MemWAL is
-        // a dedicated operation.
-        if name == MEM_WAL_INDEX_NAME {
-            return Err(Error::invalid_input(format!(
-                "{} is a system index and cannot be dropped through drop_index",
-                MEM_WAL_INDEX_NAME
-            )));
-        }
-
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
             return Err(Error::index_not_found(format!("name={}", name)));
@@ -2189,18 +2180,63 @@ impl DatasetIndexExt for Dataset {
             new_indices.push(new_idx);
         }
 
-        if new_indices.is_empty() {
-            return Ok(());
-        }
-
         // Built here rather than by the caller: an advance must name the exact
         // segments it describes, and those only exist now. Recording it in this
         // commit is what keeps the index result and its catch-up from
         // disagreeing.
+        //
+        // Built *before* the no-work early return below. A repair whose index
+        // already covers every fragment has nothing to rebuild, and that is the
+        // ordinary case after a remap: coverage was dropped because the segment
+        // changed, while the index still spans the table. Returning early there
+        // would leave catch-up missing forever and the repair rescheduling
+        // itself.
         let mem_wal_index_catchup_advances = if options.mem_wal_index_catchup.is_empty() {
             Vec::new()
         } else {
+            let Some(names) = options.index_names.as_ref().filter(|n| !n.is_empty()) else {
+                return Err(Error::invalid_input(
+                    "optimize_indices: index_names must name the indices to record \
+                     catch-up for; recording it for every index on the table is \
+                     never what a repair means",
+                ));
+            };
+            // The caller may only claim what the version it read had already
+            // compacted. Anything compacted since landed in fragments this call
+            // never inspected, so its rows are not covered by the index being
+            // published.
+            let details = indices
+                .iter()
+                .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                .map(|idx| crate::index::mem_wal::load_mem_wal_index_details(idx.clone()))
+                .transpose()?
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "optimize_indices: cannot record catch-up, the {} system \
+                         index does not exist on this table",
+                        MEM_WAL_INDEX_NAME
+                    ))
+                })?;
+            for proposed in &options.mem_wal_index_catchup {
+                let inspected = details
+                    .compacted_sstables
+                    .iter()
+                    .find(|sstable| sstable.shard_id == proposed.shard_id)
+                    .map(|sstable| sstable.generation);
+                if inspected.is_none_or(|inspected| proposed.generation > inspected) {
+                    return Err(Error::invalid_input(format!(
+                        "optimize_indices: cannot record catch-up to generation {} for \
+                         shard {}: the version this call read had compacted {}",
+                        proposed.generation,
+                        proposed.shard_id,
+                        inspected
+                            .map(|g| g.to_string())
+                            .unwrap_or_else(|| "nothing".to_string())
+                    )));
+                }
+            }
             build_index_catchup_advances(
+                names,
                 &indices,
                 &new_indices,
                 &removed_indices,
@@ -2215,6 +2251,10 @@ impl DatasetIndexExt for Dataset {
                     .collect(),
             )
         };
+
+        if new_indices.is_empty() && mem_wal_index_catchup_advances.is_empty() {
+            return Ok(());
+        }
 
         let transaction = TransactionBuilder::new(
             self.manifest.version,

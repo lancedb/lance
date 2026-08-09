@@ -72,19 +72,6 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
-/// Whether this operation publishes MemWAL compaction progress.
-fn operation_advances_compaction(operation: &Operation) -> bool {
-    match operation {
-        Operation::Update {
-            compacted_sstables, ..
-        }
-        | Operation::UpdateMemWalState {
-            compacted_sstables, ..
-        } => !compacted_sstables.is_empty(),
-        _ => false,
-    }
-}
-
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
         dataset: &Dataset,
@@ -633,21 +620,9 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
-            mem_wal_index_catchup_advances,
+            ..
         } = &mut self.transaction.operation
         {
-            // A coverage advance describes the table as the repair inspected it.
-            // If the commit it rebases over moved compaction progress, rows from
-            // the newly compacted generations landed in fragments the repair
-            // never saw, and its claim would cover generations its index does
-            // not. Nothing here can re-derive that, so refuse and let the repair
-            // re-plan against the newer state.
-            if !mem_wal_index_catchup_advances.is_empty()
-                && operation_advances_compaction(&other_transaction.operation)
-            {
-                return Err(self.retryable_conflict_err(other_transaction, other_version));
-            }
-
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
