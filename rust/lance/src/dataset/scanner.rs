@@ -898,7 +898,7 @@ pub struct Scanner {
     /// the smaller row count selected by either limit.
     batch_size_bytes: Option<u64>,
 
-    /// Number of batches to prefetch
+    /// Number of batches to decode concurrently
     batch_readahead: usize,
 
     /// Number of fragments to read concurrently
@@ -1524,9 +1524,11 @@ impl Scanner {
         self
     }
 
-    /// Set the fragment readahead.
+    /// Set the number of fragments whose reads may be scheduled concurrently.
     ///
-    /// This is only used if ``scan_in_order`` is set to false.
+    /// This applies to both ordered and unordered scans. [`Self::scan_in_order`]
+    /// controls result ordering, not whether fragment I/O overlaps. Set this to
+    /// `1` to read one fragment at a time.
     pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
         self.fragment_readahead = Some(nfragments);
         self
