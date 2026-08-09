@@ -36,7 +36,7 @@ use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{
     FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    inherit_mem_wal_index_catchup,
+    inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
 };
 use lance_table::rowids::read_row_ids;
 use lance_table::{
@@ -1973,6 +1973,10 @@ impl Transaction {
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
+        // Read below the reader validation boundary, so nothing else refuses a
+        // half-set manifest here: the flag reset would quietly drop the lone bit
+        // and republish an undefined state as legacy.
+        validate_mem_wal_index_catchup_flags(&manifest)?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
@@ -2172,7 +2176,7 @@ impl Transaction {
                 })
                 .collect();
             // The first thing to check when SSTables stop becoming trimmable.
-            log::debug!(
+            log::info!(
                 "MemWAL index catch-up invalidated at version {new_version} for {dropped:?}: \
                  these indices changed without reporting how far they caught up"
             );
