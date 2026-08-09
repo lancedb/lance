@@ -2020,7 +2020,7 @@ impl FileFragment {
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> Result<(Fragment, Schema)> {
-        let (fragments, schema, _) = schema_evolution::add_columns_to_fragments(
+        let (fragments, schema, _, _) = schema_evolution::add_columns_to_fragments(
             self.dataset.as_ref(),
             transforms,
             read_columns,
@@ -5745,6 +5745,7 @@ mod tests {
             let op = Operation::Merge {
                 fragments: merged_fragments,
                 schema: full_schema.clone(),
+                preserves_nullability: true,
             };
 
             let dataset = Dataset::commit(
@@ -5988,6 +5989,7 @@ mod tests {
             Operation::Merge {
                 schema,
                 fragments: vec![frag],
+                preserves_nullability: true,
             },
             Some(dataset.manifest.version),
             None,

@@ -77,11 +77,21 @@ class FragmentMetadata:
     deletion_file : Optional[DeletionFile]
         The deletion file, if any.
     row_id_meta : Optional[RowIdMeta]
-        The row id metadata, if any.
+        The stable row ids of this fragment's rows, if any. When committing a
+        transaction by hand on a dataset that uses stable row ids, set this to
+        carry the ids of rewritten rows over to their new fragment; build it with
+        :class:`RowIdSequence`. Rows left without an id are treated as newly
+        inserted and are assigned ids during the commit.
     created_at_version_meta : Optional[RowDatasetVersionMeta]
-        The row created at version metadata, if any.
+        The dataset version each row was created in. Derived during the commit
+        from ``row_id_meta`` -- a rewritten row keeps the version it first
+        appeared in -- so leave this as None when building a transaction. Any
+        value set here is ignored for newly written fragments.
     last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
-        The row last updated at version metadata, if any.
+        The dataset version each row was last modified in. Derived during the
+        commit, like ``created_at_version_meta``; leave this as None. It cannot
+        be computed ahead of time because a commit that loses a race is retried
+        against a later version than the one it was built for.
     overlays : List[LanceOperation.DataOverlayFile]
         The data overlay files layered over this fragment's base data, if any.
         Overlays are created via :class:`LanceOperation.DataOverlay`; they are
@@ -342,10 +352,7 @@ class LanceFragment(pa.dataset.Fragment):
         return self._fragment.__repr__()
 
     def __reduce__(self):
-        from .dataset import LanceDataset
-
-        ds = LanceDataset(self._ds.uri, self._ds.version)
-        return LanceFragment, (ds, self.fragment_id)
+        return LanceFragment, (self._ds, self.fragment_id)
 
     @staticmethod
     def create_from_file(

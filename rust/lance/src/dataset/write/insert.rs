@@ -368,7 +368,10 @@ impl<'a> InsertBuilder<'a> {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
-                dataset.commit_handler.clone(),
+                params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| dataset.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
                 let registry = params
@@ -458,6 +461,7 @@ mod test {
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
+    use lance_table::io::commit::{RenameCommitHandler, commit_handler_from_url};
 
     use crate::session::Session;
 
@@ -507,6 +511,42 @@ mod test {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn dataset_destination_honors_explicit_commit_handler() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let initial_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(initial_batch)],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+            .await
+            .unwrap();
+
+        let append_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
+                .unwrap();
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(Arc::new(RenameCommitHandler)),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(append_batch)], schema),
+            Arc::new(dataset),
+            Some(params),
+        )
+        .await
+        .expect("the explicit per-write commit handler should override the dataset handler");
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
     }
 
     #[rstest::rstest]
