@@ -131,7 +131,6 @@ use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuil
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
-use crate::index::retain_supported_indices;
 use crate::io::commit::{
     DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
     commit_transaction, detect_overlapping_fragments,
@@ -783,12 +782,15 @@ impl Dataset {
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
             let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-            let mut indices: Vec<IndexMetadata> = section
+            // Cached unfiltered: this is the same cache the commit path reads
+            // from, and an index this build cannot decode still has to survive
+            // into the next manifest. Version filtering happens on the way out,
+            // in `DatasetIndexExt::load_indices`.
+            let indices: Vec<IndexMetadata> = section
                 .indices
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
-            retain_supported_indices(&mut indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,

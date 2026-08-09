@@ -53,9 +53,9 @@ use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
-use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::details::infer_missing_vector_details;
+use crate::index::{load_all_indices, unsupported_index_version};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
@@ -928,6 +928,13 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         }
     };
     for index in indices.iter_mut() {
+        // An index this build has no reader for is carried through the commit
+        // untouched - that is the whole point of keeping it. Migration would
+        // have to open it to recalculate anything, which is exactly what this
+        // build cannot do, and failing here would fail an unrelated commit.
+        if unsupported_index_version(index).is_some() {
+            continue;
+        }
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
                 && !is_system_index(index)
@@ -1079,7 +1086,7 @@ pub(crate) async fn do_commit_detached_transaction(
             }
             _ => transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
-                dataset.load_indices().await?.as_ref().clone(),
+                load_all_indices(dataset).await?.as_ref().clone(),
                 &transaction_file,
                 &write_config.to_build_config(),
             )?,
@@ -1422,7 +1429,7 @@ pub(crate) async fn commit_transaction(
             }
             _ => transaction.build_manifest_with_read_version(
                 Some(dataset.manifest.as_ref()),
-                dataset.load_indices().await?.as_ref().clone(),
+                load_all_indices(&dataset).await?.as_ref().clone(),
                 transaction_file,
                 &write_config.to_build_config(),
                 read_version_state,
@@ -1649,6 +1656,7 @@ mod tests {
 
     use crate::Dataset;
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 

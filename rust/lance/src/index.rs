@@ -1800,68 +1800,16 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let metadata_key = IndexMetadataKey {
-            version: self.version().version,
-            store_identity: &self.object_store.store_prefix,
-        };
-        let mut indices = self
-            .index_cache
-            .get_or_insert_with_key(metadata_key, || async {
-                let mut loaded_indices = read_manifest_indexes(
-                    &self.object_store,
-                    &self.manifest_location,
-                    &self.manifest,
-                )
-                .await?;
-                retain_supported_indices(&mut loaded_indices);
-                Ok(loaded_indices)
-            })
-            .await?;
-
-        // Infer details for legacy vector indices (once per index name, concurrently).
-        // This may run on indices that were opportunistically cached during Dataset::open
-        // before the full Dataset was available for inference.
+        let indices = load_all_indices(self).await?;
+        if indices
+            .iter()
+            .all(|idx| unsupported_index_version(idx).is_none())
         {
-            let schema = self.schema();
-            if indices
-                .iter()
-                .any(|idx| needs_vector_details_inference(idx, schema))
-            {
-                let mut updated = indices.as_ref().clone();
-                infer_missing_vector_details(self, &mut updated).await;
-                if updated != *indices {
-                    indices = Arc::new(updated);
-                    self.index_cache
-                        .insert_with_key(&metadata_key, indices.clone())
-                        .await;
-                }
-            }
+            return Ok(indices);
         }
-
-        if let Some(frag_reuse_index_meta) =
-            indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-        {
-            let fri_key = FragReuseIndexKey {
-                uuid: &frag_reuse_index_meta.uuid,
-            };
-            let frag_reuse_index = self
-                .index_cache
-                .get_or_insert_with_key(fri_key, || async move {
-                    let index_details =
-                        load_frag_reuse_index_details(self, frag_reuse_index_meta).await?;
-                    open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
-                })
-                .await?;
-            let mut indices = indices.as_ref().clone();
-            for idx in indices.iter_mut() {
-                if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
-                    frag_reuse_index.remap_fragment_bitmap(bitmap)?;
-                }
-            }
-            Ok(Arc::new(indices))
-        } else {
-            Ok(indices)
-        }
+        let mut supported = indices.as_ref().clone();
+        retain_supported_indices(&mut supported);
+        Ok(Arc::new(supported))
     }
 
     async fn merge_existing_index_segments(
@@ -2621,29 +2569,107 @@ async fn gather_fragment_statistics(
     )))
 }
 
+/// `None` when this build can read the index, otherwise the highest version it can.
+pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
+    let max_supported_version = index
+        .index_details
+        .as_ref()
+        .map(|details| {
+            IndexDetails(details.clone())
+                .index_version()
+                // If we don't know how to read the index, it isn't supported
+                .unwrap_or(i32::MAX as u32)
+        })
+        .unwrap_or_default();
+    (index.index_version > max_supported_version as i32).then_some(max_supported_version)
+}
+
 pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
-    indices.retain(|idx| {
-        let max_supported_version = idx
-            .index_details
-            .as_ref()
-            .map(|details| {
-                IndexDetails(details.clone())
-                    .index_version()
-                    // If we don't know how to read the index, it isn't supported
-                    .unwrap_or(i32::MAX as u32)
-            })
-            .unwrap_or_default();
-        let is_valid = idx.index_version <= max_supported_version as i32;
-        if !is_valid {
+    indices.retain(|idx| match unsupported_index_version(idx) {
+        Some(max_supported_version) => {
             log::warn!(
                 "Index {} has version {}, which is not supported (<={}), ignoring it",
                 idx.name,
                 idx.index_version,
                 max_supported_version,
             );
+            false
         }
-        is_valid
+        None => true,
     })
+}
+
+/// Every index the manifest names, including any this build has no reader for.
+///
+/// Separate from [`DatasetIndexExt::load_indices`] because the two answer
+/// different questions. A reader asks which indices it may *use*, and an index
+/// it cannot decode is rightly absent. The commit path asks which indices the
+/// next manifest should *carry over*, and there the same omission is not a
+/// filter but an erasure: `build_manifest` seeds the new index list from what it
+/// is handed, so an index left out here disappears from the dataset for every
+/// build, including the one that could have read it.
+pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
+    let metadata_key = IndexMetadataKey {
+        version: dataset.version().version,
+        store_identity: &dataset.object_store.store_prefix,
+    };
+    let mut indices = dataset
+        .index_cache
+        .get_or_insert_with_key(metadata_key, || async {
+            read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+        })
+        .await?;
+
+    // Infer details for legacy vector indices (once per index name, concurrently).
+    // This may run on indices that were opportunistically cached during Dataset::open
+    // before the full Dataset was available for inference.
+    {
+        let schema = dataset.schema();
+        if indices
+            .iter()
+            .any(|idx| needs_vector_details_inference(idx, schema))
+        {
+            let mut updated = indices.as_ref().clone();
+            infer_missing_vector_details(dataset, &mut updated).await;
+            if updated != *indices {
+                indices = Arc::new(updated);
+                dataset
+                    .index_cache
+                    .insert_with_key(&metadata_key, indices.clone())
+                    .await;
+            }
+        }
+    }
+
+    if let Some(frag_reuse_index_meta) =
+        indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+    {
+        let fri_key = FragReuseIndexKey {
+            uuid: &frag_reuse_index_meta.uuid,
+        };
+        let frag_reuse_index = dataset
+            .index_cache
+            .get_or_insert_with_key(fri_key, || async move {
+                let index_details =
+                    load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
+                open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
+            })
+            .await?;
+        let mut indices = indices.as_ref().clone();
+        for idx in indices.iter_mut() {
+            if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
+                frag_reuse_index.remap_fragment_bitmap(bitmap)?;
+            }
+        }
+        Ok(Arc::new(indices))
+    } else {
+        Ok(indices)
+    }
 }
 
 /// A trait for internal dataset utilities
@@ -10635,6 +10661,173 @@ mod tests {
                 "after auto-heal, raw on-disk bitmap should match cleaned bitmap"
             );
         }
+    }
+
+    fn two_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'static {
+        lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("payload", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+    }
+
+    /// A dataset carrying a BTree index whose version this build has no reader
+    /// for - what an index written by a newer Lance looks like from here.
+    async fn dataset_with_an_index_from_a_newer_build(uri: &str, index_name: &str) -> Dataset {
+        let mut dataset = Dataset::write(two_column_reader(), uri, None)
+            .await
+            .unwrap();
+
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let segment = dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(index_name, "id", vec![segment])
+            .await
+            .unwrap();
+
+        let current = dataset.load_indices_by_name(index_name).await.unwrap();
+        assert_eq!(current.len(), 1);
+        let mut from_the_future = current.clone();
+        from_the_future[0].index_version = current[0].index_version + 1;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: from_the_future,
+                removed_indices: current,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        dataset
+    }
+
+    /// Indices the manifest itself carries, bypassing the version filter.
+    async fn raw_manifest_indices(dataset: &Dataset) -> Vec<IndexMetadata> {
+        lance_table::io::manifest::read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn manifest_index_names(dataset: &Dataset) -> Vec<String> {
+        raw_manifest_indices(dataset)
+            .await
+            .into_iter()
+            .map(|idx| idx.name)
+            .collect()
+    }
+
+    /// An index this build cannot read must be hidden, not erased.
+    ///
+    /// Every commit rebuilds the index list from what it is handed, so filtering
+    /// the version there turns "ignore it" into "delete it", and the build that
+    /// could have read the index never gets the chance.
+    #[tokio::test]
+    async fn test_unsupported_index_survives_an_unrelated_commit() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        // A cold reader is the only one the filter reaches: the commit path
+        // seeds the index cache with the unfiltered list.
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert!(
+            dataset
+                .load_indices_by_name("id_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the version filter should hide an index this build cannot read"
+        );
+        assert_eq!(manifest_index_names(&dataset).await, ["id_idx"]);
+
+        // An unrelated append. Nothing about the index is part of this operation.
+        let dataset = Dataset::write(
+            two_column_reader(),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx"],
+            "an unrelated append erased an index this build merely could not read"
+        );
+    }
+
+    /// Carrying an unreadable index forward is not the same as keeping it
+    /// forever: dropping the column it covers still removes it.
+    #[tokio::test]
+    async fn test_unsupported_index_is_dropped_with_its_column() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx"],
+            "the fixture must start with the index actually present"
+        );
+
+        dataset.drop_columns(&["id"]).await.unwrap();
+
+        assert!(
+            manifest_index_names(&dataset).await.is_empty(),
+            "an index over a dropped column must not be carried forward"
+        );
+    }
+
+    /// Carrying it forward must also not drag it through index migration.
+    ///
+    /// `migrate_indices` recalculates a missing `fragment_bitmap` by opening the
+    /// index, which is precisely what this build cannot do - so an unreadable
+    /// index would fail every later commit instead of riding along.
+    #[tokio::test]
+    async fn test_unsupported_index_without_a_bitmap_does_not_fail_later_commits() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+
+        // Drop the coverage too, so migration would want to rebuild it.
+        let raw = raw_manifest_indices(&dataset).await;
+        let mut without_bitmap = raw.clone();
+        without_bitmap[0].fragment_bitmap = None;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: without_bitmap,
+                removed_indices: raw,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.delete("false").await.unwrap();
+
+        assert_eq!(
+            manifest_index_names(&dataset).await,
+            ["id_idx"],
+            "a commit tried to migrate an index it cannot open"
+        );
     }
 
     #[tokio::test]
