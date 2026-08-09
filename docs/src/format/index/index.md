@@ -135,6 +135,26 @@ Before using an index segment, engines must verify they support it:
 When an engine cannot use an index segment, it should fall back to scanning the
 fragments that would have been covered by that segment.
 
+Skipping a segment applies to reading it, never to writing it. The index section of a
+new manifest is derived from the index section of the previous one, so an engine that
+omits a segment it could not recognize does not hide that segment - it deletes it, for
+every engine, including the one that wrote it. An engine must therefore carry every
+segment of the previous manifest into the one it writes, whether or not it can read
+them, removing a segment only when the operation itself calls for that: the index was
+explicitly dropped, or the fields it covers no longer exist in the schema.
+
+Two consequences follow for engines that rewrite the index section:
+
+- A segment an engine cannot read is also a segment it cannot re-derive. Any bookkeeping
+  that decides the contents of the next index section - reserving an index name,
+  selecting segments to replace or remove, computing fragment coverage for a rewrite -
+  must consider every segment the manifest names, not only the recognized ones.
+- `IndexMetadata` fields an engine does not know are not preserved across a rewrite.
+  New top-level fields on `IndexMetadata` and `IndexFile` must therefore be optional in
+  the sense that an older engine dropping them leaves a valid segment; index-type
+  specific state belongs in `index_details`, which is carried verbatim as an opaque
+  `google.protobuf.Any`.
+
 ### Serving carried columns
 
 `IndexMetadata.covering_fields` records the columns an index segment *declares* it
