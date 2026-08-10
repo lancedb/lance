@@ -627,10 +627,12 @@ pub type DurabilityCell = WatchableOnceCell<DurabilityResult>;
 /// Statistics for backpressure monitoring.
 #[derive(Debug, Default)]
 pub struct BackpressureStats {
-    /// Total number of times backpressure was applied.
+    /// Total number of *completed* waits.
     total_count: AtomicU64,
-    /// Total time spent waiting on backpressure (in milliseconds).
+    /// Total time completed waits spent parked (in milliseconds).
     total_wait_ms: AtomicU64,
+    /// Writers parked in `maybe_apply_backpressure` right now.
+    active_count: AtomicU64,
 }
 
 impl BackpressureStats {
@@ -639,18 +641,26 @@ impl BackpressureStats {
         Self::default()
     }
 
-    /// Record a backpressure event.
+    /// Record a completed backpressure wait.
     pub fn record(&self, wait_ms: u64) {
         self.total_count.fetch_add(1, Ordering::Relaxed);
         self.total_wait_ms.fetch_add(wait_ms, Ordering::Relaxed);
     }
 
-    /// Get the total backpressure count.
+    /// Count a writer as parked until the returned guard drops. Drop-based
+    /// because the caller's future can be cancelled mid-wait, which would
+    /// otherwise strand a waiter that never returns.
+    pub fn begin_wait(&self) -> BackpressureWaitGuard<'_> {
+        self.active_count.fetch_add(1, Ordering::Relaxed);
+        BackpressureWaitGuard(self)
+    }
+
+    /// Get the completed-wait count.
     pub fn count(&self) -> u64 {
         self.total_count.load(Ordering::Relaxed)
     }
 
-    /// Get the total time spent waiting on backpressure.
+    /// Get the total time completed waits spent parked.
     pub fn total_wait_ms(&self) -> u64 {
         self.total_wait_ms.load(Ordering::Relaxed)
     }
@@ -660,17 +670,34 @@ impl BackpressureStats {
         BackpressureStatsSnapshot {
             total_count: self.total_count.load(Ordering::Relaxed),
             total_wait_ms: self.total_wait_ms.load(Ordering::Relaxed),
+            active_count: self.active_count.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// Keeps its writer counted in `active_count` for as long as it is held.
+#[derive(Debug)]
+pub struct BackpressureWaitGuard<'a>(&'a BackpressureStats);
+
+impl Drop for BackpressureWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.active_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 /// Snapshot of backpressure statistics.
 #[derive(Debug, Clone, Default)]
 pub struct BackpressureStatsSnapshot {
-    /// Total number of times backpressure was applied.
+    /// Number of waits that have *finished*. A wait in progress is not counted
+    /// here, and a cancelled one never is.
     pub total_count: u64,
-    /// Total time spent waiting on backpressure (in milliseconds).
+    /// Total time finished waits spent parked (in milliseconds), on the same
+    /// denominator as `total_count`.
     pub total_wait_ms: u64,
+    /// Writers parked right now. This is the field that answers "am I being
+    /// throttled at this instant" — the totals only move once a wait ends, so
+    /// they read zero throughout a first, still-ongoing stall.
+    pub active_count: u64,
 }
 
 /// Backpressure controller for managing write flow.
@@ -713,6 +740,9 @@ impl BackpressureController {
     {
         let start = std::time::Instant::now();
         let mut iteration = 0u32;
+        // Held for the whole stall so an operator polling mid-wait sees it; the
+        // totals below cannot, since they only move once the wait ends.
+        let mut active_wait = None;
 
         loop {
             let (unflushed_memtable_bytes, oldest_watcher) = get_state();
@@ -727,6 +757,9 @@ impl BackpressureController {
             }
 
             iteration += 1;
+            if active_wait.is_none() {
+                active_wait = Some(self.stats.begin_wait());
+            }
 
             debug!(
                 "Backpressure triggered: unflushed_bytes={}, max={}, iteration={}",
@@ -2428,7 +2461,15 @@ impl ShardWriter {
             pending_wal_row_count: pending_wal.row_count,
             pending_wal_estimated_bytes: pending_wal.estimated_bytes,
             frozen_count: state.frozen_memtables.len(),
-            frozen_bytes: state.frozen_memtable_bytes,
+            // Summed from the read view rather than read off `frozen_memtable_bytes`:
+            // that counter drains on flush *completion* so a failure cannot wedge
+            // writes, which would report zero for a table still sitting in memory.
+            frozen_bytes: state
+                .frozen_memtables
+                .iter()
+                .filter(|frozen| frozen.flushed_at_ms.is_none())
+                .map(|frozen| frozen.memtable.estimated_size())
+                .sum(),
         })
     }
 
@@ -2861,10 +2902,15 @@ pub struct MemTableStats {
     /// Frozen memtables in the read view: sealed-awaiting-flush, plus flushed
     /// ones still inside `frozen_memtable_grace`.
     pub frozen_count: usize,
-    /// Heap bytes still owed to flush. Drains on flush commit, so unlike
-    /// `frozen_count` it excludes in-grace tables. Plus the active memtable's
-    /// `estimated_size`, this is what backpressure meters against
-    /// `max_unflushed_memtable_bytes`.
+    /// Heap bytes still owed to flush: frozen memtables awaiting a first flush,
+    /// plus any left resident by a failed one. Drains on flush commit, so unlike
+    /// `frozen_count` it excludes in-grace tables.
+    ///
+    /// Plus the active memtable's `estimated_size`, this is roughly what
+    /// backpressure meters against `max_unflushed_memtable_bytes` — but only
+    /// roughly: backpressure's own counter drains whenever a flush *completes*,
+    /// so bytes stranded by a failed flush stay visible here while no longer
+    /// throttling writes.
     pub frozen_bytes: usize,
 }
 
@@ -4823,6 +4869,7 @@ mod tests {
         let stats = writer.backpressure_stats();
         assert_eq!(stats.total_count, 0);
         assert_eq!(stats.total_wait_ms, 0);
+        assert_eq!(stats.active_count, 0);
 
         writer.close().await.unwrap();
     }
@@ -5328,6 +5375,92 @@ mod tests {
         assert_eq!(call_count.load(std::sync::atomic::Ordering::Relaxed), 4);
         // Should have recorded backpressure wait time (waited 3 times)
         assert_eq!(controller.stats().count(), 1);
+        assert_eq!(
+            controller.stats().snapshot().active_count,
+            0,
+            "the wait is over, so nobody is parked"
+        );
+    }
+
+    /// The totals only move when a wait ends, so a first stall would be
+    /// invisible to a poller if `active_count` did not report it live.
+    #[tokio::test]
+    async fn test_backpressure_in_progress_wait_is_observable() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        use std::time::Duration;
+
+        let config = ShardWriterConfig::default()
+            .with_max_unflushed_memtable_bytes(100)
+            .with_backpressure_log_interval(Duration::from_millis(50));
+
+        let controller = BackpressureController::new(config);
+        let stats = controller.stats().clone();
+
+        let unflushed = Arc::new(AtomicUsize::new(1000));
+        let release = unflushed.clone();
+
+        let parked =
+            controller.maybe_apply_backpressure(|| (unflushed.load(AtomicOrdering::Relaxed), None));
+
+        let observer = async {
+            // Bounded so a regression that never publishes the park fails here
+            // instead of hanging the suite.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while stats.snapshot().active_count == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "an ongoing wait was never published"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mid = stats.snapshot();
+            assert_eq!(mid.active_count, 1);
+            assert_eq!(
+                mid.total_count, 0,
+                "a wait still in progress is not a completed one"
+            );
+            assert_eq!(mid.total_wait_ms, 0);
+
+            release.store(0, AtomicOrdering::Relaxed);
+        };
+
+        let (result, ()) = tokio::join!(parked, observer);
+        result.unwrap();
+
+        let after = stats.snapshot();
+        assert_eq!(after.active_count, 0, "the guard drops when the wait ends");
+        assert_eq!(after.total_count, 1);
+    }
+
+    /// A `put` whose caller times out drops the wait future mid-park. The gauge
+    /// must come back down, or a cancelled writer is throttled forever on paper.
+    #[tokio::test]
+    async fn test_backpressure_cancelled_wait_does_not_leak_active_count() {
+        use std::time::Duration;
+
+        let config = ShardWriterConfig::default()
+            .with_max_unflushed_memtable_bytes(100)
+            .with_backpressure_log_interval(Duration::from_millis(50));
+
+        let controller = BackpressureController::new(config);
+
+        // Never drops below the threshold, so the timeout is what ends the wait.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                controller.maybe_apply_backpressure(|| (1000, None)),
+            )
+            .await
+            .is_err()
+        );
+
+        let after = controller.stats().snapshot();
+        assert_eq!(after.active_count, 0, "cancellation must release the guard");
+        assert_eq!(
+            after.total_count, 0,
+            "a cancelled wait never completed, so it is not a completed wait"
+        );
     }
 
     #[test]
@@ -7492,6 +7625,18 @@ mod tests {
             "retained sealed memtable must still hold its rows"
         );
         assert_eq!(refs.active.generation, initial_gen + 1);
+
+        // Nor did it vanish from the stats. Backpressure released these bytes on
+        // flush completion so the failure cannot wedge writes, but the memtable
+        // is still resident, and this snapshot is what an operator reads to
+        // decide whether to evict the shard.
+        let stats = writer_a.memtable_stats().await.unwrap();
+        assert_eq!(stats.frozen_count, 1);
+        assert!(
+            stats.frozen_bytes >= refs.frozen[0].batch_store.estimated_bytes(),
+            "a failed flush must keep owing its resident bytes, got {}",
+            stats.frozen_bytes
+        );
 
         writer_b.close().await.unwrap();
     }
