@@ -1385,7 +1385,11 @@ public class Dataset implements Closeable {
    * <p>The aggregation runs in native code and returns a fixed-size result, avoiding per-fragment
    * Java objects and arrays.
    *
+   * <p>Every fragment must contain enough metadata to determine its live row count. Some legacy
+   * datasets do not contain this metadata and are not supported by this method.
+   *
    * @return aggregate fragment statistics
+   * @throws RuntimeException if a fragment is missing required row-count metadata
    */
   public FragmentSummary getFragmentSummary() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

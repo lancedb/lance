@@ -789,12 +789,11 @@ impl IntoJava for FragmentSummary {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         Ok(env.new_object(
             "org/lance/FragmentSummary",
-            "(JJJJJJ)V",
+            "(JJJJJ)V",
             &[
                 JValue::Long(self.fragment_count as i64),
-                JValue::Long(self.min_rows_per_fragment.unwrap_or(0) as i64),
-                JValue::Long(self.max_rows_per_fragment.unwrap_or(0) as i64),
-                JValue::Long(self.unknown_row_count_fragment_count as i64),
+                JValue::Long(self.min_rows_per_fragment as i64),
+                JValue::Long(self.max_rows_per_fragment as i64),
                 JValue::Long(self.min_data_files_per_fragment as i64),
                 JValue::Long(self.max_data_files_per_fragment as i64),
             ],
@@ -1563,7 +1562,7 @@ fn inner_get_fragment_summary<'local>(
     let summary = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.inner.fragment_summary()
+        dataset.inner.fragment_summary()?
     };
     summary.into_java(env)
 }

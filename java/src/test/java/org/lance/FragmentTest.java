@@ -444,9 +444,8 @@ public class FragmentTest {
 
         FragmentSummary summary = dataset.getFragmentSummary();
         assertEquals(2, summary.getFragmentCount());
-        assertEquals(9, summary.getMinRowsPerFragment().orElseThrow(AssertionError::new));
-        assertEquals(21, summary.getMaxRowsPerFragment().orElseThrow(AssertionError::new));
-        assertEquals(0, summary.getUnknownRowCountFragmentCount());
+        assertEquals(9, summary.getMinRowsPerFragment());
+        assertEquals(21, summary.getMaxRowsPerFragment());
         assertEquals(1, summary.getMinDataFilesPerFragment());
         assertEquals(1, summary.getMaxDataFilesPerFragment());
       }
@@ -463,9 +462,8 @@ public class FragmentTest {
         assertEquals(0, dataset.getFragmentStatistics().size());
         FragmentSummary summary = dataset.getFragmentSummary();
         assertEquals(0, summary.getFragmentCount());
-        assertEquals(0, summary.getMinRowsPerFragment().orElseThrow(AssertionError::new));
-        assertEquals(0, summary.getMaxRowsPerFragment().orElseThrow(AssertionError::new));
-        assertEquals(0, summary.getUnknownRowCountFragmentCount());
+        assertEquals(0, summary.getMinRowsPerFragment());
+        assertEquals(0, summary.getMaxRowsPerFragment());
         assertEquals(0, summary.getMinDataFilesPerFragment());
         assertEquals(0, summary.getMaxDataFilesPerFragment());
       }
@@ -473,7 +471,7 @@ public class FragmentTest {
   }
 
   @Test
-  void testFragmentSummaryPreservesUnknownRowsFromHistoricalManifest() {
+  void testFragmentSummaryRejectsUnknownRowsFromHistoricalManifest() {
     String historicalPath =
         Path.of("..", "test_data", "v0.7.5", "with_deletions")
             .toAbsolutePath()
@@ -481,12 +479,9 @@ public class FragmentTest {
             .toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
         Dataset dataset = Dataset.open(historicalPath, allocator)) {
-      FragmentSummary summary = dataset.getFragmentSummary();
-      assertTrue(summary.getUnknownRowCountFragmentCount() > 0);
-      assertTrue(summary.getMinRowsPerFragment().isEmpty());
-      assertTrue(summary.getMaxRowsPerFragment().isEmpty());
-      assertTrue(summary.getMinDataFilesPerFragment() > 0);
-      assertTrue(summary.getMaxDataFilesPerFragment() > 0);
+      RuntimeException error = assertThrows(RuntimeException.class, dataset::getFragmentSummary);
+      assertTrue(error.getMessage().contains("Fragment summary requires"));
+      assertTrue(error.getMessage().contains("fragment"));
     }
   }
 }

@@ -22,12 +22,10 @@ use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 pub struct FragmentSummary {
     /// Number of fragments.
     pub fragment_count: u64,
-    /// Minimum number of live rows in a fragment, or `None` when any row count is unknown.
-    pub min_rows_per_fragment: Option<u64>,
-    /// Maximum number of live rows in a fragment, or `None` when any row count is unknown.
-    pub max_rows_per_fragment: Option<u64>,
-    /// Number of fragments whose live row count is unknown.
-    pub unknown_row_count_fragment_count: u64,
+    /// Minimum number of live rows in a fragment, or 0 when the dataset has no fragments.
+    pub min_rows_per_fragment: u64,
+    /// Maximum number of live rows in a fragment, or 0 when the dataset has no fragments.
+    pub max_rows_per_fragment: u64,
     /// Minimum number of data files in a fragment, or 0 when the dataset has no fragments.
     pub min_data_files_per_fragment: u64,
     /// Maximum number of data files in a fragment, or 0 when the dataset has no fragments.
@@ -36,26 +34,29 @@ pub struct FragmentSummary {
 
 impl Dataset {
     /// Aggregate fragment statistics from the loaded manifest in one pass.
-    pub fn fragment_summary(&self) -> FragmentSummary {
+    ///
+    /// Returns an error for legacy fragments that do not contain enough metadata to determine
+    /// their live row count.
+    pub fn fragment_summary(&self) -> Result<FragmentSummary> {
         summarize_fragments(self.fragments())
     }
 }
 
-fn summarize_fragments(fragments: &[lance_table::format::Fragment]) -> FragmentSummary {
+fn summarize_fragments(fragments: &[lance_table::format::Fragment]) -> Result<FragmentSummary> {
     let mut min_rows_per_fragment = u64::MAX;
     let mut max_rows_per_fragment = 0;
     let mut min_data_files_per_fragment = u64::MAX;
     let mut max_data_files_per_fragment = 0;
-    let mut unknown_row_count_fragment_count = 0;
 
     for fragment in fragments {
-        match fragment.num_rows() {
-            Some(live_rows) => {
-                min_rows_per_fragment = min_rows_per_fragment.min(live_rows as u64);
-                max_rows_per_fragment = max_rows_per_fragment.max(live_rows as u64);
-            }
-            None => unknown_row_count_fragment_count += 1,
-        }
+        let live_rows = fragment.num_rows().ok_or_else(|| {
+            Error::internal(format!(
+                "Fragment summary requires physical row count and deletion count in fragment metadata, but fragment {} is missing required row-count metadata. Rewrite the dataset with a current Lance version to populate it",
+                fragment.id
+            ))
+        })? as u64;
+        min_rows_per_fragment = min_rows_per_fragment.min(live_rows);
+        max_rows_per_fragment = max_rows_per_fragment.max(live_rows);
         let data_file_count = fragment.files.len() as u64;
         min_data_files_per_fragment = min_data_files_per_fragment.min(data_file_count);
         max_data_files_per_fragment = max_data_files_per_fragment.max(data_file_count);
@@ -66,19 +67,18 @@ fn summarize_fragments(fragments: &[lance_table::format::Fragment]) -> FragmentS
         min_data_files_per_fragment = 0;
     }
 
-    let row_counts_complete = unknown_row_count_fragment_count == 0;
-    FragmentSummary {
+    Ok(FragmentSummary {
         fragment_count: fragments.len() as u64,
-        min_rows_per_fragment: row_counts_complete.then_some(min_rows_per_fragment),
-        max_rows_per_fragment: row_counts_complete.then_some(max_rows_per_fragment),
-        unknown_row_count_fragment_count,
+        min_rows_per_fragment,
+        max_rows_per_fragment,
         min_data_files_per_fragment,
         max_data_files_per_fragment,
-    }
+    })
 }
 
 #[cfg(test)]
 mod fragment_summary_tests {
+    use lance_core::Error;
     use lance_file::version::ConcreteFileVersion;
     use lance_table::format::{DeletionFile, DeletionFileType, Fragment};
 
@@ -100,7 +100,7 @@ mod fragment_summary_tests {
     }
 
     #[test]
-    fn test_fragment_summary_preserves_unknown_row_counts() {
+    fn test_fragment_summary_rejects_unknown_row_counts() {
         let known = fragment(0, Some(10), 1);
         let unknown_physical_rows = fragment(1, None, 2);
         let mut unknown_deletions = fragment(2, Some(30), 3);
@@ -112,13 +112,14 @@ mod fragment_summary_tests {
             base_id: None,
         });
 
-        let summary = summarize_fragments(&[known, unknown_physical_rows, unknown_deletions]);
-        assert_eq!(summary.fragment_count, 3);
-        assert_eq!(summary.min_rows_per_fragment, None);
-        assert_eq!(summary.max_rows_per_fragment, None);
-        assert_eq!(summary.unknown_row_count_fragment_count, 2);
-        assert_eq!(summary.min_data_files_per_fragment, 1);
-        assert_eq!(summary.max_data_files_per_fragment, 3);
+        let physical_rows_error =
+            summarize_fragments(&[known.clone(), unknown_physical_rows]).unwrap_err();
+        assert!(matches!(&physical_rows_error, Error::Internal { .. }));
+        assert!(physical_rows_error.to_string().contains("fragment 1"));
+
+        let deletion_count_error = summarize_fragments(&[known, unknown_deletions]).unwrap_err();
+        assert!(matches!(&deletion_count_error, Error::Internal { .. }));
+        assert!(deletion_count_error.to_string().contains("fragment 2"));
     }
 
     #[test]
@@ -133,21 +134,19 @@ mod fragment_summary_tests {
         });
         let other = fragment(1, Some(20), 2);
 
-        let summary = summarize_fragments(&[deleted, other]);
-        assert_eq!(summary.min_rows_per_fragment, Some(6));
-        assert_eq!(summary.max_rows_per_fragment, Some(20));
-        assert_eq!(summary.unknown_row_count_fragment_count, 0);
+        let summary = summarize_fragments(&[deleted, other]).unwrap();
+        assert_eq!(summary.min_rows_per_fragment, 6);
+        assert_eq!(summary.max_rows_per_fragment, 20);
         assert_eq!(summary.min_data_files_per_fragment, 1);
         assert_eq!(summary.max_data_files_per_fragment, 2);
     }
 
     #[test]
     fn test_fragment_summary_empty() {
-        let summary = summarize_fragments(&[]);
+        let summary = summarize_fragments(&[]).unwrap();
         assert_eq!(summary.fragment_count, 0);
-        assert_eq!(summary.min_rows_per_fragment, Some(0));
-        assert_eq!(summary.max_rows_per_fragment, Some(0));
-        assert_eq!(summary.unknown_row_count_fragment_count, 0);
+        assert_eq!(summary.min_rows_per_fragment, 0);
+        assert_eq!(summary.max_rows_per_fragment, 0);
         assert_eq!(summary.min_data_files_per_fragment, 0);
         assert_eq!(summary.max_data_files_per_fragment, 0);
     }
