@@ -129,6 +129,11 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+        ManifestLocationInfo manifest = Dataset.inspectLatestManifest(defaultPath);
+        assertEquals(dataset.version(), manifest.getVersion());
+        assertTrue(manifest.getPath().endsWith(".manifest"));
+        assertTrue(manifest.getSizeBytes() > 0);
+        assertNotNull(manifest.getNamingScheme());
       }
 
       // Test LEGACY version

@@ -484,6 +484,36 @@ public class Dataset implements Closeable {
       boolean namespaceClientManagedVersioning);
 
   /**
+   * Resolve metadata for the latest manifest without reading or deserializing its contents.
+   *
+   * @param uri dataset URI
+   * @return metadata for the latest manifest
+   */
+  public static ManifestLocationInfo inspectLatestManifest(String uri) {
+    return inspectLatestManifest(uri, new HashMap<>());
+  }
+
+  /**
+   * Resolve metadata for the latest manifest without reading or deserializing its contents.
+   *
+   * <p>The supplied storage options are used to construct the object store. A metadata request is
+   * made only when the commit handler did not already provide the manifest size.
+   *
+   * @param uri dataset URI
+   * @param storageOptions object-store credentials and connection options
+   * @return metadata for the latest manifest
+   */
+  public static ManifestLocationInfo inspectLatestManifest(
+      String uri, Map<String, String> storageOptions) {
+    Preconditions.checkNotNull(uri, "uri must not be null");
+    Preconditions.checkNotNull(storageOptions, "storageOptions must not be null");
+    return inspectLatestManifestNative(uri, storageOptions);
+  }
+
+  private static native ManifestLocationInfo inspectLatestManifestNative(
+      String uri, Map<String, String> storageOptions);
+
+  /**
    * Creates a builder for opening a dataset.
    *
    * <p>This builder supports opening datasets either directly from a URI or from a LanceNamespace.

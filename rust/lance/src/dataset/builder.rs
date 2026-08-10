@@ -21,11 +21,11 @@ use lance_namespace::models::DescribeTableRequest;
 use lance_table::{
     format::{Manifest, populate_manifest_schema_dictionaries},
     io::commit::external_manifest::ExternalManifestCommitHandler,
-    io::commit::{CommitHandler, commit_handler_from_url},
+    io::commit::{CommitHandler, ManifestLocation, commit_handler_from_url},
 };
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
-use object_store::{DynObjectStore, path::Path};
+use object_store::{DynObjectStore, ObjectStoreExt, path::Path};
 use prost::Message;
 use tracing::{info, instrument};
 use url::Url;
@@ -597,6 +597,23 @@ impl DatasetBuilder {
             };
 
         Ok((object_store, base_path, commit_handler))
+    }
+
+    /// Resolve metadata for the latest manifest without reading its contents.
+    ///
+    /// This locates the latest manifest and performs a metadata request only when the commit
+    /// handler did not already provide the object size.
+    pub async fn latest_manifest_location(self) -> Result<ManifestLocation> {
+        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+        let mut location = commit_handler
+            .resolve_latest_location(&base_path, object_store.as_ref())
+            .await?;
+        if location.size.is_none() {
+            let metadata = object_store.inner.head(&location.path).await?;
+            location.size = Some(metadata.size);
+            location.e_tag = metadata.e_tag;
+        }
+        Ok(location)
     }
 
     #[instrument(skip_all)]
