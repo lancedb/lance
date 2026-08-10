@@ -193,11 +193,9 @@ pub fn null_columns(
 
 /// Force `plan` to report exactly `target_schema`; a no-op when they agree.
 ///
-/// A `ProjectionExec` cannot do this on its own — DataFusion derives its field
-/// nullability from the expressions, not from the schema the planner asked for
-/// — and the storage schema's widened non-PK columns leave the WAL arms
-/// disagreeing with the base arm, which `CoalesceFirstExec` and
-/// `concat_batches` both reject.
+/// `ProjectionExec` derives its nullability from the expressions, so the
+/// storage schema's widened columns leave the WAL arms disagreeing with the
+/// base arm — which `CoalesceFirstExec` and `concat_batches` both reject.
 pub(super) fn force_schema(
     plan: Arc<dyn ExecutionPlan>,
     target_schema: &SchemaRef,
@@ -261,8 +259,7 @@ mod tests {
         ]))
     }
 
-    /// [`schema`] with `id` widened, as `relax_non_pk_nullability` leaves a
-    /// shard's storage schema.
+    /// [`schema`] as `relax_non_pk_nullability` would leave it: `id` widened.
     fn widened_schema() -> SchemaRef {
         Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, true),
@@ -378,8 +375,8 @@ mod tests {
 
     #[test]
     fn project_to_canonical_reports_the_target_schema() {
-        // The ProjectionExec alone would report `id` as nullable, following its
-        // input; the relabel is what pins the output to the target.
+        // The ProjectionExec alone would follow its input and report `id` as
+        // nullable; the relabel is what pins the output to the target.
         let target = schema();
         let plan = project_to_canonical(plan_emitting(widened_schema()), &target).unwrap();
         assert_eq!(plan.schema(), target);

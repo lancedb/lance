@@ -902,9 +902,8 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
-                    // Re-label every replayed entry to the current storage
-                    // schema; entries written before deletes existed also need
-                    // `_tombstone = false` injected.
+                    // Re-label to the current storage schema; entries written
+                    // before deletes existed also need `_tombstone = false`.
                     let storage_schema = active.schema().clone();
                     let batches = entry
                         .batches
@@ -1046,12 +1045,11 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
 }
 
 /// Re-label `batch` to the storage schema, injecting `_tombstone = false` when
-/// the column is absent — callers pass logical-shaped batches, and WAL entries
-/// written before deletes existed lack it.
+/// absent — callers pass logical-shaped batches, and WAL entries written before
+/// deletes existed lack the column.
 ///
-/// A batch that already carries `_tombstone` is re-labeled rather than passed
-/// through, so an entry written under an older storage schema replays into the
-/// current one.
+/// A batch that already carries `_tombstone` is re-labeled too, so an entry
+/// written under an older storage schema replays into the current one.
 fn ensure_tombstone_column(
     batch: RecordBatch,
     storage_schema: &Arc<ArrowSchema>,
@@ -1072,10 +1070,10 @@ fn ensure_tombstone_column(
 /// Build a tombstone batch from a key-only `keys` batch: primary keys carried
 /// through, `_tombstone` true, every other column null.
 ///
-/// The storage schema's non-PK columns are nullable whatever the base table
-/// declares — that is what lets a table with non-nullable columns have
-/// tombstones at all. Primary keys stay non-nullable, so the `RecordBatch`
-/// validation below still rejects a null, mistyped, or missing key.
+/// Non-PK columns are nullable in the storage schema however the base table
+/// declares them — that is what lets a strict table have tombstones at all.
+/// Primary keys are not, so the validation below still rejects a null,
+/// mistyped, or missing key.
 fn build_tombstone_batch(
     keys: &RecordBatch,
     storage_schema: &Arc<ArrowSchema>,
@@ -1501,10 +1499,10 @@ pub struct ShardWriter {
     stats: SharedWriteStats,
     mode: WriterMode,
     /// The base table's schema as the caller passed it — no `_tombstone`,
-    /// nullability untouched. Caller input is held to this and the scan path
-    /// narrows back to it; the memtable, WAL, and SSTables carry the widened
-    /// storage schema ([`relax_non_pk_nullability`]) instead. See
-    /// [`Self::validate_against_logical_schema`].
+    /// nullability untouched. Caller input is held to it (see
+    /// [`Self::validate_against_logical_schema`]) and the scan narrows back to
+    /// it; the memtable, WAL, and SSTables carry the widened storage schema
+    /// ([`relax_non_pk_nullability`]) instead.
     logical_schema: Arc<ArrowSchema>,
 }
 
@@ -1545,9 +1543,8 @@ impl ShardWriter {
         }
 
         // The caller's schema is the shard's logical schema; the storage schema
-        // is derived from it below, once the primary key is known. lance owns
-        // `_tombstone` and appends it here — idempotent, so a reopen that
-        // already extended the schema is a no-op.
+        // is derived below, once the primary key is known. lance owns
+        // `_tombstone` and appends it here — idempotent across reopens.
         let logical_schema = schema;
         let tombstoned = schema_with_tombstone(&logical_schema);
 
@@ -1584,8 +1581,7 @@ impl ShardWriter {
             )?;
 
             // Widen only now that the primary key is known — a tombstone nulls
-            // every non-PK column. `unenforced_primary_key` above ran against
-            // the logical schema, which is what enforces non-nullable PKs.
+            // every non-PK column, and PK detection needs the strict schema.
             let storage_schema = relax_non_pk_nullability(&tombstoned, &pk_columns);
             Some((pk_field_ids, pk_columns, storage_schema))
         } else {
@@ -2120,25 +2116,21 @@ impl ShardWriter {
     }
 
     /// Reject caller input that violates the logical schema: wrong column names,
-    /// order, count, or types, or a null in a column the base table declares
+    /// order, count, or types, or a null where the base table declares
     /// non-nullable.
     ///
-    /// The *only* gate on that contract. The storage schema no longer rejects a
-    /// caller's null, and nothing downstream does either — append and
-    /// `merge_insert` compare schemas with `NullabilityComparison::Ignore`, and
-    /// the encoder takes validity from the array, not the field — so a null that
-    /// gets past here reaches the base table silently.
+    /// The *only* gate on that contract — the storage schema accepts the null,
+    /// append and `merge_insert` compare with `NullabilityComparison::Ignore`,
+    /// and the encoder takes validity from the array, not the field — so a null
+    /// that gets past here reaches the base table silently.
     ///
-    /// Runs before the WAL append: a batch rejected only after being appended
-    /// would fail identically on every replay, leaving the shard unable to
-    /// reopen.
+    /// Runs before the WAL append: a batch rejected only afterwards would fail
+    /// identically on every replay, leaving the shard unable to reopen.
     fn validate_against_logical_schema(&self, batches: &[RecordBatch]) -> Result<()> {
         for (i, batch) in batches.iter().enumerate() {
-            // Names first: everything after this point matches columns by
-            // position — `try_new` compares bare arrays, and
-            // `ensure_tombstone_column` re-labels positionally — so a pair of
-            // same-typed columns handed over swapped would be stored under each
-            // other's name.
+            // Everything downstream matches columns by position, so a swapped
+            // pair of same-typed columns would be stored under each other's
+            // names unless caught here.
             for (col, (expected, actual)) in self
                 .logical_schema
                 .fields()

@@ -756,13 +756,13 @@ fn cols_with_tombstone(cols: &[String], present: bool) -> Vec<String> {
     out
 }
 
-/// Carry schema = canonical output at the storage schema's nullability, plus a
-/// trailing non-nullable `_tombstone` Boolean.
+/// Carry schema = canonical output widened to the storage schema's
+/// nullability, plus a trailing non-nullable `_tombstone` Boolean.
 ///
 /// Widened because tombstone rows — null in every non-PK column — are still in
-/// flight here; [`filter_tombstones_after_coalesce`] drops them on the far side
-/// of `CoalesceFirstExec`, and the narrowing back to the logical schema happens
-/// after that. `_tombstone` stays non-nullable so the base arm's synthesized
+/// flight; [`filter_tombstones_after_coalesce`] drops them past
+/// `CoalesceFirstExec`, and only then does the plan narrow back to the logical
+/// schema. `_tombstone` stays non-nullable so the base arm's synthesized
 /// `Literal(false)` matches the WAL arms' real column under
 /// `CoalesceFirstExec`'s exact-schema check.
 fn carry_schema(canonical: &SchemaRef, pk_columns: &[String]) -> SchemaRef {

@@ -78,17 +78,15 @@ pub fn tombstone_field() -> ArrowField {
 /// widening every top-level field to nullable except the primary key and
 /// `_tombstone`.
 ///
-/// A tombstone carries the primary key and null in every other column, so the
-/// memtable, WAL entries, and SSTables must permit a null wherever the base
-/// table does not. The logical schema stays the caller's contract:
-/// [`write::ShardWriter::put`] validates against it and the scan path narrows
-/// back to it.
+/// A tombstone carries the primary key and null everywhere else, so storage
+/// must permit a null wherever the base table does not. The logical schema
+/// stays the caller's contract — validated at [`write::ShardWriter::put`],
+/// restored at the scan's egress.
 ///
-/// Top-level only — Arrow validates nullability only at the top level of a
-/// `RecordBatch`, so a vector column's item field gains no validity layer.
-/// Primary keys are excluded because [`lance_core::datatypes::Schema`] requires
-/// them to be non-nullable and a tombstone always carries a real key;
-/// `_tombstone` because the write path always populates it. Idempotent.
+/// Top-level only: Arrow validates nullability only there, so a vector column's
+/// item field is untouched. The primary key is excluded because
+/// [`lance_core::datatypes::Schema`] requires it non-nullable, `_tombstone`
+/// because the write path always populates it. Idempotent.
 pub fn relax_non_pk_nullability(
     logical_schema: &ArrowSchema,
     pk_columns: &[String],

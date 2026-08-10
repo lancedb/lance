@@ -20,19 +20,14 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt};
 
 /// Re-labels every batch to an exact target schema, leaving the arrays
-/// untouched.
+/// untouched. `ProjectionExec` cannot: DataFusion derives output nullability
+/// from the expressions, not from the schema the planner intended.
 ///
-/// A shard's storage schema widens non-PK columns to nullable (see
-/// `relax_non_pk_nullability`), so plan arms disagree with the base-table arm on
-/// nullability alone. `ProjectionExec` cannot pin this down: DataFusion derives
-/// its output nullability from the expressions, not from the schema the planner
-/// intended.
-///
-/// Used both ways: **widening**, so arms agree before `UnionExec` /
-/// `CoalesceFirstExec`; and **narrowing** at the scan's output boundary, back to
-/// the logical schema. Narrowing doubles as the tombstone-leak check —
-/// `RecordBatch::try_new` rejects a null in a non-nullable column, so a leak
-/// errors instead of reaching the caller.
+/// **Widening** makes a shard's storage schema (see `relax_non_pk_nullability`)
+/// agree with the base-table arm before `UnionExec` / `CoalesceFirstExec`.
+/// **Narrowing** restores the logical schema at the scan's output boundary and
+/// doubles as the tombstone-leak check, since `RecordBatch` validation rejects
+/// a null in a non-nullable column.
 #[derive(Debug)]
 pub struct SchemaRelabelExec {
     input: Arc<dyn ExecutionPlan>,
@@ -41,10 +36,9 @@ pub struct SchemaRelabelExec {
 }
 
 impl SchemaRelabelExec {
-    /// Wrap `input` so its batches are re-labeled to `schema`, which the caller
-    /// must keep column-compatible (same count, order, and data types); only
-    /// names, nullability, and metadata may differ. A mismatch surfaces per
-    /// batch at execution time, not at plan time.
+    /// Wrap `input` so its batches are re-labeled to `schema`: same column
+    /// count, order, and data types; only names, nullability, and metadata may
+    /// differ. A mismatch surfaces per batch at execution time, not plan time.
     pub fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -127,9 +121,8 @@ impl Stream for SchemaRelabelStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                // Carry the row count explicitly, so a column-less batch keeps
-                // its rows: `try_new` infers the count from the first column and
-                // errors when there is none.
+                // Carry the row count explicitly: `try_new` infers it from the
+                // first column, which a column-less batch does not have.
                 let relabeled = RecordBatch::try_new_with_options(
                     self.schema.clone(),
                     batch.columns().to_vec(),
