@@ -161,16 +161,7 @@ impl FtsQueryNode for FtsQuery {
                 }
                 columns
             }
-            Self::Boolean(query) => {
-                let mut columns = HashSet::new();
-                for query in &query.must {
-                    columns.extend(query.columns());
-                }
-                for query in &query.should {
-                    columns.extend(query.columns());
-                }
-                columns
-            }
+            Self::Boolean(query) => query.columns(),
         }
     }
 }
@@ -200,6 +191,7 @@ impl FtsQuery {
             Self::Boolean(query) => {
                 query.must.iter().any(|q| q.is_missing_column())
                     || query.should.iter().any(|q| q.is_missing_column())
+                    || query.must_not.iter().any(|q| q.is_missing_column())
             }
         }
     }
@@ -964,6 +956,36 @@ pub fn fill_fts_query_column(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_boolean_query_introspection_includes_must_not() {
+        use super::*;
+
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("include".to_string())
+                    .with_column(Some("positive_text".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::MustNot,
+                MatchQuery::new("exclude".to_string()).into(),
+            ),
+        ]));
+
+        assert_eq!(
+            query.columns(),
+            HashSet::from(["positive_text".to_string()])
+        );
+        assert!(query.is_missing_column());
+
+        let filled = fill_fts_query_column(&query, &["negative_text".to_string()], false).unwrap();
+        assert_eq!(
+            filled.columns(),
+            HashSet::from(["positive_text".to_string(), "negative_text".to_string()])
+        );
+    }
+
     #[test]
     fn test_match_query_serde() {
         use super::*;
