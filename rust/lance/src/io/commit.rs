@@ -955,9 +955,12 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         if unsupported_index_version(index).is_some() {
             continue;
         }
+        // Also true when the bitmap is missing entirely, so the failure path below
+        // pairs it with `is_some` to mean "written before the 0.8.15 fix".
+        let bitmap_missing_or_legacy =
+            must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref());
         if needs_recalculating.contains(&index.name)
-            || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
-                && !is_system_index(index)
+            || bitmap_missing_or_legacy && !is_system_index(index)
         {
             // A covered index still has exactly one keyed field; the trailing
             // `covering_fields` are carried, not keyed, so counting them
@@ -985,17 +988,32 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                     index.fragment_bitmap = Some(fragment_bitmap);
                 }
                 Err(e) => {
-                    // The bitmap is optional metadata and recalculating it means
-                    // opening the index. Failing here fails every commit the
-                    // dataset takes, since migration runs on all of them, so keep
-                    // the coverage as it stands and leave the repair to a build
-                    // that can open the index.
+                    // Recalculating means opening the index, and failing here fails
+                    // every commit the dataset takes, since migration runs on all of
+                    // them. A missing bitmap and overlapping segment bitmaps are both
+                    // re-derived from the index metadata, so they ask again on their
+                    // own; the pre-0.8.15 trigger reads the previous manifest's writer
+                    // version, which this commit replaces with the current one, and a
+                    // bitmap left in place would look migrated from here on.
+                    let repair_ends_with_this_commit =
+                        index.fragment_bitmap.is_some() && bitmap_missing_or_legacy;
                     log::warn!(
-                        "Could not recalculate the fragment bitmap for index {} (uuid: {}): {}. Leaving its existing coverage in place.",
+                        "Could not recalculate the fragment bitmap for index {} (uuid: {}): {}. {}",
                         index.name,
                         index.uuid,
-                        e
+                        e,
+                        if repair_ends_with_this_commit {
+                            "Dropping its coverage to unknown so a build that can open the index recalculates it."
+                        } else {
+                            "Leaving the repair to a build that can open the index."
+                        }
                     );
+                    if repair_ends_with_this_commit {
+                        index.fragment_bitmap = None;
+                        // Derivation ran before this and may have credited a
+                        // catch-up position off the bitmap being dropped here.
+                        recovered_coverage.push(index.name.clone());
+                    }
                 }
             }
         }
@@ -2064,7 +2082,7 @@ mod tests {
         assert_eq!(
             coverage("id_idx"),
             None,
-            "an index that cannot be opened must keep the coverage it had"
+            "an index that cannot be opened must report unknown coverage"
         );
         assert_eq!(
             coverage("payload_idx"),
