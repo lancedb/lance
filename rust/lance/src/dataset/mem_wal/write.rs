@@ -143,7 +143,7 @@ pub struct ShardWriterConfig {
     /// This value is ignored because manifest discovery now uses an internal
     /// adaptive batch size. It is retained for source compatibility.
     #[deprecated(
-        since = "10.0.0",
+        since = "11.0.0",
         note = "manifest scan concurrency is managed internally and this field is ignored"
     )]
     pub manifest_scan_batch_size: usize,
@@ -382,7 +382,7 @@ impl ShardWriterConfig {
     /// is ignored.
     #[allow(deprecated)]
     #[deprecated(
-        since = "10.0.0",
+        since = "11.0.0",
         note = "manifest scan concurrency is managed internally and this method has no effect"
     )]
     pub fn with_manifest_scan_batch_size(mut self, size: usize) -> Self {
@@ -12380,6 +12380,8 @@ mod shard_writer_tests {
         );
         // Every tunable field is present.
         assert!(defaults.contains_key("enable_memtable"));
+        // The ignored legacy setting is no longer persisted as a writer default.
+        assert!(!defaults.contains_key("manifest_scan_batch_size"));
         // add_writer_config_default records arbitrary keys.
         assert_eq!(
             defaults.get("custom_knob").map(String::as_str),
