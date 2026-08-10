@@ -14,10 +14,15 @@
 //! ```
 //!
 //! The reader keeps several manifests in flight but stops launching reads once
-//! the estimated in-flight size reaches [`MANIFEST_MEMORY_BUDGET`]. A caller
-//! that holds every [`ScannedManifest`] it receives therefore stalls the walk
-//! rather than growing without bound; dropping each one after use is what keeps
-//! the pipeline moving.
+//! the estimated in-flight size reaches [`MANIFEST_MEMORY_BUDGET`]. The budget
+//! is charged for as long as the consumer holds a [`ScannedManifest`], so
+//! dropping each one after use is what keeps the pipeline moving.
+//!
+//! The bound is on the reader's prefetch, not on what a consumer chooses to
+//! retain: one read is always allowed when nothing is in flight, so a consumer
+//! that holds every manifest degrades the walk to serial reads rather than
+//! stopping it. That escape hatch is what keeps a manifest larger than the whole
+//! budget from deadlocking the walk.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,14 +87,25 @@ pub struct ManifestScan {
     /// Number of manifests the walk will yield. Set once listing finishes, so a
     /// consumer reading it mid-walk may still see `None`.
     pub total: Arc<std::sync::OnceLock<usize>>,
-    /// Estimated in-memory bytes of the manifests the reader and the consumer
-    /// hold right now. Returns to zero once every [`ScannedManifest`] is
-    /// dropped, which is what lets the reader keep launching reads.
-    ///
-    /// Only the tests read this; production consumers rely on the budget
-    /// implicitly, by dropping each manifest after use.
+    /// Estimated in-memory bytes the reader has read and the consumer has not
+    /// yet dropped. Test-only: production consumers rely on the budget
+    /// implicitly, by dropping each manifest after use, so keeping this in
+    /// release builds would be a field nothing reads.
     #[cfg(test)]
-    pub inflight_bytes: Arc<AtomicUsize>,
+    inflight_bytes: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl ManifestScan {
+    /// Estimated in-memory bytes currently charged against the budget.
+    fn inflight_bytes(&self) -> usize {
+        self.inflight_bytes.load(Ordering::Acquire)
+    }
+
+    /// The budget counter itself, for assertions that outlive `stream`.
+    fn inflight_handle(&self) -> Arc<AtomicUsize> {
+        self.inflight_bytes.clone()
+    }
 }
 
 /// Walk every present manifest of `dataset`.
@@ -177,6 +193,9 @@ fn spawn_lister(
 }
 
 /// Reads manifests with memory-aware parallelism.
+///
+/// Read failures travel as `Err` items in the stream rather than ending the
+/// walk, so this task itself is infallible.
 fn spawn_reader(
     object_store: Arc<lance_io::object_store::ObjectStore>,
     base: Path,
@@ -187,83 +206,76 @@ fn spawn_reader(
 ) {
     let inflight_mem = inflight_mem.clone();
     tokio::spawn(async move {
-        let result: Result<()> = async {
-            let max_parallelism = object_store.io_parallelism();
-            type ScanResult = Result<ScannedManifest>;
-            let mut in_flight: FuturesUnordered<
-                std::pin::Pin<Box<dyn Future<Output = ScanResult> + Send>>,
-            > = FuturesUnordered::new();
-            let mut locations_exhausted = false;
+        let max_parallelism = object_store.io_parallelism();
+        type ScanResult = Result<ScannedManifest>;
+        let mut in_flight: FuturesUnordered<
+            std::pin::Pin<Box<dyn Future<Output = ScanResult> + Send>>,
+        > = FuturesUnordered::new();
+        let mut locations_exhausted = false;
 
-            loop {
-                // Always allow one read even when over budget, or a single
-                // manifest larger than the budget would deadlock the walk.
-                let can_launch = !locations_exhausted
-                    && in_flight.len() < max_parallelism
-                    && (in_flight.is_empty()
-                        || inflight_mem.load(Ordering::Acquire) < MANIFEST_MEMORY_BUDGET);
+        loop {
+            // Always allow one read even when over budget, or a single
+            // manifest larger than the budget would deadlock the walk.
+            let can_launch = !locations_exhausted
+                && in_flight.len() < max_parallelism
+                && (in_flight.is_empty()
+                    || inflight_mem.load(Ordering::Acquire) < MANIFEST_MEMORY_BUDGET);
 
-                if in_flight.is_empty() && !can_launch {
-                    break;
-                }
-
-                tokio::select! {
-                    biased;
-                    // Always drain completed reads first.
-                    Some(scanned) = in_flight.next(), if !in_flight.is_empty() => {
-                        if tx_manifest.send(scanned).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                    location = rx_locations.recv(), if can_launch => {
-                        match location {
-                            Some(location) => {
-                                let estimated = location.size.unwrap_or(0) as usize
-                                    * MANIFEST_DECOMPRESSION_RATIO;
-                                inflight_mem.fetch_add(estimated, Ordering::AcqRel);
-                                let permit = MemoryPermit {
-                                    bytes: estimated,
-                                    inflight: inflight_mem.clone(),
-                                    notify: mem_notify.clone(),
-                                };
-
-                                let object_store = object_store.clone();
-                                let base = base.clone();
-                                in_flight.push(Box::pin(async move {
-                                    let manifest = read_manifest(
-                                        &object_store,
-                                        &location.path,
-                                        location.size,
-                                    )
-                                    .await?;
-                                    let indexes = read_manifest_indexes(
-                                        &object_store,
-                                        &location,
-                                        &manifest,
-                                    )
-                                    .await?;
-                                    Ok(ScannedManifest {
-                                        manifest: Arc::new(manifest),
-                                        manifest_path: remove_prefix(&location.path, &base)
-                                            .to_string(),
-                                        indexes,
-                                        _permit: permit,
-                                    })
-                                }));
-                            }
-                            None => locations_exhausted = true,
-                        }
-                    }
-                    // Wake up when a consumer frees budget by dropping a manifest.
-                    _ = mem_notify.notified(), if !can_launch && !in_flight.is_empty() => {}
-                }
+            if in_flight.is_empty() && !can_launch {
+                break;
             }
-            Ok(())
-        }
-        .await;
 
-        if let Err(error) = result {
-            let _ = tx_manifest.send(Err(error)).await;
+            tokio::select! {
+                biased;
+                // Always drain completed reads first.
+                Some(scanned) = in_flight.next(), if !in_flight.is_empty() => {
+                    // The consumer went away; stop reading.
+                    if tx_manifest.send(scanned).await.is_err() {
+                        return;
+                    }
+                }
+                location = rx_locations.recv(), if can_launch => {
+                    match location {
+                        Some(location) => {
+                            let estimated = location.size.unwrap_or(0) as usize
+                                * MANIFEST_DECOMPRESSION_RATIO;
+                            inflight_mem.fetch_add(estimated, Ordering::AcqRel);
+                            let permit = MemoryPermit {
+                                bytes: estimated,
+                                inflight: inflight_mem.clone(),
+                                notify: mem_notify.clone(),
+                            };
+
+                            let object_store = object_store.clone();
+                            let base = base.clone();
+                            in_flight.push(Box::pin(async move {
+                                let manifest = read_manifest(
+                                    &object_store,
+                                    &location.path,
+                                    location.size,
+                                )
+                                .await?;
+                                let indexes = read_manifest_indexes(
+                                    &object_store,
+                                    &location,
+                                    &manifest,
+                                )
+                                .await?;
+                                Ok(ScannedManifest {
+                                    manifest: Arc::new(manifest),
+                                    manifest_path: remove_prefix(&location.path, &base)
+                                        .to_string(),
+                                    indexes,
+                                    _permit: permit,
+                                })
+                            }));
+                        }
+                        None => locations_exhausted = true,
+                    }
+                }
+                // Wake up when a consumer frees budget by dropping a manifest.
+                _ = mem_notify.notified(), if !can_launch && !in_flight.is_empty() => {}
+            }
         }
     });
 }
@@ -300,50 +312,43 @@ mod tests {
     #[tokio::test]
     async fn budget_returns_to_zero_after_consuming() {
         let dataset = dataset_with_three_versions("memory://scan_budget_zero").await;
-        let ManifestScan {
-            mut stream,
-            inflight_bytes,
-            ..
-        } = scan_manifests(&dataset, None);
+        let mut scan = scan_manifests(&dataset, None);
 
         let mut seen = 0usize;
-        while let Some(scanned) = stream.next().await {
+        while let Some(scanned) = scan.stream.next().await {
             scanned.unwrap();
             seen += 1;
         }
 
         assert_eq!(seen, 3, "expected every present manifest");
         assert_eq!(
-            inflight_bytes.load(Ordering::Acquire),
+            scan.inflight_bytes(),
             0,
             "dropping every ScannedManifest must return the whole budget"
         );
     }
 
-    /// Holding manifests keeps the budget charged. That is the backpressure
-    /// signal the reader waits on, so a consumer that hoards stalls the walk
-    /// instead of growing without bound.
+    /// Holding manifests keeps the budget charged, which is the signal the
+    /// reader throttles on. It does not stop the walk: one read is always
+    /// allowed when nothing is in flight, so a hoarding consumer gets serial
+    /// reads rather than a stall.
     #[tokio::test]
     async fn holding_manifests_keeps_budget_charged() {
         let dataset = dataset_with_three_versions("memory://scan_budget_held").await;
-        let ManifestScan {
-            mut stream,
-            inflight_bytes,
-            ..
-        } = scan_manifests(&dataset, None);
+        let mut scan = scan_manifests(&dataset, None);
 
         let mut held = Vec::new();
-        while let Some(scanned) = stream.next().await {
+        while let Some(scanned) = scan.stream.next().await {
             held.push(scanned.unwrap());
         }
         assert!(
-            inflight_bytes.load(Ordering::Acquire) > 0,
+            scan.inflight_bytes() > 0,
             "held manifests must still be charged against the budget"
         );
 
         drop(held);
         assert_eq!(
-            inflight_bytes.load(Ordering::Acquire),
+            scan.inflight_bytes(),
             0,
             "the budget must come back when the consumer lets go"
         );
@@ -362,6 +367,115 @@ mod tests {
         }
 
         assert_eq!(versions, vec![3], "min_version must drop versions 1 and 2");
+    }
+
+    /// Dropping the stream early must not leave the reader running: the closed
+    /// channel is what tells it to stop. Observed through the budget returning
+    /// to zero, which happens only once every in-flight permit is released.
+    #[tokio::test]
+    async fn dropping_the_stream_releases_every_permit() {
+        let dataset = dataset_with_three_versions("memory://scan_drop_early").await;
+        let scan = scan_manifests(&dataset, None);
+        // Keep the budget handle after the stream goes away.
+        let inflight = scan.inflight_handle();
+        let mut stream = scan.stream;
+
+        // Hold the first manifest so the budget is provably charged. Without
+        // this the assertion below could pass on a walk that never charged
+        // anything.
+        let first = stream.next().await.expect("at least one manifest").unwrap();
+        assert!(
+            inflight.load(Ordering::Acquire) > 0,
+            "holding a manifest must charge the budget"
+        );
+
+        // Drop the stream while the walk may still have reads in flight, then
+        // release our own manifest.
+        drop(stream);
+        drop(first);
+
+        // The reader unwinds asynchronously, so poll rather than assume it has
+        // already observed the closed channel. Ten seconds is far longer than
+        // this needs locally and is only here so a loaded machine reports a
+        // real failure instead of a flake.
+        let mut released = false;
+        for _ in 0..1000 {
+            if inflight.load(Ordering::Acquire) == 0 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "dropping the stream must release every in-flight permit; \
+             timed out waiting for the reader to unwind"
+        );
+    }
+
+    /// A manifest that cannot be read surfaces as an `Err` item in the stream
+    /// rather than being skipped. A skipped manifest would make the walk
+    /// silently incomplete, which for a deletion predicate means authorizing the
+    /// deletion of files only that manifest still references. The reader keeps
+    /// going after a failure; it is the consumer that decides whether to stop.
+    #[tokio::test]
+    async fn read_failure_surfaces_as_an_error_item() {
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::dataset::{ObjectStoreParams, ReadParams};
+        use crate::utils::test::FailingProxyStore;
+
+        // A real store, not `memory://`: the failing proxy wraps the store, and
+        // re-opening with a wrapper changes the registry cache key, so an
+        // in-memory reopen would land on a fresh empty store and lose the three
+        // versions this test needs.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        drop(dataset_with_three_versions(uri).await);
+
+        // Install the proxy at open time but arm it only afterwards: opening
+        // reads the latest manifest itself, so failing that read would break the
+        // open rather than the walk under test.
+        let failing = Arc::new(FailingProxyStore::new());
+        let dataset = DatasetBuilder::from_uri(uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        failing.fail_when("get_opts", "_versions", "injected manifest read failure");
+
+        let mut scan = scan_manifests(&dataset, None);
+        let mut errors = 0usize;
+        let mut successes = 0usize;
+        while let Some(scanned) = scan.stream.next().await {
+            match scanned {
+                Ok(_) => successes += 1,
+                Err(_) => errors += 1,
+            }
+        }
+
+        // One Err per manifest, not one for the whole walk: that is what pins
+        // the reader continuing after a failure. A listing failure would give a
+        // single Err instead, so this also proves the failure came from the
+        // reads rather than from listing.
+        assert_eq!(
+            successes, 0,
+            "no manifest read can succeed while every `_versions` read fails"
+        );
+        assert_eq!(
+            errors, 3,
+            "each of the three manifests must surface its own read error"
+        );
+        assert_eq!(
+            scan.inflight_bytes(),
+            0,
+            "a failed read must return its share of the budget"
+        );
     }
 
     /// The total is the number of manifests the walk will yield, available once

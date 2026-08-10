@@ -326,7 +326,7 @@ impl Dataset {
             let mut stream = stream;
             let mut processed = 0usize;
             while let Some(scanned) = stream.next().await {
-                let scanned = match scanned {
+                let mut scanned = match scanned {
                     Ok(scanned) => scanned,
                     Err(e) => {
                         let _ = tx_emitter
@@ -336,16 +336,6 @@ impl Dataset {
                     }
                 };
 
-                let version = scanned.manifest.version;
-                if !scanned.indexes.is_empty()
-                    && tx_indexes
-                        .send((version, scanned.indexes.clone()))
-                        .await
-                        .is_err()
-                {
-                    return;
-                }
-
                 let batches =
                     manifest_file_batches(&scanned.manifest, &uri_emitter, &scanned.manifest_path);
                 for batch_result in batches {
@@ -354,7 +344,18 @@ impl Dataset {
                         return;
                     }
                 }
+
+                // Fan out to the index lister only after this manifest's rows
+                // are out and its memory is released. Doing it earlier would
+                // block file-row output on a full index channel while still
+                // holding the manifest's share of the scan's memory budget.
+                let version = scanned.manifest.version;
+                let indexes = std::mem::take(&mut scanned.indexes);
                 drop(scanned);
+
+                if !indexes.is_empty() && tx_indexes.send((version, indexes)).await.is_err() {
+                    return;
+                }
 
                 processed += 1;
                 if let Some(ref cb) = progress_cb {
