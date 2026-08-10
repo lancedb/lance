@@ -1380,6 +1380,23 @@ public class Dataset implements Closeable {
   private native long[] nativeGetFragmentStatistics();
 
   /**
+   * Get aggregate statistics for all fragments in this dataset version.
+   *
+   * <p>The aggregation runs in native code and returns a fixed-size result, avoiding per-fragment
+   * Java objects and arrays.
+   *
+   * @return aggregate fragment statistics
+   */
+  public FragmentSummary getFragmentSummary() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetFragmentSummary();
+    }
+  }
+
+  private native FragmentSummary nativeGetFragmentSummary();
+
+  /**
    * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema

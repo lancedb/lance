@@ -17,6 +17,57 @@ use super::overlay::{collect_overlay_stale_frags, overlaid_fragments};
 use super::{Dataset, fragment::FileFragment};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
+/// Aggregate statistics for the fragments in a dataset version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentSummary {
+    /// Number of fragments.
+    pub fragment_count: u64,
+    /// Minimum number of live rows in a fragment, or 0 when the dataset has no fragments.
+    pub min_rows_per_fragment: u64,
+    /// Maximum number of live rows in a fragment, or 0 when the dataset has no fragments.
+    pub max_rows_per_fragment: u64,
+    /// Minimum number of data files in a fragment, or 0 when the dataset has no fragments.
+    pub min_data_files_per_fragment: u64,
+    /// Maximum number of data files in a fragment, or 0 when the dataset has no fragments.
+    pub max_data_files_per_fragment: u64,
+}
+
+impl Dataset {
+    /// Aggregate fragment statistics from the loaded manifest in one pass.
+    pub fn fragment_summary(&self) -> FragmentSummary {
+        let mut summary = FragmentSummary {
+            fragment_count: self.fragments().len() as u64,
+            min_rows_per_fragment: u64::MAX,
+            max_rows_per_fragment: 0,
+            min_data_files_per_fragment: u64::MAX,
+            max_data_files_per_fragment: 0,
+        };
+
+        for fragment in self.fragments().iter() {
+            let live_rows = fragment.physical_rows.unwrap_or(0).saturating_sub(
+                fragment
+                    .deletion_file
+                    .as_ref()
+                    .and_then(|deletion_file| deletion_file.num_deleted_rows)
+                    .unwrap_or(0),
+            ) as u64;
+            let data_file_count = fragment.files.len() as u64;
+            summary.min_rows_per_fragment = summary.min_rows_per_fragment.min(live_rows);
+            summary.max_rows_per_fragment = summary.max_rows_per_fragment.max(live_rows);
+            summary.min_data_files_per_fragment =
+                summary.min_data_files_per_fragment.min(data_file_count);
+            summary.max_data_files_per_fragment =
+                summary.max_data_files_per_fragment.max(data_file_count);
+        }
+
+        if summary.fragment_count == 0 {
+            summary.min_rows_per_fragment = 0;
+            summary.min_data_files_per_fragment = 0;
+        }
+        summary
+    }
+}
+
 /// Statistics about a single field in the dataset
 pub struct FieldStatistics {
     /// Id of the field

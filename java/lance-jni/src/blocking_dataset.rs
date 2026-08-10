@@ -35,7 +35,7 @@ use lance::dataset::cleanup::{
 };
 use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
+use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt, FragmentSummary};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
@@ -785,6 +785,22 @@ impl IntoJava for Version {
     }
 }
 
+impl IntoJava for FragmentSummary {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        Ok(env.new_object(
+            "org/lance/FragmentSummary",
+            "(JJJJJ)V",
+            &[
+                JValue::Long(self.fragment_count as i64),
+                JValue::Long(self.min_rows_per_fragment as i64),
+                JValue::Long(self.max_rows_per_fragment as i64),
+                JValue::Long(self.min_data_files_per_fragment as i64),
+                JValue::Long(self.max_data_files_per_fragment as i64),
+            ],
+        )?)
+    }
+}
+
 fn attach_native_dataset<'local>(
     env: &mut JNIEnv<'local>,
     dataset: BlockingDataset,
@@ -1529,6 +1545,26 @@ pub extern "system" fn Java_org_lance_Dataset_nativeGetFragmentStatistics<'a>(
     jdataset: JObject,
 ) -> JObject<'a> {
     ok_or_throw!(env, inner_get_fragment_statistics(&mut env, jdataset))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetFragmentSummary<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_fragment_summary(&mut env, jdataset))
+}
+
+fn inner_get_fragment_summary<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let summary = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.inner.fragment_summary()
+    };
+    summary.into_java(env)
 }
 
 /// Returns per-fragment statistics flattened as [id0, rowCount0, dataFileNum0, id1, ...].

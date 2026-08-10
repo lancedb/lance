@@ -441,6 +441,13 @@ public class FragmentTest {
             stats.getDataFileNums());
 
         assertEquals(30, Arrays.stream(stats.getRowCounts()).sum());
+
+        FragmentSummary summary = dataset.getFragmentSummary();
+        assertEquals(2, summary.getFragmentCount());
+        assertEquals(9, summary.getMinRowsPerFragment());
+        assertEquals(21, summary.getMaxRowsPerFragment());
+        assertEquals(1, summary.getMinDataFilesPerFragment());
+        assertEquals(1, summary.getMaxDataFilesPerFragment());
       }
     }
   }
@@ -453,6 +460,12 @@ public class FragmentTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(0, dataset.getFragmentStatistics().size());
+        FragmentSummary summary = dataset.getFragmentSummary();
+        assertEquals(0, summary.getFragmentCount());
+        assertEquals(0, summary.getMinRowsPerFragment());
+        assertEquals(0, summary.getMaxRowsPerFragment());
+        assertEquals(0, summary.getMinDataFilesPerFragment());
+        assertEquals(0, summary.getMaxDataFilesPerFragment());
       }
     }
   }
