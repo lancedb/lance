@@ -1568,6 +1568,22 @@ public class Dataset implements Closeable {
   private native boolean nativeHasStableRowIds();
 
   /**
+   * Get the library version that wrote the current manifest.
+   *
+   * <p>Older manifests may not contain writer version metadata.
+   *
+   * @return the current manifest writer version, or empty if unavailable
+   */
+  public Optional<WriterVersion> getWriterVersion() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeGetWriterVersion());
+    }
+  }
+
+  private native WriterVersion nativeGetWriterVersion();
+
+  /**
    * Get the Lance file format version of this dataset.
    *
    * <p>The returned string will be one of: "0.1" (legacy), "2.0", "2.1", or "2.2".

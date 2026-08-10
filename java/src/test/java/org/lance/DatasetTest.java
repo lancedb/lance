@@ -129,6 +129,9 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+        WriterVersion writerVersion = dataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertFalse(writerVersion.getVersion().isEmpty());
       }
 
       // Test LEGACY version

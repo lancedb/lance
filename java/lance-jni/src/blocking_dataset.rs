@@ -46,7 +46,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
-use lance::table::format::{BasePath, Fragment};
+use lance::table::format::{BasePath, Fragment, WriterVersion};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
@@ -782,6 +782,32 @@ impl IntoJava for Version {
             ],
         )?;
         Ok(java_version)
+    }
+}
+
+impl IntoJava for WriterVersion {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let library = env.new_string(self.library)?;
+        let version = env.new_string(self.version)?;
+        let prerelease = match self.prerelease {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+        let build_metadata = match self.build_metadata {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+
+        Ok(env.new_object(
+            "org/lance/WriterVersion",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(&library),
+                JValue::Object(&version),
+                JValue::Object(&prerelease),
+                JValue::Object(&build_metadata),
+            ],
+        )?)
     }
 }
 
@@ -2047,6 +2073,29 @@ pub extern "system" fn Java_org_lance_Dataset_nativeHasStableRowIds(
     java_dataset: JObject,
 ) -> jboolean {
     ok_or_throw_with_return!(env, inner_has_stable_row_ids(&mut env, java_dataset), 0u8)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetWriterVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_writer_version(&mut env, java_dataset))
+}
+
+fn inner_get_writer_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let writer_version = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.manifest().writer_version.clone()
+    };
+    match writer_version {
+        Some(writer_version) => writer_version.into_java(env),
+        None => Ok(JObject::null()),
+    }
 }
 
 fn inner_has_stable_row_ids(env: &mut JNIEnv, java_dataset: JObject) -> Result<u8> {
