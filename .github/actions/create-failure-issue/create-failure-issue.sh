@@ -22,6 +22,21 @@ validate_boolean() {
 validate_boolean "INCLUDE_CANCELLED" "$INCLUDE_CANCELLED"
 validate_boolean "DEDUPLICATE" "$DEDUPLICATE"
 
+find_canonical_issue_number() {
+  local marker="$1"
+
+  gh issue list \
+    --state open \
+    --label ci \
+    --limit 1000 \
+    --json number,body |
+    jq -r --arg marker "$marker" '
+      map(select((.body // "") | contains($marker)))
+      | min_by(.number)
+      | .number // empty
+    '
+}
+
 failed_jobs="$(
   jq -er '
     to_entries
@@ -76,19 +91,12 @@ else
 Please investigate the affected jobs and address any issues."
 fi
 
+issue_body="$notification_body"
+
 if [[ "$DEDUPLICATE" == "true" ]]; then
   marker_key="$(jq -nr --arg workflow "$WORKFLOW_NAME" '$workflow | @uri')"
   deduplication_marker="<!-- create-failure-issue:$marker_key -->"
-  existing_issue_number="$({
-    gh issue list \
-      --state open \
-      --label ci \
-      --limit 1000 \
-      --json number,body
-  } | jq -r --arg marker "$deduplication_marker" '
-    first(.[] | select((.body // "") | contains($marker)))
-    | .number // empty
-  ')"
+  existing_issue_number="$(find_canonical_issue_number "$deduplication_marker")"
 
   if [[ -n "$existing_issue_number" ]]; then
     echo "Found existing issue #$existing_issue_number; adding this run as a comment"
@@ -97,14 +105,35 @@ if [[ "$DEDUPLICATE" == "true" ]]; then
     exit 0
   fi
 
-  notification_body="$deduplication_marker
+  issue_body="$deduplication_marker
 
 $notification_body"
 fi
 
 echo "Detected reportable job results; creating issue"
-gh issue create \
-  --title "$issue_title" \
-  --body "$notification_body" \
-  --label ci
-echo "Issue created successfully"
+created_issue_url="$(
+  gh issue create \
+    --title "$issue_title" \
+    --body "$issue_body" \
+    --label ci
+)"
+echo "Issue created successfully: $created_issue_url"
+
+if [[ "$DEDUPLICATE" == "true" ]]; then
+  created_issue_number="${created_issue_url##*/}"
+  if [[ ! "$created_issue_number" =~ ^[0-9]+$ ]]; then
+    echo "Could not determine the created issue number from '$created_issue_url'" >&2
+    exit 1
+  fi
+
+  # Different refs can pass the initial lookup concurrently. Keep the oldest
+  # issue canonical and move this run there if this creation lost the race.
+  canonical_issue_number="$(find_canonical_issue_number "$deduplication_marker")"
+  if [[ -n "$canonical_issue_number" && "$canonical_issue_number" != "$created_issue_number" ]]; then
+    echo "Issue #$created_issue_number duplicates #$canonical_issue_number; reconciling"
+    gh issue comment "$canonical_issue_number" --body "$notification_body"
+    gh issue close "$created_issue_number" \
+      --comment "Closing this concurrently-created alert as a duplicate of #$canonical_issue_number."
+    echo "Recorded this run on issue #$canonical_issue_number and closed duplicate #$created_issue_number"
+  fi
+fi
