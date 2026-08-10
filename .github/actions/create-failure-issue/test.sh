@@ -24,6 +24,7 @@ release_mock_state_lock() {
 mock_stateful_gh() {
   local args=("$@")
   local body=""
+  local close_failures_remaining
   local close_comment=""
   local initial_list_call="false"
   local initial_list_count
@@ -67,6 +68,22 @@ mock_stateful_gh() {
     return
   fi
 
+  if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
+    issue_number="${3:?issue number is required}"
+    acquire_mock_state_lock
+    jq \
+      --argjson number "$issue_number" \
+      --slurpfile comments "$MOCK_GH_STATE_DIR/comments.json" \
+      '(.[] | select(.number == $number)) as $issue
+      | {
+          body: $issue.body,
+          comments: [$comments[0][] | select(.number == $number) | {body}]
+        }' \
+      "$MOCK_GH_STATE_DIR/issues.json"
+    release_mock_state_lock
+    return
+  fi
+
   for ((index = 0; index < ${#args[@]}; index++)); do
     if [[ "${args[index]}" == "--body" ]]; then
       body="${args[index + 1]}"
@@ -103,19 +120,29 @@ mock_stateful_gh() {
   elif [[ "${1:-}" == "issue" && "${2:-}" == "close" ]]; then
     issue_number="${3:?issue number is required}"
     acquire_mock_state_lock
+    read -r close_failures_remaining <"$MOCK_GH_STATE_DIR/close-failures-remaining"
+    tmp_file="$MOCK_GH_STATE_DIR/closes.json.$$"
+    jq \
+      --argjson number "$issue_number" \
+      --arg comment "$close_comment" \
+      --argjson succeeded "$((close_failures_remaining == 0))" \
+      '. + [{number: $number, comment: $comment, succeeded: $succeeded}]' \
+      "$MOCK_GH_STATE_DIR/closes.json" >"$tmp_file"
+    mv "$tmp_file" "$MOCK_GH_STATE_DIR/closes.json"
+
+    if (( close_failures_remaining > 0 )); then
+      printf '%s\n' "$((close_failures_remaining - 1))" \
+        >"$MOCK_GH_STATE_DIR/close-failures-remaining"
+      release_mock_state_lock
+      return 1
+    fi
+
     tmp_file="$MOCK_GH_STATE_DIR/issues.json.$$"
     jq \
       --argjson number "$issue_number" \
       'map(if .number == $number then .state = "closed" else . end)' \
       "$MOCK_GH_STATE_DIR/issues.json" >"$tmp_file"
     mv "$tmp_file" "$MOCK_GH_STATE_DIR/issues.json"
-    tmp_file="$MOCK_GH_STATE_DIR/closes.json.$$"
-    jq \
-      --argjson number "$issue_number" \
-      --arg comment "$close_comment" \
-      '. + [{number: $number, comment: $comment}]' \
-      "$MOCK_GH_STATE_DIR/closes.json" >"$tmp_file"
-    mv "$tmp_file" "$MOCK_GH_STATE_DIR/closes.json"
     release_mock_state_lock
   fi
 }
@@ -142,6 +169,12 @@ mock_gh() {
     printf '%s\n' "${MOCK_GH_LIST_RESPONSE:-[]}"
   elif [[ "${1:-}" == "issue" && "${2:-}" == "create" ]]; then
     printf '%s\n' "https://github.com/lance-format/lance/issues/999"
+  elif [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
+    if [[ -n "${MOCK_GH_VIEW_RESPONSE:-}" ]]; then
+      printf '%s\n' "$MOCK_GH_VIEW_RESPONSE"
+    else
+      printf '%s\n' '{"body":"","comments":[]}'
+    fi
   fi
 }
 
@@ -177,6 +210,7 @@ assert_equals() {
 reset_mock() {
   rm -f "$MOCK_GH_CALLS"/count "$MOCK_GH_CALLS"/[0-9]*
   unset MOCK_GH_LIST_RESPONSE || true
+  unset MOCK_GH_VIEW_RESPONSE || true
   unset MOCK_GH_STATE_DIR || true
 }
 
@@ -198,6 +232,23 @@ load_call() {
   while IFS= read -r -d '' arg; do
     CALL_ARGS+=("$arg")
   done <"$MOCK_GH_CALLS/$call_number"
+}
+
+setup_stateful_mock() {
+  local state_dir="$1"
+  local close_failures="${2:-0}"
+
+  reset_mock
+  rm -rf "$state_dir"
+  mkdir -p "$state_dir"
+  printf '%s\n' '0' >"$state_dir/initial-list-count"
+  printf '%s\n' '1000' >"$state_dir/next-issue-number"
+  printf '%s\n' "$close_failures" >"$state_dir/close-failures-remaining"
+  printf '%s\n' '[]' >"$state_dir/issues.json"
+  printf '%s\n' '[]' >"$state_dir/comments.json"
+  printf '%s\n' '[]' >"$state_dir/closes.json"
+  MOCK_GH_STATE_DIR="$state_dir"
+  export MOCK_GH_STATE_DIR
 }
 
 test_failure_creates_issue() {
@@ -243,6 +294,7 @@ test_deduplicate_seeds_new_issue() {
   load_call 2
   assert_equals "create" "${CALL_ARGS[1]}"
   assert_contains "${CALL_ARGS[5]}" "<!-- create-failure-issue:Recurring%20Tests -->"
+  assert_contains "${CALL_ARGS[5]}" "<!-- create-failure-issue-run:https%3A%2F%2Fgithub.com"
   load_call 3
   assert_equals "list" "${CALL_ARGS[1]}"
 }
@@ -253,14 +305,30 @@ test_deduplicate_comments_on_open_issue() {
   export MOCK_GH_LIST_RESPONSE
 
   run_action '{"build":{"result":"failure"}}' false true >/dev/null
-  assert_equals "2" "$(<"$MOCK_GH_CALLS/count")"
-  load_call 2
+  assert_equals "3" "$(<"$MOCK_GH_CALLS/count")"
+  load_call 3
   assert_equals "issue" "${CALL_ARGS[0]}"
   assert_equals "comment" "${CALL_ARGS[1]}"
   assert_equals "42" "${CALL_ARGS[2]}"
   assert_equals "--body" "${CALL_ARGS[3]}"
+  assert_contains "${CALL_ARGS[4]}" "<!-- create-failure-issue-run:https%3A%2F%2Fgithub.com"
   assert_contains "${CALL_ARGS[4]}" "**Failed jobs:** build"
   assert_contains "${CALL_ARGS[4]}" "actions/runs/123"
+}
+
+test_deduplicate_skips_recorded_run() {
+  local output
+
+  reset_mock
+  MOCK_GH_LIST_RESPONSE='[{"number":42,"body":"<!-- create-failure-issue:Recurring%20Tests -->\nPrevious run"}]'
+  MOCK_GH_VIEW_RESPONSE='{"body":"<!-- create-failure-issue:Recurring%20Tests -->","comments":[{"body":"<!-- create-failure-issue-run:https%3A%2F%2Fgithub.com%2Flance-format%2Flance%2Factions%2Fruns%2F123 -->"}]}'
+  export MOCK_GH_LIST_RESPONSE MOCK_GH_VIEW_RESPONSE
+
+  output="$(run_action '{"build":{"result":"failure"}}' false true)"
+  assert_contains "$output" "already recorded"
+  assert_equals "2" "$(<"$MOCK_GH_CALLS/count")"
+  load_call 2
+  assert_equals "view" "${CALL_ARGS[1]}"
 }
 
 test_deduplicate_reconciles_concurrent_creates() {
@@ -272,16 +340,7 @@ test_deduplicate_reconciles_concurrent_creates() {
   local second_pid
   local state_dir="$TEST_TMP/concurrent-state"
 
-  reset_mock
-  rm -rf "$state_dir"
-  mkdir -p "$state_dir"
-  printf '%s\n' '0' >"$state_dir/initial-list-count"
-  printf '%s\n' '1000' >"$state_dir/next-issue-number"
-  printf '%s\n' '[]' >"$state_dir/issues.json"
-  printf '%s\n' '[]' >"$state_dir/comments.json"
-  printf '%s\n' '[]' >"$state_dir/closes.json"
-  MOCK_GH_STATE_DIR="$state_dir"
-  export MOCK_GH_STATE_DIR
+  setup_stateful_mock "$state_dir"
 
   run_action \
     '{"build":{"result":"failure"}}' \
@@ -326,10 +385,82 @@ $(jq -r '.[0].body' "$state_dir/comments.json")"
   assert_contains "$combined_notifications" "actions/runs/200"
 }
 
+test_retry_reconciles_close_failure() {
+  local combined_notifications
+  local failed_run_url
+  local first_pid
+  local first_rc
+  local open_issue_body
+  local second_pid
+  local second_rc
+  local state_dir="$TEST_TMP/close-retry-state"
+
+  setup_stateful_mock "$state_dir" 1
+
+  run_action \
+    '{"build":{"result":"failure"}}' \
+    false \
+    true \
+    'https://github.com/lance-format/lance/actions/runs/100' \
+    >"$state_dir/first-output" 2>&1 &
+  first_pid=$!
+  run_action \
+    '{"build":{"result":"failure"}}' \
+    false \
+    true \
+    'https://github.com/lance-format/lance/actions/runs/200' \
+    >"$state_dir/second-output" 2>&1 &
+  second_pid=$!
+
+  if wait "$first_pid"; then
+    first_rc=0
+  else
+    first_rc=$?
+  fi
+  if wait "$second_pid"; then
+    second_rc=0
+  else
+    second_rc=$?
+  fi
+
+  if [[ "$first_rc" == "1" && "$second_rc" == "0" ]]; then
+    failed_run_url='https://github.com/lance-format/lance/actions/runs/100'
+  elif [[ "$first_rc" == "0" && "$second_rc" == "1" ]]; then
+    failed_run_url='https://github.com/lance-format/lance/actions/runs/200'
+  else
+    fail "expected one initial action to fail, got first_rc=$first_rc second_rc=$second_rc"
+  fi
+
+  run_action \
+    '{"build":{"result":"failure"}}' \
+    false \
+    true \
+    "$failed_run_url" \
+    >"$state_dir/retry-output"
+  unset MOCK_GH_STATE_DIR
+
+  assert_equals "1" "$(jq '[.[] | select(.state == "open")] | length' "$state_dir/issues.json")"
+  assert_equals "1" "$(jq '[.[] | select(.state == "closed")] | length' "$state_dir/issues.json")"
+  assert_equals "1" "$(jq 'length' "$state_dir/comments.json")"
+  assert_equals "2" "$(jq 'length' "$state_dir/closes.json")"
+  assert_equals "0" "$(jq -r '.[0].succeeded' "$state_dir/closes.json")"
+  assert_equals "1" "$(jq -r '.[1].succeeded' "$state_dir/closes.json")"
+
+  open_issue_body="$(
+    jq -r '.[] | select(.state == "open") | .body' "$state_dir/issues.json"
+  )"
+  combined_notifications="$open_issue_body
+$(jq -r '.[].body' "$state_dir/comments.json")"
+  assert_contains "$combined_notifications" "actions/runs/100"
+  assert_contains "$combined_notifications" "actions/runs/200"
+}
+
 test_failure_creates_issue
 test_cancelled_is_opt_in
 test_deduplicate_seeds_new_issue
 test_deduplicate_comments_on_open_issue
+test_deduplicate_skips_recorded_run
 test_deduplicate_reconciles_concurrent_creates
+test_retry_reconciles_close_failure
 
 echo "All create-failure-issue tests passed"
