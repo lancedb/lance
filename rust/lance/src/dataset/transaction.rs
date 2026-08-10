@@ -5461,10 +5461,16 @@ mod tests {
     #[test]
     fn test_bitmap_cardinality_exceeds_physical_rows() {
         let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
-        let (major, minor) = LanceFileVersion::Stable.to_numbers();
-        let data_file = DataFile::new("data.lance", vec![0], vec![0], major, minor, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            None,
+            None,
+        );
 
         let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
         let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
@@ -5472,6 +5478,7 @@ mod tests {
         let fragment = Fragment {
             id: 1,
             files: vec![data_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
@@ -5516,10 +5523,16 @@ mod tests {
     #[test]
     fn test_bitmap_max_offset_exceeds_physical_rows() {
         let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
-        let (major, minor) = LanceFileVersion::Stable.to_numbers();
-        let data_file = DataFile::new("data.lance", vec![0], vec![0], major, minor, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            None,
+            None,
+        );
 
         let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
         let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
@@ -5527,6 +5540,7 @@ mod tests {
         let fragment = Fragment {
             id: 1,
             files: vec![data_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
@@ -5571,10 +5585,16 @@ mod tests {
     #[test]
     fn test_bitmap_at_exact_physical_rows_boundary_succeeds() {
         let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
-        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
 
-        let (major, minor) = LanceFileVersion::Stable.to_numbers();
-        let data_file = DataFile::new("data.lance", vec![0], vec![0], major, minor, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            None,
+            None,
+        );
 
         let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
         let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
@@ -5582,6 +5602,7 @@ mod tests {
         let fragment = Fragment {
             id: 1,
             files: vec![data_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
