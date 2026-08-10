@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use arrow::{array::AsArray, buffer::NullBuffer};
+use arrow::{
+    array::{AsArray, BooleanBufferBuilder},
+    buffer::NullBuffer,
+};
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, make_array};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_arrow::*;
@@ -22,6 +25,34 @@ pub mod transform;
 
 fn distance_field() -> ArrowField {
     ArrowField::new(DIST_COL, DataType::Float32, true)
+}
+
+/// Return row-level validity for fixed-size-list vectors with nullable values.
+///
+/// Distance kernels operate on the primitive value buffer and do not inspect
+/// its null bitmap. Treat a vector with any null coordinate as a null vector so
+/// flat search follows the same policy as vector index construction.
+fn fixed_size_list_value_validity(vectors: &ArrayRef) -> Option<NullBuffer> {
+    let vectors = vectors.as_fixed_size_list_opt()?;
+    let value_nulls = vectors.values().nulls()?;
+    if value_nulls.null_count() == 0 {
+        return None;
+    }
+    let dimension = vectors.value_length() as usize;
+    let first_value_offset = vectors.value_offset(0) as usize;
+    let mut validity = BooleanBufferBuilder::new(vectors.len());
+    let mut value_validity = value_nulls.iter().skip(first_value_offset);
+
+    for _ in 0..vectors.len() {
+        let num_valid_values = value_validity
+            .by_ref()
+            .take(dimension)
+            .filter(|value_is_valid| *value_is_valid)
+            .count();
+        validity.append(num_valid_values == dimension);
+    }
+
+    Some(NullBuffer::new(validity.finish()))
 }
 
 /// Get a column from a RecordBatch, supporting nested field paths.
@@ -99,11 +130,12 @@ pub async fn compute_distance(
 
     let vectors = get_column_from_batch(&batch, column)?;
 
-    let validity_buffer = if let Some(rowids) = batch.column_by_name(ROW_ID) {
-        NullBuffer::union(rowids.nulls(), vectors.nulls())
-    } else {
-        vectors.nulls().cloned()
-    };
+    let rowid_nulls = batch
+        .column_by_name(ROW_ID)
+        .and_then(|rowids| rowids.nulls());
+    let value_validity = fixed_size_list_value_validity(&vectors);
+    let validity_buffer =
+        NullBuffer::union_many([rowid_nulls, vectors.nulls(), value_validity.as_ref()]);
 
     tokio::task::spawn_blocking(move || {
         // A selection vector may have been applied to _rowid column, so we need to
@@ -135,4 +167,49 @@ pub async fn compute_distance(
             .map_err(|e| Error::execution(format!("Failed to adding distance column: {}", e)))
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, Int8Array};
+    use arrow_schema::Field;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_compute_distance_excludes_vector_with_null_coordinate() {
+        let values = Arc::new(Int8Array::from(vec![
+            Some(1),
+            None,
+            Some(1),
+            Some(0),
+            Some(1),
+            Some(2),
+        ]));
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Int8, true)),
+                2,
+                values,
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let batch = RecordBatch::try_from_iter([("vector", vectors)]).unwrap();
+        let query = Arc::new(Int8Array::from(vec![1, 5])) as ArrayRef;
+
+        let result = compute_distance(query, DistanceType::L2, "vector", batch)
+            .await
+            .unwrap();
+        let distances = result
+            .column_by_name(DIST_COL)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+
+        assert!(distances.is_null(0));
+        assert_eq!(distances.value(1), 25.0);
+        assert_eq!(distances.value(2), 9.0);
+    }
 }
