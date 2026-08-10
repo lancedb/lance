@@ -3234,15 +3234,15 @@ impl Scanner {
     // Helper function for filtered read
     //
     // Delegates to legacy or new filtered read based on dataset storage version
-    async fn filtered_read(
-        &self,
-        filter_plan: &ExprFilterPlan,
+    fn filtered_read<'a>(
+        &'a self,
+        filter_plan: &'a ExprFilterPlan,
         projection: Projection,
         make_deletions_null: bool,
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
-    ) -> Result<PlannedFilteredScan> {
+    ) -> BoxFuture<'a, Result<PlannedFilteredScan>> {
         versions::filtered_read(
             self.dataset
                 .manifest()
@@ -3256,7 +3256,7 @@ impl Scanner {
             scan_range,
             is_prefilter,
         )
-        .await
+        .boxed()
     }
 
     fn row_ids_as_take_input(&self, row_ids: RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
