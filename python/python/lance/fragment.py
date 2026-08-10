@@ -525,6 +525,16 @@ class LanceFragment(pa.dataset.Fragment):
         """
         return self._fragment.physical_rows
 
+    def validate(self) -> None:
+        """
+        Validate the fragment.
+
+        This checks the integrity of the fragment and will raise an exception if
+        the fragment is corrupted. Unlike :meth:`lance.LanceDataset.validate`,
+        which checks every fragment, this validates only this fragment.
+        """
+        self._fragment.validate()
+
     @property
     def physical_schema(self) -> pa.Schema:
         # override the pyarrow super class method otherwise causes segfault
