@@ -34,17 +34,23 @@ public final class WriterVersion {
     return library;
   }
 
-  /** Core semantic version without prerelease or build metadata. */
+  /**
+   * Version string reported by the writer library.
+   *
+   * <p>This value is opaque because writer libraries are not required to use semantic versioning.
+   * When a writer does use semantic versioning, newer writers store the core version here and
+   * expose prerelease and build metadata separately.
+   */
   public String getVersion() {
     return version;
   }
 
-  /** Optional semantic-version prerelease component. */
+  /** Optional semantic-version prerelease component, when supplied by the writer. */
   public Optional<String> getPrerelease() {
     return Optional.ofNullable(prerelease);
   }
 
-  /** Optional semantic-version build metadata component. */
+  /** Optional semantic-version build metadata component, when supplied by the writer. */
   public Optional<String> getBuildMetadata() {
     return Optional.ofNullable(buildMetadata);
   }

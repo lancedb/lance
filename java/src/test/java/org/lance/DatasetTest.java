@@ -147,7 +147,28 @@ public class DatasetTest {
         assertEquals(
             LanceConstants.FILE_FORMAT_VERSION_0_1, legacyDataset.getLanceFileFormatVersion());
       }
+
+      // This dataset was written before writer_version was added to the manifest.
+      String historicalPath =
+          Path.of("..", "test_data", "v0.7.5", "with_deletions")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset historicalDataset = Dataset.open(historicalPath, allocator)) {
+        assertTrue(historicalDataset.getWriterVersion().isEmpty());
+      }
     }
+  }
+
+  @Test
+  void testWriterVersionPreservesOpaqueAndOptionalFields() {
+    WriterVersion writerVersion =
+        new WriterVersion("custom-writer", "release-2026", "preview.1", "build.42");
+
+    assertEquals("custom-writer", writerVersion.getLibrary());
+    assertEquals("release-2026", writerVersion.getVersion());
+    assertEquals("preview.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+    assertEquals("build.42", writerVersion.getBuildMetadata().orElseThrow(AssertionError::new));
   }
 
   @Test
