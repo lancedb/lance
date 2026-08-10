@@ -128,8 +128,11 @@ public class UpdateTest extends OperationTestBase {
       }
 
       dataset = Dataset.open(datasetPath, allocator);
-      long fragmentId = dataset.getFragments().get(0).getId();
-      FragmentMetadata newFragment = testDataset.createNewFragment(10);
+      Fragment existingFragment = dataset.getFragments().get(0);
+      long fragmentId = existingFragment.getId();
+      // Use the committed fragment's own metadata as the updatedFragment so that
+      // the updatedFragmentOffsets key is valid (must match a fragment in updatedFragments).
+      FragmentMetadata existingFragmentMeta = existingFragment.metadata();
 
       // Build Update with non-empty updatedFragmentOffsets. Values are portable RoaringBitmap
       // bytes encoding {1, 3, 5}: cookie(4) + containerCount(4) + key(2) + card-1(2) +
@@ -167,8 +170,7 @@ public class UpdateTest extends OperationTestBase {
               .readVersion(dataset.version())
               .operation(
                   Update.builder()
-                      .removedFragmentIds(Collections.singletonList(fragmentId))
-                      .newFragments(Collections.singletonList(newFragment))
+                      .updatedFragments(Collections.singletonList(existingFragmentMeta))
                       .updateMode(Optional.of(UpdateMode.RewriteColumns))
                       .updatedFragmentOffsets(offsets)
                       .build())

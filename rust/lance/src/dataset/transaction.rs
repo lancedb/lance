@@ -2041,6 +2041,13 @@ impl Transaction {
                         let Some(bitmap) = off_map.get(&fragment.id) else {
                             continue;
                         };
+                        // Defense-in-depth: only stamp fragments that were actually
+                        // rewritten. validate_operation enforces this invariant before
+                        // build_manifest is called; this guard catches any path that
+                        // bypasses validation.
+                        if !updated_by_id.contains_key(&fragment.id) {
+                            continue;
+                        }
                         if bitmap.is_empty() {
                             continue;
                         }
@@ -4134,10 +4141,24 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         Operation::Update {
             updated_fragments,
             new_fragments,
+            updated_fragment_offsets,
             ..
         } => {
             schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
-            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)
+            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)?;
+            if let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets {
+                let updated_ids: HashSet<u64> = updated_fragments.iter().map(|f| f.id).collect();
+                for &frag_id in off_map.keys() {
+                    if !updated_ids.contains(&frag_id) {
+                        return Err(Error::invalid_input(format!(
+                            "updatedFragmentOffsets key {} is not in updated_fragments; \
+                             offsets must reference only fragments being rewritten",
+                            frag_id
+                        )));
+                    }
+                }
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -5637,6 +5658,58 @@ mod tests {
             &ManifestWriteConfig::default(),
         )
         .expect("bitmap at exact physical_rows boundary should succeed");
+    }
+
+    #[test]
+    fn test_updated_fragment_offsets_key_not_in_updated_fragments_is_rejected() {
+        // Fragment A is being rewritten; fragment B exists in the manifest but is
+        // NOT in updated_fragments. Supplying an offset key for B must be rejected
+        // so that B's version metadata cannot be stamped by an unrelated commit.
+        let make_fragment = |id: u64| {
+            let row_ids = RowIdSequence::from([id * 10].as_slice());
+            let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+            Fragment {
+                id,
+                files: vec![DataFile::new(
+                    &format!("{id}.lance"),
+                    vec![0],
+                    vec![0],
+                    ConcreteFileVersion::from(LanceFileVersion::Stable),
+                    None,
+                    None,
+                )],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta,
+                physical_rows: Some(5),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            }
+        };
+
+        let frag_a = make_fragment(1);
+        let frag_b = make_fragment(2);
+        let manifest = make_stable_row_id_manifest(vec![frag_a.clone(), frag_b.clone()]);
+
+        // updated_fragments contains only A; offsets are keyed to B — must fail.
+        let off_map = HashMap::from([(frag_b.id, RoaringBitmap::from_iter([0u32, 1, 2]))]);
+        let operation = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![frag_a],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            compacted_sstables: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+        };
+
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
+        assert!(
+            err.to_string().contains("not in updated_fragments"),
+            "expected key-presence error, got: {err}"
+        );
     }
 
     #[test]
