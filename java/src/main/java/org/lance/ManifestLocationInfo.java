@@ -37,7 +37,7 @@ public final class ManifestLocationInfo {
     return version;
   }
 
-  /** Manifest path relative to the dataset root. */
+  /** Manifest path relative to the object-store namespace or root. */
   public String getPath() {
     return path;
   }

@@ -49,6 +49,23 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
 }
 
 #[tokio::test]
+async fn test_latest_manifest_location_rejects_explicit_refs() {
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+    let builders = [
+        DatasetBuilder::from_uri(test_uri).with_version(1),
+        DatasetBuilder::from_uri(test_uri).with_branch("dev", None),
+        DatasetBuilder::from_uri(test_uri).with_tag("release"),
+    ];
+
+    for builder in builders {
+        let err = builder.latest_manifest_location().await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("does not support an explicit"));
+    }
+}
+
+#[tokio::test]
 async fn test_v2_manifest_path_create() {
     // Can create a dataset, using V2 paths
     let data = lance_datagen::gen_batch()

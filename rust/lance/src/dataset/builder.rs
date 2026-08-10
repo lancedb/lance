@@ -181,6 +181,66 @@ impl DatasetBuilder {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use lance_io::object_store::StorageOptionsProvider;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestStorageOptionsProvider;
+
+    #[async_trait]
+    impl StorageOptionsProvider for TestStorageOptionsProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            Ok(None)
+        }
+
+        fn provider_id(&self) -> String {
+            "test-storage-options-provider".to_string()
+        }
+    }
+
+    #[test]
+    fn test_storage_options_override_wins_and_preserves_provider() {
+        let caller_options = HashMap::from([
+            ("endpoint".to_string(), "caller".to_string()),
+            ("caller-only".to_string(), "caller-value".to_string()),
+        ]);
+        let provider: Arc<dyn StorageOptionsProvider> = Arc::new(TestStorageOptionsProvider);
+        let options = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(caller_options, provider),
+            )),
+            ..Default::default()
+        };
+        let mut builder = DatasetBuilder::from_uri("memory://table").with_store_params(options);
+        builder.storage_options_override = Some(HashMap::from([
+            ("endpoint".to_string(), "namespace".to_string()),
+            ("namespace-only".to_string(), "namespace-value".to_string()),
+        ]));
+
+        builder.apply_storage_options_override();
+
+        let merged = builder.options.storage_options().unwrap();
+        assert_eq!(merged.get("endpoint").unwrap(), "namespace");
+        assert_eq!(merged.get("caller-only").unwrap(), "caller-value");
+        assert_eq!(merged.get("namespace-only").unwrap(), "namespace-value");
+        assert_eq!(
+            builder
+                .options
+                .get_accessor()
+                .unwrap()
+                .provider()
+                .unwrap()
+                .provider_id(),
+            "test-storage-options-provider"
+        );
+        assert!(builder.storage_options_override.is_none());
+    }
+}
+
 // Much of this builder is directly inspired from the to delta-rs table builder implementation
 // https://github.com/delta-io/delta-rs/main/crates/deltalake-core/src/table/builder.rs
 impl DatasetBuilder {
@@ -602,8 +662,15 @@ impl DatasetBuilder {
     /// Resolve metadata for the latest manifest without reading its contents.
     ///
     /// This locates the latest manifest and performs a metadata request only when the commit
-    /// handler did not already provide the object size.
-    pub async fn latest_manifest_location(self) -> Result<ManifestLocation> {
+    /// handler did not already provide the object size. Explicit version, branch, and tag targets
+    /// are not supported by this lightweight operation.
+    pub async fn latest_manifest_location(mut self) -> Result<ManifestLocation> {
+        if self.version.is_some() {
+            return Err(Error::invalid_input(
+                "latest_manifest_location does not support an explicit version, branch, or tag",
+            ));
+        }
+        self.apply_storage_options_override();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
         let mut location = commit_handler
             .resolve_latest_location(&base_path, object_store.as_ref())
@@ -662,12 +729,16 @@ impl DatasetBuilder {
         merged_params
     }
 
+    fn apply_storage_options_override(&mut self) {
+        if let Some(override_options) = self.storage_options_override.take() {
+            self.options =
+                Self::merge_store_params_with_storage_options(&self.options, &override_options);
+        }
+    }
+
     async fn load_impl(mut self) -> Result<Dataset> {
         // Apply storage_options_override to merge namespace client options with any existing accessor
-        if let Some(override_opts) = self.storage_options_override.take() {
-            self.options =
-                Self::merge_store_params_with_storage_options(&self.options, &override_opts);
-        }
+        self.apply_storage_options_override();
 
         let index_cache_backend = self.index_cache_backend.take();
         let session = match self.session.as_ref() {

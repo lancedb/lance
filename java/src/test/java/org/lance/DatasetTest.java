@@ -131,6 +131,8 @@ public class DatasetTest {
         assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
         ManifestLocationInfo manifest = Dataset.inspectLatestManifest(defaultPath);
         assertEquals(dataset.version(), manifest.getVersion());
+        assertTrue(manifest.getPath().contains("default_version/_versions/"));
+        assertFalse(manifest.getPath().startsWith("_versions/"));
         assertTrue(manifest.getPath().endsWith(".manifest"));
         assertTrue(manifest.getSizeBytes() > 0);
         assertNotNull(manifest.getNamingScheme());

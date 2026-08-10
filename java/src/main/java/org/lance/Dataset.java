@@ -486,6 +486,9 @@ public class Dataset implements Closeable {
   /**
    * Resolve metadata for the latest manifest without reading or deserializing its contents.
    *
+   * <p>This method is for datasets whose commit handler can be resolved directly from the URI.
+   * Namespace-managed tables and tables using a custom commit handler are not supported.
+   *
    * @param uri dataset URI
    * @return metadata for the latest manifest
    */
@@ -495,6 +498,9 @@ public class Dataset implements Closeable {
 
   /**
    * Resolve metadata for the latest manifest without reading or deserializing its contents.
+   *
+   * <p>This method is for datasets whose commit handler can be resolved directly from the URI.
+   * Namespace-managed tables and tables using a custom commit handler are not supported.
    *
    * <p>The supplied storage options are used to construct the object store. A metadata request is
    * made only when the commit handler did not already provide the manifest size.
