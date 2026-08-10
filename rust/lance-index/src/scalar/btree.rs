@@ -3249,6 +3249,13 @@ impl BasicTrainer for BTreeIndexPlugin {
         }
 
         let params = serde_json::from_str::<BTreeParameters>(params)?;
+        if let Some(zone_size) = params.zone_size
+            && zone_size == 0
+        {
+            return Err(Error::invalid_input_source(
+                format!("BTree zone_size must be greater than zero, got {zone_size}").into(),
+            ));
+        }
         Ok(Box::new(BTreeTrainingRequest::new(params)))
     }
 
@@ -3388,6 +3395,7 @@ mod tests {
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{FixedSizeListArray, record_batch};
+    use arrow_schema::{DataType, Field};
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
         physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
@@ -3447,6 +3455,20 @@ mod tests {
         IndexBuildProgress,
         lance_core::Result<()>
     );
+
+    #[test]
+    fn test_btree_rejects_zero_zone_size() {
+        let params = r#"{"zone_size":0}"#;
+        let field = Field::new("value", DataType::Int64, true);
+
+        let error = match BTreeIndexPlugin.new_training_request(params, &field) {
+            Ok(_) => panic!("zero zone size must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("zone_size"));
+    }
+
     #[test]
     fn test_scalar_value_size() {
         let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();
