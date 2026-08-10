@@ -342,6 +342,16 @@ Important fields:
 - `snapshot_ts_millis`, `num_shards`, and `inline_snapshots`: optional shard snapshot fields for read optimization.
 
 If a shard is absent from `index_catchup` for an index, that index is assumed to be fully caught up for the shard.
+Because absence carries that meaning, a writer records an entry for every base-table index once any SSTable has been compacted, naming every shard with recorded compaction progress and using generation `0` for a shard whose coverage it cannot prove.
+
+Entries are derived when a commit is built, not asserted by the caller.
+An index whose fragments cover every fragment that was live at the committing transaction's read version holds every row compaction had copied into the base table by that version, so it is recorded as caught up to the `compacted_sstables` progress at that version.
+This is the only available proof: nothing maps a compaction generation to the fragments its rows landed in, so covering the whole table as the transaction read it is how an index shows it covered those rows.
+Fragments appended after that version are a later catch-up gap and are not required.
+
+A recorded position is capped by the `compacted_sstables` progress the commit itself records, so a read version that was later rolled back cannot retire SSTables no live commit copied in.
+An index that does not cover the read version keeps the position it last recorded only while it remains physically unchanged; a rebuilt, replaced, or remapped index is a different index, so its position drops to generation `0` until some later commit proves coverage again.
+A position is never lowered, so a commit that reads an older version does not withdraw coverage an index has already demonstrated.
 
 Shard snapshots, when present, use the following Lance file schema:
 
@@ -494,7 +504,7 @@ On commit conflict, a compactor reloads the conflicting base-table version:
 The garbage collector may remove obsolete SSTables after:
 
 1. The SSTable has been compacted into the base table.
-2. Every maintained index has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads.
+2. Every maintained index has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads. An index recorded at generation `0` for the shard has not caught up.
 3. No retained base-table version needs the SSTable for time travel or consistency.
 
 !!! warning

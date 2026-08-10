@@ -17,7 +17,9 @@ use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::index_results_are_row_addrs;
-use crate::index::mem_wal::update_mem_wal_index_compacted_sstables;
+use crate::index::mem_wal::{
+    load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
+};
 use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
@@ -29,7 +31,7 @@ use lance_file::{
     datatypes::Fields,
     version::{ConcreteFileVersion, LanceFileVersion},
 };
-use lance_index::mem_wal::CompactedSsTable;
+use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME};
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
@@ -51,7 +53,7 @@ use object_store::path::Path;
 use roaring::RoaringBitmap;
 use std::cmp::Ordering;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 use uuid::Uuid;
@@ -261,6 +263,30 @@ pub struct Transaction {
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
+
+/// The MemWAL state of the version a transaction read.
+///
+/// An index this transaction publishes was built against this fragment set, so
+/// covering it proves the index holds every row compacted as of
+/// `compacted_sstables`. Neither half can be recovered while building the
+/// manifest, which sees only the version being committed onto -- by then
+/// fragments may have been appended, and compaction may have advanced into
+/// them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MemWalReadSnapshot {
+    /// Fragments live in the table at that version.
+    pub fragments: RoaringBitmap,
+    /// Per-shard SSTable compaction progress recorded at that version.
+    pub compacted_sstables: Vec<CompactedSsTable>,
+}
+
+/// Every non-system logical index, mapped to its sorted physical segment UUIDs.
+///
+/// A logical index may be backed by several segments, and Lance mints a fresh
+/// UUID whenever one is written, so the sorted set is a faithful identity for
+/// "is this still the same physical index" -- unlike any one arbitrarily chosen
+/// segment.
+type LogicalIndexSegments = BTreeMap<String, Vec<Uuid>>;
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct DataReplacementGroup(pub u64, pub DataFile);
@@ -1825,15 +1851,171 @@ impl Transaction {
         Ok((manifest, indices))
     }
 
+    fn logical_index_segments(indices: &[IndexMetadata]) -> LogicalIndexSegments {
+        let mut by_name: LogicalIndexSegments = BTreeMap::new();
+        for index in indices.iter().filter(|index| !is_system_index(index)) {
+            by_name
+                .entry(index.name.clone())
+                .or_default()
+                .push(index.uuid);
+        }
+        for uuids in by_name.values_mut() {
+            uuids.sort_unstable();
+        }
+        by_name
+    }
+
+    /// Record how far each index has caught up with compacted MemWAL SSTables.
+    ///
+    /// An index covering every fragment that was live when this transaction read
+    /// the table demonstrably holds every row compaction had copied in by then,
+    /// so it is caught up to the progress recorded at that version. That is the
+    /// only claim available: nothing maps a compaction generation to the
+    /// fragments its rows landed in, so covering the whole inspected table is
+    /// how an index shows it covered those rows. Fragments appended since are a
+    /// later catch-up gap.
+    ///
+    /// An index that does not cover the snapshot proves nothing and keeps the
+    /// position it last recorded only while it is physically unchanged. A
+    /// rebuilt, replaced or remapped index is a different index, and the old
+    /// position no longer describes it.
+    ///
+    /// Every index gets an explicit entry, including generation 0 for a shard it
+    /// cannot vouch for. A *missing* entry reads as "fully caught up" (see
+    /// `MemWalIndex::is_index_caught_up`), which would let the WAL retire an
+    /// SSTable whose rows no index holds.
+    fn apply_mem_wal_index_coverage(
+        final_indices: &mut [IndexMetadata],
+        segments_before: &LogicalIndexSegments,
+        read_snapshot: &MemWalReadSnapshot,
+        new_version: u64,
+    ) -> Result<()> {
+        let Some(position) = final_indices
+            .iter()
+            .position(|index| index.name == MEM_WAL_INDEX_NAME)
+        else {
+            // The system index is gone (MemWAL disabled, or an overwrite), so
+            // there is no coverage left to gate anything.
+            return Ok(());
+        };
+
+        let mut details = load_mem_wal_index_details(final_indices[position].clone())?;
+        let mut catchup_before = std::mem::take(&mut details.index_catchup);
+        catchup_before.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+
+        // Nothing has been compacted, so no index can be behind and there is no
+        // shard to name in an entry.
+        if details.compacted_sstables.is_empty() {
+            if catchup_before.is_empty() {
+                return Ok(());
+            }
+            final_indices[position] = new_mem_wal_index_meta(new_version, details)?;
+            return Ok(());
+        }
+
+        // Per shard: what this commit records as compacted, and the most this
+        // snapshot may credit. The snapshot cap is the point of the whole
+        // exercise -- generations compacted after the read landed in fragments
+        // the index never saw. The committed value caps it in turn, so a
+        // snapshot from a version that was since rolled back cannot retire
+        // SSTables no live commit copied in.
+        let shards: Vec<(Uuid, u64, u64)> = details
+            .compacted_sstables
+            .iter()
+            .map(|committed| {
+                let inspected = read_snapshot
+                    .compacted_sstables
+                    .iter()
+                    .find(|sstable| sstable.shard_id == committed.shard_id)
+                    .map_or(0, |sstable| sstable.generation);
+                (
+                    committed.shard_id,
+                    committed.generation,
+                    inspected.min(committed.generation),
+                )
+            })
+            .collect();
+
+        let mut segments_after: BTreeMap<&str, Vec<&IndexMetadata>> = BTreeMap::new();
+        for index in final_indices.iter().filter(|index| !is_system_index(index)) {
+            segments_after
+                .entry(index.name.as_str())
+                .or_default()
+                .push(index);
+        }
+
+        for (name, segments) in segments_after {
+            // A segment that does not record which fragments it covers cannot
+            // prove anything, so the whole index falls back to its old position.
+            let mut covered = Some(RoaringBitmap::new());
+            for segment in &segments {
+                match (covered.as_mut(), segment.fragment_bitmap.as_ref()) {
+                    (Some(accumulated), Some(bitmap)) => *accumulated |= bitmap,
+                    _ => {
+                        covered = None;
+                        break;
+                    }
+                }
+            }
+
+            let proven = covered.is_some_and(|covered| read_snapshot.fragments.is_subset(&covered));
+
+            // Only an index that is still physically the same may carry its old
+            // position forward; otherwise that position was recorded against an
+            // index that no longer exists.
+            let mut uuids: Vec<Uuid> = segments.iter().map(|segment| segment.uuid).collect();
+            uuids.sort_unstable();
+            let prior = segments_before
+                .get(name)
+                .is_some_and(|before| *before == uuids)
+                .then(|| catchup_before.iter().find(|entry| entry.index_name == name))
+                .flatten();
+
+            let caught_up_generations = shards
+                .iter()
+                .map(|&(shard_id, committed, creditable)| {
+                    let carried = prior
+                        .and_then(|prior| prior.caught_up_generation_for_shard(&shard_id))
+                        .unwrap_or(0);
+                    let credited = if proven { creditable } else { 0 };
+                    // Never lowers what an unchanged index already recorded: a
+                    // commit reading an older version still knows this index
+                    // covered more than its own snapshot can prove.
+                    CompactedSsTable::new(shard_id, carried.max(credited).min(committed))
+                })
+                .collect();
+
+            details.index_catchup.push(IndexCatchupProgress::new(
+                name.to_string(),
+                caught_up_generations,
+            ));
+        }
+
+        // Every commit on a compacted table reaches this point, so rewriting the
+        // entry unconditionally would mint a new UUID and drop the decoded-details
+        // cache on unrelated high-volume commits.
+        if details.index_catchup == catchup_before {
+            return Ok(());
+        }
+        final_indices[position] = new_mem_wal_index_meta(new_version, details)?;
+        Ok(())
+    }
+
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
+    ///
+    /// `mem_wal_read_snapshot` describes the version this transaction read, and
+    /// is what lets an index published here record how far it has caught up. It
+    /// is `None` when the table has no MemWAL state to maintain, and on paths
+    /// with no version to read (dataset creation, detached commits).
     pub(crate) fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
+        mem_wal_read_snapshot: Option<&MemWalReadSnapshot>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
@@ -1902,6 +2084,17 @@ impl Transaction {
             .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
+
+        // Taken before the operation rewrites the list, so coverage can be
+        // compared against what each logical index looked like going in. Only
+        // tables carrying MemWAL state pay for it.
+        let mem_wal_segments_before = mem_wal_read_snapshot
+            .is_some_and(|_| {
+                final_indices
+                    .iter()
+                    .any(|index| index.name == MEM_WAL_INDEX_NAME)
+            })
+            .then(|| Self::logical_index_segments(&final_indices));
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
@@ -2529,6 +2722,20 @@ impl Transaction {
             if !fragment.overlays.is_empty() {
                 lance_table::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
             }
+        }
+
+        // Applied once the final index list is known, so it sees exactly the
+        // indices this commit publishes rather than what any one operation arm
+        // intended.
+        if let (Some(segments_before), Some(read_snapshot)) =
+            (&mem_wal_segments_before, mem_wal_read_snapshot)
+        {
+            Self::apply_mem_wal_index_coverage(
+                &mut final_indices,
+                segments_before,
+                read_snapshot,
+                new_version,
+            )?;
         }
 
         let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
@@ -4453,6 +4660,7 @@ mod tests {
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -4488,6 +4696,7 @@ mod tests {
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -4540,6 +4749,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -4576,6 +4786,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -5402,6 +5613,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -5775,6 +5987,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -5861,6 +6074,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -5937,6 +6151,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6017,6 +6232,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6086,6 +6302,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6156,6 +6373,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6215,6 +6433,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6274,6 +6493,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6319,6 +6539,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6359,6 +6580,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6404,6 +6626,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6482,6 +6705,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6534,6 +6758,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6598,6 +6823,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6673,6 +6899,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6865,6 +7092,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6941,6 +7169,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -6981,6 +7210,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -7009,6 +7239,7 @@ mod tests {
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
+                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
@@ -7072,6 +7303,361 @@ mod tests {
             assert!(
                 matches!(txn.operation, Operation::Merge { preserves_nullability, .. } if preserves_nullability == encoded),
                 "encoded={encoded:?}"
+            );
+        }
+    }
+
+    /// Coverage is recorded from what the commit can see: the index list it
+    /// publishes, and the MemWAL state of the version the transaction read.
+    mod mem_wal_index_coverage {
+        use super::*;
+        use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails};
+
+        const VERSION: u64 = 7;
+
+        fn segment(name: &str, fragments: Option<&[u32]>) -> IndexMetadata {
+            IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: name.into(),
+                fields: vec![0],
+                dataset_version: 1,
+                fragment_bitmap: fragments.map(|ids| ids.iter().copied().collect()),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }
+        }
+
+        fn mem_wal_index(
+            compacted: &[(Uuid, u64)],
+            catchup: &[(&str, &[(Uuid, u64)])],
+        ) -> IndexMetadata {
+            let details = MemWalIndexDetails {
+                compacted_sstables: compacted
+                    .iter()
+                    .map(|&(shard, generation)| CompactedSsTable::new(shard, generation))
+                    .collect(),
+                index_catchup: catchup
+                    .iter()
+                    .map(|(name, generations)| {
+                        IndexCatchupProgress::new(
+                            (*name).to_string(),
+                            generations
+                                .iter()
+                                .map(|&(shard, generation)| {
+                                    CompactedSsTable::new(shard, generation)
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            new_mem_wal_index_meta(1, details).unwrap()
+        }
+
+        fn snapshot(fragments: &[u32], compacted: &[(Uuid, u64)]) -> MemWalReadSnapshot {
+            MemWalReadSnapshot {
+                fragments: fragments.iter().copied().collect(),
+                compacted_sstables: compacted
+                    .iter()
+                    .map(|&(shard, generation)| CompactedSsTable::new(shard, generation))
+                    .collect(),
+            }
+        }
+
+        /// Apply coverage to `indices`, treating `before` as the pre-operation
+        /// index list, and read back what each index recorded for `shard`.
+        fn recorded(
+            indices: &mut [IndexMetadata],
+            before: &[IndexMetadata],
+            read_snapshot: &MemWalReadSnapshot,
+            shard: Uuid,
+        ) -> Vec<(String, u64)> {
+            let segments_before = Transaction::logical_index_segments(before);
+            Transaction::apply_mem_wal_index_coverage(
+                indices,
+                &segments_before,
+                read_snapshot,
+                VERSION,
+            )
+            .unwrap();
+            let mem_wal = indices
+                .iter()
+                .find(|index| index.name == MEM_WAL_INDEX_NAME)
+                .unwrap();
+            load_mem_wal_index_details(mem_wal.clone())
+                .unwrap()
+                .index_catchup
+                .into_iter()
+                .map(|entry| {
+                    let generation = entry
+                        .caught_up_generation_for_shard(&shard)
+                        .expect("every entry names every compacted shard");
+                    (entry.index_name, generation)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn an_index_covering_the_read_version_records_its_compaction_progress() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0, 1])),
+                mem_wal_index(&[(shard, 5)], &[]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 5)]);
+        }
+
+        /// The whole point of the read snapshot: an index built against an older
+        /// version cannot vouch for rows compacted into fragments it never saw.
+        #[test]
+        fn coverage_is_capped_by_what_the_read_version_had_compacted() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0, 1])),
+                mem_wal_index(&[(shard, 9)], &[]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 5)]);
+        }
+
+        /// A snapshot from a version that was since rolled back must not retire
+        /// SSTables no live commit copied in.
+        #[test]
+        fn coverage_is_capped_by_what_the_commit_records_as_compacted() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0, 1])),
+                mem_wal_index(&[(shard, 3)], &[]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 9)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 3)]);
+        }
+
+        /// A missing entry reads as "fully caught up", so an index that proves
+        /// nothing must still be named, at generation 0.
+        #[test]
+        fn an_index_that_proves_nothing_records_an_explicit_zero() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0])),
+                mem_wal_index(&[(shard, 5)], &[]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 0)]);
+        }
+
+        /// Fragments appended since the read are a later catch-up gap, not a
+        /// reason to withdraw a position an unchanged index already earned.
+        #[test]
+        fn an_unchanged_index_carries_its_position_forward() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0])),
+                mem_wal_index(&[(shard, 5)], &[("idx", &[(shard, 5)])]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 5)]);
+        }
+
+        /// A rebuilt or replaced index is a different index; the position was
+        /// recorded against one that no longer exists.
+        #[test]
+        fn a_changed_index_loses_the_position_it_did_not_re_prove() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0])),
+                mem_wal_index(&[(shard, 5)], &[("idx", &[(shard, 5)])]),
+            ];
+            let mut after = vec![segment("idx", Some(&[0])), before[1].clone()];
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 0)]);
+        }
+
+        /// A commit reading an older version still knows this index covered
+        /// more than its own snapshot can prove.
+        #[test]
+        fn an_older_snapshot_never_lowers_a_recorded_position() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0, 1])),
+                mem_wal_index(&[(shard, 9)], &[("idx", &[(shard, 7)])]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 3)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 7)]);
+        }
+
+        /// A delta index is caught up only if its segments cover the snapshot
+        /// between them.
+        #[test]
+        fn coverage_is_the_union_across_a_logical_index_segments() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0])),
+                segment("idx", Some(&[1])),
+                mem_wal_index(&[(shard, 5)], &[]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 5)]);
+        }
+
+        /// A segment that does not say which fragments it covers cannot prove
+        /// anything, so the whole logical index falls back.
+        #[test]
+        fn a_segment_without_a_fragment_bitmap_proves_nothing() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0, 1])),
+                segment("idx", None),
+                mem_wal_index(&[(shard, 5)], &[]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(progress, vec![("idx".to_string(), 0)]);
+        }
+
+        /// Every commit on a compacted table reaches this code, so an unchanged
+        /// result must not mint a new UUID and drop the decoded-details cache.
+        #[test]
+        fn an_unchanged_result_leaves_the_system_index_untouched() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("idx", Some(&[0, 1])),
+                mem_wal_index(&[(shard, 5)], &[("idx", &[(shard, 5)])]),
+            ];
+            let mut after = before.clone();
+
+            recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(after[1].uuid, before[1].uuid);
+        }
+
+        /// Nothing has been compacted, so no index can be behind and there is no
+        /// shard an entry could name.
+        #[test]
+        fn a_table_that_has_never_compacted_records_nothing() {
+            let before = vec![segment("idx", Some(&[0])), mem_wal_index(&[], &[])];
+            let mut after = before.clone();
+            let read_snapshot = snapshot(&[0, 1], &[]);
+
+            let segments_before = Transaction::logical_index_segments(&before);
+            Transaction::apply_mem_wal_index_coverage(
+                &mut after,
+                &segments_before,
+                &read_snapshot,
+                VERSION,
+            )
+            .unwrap();
+
+            assert!(
+                load_mem_wal_index_details(after[1].clone())
+                    .unwrap()
+                    .index_catchup
+                    .is_empty()
+            );
+            assert_eq!(after[1].uuid, before[1].uuid);
+        }
+
+        /// Each index is judged on its own coverage, and every one is named.
+        #[test]
+        fn indices_are_judged_independently() {
+            let shard = Uuid::new_v4();
+            let before = vec![
+                segment("covers", Some(&[0, 1])),
+                segment("lags", Some(&[0])),
+                mem_wal_index(&[(shard, 5)], &[]),
+            ];
+            let mut after = before.clone();
+
+            let progress = recorded(
+                &mut after,
+                &before,
+                &snapshot(&[0, 1], &[(shard, 5)]),
+                shard,
+            );
+
+            assert_eq!(
+                progress,
+                vec![("covers".to_string(), 5), ("lags".to_string(), 0)]
             );
         }
     }

@@ -46,13 +46,14 @@ use super::ObjectStore;
 use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{MemWalReadSnapshot, Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::mem_wal::load_mem_wal_index_details;
 use crate::index::vector::details::infer_missing_vector_details;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
@@ -62,6 +63,7 @@ use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::is_system_index;
+use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
 use object_store::ObjectStoreExt;
@@ -460,7 +462,7 @@ async fn do_commit_new_dataset(
         }
     } else {
         let (manifest, indices) =
-            transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
+            transaction.build_manifest(None, vec![], &transaction_file, write_config, None)?;
         (manifest, indices)
     };
 
@@ -1137,11 +1139,14 @@ pub(crate) async fn do_commit_detached_transaction(
                 )
                 .await?
             }
+            // Detached commits sit outside the version chain, so there is no
+            // read version whose coverage this could advance.
             _ => transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
+                None,
             )?,
         };
 
@@ -1354,6 +1359,28 @@ async fn record_successful_commit(
     }
 }
 
+/// The MemWAL state of `dataset`, for a transaction that read it.
+///
+/// `None` for a table with no MemWAL index, which is every ordinary table. The
+/// index list is loaded from the session cache the commit path already warms,
+/// so a table without MemWAL pays only the lookup.
+async fn read_mem_wal_snapshot(dataset: &Dataset) -> Result<Option<MemWalReadSnapshot>> {
+    let indices = dataset.load_indices().await?;
+    let Some(mem_wal_index) = indices.iter().find(|idx| idx.name == MEM_WAL_INDEX_NAME) else {
+        return Ok(None);
+    };
+    let details = load_mem_wal_index_details(mem_wal_index.clone())?;
+    Ok(Some(MemWalReadSnapshot {
+        fragments: dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect(),
+        compacted_sstables: details.compacted_sstables,
+    }))
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -1387,6 +1414,11 @@ pub(crate) async fn commit_transaction(
             // If the dataset version is the same as the read version, we can use it directly.
             dataset.clone()
         };
+
+    // Captured here, while `dataset` is still the version this transaction read.
+    // The loop below advances it to the latest version, which is exactly the
+    // state that cannot answer what the transaction saw.
+    let mem_wal_read_snapshot = read_mem_wal_snapshot(&dataset).await?;
 
     let mut transaction = transaction.clone();
 
@@ -1464,6 +1496,7 @@ pub(crate) async fn commit_transaction(
                 dataset.load_indices().await?.as_ref().clone(),
                 transaction_file,
                 write_config,
+                mem_wal_read_snapshot.as_ref(),
             )?,
         };
 

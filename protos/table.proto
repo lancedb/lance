@@ -693,6 +693,11 @@ message IndexCatchupProgress {
   // Per-shard progress: the generation up to which this index covers.
   // If a shard is not present, the index is assumed to be fully caught up
   // (i.e., caught_up_generation >= compacted_generation for that shard).
+  //
+  // Because absence means "caught up", writers name every shard that has
+  // recorded compaction progress, using generation 0 for one this index cannot
+  // vouch for. Leaving a shard out would let its SSTables be retired against an
+  // index that never covered them.
   repeated CompactedSsTable caught_up_generations = 2;
 }
 
@@ -759,6 +764,14 @@ message MemWalIndexDetails {
   // scanning unindexed data in the base table.
   //
   // If an index is not present in this list, it is assumed to be fully caught up.
+  // A writer therefore lists every base table index once any SSTable has been
+  // compacted, recording generation 0 for one whose coverage it cannot prove.
+  //
+  // Entries are derived at commit time, not asserted by the caller: an index
+  // covering every fragment that was live at the committing transaction's read
+  // version holds every row compacted by then, so it is caught up to the
+  // progress recorded at that version. An index that changes without proving
+  // that again loses the position recorded for it.
   repeated IndexCatchupProgress index_catchup = 10;
 
   // Default ShardWriter configuration values for this MemWAL index.
