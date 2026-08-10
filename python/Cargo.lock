@@ -4470,6 +4470,7 @@ dependencies = [
 name = "lance-namespace-impls"
 version = "11.0.0-beta.3"
 dependencies = [
+ "arc-swap",
  "arrow",
  "arrow-ipc",
  "arrow-schema",
