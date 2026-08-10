@@ -920,6 +920,12 @@ mod test {
         capped
             .override_size(&staging_path, 14_961_429_442) // matches the production failure
             .await;
+        capped
+            .override_size(
+                &ManifestNamingScheme::V2.manifest_path(&base_path, 1),
+                14_961_429_442,
+            )
+            .await;
 
         // Spin up an ExternalManifestStore and drive `put` (the same code
         // path the failing CTAS hits via ExternalManifestCommitHandler).
@@ -951,6 +957,10 @@ mod test {
             capped.put_multipart_calls() >= 1,
             "read+rewrite path must initiate a multipart upload"
         );
+
+        let final_meta = capped.head(&location.path).await.unwrap();
+        assert_eq!(location.size, Some(final_meta.size));
+        assert_eq!(location.e_tag, final_meta.e_tag);
 
         // End-state assertions: final manifest exists with the original
         // bytes, and the staging file was deleted.

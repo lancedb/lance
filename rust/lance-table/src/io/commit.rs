@@ -60,7 +60,10 @@ use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
     aws_credential_types::provider::ProvideCredentials,
     aws_credential_types::provider::error::CredentialsError,
-    lance_io::object_store::{StorageOptions, providers::aws::build_aws_credential},
+    lance_io::object_store::{
+        StorageOptions,
+        providers::aws::{build_aws_credential, supports_external_manifest_create_only_copy},
+    },
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
@@ -1063,6 +1066,7 @@ async fn build_dynamodb_external_store(
     region: &str,
     endpoint: Option<String>,
     app_name: &str,
+    use_create_only_manifest_copy: bool,
 ) -> Result<Arc<dyn ExternalManifestStore>> {
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
     use aws_sdk_dynamodb::{
@@ -1085,7 +1089,13 @@ async fn build_dynamodb_external_store(
     }
     let client = Client::from_conf(dynamodb_config.build());
 
-    DynamoDBExternalManifestStore::new_external_store(client.into(), table_name, app_name).await
+    DynamoDBExternalManifestStore::new_external_store_with_create_only_copy(
+        client.into(),
+        table_name,
+        app_name,
+        use_create_only_manifest_copy,
+    )
+    .await
 }
 
 pub async fn commit_handler_from_url(
@@ -1145,10 +1155,15 @@ pub async fn commit_handler_from_url(
                 }
             };
             let options = options.clone().unwrap_or_default();
-            let storage_options_raw =
+            let mut storage_options_raw =
                 StorageOptions(options.storage_options().cloned().unwrap_or_default());
+            storage_options_raw.with_env_s3();
             let dynamo_endpoint = get_dynamodb_endpoint(&storage_options_raw);
             let storage_options = storage_options_raw.as_s3_options();
+            #[allow(deprecated)]
+            let uses_custom_object_store = options.object_store.is_some();
+            let use_create_only_manifest_copy = !uses_custom_object_store
+                && supports_external_manifest_create_only_copy(&url, &storage_options_raw);
 
             let region = storage_options.get(&AmazonS3ConfigKey::Region).cloned();
 
@@ -1174,6 +1189,7 @@ pub async fn commit_handler_from_url(
                     &region,
                     dynamo_endpoint,
                     "lancedb",
+                    use_create_only_manifest_copy,
                 )
                 .await?,
             }))

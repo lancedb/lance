@@ -40,7 +40,7 @@ mod test {
         Dataset,
         dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
     };
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{Error, utils::tempfile::TempStrDir};
     use lance_table::io::commit::{
         CommitHandler, ManifestNamingScheme,
         dynamodb::DynamoDBExternalManifestStore,
@@ -59,6 +59,11 @@ mod test {
             commit_handler: Some(handler),
             ..Default::default()
         }
+    }
+
+    fn assert_dynamodb_write_error(error: &Error) {
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("WrappedSdkError"));
     }
 
     async fn make_dynamodb_store() -> Arc<dyn ExternalManifestStore> {
@@ -197,6 +202,110 @@ mod test {
 
         store.delete("test").await.unwrap();
         assert_eq!(store.get_latest_version("test").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_staging_manifest_cas() {
+        let store = make_dynamodb_store().await;
+        let base_path = Path::from("cas-dataset");
+        let base_uri = base_path.as_ref();
+        let version = 1;
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+        let staging_path = Path::from(format!("{final_path}-staging"));
+        let final_size = 42;
+        let final_e_tag = Some("final-etag".to_string());
+
+        store
+            .put_if_not_exists(
+                base_uri,
+                version,
+                staging_path.as_ref(),
+                21,
+                Some("staging-etag".to_string()),
+            )
+            .await
+            .unwrap();
+        store
+            .finalize_staging_manifest(
+                base_uri,
+                version,
+                staging_path.as_ref(),
+                final_path.as_ref(),
+                final_size,
+                final_e_tag.clone(),
+            )
+            .await
+            .unwrap();
+
+        let location = store
+            .get_manifest_location(base_uri, version)
+            .await
+            .unwrap();
+        assert_eq!(location.path, final_path);
+        assert_eq!(location.size, Some(final_size));
+        assert_eq!(location.e_tag, final_e_tag);
+
+        // A retry sees the final row instead of the expected staging row. The
+        // exact final tuple makes the failed conditional write idempotent.
+        store
+            .finalize_staging_manifest(
+                base_uri,
+                version,
+                staging_path.as_ref(),
+                final_path.as_ref(),
+                final_size,
+                final_e_tag.clone(),
+            )
+            .await
+            .unwrap();
+
+        let replacement_path = ManifestNamingScheme::V2.manifest_path(&base_path, version + 1);
+        let stale_path_error = store
+            .finalize_staging_manifest(
+                base_uri,
+                version,
+                "cas-dataset/stale-staging",
+                replacement_path.as_ref(),
+                99,
+                Some("replacement-etag".to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert_dynamodb_write_error(&stale_path_error);
+
+        let wrong_size_error = store
+            .finalize_staging_manifest(
+                base_uri,
+                version,
+                staging_path.as_ref(),
+                final_path.as_ref(),
+                final_size + 1,
+                final_e_tag.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_dynamodb_write_error(&wrong_size_error);
+
+        let wrong_e_tag_error = store
+            .finalize_staging_manifest(
+                base_uri,
+                version,
+                staging_path.as_ref(),
+                final_path.as_ref(),
+                final_size,
+                Some("stale-etag".to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert_dynamodb_write_error(&wrong_e_tag_error);
+
+        let location = store
+            .get_manifest_location(base_uri, version)
+            .await
+            .unwrap();
+        assert_eq!(location.path, final_path);
+        assert_eq!(location.size, Some(final_size));
+        assert_eq!(location.e_tag, final_e_tag);
     }
 
     #[tokio::test]

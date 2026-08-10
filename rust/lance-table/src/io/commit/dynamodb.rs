@@ -112,6 +112,7 @@ pub struct DynamoDBExternalManifestStore {
     client: Arc<Client>,
     table_name: String,
     committer_name: String,
+    use_create_only_manifest_copy: bool,
 }
 
 // these are in macro because I want to use them in a match statement
@@ -136,11 +137,44 @@ macro_rules! committer {
     };
 }
 
+fn matches_final_location(
+    location: &ManifestLocation,
+    final_path: &str,
+    size: u64,
+    e_tag: &Option<String>,
+) -> bool {
+    location.path.as_ref() == final_path && location.size == Some(size) && &location.e_tag == e_tag
+}
+
 impl DynamoDBExternalManifestStore {
     pub async fn new_external_store(
         client: Arc<Client>,
         table_name: &str,
         committer_name: &str,
+    ) -> Result<Arc<dyn ExternalManifestStore>> {
+        Self::new_external_store_impl(client, table_name, committer_name, false).await
+    }
+
+    pub(crate) async fn new_external_store_with_create_only_copy(
+        client: Arc<Client>,
+        table_name: &str,
+        committer_name: &str,
+        use_create_only_manifest_copy: bool,
+    ) -> Result<Arc<dyn ExternalManifestStore>> {
+        Self::new_external_store_impl(
+            client,
+            table_name,
+            committer_name,
+            use_create_only_manifest_copy,
+        )
+        .await
+    }
+
+    async fn new_external_store_impl(
+        client: Arc<Client>,
+        table_name: &str,
+        committer_name: &str,
+        use_create_only_manifest_copy: bool,
     ) -> Result<Arc<dyn ExternalManifestStore>> {
         static SANITY_CHECK_CACHE: LazyLock<RwLock<HashSet<String>>> =
             LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -149,6 +183,7 @@ impl DynamoDBExternalManifestStore {
             client: client.clone(),
             table_name: table_name.to_string(),
             committer_name: committer_name.to_string(),
+            use_create_only_manifest_copy,
         });
 
         // already checked this table before, skip
@@ -243,6 +278,10 @@ impl DynamoDBExternalManifestStore {
 
 #[async_trait]
 impl ExternalManifestStore for DynamoDBExternalManifestStore {
+    fn use_create_only_manifest_copy(&self) -> bool {
+        self.use_create_only_manifest_copy
+    }
+
     /// Get the manifest path for a given base_uri and version
     async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
         let get_item_result = self
@@ -465,6 +504,59 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
         Ok(())
     }
 
+    async fn finalize_staging_manifest(
+        &self,
+        base_uri: &str,
+        version: u64,
+        staging_path: &str,
+        final_path: &str,
+        size: u64,
+        e_tag: Option<String>,
+    ) -> Result<()> {
+        let mut put_item = self
+            .ddb_put()
+            .item(base_uri!(), AttributeValue::S(base_uri.into()))
+            .item(version!(), AttributeValue::N(version.to_string()))
+            .item(path!(), AttributeValue::S(final_path.to_string()))
+            .item(committer!(), AttributeValue::S(self.committer_name.clone()))
+            .item("size", AttributeValue::N(size.to_string()));
+
+        if let Some(e_tag) = e_tag.as_ref() {
+            put_item = put_item.item("e_tag", AttributeValue::S(e_tag.clone()));
+        }
+
+        let write_result = put_item
+            .condition_expression(format!(
+                "attribute_exists({}) AND attribute_exists({}) AND #manifest_path = :staging_path",
+                base_uri!(),
+                version!(),
+            ))
+            .expression_attribute_names("#manifest_path", path!())
+            .expression_attribute_values(
+                ":staging_path",
+                AttributeValue::S(staging_path.to_string()),
+            )
+            .send()
+            .await;
+
+        let Err(write_error) = write_result else {
+            return Ok(());
+        };
+
+        // A conditional failure can mean another finalizer won, while a transport
+        // error can mean this write succeeded but its response was lost. Only the
+        // exact target tuple makes either outcome safely idempotent.
+        if self
+            .get_manifest_location(base_uri, version)
+            .await
+            .is_ok_and(|location| matches_final_location(&location, final_path, size, &e_tag))
+        {
+            return Ok(());
+        }
+
+        Err(write_error).wrap_err()
+    }
+
     /// Delete the manifest information for the given base_uri in dynamodb
     async fn delete(&self, base_uri: &str) -> Result<()> {
         let query_result = self
@@ -491,5 +583,62 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::commit::ManifestNamingScheme;
+
+    #[test]
+    fn final_location_match_requires_exact_metadata() {
+        let final_path = Path::from("dataset/_versions/1.manifest");
+        let mut location = ManifestLocation {
+            version: 1,
+            path: final_path.clone(),
+            size: Some(42),
+            naming_scheme: ManifestNamingScheme::V2,
+            e_tag: Some("final-etag".to_string()),
+        };
+
+        assert!(matches_final_location(
+            &location,
+            final_path.as_ref(),
+            42,
+            &Some("final-etag".to_string()),
+        ));
+        assert!(!matches_final_location(
+            &location,
+            "dataset/_versions/2.manifest",
+            42,
+            &Some("final-etag".to_string()),
+        ));
+        assert!(!matches_final_location(
+            &location,
+            final_path.as_ref(),
+            43,
+            &Some("final-etag".to_string()),
+        ));
+        assert!(!matches_final_location(
+            &location,
+            final_path.as_ref(),
+            42,
+            &Some("stale-etag".to_string()),
+        ));
+        assert!(!matches_final_location(
+            &location,
+            final_path.as_ref(),
+            42,
+            &None,
+        ));
+
+        location.size = None;
+        assert!(!matches_final_location(
+            &location,
+            final_path.as_ref(),
+            42,
+            &Some("final-etag".to_string()),
+        ));
     }
 }
