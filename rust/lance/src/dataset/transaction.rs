@@ -3050,6 +3050,8 @@ impl Transaction {
             Operation::UpdateMemWalState {
                 compacted_sstables, ..
             } => {
+                // Updates the MemWAL index only; the fragments are unchanged.
+                final_fragments.extend(maybe_existing_fragments?.clone());
                 update_mem_wal_index_compacted_sstables(
                     &mut final_indices,
                     new_version,
