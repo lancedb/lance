@@ -267,6 +267,10 @@ impl MiniBlockDecompressor for ByteStreamSplitDecompressor {
             block_info: BlockInfo::new(),
         }))
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        num_values.checked_mul(self.bytes_per_value() as u64)
+    }
 }
 
 /// Determine if BSS should be used based on mode and data characteristics

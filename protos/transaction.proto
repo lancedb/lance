@@ -144,12 +144,24 @@ message Transaction {
     repeated lance.file.Field schema = 2;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
+    // Set when this merge makes no nullability-affecting schema change: it
+    // introduces no field that data staged against an earlier schema could
+    // not safely omit. Without the assertion (including transactions written
+    // before this field existed) the merge conservatively conflicts with
+    // concurrent value-writes, which can only cause a retry.
+    bool preserves_nullability = 4;
   }
 
   // An operation that projects a subset of columns, altering the schema.
   message Project {
     // The new schema
     repeated lance.file.Field schema = 1;
+    // Set when this projection makes no nullability-affecting schema change,
+    // as a rename or a drop does not. Without the assertion (including
+    // transactions written before this field existed) the projection
+    // conservatively conflicts with concurrent value-writes, which can only
+    // cause a retry. A nullability tightening must not set this.
+    bool preserves_nullability = 2;
   }
 
   // An operation that restores a dataset to a previous version.
@@ -254,7 +266,12 @@ message Transaction {
     // Only tracks keys from INSERT operations during merge insert, not updates.
     optional KeyExistenceFilter inserted_rows = 8;
     // Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).
+    // Deprecated: use updated_fragment_offset_bitmaps (field 10) instead.
     map<uint64, UInt32List> updated_fragment_offsets = 9;
+    // Per-fragment matched offsets as portable RoaringBitmap bytes (replaces field 9).
+    // Writers emit field 10 only. Readers prefer field 10; fall back to field 9 for
+    // manifests written before this change.
+    map<uint64, bytes> updated_fragment_offset_bitmaps = 10;
   }
 
   // The mode of update operation

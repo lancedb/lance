@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::Schema;
@@ -32,7 +35,7 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
+    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
     format_key_values_on_columns, resolve_target_bases,
 };
 use crate::{
@@ -120,6 +123,8 @@ struct MergeState {
     stable_row_ids: bool,
     /// Set to track processed row IDs to detect duplicates
     processed_row_ids: HashSet<u64>,
+    /// Set to track non-null keys of rows inserted by FirstSeen mode
+    processed_insert_keys: InsertedKeyTracker,
     /// The "on" column names for merge operation
     on_columns: Vec<String>,
     /// How to handle duplicate source rows
@@ -141,6 +146,7 @@ impl MergeState {
             metrics,
             stable_row_ids,
             processed_row_ids: HashSet::new(),
+            processed_insert_keys: InsertedKeyTracker::default(),
             on_columns,
             source_dedupe_behavior,
         }
@@ -223,7 +229,15 @@ impl MergeState {
                 Ok(Some(row_idx)) // Keep this row for writing
             }
             Action::Insert => {
-                // Insert action - just insert new data
+                if self.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen
+                    && !self
+                        .processed_insert_keys
+                        .insert(batch, row_idx, &self.on_columns)?
+                {
+                    self.metrics.num_skipped_duplicates.add(1);
+                    return Ok(None);
+                }
+
                 // Capture the key value for conflict detection (only for inserts, not updates)
                 if let Some(key_value) =
                     extract_key_value_from_batch(batch, row_idx, &self.on_columns)
@@ -268,6 +282,7 @@ pub struct FullSchemaMergeInsertExec {
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
+    source_skipped_duplicates: Arc<AtomicU64>,
     /// Whether the ON columns match the schema's unenforced primary key.
     /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
     is_primary_key: bool,
@@ -278,6 +293,7 @@ impl FullSchemaMergeInsertExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
+        source_skipped_duplicates: Arc<AtomicU64>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -311,6 +327,7 @@ impl FullSchemaMergeInsertExec {
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
             inserted_rows_filter: Arc::new(Mutex::new(None)),
+            source_skipped_duplicates,
             is_primary_key,
         })
     }
@@ -881,6 +898,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
             inserted_rows_filter: self.inserted_rows_filter.clone(),
+            source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             is_primary_key: self.is_primary_key,
         }))
     }
@@ -980,6 +998,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
+        let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -992,6 +1011,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
+                dataset.manifest.data_storage_format.lance_file_format(),
                 Some(&dataset),
                 dataset.object_store.clone(),
                 &dataset.base,
@@ -1022,7 +1042,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
                     for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                         let serialized = lance_table::rowids::write_row_ids(&sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                     }
                 }
                 Ok(())
@@ -1108,7 +1128,15 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .add(total_files_written);
 
                 // Get the final stats from the shared state
-                let stats = MergeStats::from(&merge_state.metrics);
+                let mut stats = MergeStats::from(&merge_state.metrics);
+                stats.num_skipped_duplicates = stats
+                    .num_skipped_duplicates
+                    .checked_add(source_skipped_duplicates.load(Ordering::Relaxed))
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "merge insert skipped duplicate count overflowed u64".to_string(),
+                        )
+                    })?;
 
                 if let Ok(mut transaction_guard) = transaction_holder.lock() {
                     transaction_guard.replace(transaction);

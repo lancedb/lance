@@ -141,7 +141,7 @@ Keys are often a composite of multiple fields and all keys are scoped to the dat
 | Deletion Files    | Dataset URI, fragment_id, version, id, file_type | The deletion vector for a frag      |
 | Row Id Mask       | Dataset URI, version                             | The row id sequence for the dataset |
 | Row Id Index      | Dataset URI, version                             | The row id index for the dataset    |
-| Row Id Sequence   | Dataset URI, fragment_id                         | The row id sequence for a fragment  |
+| Row Id Sequence   | Dataset URI, fragment_id, row_id_meta            | The row id sequence for a fragment  |
 | Index Metadata    | Dataset URI, version                             | The index metadata for the dataset  |
 | Index Details¹    | Dataset URI, index uuid                          | The index details for an index      |
 | File Global Meta  | Dataset URI, file path                           | The global metadata for a file      |
@@ -188,6 +188,41 @@ large data you may need to turn down the `batch_size` to keep memory usage under
 working with 1024-dimensional vector embeddings (e.g. 32-bit floats) then 8192 rows would be 32MB of data. If you
 spread that across 16 CPU threads then you would need 512MB of compute memory per scan. You might find working
 with 1024 rows per batch is more appropriate.
+
+#### Tuning remote scans
+
+An ordered dataset scan still overlaps I/O from multiple fragments. `scan_in_order=True` controls the order in
+which batches are returned; it does not make fragment reads sequential. This is why a dataset scan can issue
+more concurrent requests than scanning one fragment directly. The following controls tune different parts of
+the scan:
+
+* `fragment_readahead` limits how many fragments may have reads scheduled concurrently. Set it to `1` to match
+  the fragment-level I/O pattern, then increase it if the storage connection has spare bandwidth.
+* `LANCE_IO_THREADS` limits concurrent storage requests for the process. Cloud stores default to 64, which is
+  intended for high-bandwidth, in-region access and can be too aggressive across regions or over the public
+  internet.
+* `io_buffer_size` limits buffered I/O bytes and applies backpressure when decoding falls behind.
+* `batch_readahead` limits concurrent batch decoding. It does not control the size of storage range requests.
+
+For a bandwidth-constrained remote connection, start with conservative settings and tune upward:
+
+```shell
+LANCE_IO_THREADS=8 python scan.py
+```
+
+```python
+scanner = dataset.scanner(
+    fragment_readahead=1,
+    batch_readahead=2,
+    io_buffer_size=64 * 1024 * 1024,
+)
+for batch in scanner.to_batches():
+    process(batch)
+```
+
+Lance reads encoded pages from storage, so reducing `batch_size` changes the returned and decoded batch sizes
+but may not reduce the initial range request. The first batch can require loading one encoded page for each
+selected column.
 
 In summary, scans could use up to `(2 * io_buffer_size) + (batch_size * num_compute_threads)` bytes of memory.
 Keep in mind that `io_buffer_size` is a soft limit (e.g. we cannot read less than one page at a time right now)

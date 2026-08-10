@@ -39,6 +39,12 @@ message ZoneMapIndexDetails {
   // variable-length types (strings, binary) and fixed-width types wider than
   // 8 bytes, and to false for narrow fixed-width types (e.g. Int64, Float64).
   optional bool use_seeds = 2;
+  // Whether this index tracks exact null row addresses in a separate bitmap.
+  // Absent or false means legacy format: null positions are not tracked and
+  // IS NULL searches fall back to approximate zone-level statistics. Present
+  // true means IS NULL is exact and IS NOT NULL can be answered without a
+  // full scan.
+  optional bool has_null_bitmap = 3;
 }
 message InvertedIndexDetails {
   enum DocumentGranularity {

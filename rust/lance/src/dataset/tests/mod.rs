@@ -16,3 +16,4 @@ mod dataset_scanner;
 mod dataset_schema_evolution;
 mod dataset_transactions;
 mod dataset_versioning;
+mod fragment_validate_tombstones;

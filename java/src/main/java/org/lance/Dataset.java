@@ -55,6 +55,7 @@ import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayInputStream;
@@ -63,6 +64,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -733,11 +735,31 @@ public class Dataset implements Closeable {
   public void alterColumns(List<ColumnAlteration> columnAlterations) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeAlterColumns(columnAlterations);
+      // Cast target types are carried across the FFI boundary through the Arrow C Data
+      // Interface rather than ArrowType#toString(), which does not round-trip reliably on
+      // the native side (parameterized types such as Int(64, true) fail to parse and the
+      // cast would otherwise be silently dropped). One field is exported per alteration that
+      // requests a type change, in the same order as {@code columnAlterations}.
+      List<Field> castFields = new ArrayList<>();
+      int castIndex = 0;
+      for (ColumnAlteration alteration : columnAlterations) {
+        if (alteration.getDataType().isPresent()) {
+          castFields.add(new Field("f" + castIndex++, castFieldType(alteration), null));
+        }
+      }
+      try (ArrowSchema castSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, new Schema(castFields), null, castSchema);
+        nativeAlterColumns(columnAlterations, castSchema.memoryAddress());
+      }
     }
   }
 
-  private native void nativeAlterColumns(List<ColumnAlteration> columnAlterations);
+  private static FieldType castFieldType(ColumnAlteration alteration) {
+    boolean nullable = alteration.getNullable().orElse(true);
+    return new FieldType(nullable, alteration.getDataType().get(), null);
+  }
+
+  private native void nativeAlterColumns(List<ColumnAlteration> columnAlterations, long castAddr);
 
   /**
    * Create a new Dataset Scanner.

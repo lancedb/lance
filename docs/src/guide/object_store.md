@@ -110,6 +110,38 @@ The following keys can be used as both environment variables or keys in the
 | `aws_sse_kms_key_id`                                                | The KMS key ID to use for server-side encryption. If set, `aws_server_side_encryption` must be `"aws:kms"` or `"aws:kms:dsse"`.                  |
 | `aws_sse_bucket_key_enabled`                                        | Whether to use bucket keys for server-side encryption.                                                                                           |
 
+### Credential provider selection
+
+By default, Lance uses the standard AWS credential provider chain (environment
+variables, shared config file, web identity tokens, ECS, EC2 instance metadata).
+
+The `aws_provider_scheme` storage option pins a dataset to a specific credential
+provider, which is useful when two datasets in the same process need different
+AWS auth (for example, one bucket using IRSA and another using ECS container
+credentials).
+
+| Value | Behavior |
+|-------|----------|
+| `token` | Use static access-key credentials. Returns an error if `aws_access_key_id` and `aws_secret_access_key` are not set. |
+| `ecs` | Use the ECS/Pod Identity container credential endpoint. Reads `AWS_CONTAINER_CREDENTIALS_FULL_URI` or `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` from the environment. |
+| `irsa` | Use IRSA (IAM Roles for Service Accounts) web identity token credentials. Reads `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` from the environment. |
+
+```python
+import lance
+
+# Bucket A — use IRSA (web identity token from the environment)
+ds_a = lance.dataset(
+    "s3://bucket-a/path",
+    storage_options={"aws_provider_scheme": "irsa"},
+)
+
+# Bucket B — use ECS container credentials
+ds_b = lance.dataset(
+    "s3://bucket-b/path",
+    storage_options={"aws_provider_scheme": "ecs"},
+)
+```
+
 ### S3-compatible stores
 
 Lance can also connect to S3-compatible stores, such as MinIO. To do so, you must
@@ -325,6 +357,15 @@ parameter; explicit `storage_options` override environment variables:
 | `cos_secret_id` | Secret ID used for COS authentication. Optional if credentials are provided by environment. |
 | `cos_secret_key` | Secret key used for COS authentication. Optional if credentials are provided by environment. |
 | `cos_enable_versioning` | Whether to enable object versioning on the bucket. Optional. |
+
+!!! warning
+
+    Tencent COS does not reliably enforce put-if-not-exists on buckets that have
+    ever had versioning enabled, even if versioning is now suspended. To prevent
+    silent manifest overwrites, Lance requires a custom distributed commit lock
+    for COS writes. Pass the same `commit_lock` implementation to every Python
+    writer, or provide a custom `CommitHandler` in Rust. Reads do not require a
+    commit lock.
 
 !!! note
 

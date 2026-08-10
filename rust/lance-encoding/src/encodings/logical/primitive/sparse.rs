@@ -3990,7 +3990,7 @@ impl DecodeSparseStructuralTask {
             data_builder.append(
                 values,
                 value_start - chunk_value_start..take_end - chunk_value_start,
-            );
+            )?;
             value_start = take_end;
         }
         Ok(())

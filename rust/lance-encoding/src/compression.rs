@@ -885,6 +885,16 @@ pub fn try_raw_block(data: &DataBlock) -> Option<(Box<dyn BlockCompressor>, Comp
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Returns the exact aggregate decoded size when it is determined solely by the value count.
+    ///
+    /// Implementations should only return `Some` when this aggregate estimate can be used by
+    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
+    /// represented by one aggregate estimate should return `None`.
+    fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
+        None
+    }
 }
 
 pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -894,6 +904,16 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Currently (and probably long term) this must be a multiple of 8
     fn bits_per_value(&self) -> u64;
+
+    /// Returns the exact aggregate decoded size when it is determined solely by the value count.
+    ///
+    /// Implementations should only return `Some` when this aggregate estimate can be used by
+    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
+    /// represented by one aggregate estimate should return `None`.
+    fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
+        None
+    }
 }
 
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {

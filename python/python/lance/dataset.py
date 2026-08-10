@@ -750,6 +750,14 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """Mark MemWAL SSTables as compacted into the base table.
 
         Call this before executing merge_insert when it compacts MemWAL SSTables.
+        The progress is recorded in the same commit as the data.
+
+        For multi-pass compaction, call this only on the final successful
+        data-changing pass. Intermediate passes must not carry compaction
+        progress. Lance cannot tell whether a caller has another pass planned,
+        so it cannot enforce this: if a delete pass carried the marker and the
+        process then died before the matching upsert, the recorded progress
+        would claim rows were copied in that never were.
 
         Parameters
         ----------
@@ -1258,16 +1266,19 @@ class LanceDataset(pa.dataset.Dataset):
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
         io_buffer_size: int, default None
-            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
-            for more information.
+            The maximum number of bytes to buffer from storage before applying
+            backpressure. See ``ScannerBuilder.io_buffer_size`` for more information.
         batch_readahead: int, optional
-            The number of batches to read ahead.
+            The number of batches to decode concurrently.
         fragment_readahead: int, optional
-            The number of fragments to read ahead.
+            The number of fragments whose reads may be scheduled concurrently.
+            This applies even when ``scan_in_order`` is true. Set this to ``1``
+            to avoid overlapping I/O from multiple fragments.
         scan_in_order: bool, default True
-            Whether to read the fragments and batches in order. If false,
-            throughput may be higher, but batches will be returned out of order
-            and memory use might increase.
+            Whether to return fragments and batches in order. This does not make
+            storage reads sequential; use ``fragment_readahead=1`` for that. If
+            false, throughput may be higher, but batches will be returned out of
+            order and memory use might increase.
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
@@ -5592,6 +5603,21 @@ class SqlQueryBuilder:
         self._builder = self._builder.with_row_addr(with_row_addr)
         return self
 
+    def blob_handling(
+        self,
+        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
+    ) -> "SqlQueryBuilder":
+        """
+        Control how blob columns are returned by this SQL query.
+
+        - ``"all_binary"`` materializes blob columns as binary values.
+        - ``"blobs_descriptions"`` returns blob descriptors (the default).
+        - ``"all_descriptions"`` returns descriptions for all binary-like
+          columns.
+        """
+        self._builder = self._builder.blob_handling(blob_handling)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
@@ -5793,7 +5819,13 @@ class LanceOperation:
         new_schema: pyarrow.Schema
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
-            The fragments that make up the new dataset.
+            The newly written fragments that make up the new dataset. They are
+            assigned fresh ids when the operation is committed, continuing from
+            the highest id the dataset has ever used, so any id they carry is
+            ignored. Since we reassign fragment ids, a fragment with a deletion
+            file is rejected: use :class:`LanceOperation.Delete` to commit
+            deletions, or :class:`LanceOperation.Merge` to change the schema of
+            existing fragments.
         initial_bases: list[DatasetBasePath], optional
             Base paths to register when creating a new dataset (CREATE mode only).
             **Only valid in CREATE mode**. Will raise an error if used with
@@ -5964,8 +5996,15 @@ class LanceOperation:
             The ids of the fragments that have been removed entirely.
         updated_fragments: list[FragmentMetadata]
             The fragments that have been updated with new deletion vectors.
+            These are used as given, so pass back the metadata read from the
+            dataset rather than a freshly constructed object, or the fragment
+            loses its row id and version metadata.
         new_fragments: list[FragmentMetadata]
-            The fragments that contain the new rows.
+            The fragments that contain the new rows. On a dataset that uses
+            stable row ids, set ``row_id_meta`` on these to carry the ids of
+            rewritten rows over; see :class:`lance.fragment.RowIdSequence`. The
+            created-at and last-updated-at version metadata are derived during
+            the commit and should be left as None.
         fields_modified: list[int]
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
@@ -6003,6 +6042,14 @@ class LanceOperation:
         schema: LanceSchema or pyarrow.Schema
             The schema of the new dataset. Passing a LanceSchema is preferred,
             and passing a pyarrow.Schema is deprecated.
+        preserves_nullability: bool
+            True when this merge makes no nullability-affecting schema change:
+            it introduces no field that data staged against an earlier schema
+            could not safely omit. Without the assertion (the default) the
+            merge conservatively conflicts with concurrent appends, whose
+            fragments would omit new columns and read as null; that can only
+            cause a retry. Pass True when every column this merge introduces
+            is nullable to let concurrent appends commit without conflict.
 
         Warning
         -------
@@ -6048,6 +6095,7 @@ class LanceOperation:
 
         fragments: Iterable[FragmentMetadata]
         schema: LanceSchema | pa.Schema
+        preserves_nullability: bool = False
 
         def __post_init__(self):
             if isinstance(self.schema, pa.Schema):
@@ -6220,6 +6268,11 @@ class LanceOperation:
         ----------
         schema: LanceSchema
             The lance schema of the new dataset.
+        preserves_nullability: bool
+            True when this projection makes no nullability-affecting schema
+            change, as a rename or a drop does not. Without the assertion
+            (the default) the projection conservatively conflicts with
+            concurrent writes, which can only cause a retry.
 
         Examples
         --------
@@ -6248,6 +6301,7 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+        preserves_nullability: bool = False
 
     @dataclass
     class UpdateMap:
@@ -7035,6 +7089,9 @@ class LanceScanner(pa.dataset.Scanner):
 
     def analyze_plan(self, count_rows: bool = False) -> str:
         """Execute the plan for this scanner and display with runtime metrics.
+
+        Full-text-search nodes include the execution-time ``tokenized_query``
+        text and positions.
 
         Parameters
         ----------

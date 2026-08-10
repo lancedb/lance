@@ -76,7 +76,7 @@ pub enum FtsQueryType {
     },
     /// Boolean query with MUST/SHOULD/MUST_NOT.
     Boolean {
-        /// Terms that must match.
+        /// Terms that must match and contribute to the score.
         must: Vec<String>,
         /// Terms that should match (adds to score).
         should: Vec<String>,

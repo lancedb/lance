@@ -1804,6 +1804,7 @@ async fn rewrite_files(
         }
     } else {
         let (frags, _) = write_fragments_internal(
+            dataset.manifest.data_storage_format.lance_file_format(),
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
             &dataset.base,
@@ -1933,7 +1934,7 @@ async fn rechunk_stable_row_ids(
     for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
         // TODO: if large enough, serialize to separate file
         let serialized = lance_table::rowids::write_row_ids(&sequence);
-        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
     }
 
     Ok(())

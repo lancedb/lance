@@ -18,7 +18,6 @@ use rayon::prelude::*;
 use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
-use std::iter;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,10 +57,23 @@ pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 /// ([`super::online::OnlineHnswBuilder`]) builders so both produce comparable graphs.
 pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
 
+/// Minimum edge count that avoids severely fragmented graphs during parallel
+/// construction while still allowing deliberately small test and index sizes.
+pub(crate) const MIN_HNSW_M: usize = 4;
+
+/// Draw a node level using the distribution from Algorithm 1.
+pub(crate) fn random_level_with<R: Rng + ?Sized>(params: &HnswBuildParams, rng: &mut R) -> u16 {
+    let ml = 1.0 / (params.m as f32).ln();
+    min(
+        (-rng.random::<f32>().ln() * ml) as u16,
+        params.max_level - 1,
+    )
+}
+
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
-    /// max level ofm
+    /// Maximum number of levels in the graph.
     pub max_level: u16,
 
     /// number of connections to establish while inserting new element
@@ -97,14 +109,17 @@ impl Default for HnswBuildParams {
 
 impl HnswBuildParams {
     /// The maximum level of the graph.
-    /// The default value is `8`.
+    /// The default value is `7`.
     pub fn max_level(mut self, max_level: u16) -> Self {
         self.max_level = max_level;
         self
     }
 
     /// The number of connections to establish while inserting new element
-    /// The default value is `30`.
+    ///
+    /// Must be at least 4. Smaller values produce severely fragmented graphs
+    /// during parallel construction.
+    /// The default value is `20`.
     pub fn num_edges(mut self, m: usize) -> Self {
         self.m = m;
         self
@@ -113,10 +128,39 @@ impl HnswBuildParams {
     /// Number of candidates to be considered when searching for the nearest neighbors
     /// during the construction of the graph.
     ///
-    /// The default value is `100`.
+    /// The default value is `150`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
         self
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.max_level == 0 {
+            return Err(Error::invalid_input(format!(
+                "HnswBuildParams::max_level must be greater than 0, got {}",
+                self.max_level
+            )));
+        }
+        if self.m < MIN_HNSW_M {
+            return Err(Error::invalid_input(format!(
+                "HnswBuildParams::m must be at least {MIN_HNSW_M} to avoid severely fragmented graphs, got {}",
+                self.m,
+            )));
+        }
+        if self.m > usize::MAX / 2 {
+            return Err(Error::invalid_input(format!(
+                "HnswBuildParams::m must be at most {} so the level-0 reciprocal limit can be represented, got {}",
+                usize::MAX / 2,
+                self.m
+            )));
+        }
+        if self.ef_construction < self.m {
+            return Err(Error::invalid_input(format!(
+                "HnswBuildParams::ef_construction must be at least m ({}), got {}",
+                self.m, self.ef_construction
+            )));
+        }
+        Ok(())
     }
 
     /// Build the HNSW index from the given data.
@@ -178,7 +222,10 @@ impl DeepSizeOf for HnswCore {
 
 impl HnswCore {
     fn max_level(&self) -> u16 {
-        self.params.max_level
+        self.level_count
+            .iter()
+            .rposition(|count| *count != 0)
+            .map_or(0, |level| level + 1) as u16
     }
 
     fn num_nodes(&self, level: usize) -> usize {
@@ -606,19 +653,18 @@ impl HNSW {
 
     /// Returns the metadata of this [`HNSW`].
     pub fn metadata(&self) -> HnswMetadata {
-        // calculate the offsets of each level,
-        // start from 0
-        let level_offsets = self
-            .inner
-            .level_count
-            .iter()
-            .chain(iter::once(&0))
-            .scan(0, |state, x| {
-                let start = *state;
-                *state += *x;
-                Some(start)
-            })
-            .collect();
+        // Version-1 readers use params.max_level as the number of level
+        // batches and index them directly. Preserve that configured shape,
+        // padding levels above the sampled graph height with empty ranges.
+        let configured_levels = self.inner.params.max_level as usize;
+        let mut level_offsets = Vec::with_capacity(configured_levels + 1);
+        let mut offset = 0;
+        level_offsets.push(0);
+        for level in 0..configured_levels {
+            let level_count = self.inner.level_count.get(level).copied().unwrap_or(0);
+            offset += level_count;
+            level_offsets.push(offset);
+        }
 
         HnswMetadata {
             entry_point: self.inner.entry_point,
@@ -650,7 +696,7 @@ impl DeepSizeOf for HnswBuilder {
 
 impl HnswBuilder {
     fn finish(self) -> HNSW {
-        let nodes = match Arc::try_unwrap(self.nodes) {
+        let nodes: Vec<GraphBuilderNode> = match Arc::try_unwrap(self.nodes) {
             Ok(nodes) => nodes
                 .into_iter()
                 .map(|node| node.into_inner().expect("builder lock poisoned"))
@@ -661,9 +707,14 @@ impl HnswBuilder {
                 .collect(),
         };
 
+        let actual_levels = nodes
+            .get(self.entry_point as usize)
+            .map(|node| node.level_neighbors.len())
+            .unwrap_or(0);
         let level_count = self
             .level_count
             .into_iter()
+            .take(actual_levels)
             .map(|count| count.load(Ordering::Relaxed))
             .collect();
 
@@ -683,9 +734,8 @@ impl HnswBuilder {
         let len = storage.len();
         let max_level = params.max_level;
 
-        let initial_level_count = usize::from(!storage.is_empty());
         let level_count = (0..max_level)
-            .map(|_| AtomicUsize::new(initial_level_count))
+            .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>();
 
         let visited_generator_queue = Arc::new(ArrayQueue::new(get_num_compute_intensive_cpus()));
@@ -707,32 +757,22 @@ impl HnswBuilder {
         }
 
         let mut nodes = Vec::with_capacity(len);
-        {
-            if len > 0 {
-                nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
+        let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
+        let mut highest_level = 0;
+        for i in 0..len {
+            let target_level = random_level_with(&builder.params, &mut level_rng);
+            if target_level > highest_level {
+                highest_level = target_level;
+                builder.entry_point = i as u32;
             }
-            let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
-            for i in 1..len {
-                nodes.push(RwLock::new(GraphBuilderNode::new(
-                    i as u32,
-                    builder.random_level(&mut level_rng) as usize + 1,
-                )));
-            }
+            nodes.push(RwLock::new(GraphBuilderNode::new(
+                i as u32,
+                target_level as usize + 1,
+            )));
         }
         builder.nodes = Arc::new(nodes);
 
         builder
-    }
-
-    /// New node's level
-    ///
-    /// See paper `Algorithm 1`
-    fn random_level<R: Rng + ?Sized>(&self, rng: &mut R) -> u16 {
-        let ml = 1.0 / (self.params.m as f32).ln();
-        min(
-            (-rng.random::<f32>().ln() * ml) as u16,
-            self.params.max_level - 1,
-        )
     }
 
     /// Insert one node.
@@ -744,6 +784,12 @@ impl HnswBuilder {
     ) {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
+        let entry_level = nodes[self.entry_point as usize]
+            .read()
+            .unwrap()
+            .level_neighbors
+            .len() as u16
+            - 1;
         let dist_calc = storage.dist_calculator_from_id(node);
         let mut ep = OrderedNode::new(
             self.entry_point,
@@ -758,7 +804,7 @@ impl HnswBuilder {
         //    ep = Select-Neighbors(W, 1)
         //  }
         // ```
-        for level in (target_level + 1..self.params.max_level).rev() {
+        for level in (target_level + 1..=entry_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
         }
@@ -774,7 +820,9 @@ impl HnswBuilder {
                 for neighbor in &neighbors {
                     current_node.add_neighbor(neighbor.id, neighbor.dist, level);
                 }
-                self.prune(storage, &mut current_node, level);
+                // Algorithm 1 selects M neighbors for the new node. Mmax0 is
+                // reserved for reciprocal edges on existing level-0 nodes.
+                self.prune(storage, &mut current_node, level, self.params.m);
                 pruned_neighbors_per_level[level as usize]
                     .clone_from(&current_node.level_neighbors_ranked[level as usize]);
 
@@ -782,22 +830,19 @@ impl HnswBuilder {
             }
         }
         for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
-            for unpruned_edge in pruned_neighbors {
-                let level = level as u16;
-                let m_max = match level {
-                    0 => self.params.m * 2,
-                    _ => self.params.m,
-                };
-                if unpruned_edge.dist
-                    < nodes[unpruned_edge.id as usize]
-                        .read()
-                        .unwrap()
-                        .cutoff(level, m_max)
-                {
-                    let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
-                    chosen_node.add_neighbor(node, unpruned_edge.dist, level);
-                    self.prune(storage, &mut chosen_node, level);
-                }
+            let level = level as u16;
+            let reciprocal_limit = if level == 0 {
+                self.params.m * 2
+            } else {
+                self.params.m
+            };
+            for selected_edge in pruned_neighbors {
+                // Algorithm 1 adds the reciprocal candidate before applying
+                // SELECT-NEIGHBORS. A distance-only cutoff would incorrectly
+                // discard farther candidates that improve directional diversity.
+                let mut chosen_node = nodes[selected_edge.id as usize].write().unwrap();
+                chosen_node.add_neighbor(node, selected_edge.dist, level);
+                self.prune(storage, &mut chosen_node, level, reciprocal_limit);
             }
         }
     }
@@ -829,20 +874,22 @@ impl HnswBuilder {
         )
     }
 
-    fn prune(&self, storage: &impl VectorStore, builder_node: &mut GraphBuilderNode, level: u16) {
-        let m_max = match level {
-            0 => self.params.m * 2,
-            _ => self.params.m,
-        };
-
+    fn prune(
+        &self,
+        storage: &impl VectorStore,
+        builder_node: &mut GraphBuilderNode,
+        level: u16,
+        max_connections: usize,
+    ) {
         let neighbors_ranked = &mut builder_node.level_neighbors_ranked[level as usize];
-        if neighbors_ranked.len() <= m_max {
+        if neighbors_ranked.len() <= max_connections {
             builder_node.update_from_ranked_neighbors(level);
             return;
         }
 
         let level_neighbors = std::mem::take(neighbors_ranked);
-        *neighbors_ranked = select_neighbors_heuristic_owned(storage, level_neighbors, m_max);
+        *neighbors_ranked =
+            select_neighbors_heuristic_owned(storage, level_neighbors, max_connections);
         builder_node.update_from_ranked_neighbors(level);
     }
 }
@@ -1361,6 +1408,7 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
+        params.validate()?;
         let builder = HnswBuilder::with_params(params, storage);
 
         log::debug!(
@@ -1377,12 +1425,23 @@ impl IvfSubIndex for HNSW {
         }
 
         let len = storage.len();
-        (1..len).into_par_iter().for_each_init(
-            || VisitedGenerator::new(len),
-            |visited_generator, node| {
-                builder.insert(node as u32, visited_generator, storage);
-            },
-        );
+        let entry_levels = builder.nodes[builder.entry_point as usize]
+            .read()
+            .unwrap()
+            .level_neighbors
+            .len();
+        for count in builder.level_count.iter().take(entry_levels) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        (0..len)
+            .into_par_iter()
+            .filter(|node| *node as u32 != builder.entry_point)
+            .for_each_init(
+                || VisitedGenerator::new(len),
+                |visited_generator, node| {
+                    builder.insert(node as u32, visited_generator, storage);
+                },
+            );
 
         assert_eq!(builder.level_count[0].load(Ordering::Relaxed), len);
         Ok(builder.finish())
@@ -1479,10 +1538,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+    };
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::deepsize::DeepSizeOf;
+    use lance_core::{Error, deepsize::DeepSizeOf};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader,
         writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
@@ -1493,9 +1554,13 @@ mod tests {
     use lance_table::io::manifest::ManifestDescribing;
     use lance_testing::datagen::generate_random_array;
     use object_store::path::Path;
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
 
-    use super::{HNSW_METADATA_KEY, HnswGraph, ImmutableHnswBottomView, ImmutableHnswLevelView};
+    use super::{
+        HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
+        ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
+    };
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
@@ -1651,6 +1716,165 @@ mod tests {
             .collect();
         all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         all.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    #[rstest]
+    #[case::zero_max_level(
+        HnswBuildParams::default().max_level(0),
+        "max_level must be greater than 0"
+    )]
+    #[case::zero_m(
+        HnswBuildParams::default().num_edges(0),
+        "m must be at least 4"
+    )]
+    #[case::one_m(
+        HnswBuildParams::default().num_edges(1),
+        "m must be at least 4"
+    )]
+    #[case::three_m(
+        HnswBuildParams::default().num_edges(3),
+        "m must be at least 4"
+    )]
+    #[case::small_ef(
+        HnswBuildParams::default().num_edges(20).ef_construction(19),
+        "ef_construction must be at least m (20)"
+    )]
+    #[case::overflowing_level_zero_limit(
+        HnswBuildParams::default()
+            .num_edges(usize::MAX)
+            .ef_construction(usize::MAX),
+        "level-0 reciprocal limit can be represented"
+    )]
+    fn test_rejects_invalid_build_params(
+        #[case] params: HnswBuildParams,
+        #[case] expected_message: &str,
+    ) {
+        let fsl =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, 0.0]), 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+
+        let error = HNSW::index_vectors(&store, params).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The lowest accepted construction settings retain a useful graph, but
+    /// do not promise full reachability. This seeded floor makes that quality
+    /// trade-off explicit and guards against catastrophic fragmentation.
+    #[test]
+    fn test_minimum_params_reachability() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let mut rng = SmallRng::seed_from_u64(0);
+        let values = Float32Array::from(
+            (0..TOTAL * DIM)
+                .map(|_| rng.random::<f32>())
+                .collect::<Vec<_>>(),
+        );
+        let vectors = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let store = FlatFloatStorage::new(vectors.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default()
+                .num_edges(MIN_HNSW_M)
+                .ef_construction(MIN_HNSW_M),
+        )
+        .unwrap();
+        let results = hnsw
+            .search_basic(
+                vectors.value(0),
+                TOTAL,
+                &HnswQueryParams {
+                    ef: TOTAL,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                },
+                None,
+                &store,
+            )
+            .unwrap();
+
+        let minimum_reachable = TOTAL * 90 / 100;
+        assert!(
+            results.len() >= minimum_reachable,
+            "minimum HNSW construction settings reached only {} of {TOTAL} nodes; expected at least {minimum_reachable}",
+            results.len(),
+        );
+    }
+
+    /// Algorithm 1 limits a newly inserted node to M connections even on
+    /// level 0. The larger Mmax0 limit only applies when old nodes receive
+    /// reciprocal connections.
+    #[test]
+    fn test_new_node_uses_m_connections() {
+        // Four equidistant, mutually diverse points around the final point.
+        // With the old shared Mmax0 limit, node 4 retained all four.
+        let values = Float32Array::from(vec![
+            1.0, 0.0, // east
+            0.0, 1.0, // north
+            -1.0, 0.0, // west
+            0.0, -1.0, // south
+            0.0, 0.0, // final node
+        ]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .max_level(1)
+            .num_edges(2)
+            .ef_construction(5);
+        let builder = HnswBuilder::with_params(params, &store);
+        let mut visited_generator = VisitedGenerator::new(store.len());
+
+        for node in 1..store.len() as u32 {
+            builder.insert(node, &mut visited_generator, &store);
+        }
+
+        let final_node = builder.nodes[4].read().unwrap();
+        assert_eq!(final_node.level_neighbors_ranked[0].len(), 2);
+        assert!(
+            builder
+                .nodes
+                .iter()
+                .all(|node| node.read().unwrap().level_neighbors_ranked[0].len() <= 4),
+            "existing level-0 nodes must remain bounded by Mmax0"
+        );
+    }
+
+    /// Offline construction pre-assigns the same random node heights as the
+    /// online builder and uses the first globally highest node as the anchor
+    /// for parallel insertion. This matches the final entry point produced by
+    /// sequential dynamic promotion without forcing node 0 to full height.
+    #[test]
+    fn test_offline_entry_point_uses_random_node_levels() {
+        const TOTAL: usize = 2048;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * 2), 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default();
+        let builder = HnswBuilder::with_params(params.clone(), &store);
+
+        let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
+        let expected_levels = (0..TOTAL)
+            .map(|_| random_level_with(&params, &mut level_rng))
+            .collect::<Vec<_>>();
+        let highest_level = *expected_levels.iter().max().unwrap();
+        let expected_entry = expected_levels
+            .iter()
+            .position(|level| *level == highest_level)
+            .unwrap() as u32;
+
+        for (node, expected_level) in builder.nodes.iter().zip(expected_levels) {
+            assert_eq!(
+                node.read().unwrap().level_neighbors.len(),
+                expected_level as usize + 1
+            );
+        }
+        assert_eq!(builder.entry_point, expected_entry);
     }
 
     /// The Arrow-backed loaded graph must search bit-identically to the
@@ -2128,6 +2352,37 @@ mod tests {
         }
     }
 
+    /// Version-1 readers use the configured max level to index serialized
+    /// level batches directly. Empty trailing ranges keep that persisted
+    /// shape while current readers use only the sampled, non-empty height.
+    #[test]
+    fn test_metadata_preserves_configured_empty_levels() {
+        const CONFIGURED_LEVELS: usize = 7;
+        let params = HnswBuildParams::default().max_level(CONFIGURED_LEVELS as u16);
+        let hnsw = HNSW::from_parts(params, vec![GraphBuilderNode::new(0, 1)], vec![1], 0);
+
+        assert_eq!(hnsw.max_level(), 1);
+        let metadata = hnsw.metadata();
+        assert_eq!(metadata.level_offsets.len(), CONFIGURED_LEVELS + 1);
+        assert_eq!(metadata.level_offsets[0], 0);
+        assert!(
+            metadata.level_offsets[1..]
+                .iter()
+                .all(|offset| *offset == 1)
+        );
+
+        let loaded = HNSW::load(hnsw.to_batch().unwrap()).unwrap();
+        assert_eq!(loaded.max_level(), 1);
+        match &loaded.inner.graph {
+            HnswGraph::Loaded(graph) => {
+                assert_eq!(graph.level_neighbors.len(), CONFIGURED_LEVELS);
+                assert_eq!(graph.level_count[0], 1);
+                assert!(graph.level_count[1..].iter().all(|count| *count == 0));
+            }
+            HnswGraph::Built(_) => panic!("expected an Arrow-backed loaded graph"),
+        }
+    }
+
     /// Indices written before issue #5156 was fixed omitted the entry point
     /// from every upper-level count. Loading those misaligned slices must keep
     /// the previous id-keyed, last-write-wins behavior.
@@ -2168,14 +2423,23 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let query = fsl.value(0);
-        let builder_results = builder
-            .search_basic(query.clone(), 10, &params, None, store.as_ref())
-            .unwrap();
-        let loaded_results = loaded
-            .search_basic(query, 10, &params, None, store.as_ref())
-            .unwrap();
-        assert_eq!(builder_results, loaded_results);
+        let entry_point = builder.inner.entry_point as usize;
+        let query_indices = [0, 1, TOTAL / 3, TOTAL - 1]
+            .into_iter()
+            .filter(|query_index| *query_index != entry_point)
+            .take(3)
+            .collect::<Vec<_>>();
+        assert_eq!(query_indices.len(), 3);
+        for query_index in query_indices {
+            let query = fsl.value(query_index);
+            let builder_results = builder
+                .search_basic(query.clone(), 10, &params, None, store.as_ref())
+                .unwrap();
+            let loaded_results = loaded
+                .search_basic(query, 10, &params, None, store.as_ref())
+                .unwrap();
+            assert_eq!(builder_results, loaded_results);
+        }
     }
 
     /// `load()` must reject a batch whose level-0 `__vector_id` no longer

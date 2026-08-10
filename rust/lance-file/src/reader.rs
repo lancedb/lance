@@ -2430,8 +2430,9 @@ mod tests {
     };
 
     use arrow_array::{
-        Int32Array, ListArray, RecordBatch, RecordBatchIterator, UInt32Array,
-        types::{Float64Type, Int32Type},
+        DictionaryArray, Int8Array, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
+        StringArray, UInt32Array,
+        types::{Float64Type, Int8Type, Int32Type},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -2596,6 +2597,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(take, vec![batch.take(&indices).unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn full_int8_dictionary_v2_2_roundtrip() {
+        let fs = FsFixture::default();
+        let values = Arc::new(StringArray::from(
+            (0..=i8::MAX)
+                .map(|value| format!("value-{value}"))
+                .collect::<Vec<_>>(),
+        ));
+        let keys = Int8Array::from((0..=i8::MAX).collect::<Vec<_>>());
+        let dictionary = Arc::new(DictionaryArray::<Int8Type>::new(keys, values));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![dictionary]).unwrap();
+
+        write_lance_file(
+            RecordBatchIterator::new([Ok(batch.clone())], arrow_schema),
+            &fs,
+            ConcreteFileVersion::V2_2,
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let actual = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(actual, vec![batch]);
     }
 
     async fn create_some_file(fs: &FsFixture, version: ConcreteFileVersion) -> WrittenFile {
@@ -2929,6 +2985,64 @@ mod tests {
         );
         assert!(
             error.to_string().contains("out of bounds"),
+            "unexpected message: {error}"
+        );
+    }
+
+    /// Storage dictionaries expand their values through `DataBlockBuilder`
+    /// before the final Arrow layout validation.  Corrupt dictionary offsets
+    /// must therefore fail at the append boundary instead of reaching a slice
+    /// operation with a decreasing range.
+    #[rstest]
+    #[tokio::test]
+    async fn test_default_reader_rejects_non_monotonic_storage_dictionary_offsets(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+    ) {
+        use arrow_array::StringArray;
+
+        let metadata = HashMap::from([
+            (
+                "lance-encoding:dict-size-ratio".to_string(),
+                "0.99".to_string(),
+            ),
+            (
+                "lance-encoding:dict-values-compression".to_string(),
+                "none".to_string(),
+            ),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("category", DataType::Utf8, false).with_metadata(metadata),
+        ]));
+        let values = (0..300)
+            .map(|index| match index % 3 {
+                0 => "alpha",
+                1 => "beta",
+                _ => "gamma",
+            })
+            .collect::<Vec<_>>();
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(StringArray::from(values))]).unwrap();
+
+        let offsets_tail_pattern = [5_i32, 9, 14]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let error = read_file_with_mutated_bytes(
+            version,
+            batch,
+            &offsets_tail_pattern,
+            4,
+            &2_i32.to_le_bytes(),
+        )
+        .await
+        .expect_err("non-monotonic dictionary offsets must fail the read");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("decreases"),
             "unexpected message: {error}"
         );
     }

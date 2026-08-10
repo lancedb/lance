@@ -16,7 +16,7 @@ use crate::index::scalar::infer_scalar_index_details;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::LanceFileVersion;
 use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
