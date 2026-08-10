@@ -139,7 +139,7 @@ parquet = { version = "58", default-features = false, features = ["arrow", "asyn
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [features]
-default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
+default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo", "tls-aws-lc-rs"]
 backtrace = ["lance-core/backtrace"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
@@ -162,6 +162,8 @@ tencent = ["lance-io/tencent"]
 goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
+tls-aws-lc-rs = ["lance-io/tls-aws-lc-rs"]
+tls-no-provider = ["lance-io/tls-no-provider"]
 # Publish object store metrics via the `metrics` crate.
 metrics = ["lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
