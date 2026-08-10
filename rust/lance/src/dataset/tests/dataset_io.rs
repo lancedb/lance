@@ -1389,6 +1389,8 @@ async fn test_restore_rejects_unknown_target_flags() {
         &write_config,
         dataset.manifest_location.naming_scheme,
         None,
+        // No inline transaction to classify from, so validate.
+        true,
     )
     .await
     .unwrap();
@@ -1404,6 +1406,8 @@ async fn test_restore_rejects_unknown_target_flags() {
         &write_config,
         dataset.manifest_location.naming_scheme,
         None,
+        // No inline transaction to classify from, so validate.
+        true,
     )
     .await
     .unwrap();
@@ -1448,6 +1452,8 @@ async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
         },
         dataset.manifest_location.naming_scheme,
         None,
+        // No inline transaction to classify from, so validate.
+        true,
     )
     .await
     .unwrap();
@@ -1900,6 +1906,8 @@ async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
         },
         source.manifest_location.naming_scheme,
         None,
+        // No inline transaction to classify from, so validate.
+        true,
     )
     .await
     .unwrap();
@@ -1946,6 +1954,8 @@ async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
         },
         source.manifest_location.naming_scheme,
         None,
+        // No inline transaction to classify from, so validate.
+        true,
     )
     .await
     .unwrap();

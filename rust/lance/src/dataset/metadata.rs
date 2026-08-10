@@ -899,4 +899,58 @@ mod tests {
             assert!(dataset.schema().unenforced_clustering_key().is_empty());
         }
     }
+
+    /// A table that already carries a nullable primary key must stay writable,
+    /// including through the delete that repairs it.
+    ///
+    /// Released versions could install a key on a nullable column through this
+    /// metadata path, so such tables exist. Validating every manifest write
+    /// would make them read-only on upgrade and leave a full overwrite as the
+    /// only repair.
+    #[tokio::test]
+    async fn nullable_primary_key_stays_repairable() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri: &str = &test_dir;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(RecordBatchIterator::new([Ok(batch)], schema), uri, None)
+            .await
+            .unwrap();
+
+        // Forge the state a released version could persist: a key on a
+        // nullable column, without passing the checks that now prevent it.
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            let field = manifest
+                .schema
+                .fields
+                .iter_mut()
+                .find(|f| f.name == "id")
+                .unwrap();
+            field.unenforced_primary_key_position = Some(1);
+        }
+
+        // Unrelated writes must still go through.
+        dataset
+            .update_config([("unrelated".to_string(), "value".to_string())])
+            .await
+            .expect("an unrelated write must not be blocked by a pre-existing bad key");
+
+        // And so must the delete that removes the offending rows -- without it
+        // there is no way to tighten the column afterwards.
+        dataset
+            .delete("id IS NULL")
+            .await
+            .expect("the repairing delete must not be blocked");
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+    }
 }

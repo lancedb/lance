@@ -26,6 +26,32 @@ impl Transaction {
     pub fn as_pb(&self) -> &pb::Transaction {
         &self.inner
     }
+
+    /// Whether this transaction can change the schema, and so can introduce or
+    /// worsen an invalid primary key.
+    ///
+    /// The rest leave the key exactly as they found it, so a table that already
+    /// carries an invalid one stays writable through them -- including the
+    /// deletes needed to repair it. An unrecognized operation counts as
+    /// schema-changing: an unknown write is not a safe one to exempt.
+    pub fn may_change_schema(&self) -> bool {
+        use pb::transaction::Operation;
+        match self.inner.operation.as_ref() {
+            Some(
+                Operation::Append(_)
+                | Operation::Delete(_)
+                | Operation::CreateIndex(_)
+                | Operation::Rewrite(_)
+                | Operation::DataReplacement(_)
+                | Operation::ReserveFragments(_)
+                | Operation::Update(_)
+                | Operation::UpdateConfig(_)
+                | Operation::UpdateMemWalState(_)
+                | Operation::UpdateBases(_),
+            ) => false,
+            _ => true,
+        }
+    }
 }
 
 /// Write-boundary conversion: serialize using protobuf at the last step.
