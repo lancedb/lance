@@ -2119,8 +2119,9 @@ impl ShardWriter {
         }
     }
 
-    /// Reject caller input that violates the logical schema: wrong column count
-    /// or types, or a null in a column the base table declares non-nullable.
+    /// Reject caller input that violates the logical schema: wrong column names,
+    /// order, count, or types, or a null in a column the base table declares
+    /// non-nullable.
     ///
     /// The *only* gate on that contract. The storage schema no longer rejects a
     /// caller's null, and nothing downstream does either — append and
@@ -2133,6 +2134,27 @@ impl ShardWriter {
     /// reopen.
     fn validate_against_logical_schema(&self, batches: &[RecordBatch]) -> Result<()> {
         for (i, batch) in batches.iter().enumerate() {
+            // Names first: everything after this point matches columns by
+            // position — `try_new` compares bare arrays, and
+            // `ensure_tombstone_column` re-labels positionally — so a pair of
+            // same-typed columns handed over swapped would be stored under each
+            // other's name.
+            for (col, (expected, actual)) in self
+                .logical_schema
+                .fields()
+                .iter()
+                .zip(batch.schema().fields())
+                .enumerate()
+            {
+                if expected.name() != actual.name() {
+                    return Err(Error::invalid_input(format!(
+                        "batch {i} column {col} is named '{}', but the base table schema \
+                         declares '{}' at that position",
+                        actual.name(),
+                        expected.name()
+                    )));
+                }
+            }
             RecordBatch::try_new(self.logical_schema.clone(), batch.columns().to_vec()).map_err(
                 |e| {
                     Error::invalid_input(format!(
@@ -3741,6 +3763,55 @@ mod tests {
             vec![Arc::new(Int32Array::from(ids.to_vec()))],
         )
         .unwrap()
+    }
+
+    /// Two same-typed columns handed over swapped pass every positional check
+    /// downstream, so the logical-schema gate has to catch them by name.
+    #[tokio::test]
+    async fn test_put_rejects_swapped_same_typed_columns() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("email", DataType::Utf8, true),
+        ]));
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            ShardWriterConfig {
+                shard_id: Uuid::new_v4(),
+                ..Default::default()
+            },
+            schema,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let swapped = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("email", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a@example.com"])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+
+        let error = writer.put(vec![swapped]).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("column 0") && message.contains("email") && message.contains("name"),
+            "error should name the position and both columns: {message}"
+        );
+
+        writer.close().await.unwrap();
     }
 
     #[test]

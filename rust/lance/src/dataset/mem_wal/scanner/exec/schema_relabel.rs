@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -127,15 +127,15 @@ impl Stream for SchemaRelabelStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                let schema = self.schema.clone();
-                // Guards the column-less case: `try_new` infers the row count
-                // from the first column and errors when there is none.
-                let relabeled = if batch.num_rows() == 0 {
-                    Ok(RecordBatch::new_empty(schema))
-                } else {
-                    RecordBatch::try_new(schema, batch.columns().to_vec())
-                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                };
+                // Carry the row count explicitly, so a column-less batch keeps
+                // its rows: `try_new` infers the count from the first column and
+                // errors when there is none.
+                let relabeled = RecordBatch::try_new_with_options(
+                    self.schema.clone(),
+                    batch.columns().to_vec(),
+                    &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                )
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
                 Poll::Ready(Some(relabeled))
             }
             other => other,
@@ -225,12 +225,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_batch_is_relabeled_without_row_count_inference() {
+    async fn empty_batch_is_relabeled() {
         let input = source(batch(schema_with(true), vec![]));
         let relabeled = Arc::new(SchemaRelabelExec::new(input, schema_with(false)));
 
         let out = run(relabeled).await.unwrap();
         assert!(out.iter().all(|b| b.num_rows() == 0));
         assert!(out.iter().all(|b| b.schema() == schema_with(false)));
+    }
+
+    #[tokio::test]
+    async fn empty_batch_is_still_checked_against_the_target_schema() {
+        let input = source(batch(schema_with(true), vec![]));
+        let mistyped = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Int32, false),
+        ]));
+        let relabeled = Arc::new(SchemaRelabelExec::new(input, mistyped));
+
+        let error = run(relabeled).await.unwrap_err().to_string();
+        assert!(
+            error.contains("column types must match"),
+            "expected a data type error, got: {error}"
+        );
     }
 }
