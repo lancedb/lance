@@ -160,11 +160,9 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
         builder = builder.download_mode(download_mode);
     }
 
-    let operator = Operator::new(builder)
-        .map_err(|e| {
-            Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
-        })?
-        .finish();
+    let operator = Operator::new(builder).map_err(|e| {
+        Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
+    })?;
 
     Ok(OpendalStore::new(operator))
 }
@@ -223,7 +221,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
         let parsed = parse_hf_url(url)?;
-        Path::parse(&parsed.relative_path).map_err(|_| {
+        Path::from_url_path(&parsed.relative_path).map_err(|_| {
             Error::invalid_input(format!("Invalid path in Huggingface URL: {}", url.path()))
         })
     }

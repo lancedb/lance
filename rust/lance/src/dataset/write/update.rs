@@ -25,6 +25,7 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
@@ -33,6 +34,16 @@ use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
+
+/// Collect a field id and all of its descendant field ids (pre-order). A struct
+/// column update rewrites the whole subtree, so an index on any descendant must be
+/// treated as modified.
+fn collect_subtree_field_ids(field: &lance_core::datatypes::Field, out: &mut Vec<u32>) {
+    out.push(field.id as u32);
+    for child in &field.children {
+        collect_subtree_field_ids(child, out);
+    }
+}
 
 /// Build an update operation.
 ///
@@ -270,6 +281,7 @@ impl UpdateJob {
     async fn execute_impl(self) -> Result<UpdateData> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -308,18 +320,17 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let version = self
-            .dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_version()?;
         let (mut new_fragments, _) = write_fragments_internal(
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
-            WriteParams::with_storage_version(version),
+            WriteParams::default(),
             None, // TODO: support multiple bases for update
         )
         .await?;
@@ -345,7 +356,7 @@ impl UpdateJob {
             })?;
             for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                 let serialized = lance_table::rowids::write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
             }
         }
 
@@ -359,6 +370,7 @@ impl UpdateJob {
                 cleanup_data_fragments(
                     &self.dataset.object_store,
                     &self.dataset.base,
+                    None,
                     &new_fragments,
                 )
                 .await;
@@ -386,10 +398,14 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        // Updated columns are top-level (nested references are rejected by `set`), but a
+        // struct-column update rewrites all of its descendants. Collect the full field
+        // subtree so an index on a nested child field is recognized as modified and not
+        // wrongly extended over the rewritten fragment.
         let mut fields_for_preserving_frag_bitmap = Vec::new();
         for column_name in self.updates.keys() {
-            if let Ok(field_id) = dataset.schema().field_id(column_name) {
-                fields_for_preserving_frag_bitmap.push(field_id as u32);
+            if let Some(field) = dataset.schema().field(column_name) {
+                collect_subtree_field_ids(field, &mut fields_for_preserving_frag_bitmap);
             }
         }
 
@@ -402,7 +418,7 @@ impl UpdateJob {
             // are moved(deleted and appended).
             // so we do not need to handle the frag bitmap of the index about it.
             fields_modified: vec![],
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
             inserted_rows_filter: None,
@@ -521,7 +537,7 @@ mod tests {
         array::AsArray,
         datatypes::{Int64Type, UInt32Type},
     };
-    use arrow_array::types::Float32Type;
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
@@ -533,7 +549,7 @@ mod tests {
     use lance_datagen::{Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
-    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
@@ -1267,6 +1283,178 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, "i < 100", 100)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, "i = 0", 1)]
+    #[tokio::test]
+    async fn test_addr_domain_index_does_not_cover_rewritten_update_fragment(
+        #[case] index_type: BuiltinIndexType,
+        #[case] query: &str,
+        #[case] expected_rows: usize,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col("category", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".to_string()),
+                &ScalarIndexParams::for_builtin(index_type),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let before = dataset
+            .scan()
+            .filter(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(before.num_rows(), expected_rows);
+
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i < 20")
+            .unwrap()
+            .set("category", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|index| index.name == "i_idx").unwrap();
+        assert_eq!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0],
+            "the address-domain index must not cover the rewritten fragment"
+        );
+
+        // Regression for https://github.com/lance-format/lance/issues/8278: a later
+        // update must find rows moved out of the address-domain index's coverage.
+        let second_update = UpdateBuilder::new(dataset)
+            .update_where(query)
+            .unwrap()
+            .set("category", "-2")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(second_update.rows_updated, expected_rows as u64);
+        let dataset = second_update.new_dataset;
+
+        let after = dataset
+            .scan()
+            .filter(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(after.num_rows(), expected_rows);
+
+        let updated = dataset
+            .scan()
+            .filter("category = -2")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(updated.num_rows(), expected_rows);
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/8076
+    ///
+    /// A bloom filter index reports matches as physical row addresses. An update that
+    /// replaces every row of a fragment removes that fragment, but the index keeps the
+    /// addresses it holds for it, so translating its results to row ids has to tolerate
+    /// a fragment that is gone rather than fail with an internal error.
+    #[tokio::test]
+    async fn test_addr_domain_index_after_update_drops_fragment() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BloomFilter,
+                Some("i_idx".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Rewrites all of fragment 1 (rows 3, 4, 5), which drops the fragment.
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i >= 3")
+            .unwrap()
+            .set("i", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        assert!(dataset.get_fragments().iter().all(|frag| frag.id() != 1));
+
+        // The index still holds a block for the dropped fragment, and a bloom filter
+        // cannot rule out a value it once held, so this query is the one that reaches
+        // the index with addresses in that fragment.
+        let matched = dataset
+            .scan()
+            .filter("i = 4")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(matched.num_rows(), 0);
+
+        let updated = dataset
+            .scan()
+            .filter("i = -1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(updated.num_rows(), 3);
+    }
+
     #[tokio::test]
     async fn test_update_mixed_indexed_unindexed_fragments() {
         let mut dataset = lance_datagen::gen_batch()
@@ -1686,5 +1874,75 @@ mod tests {
             baseline_files,
             "Rewritten data files should be cleaned up on apply_deletions failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_with_blob() {
+        use arrow_array::LargeBinaryArray;
+        use arrow_schema::Field;
+        use lance_arrow::BLOB_META_KEY;
+
+        let test_dir = TempStrDir::default();
+        let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("blobs", DataType::LargeBinary, true).with_metadata(blob_meta),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(b"foo".as_slice()),
+                    Some(b"bar".as_slice()),
+                    Some(b"baz".as_slice()),
+                ])),
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Perform an update: update the "blobs" column where id = 1
+        let dataset = Arc::new(dataset);
+        let updated_dataset = UpdateBuilder::new(dataset)
+            .update_where("id = 1")
+            .unwrap()
+            .set("blobs", "arrow_cast('updated_bar', 'LargeBinary')")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        // Verify the updated value
+        let mut scanner = updated_dataset.scan();
+        // Read as binary to assert actual value
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batches = scanner.try_into_batch().await.unwrap();
+        let blobs = batches.column_by_name("blobs").unwrap().as_binary::<i64>();
+        let ids = batches
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+
+        // Find the index of id = 1
+        let idx = ids.values().iter().position(|&x| x == 1).unwrap();
+        assert_eq!(blobs.value(idx), b"updated_bar");
+
+        let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
+        assert_eq!(blobs.value(idx_foo), b"foo");
     }
 }

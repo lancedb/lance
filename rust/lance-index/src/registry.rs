@@ -16,6 +16,21 @@ use crate::{
     },
 };
 
+/// Derive the scalar index plugin name from a details type URL.
+///
+/// Takes the last `.`-separated segment, lowercases it, and strips any trailing
+/// `"indexdetails"` suffix so the result matches the plugin name used in
+/// [`IndexPluginRegistry`]. For example, `/lance.index.pb.ZoneMapIndexDetails`
+/// yields `"zonemap"`.
+pub fn plugin_name_from_details_url(type_url: &str) -> String {
+    let segment = type_url.split('.').next_back().unwrap_or(type_url);
+    let lower = segment.to_lowercase();
+    lower
+        .strip_suffix("indexdetails")
+        .map(|s| s.to_string())
+        .unwrap_or(lower)
+}
+
 /// Derive a human-readable index type name from a details type URL.
 ///
 /// The display name is the final `.`-separated segment of the type URL with any
@@ -42,17 +57,7 @@ impl IndexPluginRegistry {
     }
 
     fn get_plugin_name_from_details_name(&self, details_name: &str) -> String {
-        let details_name = Self::normalize_plugin_name(details_name);
-        if details_name.ends_with("indexdetails") {
-            let plugin_name = details_name.replace("indexdetails", "");
-            if plugin_name == "fmindex" {
-                "fm".to_string()
-            } else {
-                plugin_name
-            }
-        } else {
-            details_name
-        }
+        plugin_name_from_details_url(details_name)
     }
 
     /// Adds a plugin to the registry, using the name of the details message to determine
@@ -87,7 +92,7 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
-        registry.add_plugin::<pb::FmIndexIndexDetails, FMIndexPlugin>();
+        registry.add_plugin::<pb::FmIndexDetails, FMIndexPlugin>();
         #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 

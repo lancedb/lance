@@ -12,10 +12,11 @@ use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::{ManifestWriteConfig, write_manifest_file};
 use crate::session::Session;
+use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
 use lance_table::format::DataStorageFormat;
 
-use crate::dataset::write::{WriteMode, WriteParams};
+use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
@@ -33,7 +34,10 @@ use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
-use lance_file::version::LanceFileVersion;
+use lance_file::{
+    version::{ConcreteFileVersion, LanceFileVersion},
+    writer::FileWriterOptions,
+};
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::BasePath;
@@ -242,6 +246,62 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
 }
 
 #[tokio::test]
+async fn test_store_params_for_base_resolves_base_scoped_options() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let uri = test_dir.to_str().unwrap();
+    let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+
+    let base_dir = tempfile::tempdir().unwrap();
+    let base_uri = file_object_store_uri(base_dir.path());
+    let base = BasePath::new(1, base_uri, Some("base".to_string()), true);
+    dataset.add_bases(vec![base.clone()], None).await.unwrap();
+
+    // Reopen with a single flat storage options map carrying base-scoped
+    // entries (`base_<id>.<key>`) next to shared defaults.
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_storage_options(HashMap::from([
+            ("shared_option".to_string(), "shared".to_string()),
+            (
+                "base_1.scoped_option".to_string(),
+                "base1-value".to_string(),
+            ),
+        ]))
+        .load()
+        .await
+        .unwrap();
+
+    // The registered base resolves the scoped entry on top of shared defaults.
+    let base_path = dataset.manifest.base_paths.get(&1).unwrap().clone();
+    let params = dataset.store_params_for_base(Some(&base_path));
+    assert_eq!(
+        params.storage_options().unwrap(),
+        &HashMap::from([
+            ("shared_option".to_string(), "shared".to_string()),
+            ("scoped_option".to_string(), "base1-value".to_string()),
+        ])
+    );
+
+    // The default scope keeps only the shared defaults.
+    let params = dataset.store_params_for_base(None);
+    assert_eq!(
+        params.storage_options().unwrap(),
+        &HashMap::from([("shared_option".to_string(), "shared".to_string())])
+    );
+
+    // The base store resolved from scoped options is usable end to end.
+    let base_store = dataset.object_store(Some(1)).await.unwrap();
+    let probe = base
+        .extract_path(dataset.session().store_registry())
+        .unwrap()
+        .join("data")
+        .join("probe.lance");
+    base_store.put(&probe, b"hello").await.unwrap();
+    let read = base_store.inner.get_range(&probe, 0..5).await.unwrap();
+    assert_eq!(read.as_ref(), b"hello");
+}
+
+#[tokio::test]
 async fn test_with_object_store_wrappers_wraps_refs_store() {
     let test_dir = tempfile::tempdir().unwrap();
     let uri = file_object_store_uri(test_dir.path());
@@ -325,6 +385,115 @@ async fn test_create_data_file_uses_base_object_store() {
 
     assert_eq!(data_file.base_id, Some(base.id));
     assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+async fn test_create_data_file_rejects_nested_schema_mismatch() {
+    let dataset_uri = format!(
+        "memory://test_create_data_file_rejects_nested_schema_mismatch/{}",
+        uuid::Uuid::new_v4()
+    );
+
+    let dataset_struct_fields = vec![
+        ArrowField::new("a", DataType::Int32, true),
+        ArrowField::new("b", DataType::Int32, true),
+    ];
+    let dataset_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        DataType::Struct(dataset_struct_fields.clone().into()),
+        true,
+    )]));
+    let dataset_struct = StructArray::try_new(
+        dataset_struct_fields.clone().into(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+        ],
+        None,
+    )
+    .unwrap();
+    let dataset_batch =
+        RecordBatch::try_new(dataset_schema.clone(), vec![Arc::new(dataset_struct)]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(dataset_batch)], dataset_schema),
+        &dataset_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    async fn write_replacement_file(
+        dataset: &Dataset,
+        file_name: &str,
+        struct_fields: Vec<ArrowField>,
+    ) {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(struct_fields.clone().into()),
+            true,
+        )]));
+        let values = struct_fields
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| Arc::new(Int32Array::from(vec![idx as i32])) as ArrayRef)
+            .collect::<Vec<_>>();
+        let struct_array = StructArray::try_new(struct_fields.into(), values, None).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array) as ArrayRef]).unwrap();
+
+        let object_writer = dataset
+            .object_store
+            .create(&dataset.data_dir().join(file_name))
+            .await
+            .unwrap();
+        let mut writer = lance_file::versions::v2_2::create_writer(
+            object_writer,
+            crate::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    write_replacement_file(
+        &dataset,
+        "nested_reordered.lance",
+        vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+        ],
+    )
+    .await;
+    let err = dataset
+        .create_data_file("nested_reordered.lance", None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Schema mismatch"),
+        "unexpected error: {err}"
+    );
+
+    write_replacement_file(
+        &dataset,
+        "nested_unknown.lance",
+        vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ],
+    )
+    .await;
+    let err = dataset
+        .create_data_file("nested_unknown.lance", None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Schema mismatch"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]
@@ -692,12 +861,82 @@ async fn test_load_manifest_iops() {
         .await
         .unwrap();
 
-    // There should be only two IOPS:
-    // 1. List _versions directory to get the latest manifest location
-    // 2. Read the manifest file. (The manifest is small enough to be read in one go.
-    //    Larger manifests would result in more IOPS.)
+    // The write above committed on this same Session, so the manifest is already
+    // in the metadata cache. Opening therefore issues a single IOP:
+    // 1. List _versions directory to resolve the latest manifest location.
+    // The manifest body is served from the cache instead of being read from storage.
     let io_stats = _dataset.object_store.as_ref().io_stats_incremental();
-    assert_io_eq!(io_stats, read_iops, 2);
+    assert_io_eq!(io_stats, read_iops, 1);
+}
+
+#[tokio::test]
+async fn test_checkout_removed_version_not_served_from_cache() {
+    let test_uri = TempStrDir::default();
+    let session = Arc::new(Session::default());
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let version = dataset.manifest().version;
+    let location = dataset.manifest_location().clone();
+    let cache = session.metadata_cache.for_dataset(&dataset.uri);
+
+    assert!(
+        cache
+            .get_with_key(&ManifestKey {
+                version,
+                e_tag: location.e_tag.as_deref(),
+            })
+            .await
+            .is_some(),
+        "manifest should be cached after the write"
+    );
+    dataset.checkout_version(version).await.unwrap();
+
+    // Remove the version from storage, as cleanup (or a manual delete) would.
+    dataset.object_store.delete(&location.path).await.unwrap();
+
+    let resolved = dataset
+        .commit_handler
+        .resolve_version_location(&dataset.base, version, &dataset.object_store.inner)
+        .await
+        .unwrap();
+    assert!(
+        resolved.size.is_none(),
+        "resolving a removed version must fall back to a size-less location, got {:?}",
+        resolved.size
+    );
+
+    cache
+        .insert_with_key(
+            &ManifestKey {
+                version,
+                e_tag: None,
+            },
+            Arc::new(dataset.manifest().clone()),
+        )
+        .await;
+    assert!(
+        dataset.checkout_version(version).await.is_err(),
+        "checkout of a version removed from storage must not be served from cache"
+    );
 }
 
 #[rstest]
@@ -760,7 +999,11 @@ async fn test_write_params(
 #[rstest]
 #[tokio::test]
 async fn test_write_manifest(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    #[values(
+        LanceFileVersion::Legacy,
+        LanceFileVersion::Stable,
+        LanceFileVersion::Next
+    )]
     data_storage_version: LanceFileVersion,
 ) {
     use lance_table::feature_flags::FLAG_UNKNOWN;
@@ -809,8 +1052,12 @@ async fn test_write_manifest(
 
     assert_eq!(
         manifest.data_storage_format,
-        DataStorageFormat::new(data_storage_version)
+        DataStorageFormat::new(ConcreteFileVersion::from(data_storage_version))
     );
+    assert!(!matches!(
+        manifest.data_storage_format.version.to_manifest_string(),
+        "stable" | "next"
+    ));
     assert_eq!(manifest.reader_feature_flags, 0);
 
     // Create one with deletions
@@ -888,6 +1135,164 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn test_rle_v2_v23_write_and_append() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+    let mut dataset = Dataset::write(
+        batches,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let manifest = read_manifest(
+        dataset.object_store.as_ref(),
+        &dataset
+            .commit_handler
+            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .await
+            .unwrap()
+            .path,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        manifest.data_storage_format.lance_file_version().unwrap(),
+        LanceFileVersion::V2_3
+    );
+
+    let append_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![9; 1000]))],
+    )
+    .unwrap();
+    let append_batches =
+        RecordBatchIterator::new(vec![Ok(append_batch)].into_iter(), schema.clone());
+    dataset = Dataset::write(
+        append_batches,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        dataset
+            .manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_3
+    );
+
+    let actual = dataset.scan().try_into_batch().await.unwrap();
+    let expected = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(
+            [vec![7; 1000], vec![9; 1000]].concat(),
+        ))],
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_rle_v2_uncommitted_create_commits_v23_storage() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let transaction = InsertBuilder::new(test_uri.as_str())
+        .with_params(&WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+
+    let dataset = CommitBuilder::new(test_uri.as_str())
+        .execute(transaction)
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_3
+    );
+}
+
+#[tokio::test]
+async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
+    let test_uri = TempStrDir::default();
+    let clone_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let clone = dataset
+        .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        clone
+            .manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_3
+    );
 }
 
 #[rstest]
@@ -1122,6 +1527,132 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+}
+
+#[tokio::test]
+async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
+    use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let source_uri = source_dir.to_str().unwrap();
+    let target_dir = test_dir.join("target");
+    let target_uri = target_dir.to_str().unwrap();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(32), BatchCount::from(1));
+    let mut source = Dataset::write(
+        data_reader,
+        source_uri,
+        Some(WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let source_transaction_file = source.manifest().transaction_file.clone();
+
+    handler.fail_next(AmbiguousFailure::LandAndConflict);
+    let cloned = source
+        .deep_clone(target_uri, source.version().version, None)
+        .await
+        .expect("readback must identify the deep-clone transaction that landed");
+
+    assert_eq!(cloned.count_rows(None).await.unwrap(), 32);
+    assert_ne!(cloned.manifest().transaction_file, source_transaction_file);
+    assert!(cloned.manifest().transaction_section.is_some());
+}
+
+// Uses an in-memory source store to force a cross-store copy. The in-memory store has
+// known platform-specific quirks on Windows (it reads back empty there; see the note in
+// tests/resource_tests.rs), so this test is gated to non-Windows. The local write side is
+// covered on Windows by `test_deep_clone` (same-store), and the cross-store streaming path
+// against real cloud stores is platform-agnostic std/tokio I/O.
+#[cfg(not(windows))]
+#[rstest]
+#[tokio::test]
+async fn test_deep_clone_cross_store(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    // Source lives in an in-memory store while the target is a local directory, so the
+    // two stores have different `store_prefix`es and `deep_clone` must stream files from
+    // the source store to the target store (the cross-account code path).
+    let session = Arc::new(Session::default());
+    let test_dir = TempStdDir::default();
+    let clone_dir = test_dir.join("clone_ds");
+    let cloned_uri = clone_dir.to_str().unwrap();
+
+    // 64 rows across 4 files exercises the multi-fragment copy path.
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("val", array::fill_utf8("deep".to_string()))
+        .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+
+    let mut dataset = Dataset::write(
+        data_reader,
+        "memory://cross_store_src",
+        Some(WriteParams {
+            max_rows_per_file: 16,
+            max_rows_per_group: 16,
+            data_storage_version: Some(data_storage_version),
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_ne!(dataset.object_store.store_prefix, "");
+
+    // Create a scalar index so the index files and the manifest index section are also
+    // copied across stores (the index section is read through the source store at commit).
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Delete some rows so a deletion file is also streamed across stores.
+    dataset.delete("id < 10").await.unwrap();
+    let cloned_dataset = dataset
+        .deep_clone(cloned_uri, dataset.version().version, None)
+        .await
+        .unwrap();
+
+    // The clone targets a local store, distinct from the in-memory source.
+    assert_ne!(
+        cloned_dataset.object_store.store_prefix,
+        dataset.object_store.store_prefix
+    );
+    assert!(cloned_dataset.manifest().base_paths.is_empty());
+
+    // Re-open the clone from a fresh session to prove the files were physically copied
+    // into the target store and the clone is fully independent of the source store.
+    let reopened = DatasetBuilder::from_uri(cloned_uri).load().await.unwrap();
+    let batches = reopened
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 54); // 64 rows - 10 deletions
+
+    // The scalar index must have been copied and resolve against the target store, with its
+    // base reference normalized to local (no external base_paths).
+    let cloned_indices = reopened.load_indices().await.unwrap();
+    assert_eq!(cloned_indices.len(), 1);
+    assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
+    assert!(cloned_indices.iter().all(|idx| idx.base_id.is_none()));
 }
 
 // Helper: count files under a dataset directory (data/_indices/_deletions)
@@ -1656,9 +2187,10 @@ async fn overwrite_dataset(
 
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    // Fragment ids reset after overwrite.
-    assert_eq!(fragments[0].id(), 0);
-    assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
+    // Fragment ids continue from the dataset's high water mark after an
+    // overwrite; they are never reused.
+    assert_eq!(fragments[0].id(), 1);
+    assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
 
     let actual_ds = Dataset::open(&test_uri).await.unwrap();
     assert_eq!(actual_ds.version().version, 2);

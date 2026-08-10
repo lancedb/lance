@@ -37,6 +37,25 @@ def test_dataset_optimize(tmp_path: Path):
     assert dataset.version == 3
 
 
+def test_compact_files_max_source_fragments(tmp_path: Path):
+    rows_per_fragment = 256 * 1024
+    dataset = lance.write_dataset(
+        pa.table({"a": pa.nulls(10 * rows_per_fragment)}),
+        tmp_path / "dataset",
+        max_rows_per_file=rows_per_fragment,
+    )
+    assert len(dataset.get_fragments()) == 10
+
+    metrics = dataset.optimize.compact_files(
+        max_source_fragments=4,
+        num_threads=1,
+    )
+
+    assert metrics.fragments_removed == 4
+    assert metrics.fragments_added == 1
+    assert len(dataset.get_fragments()) == 7
+
+
 def test_blob_compaction(tmp_path: Path):
     base_dir = tmp_path / "blob_dataset"
     blob_field = pa.field(
@@ -67,6 +86,83 @@ def test_blob_compaction(tmp_path: Path):
     blob_files = dataset.take_blobs("blob", indices=[0, 1])
     contents = [blob_files[0].readall(), blob_files[1].readall()]
     assert contents == blobs
+
+
+@pytest.mark.parametrize("storage_version", ["2.0", "2.1", "2.2"])
+def test_blob_compaction_preserves_null_empty_and_read_parity(
+    tmp_path: Path, storage_version: str
+):
+    base_dir = tmp_path / f"blob_dataset_{storage_version}"
+    if storage_version == "2.2":
+        blob_field = lance.blob_field("blob")
+    else:
+        blob_field = pa.field(
+            "blob",
+            pa.large_binary(),
+            metadata={"lance-encoding:blob": "true"},
+        )
+    schema = pa.schema([pa.field("id", pa.int64()), blob_field])
+
+    def make_blob_array(values):
+        if storage_version == "2.2":
+            return lance.blob_array(values)
+        return pa.array(values, type=pa.large_binary())
+
+    for index, (ids, values) in enumerate(
+        [
+            ([1, 2], [b"P1", None]),
+            ([3, 4, 5], [b"P3", None, b""]),
+        ]
+    ):
+        lance.write_dataset(
+            pa.Table.from_arrays(
+                [
+                    pa.array(ids, type=pa.int64()),
+                    make_blob_array(values),
+                ],
+                schema=schema,
+            ),
+            base_dir,
+            mode="create" if index == 0 else "append",
+            data_storage_version=storage_version,
+        )
+
+    dataset = lance.dataset(base_dir)
+    dataset.delete("id = 2")
+    dataset.optimize.compact_files(num_threads=1)
+
+    expected = {1: b"P1", 3: b"P3", 4: None, 5: b""}
+    binary_table = dataset.to_table(columns=["id", "blob"], blob_handling="all_binary")
+    scan_values = dict(
+        zip(
+            binary_table.column("id").to_pylist(),
+            binary_table.column("blob").to_pylist(),
+        )
+    )
+
+    ids = dataset.to_table(columns=["id"]).column("id").to_pylist()
+    blob_files = dataset.take_blobs("blob", indices=range(len(ids)))
+    take_values = {
+        row_id: None if blob_file is None else blob_file.readall()
+        for row_id, blob_file in zip(ids, blob_files)
+    }
+
+    assert take_values == expected
+    assert scan_values == take_values
+
+    descriptor_table = dataset.to_table(columns=["id", "blob"])
+    descriptions = dict(
+        zip(
+            descriptor_table.column("id").to_pylist(),
+            descriptor_table.column("blob").to_pylist(),
+        )
+    )
+    if storage_version == "2.0":
+        assert descriptions[4] == {"position": 1, "size": 0}
+    else:
+        assert descriptions[4] is None
+    assert descriptions[5] is not None
+    assert descriptions[5]["size"] == 0
 
 
 def test_optimize_max_bytes(tmp_path: Path):
@@ -492,6 +588,20 @@ def test_optimize_indices_second_call_is_noop(tmp_path: Path):
     must not write any new files to the dataset directory."""
     base_dir = tmp_path / "dataset"
 
+    def assert_optimize_is_noop(dataset: lance.LanceDataset):
+        version_before = dataset.version
+        files_before = {
+            path.relative_to(base_dir) for path in base_dir.rglob("*") if path.is_file()
+        }
+
+        dataset.optimize.optimize_indices()
+
+        files_after = {
+            path.relative_to(base_dir) for path in base_dir.rglob("*") if path.is_file()
+        }
+        assert dataset.version == version_before
+        assert files_after == files_before
+
     n = 1024
     rng = np.random.default_rng(0)
     vectors = rng.standard_normal((n, 8)).astype(np.float32)
@@ -546,16 +656,20 @@ def test_optimize_indices_second_call_is_noop(tmp_path: Path):
 
     # First optimize: should pull the new fragment into each index.
     dataset.optimize.optimize_indices()
+    assert_optimize_is_noop(dataset)
 
-    files_before = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
+    # Consolidate the vector delta so every fragment has the same physical index
+    # coverage; compaction intentionally avoids mixing fragments that do not.
+    dataset.optimize.optimize_indices(num_indices_to_merge=10)
 
-    # Second optimize: nothing has changed, so this must be a no-op on disk.
+    # Compaction invalidates the old fragment coverage, so one optimize is needed
+    # to rebuild each index. Further calls must return to the same steady state.
+    compaction = dataset.optimize.compact_files(
+        target_rows_per_fragment=2 * (n + extra_rows), num_threads=1
+    )
+    assert compaction.fragments_removed > 0
     dataset.optimize.optimize_indices()
-
-    files_after = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
-
-    new_files = files_after - files_before
-    assert not new_files, f"second optimize_indices created new files: {new_files}"
+    assert_optimize_is_noop(dataset)
 
 
 def test_compaction_generates_rewrite_transaction(tmp_path: Path):
@@ -574,3 +688,38 @@ def test_compaction_generates_rewrite_transaction(tmp_path: Path):
         t is not None and t.operation.__class__.__name__ == "Rewrite"
         for t in transactions
     )
+
+
+def test_remap_row_addrs(tmp_path: Path):
+    # Dataset.remap_row_addrs follows rows across a compaction via the
+    # fragment-reuse index: an address valid before the compaction maps to the
+    # row's new address after it. None when there is no fragment-reuse index.
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"id": range(1_000), "v": range(1_000)})
+    ds = lance.write_dataset(data, base_dir, max_rows_per_file=100)  # 10 fragments
+
+    # No fragment-reuse index yet -> None (nothing to remap against).
+    addrs = pa.array([0, 1 << 32, (5 << 32) | 7], pa.uint64())
+    assert ds.remap_row_addrs(addrs) is None
+
+    before = ds.scanner(columns=["id"], with_row_address=True).to_table()
+    old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
+
+    # A deferred-remap compaction records a fragment-reuse index only when it
+    # rewrites data an index covers, so index a column first.
+    ds.create_scalar_index("id", "BTREE")
+
+    ds.optimize.compact_files(
+        target_rows_per_fragment=1_000, defer_index_remap=True, num_threads=1
+    )
+    ds = lance.dataset(base_dir)
+    assert any(idx.name == "__lance_frag_reuse" for idx in ds.describe_indices())
+
+    after = ds.scanner(columns=["id"], with_row_address=True).to_table()
+    new = dict(zip(after["id"].to_pylist(), after["_rowaddr"].to_pylist()))
+
+    sample = [0, 137, 999]
+    remapped = ds.remap_row_addrs(
+        pa.array([old[i] for i in sample], pa.uint64())
+    ).to_pylist()
+    assert remapped == [new[i] for i in sample]

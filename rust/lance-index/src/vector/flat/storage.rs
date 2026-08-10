@@ -19,7 +19,7 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
 
@@ -87,7 +87,7 @@ impl QuantizerStorage for FlatFloatStorage {
     }
 
     async fn load_partition(
-        _: &PreviousFileReader,
+        _: &V1FileReader,
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
@@ -134,7 +134,7 @@ impl VectorStore for FlatFloatStorage {
 
     fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
         // TODO: use chunked storage
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch])?;
         let mut storage = self.clone();
         storage.row_ids = Arc::new(
             new_batch
@@ -249,7 +249,7 @@ impl QuantizerStorage for FlatBinStorage {
     }
 
     async fn load_partition(
-        _: &PreviousFileReader,
+        _: &V1FileReader,
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
@@ -296,7 +296,7 @@ impl VectorStore for FlatBinStorage {
 
     fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
         // TODO: use chunked storage
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch])?;
         let mut storage = self.clone();
         storage.row_ids = Arc::new(
             new_batch

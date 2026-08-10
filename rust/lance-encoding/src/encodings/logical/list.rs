@@ -251,9 +251,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields};
     use rstest::rstest;
 
-    use crate::{
-        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
+    use crate::testing::{
+        TestCases, TestEncoding, check_basic_random, check_round_trip_encoding_of_data,
+        create_test_field_encoder, test_encoding_strategy,
     };
 
     fn make_list_type(inner_type: DataType) -> DataType {
@@ -277,20 +277,16 @@ mod tests {
         let arrow_field =
             Field::new("", array.data_type().clone(), true).with_metadata(field_metadata);
         let lance_field = lance_core::datatypes::Field::try_from(&arrow_field).unwrap();
-        let encoding_strategy = crate::encoder::default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = test_encoding_strategy(TestEncoding::StructuralU32);
         let mut column_index_seq = crate::encoder::ColumnIndexSequence::default();
-        let encoding_options = crate::encoder::EncodingOptions {
-            version: LanceFileVersion::V2_2,
-            ..Default::default()
-        };
-        let mut encoder = encoding_strategy
-            .create_field_encoder(
-                encoding_strategy.as_ref(),
-                &lance_field,
-                &mut column_index_seq,
-                &encoding_options,
-            )
-            .unwrap();
+        let encoding_options = crate::encoder::EncodingOptions::default();
+        let mut encoder = create_test_field_encoder(
+            encoding_strategy.as_ref(),
+            &lance_field,
+            &mut column_index_seq,
+            &encoding_options,
+        )
+        .unwrap();
         let mut external_buffers =
             crate::encoder::OutOfLineBuffers::new(0, crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT);
         let num_rows = array.len() as u64;
@@ -344,6 +340,7 @@ mod tests {
                     }
                 }
                 crate::format::pb21::page_layout::Layout::BlobLayout(_) => {}
+                crate::format::pb21::page_layout::Layout::SparseLayout(_) => {}
             }
         }
 
@@ -426,6 +423,96 @@ mod tests {
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
         check_basic_random(field).await;
+    }
+
+    /// Regression test: a `List<List<Float32>>` column written as MULTIPLE
+    /// batches (chunks) whose flattened leaf values cross a value-page boundary
+    /// fails to decode with "Max offset N exceeds length of values M" (Arrow
+    /// error raised by `ListArray::try_new` in `StructuralListDecodeTask::decode`).
+    ///
+    /// The trigger (verified against the production file and pylance 7.0.0b12 /
+    /// 7.0.0 / 9.0.0-beta.10) requires ALL of:
+    ///   1. >= 2 list layers (`List<List<..>>`),
+    ///   2. a leaf large enough to be chunked into multiple value pages,
+    ///   3. the column written as more than one batch.
+    /// A single batch of the identical data round-trips fine — which is why the
+    /// earlier single-chunk version of this test (and the small `test_nested_list`
+    /// cases) did not catch it. Found in production on the gaming TransNet
+    /// `dino_embedding_per_frame` column (rectangular 3 x 768 float per row).
+    ///
+    /// Each element of the `vec![..]` passed to `check_round_trip_encoding_of_data`
+    /// is encoded as a separate batch (its own `RepDefBuilder`), so we split the
+    /// rows into two chunks to exercise the multi-batch repdef accumulation path.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_multipage_nested_float_list(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        use arrow_array::Float32Array;
+
+        // Production shape: 3 inner lists per row, 768 floats each.
+        let inner_per_row: usize = 3;
+        let inner_len: usize = 768;
+        // Two chunks (batches) -> two pages; a read batch that spans the page
+        // boundary is where the multi-page outer-offset bug triggered. A single
+        // [2731] chunk (one page) decodes fine, which is why this needs >= 2.
+        let chunk_rows: &[usize] = &[1366, 1365];
+
+        let make_chunk = |start_row: usize, num_rows: usize| -> Arc<dyn Array> {
+            let total_inner = num_rows * inner_per_row;
+            let total_values = total_inner * inner_len;
+            let values = Float32Array::from(
+                (0..total_values)
+                    .map(|i| (start_row + i) as f32)
+                    .collect::<Vec<_>>(),
+            );
+            let inner_offsets = ScalarBuffer::<i32>::from(
+                (0..=total_inner)
+                    .map(|i| (i * inner_len) as i32)
+                    .collect::<Vec<_>>(),
+            );
+            let inner_list = ListArray::new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                OffsetBuffer::new(inner_offsets),
+                Arc::new(values),
+                None,
+            );
+            let outer_offsets = ScalarBuffer::<i32>::from(
+                (0..=num_rows)
+                    .map(|i| (i * inner_per_row) as i32)
+                    .collect::<Vec<_>>(),
+            );
+            Arc::new(ListArray::new(
+                Arc::new(Field::new(
+                    "item",
+                    DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                    true,
+                )),
+                OffsetBuffer::new(outer_offsets),
+                Arc::new(inner_list),
+                None,
+            ))
+        };
+
+        let mut start = 0;
+        let chunks: Vec<Arc<dyn Array>> = chunk_rows
+            .iter()
+            .map(|&n| {
+                let c = make_chunk(start, n);
+                start += n;
+                c
+            })
+            .collect();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default().with_structural_encodings();
+        check_round_trip_encoding_of_data(chunks, &test_cases, field_metadata).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -534,7 +621,7 @@ mod tests {
             .with_range(5..7)
             .with_indices(vec![1, 6])
             .with_indices(vec![6])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
         check_round_trip_encoding_of_data(vec![Arc::new(outer_list)], &test_cases, field_metadata)
             .await;
     }
@@ -565,7 +652,7 @@ mod tests {
             .with_range(1..3)
             .with_indices(vec![1, 3])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
@@ -596,7 +683,7 @@ mod tests {
             .with_range(1..3)
             .with_indices(vec![1, 3])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
@@ -628,7 +715,7 @@ mod tests {
             .with_range(1..2)
             .with_indices(vec![0])
             .with_indices(vec![1])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
@@ -680,7 +767,7 @@ mod tests {
             .with_range(1..2)
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_arr)],
             &test_cases,
@@ -719,7 +806,7 @@ mod tests {
             .with_range(1..2)
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
         check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, field_metadata)
             .await;
     }
@@ -755,7 +842,7 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_structural_encodings()
             .with_page_sizes(vec![100])
             .with_range(800..900);
         check_round_trip_encoding_of_data(
@@ -915,7 +1002,7 @@ mod tests {
         let test_cases = TestCases::default()
             .with_range(0..2)
             .with_indices(vec![1])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
         check_round_trip_encoding_of_data(
             vec![struct_array.clone()],
             &test_cases,
@@ -937,7 +1024,7 @@ mod tests {
         outer_list_builder.append_null();
         let list_array = Arc::new(outer_list_builder.finish());
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1002,7 +1089,7 @@ mod tests {
 
         // This should trigger the assertion failure at primitive.rs:1362
         // debug_assert!(rows_avail > 0)
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         // The bug manifests when encoding this specific pattern
         // Expected: successful round-trip encoding
@@ -1056,7 +1143,7 @@ mod tests {
             .with_range(0..1000)
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
-            .with_max_file_version(LanceFileVersion::V2_2);
+            .with_dense_encodings();
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
@@ -1096,7 +1183,7 @@ mod tests {
             .with_range(0..1000)
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
-            .with_max_file_version(LanceFileVersion::V2_2);
+            .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
         assert_split_miniblock_layout(&pages, false);
@@ -1132,7 +1219,7 @@ mod tests {
         let test_cases = TestCases::default()
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, empty_prefix_rows as u64, num_rows as u64 - 1])
-            .with_max_file_version(LanceFileVersion::V2_2);
+            .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
         assert_split_miniblock_layout(&pages, true);
@@ -1169,7 +1256,7 @@ mod tests {
         let test_cases = TestCases::default()
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, null_prefix_rows as u64, num_rows as u64 - 1])
-            .with_max_file_version(LanceFileVersion::V2_2);
+            .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
         assert_split_miniblock_layout(&pages, true);
@@ -1200,7 +1287,7 @@ mod tests {
         let test_cases = TestCases::default()
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, empty_prefix_rows as u64])
-            .with_max_file_version(LanceFileVersion::V2_2);
+            .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
         assert_split_miniblock_layout(&pages, true);
@@ -1273,7 +1360,7 @@ mod tests {
         let test_cases = TestCases::default()
             .with_range(0..1)
             .with_indices(vec![0])
-            .with_max_file_version(LanceFileVersion::V2_2);
+            .with_dense_encodings();
         check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::new()).await;
     }
 
@@ -1321,8 +1408,7 @@ mod tests {
             .with_range(dense_rows.saturating_sub(8)..(dense_rows + 8))
             .with_range(0..total_rows)
             .with_indices(vec![0, dense_rows - 1, dense_rows, total_rows - 1])
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2);
+            .with_encoding(TestEncoding::StructuralU32);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
         assert_split_miniblock_layout(&pages, true);
@@ -1347,8 +1433,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_range(0..total_rows)
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2);
+            .with_encoding(TestEncoding::StructuralU32);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = try_encode_v22_pages_with_metadata(list_array.clone(), field_metadata.clone())
             .await

@@ -70,6 +70,10 @@ struct TakeStream {
     dataset: Arc<Dataset>,
     /// The fields to take from the input stream
     fields_to_take: Arc<Schema>,
+    /// The descriptor-view schema used for storage reads when blob payloads
+    /// must be materialized after take.
+    read_fields: Arc<Schema>,
+    materialize_blob_v2_binary: bool,
     /// The output schema, needed for us to merge the new columns
     /// into the input data in the correct order
     output_schema: SchemaRef,
@@ -92,9 +96,20 @@ impl TakeStream {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Self {
+        let materialize_blob_v2_binary =
+            crate::dataset::blob::schema_has_blob_v2_binary_view(fields_to_take.as_ref());
+        let read_fields = if materialize_blob_v2_binary {
+            Arc::new(crate::dataset::blob::blob_v2_descriptor_schema(
+                fields_to_take.as_ref(),
+            ))
+        } else {
+            fields_to_take.clone()
+        };
         Self {
             dataset,
             fields_to_take,
+            read_fields,
+            materialize_blob_v2_binary,
             output_schema,
             readers_cache: Arc::new(Mutex::new(HashMap::new())),
             scan_scheduler,
@@ -131,14 +146,12 @@ impl TakeStream {
                 ))
             })?;
 
-        let reader = Arc::new(
-            fragment
-                .open(
-                    &self.fields_to_take,
-                    FragReadConfig::default().with_scan_scheduler(self.scan_scheduler.clone()),
-                )
-                .await?,
-        );
+        let mut read_config =
+            FragReadConfig::default().with_scan_scheduler(self.scan_scheduler.clone());
+        if self.materialize_blob_v2_binary {
+            read_config = read_config.with_row_address(true);
+        }
+        let reader = Arc::new(fragment.open(&self.read_fields, read_config).await?);
 
         let mut readers = self.readers_cache.lock().unwrap();
         readers.insert(fragment_id, reader.clone());
@@ -355,6 +368,15 @@ impl TakeStream {
             (None, None) => {}
         }
 
+        if self.materialize_blob_v2_binary {
+            new_data = crate::dataset::blob::materialize_blob_v2_binary_batch(
+                &self.dataset,
+                self.fields_to_take.as_ref(),
+                new_data,
+            )
+            .await?;
+        }
+
         Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
 
@@ -487,10 +509,10 @@ impl TakeExec {
             projection
         );
 
-        let output_schema = Arc::new(Self::calculate_output_schema(
-            dataset.schema(),
-            &input.schema(),
-            &projection,
+        let output_schema =
+            Self::calculate_output_schema(dataset.schema(), &input.schema(), &projection);
+        let output_schema = Arc::new(crate::dataset::blob::public_blob_v2_binary_output_schema(
+            &output_schema,
         ));
         let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
         let properties = Arc::new(
@@ -521,7 +543,7 @@ impl TakeExec {
     ///
     /// If this happens the order of the new nested fields will match the order defined in
     /// the dataset schema.
-    fn calculate_output_schema(
+    pub(crate) fn calculate_output_schema(
         dataset_schema: &Schema,
         input_schema: &ArrowSchema,
         projection: &Projection,
@@ -574,10 +596,6 @@ impl TakeExec {
 impl ExecutionPlan for TakeExec {
     fn name(&self) -> &str {
         "TakeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -663,11 +681,11 @@ impl ExecutionPlan for TakeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
+    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: self.input.partition_statistics(partition)?.num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

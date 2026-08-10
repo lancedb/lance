@@ -3,7 +3,8 @@
 
 //! Extend [object_store::ObjectStore] functionalities
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -25,7 +26,7 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -39,6 +40,8 @@ pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
 mod list_retry;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod providers;
 pub mod storage_options;
 #[cfg(test)]
@@ -69,6 +72,7 @@ const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
     feature = "tencent",
     feature = "huggingface",
     feature = "tos",
+    feature = "goosefs",
 ))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
@@ -82,8 +86,10 @@ pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 pub use storage_options::{
-    EXPIRES_AT_MILLIS_KEY, LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY,
-    StorageOptionsAccessor, StorageOptionsProvider,
+    BASE_SCOPED_OPTION_PREFIX, BaseScopedStorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
+    LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY, StorageOptionsAccessor,
+    StorageOptionsProvider, has_base_scoped_options, parse_base_scoped_key,
+    resolve_base_scoped_options,
 };
 
 #[async_trait]
@@ -257,6 +263,33 @@ impl ObjectStoreParams {
             .as_ref()
             .and_then(|a| a.initial_storage_options())
     }
+
+    /// Resolve these params for a single base path scope.
+    ///
+    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// apply only to one registered base path; see
+    /// [`StorageOptionsAccessor::scoped_to_base`]. Returns the params unchanged
+    /// when the storage options contain no base-scoped entries.
+    pub fn scoped_to_base(&self, base_id: Option<u32>) -> Cow<'_, Self> {
+        let Some(accessor) = &self.storage_options_accessor else {
+            return Cow::Borrowed(self);
+        };
+        let scoped = accessor.scoped_to_base(base_id);
+        if Arc::ptr_eq(&scoped, accessor) {
+            Cow::Borrowed(self)
+        } else {
+            Cow::Owned(Self {
+                storage_options_accessor: Some(scoped),
+                ..self.clone()
+            })
+        }
+    }
+}
+
+fn wrapper_allocation_ptr(wrapper: &Arc<dyn WrappingObjectStore>) -> *const () {
+    // Trait object pointers include vtable metadata, which is not stable across codegen units.
+    // Cache identity must follow the Arc allocation instead.
+    Arc::as_ptr(wrapper) as *const ()
 }
 
 // We implement hash for caching
@@ -275,7 +308,7 @@ impl std::hash::Hash for ObjectStoreParams {
             Arc::as_ptr(aws_credentials).hash(state);
         }
         if let Some(wrapper) = &self.object_store_wrapper {
-            Arc::as_ptr(wrapper).hash(state);
+            wrapper_allocation_ptr(wrapper).hash(state);
         }
         if let Some(accessor) = &self.storage_options_accessor {
             accessor.accessor_id().hash(state);
@@ -307,8 +340,14 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
-                == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
+            && self
+                .object_store_wrapper
+                .as_ref()
+                .map(wrapper_allocation_ptr)
+                == other
+                    .object_store_wrapper
+                    .as_ref()
+                    .map(wrapper_allocation_ptr)
             && self
                 .storage_options_accessor
                 .as_ref()
@@ -461,12 +500,15 @@ impl ObjectStore {
             let mut inner = store.clone();
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
+
+            let mut io_tracker = IOTracker::default();
+            meter_store(&mut inner, &mut io_tracker, &store_prefix);
+
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
             }
 
             // Always wrap with IO tracking
-            let io_tracker = IOTracker::default();
             let tracked_store = io_tracker.wrap("", inner);
 
             let store = Self {
@@ -578,10 +620,17 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// The amount of parallelism to use for I/O operations.
+    ///
+    /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.
+    /// Always at least 1: callers feed this straight into `buffered` / `buffer_unordered`, and a
+    /// window of 0 makes those streams never poll their input — e.g. a metadata-only `count_rows`
+    /// would hang rather than return.
     pub fn io_parallelism(&self) -> usize {
         std::env::var("LANCE_IO_THREADS")
             .map(|val| val.parse::<usize>().unwrap())
             .unwrap_or(self.io_parallelism)
+            .max(1)
     }
 
     /// Get the IO tracker for this object store
@@ -813,7 +862,10 @@ impl ObjectStore {
     ) -> Result<()> {
         if self.is_local() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
-            return super::local::copy_file(from, to);
+            let metrics = self.io_tracker.begin_io("copy");
+            let result = super::local::copy_file(from, to);
+            metrics.record(&result, 0);
+            return result;
         }
         if multipart_copy_fallback {
             // Reuse the reader for both the size lookup (a single cached HEAD)
@@ -842,6 +894,16 @@ impl ObjectStore {
             .collect())
     }
 
+    /// Non-recursive, path-segment delimited list of a single directory level.
+    ///
+    /// Unlike [`Self::list`], which recurses into the entire subtree, this returns
+    /// only the immediate children of `prefix`: the child "directories" as
+    /// [`ListResult::common_prefixes`] and the direct child files as
+    /// [`ListResult::objects`].
+    pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        Ok(self.inner.list_with_delimiter(prefix).await?)
+    }
+
     pub fn list(
         &self,
         path: Option<Path>,
@@ -867,7 +929,12 @@ impl ObjectStore {
 
         if self.is_local() {
             // The local file system provider needs to delete both files and directories.
-            return super::local::remove_dir_all(&path);
+            // Counted as a single delete request, matching how `delete_stream`
+            // counts one batched request regardless of how many paths it removes.
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = super::local::remove_dir_all(&path);
+            metrics.record(&result, 0);
+            return result;
         }
         let sub_entries = self
             .inner
@@ -884,6 +951,53 @@ impl ObjectStore {
             return super::local::remove_dir_all(&path);
         }
         Ok(())
+    }
+
+    /// Remove eligible materialized empty directories below a local root.
+    ///
+    /// This is a no-op for object stores, which do not materialize directories.
+    /// Traversal does not follow symbolic links. Directories in `retained_dirs` and their
+    /// descendants are preserved. Other directories are removed only if they are empty and
+    /// either appear in `verified_dirs` or predate `unmodified_since`. Passing `None` for
+    /// `unmodified_since` disables the age check.
+    ///
+    /// ```
+    /// # use std::collections::HashSet;
+    /// # use chrono::Utc;
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # async fn remove_stale_index_dirs(store: &ObjectStore) -> Result<()> {
+    /// store
+    ///     .remove_empty_dirs(
+    ///         "dataset/_indices",
+    ///         HashSet::new(),
+    ///         HashSet::new(),
+    ///         Some(Utc::now()),
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn remove_empty_dirs(
+        &self,
+        root_path: impl Into<Path>,
+        retained_dirs: HashSet<Path>,
+        verified_dirs: HashSet<Path>,
+        unmodified_since: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        if !self.is_local() && self.scheme != "file-object-store" {
+            return Ok(());
+        }
+
+        let path = Path::parse(root_path.into())?;
+        let metrics = self.io_tracker.begin_io("delete");
+        let result = tokio::task::spawn_blocking(move || {
+            super::local::remove_empty_dirs(&path, &retained_dirs, &verified_dirs, unmodified_since)
+        })
+        .await
+        .map_err(|error| Error::io(format!("empty-directory cleanup task failed: {error}")))?;
+        metrics.record(&result, 0);
+        result
     }
 
     pub fn remove_stream<'a>(
@@ -1065,7 +1179,7 @@ static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
 impl ObjectStore {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store: Arc<DynObjectStore>,
+        mut store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -1090,13 +1204,15 @@ impl ObjectStore {
                 store_prefix
             }
         };
+        let mut io_tracker = IOTracker::default();
+        meter_store(&mut store, &mut io_tracker, &store_prefix);
+
         let store = match wrapper {
             Some(wrapper) => wrapper.wrap(&store_prefix, store),
             None => store,
         };
 
         // Always wrap with IO tracking
-        let io_tracker = IOTracker::default();
         let tracked_store = io_tracker.wrap("", store);
 
         Self {
@@ -1112,6 +1228,29 @@ impl ObjectStore {
             store_prefix,
         }
     }
+}
+
+/// Wrap `inner` so its operations publish metrics labelled by `store_prefix`,
+/// and label `io_tracker` with the same prefix so the local reads and writes
+/// that bypass `inner` publish under it too.
+///
+/// The two go together on purpose: a store metered on one path but not the other
+/// would report a partial picture that reads like a complete one. Every
+/// constructor that hands an [`ObjectStore`] to a caller must route its `inner`
+/// through here, or through nothing at all.
+#[cfg(feature = "metrics")]
+fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, store_prefix: &str) {
+    use crate::object_store::metrics::ObjectStoreMetricsExt;
+    io_tracker.set_metrics_base(store_prefix);
+    *inner = inner.clone().metered(store_prefix.to_owned());
+}
+
+#[cfg(not(feature = "metrics"))]
+fn meter_store(
+    _inner: &mut Arc<dyn OSObjectStore>,
+    _io_tracker: &mut IOTracker,
+    _store_prefix: &str,
+) {
 }
 
 fn infer_block_size(scheme: &str) -> usize {
@@ -1156,6 +1295,35 @@ mod tests {
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
+    }
+
+    #[test]
+    fn test_io_parallelism_clamped_to_nonzero() {
+        // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
+        // streams never poll, hanging callers (e.g. a metadata-only `count_rows`). It must clamp.
+        let store = ObjectStore::local();
+
+        // SAFETY: process-global env var, set and restored within this test. `io_parallelism()`
+        // only reads it, and a concurrent reader observes a valid clamped value, never 0.
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "0") };
+        assert_eq!(
+            store.io_parallelism(),
+            1,
+            "LANCE_IO_THREADS=0 must clamp to 1"
+        );
+
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "8") };
+        assert_eq!(
+            store.io_parallelism(),
+            8,
+            "a positive override must pass through unchanged"
+        );
+
+        unsafe { std::env::remove_var("LANCE_IO_THREADS") };
+        assert!(
+            store.io_parallelism() >= 1,
+            "the configured default parallelism must be at least 1"
+        );
     }
 
     #[tokio::test]
@@ -1362,6 +1530,84 @@ mod tests {
         assert!(!path.join("foo").exists());
     }
 
+    #[rstest]
+    #[case("file")]
+    #[case("file-object-store")]
+    #[tokio::test]
+    async fn test_remove_empty_directories(#[case] scheme: &str) {
+        let path = TempStdDir::default();
+        let stale_dir = path.join("stale");
+        let nested_stale_dir = path.join("nested_stale");
+        let nested_stale_child = nested_stale_dir.join("child");
+        create_dir_all(&stale_dir).unwrap();
+        create_dir_all(&nested_stale_child).unwrap();
+        create_dir_all(path.join("retained").join("child")).unwrap();
+        write_to_file(
+            path.join("file_bearing")
+                .join("test_file")
+                .to_str()
+                .unwrap(),
+            "keep",
+        )
+        .unwrap();
+        create_dir_all(path.join("file_bearing").join("empty_child")).unwrap();
+
+        let file_url = Url::from_directory_path(&path).unwrap();
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        url.set_path(file_url.path());
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
+
+        #[cfg(unix)]
+        let unmodified_since = {
+            let old_modified_time =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+            for directory in [&stale_dir, &nested_stale_dir, &nested_stale_child] {
+                std::fs::File::open(directory)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(old_modified_time))
+                    .unwrap();
+            }
+            DateTime::<Utc>::from(std::time::SystemTime::now())
+                - chrono::TimeDelta::try_days(7).unwrap()
+        };
+        #[cfg(not(unix))]
+        let unmodified_since = DateTime::<Utc>::from(std::time::SystemTime::now())
+            + chrono::TimeDelta::try_days(1).unwrap();
+
+        store
+            .remove_empty_dirs(
+                base.clone(),
+                HashSet::from([base.clone().join("retained")]),
+                HashSet::new(),
+                Some(unmodified_since),
+            )
+            .await
+            .unwrap();
+
+        assert!(!path.join("stale").exists());
+        assert!(!path.join("nested_stale").exists());
+        assert!(path.join("retained").join("child").exists());
+        assert!(path.join("file_bearing").join("empty_child").exists());
+
+        create_dir_all(path.join("fresh")).unwrap();
+        create_dir_all(path.join("verified")).unwrap();
+        store
+            .remove_empty_dirs(
+                base.clone(),
+                HashSet::from([base.clone().join("retained")]),
+                HashSet::from([base.clone().join("verified")]),
+                Some(
+                    DateTime::<Utc>::from(std::time::SystemTime::now())
+                        - chrono::TimeDelta::try_days(7).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(path.join("fresh").exists());
+        assert!(!path.join("verified").exists());
+    }
+
     #[derive(Debug)]
     struct TestWrapper {
         called: AtomicBool,
@@ -1386,6 +1632,37 @@ mod tests {
         fn called(&self) -> bool {
             self.called.load(Ordering::Relaxed)
         }
+    }
+
+    #[tokio::test]
+    async fn test_wrapper_identity_is_stable_across_tasks() {
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: Arc::new(InMemory::new()),
+        });
+        let initial_params = ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            ..ObjectStoreParams::default()
+        };
+        let task_params = tokio::spawn(async move {
+            ObjectStoreParams {
+                object_store_wrapper: Some(wrapper),
+                ..ObjectStoreParams::default()
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(initial_params, task_params);
+
+        let mut initial_hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&initial_params, &mut initial_hasher);
+        let mut task_hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&task_params, &mut task_hasher);
+        assert_eq!(
+            std::hash::Hasher::finish(&initial_hasher),
+            std::hash::Hasher::finish(&task_hasher)
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.LanceScanner;
+import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 import org.lance.ipc.ScanStats;
 
@@ -37,6 +38,8 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -46,9 +49,11 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScannerTest {
@@ -62,6 +67,90 @@ public class ScannerTest {
     // Cleanup resources used by the tests
     if (dataset != null) {
       dataset.close();
+    }
+  }
+
+  @Test
+  void testScannerPerformanceOptions() {
+    MaterializationStyle materialization =
+        MaterializationStyle.allEarlyExcept(Collections.singletonList("name"));
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .batchSize(1024)
+            .batchSizeBytes(64 * 1024)
+            .ioBufferSize(8 * 1024 * 1024)
+            .batchReadahead(4)
+            .fragmentReadahead(2)
+            .scanInOrder(false)
+            .lateMaterialization(materialization)
+            .build();
+
+    assertEquals(1024L, options.getBatchSize().orElseThrow());
+    assertEquals(64 * 1024L, options.getBatchSizeBytes().orElseThrow());
+    assertEquals(8 * 1024 * 1024L, options.getIoBufferSize().orElseThrow());
+    assertEquals(4, options.getBatchReadahead());
+    assertEquals(2, options.getFragmentReadahead().orElseThrow());
+    assertFalse(options.isScanInOrder());
+    assertEquals(materialization, options.getLateMaterialization().orElseThrow());
+    assertEquals("heuristic", MaterializationStyle.heuristic().toRustString());
+    assertEquals("all_late", MaterializationStyle.allLate().toRustString());
+    assertEquals("all_early", MaterializationStyle.allEarly().toRustString());
+    assertEquals("all_early_except", materialization.toRustString());
+    assertEquals(Collections.singletonList("name"), materialization.getColumns());
+
+    ScanOptions defaults = new ScanOptions.Builder().build();
+    assertTrue(defaults.getBatchSizeBytes().isEmpty());
+    assertTrue(defaults.getIoBufferSize().isEmpty());
+    assertTrue(defaults.getFragmentReadahead().isEmpty());
+    assertTrue(defaults.isScanInOrder());
+    assertTrue(defaults.getLateMaterialization().isEmpty());
+
+    assertThrows(
+        IllegalArgumentException.class, () -> new ScanOptions.Builder().batchSizeBytes(0).build());
+    assertThrows(
+        IllegalArgumentException.class, () -> new ScanOptions.Builder().ioBufferSize(0).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> new ScanOptions.Builder().fragmentReadahead(0).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> new ScanOptions.Builder().batchSizeBytes(1024).strictBatchSize(true).build());
+    assertTrue(MaterializationStyle.allEarlyExcept(Collections.emptyList()).getColumns().isEmpty());
+  }
+
+  static Stream<MaterializationStyle> materializationStyles() {
+    return Stream.of(
+        MaterializationStyle.heuristic(),
+        MaterializationStyle.allLate(),
+        MaterializationStyle.allEarly(),
+        MaterializationStyle.allEarlyExcept(Collections.emptyList()));
+  }
+
+  @ParameterizedTest
+  @MethodSource("materializationStyles")
+  void testMaterializationStylesAcrossJni(
+      MaterializationStyle materializationStyle, @TempDir Path tempDir) throws Exception {
+    String datasetPath =
+        tempDir.resolve("materialization_" + materializationStyle.getMode().name()).toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      try (Dataset dataset = testDataset.write(1, 40);
+          LanceScanner scanner =
+              dataset.newScan(
+                  new ScanOptions.Builder()
+                      .filter("id < 20")
+                      .lateMaterialization(materializationStyle)
+                      .build());
+          ArrowReader reader = scanner.scanBatches()) {
+        int rowCount = 0;
+        while (reader.loadNextBatch()) {
+          rowCount += reader.getVectorSchemaRoot().getRowCount();
+        }
+        assertEquals(20, rowCount);
+      }
     }
   }
 
@@ -212,6 +301,10 @@ public class ScannerTest {
           assertTrue(statsOpt.isPresent());
           ScanStats stats = statsOpt.get();
           assertTrue(stats.getBytesRead() > 0 || !stats.getAllCounts().isEmpty());
+          // Even without an index on this dataset, the two new counters must
+          // still marshal through JNI and default to zero rather than throwing.
+          assertTrue(stats.getIndexCacheHits() >= 0);
+          assertTrue(stats.getIndexCacheMisses() >= 0);
         }
       }
     }
@@ -422,26 +515,94 @@ public class ScannerTest {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      int totalRows = 1000;
-      int batchSize = 100;
-      int batchReadahead = 5;
-      try (Dataset dataset = testDataset.write(1, totalRows)) {
+
+      int totalRows = 2000;
+      int maxRowsPerFile = 100; // ~20 fragments
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(totalRows, maxRowsPerFile);
+      assertTrue(fragments.size() > 1, "expected multiple fragments, got " + fragments.size());
+
+      FragmentOperation.Append append = new FragmentOperation.Append(fragments);
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, append, Optional.of(1L))) {
+        int batchReadahead = 2; // far below the default (num compute CPUs)
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder().batchSize(50).batchReadahead(batchReadahead).build())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            int rowCount = 0;
+            long idSum = 0;
+            while (reader.loadNextBatch()) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              IntVector ids = (IntVector) root.getVector("id");
+              for (int i = 0; i < root.getRowCount(); i++) {
+                idSum += ids.get(i);
+              }
+              rowCount += root.getRowCount();
+            }
+            assertEquals(totalRows, rowCount);
+            // ids are the contiguous range [0, totalRows)
+            assertEquals((long) totalRows * (totalRows - 1) / 2, idSum);
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDatasetScannerPerformanceOptions(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_performance_options").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      int totalRows = 2000;
+      int matchingRows = 1000;
+      WriteParams writeParams =
+          new WriteParams.Builder()
+              .withMaxRowsPerFile(100)
+              .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_STABLE)
+              .build();
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(totalRows, writeParams);
+      FragmentOperation.Append append = new FragmentOperation.Append(fragments);
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, append, Optional.of(1L))) {
+        try (LanceScanner scanner =
+                dataset.newScan(
+                    new ScanOptions.Builder()
+                        .filter("id < " + matchingRows)
+                        .batchSize(200)
+                        .batchSizeBytes(256)
+                        .ioBufferSize(1024 * 1024)
+                        .batchReadahead(2)
+                        .fragmentReadahead(2)
+                        .scanInOrder(false)
+                        .lateMaterialization(MaterializationStyle.allEarly())
+                        .build());
+            ArrowReader reader = scanner.scanBatches()) {
+          int rowCount = 0;
+          long idSum = 0;
+          while (reader.loadNextBatch()) {
+            VectorSchemaRoot root = reader.getVectorSchemaRoot();
+            assertTrue(
+                root.getRowCount() < 200,
+                "batchSizeBytes should split batches before the row limit");
+            IntVector ids = (IntVector) root.getVector("id");
+            for (int i = 0; i < root.getRowCount(); i++) {
+              idSum += ids.get(i);
+            }
+            rowCount += root.getRowCount();
+          }
+          assertEquals(matchingRows, rowCount);
+          assertEquals((long) matchingRows * (matchingRows - 1) / 2, idSum);
+        }
+
         try (LanceScanner scanner =
             dataset.newScan(
                 new ScanOptions.Builder()
-                    .batchSize(batchSize)
-                    .batchReadahead(batchReadahead)
+                    .filter("id < " + matchingRows)
+                    .lateMaterialization(
+                        MaterializationStyle.allEarlyExcept(Collections.singletonList("name")))
                     .build())) {
-          // This test is more about ensuring that the batchReadahead parameter is accepted
-          // and doesn't cause errors. The actual effect of batchReadahead might not be
-          // directly observable in this test.
-          try (ArrowReader reader = scanner.scanBatches()) {
-            int rowCount = 0;
-            while (reader.loadNextBatch()) {
-              rowCount += reader.getVectorSchemaRoot().getRowCount();
-            }
-            assertEquals(totalRows, rowCount);
-          }
+          assertEquals(matchingRows, scanner.countRows());
         }
       }
     }

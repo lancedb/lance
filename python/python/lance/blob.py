@@ -8,11 +8,28 @@ from typing import IO, Any, Iterator, Optional, Union
 
 import pyarrow as pa
 
-from .lance import LanceBlobFile
+from .lance import (
+    BlobDescriptor as BlobDescriptor,
+)
+from .lance import (
+    BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
+)
+from .lance import (
+    DedicatedBlobWriter as DedicatedBlobWriter,
+)
+from .lance import (
+    LanceBlobFile,
+)
+from .lance import (
+    PackedBlobWriter as PackedBlobWriter,
+)
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
 _BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
     b"lance-encoding:blob-dedicated-size-threshold"
+)
+_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
+    b"lance-encoding:blob-pack-file-size-threshold"
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
 
@@ -217,6 +234,7 @@ def blob_field(
     nullable: bool = True,
     inline_size_threshold: Optional[int] = None,
     dedicated_size_threshold: Optional[int] = None,
+    pack_file_size_threshold: Optional[int] = None,
 ) -> pa.Field:
     """
     Construct an Arrow field for a Lance blob column.
@@ -234,14 +252,24 @@ def blob_field(
         Maximum payload size in bytes to store in packed blob storage before
         using dedicated blob storage. This threshold is checked before
         ``inline_size_threshold``.
+    pack_file_size_threshold : optional, int
+        Maximum size in bytes of a single packed blob sidecar (``.pack``) file.
+        Once a sidecar reaches this size a new one is started.
     """
     _validate_threshold("inline_size_threshold", inline_size_threshold, allow_zero=True)
     _validate_threshold(
         "dedicated_size_threshold", dedicated_size_threshold, allow_zero=False
     )
+    _validate_threshold(
+        "pack_file_size_threshold", pack_file_size_threshold, allow_zero=False
+    )
 
     field = pa.field(name, BlobType(), nullable=nullable)
-    if inline_size_threshold is None and dedicated_size_threshold is None:
+    if (
+        inline_size_threshold is None
+        and dedicated_size_threshold is None
+        and pack_file_size_threshold is None
+    ):
         return field
 
     metadata = dict(field.metadata or {})
@@ -252,6 +280,10 @@ def blob_field(
     if dedicated_size_threshold is not None:
         metadata[_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY] = str(
             dedicated_size_threshold
+        ).encode()
+    if pack_file_size_threshold is not None:
+        metadata[_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY] = str(
+            pack_file_size_threshold
         ).encode()
     return field.with_metadata(metadata)
 
@@ -273,9 +305,11 @@ class BlobColumn:
     file-like objects.
 
     This can be useful for working with medium-to-small binary objects that need
-    to interface with APIs that expect file-like objects.  For very large binary
-    objects (4-8MB or more per value) you might be better off creating a blob column
-    and using :py:meth:`lance.Dataset.take_blobs` to access the blob data.
+    to interface with APIs that expect file-like objects. For very large binary
+    objects (4-8MB or more per value) you might be better off creating a blob
+    column. Use :py:meth:`lance.Dataset.read_blobs` when you need complete blob
+    bytes, or :py:meth:`lance.Dataset.take_blobs` when you need lazy file-like
+    access.
     """
 
     def __init__(self, blob_column: Union[pa.Array, pa.ChunkedArray]):
@@ -348,6 +382,28 @@ class BlobFile(io.RawIOBase):
     def read_range(self, offset: int, length: int) -> bytes:
         """Read a blob-local byte range without changing the current cursor."""
         return self.inner.read_range(offset, length)
+
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        """
+        Read multiple blob-local byte ranges without changing the current cursor.
+
+        Each range is an ``(offset, length)`` pair, matching
+        :py:meth:`read_range`. The underlying physical reads may be reordered,
+        coalesced, or split for efficiency. For every range, offset plus length
+        must fit in an unsigned 64-bit integer and must not extend beyond the
+        blob size.
+
+        Parameters
+        ----------
+        ranges : List[Tuple[int, int]]
+            The ``(offset, length)`` byte ranges to read.
+
+        Returns
+        -------
+        data : List[bytes]
+            One payload per requested range, in input order.
+        """
+        return self.inner.read_ranges(ranges)
 
     def readinto(self, b: bytearray) -> int:
         return self.inner.read_into(b)

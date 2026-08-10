@@ -305,7 +305,8 @@ impl FixedIntBackend {
         }
     }
 
-    fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
+    fn insert_array_and_report_existing(&self, array: &dyn Array, row_offset: u64) -> Result<bool> {
+        let mut had_existing = false;
         macro_rules! insert_int {
             ($array_type:ty, $to_i64:expr) => {{
                 let typed = array
@@ -314,14 +315,26 @@ impl FixedIntBackend {
                     .unwrap();
                 let mut writer = self.writer.lock().unwrap();
                 let mut nulls: Vec<RowPosition> = Vec::new();
+                let had_existing_nulls = !self.null_positions.lock().unwrap().is_empty();
+                let mut saw_null = false;
                 for (row_idx, value) in typed.iter().enumerate() {
                     let position = row_offset + row_idx as u64;
                     match value {
-                        Some(v) => writer.insert(FixedKey {
-                            enc: $to_i64(v),
-                            position,
-                        }),
-                        None => nulls.push(position),
+                        Some(v) => {
+                            let enc = $to_i64(v);
+                            let key = FixedKey { enc, position };
+                            had_existing |= writer.insert_and_check_neighbors(key, |prev, next| {
+                                prev.is_some_and(|key| key.enc == enc)
+                                    || next.is_some_and(|key| key.enc == enc)
+                            });
+                        }
+                        None => {
+                            if had_existing_nulls || saw_null {
+                                had_existing = true;
+                            }
+                            saw_null = true;
+                            nulls.push(position);
+                        }
                     }
                 }
                 drop(writer);
@@ -348,7 +361,7 @@ impl FixedIntBackend {
                 )));
             }
         }
-        Ok(())
+        Ok(had_existing)
     }
 
     fn get_newest_visible(
@@ -458,7 +471,8 @@ impl BytesBackend {
         }
     }
 
-    fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
+    fn insert_array_and_report_existing(&self, array: &dyn Array, row_offset: u64) -> Result<bool> {
+        let mut had_existing = false;
         // Append (position, key bytes) for each row; nulls go to the side list.
         // `$v => $to_bytes` extracts the key bytes from each non-null value
         // inline (no closure, so the borrow ties directly to the row value).
@@ -467,16 +481,26 @@ impl BytesBackend {
                 let typed = array.as_any().downcast_ref::<$array_type>().unwrap();
                 let mut writer = self.writer.lock().unwrap();
                 let mut nulls: Vec<RowPosition> = Vec::new();
+                let had_existing_nulls = !self.null_positions.lock().unwrap().is_empty();
+                let mut saw_null = false;
                 for row_idx in 0..typed.len() {
                     let position = row_offset + row_idx as u64;
                     if typed.is_null(row_idx) {
+                        if had_existing_nulls || saw_null {
+                            had_existing = true;
+                        }
+                        saw_null = true;
                         nulls.push(position);
                     } else {
                         let $v = typed.value(row_idx);
                         let bytes: &[u8] = $to_bytes;
-                        writer.insert(BytesKey {
+                        let key = BytesKey {
                             bytes: InlineBytes::new(bytes),
                             position,
+                        };
+                        had_existing |= writer.insert_and_check_neighbors(key, |prev, next| {
+                            prev.is_some_and(|key| key.bytes.as_slice() == bytes)
+                                || next.is_some_and(|key| key.bytes.as_slice() == bytes)
                         });
                     }
                 }
@@ -501,7 +525,7 @@ impl BytesBackend {
                 )));
             }
         }
-        Ok(())
+        Ok(had_existing)
     }
 
     fn get_newest_visible(
@@ -609,14 +633,22 @@ impl ScalarBackend {
         }
     }
 
-    fn add(&self, value: OrderableScalarValue, row_position: RowPosition) {
-        self.writer.lock().unwrap().insert(IndexKey {
-            value,
-            row_position,
-        });
+    fn add(&self, value: OrderableScalarValue, row_position: RowPosition) -> bool {
+        let probe = value.clone();
+        self.writer.lock().unwrap().insert_and_check_neighbors(
+            IndexKey {
+                value,
+                row_position,
+            },
+            |prev, next| {
+                prev.is_some_and(|key| key.value == probe)
+                    || next.is_some_and(|key| key.value == probe)
+            },
+        )
     }
 
-    fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
+    fn insert_array_and_report_existing(&self, array: &dyn Array, row_offset: u64) -> Result<bool> {
+        let mut had_existing = false;
         macro_rules! insert_primitive {
             ($array_type:ty, $scalar_variant:ident) => {{
                 let typed_array = array
@@ -625,7 +657,7 @@ impl ScalarBackend {
                     .unwrap();
                 for (row_idx, value) in typed_array.iter().enumerate() {
                     let row_position = row_offset + row_idx as u64;
-                    self.add(
+                    had_existing |= self.add(
                         OrderableScalarValue(ScalarValue::$scalar_variant(value)),
                         row_position,
                     );
@@ -653,7 +685,7 @@ impl ScalarBackend {
                     .unwrap();
                 for (row_idx, value) in typed_array.iter().enumerate() {
                     let row_position = row_offset + row_idx as u64;
-                    self.add(
+                    had_existing |= self.add(
                         OrderableScalarValue(ScalarValue::Utf8(value.map(|s| s.to_string()))),
                         row_position,
                     );
@@ -666,7 +698,7 @@ impl ScalarBackend {
                     .unwrap();
                 for (row_idx, value) in typed_array.iter().enumerate() {
                     let row_position = row_offset + row_idx as u64;
-                    self.add(
+                    had_existing |= self.add(
                         OrderableScalarValue(ScalarValue::LargeUtf8(value.map(|s| s.to_string()))),
                         row_position,
                     );
@@ -679,7 +711,7 @@ impl ScalarBackend {
                     .unwrap();
                 for (row_idx, value) in typed_array.iter().enumerate() {
                     let row_position = row_offset + row_idx as u64;
-                    self.add(
+                    had_existing |= self.add(
                         OrderableScalarValue(ScalarValue::Boolean(value)),
                         row_position,
                     );
@@ -690,11 +722,11 @@ impl ScalarBackend {
                 for row_idx in 0..array.len() {
                     let value = ScalarValue::try_from_array(array, row_idx)?;
                     let row_position = row_offset + row_idx as u64;
-                    self.add(OrderableScalarValue(value), row_position);
+                    had_existing |= self.add(OrderableScalarValue(value), row_position);
                 }
             }
         }
-        Ok(())
+        Ok(had_existing)
     }
 
     fn get_newest_visible(
@@ -769,11 +801,11 @@ impl Backend {
         }
     }
 
-    fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
+    fn insert_array_and_report_existing(&self, array: &dyn Array, row_offset: u64) -> Result<bool> {
         match self {
-            Self::FixedInt(b) => b.insert_array(array, row_offset),
-            Self::Bytes(b) => b.insert_array(array, row_offset),
-            Self::Scalar(b) => b.insert_array(array, row_offset),
+            Self::FixedInt(b) => b.insert_array_and_report_existing(array, row_offset),
+            Self::Bytes(b) => b.insert_array_and_report_existing(array, row_offset),
+            Self::Scalar(b) => b.insert_array_and_report_existing(array, row_offset),
         }
     }
 
@@ -873,6 +905,13 @@ impl BTreeMemIndex {
 
     /// Insert rows from a batch into the index.
     pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+        self.insert_and_report_existing(batch, row_offset)
+            .map(|_| ())
+    }
+
+    /// Insert rows and report whether any inserted key already existed in the
+    /// index or repeated earlier in this batch.
+    pub fn insert_and_report_existing(&self, batch: &RecordBatch, row_offset: u64) -> Result<bool> {
         let col_idx = batch
             .schema()
             .column_with_name(&self.column_name)
@@ -885,7 +924,7 @@ impl BTreeMemIndex {
         let backend = self
             .backend
             .get_or_init(|| Backend::for_type(column.data_type()));
-        backend.insert_array(column.as_ref(), row_offset)
+        backend.insert_array_and_report_existing(column.as_ref(), row_offset)
     }
 
     /// Look up row positions for an exact value.

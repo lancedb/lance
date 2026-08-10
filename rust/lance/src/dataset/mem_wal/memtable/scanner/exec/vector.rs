@@ -3,7 +3,6 @@
 
 //! VectorIndexExec - HNSW vector search with MVCC visibility.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -35,7 +34,7 @@ pub struct VectorIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
     query: VectorQuery,
-    max_visible_batch_position: usize,
+    visible_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -59,10 +58,7 @@ impl Debug for VectorIndexExec {
         if let Some(metric) = &self.query.distance_type {
             debug.field("distance_type", metric);
         }
-        debug.field(
-            "max_visible_batch_position",
-            &self.max_visible_batch_position,
-        );
+        debug.field("visible_count", &self.visible_count);
         debug.field("with_row_id", &self.with_row_id);
         debug.finish()
     }
@@ -76,7 +72,7 @@ impl VectorIndexExec {
     /// * `batch_store` - Lock-free batch store containing data
     /// * `indexes` - Index registry with HNSW vector indexes
     /// * `query` - Vector query parameters
-    /// * `max_visible_batch_position` - MVCC visibility sequence number
+    /// * `visible_count` - MVCC visibility sequence number
     /// * `projection` - Optional column indices to project
     /// * `base_schema` - Schema after projection (will add _distance column, and _rowid if with_row_id)
     /// * `with_row_id` - Whether to include _rowid column (row position)
@@ -84,7 +80,7 @@ impl VectorIndexExec {
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
         query: VectorQuery,
-        max_visible_batch_position: usize,
+        visible_count: usize,
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
@@ -120,7 +116,7 @@ impl VectorIndexExec {
             batch_store,
             indexes,
             query,
-            max_visible_batch_position,
+            visible_count,
             projection,
             output_schema,
             properties,
@@ -129,9 +125,9 @@ impl VectorIndexExec {
         })
     }
 
-    /// Compute the maximum visible row position based on max_visible_batch_position.
+    /// Compute the maximum visible row position based on visible_count.
     ///
-    /// Returns the last row position that is visible at the given max_visible_batch_position,
+    /// Returns the last row position that is visible at the given visible_count,
     /// or None if no batches are visible.
     fn compute_max_visible_row(&self) -> Option<u64> {
         let mut max_visible_row_exclusive: u64 = 0;
@@ -139,7 +135,7 @@ impl VectorIndexExec {
 
         for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
             let batch_end = current_row + stored_batch.num_rows as u64;
-            if batch_position <= self.max_visible_batch_position {
+            if batch_position < self.visible_count {
                 max_visible_row_exclusive = batch_end;
             }
             current_row = batch_end;
@@ -310,10 +306,6 @@ impl ExecutionPlan for VectorIndexExec {
         "VectorIndexExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -355,12 +347,12 @@ impl ExecutionPlan for VectorIndexExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.k),
             total_byte_size: Precision::Absent,
             column_statistics: vec![],
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

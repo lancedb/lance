@@ -25,6 +25,7 @@ approx = { workspace = true }
 criterion = { workspace = true }
 lance-testing = { path = "../lance-testing" }
 proptest.workspace = true
+rstest.workspace = true
 
 [build-dependencies]
 cc = "1.0.83"
@@ -57,6 +58,10 @@ harness = false
 
 [[bench]]
 name = "dist_table"
+harness = false
+
+[[bench]]
+name = "batch_distance"
 harness = false
 
 [lints]

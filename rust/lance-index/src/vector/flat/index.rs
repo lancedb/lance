@@ -4,7 +4,8 @@
 //! Flat Vector Index.
 //!
 
-use std::collections::{BinaryHeap, HashMap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -12,7 +13,7 @@ use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
@@ -312,7 +313,7 @@ impl IvfSubIndex for FlatIndex {
         Ok(Self {})
     }
 
-    fn remap(&self, _: &HashMap<u64, Option<u64>>, _: &impl VectorStore) -> Result<Self> {
+    fn remap(&self, _: &RowAddrRemap, _: &impl VectorStore) -> Result<Self> {
         Ok(self.clone())
     }
 
@@ -328,7 +329,7 @@ pub struct FlatMetadata {
 
 #[async_trait::async_trait]
 impl QuantizerMetadata for FlatMetadata {
-    async fn load(_: &PreviousFileReader) -> Result<Self> {
+    async fn load(_: &V1FileReader) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
 }
@@ -569,7 +570,7 @@ mod tests {
             .zip(dists.values().iter())
             .map(|(row_id, dist)| (*row_id, *dist))
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results.sort_by_key(|left| left.0);
         results
     }
 
@@ -578,7 +579,7 @@ mod tests {
             .into_iter()
             .map(|node| (node.id, node.dist.0))
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results.sort_by_key(|left| left.0);
         results
     }
 

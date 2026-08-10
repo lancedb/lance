@@ -11,7 +11,10 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
 use lance_core::{ROW_ADDR, ROW_ID};
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use crate::Dataset;
 use crate::dataset::write::merge_insert::exec::{
@@ -36,6 +39,7 @@ pub struct MergeInsertWriteNode {
     input: LogicalPlan,
     pub(crate) dataset: Arc<Dataset>,
     pub(crate) params: MergeInsertParams,
+    pub(crate) source_skipped_duplicates: Arc<AtomicU64>,
     schema: Arc<DFSchema>,
 }
 
@@ -67,13 +71,19 @@ impl PartialOrd for MergeInsertWriteNode {
 }
 
 impl MergeInsertWriteNode {
-    pub fn new(input: LogicalPlan, dataset: Arc<Dataset>, params: MergeInsertParams) -> Self {
+    pub fn new(
+        input: LogicalPlan,
+        dataset: Arc<Dataset>,
+        params: MergeInsertParams,
+        source_skipped_duplicates: Arc<AtomicU64>,
+    ) -> Self {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
         Self {
             input,
             dataset,
             params,
+            source_skipped_duplicates,
             schema,
         }
     }
@@ -143,6 +153,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             inputs[0].clone(),
             self.dataset.clone(),
             self.params.clone(),
+            self.source_skipped_duplicates.clone(),
         ))
     }
 
@@ -248,12 +259,14 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         physical_inputs[0].clone(),
                         write_node.dataset.clone(),
                         write_node.params.clone(),
+                        write_node.source_skipped_duplicates.clone(),
                     )?)
                 } else {
                     Arc::new(FullSchemaMergeInsertExec::try_new(
                         physical_inputs[0].clone(),
                         write_node.dataset.clone(),
                         write_node.params.clone(),
+                        write_node.source_skipped_duplicates.clone(),
                     )?)
                 };
                 Some(exec)

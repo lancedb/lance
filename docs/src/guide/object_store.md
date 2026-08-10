@@ -41,6 +41,35 @@ These options apply to all object stores.
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
 
+## Per-Base Configuration
+
+A dataset can register additional base paths that store part of its data, and each
+base may live in a different bucket, account, or storage provider. A storage option
+key of the form `base_<id>.<key>` applies `<key>` only to the base path with that
+manifest id. Every base inherits the unscoped options; base-scoped entries add to or
+override them for that base only.
+
+```python
+import lance
+ds = lance.dataset(
+    "az://account-a/path",
+    storage_options={
+        # Shared defaults, used by the primary dataset and inherited by bases
+        "account_name": "account-a",
+        "account_key": "key-a",
+        # Overrides for the base path with id 1
+        "base_1.account_name": "account-b",
+        "base_1.account_key": "key-b",
+    },
+)
+```
+
+Base ids are assigned when bases are registered (`initial_bases` ids are assigned
+sequentially starting at 1, in order) and can be inspected through the manifest base
+paths. Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated
+as regular storage options. Exact per-base parameter maps (`base_store_params`,
+keyed by base path URI) take precedence over base-scoped keys for that base.
+
 ## S3 Configuration
 
 S3 (and S3-compatible stores) have additional configuration options that configure
@@ -80,6 +109,38 @@ The following keys can be used as both environment variables or keys in the
 | `aws_server_side_encryption`                                        | The server-side encryption algorithm to use. Must be one of `"AES256"`, `"aws:kms"`, or `"aws:kms:dsse"`. Default, `None`.                       |
 | `aws_sse_kms_key_id`                                                | The KMS key ID to use for server-side encryption. If set, `aws_server_side_encryption` must be `"aws:kms"` or `"aws:kms:dsse"`.                  |
 | `aws_sse_bucket_key_enabled`                                        | Whether to use bucket keys for server-side encryption.                                                                                           |
+
+### Credential provider selection
+
+By default, Lance uses the standard AWS credential provider chain (environment
+variables, shared config file, web identity tokens, ECS, EC2 instance metadata).
+
+The `aws_provider_scheme` storage option pins a dataset to a specific credential
+provider, which is useful when two datasets in the same process need different
+AWS auth (for example, one bucket using IRSA and another using ECS container
+credentials).
+
+| Value | Behavior |
+|-------|----------|
+| `token` | Use static access-key credentials. Returns an error if `aws_access_key_id` and `aws_secret_access_key` are not set. |
+| `ecs` | Use the ECS/Pod Identity container credential endpoint. Reads `AWS_CONTAINER_CREDENTIALS_FULL_URI` or `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` from the environment. |
+| `irsa` | Use IRSA (IAM Roles for Service Accounts) web identity token credentials. Reads `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` from the environment. |
+
+```python
+import lance
+
+# Bucket A — use IRSA (web identity token from the environment)
+ds_a = lance.dataset(
+    "s3://bucket-a/path",
+    storage_options={"aws_provider_scheme": "irsa"},
+)
+
+# Bucket B — use ECS container credentials
+ds_b = lance.dataset(
+    "s3://bucket-b/path",
+    storage_options={"aws_provider_scheme": "ecs"},
+)
+```
 
 ### S3-compatible stores
 
@@ -297,6 +358,15 @@ parameter; explicit `storage_options` override environment variables:
 | `cos_secret_key` | Secret key used for COS authentication. Optional if credentials are provided by environment. |
 | `cos_enable_versioning` | Whether to enable object versioning on the bucket. Optional. |
 
+!!! warning
+
+    Tencent COS does not reliably enforce put-if-not-exists on buckets that have
+    ever had versioning enabled, even if versioning is now suspended. To prevent
+    silent manifest overwrites, Lance requires a custom distributed commit lock
+    for COS writes. Pass the same `commit_lock` implementation to every Python
+    writer, or provide a custom `CommitHandler` in Rust. Reads do not require a
+    commit lock.
+
 !!! note
 
     The OpenDAL `CosConfig` currently exposes a limited set of options. Additional
@@ -310,6 +380,31 @@ filesystem. Lance accesses GooseFS through its Master gRPC service. The URL form
 is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
 (default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`) and
 `/path` is the filesystem path within GooseFS.
+
+Manifest commits on `goosefs://` use `ConditionalPutCommitHandler`
+(`PutMode::Create` / if-not-exists), backed by GooseFS master's atomic
+no-replace rename so concurrent writers cannot clobber each other's
+versioned manifests.
+
+!!! warning "Mixed-version writers are NOT safe"
+
+    The `if-not-exists` guarantee only holds when **every** writer for a
+    dataset routes through this new handler. A writer running an older
+    Lance release still selects `UnsafeCommitHandler` for `goosefs://`
+    and writes the version path unconditionally, which can overwrite a
+    manifest that an upgraded writer has already won. Safe concurrent
+    commits therefore require:
+
+    - all writers for the dataset run a Lance release that includes this
+      routing change, **or**
+    - writers share an external coordination boundary (e.g. a single-writer
+      queue, table-level lock, or a gateway that serializes commits) that
+      prevents the old code path from racing the new one.
+
+    When upgrading in place, quiesce all writers (drain jobs, scale
+    clients to zero, or route traffic through a writer coordinator) before
+    rolling out the new Lance version, then bring writers back on the new
+    version together.
 
 !!! note "About the dataset path"
 

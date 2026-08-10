@@ -4,31 +4,17 @@ Lance is a modern columnar data format optimized for ML workflows and datasets, 
 
 Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](python/AGENTS.md) | [java/](java/AGENTS.md) | [protos/](protos/AGENTS.md) | [docs/src/format/](docs/src/format/AGENTS.md)
 
-## Architecture
+## File Format Stability and Compatibility
 
-Rust workspace with Python and Java bindings:
+- Treat every file format marked stable as a durable compatibility contract. All changes to a stable format must preserve both backward and forward compatibility.
+- Treat every file format marked unstable as disposable. It may change freely; do not add compatibility code, migrations, fallbacks, or tests for files written by earlier unstable revisions.
+- Evaluate compatibility against the latest released stable version while continuing to honor all stable format contracts. Changes that exist only on the current branch or `main` are not compatibility constraints; do not compromise a cleaner or more complete design to preserve those intermediate states.
 
-- `rust/lance/` - Main library implementing the columnar format
-- `rust/lance-core/` - Core types, traits, and utilities
-- `rust/lance-arrow/` - Apache Arrow integration layer
-- `rust/lance-encoding/` - Data encoding and compression algorithms
-- `rust/lance-file/` - File format reading/writing
-- `rust/lance-index/` - Vector and scalar indexing
-- `rust/lance-io/` - I/O operations and object store integration
-- `rust/lance-linalg/` - Linear algebra for vector search
-- `rust/lance-table/` - Table format and operations
-- `rust/lance-geo/` - Geospatial data support
-- `rust/lance-datagen/` - Data generation for tests and benchmarks
-- `rust/lance-namespace/` / `rust/lance-namespace-impls/` - Namespace/catalog interfaces
-- `rust/lance-test-macros/` / `rust/lance-testing/` - Test infrastructure
-- `rust/lance-tools/` - CLI and developer tooling
-- `rust/examples/` - Sample binaries and demonstrations
-- `rust/compression/bitpacking/` / `rust/compression/fsst/` - Compression codecs
-- `rust/lance-datafusion/` - DataFusion integration (built separately)
-- `python/` - Python bindings (PyO3/maturin)
-- `java/` - Java bindings (JNI)
+### Legacy Compatibility Boundaries
 
-Key technical traits: async-first (tokio), Arrow-native, versioned writes with manifest tracking, custom ML-optimized encodings, unified object store interface (local/S3/Azure/GCS).
+- Treat formats and code paths that current writers no longer emit as frozen compatibility surfaces. Preserve their existing read behavior, but exclude them from new feature design unless legacy support is explicitly required.
+- Implement new features in the current format and write paths. Do not extend legacy writers, retrofit new capabilities into legacy readers, or reuse legacy implementations as the foundation for new code.
+- Avoid refactoring or otherwise modifying legacy code during feature work. If a shared boundary makes a legacy change unavoidable, isolate the change, preserve existing behavior, and add targeted regression coverage using released historical fixtures.
 
 ## Development Commands
 
@@ -41,6 +27,9 @@ Key technical traits: async-first (tokio), Arrow-native, versioned writes with m
 * Coverage: `cargo +nightly llvm-cov -q -p <crate> --branch`
 * Coverage HTML: `cargo +nightly llvm-cov -q -p <crate> --branch --html`
 * Coverage for file: `python ci/coverage.py -p <crate> -f <file_path>`
+* Use repository-defined Cargo profiles instead of ad hoc LTO overrides.
+* Use `release-with-debug` for benchmarks and profiling so optimized builds keep debug symbols without a rebuild.
+* Use `release-no-lto` only for local debugging, IO-bound benchmarks, or compile-time-sensitive performance investigation where LTO would not affect the measured bottleneck.
 
 ### Python / Java
 
@@ -97,6 +86,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 
 - Prefer implementing functionality with the standard library or existing workspace dependencies before adding new external crates.
 - Keep `Cargo.lock` changes intentional; revert unrelated dependency bumps. Pin broken deps with a comment linking the upstream issue.
+- The repo has three lockfiles: the root `Cargo.lock`, `python/Cargo.lock`, and `java/lance-jni/Cargo.lock` (the latter two are excluded from the workspace). A `workspace.dependencies` change must be reflected in all three — refresh the excluded ones with `cargo check --manifest-path python/Cargo.toml` and `cargo check --manifest-path java/lance-jni/Cargo.toml`, then commit the updated lockfiles. The `cargo-lock-sync` pre-commit hook catches a miss offline.
 - Gate optional/domain-specific deps behind Cargo feature flags. Prefer separate crates for domain functionality (geo, NLP).
 
 ## Testing Standards
@@ -130,8 +120,14 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Indent content under MkDocs admonition directives (`!!! note`, etc.) with 4 spaces.
 - Proofread comments and docs for typos before committing.
 
+## Filing Issues
+
+- When opening an issue with `gh issue create` or the API, classify it and pass the matching label: `--label bug`, `--label feature`, or `--label performance`. These paths bypass the `.github/ISSUE_TEMPLATE` forms, so the label is not applied automatically.
+- Prefix the title to match, e.g. `bug: ...`, `feature: ...`, or `perf: ...`. A content-based labeler (`.github/workflows/issue-labeler.yml`) uses this as a fallback signal, but an explicit `--label` is the reliable path.
+
 ## Pull Requests
 
+- Before creating a PR, search for similar PRs and inspect any PRs linked to the issue being addressed. If a matching PR exists, verify its current status and scope before proceeding to avoid creating duplicate work.
 - PR titles must follow the Conventional Commits specification because `.github/workflows/pr-title.yml` validates the PR title and body with commitlint. Use prefixes like `feat:`, `fix:`, `docs:`, `perf:`, `ci:`, `test:`, `build:`, `style:`, or `chore:`; add a scope when useful.
 - Before creating or updating a PR, run the lint checks for every touched language surface, even when they are expensive. For Rust changes, run `cargo fmt --all` and `cargo clippy --all --tests --benches -- -D warnings`. For Python changes, follow the environment workflow in `python/AGENTS.md` and run `uv run make lint` from `python/`. If a required lint check cannot be run, state the blocker explicitly in the PR summary.
 

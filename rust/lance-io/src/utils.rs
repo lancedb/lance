@@ -3,80 +3,16 @@
 
 use std::{cmp::min, num::NonZero, sync::atomic::AtomicU64};
 
-use arrow_array::{
-    ArrayRef,
-    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
-};
-use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use crate::{ReadBatchParams, traits::Reader};
-use crate::{
-    encodings::{AsyncIndex, Decoder, binary::BinaryDecoder, plain::PlainDecoder},
-    traits::ProtoStruct,
-};
+use crate::traits::{ProtoStruct, Reader};
 use lance_core::{Error, Result};
 
 pub mod tracking_store;
-
-/// Read a binary array from a [Reader].
-///
-pub async fn read_binary_array(
-    reader: &dyn Reader,
-    data_type: &DataType,
-    nullable: bool,
-    position: usize,
-    length: usize,
-    params: impl Into<ReadBatchParams>,
-) -> Result<ArrayRef> {
-    use arrow_schema::DataType::*;
-    let decoder: Box<dyn Decoder<Output = Result<ArrayRef>> + Send> = match data_type {
-        Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(
-            reader, position, length, nullable,
-        )),
-        Binary => Box::new(BinaryDecoder::<BinaryType>::new(
-            reader, position, length, nullable,
-        )),
-        LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(
-            reader, position, length, nullable,
-        )),
-        LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
-            reader, position, length, nullable,
-        )),
-        _ => {
-            return Err(Error::invalid_input(format!(
-                "Unsupported binary type: {}",
-                data_type
-            )));
-        }
-    };
-    let fut = decoder.as_ref().get(params.into());
-    fut.await
-}
-
-/// Read a fixed stride array from disk.
-///
-pub async fn read_fixed_stride_array(
-    reader: &dyn Reader,
-    data_type: &DataType,
-    position: usize,
-    length: usize,
-    params: impl Into<ReadBatchParams>,
-) -> Result<ArrayRef> {
-    if !data_type.is_fixed_stride() {
-        return Err(Error::schema(format!(
-            "{data_type} is not a fixed stride type"
-        )));
-    }
-    // TODO: support more than plain encoding here.
-    let decoder = PlainDecoder::new(reader, data_type, position, length)?;
-    decoder.get(params.into()).await
-}
 
 /// Read a protobuf message at file position 'pos'.
 ///
@@ -84,7 +20,11 @@ pub async fn read_fixed_stride_array(
 /// followed by the message itself.
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
-    if pos > file_size {
+    // A message is a u32 length prefix followed by its body; both must lie before
+    // the end. A `pos` too close to the end means the reader size is too small
+    // (e.g. a stale cached size). Reject it rather than slice a short buffer and
+    // panic.
+    if pos + 4 > file_size {
         return Err(Error::io("file size is too small".to_string()));
     }
 
@@ -96,7 +36,9 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
         let remaining_range = range.end..min(4 + pos + msg_len, file_size);
         let remaining_bytes = reader.get_range(remaining_range).await?;
         let buf = [buf, remaining_bytes].concat();
-        assert!(buf.len() >= msg_len + 4);
+        if buf.len() < msg_len + 4 {
+            return Err(Error::io("file size is too small".to_string()));
+        }
         Ok(M::decode(&buf[4..4 + msg_len])?)
     } else {
         Ok(M::decode(&buf[4..4 + msg_len])?)

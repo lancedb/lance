@@ -22,27 +22,33 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::{BoxFuture, try_join_all};
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
+use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
+use lance_core::{
+    Error, Result,
+    cache::{CacheKey, CacheKeySchema, KeyBuilder},
+    datatypes::Schema,
+};
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::previous::reader::{
-    FileReader as PreviousFileReader, read_batch as previous_read_batch,
+use lance_file::reader::{
+    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader,
 };
-use lance_file::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
-use lance_file::version::LanceFileVersion;
-use lance_file::{LanceEncodingsIo, determine_file_version};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
+use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
@@ -62,6 +68,9 @@ use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
+use crate::dataset::overlay::{
+    OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
+};
 use crate::io::deletion::read_dataset_deletion_file;
 
 /// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
@@ -133,7 +142,7 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     fn projection(&self) -> &Arc<Schema>;
 
     /// Get storage statistics for this file (ignored by v1 reader)
-    fn storage_stats(&self) -> Vec<(u32, u64)>;
+    fn storage_stats(&self) -> Result<Vec<(u32, u64)>>;
 
     // Helper functions to fallback to the legacy implementation while we
     // slowly migrate functionality over to the generic reader
@@ -145,20 +154,20 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     fn is_legacy(&self) -> bool;
     // Return a reference to the legacy reader, panics if called on a v2
     // file.
-    fn as_legacy(&self) -> &PreviousFileReader {
+    fn as_legacy(&self) -> &V1FileReader {
         self.as_legacy_opt()
             .expect("legacy function called on v2 file")
     }
     // Return a reference to the legacy reader if this is a v1 reader and
     // return None otherwise
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader>;
+    fn as_legacy_opt(&self) -> Option<&V1FileReader>;
     // Return a mutable reference to the legacy reader if this is a v1 reader
     // and return None otherwise
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader>;
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader>;
 }
 
 fn ranges_to_tasks(
-    reader: &PreviousFileReader,
+    reader: &V1FileReader,
     ranges: Vec<(i32, Range<usize>)>,
     projection: Arc<Schema>,
 ) -> ReadBatchTaskStream {
@@ -169,7 +178,7 @@ fn ranges_to_tasks(
             let reader = reader.clone();
             let projection = projection.clone();
             let task = tokio::task::spawn(async move {
-                previous_read_batch(
+                v1_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
                     &projection,
@@ -189,12 +198,12 @@ fn ranges_to_tasks(
 
 #[derive(Clone, Debug)]
 struct V1Reader {
-    reader: PreviousFileReader,
+    reader: V1FileReader,
     projection: Arc<Schema>,
 }
 
 impl V1Reader {
-    fn new(reader: PreviousFileReader, projection: Arc<Schema>) -> Self {
+    fn new(reader: V1FileReader, projection: Arc<Schema>) -> Self {
         Self { reader, projection }
     }
 }
@@ -299,9 +308,9 @@ impl GenericFileReader for V1Reader {
         self.reader.len() as u32
     }
 
-    fn storage_stats(&self) -> Vec<(u32, u64)> {
+    fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
         // No-op for v1 files
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
@@ -312,11 +321,11 @@ impl GenericFileReader for V1Reader {
         true
     }
 
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+    fn as_legacy_opt(&self) -> Option<&V1FileReader> {
         Some(&self.reader)
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
         Some(&mut self.reader)
     }
 }
@@ -328,7 +337,7 @@ mod v2_adapter {
 
     #[derive(Debug, Clone)]
     pub struct Reader {
-        reader: Arc<lance_file::reader::FileReader>,
+        reader: Arc<ProjectedFileReader>,
         projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         default_priority: u32,
@@ -337,7 +346,7 @@ mod v2_adapter {
 
     impl Reader {
         pub fn new(
-            reader: Arc<lance_file::reader::FileReader>,
+            reader: Arc<ProjectedFileReader>,
             projection: Arc<Schema>,
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
             default_priority: u32,
@@ -362,8 +371,8 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
-                    self.reader.metadata().version(),
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
@@ -392,8 +401,8 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
-                    self.reader.metadata().version(),
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
@@ -421,8 +430,8 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
-                let projection = ReaderProjection::from_field_ids(
-                    self.reader.metadata().version(),
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
@@ -453,8 +462,8 @@ mod v2_adapter {
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             let indices = UInt32Array::from(indices.to_vec());
             async move {
-                let projection = ReaderProjection::from_field_ids(
-                    self.reader.metadata().version(),
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
@@ -487,8 +496,10 @@ mod v2_adapter {
             .boxed()
         }
 
-        fn storage_stats(&self) -> Vec<(u32, u64)> {
-            let file_statistics = self.reader.file_statistics();
+        fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
+            let file_statistics = self.reader.file_statistics().ok_or_else(|| {
+                Error::internal("storage_stats requires full file metadata".to_string())
+            })?;
             let column_idx_to_field_id = self
                 .field_id_to_column_idx
                 .iter()
@@ -505,7 +516,7 @@ mod v2_adapter {
                 }
                 stats.push((current_field_id, col_stats.size_bytes));
             }
-            stats
+            Ok(stats)
         }
 
         fn projection(&self) -> &Arc<Schema> {
@@ -514,7 +525,7 @@ mod v2_adapter {
 
         /// Return the number of rows in the file
         fn len(&self) -> u32 {
-            self.reader.metadata().num_rows as u32
+            self.reader.num_rows() as u32
         }
 
         fn clone_box(&self) -> Box<dyn GenericFileReader> {
@@ -525,11 +536,11 @@ mod v2_adapter {
             false
         }
 
-        fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+        fn as_legacy_opt(&self) -> Option<&V1FileReader> {
             None
         }
 
-        fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+        fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
             None
         }
     }
@@ -614,9 +625,9 @@ impl GenericFileReader for NullReader {
         self.read_ranges_tasks(vec![0..num_rows].into(), batch_size, projection)
     }
 
-    fn storage_stats(&self) -> Vec<(u32, u64)> {
+    fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
         // No-op for null reader
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn projection(&self) -> &Arc<Schema> {
@@ -635,16 +646,16 @@ impl GenericFileReader for NullReader {
         false
     }
 
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+    fn as_legacy_opt(&self) -> Option<&V1FileReader> {
         None
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
         None
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FragReadConfig {
     // Add the row id column
     pub with_row_id: bool,
@@ -715,6 +726,12 @@ impl FragReadConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataMode {
+    LazyAllowed,
+    Full,
+}
+
 impl FileFragment {
     /// Creates a new FileFragment.
     pub fn new(dataset: Arc<Dataset>, metadata: Fragment) -> Self {
@@ -767,7 +784,9 @@ impl FileFragment {
         let file_version =
             determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
 
-        if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
+        if file_version
+            != ConcreteFileVersion::from(dataset.manifest.data_storage_format.lance_file_version()?)
+        {
             return Err(Error::invalid_input(format!(
                 "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
                 dataset.manifest.data_storage_format.lance_file_version()?,
@@ -775,7 +794,7 @@ impl FileFragment {
             )));
         }
 
-        if file_version == LanceFileVersion::Legacy {
+        if file_version == ConcreteFileVersion::V1 {
             let fragment = Fragment::with_file_legacy(
                 fragment_id as u64,
                 filename,
@@ -806,7 +825,7 @@ impl FileFragment {
             reader
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
-            let projection = lance_file::reader::ReaderProjection::from_whole_schema(
+            let projection = file_versions::reader_projection_from_whole_schema(
                 dataset.schema(),
                 reader.metadata().version(),
             );
@@ -824,7 +843,7 @@ impl FileFragment {
                 filename,
                 dataset.schema().field_ids(),
                 column_indices,
-                &file_version,
+                file_version,
                 None,
             );
             Ok(frag)
@@ -839,13 +858,13 @@ impl FileFragment {
     ) -> Result<Vec<(u32, u64)>> {
         let mut stats = Vec::new();
         for reader in self
-            .open_readers(
+            .open_readers_with_full_metadata(
                 dataset_schema,
                 &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
             )
             .await?
         {
-            stats.extend(reader.storage_stats());
+            stats.extend(reader.storage_stats()?);
         }
         Ok(stats)
     }
@@ -938,6 +957,19 @@ impl FileFragment {
             Arc::new(self.metadata.clone()),
         )?;
 
+        // Plan overlay resolution from coverage metadata (no files opened here); the
+        // readers are opened lazily on read, pruned to the rows each read touches.
+        if !self.metadata.overlays.is_empty() {
+            let planner = plan_overlays(self, projection)?;
+            if !planner.is_empty() {
+                reader.overlay = Some(OverlayReadState {
+                    planner: Arc::new(planner),
+                    fragment: Arc::new(self.clone()),
+                    read_config: Arc::new(read_config.clone()),
+                });
+            }
+        }
+
         if read_config.with_row_id {
             reader.with_row_id();
         }
@@ -958,123 +990,209 @@ impl FileFragment {
         data_file.fields.first().copied().unwrap_or(0) as u32
     }
 
-    async fn open_reader(
+    pub(super) async fn open_reader(
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
         read_config: &FragReadConfig,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
-        let full_schema = self.dataset.schema();
-        // The data file may contain fields that are not part of the dataset any longer, remove those
-        let data_file_schema = data_file.schema(full_schema);
-        let projection = projection.unwrap_or(full_schema);
-        // Also remove any fields that are not part of the user's provided projection
-        let schema_per_file = Arc::new(projection.intersection_ignore_types(&data_file_schema)?);
+        self.open_reader_impl(
+            data_file,
+            projection,
+            read_config,
+            MetadataMode::LazyAllowed,
+        )
+        .await
+    }
 
-        if data_file.is_legacy_file() {
-            let max_field_id = data_file.fields.iter().max().unwrap();
-            if !schema_per_file.fields.is_empty() {
+    async fn open_reader_with_full_metadata(
+        &self,
+        data_file: &DataFile,
+        projection: Option<&Schema>,
+        read_config: &FragReadConfig,
+    ) -> Result<Option<Box<dyn GenericFileReader>>> {
+        self.open_reader_impl(data_file, projection, read_config, MetadataMode::Full)
+            .await
+    }
+
+    fn open_reader_impl<'a>(
+        &'a self,
+        data_file: &'a DataFile,
+        projection: Option<&'a Schema>,
+        read_config: &'a FragReadConfig,
+        metadata_mode: MetadataMode,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn GenericFileReader>>>> {
+        async move {
+            let full_schema = self.dataset.schema();
+            // The data file may contain fields that are not part of the dataset any longer, remove those
+            let data_file_schema = Arc::new(data_file.schema(full_schema));
+            let projection = projection.unwrap_or(full_schema);
+            // Also remove any fields that are not part of the user's provided projection
+            let schema_per_file =
+                Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+
+            if data_file.is_legacy_file() {
+                let max_field_id = data_file.fields.iter().max().unwrap();
+                if !schema_per_file.fields.is_empty() {
+                    let path = self
+                        .dataset
+                        .data_file_dir(data_file)?
+                        .join(data_file.path.as_str());
+                    let object_store = self.dataset.object_store_for_data_file(data_file).await?;
+                    let field_id_offset = Self::get_field_id_offset(data_file);
+                    let reader = V1FileReader::try_new_with_fragment_id(
+                        &object_store,
+                        &path,
+                        self.schema().clone(),
+                        self.id() as u32,
+                        field_id_offset as i32,
+                        *max_field_id,
+                        Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
+                    )
+                    .await?;
+                    let initialized_schema = reader.schema().project_by_schema(
+                        schema_per_file.as_ref(),
+                        OnMissing::Error,
+                        OnTypeMismatch::Error,
+                    )?;
+                    let reader = V1Reader::new(reader, Arc::new(initialized_schema));
+                    let reader: Box<dyn GenericFileReader> = Box::new(reader);
+                    Ok(Some(reader))
+                } else {
+                    Ok(None)
+                }
+            } else if schema_per_file.fields.is_empty() {
+                Ok(None)
+            } else {
                 let path = self
                     .dataset
                     .data_file_dir(data_file)?
                     .join(data_file.path.as_str());
-                let object_store = self.dataset.object_store_for_data_file(data_file).await?;
-                let field_id_offset = Self::get_field_id_offset(data_file);
-                let reader = PreviousFileReader::try_new_with_fragment_id(
-                    &object_store,
-                    &path,
-                    self.schema().clone(),
-                    self.id() as u32,
-                    field_id_offset as i32,
-                    *max_field_id,
-                    Some(&self.dataset.metadata_cache.file_metadata_cache(&path)),
-                )
-                .await?;
-                let initialized_schema = reader.schema().project_by_schema(
+                let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
+                    // TODO: make object stores for non-default bases reuse the same scan scheduler
+                    //  currently we always create a new one
+                    let object_store = self.dataset.object_store(Some(base_id)).await?;
+                    let config = SchedulerConfig::max_bandwidth(&object_store);
+                    (
+                        ScanScheduler::new(object_store, config),
+                        read_config.reader_priority.unwrap_or(0),
+                    )
+                } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
+                    (
+                        scan_scheduler.clone(),
+                        read_config.reader_priority.unwrap_or(0),
+                    )
+                } else {
+                    (
+                        ScanScheduler::new(
+                            self.dataset.object_store.clone(),
+                            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                        ),
+                        0,
+                    )
+                };
+                let file_scheduler = store_scheduler
+                    .open_file_with_priority(
+                        &path,
+                        reader_priority as u64,
+                        &data_file.file_size_bytes,
+                    )
+                    .await?;
+                let path = file_scheduler.reader().path().clone();
+                let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
+                let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
+                    data_file
+                        .fields
+                        .iter()
+                        .copied()
+                        .zip(data_file.column_indices.iter().copied())
+                        .filter_map(|(field_id, column_index)| {
+                            if column_index < 0 {
+                                None
+                            } else {
+                                Some((field_id as u32, column_index as u32))
+                            }
+                        }),
+                ));
+                let file_version = data_file.file_version()?;
+                let reader_projection = file_versions::reader_projection_from_field_ids(
+                    file_version,
                     schema_per_file.as_ref(),
-                    OnMissing::Error,
-                    OnTypeMismatch::Error,
+                    field_id_to_column_idx.as_ref(),
                 )?;
-                let reader = V1Reader::new(reader, Arc::new(initialized_schema));
-                Ok(Some(Box::new(reader)))
-            } else {
-                Ok(None)
-            }
-        } else if schema_per_file.fields.is_empty() {
-            Ok(None)
-        } else {
-            let path = self
-                .dataset
-                .data_file_dir(data_file)?
-                .join(data_file.path.as_str());
-            let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
-                // TODO: make object stores for non-default bases reuse the same scan scheduler
-                //  currently we always create a new one
-                let object_store = self.dataset.object_store(Some(base_id)).await?;
-                let config = SchedulerConfig::max_bandwidth(&object_store);
-                (
-                    ScanScheduler::new(object_store, config),
-                    read_config.reader_priority.unwrap_or(0),
-                )
-            } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
-                (
-                    scan_scheduler.clone(),
-                    read_config.reader_priority.unwrap_or(0),
-                )
-            } else {
-                (
-                    ScanScheduler::new(
-                        self.dataset.object_store.clone(),
-                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
-                    ),
-                    0,
-                )
-            };
-            let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
-                .await?;
-            let file_metadata = self.get_file_metadata(&file_scheduler).await?;
-            let path = file_scheduler.reader().path().clone();
-            let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
-            let reader = Arc::new(
-                lance_file::reader::FileReader::try_open_with_file_metadata(
-                    Arc::new(LanceEncodingsIo::new(file_scheduler.clone())),
-                    path,
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    file_metadata,
-                    &metadata_cache,
-                    read_config
-                        .file_reader_options
-                        .clone()
-                        .or_else(|| self.dataset.file_reader_options.clone())
-                        .unwrap_or_default(),
-                )
-                .await?,
-            );
-            let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
-                data_file
-                    .fields
-                    .iter()
-                    .copied()
-                    .zip(data_file.column_indices.iter().copied())
-                    .filter_map(|(field_id, column_index)| {
-                        if column_index < 0 {
-                            None
-                        } else {
-                            Some((field_id as u32, column_index as u32))
+                let file_reader_options = read_config
+                    .file_reader_options
+                    .clone()
+                    .or_else(|| self.dataset.file_reader_options.clone())
+                    .unwrap_or_default();
+                let prefer_indexed = metadata_mode == MetadataMode::LazyAllowed
+                    && reader_projection.column_indices.len().saturating_mul(4)
+                        < data_file
+                            .column_indices
+                            .iter()
+                            .filter(|column_index| **column_index >= 0)
+                            .count();
+                let known_schema = self
+                    .metadata
+                    .physical_rows
+                    .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
+                let encodings_io = Arc::new(
+                    LanceEncodingsIo::new(file_scheduler.clone())
+                        .with_read_chunk_size(file_reader_options.read_chunk_size),
+                );
+                let reader = file_versions::open_projected_reader(
+                    file_version,
+                    &reader_projection,
+                    prefer_indexed,
+                    || async {
+                        let metadata_index = self
+                            .get_file_metadata_index(&file_scheduler, known_schema)
+                            .await?;
+                        if (reader_projection.column_indices.len() as u32).saturating_mul(4)
+                            >= metadata_index.num_columns()
+                        {
+                            return Ok(None);
                         }
-                    }),
-            ));
-            let reader = v2_adapter::Reader::new(
-                reader,
-                schema_per_file,
-                field_id_to_column_idx,
-                reader_priority,
-                file_scheduler,
-            );
-            Ok(Some(Box::new(reader)))
+                        Ok(Some(
+                            ProjectedFileReader::try_open_with_metadata_index(
+                                encodings_io.clone(),
+                                path.clone(),
+                                Some(reader_projection.clone()),
+                                Arc::<DecoderPlugins>::default(),
+                                metadata_index,
+                                &metadata_cache,
+                                file_reader_options.clone(),
+                            )
+                            .await?,
+                        ))
+                    },
+                    || async {
+                        let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+                        ProjectedFileReader::try_open_with_file_metadata(
+                            encodings_io.clone(),
+                            path.clone(),
+                            None,
+                            Arc::<DecoderPlugins>::default(),
+                            file_metadata,
+                            &metadata_cache,
+                            file_reader_options.clone(),
+                        )
+                        .await
+                    },
+                )
+                .await?;
+                let reader = v2_adapter::Reader::new(
+                    Arc::new(reader),
+                    schema_per_file,
+                    field_id_to_column_idx,
+                    reader_priority,
+                    file_scheduler,
+                );
+                let reader: Box<dyn GenericFileReader> = Box::new(reader);
+                Ok(Some(reader))
+            }
         }
+        .boxed()
     }
 
     async fn open_readers(
@@ -1082,35 +1200,68 @@ impl FileFragment {
         projection: &Schema,
         read_config: &FragReadConfig,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
-        let mut opened_files = vec![];
-        for data_file in &self.metadata.files {
-            if let Some(reader) = self
-                .open_reader(data_file, Some(projection), read_config)
-                .await?
-            {
-                opened_files.push(reader);
+        self.open_readers_impl(projection, read_config, MetadataMode::LazyAllowed)
+            .await
+    }
+
+    async fn open_readers_with_full_metadata(
+        &self,
+        projection: &Schema,
+        read_config: &FragReadConfig,
+    ) -> Result<Vec<Box<dyn GenericFileReader>>> {
+        self.open_readers_impl(projection, read_config, MetadataMode::Full)
+            .await
+    }
+
+    fn open_readers_impl<'a>(
+        &'a self,
+        projection: &'a Schema,
+        read_config: &'a FragReadConfig,
+        metadata_mode: MetadataMode,
+    ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
+        async move {
+            let mut opened_files = vec![];
+            for data_file in &self.metadata.files {
+                let reader = match metadata_mode {
+                    MetadataMode::LazyAllowed => {
+                        self.open_reader(data_file, Some(projection), read_config)
+                            .await?
+                    }
+                    MetadataMode::Full => {
+                        self.open_reader_with_full_metadata(
+                            data_file,
+                            Some(projection),
+                            read_config,
+                        )
+                        .await?
+                    }
+                };
+                if let Some(reader) = reader {
+                    opened_files.push(reader);
+                }
             }
+
+            // This should return immediately on modern datasets.  Need to use physical_rows because
+            // deletions will be applied later
+            let num_rows = self.physical_rows().await?;
+
+            // Check if there are any fields that are not in any data files
+            let field_ids_in_files = opened_files
+                .iter()
+                .flat_map(|r| r.projection().fields_pre_order().map(|f| f.id))
+                .filter(|id| *id >= 0)
+                .collect::<HashSet<_>>();
+            let mut missing_fields = projection.field_ids();
+            missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
+            if !missing_fields.is_empty() {
+                let missing_projection = projection.project_by_ids(&missing_fields, true);
+                let null_reader = NullReader::new(Arc::new(missing_projection), num_rows as u32);
+                opened_files.push(Box::new(null_reader));
+            }
+
+            Ok(opened_files)
         }
-
-        // This should return immediately on modern datasets.  Need to use physical_rows because
-        // deletions will be applied later
-        let num_rows = self.physical_rows().await?;
-
-        // Check if there are any fields that are not in any data files
-        let field_ids_in_files = opened_files
-            .iter()
-            .flat_map(|r| r.projection().fields_pre_order().map(|f| f.id))
-            .filter(|id| *id >= 0)
-            .collect::<HashSet<_>>();
-        let mut missing_fields = projection.field_ids();
-        missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
-        if !missing_fields.is_empty() {
-            let missing_projection = projection.project_by_ids(&missing_fields, true);
-            let null_reader = NullReader::new(Arc::new(missing_projection), num_rows as u32);
-            opened_files.push(Box::new(null_reader));
-        }
-
-        Ok(opened_files)
+        .boxed()
     }
 
     /// Count the rows in this fragment.
@@ -1257,6 +1408,11 @@ impl FileFragment {
         for data_file in &self.metadata.files {
             let last = -1;
             for field_id in data_file.fields.iter() {
+                // A tombstone marks a field superseded by a later data file.
+                // It is not a field id: it has no ordering and can repeat.
+                if *field_id == TOMBSTONE_FIELD_ID {
+                    continue;
+                }
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
@@ -1427,8 +1583,22 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false, false, false, false)
-            .await
+        let batch = self
+            .take_rows(&row_ids, projection, false, false, false, false)
+            .await?;
+
+        // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
+        // for user-facing output.
+        if batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| lance_arrow::json::is_json_field(f) || lance_arrow::json::has_json_fields(f))
+        {
+            Ok(lance_arrow::json::convert_lance_json_to_arrow(&batch)?)
+        } else {
+            Ok(batch)
+        }
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
@@ -1444,7 +1614,7 @@ impl FileFragment {
     }
 
     /// Get the file metadata for this fragment, using the cache if available.
-    async fn get_file_metadata(
+    pub async fn get_file_metadata(
         &self,
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
@@ -1459,6 +1629,32 @@ impl FileFragment {
             })
             .await?;
         Ok(file_metadata)
+    }
+
+    pub async fn get_file_metadata_index(
+        &self,
+        file_scheduler: &FileScheduler,
+        known_schema: Option<(Arc<Schema>, u64)>,
+    ) -> Result<Arc<FileMetadataIndex>> {
+        let path = file_scheduler.reader().path();
+        let cache = self.dataset.metadata_cache.file_metadata_cache(path);
+
+        let metadata_index = cache
+            .get_or_insert_with_key(FileMetadataIndexCacheKey, || async {
+                let metadata_index = if let Some((file_schema, num_rows)) = known_schema {
+                    lance_file::reader::FileReader::read_metadata_index_with_schema(
+                        file_scheduler,
+                        file_schema,
+                        num_rows,
+                    )
+                    .await?
+                } else {
+                    lance_file::reader::FileReader::read_metadata_index(file_scheduler).await?
+                };
+                Ok(metadata_index)
+            })
+            .await?;
+        Ok(metadata_index)
     }
 
     /// Take rows based on internal local row offsets
@@ -1721,6 +1917,17 @@ impl FileFragment {
             )
             .await?;
         // Hash join: rows matched on the right-hand stream rewrite columns; track physical offsets via `_rowaddr`.
+        // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary) in the right stream
+        // so they match the physical storage format read from the fragment's left batch.
+        let right_stream: Box<dyn RecordBatchReader + Send> = if right_schema
+            .fields()
+            .iter()
+            .any(|f| is_arrow_json_field(f) || has_json_fields(f))
+        {
+            Box::new(JsonConvertingReader::new(right_stream))
+        } else {
+            right_stream
+        };
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
         let mut matched_offsets = RoaringBitmap::new();
         let frag_id_u32 = u32::try_from(self.metadata.id).map_err(|_| {
@@ -1792,7 +1999,7 @@ impl FileFragment {
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> Result<(Fragment, Schema)> {
-        let (fragments, schema, _) = schema_evolution::add_columns_to_fragments(
+        let (fragments, schema, _, _) = schema_evolution::add_columns_to_fragments(
             self.dataset.as_ref(),
             transforms,
             read_columns,
@@ -1981,6 +2188,33 @@ impl CacheKey for FileMetadataCacheKey {
     fn type_name() -> &'static str {
         "FileMetadata"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.fragment-file-metadata-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
+}
+
+#[derive(Debug, Clone)]
+struct FileMetadataIndexCacheKey;
+
+impl CacheKey for FileMetadataIndexCacheKey {
+    type ValueType = FileMetadataIndex;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "metadata_index".into()
+    }
+
+    fn type_name() -> &'static str {
+        "FileMetadataIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.fragment-file-metadata-index-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
 impl From<FileFragment> for Fragment {
@@ -2042,6 +2276,23 @@ pub struct FragmentReader {
 
     // total number of physical rows in the fragment (all rows, ignoring deletions)
     num_physical_rows: usize,
+
+    /// Read-time state for resolving data overlay files: the coverage plan plus
+    /// what is needed to open overlay readers. `None` when the fragment has no
+    /// overlays. Overlays are merged into base batches (by `offset_in_frag`) before
+    /// deletion filtering, opening only the files each read's rows touch.
+    overlay: Option<OverlayReadState>,
+}
+
+/// What [`FragmentReader`] needs to resolve overlays at read time: the coverage
+/// plan (from metadata, cheap to build), and the fragment + config needed to open
+/// overlay readers once the read's rows — and therefore which files it touches —
+/// are known. All `Arc` so cloning a reader stays cheap.
+#[derive(Clone, Debug)]
+struct OverlayReadState {
+    planner: Arc<OverlayReadPlanner>,
+    fragment: Arc<FileFragment>,
+    read_config: Arc<FragReadConfig>,
 }
 
 // Custom clone impl needed because it is not easy to clone Box<dyn GenericFileReader>
@@ -2070,6 +2321,7 @@ impl Clone for FragmentReader {
             created_at_sequence: self.created_at_sequence.clone(),
             num_rows: self.num_rows,
             num_physical_rows: self.num_physical_rows,
+            overlay: self.overlay.clone(),
         }
     }
 }
@@ -2137,6 +2389,7 @@ impl FragmentReader {
             created_at_sequence: None,
             num_rows,
             num_physical_rows,
+            overlay: None,
         })
     }
 
@@ -2394,6 +2647,77 @@ impl FragmentReader {
         Ok(result.project_by_schema(&output_schema)?)
     }
 
+    /// Merge data overlay values onto a stream of base batches.
+    ///
+    /// Runs on physical rows in read order, *before* deletion filtering, so each
+    /// row can be addressed by its position in the fragment (its `offset_in_frag`,
+    /// derived from `params`) and deletions take precedence naturally: an overlay
+    /// value for a deleted row is dropped along with the row downstream. A no-op
+    /// when the fragment has no overlays.
+    ///
+    /// The read's `offset_in_frag` values are known from `params` up front, so
+    /// overlays are resolved here to just the files this read's rows touch — an
+    /// overlay whose cells fall outside the read is not opened at all. Within each
+    /// batch, the overlay reads (only the values that batch needs) are then issued
+    /// concurrently with the base read rather than after it.
+    async fn merge_overlays(
+        &self,
+        merged: ReadBatchTaskStream,
+        params: &ReadBatchParams,
+        total_num_rows: u32,
+    ) -> Result<ReadBatchTaskStream> {
+        let Some(overlay) = &self.overlay else {
+            return Ok(merged);
+        };
+        // The offset_in_frag of every row this read will return, materialized once.
+        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row), and
+        // it lets us both prune overlays to the read and slice each batch's offsets
+        // below without reading any data. Only paid when the fragment has overlays.
+        //
+        // TODO(overlay perf): this could be avoided by teaching `ReadBatchParams` to
+        // yield a coverage bitmap directly (for pruning) and to slice per batch (for
+        // the routing below), or by moving `ReadBatchParams` to a roaring bitmap
+        // wholesale — a larger refactor tracked separately.
+        let offsets_in_frag: Arc<Vec<u32>> =
+            Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
+
+        // Open only the overlay readers this read touches (pruned by row selection).
+        let plans = resolve_overlays(
+            &overlay.planner,
+            &offsets_in_frag,
+            &overlay.fragment,
+            &overlay.read_config,
+        )
+        .await?;
+        if plans.is_empty() {
+            return Ok(merged);
+        }
+        let plans = Arc::new(plans);
+
+        // Batches arrive in physical read order, so a running total of the rows seen
+        // so far gives each batch its starting offset_in_batch into `offsets_in_frag`.
+        let mut rows_seen = 0usize;
+        let stream = merged
+            .map(move |task| {
+                let num_rows = task.num_rows;
+                let start = rows_seen;
+                rows_seen += num_rows as usize;
+                let offsets_in_frag = offsets_in_frag.clone();
+                let plans = plans.clone();
+                let inner = task.task;
+                ReadBatchTask {
+                    num_rows,
+                    task: async move {
+                        let batch_offsets = &offsets_in_frag[start..start + num_rows as usize];
+                        merge_overlay_batch(inner, batch_offsets, &plans).await
+                    }
+                    .boxed(),
+                }
+            })
+            .boxed();
+        Ok(stream)
+    }
+
     async fn new_read_impl<'a, F>(
         &'a self,
         params: ReadBatchParams,
@@ -2460,6 +2784,8 @@ impl FragmentReader {
             // Merge the streams, this merges the generated batches
             lance_table::utils::stream::merge_streams(read_streams)
         };
+
+        let merged = self.merge_overlays(merged, &params, total_num_rows).await?;
 
         // Add the row id column (if needed) and delete rows (if a deletion
         // vector is present).
@@ -2631,6 +2957,11 @@ impl FragmentReader {
             lance_table::utils::stream::merge_streams(read_streams)
         };
 
+        let params = ReadBatchParams::Ranges(ranges);
+        let merged_stream = self
+            .merge_overlays(merged_stream, &params, total_num_rows)
+            .await?;
+
         // Add the row id column (if needed) and delete rows (if a deletion
         // vector is present).
         let config = RowIdAndDeletesConfig {
@@ -2643,7 +2974,7 @@ impl FragmentReader {
             with_row_created_at_version: self.with_row_created_at_version,
             last_updated_at_sequence: self.last_updated_at_sequence.clone(),
             created_at_sequence: self.created_at_sequence.clone(),
-            params: ReadBatchParams::Ranges(ranges),
+            params,
             total_num_rows,
         };
         let output_schema = Arc::new(self.output_schema.clone());
@@ -2746,6 +3077,59 @@ impl FragmentReader {
     }
 }
 
+/// A wrapper around a `RecordBatchReader` that converts Arrow JSON columns
+/// (Utf8/LargeUtf8 with `arrow.json` extension) to Lance JSON columns
+/// (LargeBinary with `lance.json` extension / JSONB format).
+///
+/// This is needed when user-provided data contains Arrow JSON fields but the
+/// dataset stores them in Lance's JSONB binary format.
+struct JsonConvertingReader {
+    inner: Box<dyn RecordBatchReader + Send>,
+    schema: arrow_schema::SchemaRef,
+}
+
+impl JsonConvertingReader {
+    fn new(inner: Box<dyn RecordBatchReader + Send>) -> Self {
+        use lance_arrow::json::arrow_json_to_lance_json;
+
+        // Build the converted schema (Arrow JSON fields → Lance JSON fields)
+        let orig_schema = inner.schema();
+        let new_fields: Vec<arrow_schema::FieldRef> = orig_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if is_arrow_json_field(f) || has_json_fields(f) {
+                    Arc::new(arrow_json_to_lance_json(f))
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect();
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            new_fields,
+            orig_schema.metadata().clone(),
+        ));
+
+        Self { inner, schema }
+    }
+}
+
+impl Iterator for JsonConvertingReader {
+    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|result| result.and_then(|batch| convert_json_columns(&batch)))
+    }
+}
+
+impl RecordBatchReader for JsonConvertingReader {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        self.schema.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_arith::numeric::mul;
@@ -2756,7 +3140,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{RowCount, array, gen_batch};
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_file::writer::FileWriterOptions;
     use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
@@ -2837,6 +3221,1671 @@ mod tests {
             .unwrap();
 
         Dataset::open(test_uri).await.unwrap()
+    }
+
+    /// End-to-end tests for reading data overlay files (OSS-1324): overlays are
+    /// written, committed via the `DataOverlay` transaction, and then resolved on
+    /// the `take` and scan read paths.
+    mod overlay_read {
+        use std::sync::Arc;
+
+        use arrow_array::{
+            Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StructArray, UInt64Array,
+        };
+        use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+        use lance_file::writer::FileWriterOptions;
+        use lance_io::utils::CachedFileSize;
+        use lance_table::format::DataFile;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use object_store::path::Path;
+        use roaring::RoaringBitmap;
+        use rstest::rstest;
+
+        use crate::dataset::transaction::{DataOverlayGroup, Operation};
+        use crate::dataset::{Dataset, WriteDestination, WriteParams};
+
+        fn bitmap(offsets: impl IntoIterator<Item = u32>) -> RoaringBitmap {
+            RoaringBitmap::from_iter(offsets)
+        }
+
+        fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
+            Arc::new(Int32Array::from_iter(values))
+        }
+
+        /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `val` (field 1)
+        /// = id * 10, written 6 rows per file (fragments 0 and 1).
+        ///
+        async fn create_base_dataset(version: LanceFileVersion) -> Dataset {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..12)),
+                    Arc::new(Int32Array::from_iter_values((0..12).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap()
+        }
+
+        /// Write an overlay file covering `fields` (dataset field ids) of
+        /// `fragment_id` with the given coverage and per-field value columns, then
+        /// commit it as a `DataOverlay` transaction. `name` makes the file unique.
+        #[allow(clippy::too_many_arguments)]
+        async fn commit_overlay(
+            dataset: Dataset,
+            name: &str,
+            fragment_id: u64,
+            fields: &[i32],
+            coverage: OverlayCoverage,
+            columns: Vec<ArrayRef>,
+            version: LanceFileVersion,
+        ) -> Dataset {
+            let read_version = dataset.version().version;
+            let overlay_schema = dataset.schema().project_by_ids(fields, true);
+
+            let filename = format!("{name}.lance");
+            // The manifest records the bare filename; only the physical write is
+            // data-dir qualified.
+            let path = dataset.data_dir().join(filename.as_str());
+            let obj_writer = dataset.object_store.create(&path).await.unwrap();
+            let file_version = ConcreteFileVersion::from(version);
+            let mut writer = lance_file::versions::create_writer(
+                file_version,
+                obj_writer,
+                overlay_schema,
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            for (column_index, array) in columns.into_iter().enumerate() {
+                writer.write_column(column_index, array).await.unwrap();
+            }
+            let summary = writer.finish().await.unwrap();
+
+            let mut data_file = DataFile::new_unstarted(filename, file_version);
+            data_file.fields = writer
+                .field_id_to_column_indices()
+                .iter()
+                .map(|(field_id, _)| *field_id as i32)
+                .collect::<Vec<_>>()
+                .into();
+            data_file.column_indices = writer
+                .field_id_to_column_indices()
+                .iter()
+                .map(|(_, column_index)| *column_index as i32)
+                .collect::<Vec<_>>()
+                .into();
+            data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+
+            let overlay = DataOverlayFile {
+                data_file,
+                coverage,
+                committed_version: 0,
+            };
+            Dataset::commit(
+                WriteDestination::Dataset(Arc::new(dataset)),
+                Operation::DataOverlay {
+                    groups: vec![DataOverlayGroup {
+                        fragment_id,
+                        overlays: vec![overlay],
+                    }],
+                },
+                Some(read_version),
+                None,
+                None,
+                Arc::new(Default::default()),
+                false,
+            )
+            .await
+            .unwrap()
+        }
+
+        /// `collect_paths` feeds `deep_clone`'s copy loop, so an overlay data file
+        /// it omits is referenced by the clone's manifest but never copied. The
+        /// clone then fails to read the overlaid values.
+        #[tokio::test]
+        async fn deep_clone_copies_overlay_files() {
+            use lance_core::utils::tempfile::TempStdDir;
+
+            let version = LanceFileVersion::Stable;
+            let test_dir = TempStdDir::default();
+            let source_uri = test_dir.join("source").to_str().unwrap().to_string();
+            let clone_uri = test_dir.join("clone").to_str().unwrap().to_string();
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(
+                reader,
+                &source_uri,
+                Some(WriteParams {
+                    max_rows_per_file: 6,
+                    max_rows_per_group: 6,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            // Overlay `val` on offsets 0 and 1 of fragment 0.
+            let mut dataset = commit_overlay(
+                dataset,
+                "overlay0",
+                0,
+                &[1],
+                OverlayCoverage::Shared(Arc::new(bitmap([0, 1]))),
+                vec![i32_array([Some(700), Some(701)])],
+                version,
+            )
+            .await;
+
+            let source_version = dataset.version().version;
+            dataset
+                .tags()
+                .create("clone-me", source_version)
+                .await
+                .unwrap();
+            let cloned = dataset
+                .deep_clone(&clone_uri, "clone-me", None)
+                .await
+                .unwrap();
+
+            let batch = cloned
+                .scan()
+                .try_into_batch()
+                .await
+                .expect("the clone must be readable, including its overlay files");
+            let val = col(&batch, "val");
+            assert_eq!(
+                val.values()[..2],
+                [700, 701],
+                "the clone must return the overlaid values, not the base ones"
+            );
+        }
+
+        /// Deep-cloning a shallow clone has to drop every `base_id`, since the
+        /// result owns its files. An overlay whose `base_id` survives points at a
+        /// base the new manifest no longer lists.
+        #[tokio::test]
+        async fn deep_clone_of_shallow_clone_clears_overlay_base_id() {
+            use lance_core::utils::tempfile::TempStdDir;
+
+            let version = LanceFileVersion::Stable;
+            let test_dir = TempStdDir::default();
+            let source_uri = test_dir.join("source").to_str().unwrap().to_string();
+            let shallow_uri = test_dir.join("shallow").to_str().unwrap().to_string();
+            let deep_uri = test_dir.join("deep").to_str().unwrap().to_string();
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(
+                reader,
+                &source_uri,
+                Some(WriteParams {
+                    max_rows_per_file: 6,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let mut dataset = commit_overlay(
+                dataset,
+                "overlay0",
+                0,
+                &[1],
+                OverlayCoverage::Shared(Arc::new(bitmap([0, 1]))),
+                vec![i32_array([Some(700), Some(701)])],
+                version,
+            )
+            .await;
+
+            let source_version = dataset.version().version;
+            dataset.tags().create("v", source_version).await.unwrap();
+            let mut shallow = dataset
+                .shallow_clone(&shallow_uri, "v", None)
+                .await
+                .unwrap();
+            // The shallow clone reaches the overlay through the parent.
+            assert!(
+                shallow.get_fragments()[0].metadata().overlays[0]
+                    .data_file
+                    .base_id
+                    .is_some(),
+                "the shallow clone must reference the parent's overlay by base_id"
+            );
+
+            let shallow_version = shallow.version().version;
+            shallow.tags().create("v", shallow_version).await.unwrap();
+            let deep = shallow.deep_clone(&deep_uri, "v", None).await.unwrap();
+
+            assert_eq!(
+                deep.get_fragments()[0].metadata().overlays[0]
+                    .data_file
+                    .base_id,
+                None,
+                "a deep clone owns its files, so the overlay must carry no base_id"
+            );
+            assert!(
+                deep.manifest.base_paths.is_empty(),
+                "a deep clone lists no external bases"
+            );
+        }
+
+        fn full_schema(dataset: &Dataset) -> Schema {
+            dataset.schema().clone()
+        }
+
+        fn col(batch: &RecordBatch, name: &str) -> Int32Array {
+            let idx = batch.schema().index_of(name).unwrap();
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .clone()
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_covered_and_uncovered(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Overlay fragment 0's `val` at physical offsets {1, 4}.
+            let dataset = commit_overlay(
+                dataset,
+                "ov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag
+                .take(&[0, 1, 2, 4], &full_schema(&dataset))
+                .await
+                .unwrap();
+            // Offsets 1 and 4 take overlay values; 0 and 2 fall through to base.
+            assert_eq!(col(&batch, "val").values(), &[0, 111, 20, 444]);
+            // The unrelated `id` column is untouched.
+            assert_eq!(col(&batch, "id").values(), &[0, 1, 2, 4]);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_newest_overlay_wins(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "older",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+            // A newer overlay (later commit -> higher committed_version) re-covers
+            // offset 1.
+            let dataset = commit_overlay(
+                dataset,
+                "newer",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1])),
+                vec![i32_array([Some(999)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 4], &full_schema(&dataset)).await.unwrap();
+            // Offset 1 -> newest overlay (999); offset 4 -> only older covers it.
+            assert_eq!(col(&batch, "val").values(), &[999, 444]);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_per_field_coverage(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Sparse overlay: `id` covers {2}, `val` covers {2, 3} — different
+            // offset sets and therefore unequal-length value columns.
+            let dataset = commit_overlay(
+                dataset,
+                "sparse",
+                0,
+                &[0, 1],
+                OverlayCoverage::sparse(vec![bitmap([2]), bitmap([2, 3])]),
+                vec![i32_array([Some(777)]), i32_array([Some(220), Some(330)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[2, 3], &full_schema(&dataset)).await.unwrap();
+            // id: offset 2 covered (777), offset 3 falls through (3).
+            assert_eq!(col(&batch, "id").values(), &[777, 3]);
+            // val: both offsets covered (220, 330).
+            assert_eq!(col(&batch, "val").values(), &[220, 330]);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_null_override(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "nullov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([None])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[0, 1], &full_schema(&dataset)).await.unwrap();
+            let val = col(&batch, "val");
+            // Offset 0 is covered with a NULL value -> resolves to NULL; offset 1
+            // falls through to the base value.
+            assert!(val.is_null(0));
+            assert_eq!(val.value(1), 10);
+        }
+
+        /// Overlays interact correctly with NULL *base* cells (distinct from a NULL
+        /// overlay value): a covered row whose base value is NULL is overridden to the
+        /// overlay's non-null value, while an uncovered NULL base cell falls through
+        /// and stays NULL.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_null_base_cell(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    // `val` is NULL at offsets 1 and 3.
+                    Arc::new(Int32Array::from_iter([
+                        Some(0),
+                        None,
+                        Some(20),
+                        None,
+                        Some(40),
+                        Some(50),
+                    ])),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Cover offset 1 (NULL base) and offset 4 (non-null base); leave offset
+            // 3's NULL base uncovered.
+            let dataset = commit_overlay(
+                dataset,
+                "nullbase",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 3, 4], &full_schema(&dataset)).await.unwrap();
+            let val = col(&batch, "val");
+            // Offset 1: NULL base overridden to 111. Offset 3: uncovered NULL base
+            // stays NULL. Offset 4: non-null base overridden to 444.
+            assert_eq!(val.value(0), 111);
+            assert!(val.is_null(1));
+            assert_eq!(val.value(2), 444);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_overlay_on_deleted_row_is_inert(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let mut dataset = create_base_dataset(version).await;
+            // Delete global row 1 (fragment 0, physical offset 1).
+            dataset.delete("id = 1").await.unwrap();
+            // Overlay covers the deleted offset 1 and the live offset 4.
+            let dataset = commit_overlay(
+                dataset,
+                "delov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+
+            // Scan fragment 0: row 1 is gone, and offset 4's overlay value survives
+            // even though the deletion shifts logical positions — coverage is keyed
+            // by physical offset.
+            let frag = dataset.get_fragment(0).unwrap();
+            let mut scanner = frag.scan();
+            let batch = scanner
+                .project(&["id", "val"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(col(&batch, "id").values(), &[0, 2, 3, 4, 5]);
+            assert_eq!(col(&batch, "val").values(), &[0, 20, 30, 444, 50]);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_scan_multi_fragment_overlays(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Overlay fragment 0 at offset 0 and fragment 1 at offset 0 (global
+            // row 6). Each fragment's coverage is independent.
+            let dataset = commit_overlay(
+                dataset,
+                "frag0",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([Some(1000)])],
+                version,
+            )
+            .await;
+            let dataset = commit_overlay(
+                dataset,
+                "frag1",
+                1,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([Some(6000)])],
+                version,
+            )
+            .await;
+
+            let batch = dataset
+                .scan()
+                .project(&["id", "val"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(batch.num_rows(), 12);
+            let expected: Vec<i32> = (0..12)
+                .map(|i| match i {
+                    0 => 1000,
+                    6 => 6000,
+                    other => other * 10,
+                })
+                .collect();
+            assert_eq!(col(&batch, "val").values(), &expected);
+        }
+
+        /// A `take` of a few rows must read only the overlay values those rows
+        /// touch — not the whole column. Uses v2.1 (which slices pages on read) and
+        /// an incompressible, all-covering overlay, so reading the full column would
+        /// be far more bytes than reading a couple of values. This is the regression
+        /// guard for the lazy, value-pushdown overlay read.
+        #[tokio::test]
+        async fn test_take_reads_only_needed_overlay_values() {
+            let version = LanceFileVersion::V2_1;
+            const N: usize = 100_000;
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let base = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..N as i32)),
+                    Arc::new(Int32Array::from_iter_values((0..N as i32).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: N,
+                max_rows_per_group: N,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(base)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay `val` over ALL N offsets with incompressible values, so the
+            // value column is ~N*4 bytes on disk.
+            let values: Vec<i32> = (0..N as u64)
+                .map(|i| {
+                    let mut x = i;
+                    x ^= x >> 33;
+                    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+                    x ^= x >> 33;
+                    x as i32
+                })
+                .collect();
+            let dataset = commit_overlay(
+                dataset,
+                "big",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap(0..N as u32)),
+                vec![Arc::new(Int32Array::from(values.clone())) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let val_only = dataset.schema().project_by_ids(&[1], true);
+
+            // Measure only the reads that resolve the take.
+            dataset.object_store.io_stats_incremental();
+            let batch = frag.take(&[0, 1], &val_only).await.unwrap();
+            let io = dataset.object_store.io_stats_incremental();
+
+            // The overlay's `val` column alone is N*4 bytes; resolving two adjacent
+            // offsets must read only a small fraction of it.
+            let full_column_bytes = (N * std::mem::size_of::<i32>()) as u64;
+            assert!(
+                io.read_bytes > 0 && io.read_bytes < full_column_bytes / 4,
+                "take read {} bytes; expected far less than the {}-byte overlay \
+                 column (a take must not read the whole value column)",
+                io.read_bytes,
+                full_column_bytes,
+            );
+
+            // ...and it still resolves correctly.
+            let val = col(&batch, "val");
+            assert_eq!(val.value(0), values[0]);
+            assert_eq!(val.value(1), values[1]);
+        }
+
+        /// Row-selection pruning: an overlay whose coverage is disjoint from the
+        /// requested rows must not be opened at all. Proven by deleting the overlay's
+        /// data file — a `take` that misses its coverage still succeeds (the file is
+        /// never touched), while a `take` that hits it then fails because the file is
+        /// genuinely needed.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_prunes_overlays_outside_row_selection(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Overlay on fragment 0 (offsets 0..6) covering only offset_in_frag 5.
+            let dataset = commit_overlay(
+                dataset,
+                "miss",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([5])),
+                vec![i32_array([Some(5000)])],
+                version,
+            )
+            .await;
+
+            // Delete the overlay's data file: opening it now fails.
+            dataset
+                .object_store
+                .delete(&Path::from("data/miss.lance"))
+                .await
+                .unwrap();
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let val_only = dataset.schema().project_by_ids(&[1], true);
+
+            // A take that misses the overlay's coverage must not open it, so it
+            // succeeds and returns base values (val = offset * 10).
+            let batch = frag.take(&[0, 1], &val_only).await.unwrap();
+            assert_eq!(col(&batch, "val").values(), &[0, 10]);
+
+            // A take that hits the coverage does need the file, so it now fails with
+            // a not-found error naming the missing overlay file.
+            let err = frag.take(&[5], &val_only).await.unwrap_err();
+            let message = format!("{err:?}");
+            assert!(
+                err.is_not_found() && message.contains("miss.lance"),
+                "take hitting the overlay's coverage should fail with a not-found error \
+                 for its missing file, got: {message}",
+            );
+        }
+
+        /// The overlay merge runs before `wrap_with_row_id_and_delete`, so the
+        /// `_rowid` system column must coexist with overlay-resolved data columns:
+        /// the row ids are unaffected by the merge and the overlay value still wins.
+        #[rstest]
+        #[tokio::test]
+        async fn test_scan_with_row_id_alongside_overlay(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "rowidov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([Some(1000)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag
+                .scan()
+                .with_row_id()
+                .project(&["id", "val"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            // Overlay value resolves...
+            assert_eq!(col(&batch, "val").values()[0], 1000);
+            assert_eq!(&col(&batch, "val").values()[1..], &[10, 20, 30, 40, 50]);
+            // ...and the row ids for fragment 0 are the untouched physical offsets.
+            let row_ids = batch
+                .column(batch.schema().index_of("_rowid").unwrap())
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            assert_eq!(row_ids.values(), &[0, 1, 2, 3, 4, 5]);
+        }
+
+        /// When the newest overlay covers every requested offset, an older overlay
+        /// in the same plan needs zero values and its value column must not be read
+        /// (the empty-input branch of `fetch_overlay_values`). The result still
+        /// resolves to the newest overlay.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_older_overlay_contributes_no_values(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Older covers {1, 4}; newer re-covers {1}. A take of only offset 1
+            // routes entirely to the newer overlay, leaving the older one with no
+            // values to fetch even though it is part of the field's plan.
+            let dataset = commit_overlay(
+                dataset,
+                "older",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+            let dataset = commit_overlay(
+                dataset,
+                "newer",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1])),
+                vec![i32_array([Some(999)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1], &full_schema(&dataset)).await.unwrap();
+            assert_eq!(col(&batch, "val").values(), &[999]);
+        }
+
+        /// A newest overlay whose value is NULL must shadow an older overlay's
+        /// non-null value at the same offset — the merge resolves to NULL, it does
+        /// not fall back to the older overlay.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_newest_null_shadows_older(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "older",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1])),
+                vec![i32_array([Some(111)])],
+                version,
+            )
+            .await;
+            let dataset = commit_overlay(
+                dataset,
+                "newer_null",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1])),
+                vec![i32_array([None])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1], &full_schema(&dataset)).await.unwrap();
+            let val = col(&batch, "val");
+            assert!(val.is_null(0), "newest NULL must win over older 111");
+        }
+
+        /// Newest-wins is resolved independently per field across multiple sparse
+        /// overlays: for the same offset, `id` can resolve to one overlay while
+        /// `val` resolves to the other, depending on which overlay newly covers
+        /// that field at that offset.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_multi_sparse_per_field_newest_wins(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Older: id covers {3}, val covers {2}.
+            let dataset = commit_overlay(
+                dataset,
+                "older",
+                0,
+                &[0, 1],
+                OverlayCoverage::sparse(vec![bitmap([3]), bitmap([2])]),
+                vec![i32_array([Some(7773)]), i32_array([Some(2772)])],
+                version,
+            )
+            .await;
+            // Newer: id covers {2}, val covers {3} — the mirror image.
+            let dataset = commit_overlay(
+                dataset,
+                "newer",
+                0,
+                &[0, 1],
+                OverlayCoverage::sparse(vec![bitmap([2]), bitmap([3])]),
+                vec![i32_array([Some(9992)]), i32_array([Some(9993)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[2, 3], &full_schema(&dataset)).await.unwrap();
+            // id: offset 2 -> newer (9992), offset 3 -> older (7773).
+            assert_eq!(col(&batch, "id").values(), &[9992, 7773]);
+            // val: offset 2 -> older (2772), offset 3 -> newer (9993).
+            assert_eq!(col(&batch, "val").values(), &[2772, 9993]);
+        }
+
+        /// A fragment with an overlay plan, but a take that touches only uncovered
+        /// offsets, must fall entirely through to the base values (the
+        /// `!routing.any_overlay` early-return with a plan present).
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_plan_present_all_offsets_uncovered(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "ov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            // None of {0, 2, 5} are covered: the plan exists but contributes nothing.
+            let batch = frag.take(&[0, 2, 5], &full_schema(&dataset)).await.unwrap();
+            assert_eq!(col(&batch, "val").values(), &[0, 20, 50]);
+            assert_eq!(col(&batch, "id").values(), &[0, 2, 5]);
+        }
+
+        /// A dataset-level `take` spanning multiple fragments, each with its own
+        /// overlay, routes every global row index to the right fragment's overlay.
+        #[rstest]
+        #[tokio::test]
+        async fn test_dataset_take_multi_fragment_overlays(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "frag0",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([Some(1000)])],
+                version,
+            )
+            .await;
+            let dataset = commit_overlay(
+                dataset,
+                "frag1",
+                1,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([Some(6000)])],
+                version,
+            )
+            .await;
+
+            // Global rows 0 and 6 are the overlaid offset-0 rows of fragments 0 and
+            // 1; rows 1 and 7 fall through to base.
+            let batch = dataset
+                .take(&[0, 1, 6, 7], full_schema(&dataset))
+                .await
+                .unwrap();
+            assert_eq!(col(&batch, "id").values(), &[0, 1, 6, 7]);
+            assert_eq!(col(&batch, "val").values(), &[1000, 10, 6000, 70]);
+        }
+
+        /// A scan whose read splits into multiple batches must slice
+        /// `offsets_in_frag` per batch correctly — the running `rows_seen`
+        /// accumulator in `merge_overlays` gives each batch its start. Every other
+        /// scan test uses single-batch fragments, so this is the only guard for the
+        /// cross-batch (`start > 0`) path.
+        #[rstest]
+        #[tokio::test]
+        async fn test_scan_multi_batch_overlay_slicing(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            use futures::TryStreamExt;
+
+            // One fragment of 10 rows so the read can be chunked below.
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..10)),
+                    Arc::new(Int32Array::from_iter_values((0..10).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 100,
+                max_rows_per_group: 100,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay one offset in each batch that batch_size 4 produces (batches
+            // [0,4), [4,8), [8,10)): offsets 1, 5, 9 with distinct values. A wrong
+            // per-batch slice would misalign these.
+            let dataset = commit_overlay(
+                dataset,
+                "multibatch",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 5, 9])),
+                vec![i32_array([Some(111), Some(555), Some(999)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let mut scanner = frag.scan();
+            scanner.batch_size(4).project(&["val"]).unwrap();
+            let batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            // Guard the guard: the read must actually span multiple batches, else
+            // this would not exercise the cross-batch slice at all.
+            assert!(
+                batches.len() > 1,
+                "expected a multi-batch scan, got {} batch(es)",
+                batches.len()
+            );
+
+            let merged =
+                arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+            let expected: Vec<i32> = (0..10)
+                .map(|i| match i {
+                    1 => 111,
+                    5 => 555,
+                    9 => 999,
+                    other => other * 10,
+                })
+                .collect();
+            assert_eq!(col(&merged, "val").values(), &expected);
+        }
+
+        /// An empty selection must not trip over the overlay path: the plan exists
+        /// but there are no offsets to route, so the result is an empty batch.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_empty_selection(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "ov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[], &full_schema(&dataset)).await.unwrap();
+            assert_eq!(batch.num_rows(), 0);
+        }
+
+        /// Overlays resolve variable-width columns end-to-end, not just fixed-width
+        /// ones: the value column is fetched through the real file reader (a
+        /// different value-pushdown path than the fixed-width case) and assembled.
+        #[rstest]
+        #[tokio::test]
+        async fn test_string_overlay_end_to_end(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            use arrow_array::StringArray;
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e", "f"])),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay `name` at offsets {1, 4}, one of the values NULL.
+            let dataset = commit_overlay(
+                dataset,
+                "strov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![Arc::new(StringArray::from(vec![Some("B"), None])) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[0, 1, 4], &full_schema(&dataset)).await.unwrap();
+            let name = batch
+                .column(batch.schema().index_of("name").unwrap())
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(name.value(0), "a"); // falls through to base
+            assert_eq!(name.value(1), "B"); // overlay value
+            assert!(name.is_null(2)); // overlay NULL wins
+        }
+
+        /// Projection pruning must do NO IO to overlay files whose fields are not
+        /// projected. Proven the same way as row-selection pruning: delete the
+        /// overlay's data file, then read projecting only the *unrelated* `id`
+        /// column — it must succeed (the `val` overlay file is never opened), while
+        /// projecting the overlaid `val` column then fails because its file is gone.
+        #[rstest]
+        #[tokio::test]
+        async fn test_projection_prunes_overlay_files_no_io(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Overlay covers `val` (field 1) only.
+            let dataset = commit_overlay(
+                dataset,
+                "valov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([0, 1])),
+                vec![i32_array([Some(1000), Some(1010)])],
+                version,
+            )
+            .await;
+
+            // Delete the overlay's data file: opening it now fails.
+            dataset
+                .object_store
+                .delete(&Path::from("data/valov.lance"))
+                .await
+                .unwrap();
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let id_only = dataset.schema().project_by_ids(&[0], true);
+            let val_only = dataset.schema().project_by_ids(&[1], true);
+
+            // Projecting only `id` must not open the `val` overlay file, so it
+            // succeeds and returns untouched base values.
+            let batch = frag.take(&[0, 1], &id_only).await.unwrap();
+            assert_eq!(col(&batch, "id").values(), &[0, 1]);
+            // A scan projecting only `id` must likewise never touch the file.
+            let batch = frag
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(col(&batch, "id").values(), &[0, 1, 2, 3, 4, 5]);
+
+            // Projecting the overlaid `val` column does need the file, so it fails
+            // with a not-found error naming the missing overlay file.
+            let err = frag.take(&[0], &val_only).await.unwrap_err();
+            let message = format!("{err:?}");
+            assert!(
+                err.is_not_found() && message.contains("valov.lance"),
+                "projecting the overlaid column should fail with a not-found error \
+                 for its missing file, got: {message}",
+            );
+        }
+
+        /// A top-level struct column resolves through overlays: the overlay stores
+        /// the struct's leaf columns (under V2_1 those are the only ids in
+        /// `data_file.fields`), and `plan_overlays` maps them back to the top-level
+        /// struct so the whole value is fetched and replaced as a unit.
+        #[rstest]
+        #[tokio::test]
+        async fn test_struct_overlay_end_to_end(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let struct_fields = Fields::from(vec![
+                ArrowField::new("x", DataType::Int32, true),
+                ArrowField::new("y", DataType::Int32, true),
+            ]);
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("info", DataType::Struct(struct_fields.clone()), true),
+            ]));
+            let info = Arc::new(StructArray::new(
+                struct_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 100))),
+                ],
+                None,
+            ));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..6)), info],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay the whole `info` struct (top-level field id 1) at offset 2.
+            let overlay_info = Arc::new(StructArray::new(
+                struct_fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![777])),
+                    Arc::new(Int32Array::from(vec![888])),
+                ],
+                None,
+            )) as ArrayRef;
+            let dataset = commit_overlay(
+                dataset,
+                "structov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![overlay_info],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 2], &full_schema(&dataset)).await.unwrap();
+            let info = batch
+                .column(batch.schema().index_of("info").unwrap())
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let x = info
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let y = info
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            // Offset 1 falls through to base {1, 100}; offset 2 takes the overlay.
+            assert_eq!(x.values(), &[1, 777]);
+            assert_eq!(y.values(), &[100, 888]);
+        }
+
+        /// A top-level list column resolves through overlays the same way — the
+        /// overlay's leaf (item) id maps back to the top-level list, and the whole
+        /// list value at a covered offset is replaced.
+        #[rstest]
+        #[tokio::test]
+        async fn test_list_overlay_end_to_end(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            use arrow_array::ListArray;
+            use arrow_array::types::Int32Type;
+
+            let item = Arc::new(ArrowField::new("item", DataType::Int32, true));
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("tags", DataType::List(item.clone()), true),
+            ]));
+            let base_tags = ListArray::from_iter_primitive::<Int32Type, _, _>(
+                (0..6i32).map(|i| Some(vec![Some(i), Some(i * 10)])),
+            );
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(base_tags),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay `tags` (top-level field id 1) at offset 2 with a new list.
+            let overlay_tags =
+                ListArray::from_iter_primitive::<Int32Type, _, _>(std::iter::once(Some(vec![
+                    Some(77),
+                    Some(88),
+                    Some(99),
+                ])));
+            let dataset = commit_overlay(
+                dataset,
+                "listov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(overlay_tags) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 2], &full_schema(&dataset)).await.unwrap();
+            let tags = batch
+                .column(batch.schema().index_of("tags").unwrap())
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let row1 = tags.value(0);
+            let row1 = row1.as_any().downcast_ref::<Int32Array>().unwrap();
+            let row2 = tags.value(1);
+            let row2 = row2.as_any().downcast_ref::<Int32Array>().unwrap();
+            // Offset 1 falls through to base [1, 10]; offset 2 takes the overlay.
+            assert_eq!(row1.values(), &[1, 10]);
+            assert_eq!(row2.values(), &[77, 88, 99]);
+        }
+
+        /// A top-level Map column resolves as a single atomic field even though its
+        /// value spans two leaves (key and value): both leaf ids map back to the one
+        /// Map atomic field, and the whole map value at a covered offset is replaced.
+        /// Maps require
+        /// the 2.2+ file format, so this runs only at V2_2 (unlike the V2_0/V2_1
+        /// parametrized tests).
+        #[tokio::test]
+        async fn test_map_overlay_end_to_end() {
+            use arrow_array::MapArray;
+            use arrow_array::builder::{Int32Builder, MapBuilder};
+
+            let version = LanceFileVersion::V2_2;
+
+            // Base row i holds the single entry {i: i * 10}.
+            let mut builder = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+            for i in 0..6i32 {
+                builder.keys().append_value(i);
+                builder.values().append_value(i * 10);
+                builder.append(true).unwrap();
+            }
+            let base_attrs = builder.finish();
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("attrs", base_attrs.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(base_attrs),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay `attrs` (top-level field id 1) at offset 2 with a two-entry map.
+            let mut ov = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+            ov.keys().append_value(7);
+            ov.values().append_value(77);
+            ov.keys().append_value(8);
+            ov.values().append_value(88);
+            ov.append(true).unwrap();
+            let overlay_attrs = ov.finish();
+            let dataset = commit_overlay(
+                dataset,
+                "mapov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(overlay_attrs) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 2], &full_schema(&dataset)).await.unwrap();
+            let attrs = batch
+                .column(batch.schema().index_of("attrs").unwrap())
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap();
+
+            let entries = |i: usize| -> (Vec<i32>, Vec<i32>) {
+                let row = attrs.value(i);
+                let keys = row.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                let vals = row.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                (keys.values().to_vec(), vals.values().to_vec())
+            };
+            // Offset 1 falls through to the base entry {1: 10}; offset 2 takes the
+            // overlay map {7: 77, 8: 88}.
+            assert_eq!(entries(0), (vec![1], vec![10]));
+            assert_eq!(entries(1), (vec![7, 8], vec![77, 88]));
+        }
+
+        /// Base `id` + a struct `s { a, b }` (6 rows). Field ids: s=1, a=2, b=3.
+        async fn create_struct_dataset(version: LanceFileVersion) -> (Dataset, Fields) {
+            let s_fields = Fields::from(vec![
+                ArrowField::new("a", DataType::Int32, true),
+                ArrowField::new("b", DataType::Int32, true),
+            ]);
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("s", DataType::Struct(s_fields.clone()), true),
+            ]));
+            let s = Arc::new(StructArray::new(
+                s_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 100))),
+                ],
+                None,
+            ));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..6)), s],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+            (dataset, s_fields)
+        }
+
+        fn struct_col<'a>(batch: &'a RecordBatch, name: &str) -> &'a StructArray {
+            batch
+                .column(batch.schema().index_of(name).unwrap())
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+        }
+
+        fn i32_child(s: &StructArray, i: usize) -> Int32Array {
+            s.column(i)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .clone()
+        }
+
+        /// The reviewer's core case (r3553495147): an overlay stores only sub-field
+        /// `s.a`, but the read projects the whole struct `s`. The overlay must splice
+        /// into `a` and leave `b` untouched (previously this panicked because the merge
+        /// fetched the whole `s` from an overlay file holding only `a`).
+        #[rstest]
+        #[tokio::test]
+        async fn test_overlay_subfield_projecting_parent_struct(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let (dataset, _) = create_struct_dataset(version).await;
+            // Overlay ONLY `s.a` (field id 2) at offset 2.
+            let a_only = Fields::from(vec![ArrowField::new("a", DataType::Int32, true)]);
+            let overlay = Arc::new(StructArray::new(
+                a_only,
+                vec![Arc::new(Int32Array::from(vec![777]))],
+                None,
+            )) as ArrayRef;
+            let dataset = commit_overlay(
+                dataset,
+                "aov",
+                0,
+                &[2],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![overlay],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 2], &full_schema(&dataset)).await.unwrap();
+            let s = struct_col(&batch, "s");
+            // a: offset 1 base (1), offset 2 overlaid (777).
+            assert_eq!(i32_child(s, 0).values(), &[1, 777]);
+            // b: untouched base (100, 200).
+            assert_eq!(i32_child(s, 1).values(), &[100, 200]);
+        }
+
+        /// An overlay on a non-projected sibling leaf must be skipped and its file
+        /// never opened: overlay covers `s.b`, but the read projects only `s.a`.
+        #[rstest]
+        #[tokio::test]
+        async fn test_overlay_nonprojected_sibling_skipped(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let (dataset, _) = create_struct_dataset(version).await;
+            let b_only = Fields::from(vec![ArrowField::new("b", DataType::Int32, true)]);
+            let overlay = Arc::new(StructArray::new(
+                b_only,
+                vec![Arc::new(Int32Array::from(vec![888]))],
+                None,
+            )) as ArrayRef;
+            let dataset = commit_overlay(
+                dataset,
+                "bov",
+                0,
+                &[3],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![overlay],
+                version,
+            )
+            .await;
+            // Delete the overlay file: if projecting only `s.a` opened it, this fails.
+            dataset
+                .object_store
+                .delete(&Path::from("data/bov.lance"))
+                .await
+                .unwrap();
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let a_only = dataset.schema().project_by_ids(&[2], true);
+            let batch = frag.take(&[1, 2], &a_only).await.unwrap();
+            let s = struct_col(&batch, "s");
+            // Only `a` is projected, unchanged base values.
+            assert_eq!(i32_child(s, 0).values(), &[1, 2]);
+        }
+
+        /// Two overlays target different sub-fields of the same struct, and a third
+        /// re-overlays `s.a`. Each leaf resolves independently and newest wins on `a`.
+        #[rstest]
+        #[tokio::test]
+        async fn test_overlay_multiple_subfields_newest_wins(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let (dataset, _) = create_struct_dataset(version).await;
+            let a_field = Fields::from(vec![ArrowField::new("a", DataType::Int32, true)]);
+            let b_field = Fields::from(vec![ArrowField::new("b", DataType::Int32, true)]);
+            // Older: a := 700 at offset 2.
+            let dataset = commit_overlay(
+                dataset,
+                "a_old",
+                0,
+                &[2],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(StructArray::new(
+                    a_field.clone(),
+                    vec![Arc::new(Int32Array::from(vec![700]))],
+                    None,
+                )) as ArrayRef],
+                version,
+            )
+            .await;
+            // b := 800 at offset 2.
+            let dataset = commit_overlay(
+                dataset,
+                "b_ov",
+                0,
+                &[3],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(StructArray::new(
+                    b_field,
+                    vec![Arc::new(Int32Array::from(vec![800]))],
+                    None,
+                )) as ArrayRef],
+                version,
+            )
+            .await;
+            // Newest: a := 999 at offset 2 (shadows the older `a` overlay).
+            let dataset = commit_overlay(
+                dataset,
+                "a_new",
+                0,
+                &[2],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(StructArray::new(
+                    a_field,
+                    vec![Arc::new(Int32Array::from(vec![999]))],
+                    None,
+                )) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[2], &full_schema(&dataset)).await.unwrap();
+            let s = struct_col(&batch, "s");
+            assert_eq!(i32_child(s, 0).values(), &[999]); // newest `a` wins
+            assert_eq!(i32_child(s, 1).values(), &[800]); // `b` from its own overlay
+        }
+
+        /// Three levels of nesting: `outer { middle { a, b } }`. An overlay on the
+        /// deep leaf `outer.middle.a` splices correctly when the whole `outer` is read.
+        #[rstest]
+        #[tokio::test]
+        async fn test_overlay_deeply_nested_subfield(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let mid_fields = Fields::from(vec![
+                ArrowField::new("a", DataType::Int32, true),
+                ArrowField::new("b", DataType::Int32, true),
+            ]);
+            let outer_fields = Fields::from(vec![ArrowField::new(
+                "middle",
+                DataType::Struct(mid_fields.clone()),
+                true,
+            )]);
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("outer", DataType::Struct(outer_fields.clone()), true),
+            ]));
+            // Field ids: outer=1, middle=2, a=3, b=4.
+            let middle = Arc::new(StructArray::new(
+                mid_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 100))),
+                ],
+                None,
+            ));
+            let outer = Arc::new(StructArray::new(outer_fields, vec![middle], None));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..6)), outer],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay the deep leaf `outer.middle.a` (field id 3) at offset 2.
+            let a_leaf = Fields::from(vec![ArrowField::new("a", DataType::Int32, true)]);
+            let mid_a = Fields::from(vec![ArrowField::new(
+                "middle",
+                DataType::Struct(a_leaf.clone()),
+                true,
+            )]);
+            let overlay = Arc::new(StructArray::new(
+                mid_a,
+                vec![Arc::new(StructArray::new(
+                    a_leaf,
+                    vec![Arc::new(Int32Array::from(vec![777]))],
+                    None,
+                ))],
+                None,
+            )) as ArrayRef;
+            let dataset = commit_overlay(
+                dataset,
+                "deepov",
+                0,
+                &[3],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![overlay],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 2], &full_schema(&dataset)).await.unwrap();
+            let outer = struct_col(&batch, "outer");
+            let middle = outer
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            // a: offset 1 base (1), offset 2 overlaid (777); b untouched.
+            assert_eq!(i32_child(middle, 0).values(), &[1, 777]);
+            assert_eq!(i32_child(middle, 1).values(), &[100, 200]);
+
+            // Projecting the *intermediate* struct `outer.middle` (field id 2) while
+            // the overlay targets a deeper field (id 3) must still apply: the
+            // overlay's leaf id falls inside the projected subtree, so it maps to a
+            // projected atomic field. (This is the case wjones127/westonpace flagged where a
+            // top-level-only mapping would miss the overlay.)
+            let middle_only = dataset.schema().project_by_ids(&[2], true);
+            let batch = frag.take(&[2], &middle_only).await.unwrap();
+            let middle = struct_col(&batch, "outer")
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert_eq!(i32_child(middle, 0).values(), &[777]);
+        }
     }
 
     #[rstest]
@@ -2982,7 +5031,7 @@ mod tests {
             updated_fragments: vec![u1.fragment],
             new_fragments: vec![],
             fields_modified: u1.fields_modified,
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -3063,7 +5112,7 @@ mod tests {
             updated_fragments: vec![u2.fragment],
             new_fragments: vec![],
             fields_modified: u2.fields_modified,
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -3637,48 +5686,65 @@ mod tests {
                 assert_eq!(dataset.count_rows(None).await.unwrap(), 195);
             }
 
-            let fragment = &mut dataset.get_fragment(0).unwrap();
-            let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
             let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "double_i",
                 DataType::Int32,
                 true,
             )]));
-            while let Some(batch) = updater.next().await.unwrap() {
-                let input_col = batch.column_by_name("i").unwrap();
-                let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
-                let batch = RecordBatch::try_new(
-                    new_schema.clone(),
-                    vec![Arc::new(result_col) as ArrayRef],
-                )
-                .unwrap();
-                updater.update(batch).await.unwrap();
-            }
-            let new_fragment = updater.finish().await.unwrap();
+            // Merge keeps the fragment list intact, so every fragment gets the new
+            // column. Fragment 0 is the one carrying the deletions.
+            let fragment_ids = dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as usize)
+                .collect::<Vec<_>>();
+            let mut merged_fragments = Vec::new();
+            for fragment_id in fragment_ids {
+                let fragment = &mut dataset.get_fragment(fragment_id).unwrap();
+                let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
+                while let Some(batch) = updater.next().await.unwrap() {
+                    let input_col = batch.column_by_name("i").unwrap();
+                    let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
+                    let batch = RecordBatch::try_new(
+                        new_schema.clone(),
+                        vec![Arc::new(result_col) as ArrayRef],
+                    )
+                    .unwrap();
+                    updater.update(batch).await.unwrap();
+                }
+                let new_fragment = updater.finish().await.unwrap();
 
-            assert_eq!(new_fragment.files.len(), 2);
+                assert_eq!(new_fragment.files.len(), 2);
+                merged_fragments.push(new_fragment);
+            }
 
             // Scan again
             let mut full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
             full_schema.set_field_id(None);
             let before_version = dataset.version().version;
 
-            let op = Operation::Overwrite {
-                fragments: vec![new_fragment],
+            let op = Operation::Merge {
+                fragments: merged_fragments,
                 schema: full_schema.clone(),
-                config_upsert_values: None,
-                initial_bases: None,
+                preserves_nullability: true,
             };
 
-            let dataset =
-                Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
-                    .await
-                    .unwrap();
+            let dataset = Dataset::commit(
+                test_uri,
+                op,
+                Some(before_version),
+                None,
+                None,
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
 
-            // We only kept the first fragment of 40 rows
             assert_eq!(
                 dataset.count_rows(None).await.unwrap(),
-                if with_delete { 35 } else { 40 }
+                if with_delete { 195 } else { 200 }
             );
             assert_eq!(dataset.version().version, before_version + 1);
             dataset.validate().await.unwrap();
@@ -3829,7 +5895,7 @@ mod tests {
         .unwrap();
 
         let (object_store, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
-        let file_reader = PreviousFileReader::try_new_with_fragment_id(
+        let file_reader = V1FileReader::try_new_with_fragment_id(
             &object_store,
             &base_path
                 .clone()
@@ -3905,6 +5971,7 @@ mod tests {
             Operation::Merge {
                 schema,
                 fragments: vec![frag],
+                preserves_nullability: true,
             },
             Some(dataset.manifest.version),
             None,
@@ -4020,8 +6087,10 @@ mod tests {
         let store = ObjectStore::local();
         let file_path = dataset.data_dir().join("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
-        let mut file_writer =
-            lance_file::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
+        let mut file_writer = lance_file::versions::v2_1::create_lazy_writer(
+            object_writer,
+            FileWriterOptions::default(),
+        );
         file_writer.write_batch(&new_data).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -4033,7 +6102,7 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            LanceFileVersion::Stable.resolve()
+            ConcreteFileVersion::from(LanceFileVersion::Stable)
         );
 
         let op = Operation::Append {
@@ -4057,6 +6126,105 @@ mod tests {
                 .await
                 .unwrap(),
             256
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lazy_column_metadata_scan_reads_less_than_full_projection() {
+        let num_columns = 512;
+        let rows_per_batch = 100;
+        let num_batches = 10;
+        let schema = Arc::new(ArrowSchema::new(
+            (0..num_columns)
+                .map(|i| ArrowField::new(format!("col_{i}"), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let batches = (0..num_batches)
+            .map(|batch_idx| {
+                let columns = (0..num_columns)
+                    .map(|column_idx| {
+                        Arc::new(Int32Array::from_iter_values((0..rows_per_batch).map(
+                            |row_idx| (batch_idx * rows_per_batch + row_idx) as i32 + column_idx,
+                        ))) as ArrayRef
+                    })
+                    .collect::<Vec<_>>();
+                RecordBatch::try_new(schema.clone(), columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let test_dir = TempStrDir::default();
+        let write_params = WriteParams {
+            max_rows_per_file: rows_per_batch * num_batches,
+            max_rows_per_group: rows_per_batch,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, &test_dir, Some(write_params))
+            .await
+            .unwrap();
+
+        let projection = dataset.schema().project(&["col_0"]).unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+
+        dataset.object_store.as_ref().io_stats_incremental();
+        let narrow_reader = fragment
+            .open(&projection, FragReadConfig::default())
+            .await
+            .unwrap();
+        let mut empty_narrow_stream = narrow_reader.take_range(0..0, 1024).await.unwrap();
+        assert!(empty_narrow_stream.next().await.is_none());
+        let narrow_metadata_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert!(
+            narrow_metadata_stats.read_iops <= 3,
+            "expected lazy metadata open to skip the schema buffer read, iops={}, bytes={}",
+            narrow_metadata_stats.read_iops,
+            narrow_metadata_stats.read_bytes
+        );
+
+        let full_projection = dataset.schema().clone();
+        let full_reader = fragment
+            .open(&full_projection, FragReadConfig::default())
+            .await
+            .unwrap();
+        let mut empty_full_stream = full_reader.take_range(0..0, 1024).await.unwrap();
+        assert!(empty_full_stream.next().await.is_none());
+        let full_metadata_stats = dataset.object_store.as_ref().io_stats_incremental();
+
+        assert!(
+            full_metadata_stats.read_bytes > narrow_metadata_stats.read_bytes * 4,
+            "expected narrow lazy metadata read to fetch much less than full metadata, narrow={} bytes, full={} bytes",
+            narrow_metadata_stats.read_bytes,
+            full_metadata_stats.read_bytes
+        );
+
+        let mut narrow_scan = dataset.scan();
+        let narrow_batch = narrow_scan
+            .project(&["col_0"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(narrow_batch.num_columns(), 1);
+        assert_eq!(narrow_batch.num_rows(), rows_per_batch * num_batches);
+
+        let taken = fragment.take(&[0, 777, 999], &projection).await.unwrap();
+        let taken_values = taken
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(taken_values.values(), &[0, 777, 999]);
+
+        let projected_readers = fragment
+            .open_readers(&projection, &FragReadConfig::default())
+            .await
+            .unwrap();
+        let err = projected_readers[0].storage_stats().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("storage_stats requires full file metadata"),
+            "expected storage_stats to reject projected metadata, got {err:?}"
         );
     }
 
@@ -4120,5 +6288,81 @@ mod tests {
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn test_update_columns_with_json_extension_type() {
+        use arrow_array::UInt64Array;
+        use lance_arrow::ARROW_EXT_NAME_KEY;
+        use lance_arrow::json::ARROW_JSON_EXT_NAME;
+        use lance_core::ROW_ID;
+        use std::collections::HashMap;
+
+        // Create a dataset with an Arrow JSON extension column
+        let test_dir = TempStrDir::default();
+        let mut json_metadata = HashMap::new();
+        json_metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("name", DataType::Utf8, true),
+            ArrowField::new("meta", DataType::Utf8, true).with_metadata(json_metadata.clone()),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"x":1}"#,
+                    r#"{"x":2}"#,
+                    r#"{"x":3}"#,
+                    r#"{"x":4}"#,
+                    r#"{"x":5}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(reader, test_dir.as_ref(), None)
+            .await
+            .unwrap();
+
+        // Build the right stream with Arrow JSON column (Utf8 + arrow.json extension)
+        // Only update rows with row_id 1 and 3
+        let update_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 3])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"updated":true,"id":2}"#,
+                    r#"{"updated":true,"id":4}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)],
+            update_schema,
+        ));
+
+        // Perform update_columns - this should NOT fail with type mismatch
+        // Previously this would error with:
+        //   "It is not possible to interleave arrays of different data types (Utf8 and LargeBinary)"
+        let mut fragment = dataset.get_fragment(0).unwrap();
+        let (updated_fragment, fields_modified) = fragment
+            .update_columns(right_stream, ROW_ID, ROW_ID)
+            .await
+            .unwrap();
+
+        // Verify the operation produced valid results
+        assert!(!fields_modified.is_empty());
+        assert!(!updated_fragment.files.is_empty());
     }
 }

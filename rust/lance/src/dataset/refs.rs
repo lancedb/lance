@@ -21,7 +21,6 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
-use std::io::ErrorKind;
 use uuid::Uuid;
 
 pub const MAIN_BRANCH: &str = "main";
@@ -476,7 +475,7 @@ impl Branches<'_> {
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
-                message: format!("Manifest file {} does not exist", &manifest_file.path),
+                message: format!("Manifest file {} does not exist", manifest_file.path),
             });
         };
 
@@ -574,6 +573,28 @@ impl Branches<'_> {
             log::warn!("BranchContents of {} does not exist", branch);
         }
 
+        // Tags identify snapshots by (branch, version). Deleting a branch removes its entire version chain,
+        // so any tag whose branch matches the deletion target blocks the operation, regardless of the tagged
+        // version.
+        let referenced_tags = self
+            .refs
+            .tags()
+            .fetch_tags()
+            .await?
+            .into_iter()
+            .filter_map(|(name, contents)| {
+                (contents.branch.as_deref() == Some(branch)).then_some((name, contents.version))
+            })
+            .collect_vec();
+        if !referenced_tags.is_empty() {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Branch {} is referenced by tags {:?}, can not delete",
+                    branch, referenced_tags
+                ),
+            });
+        }
+
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {
@@ -611,16 +632,8 @@ impl Branches<'_> {
             && let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await
         {
             match &e {
-                Error::IO { source, .. } => {
-                    if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                        if io_err.kind() == ErrorKind::NotFound {
-                            log::debug!("Branch directory already deleted: {}", io_err);
-                        } else {
-                            return Err(e);
-                        }
-                    } else {
-                        return Err(e);
-                    }
+                Error::NotFound { .. } => {
+                    log::debug!("Branch directory already deleted");
                 }
                 _ => return Err(e),
             }

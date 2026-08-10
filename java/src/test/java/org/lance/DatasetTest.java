@@ -80,6 +80,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -656,6 +657,40 @@ public class DatasetTest {
       nameColumnAlteration = new ColumnAlteration.Builder("new_name_2").build();
       dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
       assertNotNull(dataset.getSchema().findField("new_name_2"));
+    }
+  }
+
+  @Test
+  void testAlterColumnsCastType(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Widen "id" from Int32 to Int64. The cast target type is a parameterized ArrowType, which
+      // must survive the trip to the native side; regression test for a dropped cast that left the
+      // stored type unchanged.
+      ColumnAlteration widenId =
+          new ColumnAlteration.Builder("id").castTo(new ArrowType.Int(64, true)).build();
+      dataset.alterColumns(Collections.singletonList(widenId));
+
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id").getType());
+
+      // A cast combined with rename must apply both.
+      ColumnAlteration renameAndWiden =
+          new ColumnAlteration.Builder("id")
+              .rename("id_long")
+              .castTo(new ArrowType.Int(64, true))
+              .build();
+      dataset.alterColumns(Collections.singletonList(renameAndWiden));
+
+      List<String> fieldNames =
+          dataset.getSchema().getFields().stream().map(Field::getName).collect(Collectors.toList());
+      assertFalse(fieldNames.contains("id"));
+      assertTrue(fieldNames.contains("id_long"));
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id_long").getType());
     }
   }
 
@@ -2027,6 +2062,16 @@ public class DatasetTest {
   }
 
   @Test
+  void testTakeNullBlobPreservesSelection(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testTakeNullBlobPreservesSelection").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(15L), "blobs");
+      assertEquals(1, blobs.size());
+      assertNull(blobs.get(0));
+    }
+  }
+
+  @Test
   void testReadLargeBlobAndRanges(@TempDir Path tempDir) throws Exception {
     String base = tempDir.resolve("testReadLargeBlobAndRanges").toString();
     try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
@@ -2142,6 +2187,13 @@ public class DatasetTest {
 
         assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
         assertEquals("index1", desc.getSegments().get(0).name());
+        assertTrue(
+            desc.getSegments().get(0).getSizeBytes().orElse(0L) > 0,
+            "segment size should be positive");
+        assertEquals(
+            desc.getSegments().get(0).getSizeBytes(),
+            desc.getTotalSizeBytes(),
+            "single-segment size should equal the logical index size");
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");
@@ -2154,6 +2206,8 @@ public class DatasetTest {
               indexDesc.getSegments(),
               "segments alias should match metadata");
           assertNotNull(indexDesc.getDetailsJson(), "Details JSON should not be null");
+          assertTrue(
+              indexDesc.getTotalSizeBytes().orElse(0L) > 0, "total index size should be positive");
         }
       }
     }

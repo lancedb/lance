@@ -12,7 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [package.metadata.docs.rs]
-features = []
+# Publish the feature-gated metrics catalogue; keep cloud backends off.
+features = ["metrics"]
 no-default-features = true
 
 [package.metadata.cargo-machete]
@@ -32,6 +33,7 @@ lance-namespace = { workspace = true }
 lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
+lance-bitpacking = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -43,7 +45,6 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 async-recursion.workspace = true
 async-trait.workspace = true
-bitpacking = { workspace = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -139,6 +140,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
+backtrace = ["lance-core/backtrace"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
@@ -160,6 +162,8 @@ tencent = ["lance-io/tencent"]
 goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
+# Publish object store metrics via the `metrics` crate.
+metrics = ["lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
@@ -169,6 +173,14 @@ slow_tests = []
 
 [[bin]]
 name = "lq"
+required-features = ["cli"]
+
+[[bin]]
+name = "fm_contains_bench"
+required-features = ["cli"]
+
+[[bin]]
+name = "fm_index_tool"
 required-features = ["cli"]
 
 [[bench]]
@@ -185,6 +197,10 @@ harness = false
 
 [[bench]]
 name = "scan"
+harness = false
+
+[[bench]]
+name = "s3_file_reader_diagnostics"
 harness = false
 
 [[bench]]

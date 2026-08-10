@@ -14,6 +14,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
     Literal,
@@ -34,6 +35,9 @@ from .lance import (
 from .lance import (
     RowIdMeta as RowIdMeta,
 )
+from .lance import (
+    RowIdSequence as RowIdSequence,
+)
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
@@ -44,6 +48,7 @@ if TYPE_CHECKING:
         ColumnOrdering,
         DatasetBasePath,
         LanceDataset,
+        LanceOperation,
         LanceScanner,
         ReaderLike,
         Transaction,
@@ -72,11 +77,26 @@ class FragmentMetadata:
     deletion_file : Optional[DeletionFile]
         The deletion file, if any.
     row_id_meta : Optional[RowIdMeta]
-        The row id metadata, if any.
+        The stable row ids of this fragment's rows, if any. When committing a
+        transaction by hand on a dataset that uses stable row ids, set this to
+        carry the ids of rewritten rows over to their new fragment; build it with
+        :class:`RowIdSequence`. Rows left without an id are treated as newly
+        inserted and are assigned ids during the commit.
     created_at_version_meta : Optional[RowDatasetVersionMeta]
-        The row created at version metadata, if any.
+        The dataset version each row was created in. Derived during the commit
+        from ``row_id_meta`` -- a rewritten row keeps the version it first
+        appeared in -- so leave this as None when building a transaction. Any
+        value set here is ignored for newly written fragments.
     last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
-        The row last updated at version metadata, if any.
+        The dataset version each row was last modified in. Derived during the
+        commit, like ``created_at_version_meta``; leave this as None. It cannot
+        be computed ahead of time because a commit that loses a race is retried
+        against a later version than the one it was built for.
+    overlays : List[LanceOperation.DataOverlayFile]
+        The data overlay files layered over this fragment's base data, if any.
+        Overlays are created via :class:`LanceOperation.DataOverlay`; they are
+        carried here so they survive operations that round-trip fragment
+        metadata (e.g. a manual ``Delete``, ``Update``, or ``Merge`` commit).
     """
 
     id: int
@@ -86,6 +106,7 @@ class FragmentMetadata:
     row_id_meta: Optional[RowIdMeta] = None
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    overlays: List["LanceOperation.DataOverlayFile"] = field(default_factory=list)
 
     @property
     def num_deletions(self) -> int:
@@ -109,12 +130,25 @@ class FragmentMetadata:
 
     def to_json(self) -> dict:
         """Get this as a simple JSON-serializable dictionary."""
-        files = [asdict(f) for f in self.files]
-        for f in files:
-            f["path"] = f.pop("_path")
+
+        def _data_file_to_json(f: DataFile) -> dict:
+            d = asdict(f)
+            d["path"] = d.pop("_path")
+            return d
+
+        files = [_data_file_to_json(f) for f in self.files]
+        overlays = [
+            dict(
+                data_file=_data_file_to_json(o.data_file),
+                offsets=o.offsets,
+                committed_version=o.committed_version,
+            )
+            for o in self.overlays
+        ]
         return dict(
             id=self.id,
             files=files,
+            overlays=overlays,
             physical_rows=self.physical_rows,
             deletion_file=(
                 self.deletion_file.asdict() if self.deletion_file is not None else None
@@ -158,6 +192,20 @@ class FragmentMetadata:
                 json.dumps(last_updated_at_version_meta)
             )
 
+        overlays = []
+        overlays_json = json_data.get("overlays")
+        if overlays_json:
+            from .dataset import LanceOperation
+
+            overlays = [
+                LanceOperation.DataOverlayFile(
+                    data_file=DataFile(**o["data_file"]),
+                    offsets=o["offsets"],
+                    committed_version=o.get("committed_version"),
+                )
+                for o in overlays_json
+            ]
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
@@ -166,6 +214,7 @@ class FragmentMetadata:
             row_id_meta=row_id_meta,
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
+            overlays=overlays,
         )
 
 
@@ -303,10 +352,7 @@ class LanceFragment(pa.dataset.Fragment):
         return self._fragment.__repr__()
 
     def __reduce__(self):
-        from .dataset import LanceDataset
-
-        ds = LanceDataset(self._ds.uri, self._ds.version)
-        return LanceFragment, (ds, self.fragment_id)
+        return LanceFragment, (self._ds, self.fragment_id)
 
     @staticmethod
     def create_from_file(
@@ -478,6 +524,16 @@ class LanceFragment(pa.dataset.Fragment):
         :meth:`count_rows` instead.
         """
         return self._fragment.physical_rows
+
+    def validate(self) -> None:
+        """
+        Validate the fragment.
+
+        This checks the integrity of the fragment and will raise an exception if
+        the fragment is corrupted. Unlike :meth:`lance.LanceDataset.validate`,
+        which checks every fragment, this validates only this fragment.
+        """
+        self._fragment.validate()
 
     @property
     def physical_schema(self) -> pa.Schema:
@@ -965,6 +1021,24 @@ class LanceFragment(pa.dataset.Fragment):
             return None
         return raw_fragment.metadata()
 
+    def delete_rows(self, offsets: "Iterable[int]") -> FragmentMetadata | None:
+        """Delete rows by their local (within-fragment) physical row offsets.
+
+        Adds the given 0-based offsets to this fragment's deletion file and
+        returns a new fragment, or None if no rows are left. Unlike
+        :meth:`delete`, this deletes exactly the supplied rows without
+        re-evaluating a SQL predicate -- useful when the caller already knows
+        which rows to delete (e.g. offsets collected from a prior scan).
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+        """
+        raw_fragment = self._fragment.delete_rows([int(o) for o in offsets])
+        if raw_fragment is None:
+            return None
+        return raw_fragment.metadata()
+
     @property
     def schema(self) -> pa.Schema:
         """Return the schema of this fragment."""
@@ -1010,6 +1084,7 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
+        target_all_bases: Optional[bool] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         external_blob_mode: Literal["reference", "ingest"] = "reference",
@@ -1035,6 +1110,7 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
+        target_all_bases: Optional[bool] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         external_blob_mode: Literal["reference", "ingest"] = "reference",
@@ -1060,6 +1136,7 @@ def write_fragments(
     storage_options: Optional[Dict[str, str]] = None,
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
+    target_all_bases: Optional[bool] = None,
     initial_bases: Optional[List["DatasetBasePath"]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
@@ -1130,6 +1207,11 @@ def write_fragments(
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the
         existing manifest
+    target_all_bases : bool, optional
+        Write new data files round-robin across every base registered in the
+        manifest, resolved at execution time. When True, the dataset's
+        primary storage participates as the first slot. Cannot be combined
+        with `target_bases`.
     initial_bases : list of DatasetBasePath, optional
         Base paths to register when creating a new dataset (CREATE mode only).
 
@@ -1235,6 +1317,7 @@ def write_fragments(
         table_id=table_id,
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
+        target_all_bases=target_all_bases,
         initial_bases=initial_bases,
         base_store_params=base_store_params,
         external_blob_mode=external_blob_mode,

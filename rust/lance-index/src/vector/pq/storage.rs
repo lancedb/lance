@@ -5,9 +5,9 @@
 //!
 //! Used as storage backend for Graph based algorithms.
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     cmp::min,
-    collections::HashMap,
     sync::{Arc, OnceLock},
 };
 
@@ -24,8 +24,8 @@ use bytes::{Bytes, BytesMut};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::{
-    reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+use lance_file::versions::v1::{
+    reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
 };
 use lance_io::{object_store::ObjectStore, utils::read_message};
 use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
@@ -126,7 +126,7 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
         }
     }
 
-    async fn load(reader: &PreviousFileReader) -> Result<Self> {
+    async fn load(reader: &V1FileReader) -> Result<Self> {
         let metadata = reader
             .schema()
             .metadata
@@ -386,7 +386,7 @@ impl ProductQuantizationStorage {
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let reader = PreviousFileReader::try_new_self_described(object_store, path, None).await?;
+        let reader = V1FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema
@@ -469,7 +469,7 @@ impl ProductQuantizationStorage {
     ///
     pub async fn write_partition(
         &self,
-        writer: &mut PreviousFileWriter<ManifestDescribing>,
+        writer: &mut V1FileWriter<ManifestDescribing>,
     ) -> Result<usize> {
         let batch_size: usize = 10240; // TODO: make it configurable
         for offset in (0..self.batch.num_rows()).step_by(batch_size) {
@@ -550,16 +550,16 @@ impl QuantizerStorage for ProductQuantizationStorage {
 
     // we can't use the default implementation of remap,
     // because PQ Storage transposed the PQ codes
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
         let transposed_codes = self.pq_code.values();
         let mut new_row_ids = Vec::with_capacity(self.len());
         let mut new_codes = Vec::with_capacity(self.len() * self.metadata.num_sub_vectors);
 
         let row_ids = self.row_ids.values();
         for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
+            match mapping.get(*row_id) {
                 Some(Some(new_id)) => {
-                    new_row_ids.push(*new_id);
+                    new_row_ids.push(new_id);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
                         self.metadata.nbits,
@@ -613,9 +613,9 @@ impl QuantizerStorage for ProductQuantizationStorage {
     ///
     /// Parameters
     /// ----------
-    /// - *reader: &PreviousFileReader
+    /// - *reader: &V1FileReader
     async fn load_partition(
-        reader: &PreviousFileReader,
+        reader: &V1FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
@@ -1154,6 +1154,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
     use rand::Rng;
+    use rstest::rstest;
 
     const DIM: usize = 32;
     const TOTAL: usize = 512;
@@ -1300,21 +1301,40 @@ mod tests {
         assert!((storage.dist_between(u, v) - expected).abs() < 1e-4);
     }
 
+    // The first half of the rows is rewritten in order into frag 1; the second
+    // half is deleted. remap must behave the same in either RowAddrRemap mode.
+    fn pq_remap_compact() -> RowAddrRemap {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        use roaring::RoaringTreemap;
+        RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter((0..TOTAL / 2).map(|i| i as u64)),
+            old_frag_ids: vec![0],
+            new_frags: vec![(1, (TOTAL / 2) as u32)],
+        }])
+        .unwrap()
+    }
+
+    fn pq_remap_explicit() -> RowAddrRemap {
+        RowAddrRemap::direct(
+            (0..TOTAL / 2)
+                .map(|i| (i as u64, Some((1u64 << 32) | i as u64)))
+                .chain((TOTAL / 2..TOTAL).map(|i| (i as u64, None)))
+                .collect(),
+        )
+    }
+
+    #[rstest]
+    #[case(pq_remap_compact())]
+    #[case(pq_remap_explicit())]
     #[tokio::test]
-    async fn test_remap_with_extra_column() {
+    async fn test_remap_with_extra_column(#[case] remap: RowAddrRemap) {
         let storage = create_pq_storage_with_extra_column().await;
-        let mut mapping = HashMap::new();
-        for i in 0..TOTAL / 2 {
-            mapping.insert(i as u64, Some((TOTAL + i) as u64));
-        }
-        for i in TOTAL / 2..TOTAL {
-            mapping.insert(i as u64, None);
-        }
-        let new_storage = storage.remap(&mapping).unwrap();
+        let new_storage = storage.remap(&remap).unwrap();
         assert_eq!(new_storage.len(), TOTAL / 2);
         assert_eq!(new_storage.row_ids.len(), TOTAL / 2);
         for (i, row_id) in new_storage.row_ids().enumerate() {
-            assert_eq!(*row_id, (TOTAL + i) as u64);
+            // Rewritten row i lands at offset i of frag 1.
+            assert_eq!(*row_id, (1u64 << 32) | i as u64);
         }
         assert_eq!(new_storage.batch.num_columns(), 2);
         assert!(new_storage.batch.column_by_name(ROW_ID).is_some());
