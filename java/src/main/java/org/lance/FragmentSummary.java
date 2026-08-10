@@ -13,11 +13,14 @@
  */
 package org.lance;
 
+import java.util.OptionalLong;
+
 /** Aggregate statistics for the fragments in a dataset version. */
 public final class FragmentSummary {
   private final long fragmentCount;
   private final long minRowsPerFragment;
   private final long maxRowsPerFragment;
+  private final long unknownRowCountFragmentCount;
   private final long minDataFilesPerFragment;
   private final long maxDataFilesPerFragment;
 
@@ -25,11 +28,13 @@ public final class FragmentSummary {
       long fragmentCount,
       long minRowsPerFragment,
       long maxRowsPerFragment,
+      long unknownRowCountFragmentCount,
       long minDataFilesPerFragment,
       long maxDataFilesPerFragment) {
     this.fragmentCount = fragmentCount;
     this.minRowsPerFragment = minRowsPerFragment;
     this.maxRowsPerFragment = maxRowsPerFragment;
+    this.unknownRowCountFragmentCount = unknownRowCountFragmentCount;
     this.minDataFilesPerFragment = minDataFilesPerFragment;
     this.maxDataFilesPerFragment = maxDataFilesPerFragment;
   }
@@ -39,14 +44,33 @@ public final class FragmentSummary {
     return fragmentCount;
   }
 
-  /** Minimum number of live rows in a fragment, or 0 when there are no fragments. */
-  public long getMinRowsPerFragment() {
-    return minRowsPerFragment;
+  /**
+   * Minimum number of live rows in a fragment.
+   *
+   * @return empty when any fragment has an unknown live-row count; otherwise the minimum, or 0 when
+   *     there are no fragments
+   */
+  public OptionalLong getMinRowsPerFragment() {
+    return unknownRowCountFragmentCount == 0
+        ? OptionalLong.of(minRowsPerFragment)
+        : OptionalLong.empty();
   }
 
-  /** Maximum number of live rows in a fragment, or 0 when there are no fragments. */
-  public long getMaxRowsPerFragment() {
-    return maxRowsPerFragment;
+  /**
+   * Maximum number of live rows in a fragment.
+   *
+   * @return empty when any fragment has an unknown live-row count; otherwise the maximum, or 0 when
+   *     there are no fragments
+   */
+  public OptionalLong getMaxRowsPerFragment() {
+    return unknownRowCountFragmentCount == 0
+        ? OptionalLong.of(maxRowsPerFragment)
+        : OptionalLong.empty();
+  }
+
+  /** Number of fragments whose live row count is unknown. */
+  public long getUnknownRowCountFragmentCount() {
+    return unknownRowCountFragmentCount;
   }
 
   /** Minimum number of data files in a fragment, or 0 when there are no fragments. */

@@ -22,10 +22,12 @@ use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 pub struct FragmentSummary {
     /// Number of fragments.
     pub fragment_count: u64,
-    /// Minimum number of live rows in a fragment, or 0 when the dataset has no fragments.
-    pub min_rows_per_fragment: u64,
-    /// Maximum number of live rows in a fragment, or 0 when the dataset has no fragments.
-    pub max_rows_per_fragment: u64,
+    /// Minimum number of live rows in a fragment, or `None` when any row count is unknown.
+    pub min_rows_per_fragment: Option<u64>,
+    /// Maximum number of live rows in a fragment, or `None` when any row count is unknown.
+    pub max_rows_per_fragment: Option<u64>,
+    /// Number of fragments whose live row count is unknown.
+    pub unknown_row_count_fragment_count: u64,
     /// Minimum number of data files in a fragment, or 0 when the dataset has no fragments.
     pub min_data_files_per_fragment: u64,
     /// Maximum number of data files in a fragment, or 0 when the dataset has no fragments.
@@ -35,36 +37,119 @@ pub struct FragmentSummary {
 impl Dataset {
     /// Aggregate fragment statistics from the loaded manifest in one pass.
     pub fn fragment_summary(&self) -> FragmentSummary {
-        let mut summary = FragmentSummary {
-            fragment_count: self.fragments().len() as u64,
-            min_rows_per_fragment: u64::MAX,
-            max_rows_per_fragment: 0,
-            min_data_files_per_fragment: u64::MAX,
-            max_data_files_per_fragment: 0,
-        };
+        summarize_fragments(self.fragments())
+    }
+}
 
-        for fragment in self.fragments().iter() {
-            let live_rows = fragment.physical_rows.unwrap_or(0).saturating_sub(
-                fragment
-                    .deletion_file
-                    .as_ref()
-                    .and_then(|deletion_file| deletion_file.num_deleted_rows)
-                    .unwrap_or(0),
-            ) as u64;
-            let data_file_count = fragment.files.len() as u64;
-            summary.min_rows_per_fragment = summary.min_rows_per_fragment.min(live_rows);
-            summary.max_rows_per_fragment = summary.max_rows_per_fragment.max(live_rows);
-            summary.min_data_files_per_fragment =
-                summary.min_data_files_per_fragment.min(data_file_count);
-            summary.max_data_files_per_fragment =
-                summary.max_data_files_per_fragment.max(data_file_count);
-        }
+fn summarize_fragments(fragments: &[lance_table::format::Fragment]) -> FragmentSummary {
+    let mut min_rows_per_fragment = u64::MAX;
+    let mut max_rows_per_fragment = 0;
+    let mut min_data_files_per_fragment = u64::MAX;
+    let mut max_data_files_per_fragment = 0;
+    let mut unknown_row_count_fragment_count = 0;
 
-        if summary.fragment_count == 0 {
-            summary.min_rows_per_fragment = 0;
-            summary.min_data_files_per_fragment = 0;
+    for fragment in fragments {
+        match fragment.num_rows() {
+            Some(live_rows) => {
+                min_rows_per_fragment = min_rows_per_fragment.min(live_rows as u64);
+                max_rows_per_fragment = max_rows_per_fragment.max(live_rows as u64);
+            }
+            None => unknown_row_count_fragment_count += 1,
         }
-        summary
+        let data_file_count = fragment.files.len() as u64;
+        min_data_files_per_fragment = min_data_files_per_fragment.min(data_file_count);
+        max_data_files_per_fragment = max_data_files_per_fragment.max(data_file_count);
+    }
+
+    if fragments.is_empty() {
+        min_rows_per_fragment = 0;
+        min_data_files_per_fragment = 0;
+    }
+
+    let row_counts_complete = unknown_row_count_fragment_count == 0;
+    FragmentSummary {
+        fragment_count: fragments.len() as u64,
+        min_rows_per_fragment: row_counts_complete.then_some(min_rows_per_fragment),
+        max_rows_per_fragment: row_counts_complete.then_some(max_rows_per_fragment),
+        unknown_row_count_fragment_count,
+        min_data_files_per_fragment,
+        max_data_files_per_fragment,
+    }
+}
+
+#[cfg(test)]
+mod fragment_summary_tests {
+    use lance_file::version::ConcreteFileVersion;
+    use lance_table::format::{DeletionFile, DeletionFileType, Fragment};
+
+    use super::summarize_fragments;
+
+    fn fragment(id: u64, rows: Option<usize>, file_count: usize) -> Fragment {
+        let mut fragment = Fragment::new(id);
+        fragment.physical_rows = rows;
+        for file_idx in 0..file_count {
+            fragment.add_file(
+                format!("{id}-{file_idx}.lance"),
+                vec![file_idx as i32],
+                vec![file_idx as i32],
+                ConcreteFileVersion::V2_1,
+                None,
+            );
+        }
+        fragment
+    }
+
+    #[test]
+    fn test_fragment_summary_preserves_unknown_row_counts() {
+        let known = fragment(0, Some(10), 1);
+        let unknown_physical_rows = fragment(1, None, 2);
+        let mut unknown_deletions = fragment(2, Some(30), 3);
+        unknown_deletions.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: None,
+            base_id: None,
+        });
+
+        let summary = summarize_fragments(&[known, unknown_physical_rows, unknown_deletions]);
+        assert_eq!(summary.fragment_count, 3);
+        assert_eq!(summary.min_rows_per_fragment, None);
+        assert_eq!(summary.max_rows_per_fragment, None);
+        assert_eq!(summary.unknown_row_count_fragment_count, 2);
+        assert_eq!(summary.min_data_files_per_fragment, 1);
+        assert_eq!(summary.max_data_files_per_fragment, 3);
+    }
+
+    #[test]
+    fn test_fragment_summary_uses_live_rows() {
+        let mut deleted = fragment(0, Some(10), 1);
+        deleted.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(4),
+            base_id: None,
+        });
+        let other = fragment(1, Some(20), 2);
+
+        let summary = summarize_fragments(&[deleted, other]);
+        assert_eq!(summary.min_rows_per_fragment, Some(6));
+        assert_eq!(summary.max_rows_per_fragment, Some(20));
+        assert_eq!(summary.unknown_row_count_fragment_count, 0);
+        assert_eq!(summary.min_data_files_per_fragment, 1);
+        assert_eq!(summary.max_data_files_per_fragment, 2);
+    }
+
+    #[test]
+    fn test_fragment_summary_empty() {
+        let summary = summarize_fragments(&[]);
+        assert_eq!(summary.fragment_count, 0);
+        assert_eq!(summary.min_rows_per_fragment, Some(0));
+        assert_eq!(summary.max_rows_per_fragment, Some(0));
+        assert_eq!(summary.unknown_row_count_fragment_count, 0);
+        assert_eq!(summary.min_data_files_per_fragment, 0);
+        assert_eq!(summary.max_data_files_per_fragment, 0);
     }
 }
 

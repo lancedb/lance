@@ -789,11 +789,12 @@ impl IntoJava for FragmentSummary {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         Ok(env.new_object(
             "org/lance/FragmentSummary",
-            "(JJJJJ)V",
+            "(JJJJJJ)V",
             &[
                 JValue::Long(self.fragment_count as i64),
-                JValue::Long(self.min_rows_per_fragment as i64),
-                JValue::Long(self.max_rows_per_fragment as i64),
+                JValue::Long(self.min_rows_per_fragment.unwrap_or(0) as i64),
+                JValue::Long(self.max_rows_per_fragment.unwrap_or(0) as i64),
+                JValue::Long(self.unknown_row_count_fragment_count as i64),
                 JValue::Long(self.min_data_files_per_fragment as i64),
                 JValue::Long(self.max_data_files_per_fragment as i64),
             ],
