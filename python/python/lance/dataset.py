@@ -2971,7 +2971,7 @@ class LanceDataset(pa.dataset.Dataset):
             where = str(where)
         return self._ds.update(updates, where, conflict_retries, retry_timeout)
 
-    def versions(self) -> List[Dict[str, Any]]:
+    def versions(self) -> List[Version]:
         """
         Return all versions in this dataset.
         """
