@@ -1306,6 +1306,29 @@ pub(crate) async fn commit_transaction(
             dataset.clone()
         };
 
+    // The version this transaction read, captured before the retry loop moves
+    // `dataset` forward. MemWAL index catch-up is derived from it: an index
+    // covering every fragment live here holds every row compaction had copied
+    // in by then.
+    //
+    // Only tables on the protocol pay for the extra index load; the bit is on
+    // the manifest already in hand.
+    let read_version_dataset = dataset.clone();
+    let read_version_indices = if read_version_dataset.manifest.reader_feature_flags
+        & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
+        != 0
+    {
+        Some(read_version_dataset.load_indices().await?.as_ref().clone())
+    } else {
+        None
+    };
+    let read_version_state = read_version_indices.as_ref().map(|indices| {
+        crate::dataset::transaction::ReadVersionState {
+            manifest: read_version_dataset.manifest.as_ref(),
+            indices: indices.as_slice(),
+        }
+    });
+
     let mut transaction = transaction.clone();
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
@@ -1377,11 +1400,12 @@ pub(crate) async fn commit_transaction(
                 )
                 .await?
             }
-            _ => transaction.build_manifest(
+            _ => transaction.build_manifest_with_read_version(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 transaction_file,
                 write_config,
+                read_version_state,
             )?,
         };
 

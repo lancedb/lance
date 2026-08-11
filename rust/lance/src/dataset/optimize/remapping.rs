@@ -381,7 +381,6 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         Operation::CreateIndex {
             new_indices: vec![new_index_meta],
             removed_indices: vec![curr_index_meta],
-            mem_wal_index_catchup_advances: Vec::new(),
         },
         None,
     );

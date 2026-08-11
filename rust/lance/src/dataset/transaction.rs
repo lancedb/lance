@@ -331,126 +331,22 @@ pub struct UpdateMap {
 /// base fragments.
 type LogicalIndexSegments = BTreeMap<String, Vec<IndexMetadata>>;
 
-/// Records that one logical index covers named per-shard compaction generations.
+/// [`LogicalIndexSegments`] borrowed from an index list the caller still holds.
+type LogicalIndexSegmentRefs<'a> = BTreeMap<&'a str, Vec<&'a IndexMetadata>>;
+
+/// The version a transaction read, as the coverage derivation needs it.
 ///
-/// Supplied only by the WAL index-repair worker, and published in the same
-/// commit as the index change it describes so the index result and the coverage
-/// it reports can never disagree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexCatchupAdvance {
-    /// One user-visible logical index, possibly backed by several segments.
-    pub index_name: String,
-    /// Exact final physical segment UUID set expected after this operation.
-    ///
-    /// The commit fails unless the segments actually present match exactly, so
-    /// a repair cannot claim coverage for an index that something else replaced
-    /// while it was running.
-    pub expected_index_segment_uuids: Vec<Uuid>,
-    /// Compaction numbers captured when the repair job opened the table.
-    ///
-    /// Only these are recorded, never whatever is current at commit time: the
-    /// claim must not exceed what the job actually indexed.
-    pub caught_up_generations: Vec<CompactedSsTable>,
-    /// The fragments the named segments covered when the repair inspected them.
-    ///
-    /// UUIDs alone are not a fence: an operation can prune a segment's fragment
-    /// bitmap while keeping its UUID, so a claim made before the prune would
-    /// still match afterwards. The commit fails unless the segments it publishes
-    /// cover exactly these fragments.
-    pub expected_fragment_bitmap: RoaringBitmap,
-    /// Every fragment live in the table when the repair inspected it.
-    ///
-    /// The index must cover all of them. That is what ties the claim to the
-    /// generations it names: nothing records which fragments a generation's rows
-    /// landed in, so covering the whole inspected table is how the repair shows
-    /// it covered those rows. Fragments appended after the snapshot are a later
-    /// catch-up gap and are not required.
-    pub inspected_fragments: RoaringBitmap,
-}
-
-// Hand-written because `Uuid` does not implement `DeepSizeOf`; it is a fixed
-// 16 bytes with no heap allocation, like `CompactedSsTable`'s own impl.
-impl DeepSizeOf for IndexCatchupAdvance {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.index_name.deep_size_of_children(context)
-            + self.expected_index_segment_uuids.capacity() * std::mem::size_of::<Uuid>()
-            + self.caught_up_generations.deep_size_of_children(context)
-            + self.expected_fragment_bitmap.serialized_size()
-            + self.inspected_fragments.serialized_size()
-    }
-}
-
-impl From<&IndexCatchupAdvance> for pb::transaction::create_index::IndexCatchupAdvance {
-    fn from(advance: &IndexCatchupAdvance) -> Self {
-        Self {
-            index_name: advance.index_name.clone(),
-            expected_index_segment_uuids: advance
-                .expected_index_segment_uuids
-                .iter()
-                .map(pb::Uuid::from)
-                .collect(),
-            caught_up_generations: advance
-                .caught_up_generations
-                .iter()
-                .map(pb::CompactedSsTable::from)
-                .collect(),
-            inspected_fragments: {
-                let mut bytes = Vec::with_capacity(advance.inspected_fragments.serialized_size());
-                advance
-                    .inspected_fragments
-                    .serialize_into(&mut bytes)
-                    .expect("serializing a roaring bitmap into a Vec cannot fail");
-                bytes
-            },
-            expected_fragment_bitmap: {
-                let mut bytes =
-                    Vec::with_capacity(advance.expected_fragment_bitmap.serialized_size());
-                // Writing to a Vec cannot fail.
-                advance
-                    .expected_fragment_bitmap
-                    .serialize_into(&mut bytes)
-                    .expect("serializing a roaring bitmap into a Vec cannot fail");
-                bytes
-            },
-        }
-    }
-}
-
-impl TryFrom<pb::transaction::create_index::IndexCatchupAdvance> for IndexCatchupAdvance {
-    type Error = Error;
-
-    fn try_from(advance: pb::transaction::create_index::IndexCatchupAdvance) -> Result<Self> {
-        let index_name = advance.index_name;
-        Ok(Self {
-            expected_index_segment_uuids: advance
-                .expected_index_segment_uuids
-                .iter()
-                .map(Uuid::try_from)
-                .collect::<Result<_>>()?,
-            caught_up_generations: advance
-                .caught_up_generations
-                .into_iter()
-                .map(CompactedSsTable::try_from)
-                .collect::<Result<_>>()?,
-            expected_fragment_bitmap: RoaringBitmap::deserialize_from(
-                advance.expected_fragment_bitmap.as_slice(),
-            )
-            .map_err(|err| {
-                Error::invalid_input(format!(
-                    "Could not decode expected_fragment_bitmap for index {index_name}: {err}"
-                ))
-            })?,
-            inspected_fragments: RoaringBitmap::deserialize_from(
-                advance.inspected_fragments.as_slice(),
-            )
-            .map_err(|err| {
-                Error::invalid_input(format!(
-                    "Could not decode inspected_fragments for index {index_name}: {err}"
-                ))
-            })?,
-            index_name,
-        })
-    }
+/// An index covering every fragment live at this version holds every row
+/// compaction had copied into the base table by then, so it is caught up to
+/// that version's `compacted_sstables`. That is the only proof available:
+/// nothing maps a compaction generation to the fragments its rows landed in.
+///
+/// `read_version` is fixed for the life of a transaction and survives rebase,
+/// so the derivation gives the same answer on every commit attempt.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadVersionState<'a> {
+    pub manifest: &'a Manifest,
+    pub indices: &'a [IndexMetadata],
 }
 
 /// An operation on a dataset.
@@ -492,14 +388,6 @@ pub enum Operation {
         new_indices: Vec<IndexMetadata>,
         /// The indices that have been modified.
         removed_indices: Vec<IndexMetadata>,
-        /// MemWAL index catch-up this operation reports, if any.
-        ///
-        /// Empty for every ordinary index operation. Creating, reindexing,
-        /// appending to, or remapping an index changes it without saying how far
-        /// it has caught up, so that index's `index_catchup` entry is removed and
-        /// a later repair records a fresh one. Conservative, but it can never
-        /// leave a lagging index looking caught up.
-        mem_wal_index_catchup_advances: Vec<IndexCatchupAdvance>,
     },
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
@@ -783,18 +671,12 @@ impl PartialEq for Operation {
                 Self::CreateIndex {
                     new_indices: a_new,
                     removed_indices: a_removed,
-                    mem_wal_index_catchup_advances: a_advances,
                 },
                 Self::CreateIndex {
                     new_indices: b_new,
                     removed_indices: b_removed,
-                    mem_wal_index_catchup_advances: b_advances,
                 },
-            ) => {
-                compare_vec(a_new, b_new)
-                    && compare_vec(a_removed, b_removed)
-                    && compare_vec(a_advances, b_advances)
-            }
+            ) => compare_vec(a_new, b_new) && compare_vec(a_removed, b_removed),
             (
                 Self::Rewrite {
                     groups: a_groups,
@@ -2044,22 +1926,22 @@ impl Transaction {
         Ok(())
     }
 
-    /// Every non-system logical index, mapped to its sorted segment UUIDs.
+    /// Every non-system logical index, mapped to its segments in a stable order.
     ///
-    /// A logical index may be backed by several physical segments. Lance mints a
-    /// fresh UUID whenever a segment is written, so the complete sorted set is a
-    /// faithful identity for "is this the same physical index" -- unlike any one
-    /// arbitrarily chosen segment.
+    /// A logical index may be backed by several physical segments, so "did this
+    /// index change" is a question about the whole set. Whole metadata rather
+    /// than UUIDs: an operation can prune a segment's fragment bitmap in place
+    /// while keeping its UUID.
     ///
-    /// Built once per side, so the comparison below is a map lookup per coverage
-    /// entry rather than a scan of the whole index list.
-    fn logical_index_segments(indices: &[IndexMetadata]) -> LogicalIndexSegments {
-        let mut by_name: LogicalIndexSegments = BTreeMap::new();
+    /// Owned, because the caller snapshots this before the operation rewrites
+    /// the index list. Use [`Self::logical_index_segment_refs`] for the side
+    /// that is still in hand.
+    /// [`Self::logical_index_segments`] without the clones, for an index list
+    /// the caller still holds.
+    fn logical_index_segment_refs(indices: &[IndexMetadata]) -> LogicalIndexSegmentRefs<'_> {
+        let mut by_name: LogicalIndexSegmentRefs<'_> = BTreeMap::new();
         for idx in indices.iter().filter(|idx| !is_system_index(idx)) {
-            by_name
-                .entry(idx.name.clone())
-                .or_default()
-                .push(idx.clone());
+            by_name.entry(idx.name.as_str()).or_default().push(idx);
         }
         for segments in by_name.values_mut() {
             segments.sort_unstable_by_key(|segment| segment.uuid);
@@ -2067,34 +1949,49 @@ impl Transaction {
         by_name
     }
 
+    fn logical_index_segments(indices: &[IndexMetadata]) -> LogicalIndexSegments {
+        Self::logical_index_segment_refs(indices)
+            .into_iter()
+            .map(|(name, segments)| {
+                (
+                    name.to_string(),
+                    segments.into_iter().cloned().collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
     /// Apply MemWAL index-coverage rules once the final index list is known.
     ///
     /// Coverage records that a base-table index contains the rows a compaction
-    /// copied in, and the WAL pod retires SSTables against it. So any index
-    /// change this transaction does not explicitly report must drop that
-    /// index's coverage: an ordinary create, reindex, append, replacement or
-    /// remap carries no advance and is therefore conservative. The rule lives
-    /// here rather than in each caller so an ordinary index job cannot forget it
-    /// and leave a stale catch-up position behind.
+    /// copied in, and the WAL pod retires SSTables against it.
     ///
-    /// Dropping coverage is only conservative once catch-up is required, where a
-    /// missing entry means "not caught up" and the SSTables stay. A legacy table
-    /// reads a missing entry as "fully caught up", so this leaves legacy
-    /// progress untouched rather than making the table look more covered.
+    /// It is derived, not reported. An index covering every fragment live at the
+    /// transaction's read version holds every row compaction had copied in by
+    /// then, so it is caught up to that version's `compacted_sstables`. That is
+    /// the only proof available: nothing maps a generation to the fragments its
+    /// rows landed in, so covering the table as the transaction read it is how
+    /// an index shows it covered those rows. Fragments appended since are a
+    /// later gap.
+    ///
+    /// Deriving rather than transmitting means no claim can go stale between
+    /// inspection and commit, the answer survives rebase (`read_version` is
+    /// fixed for a transaction's life), and any operation can earn coverage --
+    /// an ordinary reindex that fully covers no longer has to throw its work
+    /// away and wait for a repair.
+    ///
+    /// Only meaningful once catch-up is required, where a missing entry means
+    /// "not caught up" and the SSTables stay. A legacy table reads a missing
+    /// entry as "fully caught up", so this leaves it untouched rather than
+    /// making the table look more covered than it is.
     fn apply_mem_wal_index_coverage(
         final_indices: &mut [IndexMetadata],
         segments_before: &LogicalIndexSegments,
-        advances: &[IndexCatchupAdvance],
+        read_version_state: Option<ReadVersionState<'_>>,
         index_catchup_required: bool,
         new_version: u64,
     ) -> Result<()> {
         if !index_catchup_required {
-            if !advances.is_empty() {
-                return Err(Error::invalid_input(
-                    "Index coverage can only be advanced on a table that requires MemWAL \
-                     index catch-up",
-                ));
-            }
             return Ok(());
         }
 
@@ -2103,245 +2000,147 @@ impl Transaction {
             .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
         else {
             // The system index went away with this transaction (MemWAL disable,
-            // or an overwrite). There is no coverage left to maintain, but a
-            // claim about it is a contradiction.
-            if !advances.is_empty() {
-                return Err(Error::invalid_input(format!(
-                    "Cannot advance index coverage: the {} system index is not \
-                     present in the resulting index list",
-                    MEM_WAL_INDEX_NAME
-                )));
-            }
+            // or an overwrite). There is no coverage left to maintain.
             return Ok(());
         };
 
         let mut details = load_mem_wal_index_details(final_indices[pos].clone())?;
 
-        // Nothing has ever been compacted, so no index can be behind and there is
-        // no coverage to invalidate. Bail before doing any work.
-        if details.compacted_sstables.is_empty()
-            && details.index_catchup.is_empty()
-            && advances.is_empty()
-        {
+        // Nothing has ever been compacted, so no index can be behind and there
+        // is no coverage to invalidate.
+        if details.compacted_sstables.is_empty() && details.index_catchup.is_empty() {
             return Ok(());
         }
 
-        let segments_after = Self::logical_index_segments(final_indices);
-        let advanced_names: HashSet<&str> =
-            advances.iter().map(|a| a.index_name.as_str()).collect();
-        // Kept so an advance can merge onto what the index already recorded, and so
-        // an unchanged result can skip rewriting the system index entirely.
-        let catchup_before = details.index_catchup.clone();
+        let segments_after = Self::logical_index_segment_refs(final_indices);
+        let catchup_before = std::mem::take(&mut details.index_catchup);
 
-        let index_unchanged = |name: &str| {
-            matches!(
-                (segments_before.get(name), segments_after.get(name)),
-                (Some(before), Some(after)) if before == after
-            )
-        };
+        // Per shard: what this commit records as compacted, and the most the
+        // read version may credit. Generations compacted after that read landed
+        // in fragments no index under consideration has seen; the committed
+        // value caps it in turn, so a read version since rolled back cannot
+        // retire SSTables no live commit copied in.
+        let read_details = read_version_state
+            .map(|state| {
+                state
+                    .indices
+                    .iter()
+                    .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                    .cloned()
+                    .map(load_mem_wal_index_details)
+                    .transpose()
+            })
+            .transpose()?
+            .flatten();
+        let shards: Vec<(Uuid, u64, u64)> = details
+            .compacted_sstables
+            .iter()
+            .map(|committed| {
+                let at_read = read_details
+                    .as_ref()
+                    .and_then(|read| {
+                        read.compacted_sstables
+                            .iter()
+                            .find(|s| s.shard_id == committed.shard_id)
+                    })
+                    .map_or(0, |s| s.generation);
+                (
+                    committed.shard_id,
+                    committed.generation,
+                    at_read.min(committed.generation),
+                )
+            })
+            .collect();
 
-        // --- invalidate coverage the transaction changed but did not report ---
-
-        details.index_catchup.retain(|entry| {
-            // A name this transaction reports is rebuilt below from the advance.
-            if advanced_names.contains(entry.index_name.as_str()) {
-                return false;
-            }
-            match (
-                segments_before.get(&entry.index_name),
-                segments_after.get(&entry.index_name),
-            ) {
-                // Dropped index: coverage no longer gates anything.
-                (_, None) => false,
-                // Present before and after: keep only if physically unchanged.
-                (Some(before), Some(after)) => before == after,
-                // Absent before, present now: a brand-new index has no catch-up position.
-                (None, Some(_)) => false,
-            }
+        // Every fragment live when the transaction read the table. An index
+        // spanning all of them holds every row compacted by then.
+        let read_fragments: Option<RoaringBitmap> = read_version_state.map(|state| {
+            state
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect()
         });
 
-        if details.index_catchup.len() < catchup_before.len() {
-            let dropped: Vec<&str> = catchup_before
+        let covers_read_version = |segments: &[&IndexMetadata]| -> bool {
+            let Some(required) = read_fragments.as_ref() else {
+                return false;
+            };
+            if required.is_empty() {
+                return false;
+            }
+            let mut covered = RoaringBitmap::new();
+            for segment in segments {
+                match segment.fragment_bitmap.as_ref() {
+                    Some(bitmap) => covered |= bitmap,
+                    // An unknown bitmap cannot be shown to cover anything.
+                    None => return false,
+                }
+            }
+            required.is_subset(&covered)
+        };
+
+        let mut rebuilt: Vec<IndexCatchupProgress> = Vec::new();
+        for (name, after) in segments_after.iter() {
+            // Whole metadata, not one segment UUID: an Update that touches an
+            // indexed field prunes a segment's fragment bitmap in place while
+            // keeping its UUID, so a UUID-only comparison would carry a position
+            // forward that the index no longer earns.
+            let unchanged = segments_before.get(*name).is_some_and(|before| {
+                before.len() == after.len() && before.iter().zip(after.iter()).all(|(b, a)| b == *a)
+            });
+            let carried = unchanged
+                .then(|| catchup_before.iter().find(|e| e.index_name == **name))
+                .flatten();
+            let proven = covers_read_version(after);
+
+            if carried.is_none() && !proven {
+                // Changed, and nothing shows the new index covers the read
+                // version. No entry: a missing one reads as "not caught up".
+                continue;
+            }
+
+            let generations = shards
                 .iter()
-                .map(|entry| entry.index_name.as_str())
-                .filter(|name| {
-                    !details
-                        .index_catchup
-                        .iter()
-                        .any(|kept| kept.index_name == *name)
+                .map(|&(shard_id, committed, creditable)| {
+                    let prior = carried
+                        .and_then(|entry| entry.caught_up_generation_for_shard(&shard_id))
+                        .unwrap_or(0);
+                    let credited = if proven { creditable } else { 0 };
+                    // Never lowers what an unchanged index already recorded: a
+                    // commit reading an older version still knows this index
+                    // covered more than its own snapshot can prove.
+                    CompactedSsTable::new(shard_id, prior.max(credited).min(committed))
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if generations.iter().all(|g| g.generation == 0) {
+                continue;
+            }
+            rebuilt.push(IndexCatchupProgress::new((*name).to_string(), generations));
+        }
+        rebuilt.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+
+        let mut before_sorted = catchup_before;
+        before_sorted.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+        if rebuilt == before_sorted {
+            return Ok(());
+        }
+
+        let dropped: Vec<&str> = before_sorted
+            .iter()
+            .map(|e| e.index_name.as_str())
+            .filter(|name| !rebuilt.iter().any(|kept| kept.index_name == *name))
+            .collect();
+        if !dropped.is_empty() {
             // The first thing to check when SSTables stop becoming trimmable.
             log::info!(
                 "MemWAL index catch-up invalidated at version {new_version} for {dropped:?}: \
-                 these indices changed without reporting how far they caught up"
+                 these indices changed and no longer cover the version this commit read"
             );
         }
 
-        // --- validate and apply each advance ---
-
-        let mut seen_names = HashSet::with_capacity(advances.len());
-        for advance in advances {
-            if !seen_names.insert(advance.index_name.as_str()) {
-                return Err(Error::invalid_input(format!(
-                    "Duplicate index name {} in index-coverage advances; each \
-                     logical index may advance at most once per transaction",
-                    advance.index_name
-                )));
-            }
-
-            let mut expected = advance.expected_index_segment_uuids.clone();
-            expected.sort_unstable();
-            let before_dedup = expected.len();
-            expected.dedup();
-            if expected.len() != before_dedup {
-                return Err(Error::invalid_input(format!(
-                    "Duplicate expected segment UUID for index {}",
-                    advance.index_name
-                )));
-            }
-
-            let segments = match segments_after.get(&advance.index_name) {
-                Some(segments) => segments.as_slice(),
-                None => {
-                    return Err(Error::invalid_input(format!(
-                        "Cannot advance coverage for index {}: it is not present in \
-                         the resulting index list",
-                        advance.index_name
-                    )));
-                }
-            };
-            let actual: Vec<Uuid> = segments.iter().map(|segment| segment.uuid).collect();
-            // Exact equality, so a repair cannot claim coverage for an index that
-            // a concurrent reindex or replacement changed underneath it.
-            if actual != expected {
-                return Err(Error::invalid_input(format!(
-                    "Index {} does not match the segments this coverage advance \
-                     expects: expected {:?}, found {:?}",
-                    advance.index_name, expected, actual
-                )));
-            }
-
-            // UUIDs alone are not a fence: pruning narrows a segment's fragment
-            // bitmap without changing its UUID, so an advance made before the
-            // prune would still match the UUID set afterwards.
-            let mut published = RoaringBitmap::new();
-            for segment in segments {
-                let Some(bitmap) = segment.fragment_bitmap.as_ref() else {
-                    return Err(Error::invalid_input(format!(
-                        "Cannot advance coverage for index {}: segment {} does not \
-                         record which fragments it covers",
-                        advance.index_name, segment.uuid
-                    )));
-                };
-                published |= bitmap;
-            }
-            if published != advance.expected_fragment_bitmap {
-                return Err(Error::invalid_input(format!(
-                    "Index {} does not cover the fragments this coverage advance \
-                     expects: expected {:?}, found {:?}",
-                    advance.index_name,
-                    advance.expected_fragment_bitmap.iter().collect::<Vec<_>>(),
-                    published.iter().collect::<Vec<_>>()
-                )));
-            }
-
-            // Nothing records which fragments a generation's rows landed in, so
-            // the claim is tied to its generations by requiring the index to
-            // cover the whole table as the repair saw it. Fragments appended
-            // since are a later gap. Applied to every advance: publishing one
-            // index says nothing about another index this commit also names, and
-            // removing a segment is not evidence of anything.
-            let missing = &advance.inspected_fragments - &published;
-            if !missing.is_empty() {
-                return Err(Error::invalid_input(format!(
-                    "Cannot advance catch-up for index {}: it does not cover {} of the \
-                     {} fragments live when the repair inspected the table",
-                    advance.index_name,
-                    missing.len(),
-                    advance.inspected_fragments.len()
-                )));
-            }
-
-            let mut seen_shards = HashSet::with_capacity(advance.caught_up_generations.len());
-            for proposed in &advance.caught_up_generations {
-                if !seen_shards.insert(proposed.shard_id) {
-                    return Err(Error::invalid_input(format!(
-                        "Duplicate shard {} in the coverage advance for index {}",
-                        proposed.shard_id, advance.index_name
-                    )));
-                }
-
-                // Coverage can never exceed what has actually been compacted;
-                // otherwise SSTables would be retired that no commit copied in.
-                let compacted = details
-                    .compacted_sstables
-                    .iter()
-                    .find(|sstable| sstable.shard_id == proposed.shard_id)
-                    .map(|sstable| sstable.generation);
-                match compacted {
-                    Some(compacted) if proposed.generation <= compacted => {}
-                    Some(compacted) => {
-                        return Err(Error::invalid_input(format!(
-                            "Coverage for index {} shard {} claims generation {} but \
-                             only {} has been compacted into the base table",
-                            advance.index_name, proposed.shard_id, proposed.generation, compacted
-                        )));
-                    }
-                    None => {
-                        return Err(Error::invalid_input(format!(
-                            "Coverage for index {} names shard {}, which has no \
-                             recorded compaction progress",
-                            advance.index_name, proposed.shard_id
-                        )));
-                    }
-                }
-            }
-
-            // Shards this advance does not name keep the generation they already
-            // recorded, so repairing one shard does not erase another and two
-            // repairs on different shards do not overwrite each other. Only an
-            // index that is physically unchanged may carry its old position forward;
-            // otherwise it was recorded against an index that no longer exists.
-            let mut merged = if index_unchanged(&advance.index_name) {
-                catchup_before
-                    .iter()
-                    .find(|entry| entry.index_name == advance.index_name)
-                    .map(|entry| entry.caught_up_generations.clone())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            // Per-shard max, so a delayed or reordered retry cannot lower coverage.
-            for proposed in &advance.caught_up_generations {
-                match merged
-                    .iter_mut()
-                    .find(|existing| existing.shard_id == proposed.shard_id)
-                {
-                    Some(existing) => {
-                        existing.generation = existing.generation.max(proposed.generation)
-                    }
-                    None => merged.push(proposed.clone()),
-                }
-            }
-            merged.sort_unstable_by_key(|sstable| sstable.shard_id);
-            details.index_catchup.push(IndexCatchupProgress::new(
-                advance.index_name.clone(),
-                merged,
-            ));
-        }
-
-        details
-            .index_catchup
-            .sort_by(|a, b| a.index_name.cmp(&b.index_name));
-
-        // Every commit on a table that has ever compacted reaches this point, so
-        // rewriting the entry unconditionally would mint a new UUID and drop the
-        // decoded-details cache on unrelated high-volume commits.
-        if details.index_catchup == catchup_before {
-            return Ok(());
-        }
-
+        details.index_catchup = rebuilt;
         final_indices[pos] = new_mem_wal_index_meta(new_version, details)?;
         Ok(())
     }
@@ -2355,6 +2154,29 @@ impl Transaction {
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        self.build_manifest_with_read_version(
+            current_manifest,
+            current_indices,
+            transaction_file_path,
+            config,
+            None,
+        )
+    }
+
+    /// [`Self::build_manifest`] with the version this transaction read.
+    ///
+    /// Supplied by the commit path, which already materializes that version.
+    /// `None` where there is none to read -- dataset creation and detached
+    /// commits -- in which case no index can be shown to cover it and coverage
+    /// is left as the invalidation rules put it.
+    pub(crate) fn build_manifest_with_read_version(
+        &self,
+        current_manifest: Option<&Manifest>,
+        current_indices: Vec<IndexMetadata>,
+        transaction_file_path: &str,
+        config: &ManifestWriteConfig,
+        read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
@@ -3113,21 +2935,12 @@ impl Transaction {
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one operation arm
         // intended.
-        let advances: &[IndexCatchupAdvance] = match &self.operation {
-            Operation::CreateIndex {
-                mem_wal_index_catchup_advances,
-                ..
-            } => mem_wal_index_catchup_advances,
-            _ => &[],
-        };
-        // Advances are also routed in when the table carries no system index, so a
-        // coverage claim on such a table is rejected rather than silently dropped.
-        if mem_wal_segments_before.is_some() || !advances.is_empty() {
+        if mem_wal_segments_before.is_some() {
             let empty_segments = LogicalIndexSegments::new();
             Self::apply_mem_wal_index_coverage(
                 &mut final_indices,
                 mem_wal_segments_before.as_ref().unwrap_or(&empty_segments),
-                advances,
+                read_version_state,
                 index_catchup_required,
                 new_version,
             )?;
@@ -4122,7 +3935,6 @@ impl TryFrom<pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
                 new_indices,
                 removed_indices,
-                mem_wal_index_catchup_advances,
             })) => Operation::CreateIndex {
                 new_indices: new_indices
                     .into_iter()
@@ -4131,10 +3943,6 @@ impl TryFrom<pb::Transaction> for Transaction {
                 removed_indices: removed_indices
                     .into_iter()
                     .map(IndexMetadata::try_from)
-                    .collect::<Result<_>>()?,
-                mem_wal_index_catchup_advances: mem_wal_index_catchup_advances
-                    .into_iter()
-                    .map(IndexCatchupAdvance::try_from)
                     .collect::<Result<_>>()?,
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -4527,16 +4335,11 @@ impl From<&Transaction> for pb::Transaction {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
-                mem_wal_index_catchup_advances,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
                 new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
                 removed_indices: removed_indices
                     .iter()
                     .map(pb::IndexMetadata::from)
-                    .collect(),
-                mem_wal_index_catchup_advances: mem_wal_index_catchup_advances
-                    .iter()
-                    .map(pb::transaction::create_index::IndexCatchupAdvance::from)
                     .collect(),
             }),
             Operation::Merge {
@@ -5170,7 +4973,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![third_index.clone()],
                 removed_indices: vec![second_index.clone()],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -5206,7 +5008,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![first_index.clone(), third_index.clone()],
                 removed_indices: vec![second_index.clone()],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -8184,14 +7985,15 @@ mod tests {
         use lance_index::mem_wal::{
             CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, MemWalIndexDetails,
         };
+        use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 
-        fn user_index(name: &str, uuid: Uuid) -> IndexMetadata {
+        fn user_index(name: &str, uuid: Uuid, frags: &[u32]) -> IndexMetadata {
             IndexMetadata {
                 uuid,
                 name: name.to_string(),
                 fields: vec![0],
                 dataset_version: 1,
-                fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+                fragment_bitmap: Some(RoaringBitmap::from_iter(frags.iter().copied())),
                 index_details: None,
                 index_version: 0,
                 created_at: None,
@@ -8204,669 +8006,524 @@ mod tests {
             crate::index::mem_wal::new_mem_wal_index_meta(1, details).unwrap()
         }
 
-        fn details_of(indices: &[IndexMetadata]) -> MemWalIndexDetails {
+        fn coverage_for(indices: &[IndexMetadata], name: &str) -> Option<Vec<CompactedSsTable>> {
             let meta = indices
                 .iter()
                 .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
                 .expect("mem wal index present");
-            load_mem_wal_index_details(meta.clone()).unwrap()
-        }
-
-        /// Same helper the production path uses, so tests exercise the real
-        /// before/after comparison rather than a parallel implementation.
-        fn segments_before(indices: &[IndexMetadata]) -> LogicalIndexSegments {
-            Transaction::logical_index_segments(indices)
-        }
-
-        /// Drives the production path, defaulting the arguments a test is not
-        /// exercising: no fragments and an operation that publishes index work.
-        fn apply_coverage(
-            final_indices: &mut [IndexMetadata],
-            segments_before: &LogicalIndexSegments,
-            advances: &[IndexCatchupAdvance],
-            index_catchup_required: bool,
-        ) -> Result<()> {
-            Transaction::apply_mem_wal_index_coverage(
-                final_indices,
-                segments_before,
-                advances,
-                index_catchup_required,
-                2,
-            )
-        }
-
-        /// The fragments `name`'s segments cover here -- what a repair that
-        /// inspected this state would put in its advance.
-        fn covered_by(indices: &[IndexMetadata], name: &str) -> RoaringBitmap {
-            indices
-                .iter()
-                .filter(|idx| idx.name == name)
-                .filter_map(|idx| idx.fragment_bitmap.clone())
-                .fold(RoaringBitmap::new(), |mut acc, bitmap| {
-                    acc |= bitmap;
-                    acc
-                })
-        }
-
-        fn coverage_for(indices: &[IndexMetadata], name: &str) -> Option<Vec<CompactedSsTable>> {
-            details_of(indices)
+            load_mem_wal_index_details(meta.clone())
+                .unwrap()
                 .index_catchup
                 .into_iter()
                 .find(|entry| entry.index_name == name)
                 .map(|entry| entry.caught_up_generations)
         }
 
-        /// shard with `compacted` recorded, and `name` covered through `covered`
-        fn table(
-            shard: Uuid,
-            compacted: u64,
-            name: &str,
-            covered: u64,
-            idx_uuid: Uuid,
-        ) -> Vec<IndexMetadata> {
-            vec![
-                user_index(name, idx_uuid),
-                mem_wal_index(MemWalIndexDetails {
-                    compacted_sstables: vec![CompactedSsTable::new(shard, compacted)],
-                    index_catchup: vec![IndexCatchupProgress::new(
-                        name.to_string(),
-                        vec![CompactedSsTable::new(shard, covered)],
-                    )],
-                    ..Default::default()
-                }),
-            ]
+        fn compacted(shard: Uuid, generation: u64) -> Vec<CompactedSsTable> {
+            vec![CompactedSsTable::new(shard, generation)]
         }
 
-        #[test]
-        fn an_untouched_index_keeps_its_coverage() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 10, uuid);
-            let mut after = before.clone();
-
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            assert_eq!(
-                coverage_for(&after, "vec_idx").unwrap()[0].generation,
-                10,
-                "an index this transaction did not touch must keep its catch-up position"
-            );
-        }
-
-        /// An ordinary reindex/append/replacement mints new segment UUIDs and
-        /// supplies no advance, so its old catch-up position must not survive.
-        #[test]
-        fn a_changed_index_loses_its_coverage() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 10, uuid);
-            let mut after = before.clone();
-            after[0] = user_index("vec_idx", Uuid::new_v4()); // rebuilt
-
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            assert!(
-                coverage_for(&after, "vec_idx").is_none(),
-                "a rebuilt index must not inherit the previous index's catch-up position"
-            );
-        }
-
-        #[test]
-        fn a_dropped_index_loses_its_coverage() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 10, uuid);
-            let mut after = vec![before[1].clone()]; // user index dropped
-
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            assert!(coverage_for(&after, "vec_idx").is_none());
-        }
-
-        #[test]
-        fn changing_one_index_preserves_another() {
-            let (shard, a, b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-            let mut before = table(shard, 10, "idx_a", 10, a);
-            before.insert(1, user_index("idx_b", b));
-            let details = MemWalIndexDetails {
-                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                index_catchup: vec![
-                    IndexCatchupProgress::new(
-                        "idx_a".to_string(),
-                        vec![CompactedSsTable::new(shard, 10)],
-                    ),
-                    IndexCatchupProgress::new(
-                        "idx_b".to_string(),
-                        vec![CompactedSsTable::new(shard, 7)],
-                    ),
-                ],
-                ..Default::default()
-            };
-            let before: Vec<IndexMetadata> = vec![
-                user_index("idx_a", a),
-                user_index("idx_b", b),
-                mem_wal_index(details),
-            ];
-            let mut after = before.clone();
-            after[0] = user_index("idx_a", Uuid::new_v4()); // only idx_a rebuilt
-
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            assert!(coverage_for(&after, "idx_a").is_none());
-            assert_eq!(coverage_for(&after, "idx_b").unwrap()[0].generation, 7);
-        }
-
-        #[test]
-        fn an_advance_publishes_the_catch_up_it_reports() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 3, uuid);
-            let mut after = before.clone();
-            let rebuilt = Uuid::new_v4();
-            after[0] = user_index("vec_idx", rebuilt);
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![rebuilt],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 10)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            apply_coverage(&mut after, &segments_before(&before), &[advance], true).unwrap();
-
-            assert_eq!(coverage_for(&after, "vec_idx").unwrap()[0].generation, 10);
-        }
-
-        /// The segment set is the fence against a concurrent reindex: if the
-        /// index is not the one the repair built, the claim is refused.
-        #[test]
-        fn an_advance_whose_segments_do_not_match_rejects() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 3, uuid);
-            let mut after = before.clone();
-            after[0] = user_index("vec_idx", Uuid::new_v4()); // someone else rebuilt it
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![Uuid::new_v4()], // what the repair built
-                caught_up_generations: vec![CompactedSsTable::new(shard, 10)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], true)
-                .unwrap_err();
-
-            assert!(
-                err.to_string().contains("does not match the segments"),
-                "{err}"
-            );
-        }
-
-        /// Coverage above what was compacted would let the WAL pod retire
-        /// SSTables no commit copied into the base table.
-        #[test]
-        fn coverage_above_compacted_progress_rejects() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 5, "vec_idx", 3, uuid);
-            let mut after = before.clone();
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 9)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], true)
-                .unwrap_err();
-
-            assert!(
-                err.to_string().contains("only 5 has been compacted"),
-                "{err}"
-            );
-        }
-
-        #[test]
-        fn coverage_for_an_uncompacted_shard_rejects() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 5, "vec_idx", 3, uuid);
-            let mut after = before.clone();
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(Uuid::new_v4(), 1)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], true)
-                .unwrap_err();
-
-            assert!(
-                err.to_string().contains("no recorded compaction progress"),
-                "{err}"
-            );
-        }
-
-        #[test]
-        fn an_advance_on_a_legacy_table_rejects() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 3, uuid);
-            let mut after = before.clone();
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 10)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], false)
-                .unwrap_err();
-
-            assert!(err.to_string().contains("index catch-up"), "{err}");
-        }
-
-        #[test]
-        fn an_advance_on_a_table_without_the_system_index_rejects() {
-            let uuid = Uuid::new_v4();
-            let mut after = vec![user_index("vec_idx", uuid)];
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(Uuid::new_v4(), 10)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = apply_coverage(&mut after, &LogicalIndexSegments::new(), &[advance], true)
-                .unwrap_err();
-
-            assert!(err.to_string().contains("is not present"), "{err}");
-        }
-
-        #[test]
-        fn duplicate_index_names_in_one_transaction_reject() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 3, uuid);
-            let mut after = before.clone();
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 10)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = apply_coverage(
-                &mut after,
-                &segments_before(&before),
-                &[advance.clone(), advance],
-                true,
+        /// A manifest carrying exactly `frags`, standing in for the version a
+        /// transaction read.
+        fn manifest_with(frags: &[u32]) -> Manifest {
+            let fragments: Vec<Fragment> =
+                frags.iter().map(|id| Fragment::new(*id as u64)).collect();
+            Manifest::new(
+                Schema::default(),
+                Arc::new(fragments),
+                DataStorageFormat::default(),
+                Default::default(),
             )
-            .unwrap_err();
-
-            assert!(err.to_string().contains("Duplicate index name"), "{err}");
         }
 
-        #[test]
-        fn duplicate_shards_in_one_advance_reject() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 3, uuid);
-            let mut after = before.clone();
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![
-                    CompactedSsTable::new(shard, 9),
-                    CompactedSsTable::new(shard, 10),
-                ],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], true)
-                .unwrap_err();
-
-            assert!(err.to_string().contains("Duplicate shard"), "{err}");
+        /// Drives the production path, so these exercise the real derivation.
+        fn apply(
+            after: &mut [IndexMetadata],
+            before: &[IndexMetadata],
+            read_frags: &[u32],
+            read_indices: &[IndexMetadata],
+            required: bool,
+        ) -> Result<()> {
+            let manifest = manifest_with(read_frags);
+            let segments_before = Transaction::logical_index_segments(before);
+            Transaction::apply_mem_wal_index_coverage(
+                after,
+                &segments_before,
+                Some(ReadVersionState {
+                    manifest: &manifest,
+                    indices: read_indices,
+                }),
+                required,
+                2,
+            )
         }
 
-        #[test]
-        fn duplicate_expected_segment_uuids_reject() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 3, uuid);
-            let mut after = before.clone();
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid, uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 10)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], true)
-                .unwrap_err();
-
-            assert!(
-                err.to_string().contains("Duplicate expected segment"),
-                "{err}"
-            );
+        fn table(idx_frags: &[u32], uuid: Uuid, details: MemWalIndexDetails) -> Vec<IndexMetadata> {
+            vec![user_index("idx", uuid, idx_frags), mem_wal_index(details)]
         }
 
-        #[test]
-        fn activation_rejects_pre_existing_beta_compaction_progress() {
-            let mut indices = vec![mem_wal_index(MemWalIndexDetails {
-                compacted_sstables: vec![CompactedSsTable::new(Uuid::new_v4(), 4)],
+        fn progress(shard: Uuid, generation: u64) -> MemWalIndexDetails {
+            MemWalIndexDetails {
+                compacted_sstables: compacted(shard, generation),
                 ..Default::default()
-            })];
-
-            let err = Transaction::require_index_catchup(&mut indices, 2).unwrap_err();
-
-            assert!(err.to_string().contains("beta protocol"), "{err}");
+            }
         }
 
-        #[test]
-        fn activation_requires_the_mem_wal_index() {
-            let err = Transaction::require_index_catchup(&mut [], 2).unwrap_err();
-            assert!(err.to_string().contains("does not exist"), "{err}");
+        fn progress_with_catchup(shard: Uuid, generation: u64, caught: u64) -> MemWalIndexDetails {
+            MemWalIndexDetails {
+                compacted_sstables: compacted(shard, generation),
+                index_catchup: vec![IndexCatchupProgress::new(
+                    "idx".to_string(),
+                    compacted(shard, caught),
+                )],
+                ..Default::default()
+            }
         }
 
+        /// An index spanning every fragment the transaction read is credited
+        /// with what that version had compacted.
         #[test]
-        fn activation_accepts_a_clean_table() {
-            let mut indices = vec![mem_wal_index(MemWalIndexDetails::default())];
-            Transaction::require_index_catchup(&mut indices, 2).unwrap();
+        fn an_index_covering_the_read_version_is_credited() {
+            let shard = Uuid::new_v4();
+            let read = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
+            let mut after = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
+            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
         }
 
+        /// An index short of the read version proves nothing, so it gets no
+        /// entry -- absence reads as "not caught up".
         #[test]
-        fn a_legacy_table_keeps_its_coverage_when_an_index_changes() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
-            let mut after = before.clone();
-            after[0] = user_index("vec_idx", Uuid::new_v4());
+        fn an_index_short_of_the_read_version_is_not_credited() {
+            let shard = Uuid::new_v4();
+            let read = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
 
-            apply_coverage(&mut after, &segments_before(&before), &[], false).unwrap();
-
-            // Legacy readers treat a missing entry as fully caught up, so removing
-            // this one would widen coverage from 5 to the compacted 10.
+        /// The hazard that makes the comparison use whole metadata.
+        ///
+        /// `Operation::Update` prunes a segment's fragment bitmap in place when
+        /// it touches an indexed field, keeping the same UUID. A UUID-only
+        /// "unchanged" test carries the old position forward while the index
+        /// covers fewer fragments, and the WAL pod then trims on a position the
+        /// index no longer earns. Reachable from the ordinary SSTable merge.
+        #[test]
+        fn a_bitmap_pruned_in_place_does_not_keep_its_position() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0, 1], uuid, progress_with_catchup(shard, 5, 5));
+            // Same UUID, fragment 1 pruned away.
+            let mut after = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
             assert_eq!(
-                coverage_for(&after, "vec_idx"),
-                Some(vec![CompactedSsTable::new(shard, 5)])
+                coverage_for(&after, "idx"),
+                None,
+                "a shrunken index kept a position it no longer earns"
             );
         }
 
+        /// Carrying a position forward is not the same as extending it. An
+        /// index that has not moved still only holds the generations it caught
+        /// up to; the compaction that has landed since is in fragments it does
+        /// not span.
         #[test]
-        fn a_changed_index_loses_its_coverage_in_safe_mode() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
+        fn an_unchanged_index_is_not_raised_beyond_what_it_proves() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            // Recorded at generation 2; generation 5 has since been folded in.
+            let before = table(&[0], uuid, progress_with_catchup(shard, 5, 2));
             let mut after = before.clone();
-            after[0] = user_index("vec_idx", Uuid::new_v4());
-
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            assert_eq!(coverage_for(&after, "vec_idx"), None);
+            // Fragment 1 arrived with that compaction and this index lacks it.
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 2)));
         }
 
+        /// A recorded position above what this commit says was compacted is
+        /// clamped down. Nothing should produce one, but a position the base
+        /// table cannot back would retire SSTables whose rows are nowhere.
         #[test]
-        fn a_pruned_fragment_bitmap_loses_coverage_even_though_the_uuid_is_the_same() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let mut before = table(shard, 10, "vec_idx", 5, uuid);
-            before[0].fragment_bitmap = Some(RoaringBitmap::from_iter([0u32, 1]));
+        fn a_carried_position_cannot_exceed_the_committed_progress() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 3, 9));
             let mut after = before.clone();
-            // What Rewrite does: same segment, fewer base fragments.
-            after[0].fragment_bitmap = Some(RoaringBitmap::from_iter([0u32]));
-
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            assert_eq!(coverage_for(&after, "vec_idx"), None);
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 3)));
         }
 
+        /// An unchanged index keeps what it recorded even when this commit's
+        /// own snapshot cannot prove as much.
         #[test]
-        fn an_advance_keeps_the_shards_it_does_not_name() {
-            let (shard_a, shard_b, uuid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-            let before = vec![
-                user_index("vec_idx", uuid),
+        fn an_unchanged_index_is_never_lowered() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 9, 9));
+            let mut after = before.clone();
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 9)));
+        }
+
+        /// Credit never exceeds what this commit records as compacted, so a
+        /// read version since rolled back cannot retire SSTables no live commit
+        /// copied in.
+        #[test]
+        fn credit_is_capped_by_the_committed_progress() {
+            let shard = Uuid::new_v4();
+            let read = table(&[0], Uuid::new_v4(), progress(shard, 9));
+            let mut after = table(&[0], Uuid::new_v4(), progress(shard, 3));
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 3)));
+        }
+
+        /// The cap is the read version's progress, not this commit's. A
+        /// compaction that landed while the index was being built put its rows
+        /// in fragments this transaction never inspected, so covering
+        /// everything it *did* read earns only what had been folded in by then.
+        #[test]
+        fn credit_never_reaches_past_the_read_version() {
+            let shard = Uuid::new_v4();
+            // Read at generation 2; generation 5 landed while this ran.
+            let read = table(&[0], Uuid::new_v4(), progress(shard, 2));
+            let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 2)));
+        }
+
+        /// One segment with an unknown bitmap makes the whole index unproven,
+        /// even when its siblings happen to span everything. Coverage that
+        /// cannot be read is not coverage that can be relied on.
+        #[test]
+        fn an_index_with_an_unknown_segment_is_not_credited() {
+            let shard = Uuid::new_v4();
+            let mut unknown = user_index("idx", Uuid::new_v4(), &[]);
+            unknown.fragment_bitmap = None;
+            let read = vec![
+                user_index("idx", Uuid::new_v4(), &[0, 1]),
+                unknown,
+                mem_wal_index(progress(shard, 5)),
+            ];
+            let mut after = read.clone();
+            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// A dropped index has no coverage left to gate anything.
+        #[test]
+        fn a_dropped_index_loses_its_entry() {
+            let shard = Uuid::new_v4();
+            let before = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            let mut after = vec![mem_wal_index(progress_with_catchup(shard, 5, 5))];
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// An index created by this commit is credited if it spans the read
+        /// version -- it was built over those fragments, so it holds their
+        /// rows. This is what the advance model could not express: an ordinary
+        /// build that fully covers had to throw its work away and wait.
+        #[test]
+        fn a_new_index_covering_the_read_version_is_credited() {
+            let shard = Uuid::new_v4();
+            let before = vec![mem_wal_index(progress(shard, 5))];
+            let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            // Covers the read version, but was not there when it was read.
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
+        }
+
+        /// A legacy table reads a missing entry as "fully caught up", so this
+        /// must leave it alone rather than make it look more covered.
+        #[test]
+        fn a_legacy_table_is_untouched() {
+            let shard = Uuid::new_v4();
+            let before = table(&[0], Uuid::new_v4(), progress(shard, 5));
+            let mut after = before.clone();
+            let untouched = after.clone();
+            apply(&mut after, &before, &[0], &before, false).unwrap();
+            assert_eq!(after, untouched);
+        }
+
+        /// Two shards, only one of them compacted.
+        #[test]
+        fn each_shard_is_credited_independently() {
+            let merged = Uuid::new_v4();
+            let idle = Uuid::new_v4();
+            let details = MemWalIndexDetails {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(merged, 4),
+                    CompactedSsTable::new(idle, 0),
+                ],
+                ..Default::default()
+            };
+            let read = table(&[0], Uuid::new_v4(), details.clone());
+            let mut after = table(&[0], Uuid::new_v4(), details);
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            let coverage = coverage_for(&after, "idx").expect("credited");
+            assert_eq!(
+                coverage
+                    .iter()
+                    .find(|g| g.shard_id == merged)
+                    .map(|g| g.generation),
+                Some(4)
+            );
+            assert_eq!(
+                coverage
+                    .iter()
+                    .find(|g| g.shard_id == idle)
+                    .map(|g| g.generation),
+                Some(0)
+            );
+        }
+
+        /// Two indexes advance independently: one covering, one behind.
+        #[test]
+        fn indexes_are_credited_independently() {
+            let shard = Uuid::new_v4();
+            let read = vec![
+                user_index("fast", Uuid::new_v4(), &[0, 1]),
+                user_index("slow", Uuid::new_v4(), &[0]),
+                mem_wal_index(progress(shard, 6)),
+            ];
+            let mut after = read.clone();
+            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "fast"), Some(compacted(shard, 6)));
+            assert_eq!(coverage_for(&after, "slow"), None);
+        }
+
+        /// An index whose coverage is unknown cannot be shown to cover anything.
+        #[test]
+        fn an_index_without_a_bitmap_is_not_credited() {
+            let shard = Uuid::new_v4();
+            let mut idx = user_index("idx", Uuid::new_v4(), &[0]);
+            idx.fragment_bitmap = None;
+            let read = vec![idx, mem_wal_index(progress(shard, 5))];
+            let mut after = read.clone();
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// Nothing compacted means nothing to be behind on.
+        #[test]
+        fn no_compaction_progress_writes_no_entries() {
+            let before = table(&[0], Uuid::new_v4(), MemWalIndexDetails::default());
+            let mut after = before.clone();
+            let untouched = after.clone();
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(after, untouched);
+        }
+
+        /// No MemWAL system index: nothing to maintain, and no error.
+        #[test]
+        fn a_table_without_mem_wal_is_a_no_op() {
+            let before = vec![user_index("idx", Uuid::new_v4(), &[0])];
+            let mut after = before.clone();
+            let untouched = after.clone();
+            apply(&mut after, &before, &[0], &before, true).unwrap();
+            assert_eq!(after, untouched);
+        }
+
+        /// No read version -- dataset creation, detached commits -- credits
+        /// nothing and lowers nothing.
+        #[test]
+        fn without_a_read_version_nothing_changes() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
+            let mut after = before.clone();
+            let segments_before = Transaction::logical_index_segments(&before);
+            Transaction::apply_mem_wal_index_coverage(&mut after, &segments_before, None, true, 2)
+                .unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
+        }
+
+        /// An untrained index covers nothing that exists, so a sibling's work
+        /// is no evidence for it.
+        #[test]
+        fn an_untrained_index_earns_nothing() {
+            let shard = Uuid::new_v4();
+            let read = vec![
+                user_index("untrained", Uuid::new_v4(), &[]),
+                user_index("trained", Uuid::new_v4(), &[0]),
+                mem_wal_index(progress(shard, 10)),
+            ];
+            let mut after = read.clone();
+            apply(&mut after, &read, &[0], &read, true).unwrap();
+            assert_eq!(coverage_for(&after, "untrained"), None);
+            assert_eq!(coverage_for(&after, "trained"), Some(compacted(shard, 10)));
+        }
+
+        /// Shards move independently within one index: one advances on this
+        /// commit's proof while another keeps the position it already had.
+        #[test]
+        fn a_shard_keeps_its_position_while_another_advances() {
+            let (advancing, quiet) = (Uuid::new_v4(), Uuid::new_v4());
+            let uuid = Uuid::new_v4();
+            let details = |advancing_gen: u64| MemWalIndexDetails {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(advancing, advancing_gen),
+                    CompactedSsTable::new(quiet, 10),
+                ],
+                index_catchup: vec![IndexCatchupProgress::new(
+                    "idx".to_string(),
+                    vec![CompactedSsTable::new(quiet, 7)],
+                )],
+                ..Default::default()
+            };
+            // The quiet shard was never compacted as of the read, so nothing
+            // this commit proves reaches it -- it keeps its recorded 7.
+            let read = vec![
+                user_index("idx", uuid, &[0]),
                 mem_wal_index(MemWalIndexDetails {
-                    compacted_sstables: vec![
-                        CompactedSsTable::new(shard_a, 10),
-                        CompactedSsTable::new(shard_b, 10),
-                    ],
-                    index_catchup: vec![IndexCatchupProgress::new(
-                        "vec_idx".to_string(),
-                        vec![CompactedSsTable::new(shard_b, 7)],
-                    )],
-                    ..Default::default()
+                    compacted_sstables: vec![CompactedSsTable::new(advancing, 9)],
+                    ..details(9)
                 }),
             ];
-            let mut after = before.clone();
+            let mut after = vec![user_index("idx", uuid, &[0]), mem_wal_index(details(10))];
+            apply(&mut after, &read, &[0], &read, true).unwrap();
 
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard_a, 9)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            apply_coverage(&mut after, &segments_before(&before), &[advance], true).unwrap();
-
-            let mut coverage = coverage_for(&after, "vec_idx").unwrap();
+            let mut coverage = coverage_for(&after, "idx").expect("credited");
             coverage.sort_unstable_by_key(|sstable| sstable.shard_id);
             let mut expected = vec![
-                CompactedSsTable::new(shard_a, 9),
-                CompactedSsTable::new(shard_b, 7),
+                CompactedSsTable::new(advancing, 9),
+                CompactedSsTable::new(quiet, 7),
             ];
             expected.sort_unstable_by_key(|sstable| sstable.shard_id);
             assert_eq!(coverage, expected);
         }
 
+        /// The derivation drops coverage an index no longer earns, but it never
+        /// rejects the commit -- an ordinary index job must not be blocked by
+        /// a protocol it knows nothing about.
         #[test]
-        fn a_late_advance_cannot_lower_recorded_coverage() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 9, uuid);
-            let mut after = before.clone();
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 6)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            apply_coverage(&mut after, &segments_before(&before), &[advance], true).unwrap();
-
-            assert_eq!(
-                coverage_for(&after, "vec_idx"),
-                Some(vec![CompactedSsTable::new(shard, 9)])
-            );
+        fn an_ordinary_index_job_is_never_blocked() {
+            let shard = Uuid::new_v4();
+            let before = table(&[0, 1], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            // Rebuilt over a subset -- the shape a partial reindex leaves.
+            let mut after = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
         }
 
+        /// A reader's rule is that a missing entry means "not caught up", so an
+        /// index caught up to nothing must be absent rather than present at
+        /// generation zero -- otherwise it reads as known-and-covered.
         #[test]
-        fn a_changed_index_does_not_carry_its_old_shards_into_an_advance() {
-            let (shard_a, shard_b, uuid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-            let before = vec![
-                user_index("vec_idx", uuid),
-                mem_wal_index(MemWalIndexDetails {
-                    compacted_sstables: vec![
-                        CompactedSsTable::new(shard_a, 10),
-                        CompactedSsTable::new(shard_b, 10),
+        fn an_index_caught_up_to_nothing_gets_no_entry() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 5, 0));
+            let mut after = before.clone();
+            // Does not span the read version, so nothing lifts it off zero.
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// Each shard carries its own position. Collapsing them to one value
+        /// would credit a lagging shard with a busier shard's progress.
+        #[test]
+        fn carried_positions_do_not_leak_between_shards() {
+            let (ahead, behind) = (Uuid::new_v4(), Uuid::new_v4());
+            let uuid = Uuid::new_v4();
+            let details = MemWalIndexDetails {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(ahead, 10),
+                    CompactedSsTable::new(behind, 10),
+                ],
+                index_catchup: vec![IndexCatchupProgress::new(
+                    "idx".to_string(),
+                    vec![
+                        CompactedSsTable::new(ahead, 8),
+                        CompactedSsTable::new(behind, 2),
                     ],
-                    index_catchup: vec![IndexCatchupProgress::new(
-                        "vec_idx".to_string(),
-                        vec![CompactedSsTable::new(shard_b, 7)],
-                    )],
-                    ..Default::default()
-                }),
-            ];
-            let mut after = before.clone();
-            let rebuilt = Uuid::new_v4();
-            after[0] = user_index("vec_idx", rebuilt);
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![rebuilt],
-                caught_up_generations: vec![CompactedSsTable::new(shard_a, 9)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
+                )],
+                ..Default::default()
             };
-            apply_coverage(&mut after, &segments_before(&before), &[advance], true).unwrap();
+            let before = vec![user_index("idx", uuid, &[0]), mem_wal_index(details)];
+            let mut after = before.clone();
+            // Unchanged and unproven: both shards keep exactly what they had.
+            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
 
-            // Shard B was recorded against the index this commit replaced.
-            assert_eq!(
-                coverage_for(&after, "vec_idx"),
-                Some(vec![CompactedSsTable::new(shard_a, 9)])
-            );
+            let mut coverage = coverage_for(&after, "idx").expect("carried");
+            coverage.sort_unstable_by_key(|sstable| sstable.shard_id);
+            let mut expected = vec![
+                CompactedSsTable::new(ahead, 8),
+                CompactedSsTable::new(behind, 2),
+            ];
+            expected.sort_unstable_by_key(|sstable| sstable.shard_id);
+            assert_eq!(coverage, expected);
         }
 
+        /// A commit that changes nothing must not churn the system index: a new
+        /// UUID on every append would invalidate its cache entry fleet-wide.
         #[test]
         fn an_unchanged_commit_does_not_rewrite_the_system_index() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let before = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
             let mut after = before.clone();
+            apply(&mut after, &before, &[0], &before, true).unwrap();
 
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            let system_index = |indices: &[IndexMetadata]| {
+            let system_uuid = |indices: &[IndexMetadata]| {
                 indices
                     .iter()
                     .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
                     .unwrap()
                     .uuid
             };
-            assert_eq!(system_index(&after), system_index(&before));
+            assert_eq!(system_uuid(&after), system_uuid(&before));
         }
 
+        /// Activation is what puts a table on the protocol. A table that has
+        /// never compacted is clean.
         #[test]
-        fn a_coverage_only_advance_survives_a_concurrent_append() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
-            let mut after = before.clone();
-            // The index spans the table the repair read; fragment 1 landed while
-            // the repair ran. A table still taking writes always looks like this,
-            // and the claim is only about generations already compacted.
-            after[0].fragment_bitmap = Some(RoaringBitmap::from_iter([0u32]));
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 9)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            Transaction::apply_mem_wal_index_coverage(
-                &mut after,
-                &segments_before(&before),
-                &[advance],
-                true,
-                2,
-            )
-            .unwrap();
-
-            assert_eq!(
-                coverage_for(&after, "vec_idx"),
-                Some(vec![CompactedSsTable::new(shard, 9)])
-            );
+        fn activation_accepts_a_clean_table() {
+            let mut indices = vec![mem_wal_index(MemWalIndexDetails::default())];
+            Transaction::require_index_catchup(&mut indices, 2).unwrap();
         }
 
+        /// There is nothing to put on the protocol.
         #[test]
-        fn an_untrained_target_cannot_back_a_claim() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
-            let mut after = before.clone();
-            // Declared but never trained: covers nothing.
-            after[0].fragment_bitmap = Some(RoaringBitmap::new());
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 9)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                // The repair inspected a table that had a fragment.
-                inspected_fragments: RoaringBitmap::from_iter([0u32]),
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], true)
-                .unwrap_err();
-
-            assert!(err.to_string().contains("does not cover"), "{err}");
+        fn activation_requires_the_mem_wal_index() {
+            let err = Transaction::require_index_catchup(&mut [], 2).unwrap_err();
+            assert!(err.to_string().contains("does not exist"), "{err}");
         }
 
-        #[test]
-        fn a_coverage_only_advance_accepts_an_index_that_spans_the_table() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
-            let mut after = before.clone();
-            after[0].fragment_bitmap = Some(RoaringBitmap::from_iter([0u32, 1]));
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 9)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            Transaction::apply_mem_wal_index_coverage(
-                &mut after,
-                &segments_before(&before),
-                &[advance],
-                true,
-                2,
-            )
-            .unwrap();
-
-            assert_eq!(
-                coverage_for(&after, "vec_idx"),
-                Some(vec![CompactedSsTable::new(shard, 9)])
-            );
-        }
-
-        #[test]
-        fn a_coverage_only_advance_rejects_an_index_with_no_fragment_bitmap() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
-            let mut after = before.clone();
-            after[0].fragment_bitmap = None;
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 9)],
-                expected_fragment_bitmap: covered_by(&after, "vec_idx"),
-                inspected_fragments: covered_by(&after, "vec_idx"),
-            };
-            let err = Transaction::apply_mem_wal_index_coverage(
-                &mut after,
-                &segments_before(&before),
-                &[advance],
-                true,
-                2,
-            )
-            .unwrap_err();
-
-            assert!(err.to_string().contains("which fragments"), "{err}");
-        }
-
+        /// Coverage recorded under the beta rules was written to a different
+        /// contract; keeping it would let the first trim run unchecked.
         #[test]
         fn activation_clears_beta_coverage() {
             let shard = Uuid::new_v4();
             let mut indices = vec![mem_wal_index(MemWalIndexDetails {
                 index_catchup: vec![IndexCatchupProgress::new(
-                    "vec_idx".to_string(),
-                    vec![CompactedSsTable::new(shard, 100)],
+                    "idx".to_string(),
+                    compacted(shard, 100),
                 )],
                 ..Default::default()
             })];
 
             Transaction::require_index_catchup(&mut indices, 2).unwrap();
 
-            // Beta coverage was written under rules this protocol does not
-            // enforce, so keeping it would let the first trim run without a catch-up check.
-            assert!(details_of(&indices).index_catchup.is_empty());
+            assert!(
+                load_mem_wal_index_details(indices[0].clone())
+                    .unwrap()
+                    .index_catchup
+                    .is_empty()
+            );
         }
 
-        /// F1: the real commit path, not `apply_feature_flags` in isolation.
-        /// `Manifest::new_from_previous` zeroes both feature words, so a helper
-        /// that reads them back sees nothing to preserve.
+        /// Beta compaction progress means SSTables were folded in without any
+        /// coverage rule. No later commit can prove which indexes hold them.
         #[test]
-        fn an_ordinary_commit_keeps_the_feature_bit() {
-            let mut current = sample_manifest_with_fragments(0..1);
-            current.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-            current.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+        fn activation_rejects_pre_existing_beta_compaction_progress() {
+            let mut indices = vec![mem_wal_index(progress(Uuid::new_v4(), 4))];
+            let err = Transaction::require_index_catchup(&mut indices, 2).unwrap_err();
+            assert!(err.to_string().contains("beta protocol"), "{err}");
+        }
 
-            let transaction = Transaction::new(
+        fn config_transaction(current: &Manifest) -> Transaction {
+            Transaction::new(
                 current.version,
                 Operation::UpdateConfig {
                     config_updates: None,
@@ -8875,22 +8532,12 @@ mod tests {
                     field_metadata_updates: HashMap::new(),
                 },
                 None,
-            );
-            let (next, _) = transaction
-                .build_manifest(
-                    Some(&current),
-                    vec![mem_wal_index(MemWalIndexDetails::default())],
-                    "txn",
-                    &ManifestWriteConfig::default(),
-                )
-                .unwrap();
-
-            assert_ne!(next.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
-            assert_ne!(next.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
+            )
         }
 
-        /// F2: one bit set means a legacy reader or a legacy writer is still
-        /// permitted, which is neither mode. Refused, not normalized to both.
+        /// One bit without the other is a manifest no writer should produce:
+        /// a reader-only bit lets an unaware writer trim, a writer-only bit
+        /// lets an unaware reader serve rows no index holds.
         #[test]
         fn a_half_set_feature_bit_is_refused() {
             for (reader, writer) in [
@@ -8901,17 +8548,7 @@ mod tests {
                 current.reader_feature_flags = reader;
                 current.writer_feature_flags = writer;
 
-                let transaction = Transaction::new(
-                    current.version,
-                    Operation::UpdateConfig {
-                        config_updates: None,
-                        table_metadata_updates: None,
-                        schema_metadata_updates: None,
-                        field_metadata_updates: HashMap::new(),
-                    },
-                    None,
-                );
-                let err = transaction
+                let err = config_transaction(&current)
                     .build_manifest(
                         Some(&current),
                         vec![mem_wal_index(MemWalIndexDetails::default())],
@@ -8924,141 +8561,38 @@ mod tests {
             }
         }
 
-        /// F3: pruning narrows a segment's fragment bitmap without changing its
-        /// UUID, so the UUID set alone cannot fence the advance.
+        /// A writer that knows nothing about catch-up must not silently take a
+        /// table off the protocol.
         #[test]
-        fn an_advance_whose_target_was_pruned_rejects() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let mut before = table(shard, 10, "vec_idx", 3, uuid);
-            before[0].fragment_bitmap = Some(RoaringBitmap::from_iter([0u32, 1]));
-            let mut after = before.clone();
+        fn an_ordinary_commit_keeps_the_feature_bit() {
+            let mut current = sample_manifest_with_fragments(0..1);
+            current.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
+            current.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
 
-            // What the repair inspected, before anything pruned it.
-            let inspected = covered_by(&after, "vec_idx");
+            let (next, _) = config_transaction(&current)
+                .build_manifest(
+                    Some(&current),
+                    vec![mem_wal_index(MemWalIndexDetails::default())],
+                    "txn",
+                    &ManifestWriteConfig::default(),
+                )
+                .unwrap();
 
-            Transaction::prune_updated_fields_from_indices(&mut after, &[Fragment::new(1)], &[0]);
-            assert_eq!(
-                after[0].fragment_bitmap,
-                Some(RoaringBitmap::from_iter([0u32])),
-                "precondition: the prune narrowed the segment but kept its UUID"
-            );
-
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 10)],
-                expected_fragment_bitmap: inspected.clone(),
-                inspected_fragments: inspected,
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], true)
-                .unwrap_err();
-
-            assert!(
-                err.to_string().contains("does not cover the fragments"),
-                "{err}"
-            );
+            assert_ne!(next.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
+            assert_ne!(next.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
         }
 
-        /// F4: publishing one index says nothing about a different index named
-        /// by another advance in the same commit.
+        /// Two attempts against the same read version agree, which is what makes
+        /// a rebase safe: `read_version` is fixed for a transaction's life.
         #[test]
-        fn work_on_one_index_does_not_excuse_another() {
+        fn the_derivation_is_stable_across_attempts() {
             let shard = Uuid::new_v4();
-            let target_uuid = Uuid::new_v4();
-            let mut target = user_index("idx_a", target_uuid);
-            // Declared but never trained: covers nothing that still exists.
-            target.fragment_bitmap = Some(RoaringBitmap::new());
-            let mut after = vec![
-                target,
-                user_index("idx_b", Uuid::new_v4()),
-                mem_wal_index(MemWalIndexDetails {
-                    compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                    index_catchup: vec![IndexCatchupProgress::new(
-                        "idx_a".to_string(),
-                        vec![CompactedSsTable::new(shard, 3)],
-                    )],
-                    ..Default::default()
-                }),
-            ];
-            let before = after.clone();
-
-            let advance = IndexCatchupAdvance {
-                index_name: "idx_a".to_string(),
-                expected_index_segment_uuids: vec![target_uuid],
-                caught_up_generations: vec![CompactedSsTable::new(shard, 9)],
-                expected_fragment_bitmap: RoaringBitmap::new(),
-                // The repair saw a table with one fragment; idx_a covers none of
-                // it. Publishing idx_b in the same commit is no evidence for
-                // idx_a.
-                inspected_fragments: RoaringBitmap::from_iter([0u32]),
-            };
-            let err = apply_coverage(&mut after, &segments_before(&before), &[advance], true)
-                .unwrap_err();
-
-            assert!(err.to_string().contains("does not cover"), "{err}");
-        }
-
-        /// An ordinary index job on a table that requires catch-up must still
-        /// commit -- it loses the coverage entry, it is never refused.
-        #[test]
-        fn an_ordinary_index_job_is_never_blocked() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
-            let mut after = before.clone();
-            after[0] = user_index("vec_idx", Uuid::new_v4());
-
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            assert_eq!(coverage_for(&after, "vec_idx"), None, "coverage dropped");
-        }
-
-        /// A table with no MemWAL system index never reaches the protocol, so an
-        /// index job on an ordinary table is untouched by any of this.
-        #[test]
-        fn a_table_without_mem_wal_is_untouched() {
-            let uuid = Uuid::new_v4();
-            let before = vec![user_index("vec_idx", uuid)];
-            let mut after = before.clone();
-            after[0] = user_index("vec_idx", Uuid::new_v4());
-            let expected = after.clone();
-
-            apply_coverage(&mut after, &segments_before(&before), &[], true).unwrap();
-
-            assert_eq!(after, expected, "index list must be byte-identical");
-        }
-
-        /// A MemWAL table that has not been migrated keeps legacy behaviour: an
-        /// index job neither loses coverage nor is refused.
-        #[test]
-        fn a_legacy_mem_wal_table_is_untouched_by_an_index_job() {
-            let (shard, uuid) = (Uuid::new_v4(), Uuid::new_v4());
-            let before = table(shard, 10, "vec_idx", 5, uuid);
-            let mut after = before.clone();
-            after[0] = user_index("vec_idx", Uuid::new_v4());
-            let expected = after.clone();
-
-            apply_coverage(&mut after, &segments_before(&before), &[], false).unwrap();
-
-            assert_eq!(after, expected, "index list must be byte-identical");
-        }
-
-        #[test]
-        fn index_catchup_advance_round_trips_through_protobuf() {
-            let advance = IndexCatchupAdvance {
-                index_name: "vec_idx".to_string(),
-                expected_index_segment_uuids: vec![Uuid::new_v4(), Uuid::new_v4()],
-                caught_up_generations: vec![
-                    CompactedSsTable::new(Uuid::new_v4(), 3),
-                    CompactedSsTable::new(Uuid::new_v4(), 9),
-                ],
-                expected_fragment_bitmap: RoaringBitmap::from_iter([0u32, 7, 42]),
-                inspected_fragments: RoaringBitmap::from_iter([0u32, 7, 42]),
-            };
-
-            let encoded = pb::transaction::create_index::IndexCatchupAdvance::from(&advance);
-            let decoded = IndexCatchupAdvance::try_from(encoded).unwrap();
-
-            assert_eq!(decoded, advance);
+            let read = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
+            let mut first = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
+            let mut second = first.clone();
+            apply(&mut first, &read, &[0, 1], &read, true).unwrap();
+            apply(&mut second, &read, &[0, 1], &read, true).unwrap();
+            assert_eq!(coverage_for(&first, "idx"), coverage_for(&second, "idx"));
         }
     }
 }
