@@ -8,7 +8,7 @@ use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    UpdateMap, UpdateMapEntry, UpdateMode,
+    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::datatypes::Schema;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -413,6 +413,31 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .ok()
                     .map(|py_mode| py_mode.0);
 
+                // Absent on objects predating the field.
+                let updated_fragment_offsets = ob
+                    .getattr("updated_fragment_offsets")
+                    .ok()
+                    .map(|v| v.extract::<Option<HashMap<u64, Vec<u8>>>>())
+                    .transpose()?
+                    .flatten()
+                    .map(|offsets| {
+                        offsets
+                            .into_iter()
+                            .map(|(frag_id, bytes)| {
+                                RoaringBitmap::deserialize_from(&bytes[..])
+                                    .map(|bitmap| (frag_id, bitmap))
+                                    .map_err(|e| {
+                                        PyValueError::new_err(format!(
+                                            "updated_fragment_offsets[{frag_id}]: invalid \
+                                             portable RoaringBitmap bytes: {e}"
+                                        ))
+                                    })
+                            })
+                            .collect::<PyResult<HashMap<_, _>>>()
+                    })
+                    .transpose()?
+                    .map(UpdatedFragmentOffsets);
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
@@ -422,7 +447,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
-                    updated_fragment_offsets: None,
+                    updated_fragment_offsets,
                 };
                 Ok(Self(op))
             }
@@ -434,7 +459,18 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .extract::<Vec<PyLance<Fragment>>>()?;
                 let fragments = fragments.into_iter().map(|f| f.0).collect();
 
-                let op = Operation::Merge { schema, fragments };
+                // Absent on objects predating the field: no assertion, which
+                // conservatively conflicts.
+                let preserves_nullability = ob
+                    .getattr("preserves_nullability")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(false);
+
+                let op = Operation::Merge {
+                    schema,
+                    fragments,
+                    preserves_nullability,
+                };
                 Ok(Self(op))
             }
             "Restore" => {
@@ -482,8 +518,17 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             }
             "Project" => {
                 let schema = extract_schema(&ob.getattr("schema")?)?;
+                // Absent on objects predating the field: no assertion, which
+                // conservatively conflicts.
+                let preserves_nullability = ob
+                    .getattr("preserves_nullability")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(false);
 
-                let op = Operation::Project { schema };
+                let op = Operation::Project {
+                    schema,
+                    preserves_nullability,
+                };
                 Ok(Self(op))
             }
             "UpdateConfig" => {
@@ -581,6 +626,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 fields_modified,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                updated_fragment_offsets,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -598,6 +644,21 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     },
                     None => "rewrite_rows",
                 };
+                let updated_fragment_offsets =
+                    updated_fragment_offsets
+                        .as_ref()
+                        .map(|UpdatedFragmentOffsets(offsets)| {
+                            offsets
+                                .iter()
+                                .map(|(frag_id, bitmap)| {
+                                    let mut buf = Vec::with_capacity(bitmap.serialized_size());
+                                    bitmap
+                                        .serialize_into(&mut buf)
+                                        .expect("RoaringBitmap serialization cannot fail");
+                                    (*frag_id, buf)
+                                })
+                                .collect::<HashMap<u64, Vec<u8>>>()
+                        });
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -608,6 +669,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_modified,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
+                    updated_fragment_offsets,
                 ))
             }
             Operation::DataReplacement { replacements } => {
@@ -636,13 +698,17 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Delete class");
                 cls.call1((updated_fragments, deleted_fragment_ids, predicate))
             }
-            Operation::Merge { fragments, schema } => {
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability,
+            } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Merge")
                     .expect("Failed to get Merge class");
-                cls.call1((fragments_py, schema_py))
+                cls.call1((fragments_py, schema_py, *preserves_nullability))
             }
             Operation::Restore { version } => {
                 let cls = namespace
@@ -674,12 +740,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get CreateIndex class");
                 cls.call1((new_indices_py, removed_indices_py))
             }
-            Operation::Project { schema } => {
+            Operation::Project {
+                schema,
+                preserves_nullability,
+            } => {
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Project")
                     .expect("Failed to get Project class");
-                cls.call1((schema_py,))
+                cls.call1((schema_py, *preserves_nullability))
             }
             Operation::ReserveFragments { num_fragments } => {
                 if let Ok(cls) = namespace.getattr("ReserveFragments") {

@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::Schema;
@@ -19,7 +22,10 @@ use datafusion::{
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
-use lance_core::{Error, ROW_ADDR, ROW_ID};
+use lance_core::{
+    Error, ROW_ADDR, ROW_ID,
+    datatypes::{BLOB_V2_LOGICAL_TYPE, BlobV2Layout},
+};
 use lance_table::format::RowIdMeta;
 use roaring::RoaringTreemap;
 
@@ -29,7 +35,7 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
+    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
     format_key_values_on_columns, resolve_target_bases,
 };
 use crate::{
@@ -49,46 +55,58 @@ use crate::{
 
 use super::apply_deletions;
 
-fn blob_v2_user_view_schema(
+fn descriptor_to_logical_blob_schema(
     input_schema: arrow_schema::SchemaRef,
     dataset_schema: &lance_core::datatypes::Schema,
-) -> arrow_schema::SchemaRef {
+) -> lance_core::Result<arrow_schema::SchemaRef> {
     let fields = input_schema
         .fields()
         .iter()
-        .map(|field| {
+        .map(|field| -> lance_core::Result<_> {
             let Some(dataset_field) = dataset_schema
                 .field(field.name())
                 .filter(|dataset_field| dataset_field.is_blob_v2())
             else {
-                return field.clone();
+                return Ok(field.clone());
             };
-            let is_descriptor = matches!(
-                field.data_type(),
-                arrow_schema::DataType::Struct(fields)
-                    if fields.iter().any(|child| child.name() == "kind")
-            );
-            if !is_descriptor {
-                return field.clone();
-            }
-            let logical_field = arrow_schema::Field::from(dataset_field);
-            Arc::new(
-                arrow_schema::Field::new(
+            let arrow_schema::DataType::Struct(fields) = field.data_type() else {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 merge input '{}' has non-struct type {}; expected logical or descriptor layout",
                     field.name(),
-                    lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
-                    field.is_nullable(),
-                )
-                .with_metadata(logical_field.metadata().clone()),
-            )
+                    field.data_type()
+                )));
+            };
+            match BlobV2Layout::classify(fields) {
+                Some(BlobV2Layout::Logical) => Ok(field.clone()),
+                Some(BlobV2Layout::Descriptor) => {
+                    let logical_field = arrow_schema::Field::from(dataset_field);
+                    Ok(Arc::new(
+                        arrow_schema::Field::new(
+                            field.name(),
+                            BLOB_V2_LOGICAL_TYPE.clone(),
+                            field.is_nullable(),
+                        )
+                        .with_metadata(logical_field.metadata().clone()),
+                    ))
+                }
+                Some(actual) => Err(Error::invalid_input(format!(
+                    "Blob v2 merge input '{}' has {actual} layout; expected logical or descriptor layout",
+                    field.name()
+                ))),
+                None => Err(Error::invalid_input(format!(
+                    "Blob v2 merge input '{}' has unrecognized layout {fields:?}; expected logical or descriptor layout",
+                    field.name()
+                ))),
+            }
         })
-        .collect::<Vec<_>>();
-    Arc::new(arrow_schema::Schema::new_with_metadata(
+        .collect::<lance_core::Result<Vec<_>>>()?;
+    Ok(Arc::new(arrow_schema::Schema::new_with_metadata(
         fields
             .iter()
             .map(|field| field.as_ref().clone())
             .collect::<Vec<_>>(),
         input_schema.metadata().clone(),
-    ))
+    )))
 }
 
 /// Shared state for merge insert operations to simplify lock management
@@ -105,6 +123,8 @@ struct MergeState {
     stable_row_ids: bool,
     /// Set to track processed row IDs to detect duplicates
     processed_row_ids: HashSet<u64>,
+    /// Set to track non-null keys of rows inserted by FirstSeen mode
+    processed_insert_keys: InsertedKeyTracker,
     /// The "on" column names for merge operation
     on_columns: Vec<String>,
     /// How to handle duplicate source rows
@@ -126,6 +146,7 @@ impl MergeState {
             metrics,
             stable_row_ids,
             processed_row_ids: HashSet::new(),
+            processed_insert_keys: InsertedKeyTracker::default(),
             on_columns,
             source_dedupe_behavior,
         }
@@ -208,7 +229,15 @@ impl MergeState {
                 Ok(Some(row_idx)) // Keep this row for writing
             }
             Action::Insert => {
-                // Insert action - just insert new data
+                if self.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen
+                    && !self
+                        .processed_insert_keys
+                        .insert(batch, row_idx, &self.on_columns)?
+                {
+                    self.metrics.num_skipped_duplicates.add(1);
+                    return Ok(None);
+                }
+
                 // Capture the key value for conflict detection (only for inserts, not updates)
                 if let Some(key_value) =
                     extract_key_value_from_batch(batch, row_idx, &self.on_columns)
@@ -253,6 +282,7 @@ pub struct FullSchemaMergeInsertExec {
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
+    source_skipped_duplicates: Arc<AtomicU64>,
     /// Whether the ON columns match the schema's unenforced primary key.
     /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
     is_primary_key: bool,
@@ -263,6 +293,7 @@ impl FullSchemaMergeInsertExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
+        source_skipped_duplicates: Arc<AtomicU64>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -296,6 +327,7 @@ impl FullSchemaMergeInsertExec {
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
             inserted_rows_filter: Arc::new(Mutex::new(None)),
+            source_skipped_duplicates,
             is_primary_key,
         })
     }
@@ -866,6 +898,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
             inserted_rows_filter: self.inserted_rows_filter.clone(),
+            source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             is_primary_key: self.is_primary_key,
         }))
     }
@@ -913,7 +946,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             .any(|field| field.is_blob_v2());
         let input_stream = if has_blob_v2_columns {
             let input_schema = input_stream.schema();
-            let output_schema = blob_v2_user_view_schema(input_schema, self.dataset.schema());
+            let output_schema =
+                descriptor_to_logical_blob_schema(input_schema, self.dataset.schema())
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
             let dataset = self.dataset.clone();
             let dataset_schema = self.dataset.schema().clone();
             let transformed = input_stream.then(move |batch_result| {
@@ -963,6 +998,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
+        let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -975,6 +1011,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
+                dataset.manifest.data_storage_format.lance_file_format(),
                 Some(&dataset),
                 dataset.object_store.clone(),
                 &dataset.base,
@@ -1005,7 +1042,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
                     for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                         let serialized = lance_table::rowids::write_row_ids(&sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
                     }
                 }
                 Ok(())
@@ -1091,7 +1128,15 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .add(total_files_written);
 
                 // Get the final stats from the shared state
-                let stats = MergeStats::from(&merge_state.metrics);
+                let mut stats = MergeStats::from(&merge_state.metrics);
+                stats.num_skipped_duplicates = stats
+                    .num_skipped_duplicates
+                    .checked_add(source_skipped_duplicates.load(Ordering::Relaxed))
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "merge insert skipped duplicate count overflowed u64".to_string(),
+                        )
+                    })?;
 
                 if let Ok(mut transaction_guard) = transaction_holder.lock() {
                     transaction_guard.replace(transaction);
@@ -1125,6 +1170,27 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 mod tests {
     use super::*;
     use arrow_array::UInt64Array;
+
+    #[test]
+    fn test_descriptor_to_logical_blob_schema_rejects_prepared_layout() {
+        let logical_field = crate::blob::blob_field("blob", true);
+        let dataset_schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![logical_field.clone()]))
+                .unwrap();
+        let prepared_field = arrow_schema::Field::new(
+            "blob",
+            lance_core::datatypes::BLOB_V2_PREPARED_TYPE.clone(),
+            true,
+        )
+        .with_metadata(logical_field.metadata().clone());
+        let input_schema = Arc::new(Schema::new(vec![prepared_field]));
+
+        let error = descriptor_to_logical_blob_schema(input_schema, &dataset_schema).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Blob v2 merge input 'blob' has prepared layout; expected logical or descriptor layout"
+        ));
+    }
 
     #[test]
     fn test_merge_state_duplicate_rowid_detection_fail() {

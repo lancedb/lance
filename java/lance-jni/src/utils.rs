@@ -12,7 +12,7 @@ use lance::dataset::optimize::{CompactionMode, CompactionOptions};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::LanceFileVersion;
 use lance_index::IndexParams;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;

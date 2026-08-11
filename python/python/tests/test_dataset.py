@@ -1551,13 +1551,20 @@ def test_get_fragments(tmp_path: Path):
 def test_pickle_fragment(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
+    storage_options = {"allow_http": "true"}
+    lance.write_dataset(table, base_dir, storage_options=storage_options)
 
-    dataset = lance.dataset(base_dir)
+    dataset = lance.dataset(base_dir, storage_options=storage_options)
     fragment = dataset.get_fragments()[0]
-    pickled = pickle.dumps(fragment)
+    with mock.patch.object(
+        lance.LanceDataset,
+        "__init__",
+        side_effect=AssertionError("pickling reopened the dataset"),
+    ):
+        pickled = pickle.dumps(fragment)
     unpickled = pickle.loads(pickled)
 
+    assert unpickled._ds._storage_options == storage_options
     assert fragment.to_table() == unpickled.to_table()
 
 
@@ -2076,6 +2083,52 @@ def test_merge_insert_with_commit():
     )
 
 
+def test_update_with_commit_updated_fragment_offsets():
+    table = pa.table({"id": range(10), "updated": [False] * 10})
+    dataset = lance.write_dataset(table, "memory://test")
+
+    updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
+    transaction, _ = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .execute_uncommitted(updates)
+    )
+    assert transaction.operation.updated_fragment_offsets is None
+
+    # Portable RoaringBitmap serializations of {1, 3, 5, 7} and {0, 2, 100000}.
+    offsets = {
+        0: (
+            b"\x3a\x30\x00\x00\x01\x00\x00\x00\x00\x00\x03\x00"
+            b"\x10\x00\x00\x00\x01\x00\x03\x00\x05\x00\x07\x00"
+        ),
+        2: (
+            b"\x3a\x30\x00\x00\x02\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00"
+            b"\x00\x18\x00\x00\x00\x1c\x00\x00\x00\x00\x00\x02\x00\xa0\x86"
+        ),
+    }
+    transaction.operation.updated_fragment_offsets = offsets
+
+    dataset = lance.LanceDataset.commit(dataset, transaction)
+    read_back = dataset.read_transaction(dataset.version)
+    assert read_back.operation.updated_fragment_offsets == offsets
+
+
+def test_update_with_commit_rejects_invalid_offset_bytes():
+    table = pa.table({"id": range(10), "updated": [False] * 10})
+    dataset = lance.write_dataset(table, "memory://test")
+
+    updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
+    transaction, _ = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .execute_uncommitted(updates)
+    )
+    transaction.operation.updated_fragment_offsets = {0: b"not a bitmap"}
+
+    with pytest.raises(ValueError, match="RoaringBitmap"):
+        lance.LanceDataset.commit(dataset, transaction)
+
+
 def test_merge_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -2277,8 +2330,13 @@ def test_deletion_file(tmp_path: Path):
     assert re.match(
         "_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file.path(0)
     )
-    operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
+    # Delete, not Overwrite: the deletion file belongs to fragment 0 of this
+    # dataset, and an overwrite's fragments are newly written ones that get fresh
+    # ids, which a deletion file cannot follow.
+    operation = lance.LanceOperation.Delete([new_fragment], [], "a < 10")
+    dataset = lance.LanceDataset.commit(
+        base_dir, operation, read_version=dataset.version
+    )
     assert dataset.count_rows() == 90
 
 
@@ -3007,6 +3065,42 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 350
     check_merge_stats(merge_dict, (0, 350, 0))
+
+
+def test_indexed_merge_insert_deduplicates_cross_batch_candidates(tmp_path: Path):
+    target = pa.table(
+        {
+            "a": [1, 1, 2, 2],
+            "b": [10, 20, 10, 20],
+            "value": [110, 120, 210, 220],
+        }
+    )
+    dataset = lance.write_dataset(target, tmp_path / "dataset")
+    dataset.create_scalar_index("a", "BTREE")
+    dataset.create_scalar_index("b", "BTREE")
+
+    first = pa.RecordBatch.from_pydict(
+        {"a": [1], "b": [10], "value": [901]}, schema=target.schema
+    )
+    # The per-column index probe for this batch also reaches (1, 10), which
+    # was already emitted for the first batch. The exact join filters that
+    # over-match, but the indexed scan must not read the target row twice.
+    second = pa.RecordBatch.from_pydict(
+        {"a": [1, 2], "b": [20, 10], "value": [902, 903]},
+        schema=target.schema,
+    )
+    source = pa.RecordBatchReader.from_batches(target.schema, [first, second])
+
+    stats = dataset.merge_insert(["a", "b"]).when_matched_update_all().execute(source)
+
+    check_merge_stats(stats, (0, 3, 0))
+    assert (
+        dataset.to_table().sort_by([("a", "ascending"), ("b", "ascending")]).to_pydict()
+    ) == {
+        "a": [1, 1, 2, 2],
+        "b": [10, 20, 10, 20],
+        "value": [901, 902, 903, 220],
+    }
 
 
 def test_merge_insert_vector_column(tmp_path: Path):

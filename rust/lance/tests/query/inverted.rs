@@ -230,6 +230,57 @@ fn expected_bm25_score(
 }
 
 #[tokio::test]
+async fn test_row_document_raw_list_is_consistent_across_index_coverage() {
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![0])) as ArrayRef),
+        ("tags", string_lists(&[Some(vec![Some("a"), Some("b")])])),
+    ])
+    .unwrap();
+    let test_dir = tempfile::tempdir().unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        test_dir.path().to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    ds.create_index(
+        &["tags"],
+        IndexType::Inverted,
+        None,
+        &params_for("raw", false, false),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let appended = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        ("tags", string_lists(&[Some(vec![Some("a"), Some("b")])])),
+    ])
+    .unwrap();
+    ds = InsertBuilder::new(Arc::new(ds))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+
+    let joined = run_fts(&ds, row_match("tags", "a b"), None).await;
+    assert_eq!(
+        joined["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1]
+    );
+    let element = run_fts(&ds, row_match("tags", "a"), None).await;
+    assert_eq!(element.num_rows(), 0);
+}
+
+#[tokio::test]
 async fn test_element_document_fts_flat_indexed_and_mixed() {
     let ids = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5]));
     let tags = string_lists(&[

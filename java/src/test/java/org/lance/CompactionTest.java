@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.compaction.Compaction;
 import org.lance.compaction.CompactionMetrics;
+import org.lance.compaction.CompactionMode;
 import org.lance.compaction.CompactionOptions;
 import org.lance.compaction.CompactionPlan;
 import org.lance.compaction.CompactionTask;
@@ -23,6 +24,8 @@ import org.lance.compaction.RewriteResult;
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -139,6 +142,40 @@ public class CompactionTest {
         dataset.checkoutLatest();
         assertEquals(1, dataset.getFragments().size());
         assertEquals(11, dataset.getFragments().get(0).countRows());
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(CompactionMode.class)
+  public void testCompactionModeRoundTrip(CompactionMode mode, @TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("test_dataset_for_compaction").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        CompactionOptions compactionOptions =
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withNumThreads(1)
+                .withCompactionMode(mode)
+                .build();
+        CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
+
+        // The plan's options are rebuilt by the native layer; the mode must come
+        // back as a CompactionMode enum, not a raw String.
+        assertEquals(
+            Optional.of(mode.getValue()),
+            compactionPlan.getCompactionOptions().getCompactionMode());
+
+        CompactionTask task = serializeAndDeserialize(compactionPlan.getCompactionTasks().get(0));
+        RewriteResult result = task.execute(dataset);
+        assertEquals(2, result.getMetrics().getFragmentsRemoved());
+        assertEquals(1, result.getMetrics().getFragmentsAdded());
       }
     }
   }

@@ -319,7 +319,7 @@ async fn try_read_manifest_at(
 pub(crate) async fn write_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
-    transaction: &Transaction,
+    transaction: &pb::Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
     let path = base_path
@@ -327,12 +327,19 @@ pub(crate) async fn write_transaction_file(
         .join(TRANSACTIONS_DIR)
         .join(file_name.as_str());
 
-    let message = pb::Transaction::from(transaction);
-    let buf = message.encode_to_vec();
+    let buf = transaction.encode_to_vec();
     object_store.put(&path, &buf).await?;
 
     Ok(file_name)
 }
+
+/// Transactions serialized above this size are not inlined into the manifest.
+#[cfg(not(test))]
+pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 20 * 1024 * 1024;
+/// Smaller threshold for unit tests so spill coverage does not need
+/// multi-megabyte payloads.
+#[cfg(test)]
+pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
@@ -346,8 +353,11 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let pb_transaction = pb::Transaction::from(transaction);
+    let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, transaction).await?
+        write_transaction_file(object_store, base_path, &pb_transaction).await?
     } else {
         String::new()
     };
@@ -421,7 +431,7 @@ async fn do_commit_new_dataset(
                 (!transaction_file.is_empty()).then_some(transaction_file.clone());
             let mut new_frags = new_manifest.fragments.as_ref().clone();
             for f in &mut new_frags {
-                for df in &mut f.files {
+                for df in f.referenced_lance_files_mut() {
                     df.base_id = None;
                 }
                 if let Some(d) = f.deletion_file.as_mut() {
@@ -466,7 +476,7 @@ async fn do_commit_new_dataset(
         },
         write_config,
         manifest_naming_scheme,
-        Some(transaction),
+        inline_transaction.then(|| pb_transaction.into()),
     )
     .await;
 
@@ -687,6 +697,26 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                 actual_file_version, data_storage_version
             )));
         }
+    }
+    Ok(())
+}
+
+/// Reject a manifest in which two fragments share an id. Per-fragment state is
+/// keyed by fragment id — deletion file paths, cached row id sequences, row
+/// addresses — so a duplicate makes it ambiguous which rows that state describes.
+///
+/// Runs after the legacy fixups above, so a dataset that needs a rollback for some
+/// other reason is diagnosed with that first. Relies on `build_manifest` leaving
+/// the fragments sorted by id.
+fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
+    if let Some(pair) = manifest.fragments.windows(2).find(|p| p[0].id == p[1].id) {
+        return Err(Error::invalid_input(format!(
+            "The commit would produce two fragments with id {}. Fragment ids must be \
+             unique. Datasets written by Lance 0.16 and earlier may already contain \
+             duplicate ids; those have to be rewritten, or rolled back to a version \
+             without the duplicate.",
+            pair[0].id
+        )));
     }
     Ok(())
 }
@@ -1071,13 +1101,21 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let pb_transaction = pb::Transaction::from(transaction);
+    let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, &dataset.base, transaction).await?
+        write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
     } else {
         String::new()
     };
+
+    // The inline copy is moved into the first commit attempt; a retry (only on
+    // a random-version collision) rebuilds it instead of cloning up front.
+    let mut inline_tx: Option<lance_table::format::Transaction> =
+        inline_transaction.then(|| pb_transaction.into());
 
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
@@ -1116,6 +1154,7 @@ pub(crate) async fn do_commit_detached_transaction(
         fix_schema(&mut manifest)?;
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
+        check_fragment_ids(&manifest)?;
         migrate_indices(dataset, &mut indices).await?;
 
         // Try to commit the manifest
@@ -1131,7 +1170,7 @@ pub(crate) async fn do_commit_detached_transaction(
             },
             write_config,
             ManifestNamingScheme::V2,
-            Some(transaction),
+            inline_tx.take(),
         )
         .await;
 
@@ -1180,6 +1219,9 @@ pub(crate) async fn do_commit_detached_transaction(
                     cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
                     return Err(error);
                 }
+                // The inline copy was moved into the failed attempt; rebuild
+                // it for the retry with a new random version.
+                inline_tx = inline_transaction.then(|| pb::Transaction::from(transaction).into());
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(
@@ -1385,8 +1427,13 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
+        // Recomputed every attempt: the rebase above may have rewritten the
+        // transaction.
+        let pb_transaction = pb::Transaction::from(&transaction);
+        let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+
         current_transaction_file = if !write_config.disable_transaction_file() {
-            write_transaction_file(object_store, &dataset.base, &transaction).await?
+            write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
         } else {
             String::new()
         };
@@ -1435,6 +1482,7 @@ pub(crate) async fn commit_transaction(
 
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
+        check_fragment_ids(&manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
 
@@ -1451,7 +1499,7 @@ pub(crate) async fn commit_transaction(
             },
             write_config,
             manifest_naming_scheme,
-            Some(&transaction),
+            inline_transaction.then(|| pb_transaction.into()),
         )
         .await;
 
@@ -1624,6 +1672,7 @@ mod tests {
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
+        commit_handler_from_url,
     };
     use lance_testing::datagen::generate_random_array;
 
@@ -1771,9 +1820,13 @@ mod tests {
             Some("hello world".to_string()),
         );
 
-        let file_name = write_transaction_file(&object_store, &base_path, &transaction)
-            .await
-            .unwrap();
+        let file_name = write_transaction_file(
+            &object_store,
+            &base_path,
+            &pb::Transaction::from(&transaction),
+        )
+        .await
+        .unwrap();
         let read_transaction = read_transaction_file(&object_store, &base_path, &file_name)
             .await
             .unwrap();
@@ -2310,6 +2363,44 @@ mod tests {
             extra = txn_files_after.saturating_sub(txn_files_before),
         );
     }
+
+    #[tokio::test]
+    async fn test_cos_commit_failure_preserves_error_and_cleans_up_transaction() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let batch = simple_batch(&schema, vec![1, 2, 3]);
+        let commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+            .await
+            .unwrap();
+        let params = WriteParams {
+            commit_handler: Some(commit_handler),
+            ..Default::default()
+        };
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(params),
+        )
+        .await
+        .expect_err("the default Tencent COS handler should reject writes");
+
+        assert!(
+            matches!(&error, Error::NotSupported { .. }),
+            "expected NotSupported, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("distributed commit_lock"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            count_txn_files(uri),
+            0,
+            "a definitively failed COS commit must clean up its transaction file"
+        );
+    }
+
     fn simple_batch(schema: &Arc<ArrowSchema>, values: Vec<i32>) -> RecordBatch {
         RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
     }
