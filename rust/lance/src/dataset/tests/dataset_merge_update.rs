@@ -6,14 +6,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::vec;
 
+use crate::dataset::CommitBuilder;
 use crate::dataset::ROW_ID;
 use crate::dataset::WriteDestination;
+use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder};
 use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
-use lance_core::ROW_ADDR;
+use lance_core::{ROW_ADDR, ROW_LAST_UPDATED_AT_VERSION};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
@@ -28,7 +31,7 @@ use arrow_array::RecordBatch;
 use arrow_array::{Array, LargeBinaryArray, StructArray};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray,
-    types::Int32Type,
+    types::{Int32Type, UInt64Type},
 };
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_arrow::BLOB_META_KEY;
@@ -36,6 +39,7 @@ use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{BasePath, DataFile, Fragment};
 
@@ -829,6 +833,7 @@ async fn test_datafile_partial_replacement() {
         Operation::Merge {
             fragments: vec![fragment],
             schema: extended_schema.as_ref().try_into().unwrap(),
+            preserves_nullability: true,
         },
         Some(2),
         None,
@@ -1015,6 +1020,7 @@ async fn test_datafile_replacement_error() {
         Operation::Merge {
             fragments: vec![fragment],
             schema: extended_schema.as_ref().try_into().unwrap(),
+            preserves_nullability: true,
         },
         Some(2),
         None,
@@ -2142,6 +2148,87 @@ async fn test_merge_insert_flat_index_stable_row_id_multiple_indexes() {
     );
 }
 
+#[tokio::test]
+async fn test_data_replacement_advances_row_lineage() {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "value",
+        DataType::Int32,
+        true,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let replacement = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20]))],
+    )
+    .unwrap();
+    let object_writer = dataset
+        .object_store
+        .create(&Path::from("data/lineage_replacement.lance"))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_1::create_writer(
+        object_writer,
+        schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&replacement).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let frag = dataset.get_fragment(0).unwrap();
+    let mut new_data_file = frag.data_file_for_field(0).unwrap().clone();
+    new_data_file.path = "lineage_replacement.lance".to_string();
+
+    let read_version = dataset.version().version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, new_data_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.version().version, 2);
+
+    // The rows read differently now, so their last-updated stamp has to name
+    // the version that changed them or get_updated_rows will never see them.
+    let batch = dataset
+        .scan()
+        .project(&["value", ROW_LAST_UPDATED_AT_VERSION])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        batch["value"].as_primitive::<Int32Type>().values(),
+        &[10, 20]
+    );
+    assert_eq!(
+        batch[ROW_LAST_UPDATED_AT_VERSION]
+            .as_primitive::<UInt64Type>()
+            .values(),
+        &[2, 2]
+    );
+}
+
 /// DataReplacement should invalidate index fragment bitmaps for replaced fields.
 #[tokio::test]
 async fn test_data_replacement_invalidates_index_bitmap() {
@@ -2395,6 +2482,7 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
         Operation::Merge {
             fragments: vec![overlay],
             schema: schema.as_ref().try_into().unwrap(),
+            preserves_nullability: true,
         },
         Some(read_version),
         None,
@@ -4291,4 +4379,507 @@ async fn test_merge_insert_target_all_bases() {
     for row in expected_new {
         assert!(all_rows.contains(&row), "missing row {:?}", row);
     }
+}
+
+/// A write landing between the tightening scan and its commit falsifies the
+/// claim, leaving a table that validates but cannot be scanned.
+#[rstest]
+#[case::tightening_conflicts(true, true)]
+#[case::rename_does_not(false, false)]
+#[tokio::test]
+async fn test_alter_columns_conflicts_only_when_asserting(
+    #[case] tighten: bool,
+    #[case] expect_conflict: bool,
+) {
+    let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    // Leave the first handle a version behind, so the alteration commits stale.
+    let appended = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![
+            arrow_array::record_batch!(("value", Int32, [3])).unwrap(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(appended.version().version, 2);
+
+    let mut stale = dataset;
+    let alteration = if tighten {
+        ColumnAlteration::new("value".into()).set_nullable(false)
+    } else {
+        ColumnAlteration::new("value".into()).rename("renamed".into())
+    };
+    let result = stale.alter_columns(&[alteration]).await;
+    assert_eq!(
+        result.is_err(),
+        expect_conflict,
+        "tighten={tighten}: got {result:?}"
+    );
+}
+
+/// read_version is the version the data was validated against. Declaring it
+/// honestly puts a later tightening inside the conflict window; declaring a
+/// later version skips the checks, which is a caller bug, not a guarantee.
+#[rstest]
+#[case::honest_read_version_conflicts(1, true)]
+#[case::misdeclared_read_version_commits(2, false)]
+#[tokio::test]
+async fn test_stale_append_protection_follows_read_version(
+    #[case] declared: u64,
+    #[case] expect_conflict: bool,
+) {
+    let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let dataset = Arc::new(Dataset::write(reader, "memory://", None).await.unwrap());
+
+    let mut tightened = dataset.schema().clone();
+    tightened.fields[0].nullable = false;
+    let tightened = Dataset::commit(
+        WriteDestination::Dataset(dataset.clone()),
+        Operation::Project {
+            schema: tightened,
+            preserves_nullability: false,
+        },
+        Some(dataset.version().version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(tightened.version().version, 2);
+
+    let mut append = InsertBuilder::new(WriteDestination::Dataset(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+    append.read_version = declared;
+
+    let result = CommitBuilder::new(Arc::new(tightened))
+        .execute(append)
+        .await;
+    assert_eq!(
+        result.is_err(),
+        expect_conflict,
+        "declared={declared}: got {result:?}"
+    );
+}
+
+/// A field added and tightened after the write snapshot: the tightening's
+/// claim is in the honest conflict window, so the operation-wide barrier
+/// rejects the stale append. Added-but-nullable commits, since synthesized
+/// nulls are legal there.
+#[rstest]
+#[case::added_then_tightened(true, true)]
+#[case::added_still_nullable(false, false)]
+#[tokio::test]
+async fn test_stale_append_vs_field_added_since(
+    #[case] tighten: bool,
+    #[case] expect_conflict: bool,
+) {
+    let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let dataset = Arc::new(Dataset::write(reader, "memory://", None).await.unwrap());
+
+    let append = InsertBuilder::new(WriteDestination::Dataset(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+
+    let mut latest = dataset.as_ref().clone();
+    latest
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                "new_value".to_string(),
+                "value".to_string(),
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    if tighten {
+        latest
+            .alter_columns(&[ColumnAlteration::new("new_value".into()).set_nullable(false)])
+            .await
+            .unwrap();
+    }
+
+    let result = CommitBuilder::new(Arc::new(latest)).execute(append).await;
+    assert_eq!(
+        result.is_err(),
+        expect_conflict,
+        "tighten={tighten}: got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_alter_columns_rejects_cast_with_tightening() {
+    let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    let err = dataset
+        .alter_columns(&[ColumnAlteration::new("value".into())
+            .set_nullable(false)
+            .cast_to(DataType::Int64)])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("same call"), "got: {err}");
+
+    // Separately, both succeed.
+    dataset
+        .alter_columns(&[ColumnAlteration::new("value".into()).cast_to(DataType::Int64)])
+        .await
+        .unwrap();
+    dataset
+        .alter_columns(&[ColumnAlteration::new("value".into()).set_nullable(false)])
+        .await
+        .unwrap();
+}
+
+/// A merge introducing a non-nullable column claims non-null, so a stale
+/// append, whose fragments omit the column and would read as null, conflicts.
+/// A nullable column keeps the long-standing behavior: the append commits and
+/// its rows legally read as null.
+#[rstest]
+#[case::required_column_conflicts("1", true)]
+#[case::nullable_column_commits("value", false)]
+#[tokio::test]
+async fn test_stale_append_vs_column_added_by_merge(
+    #[case] expression: &str,
+    #[case] expect_conflict: bool,
+) {
+    let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let dataset = Arc::new(Dataset::write(reader, "memory://", None).await.unwrap());
+
+    let append = InsertBuilder::new(WriteDestination::Dataset(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+
+    // A literal is non-nullable; a projection of a nullable column is nullable.
+    let mut latest = dataset.as_ref().clone();
+    latest
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                "new_value".to_string(),
+                expression.to_string(),
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let result = CommitBuilder::new(Arc::new(latest)).execute(append).await;
+    assert_eq!(
+        result.is_err(),
+        expect_conflict,
+        "expression={expression}: got {result:?}"
+    );
+    if let Ok(committed) = result {
+        committed.scan().try_into_batch().await.unwrap();
+    }
+}
+
+/// A cast rewrites the column under a new field id, so a stale append omits it
+/// and its rows read as null. Casting a non-nullable column therefore claims
+/// non-null and conflicts; casting a nullable one does not.
+#[rstest]
+#[case::cast_of_required_conflicts(true, true)]
+#[case::cast_of_nullable_commits(false, false)]
+#[tokio::test]
+async fn test_stale_append_vs_cast(#[case] tighten_first: bool, #[case] expect_conflict: bool) {
+    let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    if tighten_first {
+        dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).set_nullable(false)])
+            .await
+            .unwrap();
+    }
+
+    // Stage against the pre-cast schema, so the cast lands inside the window.
+    let staged = Arc::new(dataset.clone());
+    let append = InsertBuilder::new(WriteDestination::Dataset(staged.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+
+    dataset
+        .alter_columns(&[ColumnAlteration::new("value".into()).cast_to(DataType::Int64)])
+        .await
+        .unwrap();
+
+    let result = CommitBuilder::new(Arc::new(dataset)).execute(append).await;
+    assert_eq!(
+        result.is_err(),
+        expect_conflict,
+        "tighten_first={tighten_first}: got {result:?}"
+    );
+    if let Ok(committed) = result {
+        committed.scan().try_into_batch().await.unwrap();
+    }
+}
+
+/// A subcolumn addition (V2.2+) merges a new child into an existing struct.
+/// Stale rows supply the parent, so a required new child would read as
+/// unmasked null: the merge claims and the stale append conflicts. A nullable
+/// new child under a nullable parent masks itself and keeps appends flowing.
+/// Under a non-nullable parent even a nullable child claims: the reader
+/// synthesizes missing subcolumns against the column's declared nullability,
+/// so the stale fragment could not be read at all.
+#[rstest]
+#[case::required_child_conflicts(true, false, true)]
+#[case::required_child_nullable_parent_conflicts(true, true, true)]
+#[case::nullable_child_nullable_parent_commits(false, true, false)]
+#[case::nullable_child_required_parent_conflicts(false, false, true)]
+#[tokio::test]
+async fn test_stale_append_vs_sub_column_added_by_merge(
+    #[case] child_required: bool,
+    #[case] parent_nullable: bool,
+    #[case] expect_conflict: bool,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "b",
+        DataType::Struct(Fields::from(vec![ArrowField::new(
+            "c",
+            DataType::Int32,
+            true,
+        )])),
+        parent_nullable,
+    )]));
+    let struct_batch = |values: Vec<i32>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("c", DataType::Int32, true)),
+                Arc::new(Int32Array::from(values)) as ArrayRef,
+            )]))],
+        )
+        .unwrap()
+    };
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(struct_batch(vec![1, 2]))], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let append = InsertBuilder::new(WriteDestination::Dataset(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![struct_batch(vec![3])])
+        .await
+        .unwrap();
+
+    let new_child = Arc::new(ArrowField::new("d", DataType::Int32, !child_required));
+    let sub_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "b",
+        DataType::Struct(Fields::from(vec![new_child.as_ref().clone()])),
+        parent_nullable,
+    )]));
+    let sub_batch = RecordBatch::try_new(
+        sub_schema.clone(),
+        vec![Arc::new(StructArray::from(vec![(
+            new_child,
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        )]))],
+    )
+    .unwrap();
+    let mut latest = dataset.as_ref().clone();
+    latest
+        .add_columns(
+            crate::dataset::NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(sub_batch)],
+                sub_schema,
+            ))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let result = CommitBuilder::new(Arc::new(latest)).execute(append).await;
+    assert_eq!(
+        result.is_err(),
+        expect_conflict,
+        "child_required={child_required} parent_nullable={parent_nullable}: got {result:?}"
+    );
+    if let Ok(committed) = result {
+        // The stale rows keep their parent values; the new child reads null.
+        let batch = committed.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        let parent = batch["b"].as_struct();
+        assert_eq!(parent.null_count(), 0);
+        assert_eq!(parent.column_by_name("d").unwrap().null_count(), 1);
+    }
+}
+
+/// The barrier is operation-wide, so a tightening of a nested field conflicts
+/// with a concurrent write exactly like a top-level one.
+#[tokio::test]
+async fn test_alter_columns_nested_tightening_conflicts() {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "b",
+        DataType::Struct(Fields::from(vec![ArrowField::new(
+            "c",
+            DataType::Int32,
+            true,
+        )])),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("c", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        )]))],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Leave the first handle a version behind, so the tightening commits stale.
+    InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+
+    let mut stale = dataset;
+    stale
+        .alter_columns(&[ColumnAlteration::new("b.c".into()).set_nullable(false)])
+        .await
+        .unwrap_err();
+}
+
+/// The invariant every piece of the tightening barrier serves: no interleaving
+/// of honest writers and schema changes may commit a dataset that validates
+/// but cannot be scanned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_tightening_stress() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str().to_string();
+    let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    Dataset::write(reader, uri.as_str(), None).await.unwrap();
+
+    let mut tasks = tokio::task::JoinSet::new();
+
+    // Appenders: honest read versions, half the batches carry nulls. A null
+    // append must either land while the column is nullable or be refused --
+    // by the writer against a non-null schema, or by the claim barrier when a
+    // tightening won the race after the write.
+    for a in 0..4u8 {
+        let uri = uri.clone();
+        tasks.spawn(async move {
+            let mut outcomes = [0u32; 2];
+            for i in 0..12u32 {
+                let with_null = (a as u32 + i).is_multiple_of(2);
+                let batch = if with_null {
+                    arrow_array::record_batch!(("value", Int32, [None, Some(3)])).unwrap()
+                } else {
+                    arrow_array::record_batch!(("value", Int32, [4, 5])).unwrap()
+                };
+                let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+                let result = Dataset::write(
+                    reader,
+                    uri.as_str(),
+                    Some(WriteParams {
+                        mode: WriteMode::Append,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+                outcomes[result.is_ok() as usize] += 1;
+            }
+            outcomes
+        });
+    }
+
+    // The tightener alternates NOT NULL and back. Either step may lose to
+    // concurrent writes; losing is an acceptable outcome, corruption is not.
+    {
+        let uri = uri.clone();
+        tasks.spawn(async move {
+            let mut outcomes = [0u32; 2];
+            for i in 0..10u32 {
+                let Ok(mut dataset) = DatasetBuilder::from_uri(uri.as_str()).load().await else {
+                    continue;
+                };
+                let result = dataset
+                    .alter_columns(
+                        &[ColumnAlteration::new("value".into()).set_nullable(i % 2 == 1)],
+                    )
+                    .await;
+                outcomes[result.is_ok() as usize] += 1;
+            }
+            outcomes
+        });
+    }
+
+    let mut totals = [0u32; 2];
+    while let Some(res) = tasks.join_next().await {
+        let [err, ok] = res.unwrap();
+        totals[0] += err;
+        totals[1] += ok;
+    }
+
+    // The oracle: whatever interleaving happened, the final dataset must be
+    // internally consistent -- validation and scanning agree.
+    let dataset = DatasetBuilder::from_uri(uri.as_str()).load().await.unwrap();
+    dataset.validate().await.unwrap();
+    let scanned = dataset.scan().try_into_batch().await.unwrap();
+    assert!(scanned.num_rows() >= 2);
+    // And every historical version must scan too: a corrupt intermediate
+    // commit would have been the bug even if later commits papered over it.
+    for version in 1..=dataset.version().version {
+        let at = dataset.checkout_version(version).await.unwrap();
+        at.validate().await.unwrap();
+        at.scan().try_into_batch().await.unwrap();
+    }
+    assert!(totals[1] > 0, "nothing succeeded: {totals:?}");
 }

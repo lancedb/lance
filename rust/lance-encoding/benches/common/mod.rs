@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -249,7 +252,7 @@ impl FieldEncodingStrategy for BenchFieldEncodingStrategy {
 
 pub fn encoding_strategy(encoding: BenchEncoding) -> Box<dyn FieldEncodingStrategy> {
     if encoding == BenchEncoding::Array {
-        return Box::new(lance_encoding::array_encoding::ArrayFieldEncodingStrategy::new());
+        return Box::new(lance_encoding::encoder::ArrayFieldEncodingStrategy::new());
     }
 
     let compression = Arc::new(BenchCompressionStrategy {

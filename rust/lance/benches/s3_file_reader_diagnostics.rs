@@ -574,7 +574,7 @@ fn projection_name(columns: &Option<Vec<String>>) -> String {
 
 fn page_layout_kind(encoding: &PageEncoding) -> &'static str {
     match encoding {
-        PageEncoding::Array(_) => "legacy",
+        PageEncoding::Legacy(_) => "legacy",
         PageEncoding::Structural(layout) => match layout.layout.as_ref() {
             Some(pb21::page_layout::Layout::MiniBlockLayout(_)) => "miniblock",
             Some(pb21::page_layout::Layout::ConstantLayout(_)) => "constant",

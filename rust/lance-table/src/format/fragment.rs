@@ -12,7 +12,8 @@ use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::overlay::{DataOverlayFile, sort_overlays_newest_last};
+use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
+use super::row_ids::{ExternalFile, RowIdMeta};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -36,7 +37,7 @@ pub struct DataFile {
     pub fields: Arc<[i32]>,
     /// The offsets of the fields listed in `fields`, empty in v1 files
     ///
-    /// Note that -1 is a possibility and it indices that the field has
+    /// Note that -1 is a possibility and it indicates that the field has
     /// no top-level column in the file.
     ///
     /// Columns that lack a field id may still exist as extra entries in
@@ -182,7 +183,16 @@ impl DataFile {
 
     pub fn validate(&self, base_path: &Path) -> Result<()> {
         if self.uses_v1_data_file_encoding() {
-            if !self.fields.windows(2).all(|w| w[0] < w[1]) {
+            // A tombstone marks a field superseded by a later data file. It is
+            // not a field id, so it carries no ordering; the live ids around it
+            // must still be sorted and distinct.
+            let live: Vec<i32> = self
+                .fields
+                .iter()
+                .copied()
+                .filter(|field| *field != TOMBSTONE_FIELD_ID)
+                .collect();
+            if !live.windows(2).all(|w| w[0] < w[1]) {
                 return Err(Error::corrupt_file(
                     base_path.clone().join(self.path.clone()),
                     "contained unsorted or duplicate field ids",
@@ -445,38 +455,6 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
     }
 }
 
-/// A reference to a part of a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct ExternalFile {
-    pub path: String,
-    pub offset: u64,
-    pub size: u64,
-}
-
-/// Metadata about location of the row id sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub enum RowIdMeta {
-    Inline(Vec<u8>),
-    External(ExternalFile),
-}
-
-impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
-    type Error = Error;
-
-    fn try_from(value: pb::data_fragment::RowIdSequence) -> Result<Self> {
-        match value {
-            pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data)),
-            pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
-                Ok(Self::External(ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                }))
-            }
-        }
-    }
-}
-
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -545,6 +523,51 @@ impl Fragment {
             ) => Some(len - num_deleted_rows),
             _ => None,
         }
+    }
+
+    /// Every Lance-format file this fragment references: the base data files
+    /// plus the data file of each overlay. The fragment's other referenced
+    /// files (deletion files, external row-id files) are not in this format.
+    ///
+    /// Prefer this over `files`, which is the base data files only and so omits
+    /// overlays.
+    pub fn referenced_lance_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
+        // Destructured on purpose: a new field here fails to compile until
+        // someone decides whether it references files.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter()
+            .chain(overlays.iter().map(|overlay| &overlay.data_file))
+    }
+
+    /// Mutable counterpart of [`Self::referenced_lance_files`], for rewriting
+    /// the fields a clone has to normalize (`base_id`) across base and overlay
+    /// files alike.
+    pub fn referenced_lance_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
+        // Destructured for the same reason as `referenced_lance_files`, and so
+        // the two disjoint field borrows are visible to the borrow checker.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter_mut()
+            .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
@@ -708,7 +731,9 @@ impl From<&Fragment> for pb::DataFragment {
         });
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
-            RowIdMeta::Inline(data) => pb::data_fragment::RowIdSequence::InlineRowIds(data.clone()),
+            RowIdMeta::Inline(data) => {
+                pb::data_fragment::RowIdSequence::InlineRowIds(data.to_vec())
+            }
             RowIdMeta::External(file) => {
                 pb::data_fragment::RowIdSequence::ExternalRowIds(pb::ExternalFile {
                     path: file.path.clone(),

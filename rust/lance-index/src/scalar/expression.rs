@@ -20,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -274,6 +274,10 @@ pub struct SargableQueryParser {
     index_name: String,
     index_type: String,
     needs_recheck: bool,
+    /// Whether IS NULL queries need post-filter rechecking. May be false even
+    /// when `needs_recheck` is true for indexes that track exact null positions
+    /// (e.g. zone maps with a null bitmap).
+    is_null_needs_recheck: bool,
     supports_like_prefix: bool,
 }
 
@@ -283,6 +287,7 @@ impl SargableQueryParser {
             index_name,
             index_type,
             needs_recheck,
+            is_null_needs_recheck: needs_recheck,
             supports_like_prefix: true,
         }
     }
@@ -292,6 +297,14 @@ impl SargableQueryParser {
     /// ordinary filtering instead of failing at search time.
     pub fn without_like_prefix(mut self) -> Self {
         self.supports_like_prefix = false;
+        self
+    }
+
+    /// Mark IS NULL as exact so that IS NOT NULL can be served by the index
+    /// without a post-filter. Use this when the index tracks null row addresses
+    /// precisely (e.g. a zone map with a null bitmap).
+    pub fn with_exact_null_tracking(mut self) -> Self {
+        self.is_null_needs_recheck = false;
         self
     }
 }
@@ -362,7 +375,7 @@ impl ScalarQueryParser for SargableQueryParser {
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(SargableQuery::IsNull()),
-            self.needs_recheck,
+            self.is_null_needs_recheck,
         ))
     }
 
@@ -774,6 +787,11 @@ impl ScalarQueryParser for LabelListQueryParser {
         if args.len() != 2 {
             return None;
         }
+        // LABEL_LIST stores unnested items as bitmap keys. Nested items cannot be
+        // ordered by the bitmap lookup, so legacy indexes must fall back to a scan.
+        if validate_label_list_data_type(data_type).is_err() {
+            return None;
+        }
         // DataFusion normalizes array_contains to array_has
         if func.name() == "array_has" {
             let inner_type = match data_type {
@@ -796,34 +814,34 @@ impl ScalarQueryParser for LabelListQueryParser {
         }
 
         let label_list = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::List(list_arr) = label_list {
-            let list_values = list_arr.values();
-            if list_values.is_empty() {
-                return None;
-            }
-            let mut scalars = Vec::with_capacity(list_values.len());
-            for idx in 0..list_values.len() {
-                scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
-            }
-            if func.name() == "array_has_all" {
-                let query = LabelListQuery::HasAllLabels(scalars);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    self.index_type.clone(),
-                    Arc::new(query),
-                ))
-            } else if func.name() == "array_has_any" {
-                let query = LabelListQuery::HasAnyLabel(scalars);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    self.index_type.clone(),
-                    Arc::new(query),
-                ))
-            } else {
-                None
-            }
+        let list_values = match label_list {
+            ScalarValue::List(list_arr) => list_arr.values().clone(),
+            ScalarValue::LargeList(list_arr) => list_arr.values().clone(),
+            _ => return None,
+        };
+        if list_values.is_empty() {
+            return None;
+        }
+        let mut scalars = Vec::with_capacity(list_values.len());
+        for idx in 0..list_values.len() {
+            scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
+        }
+        if func.name() == "array_has_all" {
+            let query = LabelListQuery::HasAllLabels(scalars);
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                self.index_type.clone(),
+                Arc::new(query),
+            ))
+        } else if func.name() == "array_has_any" {
+            let query = LabelListQuery::HasAnyLabel(scalars);
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                self.index_type.clone(),
+                Arc::new(query),
+            ))
         } else {
             None
         }
@@ -838,6 +856,10 @@ pub struct TextQueryParser {
     index_type: String,
     needs_recheck: bool,
     supports_regex: bool,
+    /// The shortest `contains` pattern (in characters, not bytes) the index can
+    /// say anything useful about.  Shorter patterns bypass the index entirely so
+    /// they are answered by a full scan.  Use 0 for indices with no such limit.
+    min_contains_chars: usize,
 }
 
 impl TextQueryParser {
@@ -846,12 +868,14 @@ impl TextQueryParser {
         index_type: String,
         needs_recheck: bool,
         supports_regex: bool,
+        min_contains_chars: usize,
     ) -> Self {
         Self {
             index_name,
             index_type,
             needs_recheck,
             supports_regex,
+            min_contains_chars,
         }
     }
 }
@@ -908,7 +932,16 @@ impl ScalarQueryParser for TextQueryParser {
         };
 
         let query = match func.name() {
-            "contains" if args.len() == 2 => TextQuery::StringContains(pattern),
+            "contains" if args.len() == 2 => {
+                // A pattern shorter than the index's token width produces no
+                // tokens, so the index can only answer "recheck everything".
+                // Leave it to a full scan instead.  The count is in characters
+                // because tokenizers split on characters, not bytes.
+                if pattern.chars().count() < self.min_contains_chars {
+                    return None;
+                }
+                TextQuery::StringContains(pattern)
+            }
             "regexp_like" | "regexp_match" if self.supports_regex => {
                 let pattern = match args.get(2) {
                     Some(flags_expr) => apply_regex_flags(&pattern, flags_expr)?,
@@ -1991,27 +2024,30 @@ fn maybe_column(expr: &Expr) -> Option<&str> {
     }
 }
 
-// Extract the full nested column path from a get_field expression chain
-// For example: get_field(get_field(metadata, "status"), "code") -> "metadata.status.code"
+// Extract the full nested column path from chained or variadic get_field expressions.
+// For example, both get_field(get_field(metadata, "status"), "code") and
+// get_field(metadata, "status", "code") produce "metadata.status.code".
 fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     let mut current_expr = expr;
     let mut parts = Vec::new();
 
-    // Walk up the get_field chain
+    // Walk up the get_field chain. Add variadic arguments in reverse because all
+    // parts are reversed after reaching the base column.
     loop {
         match current_expr {
             Expr::ScalarFunction(udf) if udf.name() == "get_field" => {
-                if udf.args.len() != 2 {
+                if udf.args.len() < 2 {
                     return None;
                 }
-                // Extract the field name from the second argument
-                // The Literal now has two fields: ScalarValue and Option<FieldMetadata>
-                if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = &udf.args[1] {
-                    parts.push(field_name.clone());
-                } else {
-                    return None;
+
+                for field_expr in udf.args[1..].iter().rev() {
+                    if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = field_expr {
+                        parts.push(field_name.clone());
+                    } else {
+                        return None;
+                    }
                 }
-                // Move up to the parent expression
+
                 current_expr = &udf.args[0];
             }
             Expr::Column(col) => {
@@ -2599,13 +2635,14 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_array::Array;
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{Field, Fields, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
     use lance_select::result::IndexExprResultWireFormat;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
@@ -2667,6 +2704,16 @@ mod tests {
             Field::new("price", DataType::Float32, false),
             Field::new("json", DataType::LargeBinary, false),
         ]);
+        check_with_schema(index_info, expr, expected, optimize, schema);
+    }
+
+    fn check_with_schema(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        expected: Option<IndexedExpression>,
+        optimize: bool,
+        schema: Schema,
+    ) {
         let df_schema: DFSchema = schema.try_into().unwrap();
 
         let ctx = get_session_context(&LanceExecutionOptions::default());
@@ -2754,6 +2801,117 @@ mod tests {
             ),
             false,
         )
+    }
+
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))))]
+    fn test_label_list_query_parser(#[case] label_type: DataType) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("labels", label_type, true)]);
+
+        check_with_schema(
+            &index_info,
+            "array_has_any(labels, ['distributed'])",
+            Some(IndexedExpression::index_query(
+                "labels".to_string(),
+                "labels_idx".to_string(),
+                "LabelList".to_string(),
+                Arc::new(LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some(
+                    "distributed".to_string(),
+                ))])),
+            )),
+            true,
+            schema,
+        );
+    }
+
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    fn test_label_list_nested_item(#[case] label_type: DataType) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("labels", label_type, true)]);
+
+        // Nested item types must not produce a scalar index query.
+        check_with_schema(
+            &index_info,
+            "array_has_any(labels, [[1]])",
+            None,
+            true,
+            schema,
+        );
+    }
+
+    #[test]
+    fn test_nested_column_index() {
+        let column = "user_profile.basic.age";
+        let index_info = MockIndexInfoProvider::new(vec![(
+            column,
+            ColInfo::new(
+                DataType::Int32,
+                Box::new(SargableQueryParser::new(
+                    format!("{column}_idx"),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new(
+            "user_profile",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "basic",
+                DataType::Struct(Fields::from(vec![Field::new("age", DataType::Int32, true)])),
+                true,
+            )])),
+            true,
+        )]);
+
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner
+            .parse_filter("user_profile.basic.age > 900")
+            .unwrap();
+        let plan = planner
+            .create_filter_plan(filter, &index_info, true)
+            .unwrap();
+        let expected = IndexedExpression::index_query(
+            column.to_string(),
+            format!("{column}_idx"),
+            "BTree".to_string(),
+            Arc::new(SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(900))),
+                Bound::Unbounded,
+            )),
+        );
+
+        assert_eq!(plan.index_query, expected.scalar_query);
+        assert!(plan.refine_expr.is_none());
     }
 
     #[test]
@@ -4762,6 +4920,44 @@ mod tests {
                 .iter()
                 .any(|leaf| matches!(leaf, ScalarIndexExpr::Not(_)))
         );
+    }
+
+    #[test]
+    fn test_optimize_parser_merges_ranges_for_multiple_columns() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves =
+            optimize_parsed_scalar_filter("x > 10 AND x < 20 AND y > 30 AND y < 40", &index_info);
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "x"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(10))),
+                                Bound::Excluded(ScalarValue::Int64(Some(20))),
+                            ))
+                        )
+            )
+        }));
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "y"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(30))),
+                                Bound::Excluded(ScalarValue::Int64(Some(40))),
+                            ))
+                        )
+            )
+        }));
     }
 
     #[test]

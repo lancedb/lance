@@ -3,12 +3,13 @@
 
 pub mod builder;
 mod cache_codec;
+mod compound;
+mod documents;
 mod encoding;
 mod impact;
 mod index;
 mod iter;
 pub mod json;
-mod lazy_docset;
 pub mod parser;
 pub mod query;
 mod scorer;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
+pub use compound::{compound_search, compound_search_with_base_scorer};
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
@@ -125,7 +127,8 @@ use crate::scalar::{
     CreatedIndex, RowIdRemapper, ScalarIndex,
     expression::{FtsQueryParser, ScalarQueryParser},
     registry::{
-        BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+        BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+        TrainingOrdering, TrainingRequest,
     },
 };
 
@@ -155,6 +158,7 @@ impl InvertedIndexPlugin {
 
         params.validate_format_version()?;
         let format_version = params.resolved_format_version();
+        let is_element_document = params.get_document_granularity().is_list_element();
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
@@ -162,7 +166,11 @@ impl InvertedIndexPlugin {
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: format_version.index_version(),
+            index_version: if is_element_document {
+                INVERTED_INDEX_VERSION_V3
+            } else {
+                format_version.index_version()
+            },
             files,
         })
     }
@@ -303,20 +311,38 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
-            InvertedIndex::load(index_store, frag_reuse_index, cache).await?
-                as Arc<dyn ScalarIndex>,
-        )
+        let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
+        let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        let physical_granularity = index.params().get_document_granularity();
+        if physical_granularity != expected_granularity {
+            return Err(Error::index(format!(
+                "FTS document granularity in index details is {expected_granularity:?}, but the physical document schema implies {physical_granularity:?}"
+            )));
+        }
+        Ok(index as Arc<dyn ScalarIndex>)
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        cache
+            .get_or_insert_unsized_with_key(ScalarIndexCacheKey, || load)
+            .await
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
         let index_details = details.to_msg::<pbold::InvertedIndexDetails>()?;
         let index_params = InvertedIndexParams::try_from(&index_details)?;
-        Ok(serde_json::json!(&index_params))
+        Ok(index_params.to_details_json()?)
     }
 }
 
@@ -329,6 +355,20 @@ mod tests {
     fn test_plugin_version_tracks_v3_capability_gate() {
         let plugin = InvertedIndexPlugin;
         assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V3);
+    }
+
+    #[test]
+    fn test_details_json_includes_document_granularity() {
+        let details = pbold::InvertedIndexDetails {
+            document_granularity: pbold::inverted_index_details::DocumentGranularity::ListElement
+                as i32,
+            ..Default::default()
+        };
+        let details = prost_types::Any::from_msg(&details).unwrap();
+
+        let json = InvertedIndexPlugin.details_as_json(&details).unwrap();
+
+        assert_eq!(json["document_granularity"], "list_element");
     }
 
     #[test]

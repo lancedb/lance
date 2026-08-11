@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::ffi::JNIEnvExt;
 use crate::transaction::convert_to_java_transaction;
+use crate::{RT, block_on};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
@@ -123,7 +123,7 @@ fn inner_list_transactions<'local>(
     let txs: Vec<Transaction> = {
         let delta_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDatasetDelta>(&j_delta, NATIVE_DELTA) }?;
-        RT.block_on(delta_guard.inner.list_transactions())?
+        block_on(delta_guard.inner.list_transactions())?
     };
 
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
@@ -156,7 +156,7 @@ fn inner_get_inserted_rows<'local>(
     let delta_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDatasetDelta>(&j_delta, NATIVE_DELTA) }?;
 
-    let stream: DatasetRecordBatchStream = RT.block_on(delta_guard.inner.get_inserted_rows())?;
+    let stream: DatasetRecordBatchStream = block_on(delta_guard.inner.get_inserted_rows())?;
     let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone())?;
 
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
@@ -180,7 +180,7 @@ fn inner_get_updated_rows<'local>(
     let delta_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDatasetDelta>(&j_delta, NATIVE_DELTA) }?;
 
-    let stream: DatasetRecordBatchStream = RT.block_on(delta_guard.inner.get_updated_rows())?;
+    let stream: DatasetRecordBatchStream = block_on(delta_guard.inner.get_updated_rows())?;
     let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone())?;
 
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }

@@ -63,6 +63,9 @@ from .fragment import (
 from .fragment import (
     RowIdMeta as RowIdMeta,
 )
+from .fragment import (
+    RowIdSequence as RowIdSequence,
+)
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
 from .lance import PySearchFilter
@@ -106,6 +109,37 @@ def register_lance_metrics_recorder() -> bool: ...
 def lance_metrics_catalog() -> List[MetricDescription]: ...
 def snapshot_lance_metrics() -> List[MetricPoint]: ...
 
+class FtsToken:
+    text: str
+    position: int
+    def __repr__(self) -> str: ...
+
+def tokenize(
+    query: str,
+    *,
+    analyzer: Optional[Literal["text", "code"]] = None,
+    base_tokenizer: Optional[str] = None,
+    language: Optional[str] = None,
+    max_token_length: Optional[int] = 40,
+    lower_case: Optional[bool] = None,
+    stem: Optional[bool] = None,
+    remove_stop_words: Optional[bool] = None,
+    custom_stop_words: Optional[List[str]] = None,
+    ascii_folding: Optional[bool] = None,
+    min_ngram_length: Optional[int] = None,
+    max_ngram_length: Optional[int] = None,
+    prefix_only: Optional[bool] = None,
+    split_identifiers: Optional[bool] = None,
+    split_on_numerics: Optional[bool] = None,
+    preserve_original: Optional[bool] = None,
+    index_operators: Optional[bool] = None,
+) -> List[FtsToken]:
+    """Tokenize an FTS query without an index.
+
+    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    """
+    ...
+
 class CleanupStats:
     bytes_removed: int
     old_versions: int
@@ -134,6 +168,12 @@ class CleanupExplanation:
     referenced_branches: List[CleanupReferencedBranch]
     warnings: List[str]
 
+class LanceFileWriteSummary:
+    num_rows: int
+    size_bytes: int
+
+    def __repr__(self) -> str: ...
+
 class LanceFileWriter:
     def __init__(
         self,
@@ -148,7 +188,7 @@ class LanceFileWriter:
         max_page_bytes: Optional[int],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
-    def finish(self) -> int: ...
+    def finish(self) -> LanceFileWriteSummary: ...
     def add_schema_metadata(self, key: str, value: str) -> None: ...
     def add_global_buffer(self, data: bytes) -> int: ...
 
@@ -278,6 +318,23 @@ class LanceColumnStatistics:
     size_bytes: int
 
 class _Session:
+    def __init__(
+        self,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_backend: Optional[str | Dict[str, Any]] = None,
+        metadata_cache_backend: Optional[str | Dict[str, Any]] = None,
+    ) -> None:
+        """Create a Lance session.
+
+        Cache backends may be backend URI strings such as
+        ``"moka://?capacity=1048576"`` or dictionaries such as
+        ``{"kind": "moka", "options": {"capacity": "1048576"}}``.
+        ``index_cache_backend`` is mutually exclusive with
+        ``index_cache_size_bytes``. ``metadata_cache_backend`` is mutually
+        exclusive with ``metadata_cache_size_bytes``.
+        """
+        ...
     def size_bytes(self) -> int: ...
     def index_cache_size_bytes(self) -> int: ...
 
@@ -288,6 +345,8 @@ class LanceBlobFile:
     def tell(self) -> int: ...
     def size(self) -> int: ...
     def readall(self) -> bytes: ...
+    def read_range(self, offset: int, length: int) -> bytes: ...
+    def read_ranges(self, ranges: List[Tuple[int, int]]) -> List[bytes]: ...
     def read_into(self, b: bytearray) -> int: ...
 
 class _Dataset:
@@ -686,6 +745,7 @@ class _Fragment:
     def physical_rows(self) -> int: ...
     @property
     def num_deletions(self) -> int: ...
+    def validate(self) -> None: ...
 
 def iops_counter() -> int: ...
 def bytes_read_counter() -> int: ...

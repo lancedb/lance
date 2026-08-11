@@ -357,31 +357,31 @@ fn inline_scheduling_threshold() -> u64 {
 /// and 2.1+ decoders can always assume this is pb::PageLayout
 #[derive(Debug, Clone)]
 pub enum PageEncoding {
-    Array(pb::ArrayEncoding),
+    Legacy(pb::ArrayEncoding),
     Structural(pb21::PageLayout),
 }
 
 impl DeepSizeOf for PageEncoding {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         match self {
-            Self::Array(encoding) => encoding.encoded_len() * 4,
+            Self::Legacy(encoding) => encoding.encoded_len() * 4,
             Self::Structural(encoding) => encoding.encoded_len() * 4,
         }
     }
 }
 
 impl PageEncoding {
-    pub fn as_array(&self) -> &pb::ArrayEncoding {
+    pub fn as_legacy(&self) -> &pb::ArrayEncoding {
         match self {
-            Self::Array(enc) => enc,
-            Self::Structural(_) => panic!("Expected an array encoding"),
+            Self::Legacy(enc) => enc,
+            Self::Structural(_) => panic!("Expected a legacy encoding"),
         }
     }
 
     pub fn as_structural(&self) -> &pb21::PageLayout {
         match self {
             Self::Structural(enc) => enc,
-            Self::Array(_) => panic!("Expected a structural encoding"),
+            Self::Legacy(_) => panic!("Expected a structural encoding"),
         }
     }
 
@@ -708,7 +708,7 @@ impl CoreFieldDecoderStrategy {
             return Err(Error::invalid_input_source(format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into()));
         }
         let encoding = &column_info.page_infos[0].encoding;
-        match encoding.as_array().array_encoding.as_ref().unwrap() {
+        match encoding.as_legacy().array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Struct(_) => Ok(()),
             _ => Err(Error::invalid_input_source(format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into())),
         }
@@ -717,7 +717,7 @@ impl CoreFieldDecoderStrategy {
     fn check_packed_struct(column_info: &ColumnInfo) -> bool {
         let encoding = &column_info.page_infos[0].encoding;
         matches!(
-            encoding.as_array().array_encoding.as_ref().unwrap(),
+            encoding.as_legacy().array_encoding.as_ref().unwrap(),
             pb::array_encoding::ArrayEncoding::PackedStruct(_)
         )
     }
@@ -737,36 +737,41 @@ impl CoreFieldDecoderStrategy {
         let items_scheduler =
             self.create_array_field_scheduler(&list_field.children[0], column_infos, buffers)?;
 
-        let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
+        let mut inner_infos = Vec::with_capacity(offsets_column.page_infos.len());
+        let mut null_offset_adjustments = Vec::with_capacity(offsets_column.page_infos.len());
+        for (page_index, offsets_page) in offsets_column
             .page_infos
             .iter()
-            .filter(|offsets_page| offsets_page.num_rows > 0)
-            .map(|offsets_page| {
-                if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
-                    &offsets_page.encoding.as_array().array_encoding
-                {
-                    let inner = PageInfo {
-                        buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
-                        encoding: PageEncoding::Array(
-                            list_encoding.offsets.as_ref().unwrap().as_ref().clone(),
-                        ),
-                        num_rows: offsets_page.num_rows,
-                        priority: 0,
-                    };
-                    (
-                        inner,
-                        OffsetPageInfo {
-                            offsets_in_page: offsets_page.num_rows,
-                            null_offset_adjustment: list_encoding.null_offset_adjustment,
-                            num_items_referenced_by_page: list_encoding.num_items,
-                        },
-                    )
-                } else {
-                    // TODO: Should probably return Err here
-                    panic!("Expected a list column");
-                }
-            })
-            .unzip();
+            .enumerate()
+            .filter(|(_, offsets_page)| offsets_page.num_rows > 0)
+        {
+            let PageEncoding::Legacy(pb::ArrayEncoding {
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::List(list_encoding)),
+            }) = &offsets_page.encoding
+            else {
+                return Err(Error::invalid_input(format!(
+                    "expected list encoding for field '{}' in column {}, page {} but got {:?}",
+                    list_field.name, offsets_column.index, page_index, offsets_page.encoding
+                )));
+            };
+            let offsets_encoding = list_encoding.offsets.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "list encoding for field '{}' in column {}, page {} is missing its offsets encoding",
+                    list_field.name, offsets_column.index, page_index
+                ))
+            })?;
+            inner_infos.push(PageInfo {
+                buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
+                encoding: PageEncoding::Legacy(offsets_encoding.as_ref().clone()),
+                num_rows: offsets_page.num_rows,
+                priority: 0,
+            });
+            null_offset_adjustments.push(OffsetPageInfo {
+                offsets_in_page: offsets_page.num_rows,
+                null_offset_adjustment: list_encoding.null_offset_adjustment,
+                num_items_referenced_by_page: list_encoding.num_items,
+            });
+        }
         let inner = Arc::new(PrimitiveFieldScheduler::new(
             offsets_column.index,
             DataType::UInt64,
@@ -937,7 +942,7 @@ impl CoreFieldDecoderStrategy {
             }
             if let Some(page_info) = column_info.page_infos.first() {
                 if matches!(
-                    page_info.encoding.as_array(),
+                    page_info.encoding.as_legacy(),
                     pb::ArrayEncoding {
                         array_encoding: Some(pb::array_encoding::ArrayEncoding::List(..))
                     }
@@ -1064,7 +1069,7 @@ fn root_column(num_rows: u64) -> ColumnInfo {
             } else {
                 u64::MAX
             },
-            encoding: PageEncoding::Array(pb::ArrayEncoding {
+            encoding: PageEncoding::Legacy(pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
                     pb::SimpleStruct {},
                 )),
@@ -1850,7 +1855,8 @@ pub struct StructuralBatchDecodeStream {
     // - false: run `into_batch` inline, which avoids Tokio scheduling overhead and is
     //   typically better for point lookups / small takes.
     spawn_batch_decode_tasks: bool,
-    /// If set, target this many bytes per batch instead of `rows_per_batch` rows.
+    /// If set, target this many bytes per batch while retaining `rows_per_batch`
+    /// as an independent upper bound.
     batch_size_bytes: Option<u64>,
     /// Schema-based estimate of bytes per row, computed once at construction.
     /// Only meaningful when `batch_size_bytes` is `Some`.
@@ -1938,6 +1944,7 @@ impl StructuralBatchDecodeStream {
             return Ok(None);
         }
 
+        let row_limit = self.rows_remaining.min(self.rows_per_batch as u64);
         let mut to_take = if let Some(batch_size_bytes) = self.batch_size_bytes {
             let feedback = self.bytes_per_row_feedback.load(Ordering::Relaxed);
             let bpr = if feedback > 0 {
@@ -1946,9 +1953,9 @@ impl StructuralBatchDecodeStream {
                 self.schema_bytes_per_row
             };
             let rows = (batch_size_bytes as f64 / bpr) as u64;
-            self.rows_remaining.min(rows.max(1))
+            row_limit.min(rows.max(1))
         } else {
-            self.rows_remaining.min(self.rows_per_batch as u64)
+            row_limit
         };
         self.rows_remaining -= to_take;
 
@@ -2112,7 +2119,8 @@ pub struct SchedulerDecoderConfig {
     pub cache: Arc<LanceCache>,
     /// Decoder configuration
     pub decoder_config: DecoderConfig,
-    /// If set, target this many bytes per batch instead of using `batch_size` rows.
+    /// If set, target this many bytes per batch while retaining `batch_size` as
+    /// an independent row-count upper bound.
     ///
     /// Only supported for v2.1+ (structural) files. For v2.0 files this
     /// option is ignored and a warning is logged.
@@ -3112,6 +3120,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_list_page_with_non_list_encoding_returns_error() {
+        let item = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let list = DataType::List(item);
+        let field = Field::try_from(&ArrowField::new("values", list, true)).unwrap();
+        let values_encoding = pb::ColumnEncoding {
+            column_encoding: Some(pb::column_encoding::ColumnEncoding::Values(())),
+        };
+        let offsets_column = Arc::new(ColumnInfo::new(
+            0,
+            Arc::new([PageInfo {
+                num_rows: 1,
+                priority: 0,
+                encoding: PageEncoding::Legacy(pb::ArrayEncoding {
+                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(
+                        pb::Flat::default(),
+                    )),
+                }),
+                buffer_offsets_and_sizes: Arc::new([]),
+            }]),
+            vec![],
+            values_encoding.clone(),
+        ));
+        let items_column = Arc::new(ColumnInfo::new(1, Arc::new([]), vec![], values_encoding));
+        let column_indices = [0, 1];
+        let mut columns = ColumnInfoIter::new(vec![offsets_column, items_column], &column_indices);
+
+        let err = CoreFieldDecoderStrategy::default()
+            .create_array_field_scheduler(
+                &field,
+                &mut columns,
+                FileBuffers {
+                    positions_and_sizes: &[],
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("expected list encoding for field 'values' in column 0, page 0 but got"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_array_stream_stops_on_load_error() {
         use arrow_schema::Field as ArrowField;
@@ -3397,6 +3450,29 @@ mod tests {
                 batch.num_rows()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_byte_sized_batches_respect_row_limit() {
+        use arrow_array::Int32Array;
+
+        let num_rows: i32 = 1000;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let input_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+
+        // The byte limit can hold every row, so the 100-row limit must win.
+        let batches =
+            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 100, Some(10_000)).await;
+        assert_eq!(batches.len(), 10);
+        assert!(batches.iter().all(|batch| batch.num_rows() == 100));
     }
 
     #[tokio::test]

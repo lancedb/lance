@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Dataset policies that differ across exact Lance file versions.
 //!
 //! File grammar belongs to `lance_file::versions`. This module contains only
@@ -279,7 +282,8 @@ pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
 fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
     for fragment in manifest.fragments.iter() {
         for data_file in &fragment.files {
-            if data_file.column_indices.is_empty() {
+            let file_version = data_file.file_version()?;
+            if file_version == ConcreteFileVersion::V1 || data_file.column_indices.is_empty() {
                 continue;
             }
             if data_file.fields.len() != data_file.column_indices.len() {
@@ -290,6 +294,9 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
                     data_file.fields.len(),
                     data_file.column_indices.len()
                 )));
+            }
+            if file_version == ConcreteFileVersion::V2_0 {
+                continue;
             }
             for (field_id, column_index) in
                 data_file.fields.iter().zip(data_file.column_indices.iter())
@@ -397,22 +404,6 @@ pub async fn open_writer(
             .await
         }
     }
-}
-
-pub async fn open_data_writer(
-    version: ConcreteFileVersion,
-    object_store: &ObjectStore,
-    schema: &Schema,
-    base_dir: &Path,
-) -> Result<Box<dyn GenericWriter>> {
-    open_writer(
-        version,
-        object_store,
-        schema,
-        base_dir,
-        WriterOptions::data_file(),
-    )
-    .await
 }
 
 pub async fn open_update_writer(

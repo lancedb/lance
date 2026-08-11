@@ -74,7 +74,7 @@ impl PrimitiveFieldScheduler {
                     positions_and_sizes: &page.buffer_offsets_and_sizes,
                 };
                 let scheduler = decoder_from_array_encoding(
-                    page.encoding.as_array(),
+                    page.encoding.as_legacy(),
                     &page_buffers,
                     &data_type,
                 );
@@ -436,7 +436,7 @@ impl PrimitiveFieldEncoder {
             let (data, description) = array.into_buffers();
             Ok(EncodedPage {
                 data,
-                description: PageEncoding::Array(description),
+                description: PageEncoding::Legacy(description),
                 num_rows: num_values,
                 column_idx,
                 row_number: 0, // v2.0 encoders do not use

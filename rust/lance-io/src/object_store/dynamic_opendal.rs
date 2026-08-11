@@ -278,7 +278,7 @@ mod tests {
                         "Failed to create memory operator: {e:?}"
                     ))
                 })?;
-                Ok(OpendalStore::new(operator.finish()))
+                Ok(OpendalStore::new(operator))
             },
         );
 
@@ -316,7 +316,7 @@ mod tests {
                         "Failed to create memory operator: {e:?}"
                     ))
                 })?;
-                Ok(OpendalStore::new(operator.finish()))
+                Ok(OpendalStore::new(operator))
             },
         )
         .with_protected_keys(["bucket", "root"]);

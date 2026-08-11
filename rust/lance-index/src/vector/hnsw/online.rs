@@ -18,7 +18,7 @@
 //!
 //! # Lifecycle
 //!
-//! 1. `OnlineHnswBuilder::with_capacity(...)` pre-allocates fixed-size node
+//! 1. `OnlineHnswBuilder::try_with_capacity(...)` pre-allocates fixed-size node
 //!    arrays. Each slot has its target level pre-assigned so concurrent
 //!    inserts don't need to allocate.
 //! 2. Writer calls `insert(id, storage)` for `id` in `0..capacity`. The vector
@@ -29,22 +29,24 @@
 //! 4. `finalize()` consumes the builder and returns an immutable
 //!    [`super::HNSW`] that can be serialized via `HNSW::to_batch()`.
 
-use std::cmp::min;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::{SeedableRng, rngs::SmallRng};
 
-use super::builder::{HNSW, HNSW_LEVEL_RNG_SEED, HnswBuildParams, HnswQueryParams};
+use super::builder::{
+    HNSW, HNSW_LEVEL_RNG_SEED, HnswBuildParams, HnswQueryParams, random_level_with,
+};
 use super::select_neighbors_heuristic;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
     Graph, OrderedFloat, OrderedNode, VisitedGenerator, beam_search, greedy_search,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
+use lance_core::Result;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 
 /// A node in the online HNSW graph.
@@ -97,22 +99,6 @@ impl OnlineGraphBuilderNode {
         ranked[level as usize].push(OrderedNode { dist, id: v });
     }
 
-    fn cutoff(&self, level: u16, max_size: usize) -> OrderedFloat {
-        if !self.has_level(level) {
-            return OrderedFloat(f32::NEG_INFINITY);
-        }
-        let ranked = self
-            .level_neighbors_ranked
-            .lock()
-            .expect("level_neighbors_ranked mutex poisoned");
-        let neighbors = &ranked[level as usize];
-        if neighbors.len() < max_size {
-            OrderedFloat(f32::INFINITY)
-        } else {
-            neighbors.last().unwrap().dist
-        }
-    }
-
     /// Rebuild `level_neighbors[level]` from the current ranked list and
     /// publish it via `ArcSwap`. Also updates `bottom_neighbors` for level 0.
     fn publish_from_ranked(&self, level: u16) {
@@ -156,28 +142,48 @@ pub struct OnlineHnswBuilder {
 }
 
 impl OnlineHnswBuilder {
-    /// Create a new builder with the given capacity. Each node's target level
-    /// is pre-assigned at random.
+    /// Create a new builder with validated parameters.
+    ///
+    /// Each node's target level is pre-assigned at random.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::vector::hnsw::{OnlineHnswBuilder, builder::HnswBuildParams};
+    ///
+    /// let builder = OnlineHnswBuilder::try_with_capacity(
+    ///     1_024,
+    ///     HnswBuildParams::default(),
+    /// )?;
+    /// assert_eq!(builder.capacity(), 1_024);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn try_with_capacity(capacity: usize, params: HnswBuildParams) -> Result<Self> {
+        params.validate()?;
+        Ok(Self::new(capacity, params))
+    }
+
+    /// Create a new builder with the given capacity.
+    ///
+    /// Use [`Self::try_with_capacity`] to handle invalid parameters without
+    /// panicking.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `params` violates an HNSW construction precondition.
+    #[deprecated(note = "use OnlineHnswBuilder::try_with_capacity")]
     pub fn with_capacity(capacity: usize, params: HnswBuildParams) -> Self {
-        assert!(
-            params.max_level > 0,
-            "HnswBuildParams::max_level must be > 0"
-        );
+        Self::try_with_capacity(capacity, params)
+            .unwrap_or_else(|error| panic!("invalid HNSW build parameters: {error}"))
+    }
+
+    fn new(capacity: usize, params: HnswBuildParams) -> Self {
         let max_level = params.max_level;
         let level_count = (0..max_level).map(|_| AtomicUsize::new(0)).collect();
 
         let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
         let nodes: Vec<_> = (0..capacity)
-            .map(|i| {
-                let target_level = if i == 0 {
-                    // First inserted node anchors the graph; matches offline
-                    // builder which always starts at level 0.
-                    0
-                } else {
-                    Self::random_level_with(&params, &mut level_rng)
-                };
-                OnlineGraphBuilderNode::new(target_level)
-            })
+            .map(|_| OnlineGraphBuilderNode::new(random_level_with(&params, &mut level_rng)))
             .collect();
 
         let queue_size = get_num_compute_intensive_cpus().max(1);
@@ -194,14 +200,6 @@ impl OnlineHnswBuilder {
             inserted_len: AtomicUsize::new(0),
             visited_generator_queue,
         }
-    }
-
-    fn random_level_with<R: Rng + ?Sized>(params: &HnswBuildParams, rng: &mut R) -> u16 {
-        let ml = 1.0 / (params.m as f32).ln();
-        min(
-            (-rng.random::<f32>().ln() * ml) as u16,
-            params.max_level - 1,
-        )
     }
 
     pub fn capacity(&self) -> usize {
@@ -258,10 +256,11 @@ impl OnlineHnswBuilder {
         }
 
         let entry = self.entry_point.load(Ordering::Acquire);
+        let entry_target_level = nodes[entry as usize].target_level();
         let mut ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
         // Walk down upper levels with greedy_search to refine the entry point.
-        for level in (target_level + 1..self.params.max_level).rev() {
+        for level in (target_level + 1..=entry_target_level).rev() {
             let cur_level = OnlineHnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
         }
@@ -284,7 +283,9 @@ impl OnlineHnswBuilder {
                 }
                 current_node.add_neighbor(neighbor.id, neighbor.dist, level);
             }
-            self.prune(storage, current_node, level);
+            // New nodes select M connections at every level. The larger
+            // level-0 limit applies only to reciprocal edges on old nodes.
+            self.prune(storage, current_node, level, self.params.m);
             // Snapshot the pruned ranked list before publishing.
             let snapshot = {
                 let ranked = current_node
@@ -310,18 +311,16 @@ impl OnlineHnswBuilder {
         // Add reverse edges to chosen neighbors, prune them too.
         for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
             let level = level as u16;
-            let m_max = if level == 0 {
+            let reciprocal_limit = if level == 0 {
                 self.params.m * 2
             } else {
                 self.params.m
             };
-            for unpruned_edge in pruned_neighbors {
-                let chosen = &nodes[unpruned_edge.id as usize];
-                if unpruned_edge.dist < chosen.cutoff(level, m_max) {
-                    chosen.add_neighbor(id, unpruned_edge.dist, level);
-                    self.prune(storage, chosen, level);
-                    chosen.publish_from_ranked(level);
-                }
+            for selected_edge in pruned_neighbors {
+                let chosen = &nodes[selected_edge.id as usize];
+                chosen.add_neighbor(id, selected_edge.dist, level);
+                self.prune(storage, chosen, level, reciprocal_limit);
+                chosen.publish_from_ranked(level);
             }
         }
 
@@ -331,7 +330,6 @@ impl OnlineHnswBuilder {
         // plain store to keep `entry_point` updates atomic against concurrent
         // searches and to leave the door open if the writer ever becomes
         // multi-threaded.
-        let entry_target_level = nodes[entry as usize].target_level();
         if target_level > entry_target_level {
             let _ =
                 self.entry_point
@@ -368,22 +366,23 @@ impl OnlineHnswBuilder {
         )
     }
 
-    fn prune(&self, storage: &impl VectorStore, node: &OnlineGraphBuilderNode, level: u16) {
-        let m_max = if level == 0 {
-            self.params.m * 2
-        } else {
-            self.params.m
-        };
-
+    fn prune(
+        &self,
+        storage: &impl VectorStore,
+        node: &OnlineGraphBuilderNode,
+        level: u16,
+        max_connections: usize,
+    ) {
         let mut ranked = node
             .level_neighbors_ranked
             .lock()
             .expect("level_neighbors_ranked mutex poisoned");
         let level_neighbors = ranked[level as usize].clone();
-        if level_neighbors.len() <= m_max {
+        if level_neighbors.len() <= max_connections {
             return;
         }
-        ranked[level as usize] = select_neighbors_heuristic(storage, &level_neighbors, m_max);
+        ranked[level as usize] =
+            select_neighbors_heuristic(storage, &level_neighbors, max_connections);
     }
 
     /// Search the graph for the k nearest neighbors of `query`.
@@ -419,7 +418,7 @@ impl OnlineHnswBuilder {
         let mut ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
         let nodes = self.nodes.as_slice();
-        for level in (1..self.params.max_level).rev() {
+        for level in (1..=nodes[entry as usize].target_level()).rev() {
             let cur_level = OnlineHnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
         }
@@ -457,34 +456,29 @@ impl OnlineHnswBuilder {
     /// Only nodes whose insert has fully completed are included. Caller must
     /// ensure no concurrent inserts while this runs.
     ///
-    /// The entry point node is padded to full `max_level` height (with empty
-    /// neighbor lists at unused levels) so that search at upper levels can
-    /// safely traverse from it. `level_count` is recomputed from the actual
-    /// per-level emissions so the serialized batch and metadata stay in sync.
+    /// `level_count` is recomputed from the actual per-level emissions so the
+    /// serialized batch and metadata stay in sync.
     pub fn to_hnsw(&self) -> HNSW {
         let inserted = self.inserted_len.load(Ordering::Acquire);
         let entry_point = self.entry_point.load(Ordering::Acquire);
-        let max_level = self.params.max_level as usize;
+        let actual_levels = if inserted == 0 {
+            0
+        } else {
+            self.nodes[entry_point as usize].level_neighbors.len()
+        };
 
         let mut frozen_nodes: Vec<GraphBuilderNode> = Vec::with_capacity(inserted);
-        for (idx, node) in self.nodes.iter().enumerate().take(inserted) {
-            let mut level_neighbors: Vec<Arc<Vec<u32>>> = node
+        for node in self.nodes.iter().take(inserted) {
+            let level_neighbors: Vec<Arc<Vec<u32>>> = node
                 .level_neighbors
                 .iter()
                 .map(|sl| sl.load_full())
                 .collect();
-            let mut level_neighbors_ranked = node
+            let level_neighbors_ranked = node
                 .level_neighbors_ranked
                 .lock()
                 .expect("level_neighbors_ranked mutex poisoned")
                 .clone();
-
-            if idx as u32 == entry_point {
-                while level_neighbors.len() < max_level {
-                    level_neighbors.push(Arc::new(Vec::new()));
-                    level_neighbors_ranked.push(Vec::new());
-                }
-            }
 
             let bottom_neighbors = level_neighbors
                 .first()
@@ -497,9 +491,9 @@ impl OnlineHnswBuilder {
             ));
         }
 
-        let mut level_count: Vec<usize> = vec![0; max_level];
+        let mut level_count: Vec<usize> = vec![0; actual_levels];
         for node in &frozen_nodes {
-            let levels = node.level_neighbors.len().min(max_level);
+            let levels = node.level_neighbors.len().min(actual_levels);
             for count in level_count.iter_mut().take(levels) {
                 *count += 1;
             }
@@ -568,10 +562,11 @@ impl Graph for OnlineHnswBottomView<'_> {
 mod tests {
     use super::*;
     use crate::vector::flat::storage::FlatFloatStorage;
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{FixedSizeListArray, Float32Array};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array;
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn build_storage(n: usize, dim: usize) -> (Arc<FlatFloatStorage>, FixedSizeListArray) {
@@ -579,6 +574,47 @@ mod tests {
         let fsl = FixedSizeListArray::try_new_from_values(data, dim as i32).unwrap();
         let storage = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         (storage, fsl)
+    }
+
+    #[rstest]
+    #[case::zero_max_level(
+        HnswBuildParams::default().max_level(0),
+        "max_level must be greater than 0"
+    )]
+    #[case::zero_m(
+        HnswBuildParams::default().num_edges(0),
+        "m must be at least 4"
+    )]
+    #[case::one_m(
+        HnswBuildParams::default().num_edges(1),
+        "m must be at least 4"
+    )]
+    #[case::three_m(
+        HnswBuildParams::default().num_edges(3),
+        "m must be at least 4"
+    )]
+    #[case::small_ef(
+        HnswBuildParams::default().num_edges(20).ef_construction(19),
+        "ef_construction must be at least m (20)"
+    )]
+    #[case::overflowing_level_zero_limit(
+        HnswBuildParams::default()
+            .num_edges(usize::MAX)
+            .ef_construction(usize::MAX),
+        "level-0 reciprocal limit can be represented"
+    )]
+    fn test_try_with_capacity_rejects_invalid_params(
+        #[case] params: HnswBuildParams,
+        #[case] expected_message: &str,
+    ) {
+        let Err(error) = OnlineHnswBuilder::try_with_capacity(2, params) else {
+            panic!("expected invalid HNSW parameters to be rejected");
+        };
+        assert!(matches!(&error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -590,7 +626,7 @@ mod tests {
         let params = HnswBuildParams::default()
             .num_edges(16)
             .ef_construction(100);
-        let builder = OnlineHnswBuilder::with_capacity(N, params);
+        let builder = OnlineHnswBuilder::try_with_capacity(N, params).unwrap();
 
         for i in 0..N {
             builder.insert(i as u32, storage.as_ref());
@@ -646,7 +682,7 @@ mod tests {
         let params = HnswBuildParams::default()
             .num_edges(16)
             .ef_construction(100);
-        let builder = OnlineHnswBuilder::with_capacity(N, params);
+        let builder = OnlineHnswBuilder::try_with_capacity(N, params).unwrap();
         for i in 0..N {
             builder.insert(i as u32, storage.as_ref());
         }
@@ -691,9 +727,71 @@ mod tests {
     #[test]
     fn test_online_hnsw_empty_search() {
         let params = HnswBuildParams::default();
-        let builder = OnlineHnswBuilder::with_capacity(16, params);
+        let builder = OnlineHnswBuilder::try_with_capacity(16, params).unwrap();
         let (storage, fsl) = build_storage(1, 8);
         let results = builder.search(fsl.value(0), 10, 32, storage.as_ref());
         assert!(results.is_empty());
+    }
+
+    /// Online construction uses the same Algorithm 1 distinction as the
+    /// offline builder: M for a new node and Mmax0 for reciprocal edges.
+    #[test]
+    fn test_online_new_node_uses_m_connections() {
+        let values = Float32Array::from(vec![
+            1.0, 0.0, // east
+            0.0, 1.0, // north
+            -1.0, 0.0, // west
+            0.0, -1.0, // south
+            0.0, 0.0, // final node
+        ]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let storage = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .max_level(1)
+            .num_edges(2)
+            .ef_construction(5);
+        // Bypass public validation to isolate the Algorithm 1 degree rule.
+        let builder = OnlineHnswBuilder::new(5, params);
+
+        for id in 0..5 {
+            builder.insert(id, &storage);
+        }
+
+        let final_node = builder.nodes[4].level_neighbors_ranked.lock().unwrap();
+        assert_eq!(final_node[0].len(), 2);
+        drop(final_node);
+        assert!(
+            builder
+                .nodes
+                .iter()
+                .all(|node| { node.level_neighbors_ranked.lock().unwrap()[0].len() <= 4 }),
+            "existing level-0 nodes must remain bounded by Mmax0"
+        );
+    }
+
+    #[test]
+    fn test_online_promotes_first_highest_random_level() {
+        const TOTAL: usize = 128;
+        let (storage, _) = build_storage(TOTAL, 4);
+        let params = HnswBuildParams::default();
+        let builder = OnlineHnswBuilder::try_with_capacity(TOTAL, params.clone()).unwrap();
+
+        let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
+        let expected_levels = (0..TOTAL)
+            .map(|_| random_level_with(&params, &mut level_rng))
+            .collect::<Vec<_>>();
+        for (node, expected_level) in builder.nodes.iter().zip(&expected_levels) {
+            assert_eq!(node.target_level(), *expected_level);
+        }
+
+        for id in 0..TOTAL as u32 {
+            builder.insert(id, storage.as_ref());
+        }
+        let highest_level = *expected_levels.iter().max().unwrap();
+        let expected_entry = expected_levels
+            .iter()
+            .position(|level| *level == highest_level)
+            .unwrap() as u32;
+        assert_eq!(builder.entry_point.load(Ordering::Acquire), expected_entry);
     }
 }

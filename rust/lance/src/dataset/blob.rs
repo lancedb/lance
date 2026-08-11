@@ -36,10 +36,13 @@ use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
 use crate::blob::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobIdAllocator, BlobRange, PackedBlobWriter,
-    is_logical_blob_v2_field, is_prepared_blob_v2_field, validate_prepared_blob_array,
+    blob_v2_layout, blob_v2_shape_error, validate_prepared_blob_array,
 };
 use arrow_array::StructArray;
-use lance_core::datatypes::{BlobKind, BlobVersion, Field as LanceField, Schema, parse_field_path};
+use lance_core::datatypes::{
+    BLOB_DESC_FIELDS, BlobKind, BlobV2Layout, BlobVersion, Field as LanceField, Schema,
+    parse_field_path,
+};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
@@ -334,37 +337,32 @@ enum BlobPreprocessFieldKind {
 impl BlobPreprocessField {
     fn new(field: &ArrowField) -> Result<Self> {
         if field.is_blob_v2() {
-            if is_prepared_blob_v2_field(field) {
-                return Ok(Self {
+            return match blob_v2_layout(field) {
+                Some(BlobV2Layout::Prepared) => Ok(Self {
                     kind: BlobPreprocessFieldKind::Passthrough,
-                });
-            }
-            if !is_logical_blob_v2_field(field) {
-                return Err(Error::invalid_input(format!(
-                    "Blob v2 field '{}' must use either logical struct<data: LargeBinary?, \
-                     uri: Utf8?> with optional position/size UInt64 fields or prepared \
-                     struct<kind: UInt8?, data: LargeBinary?, uri: Utf8?, blob_id: UInt32?, \
-                     blob_size: UInt64?, position: UInt64?>",
-                    field.name()
-                )));
-            }
-            return Ok(Self {
-                kind: BlobPreprocessFieldKind::BlobV2 {
-                    inline_threshold: blob_inline_threshold_from_metadata(
-                        field.metadata(),
-                        field.name(),
-                    )?,
-                    dedicated_threshold: blob_dedicated_threshold_from_metadata(
-                        field.metadata(),
-                        field.name(),
-                    )?,
-                    pack_file_threshold: blob_pack_file_threshold_from_metadata(
-                        field.metadata(),
-                        field.name(),
-                    )?,
-                    writer_metadata: field.metadata().clone(),
-                },
-            });
+                }),
+                Some(BlobV2Layout::Logical) => Ok(Self {
+                    kind: BlobPreprocessFieldKind::BlobV2 {
+                        inline_threshold: blob_inline_threshold_from_metadata(
+                            field.metadata(),
+                            field.name(),
+                        )?,
+                        dedicated_threshold: blob_dedicated_threshold_from_metadata(
+                            field.metadata(),
+                            field.name(),
+                        )?,
+                        pack_file_threshold: blob_pack_file_threshold_from_metadata(
+                            field.metadata(),
+                            field.name(),
+                        )?,
+                        writer_metadata: field.metadata().clone(),
+                    },
+                }),
+                _ => Err(blob_v2_shape_error(
+                    field,
+                    &[BlobV2Layout::Logical, BlobV2Layout::Prepared],
+                )),
+            };
         }
 
         if let ArrowDataType::Struct(children) = field.data_type() {
@@ -648,7 +646,7 @@ impl BlobPreprocessor {
         field: &'a Arc<ArrowField>,
     ) -> BoxFuture<'a, Result<(ArrayRef, Arc<ArrowField>)>> {
         async move {
-            if is_prepared_blob_v2_field(field.as_ref()) {
+            if blob_v2_layout(field.as_ref()) == Some(BlobV2Layout::Prepared) {
                 validate_prepared_blob_array(field.as_ref(), &array)?;
                 return Ok((array, field.clone()));
             }
@@ -661,7 +659,7 @@ impl BlobPreprocessor {
                     pack_file_threshold,
                     writer_metadata,
                 } => {
-                    self.preprocess_blob_array(
+                    self.logical_to_prepared_blob_array(
                         array,
                         field.as_ref(),
                         *inline_threshold,
@@ -817,7 +815,7 @@ impl BlobPreprocessor {
         Ok((Arc::new(list_array), field))
     }
 
-    async fn preprocess_blob_array(
+    async fn logical_to_prepared_blob_array(
         &mut self,
         array: ArrayRef,
         field: &ArrowField,
@@ -830,6 +828,15 @@ impl BlobPreprocessor {
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| Error::invalid_input("Blob column was not a struct array"))?;
+        if BlobV2Layout::classify(struct_arr.fields()) != Some(BlobV2Layout::Logical) {
+            let actual = BlobV2Layout::classify(struct_arr.fields())
+                .map(|layout| layout.to_string())
+                .unwrap_or_else(|| format!("unrecognized ({:?})", struct_arr.fields()));
+            return Err(Error::invalid_input(format!(
+                "Blob v2 field '{}' has {actual} array layout; expected logical layout before preparation",
+                field.name()
+            )));
+        }
 
         let data_col = struct_arr
             .column_by_name("data")
@@ -2889,23 +2896,29 @@ fn leaf_descriptor_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a
     Ok(current)
 }
 
+fn blob_descriptor_fields_match(
+    actual: &arrow_schema::Fields,
+    expected: &arrow_schema::Fields,
+) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| {
+                actual.name() == expected.name() && actual.data_type() == expected.data_type()
+            })
+}
+
 fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVersion> {
     let fields = descriptions.fields();
-    if fields.len() == 2 && fields[0].name() == "position" && fields[1].name() == "size" {
+    if blob_descriptor_fields_match(fields, &BLOB_DESC_FIELDS) {
         return Ok(BlobVersion::V1);
     }
-    if fields.len() == 5
-        && fields[0].name() == "kind"
-        && fields[1].name() == "position"
-        && fields[2].name() == "size"
-        && fields[3].name() == "blob_id"
-        && fields[4].name() == "blob_uri"
-    {
+    if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Descriptor) {
         return Ok(BlobVersion::V2);
     }
     Err(Error::invalid_input_source(format!(
-        "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 (kind,position,size,blob_id,blob_uri) but got {:?}",
-        fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+        "Unrecognized blob descriptions schema: expected v1 descriptor or v2 descriptor layout but got {fields:?}",
     )
     .into()))
 }
@@ -3701,9 +3714,10 @@ mod tests {
 
     use super::{
         BlobEntry, BlobFile, BlobRangeRequest, BlobReadRange, BlobSource, ExternalBaseCandidate,
-        ExternalBaseResolver, ReadBlobsExecution, collect_blob_files_v1, data_file_key_from_path,
-        execute_blob_entries, execute_blob_read_batches_stream, execute_blob_read_plan,
-        plan_blob_read_batches, plan_blob_read_plans,
+        ExternalBaseResolver, ReadBlobsExecution, blob_version_from_descriptions,
+        collect_blob_files_v1, data_file_key_from_path, execute_blob_entries,
+        execute_blob_read_batches_stream, execute_blob_read_plan, plan_blob_read_batches,
+        plan_blob_read_plans,
     };
     use crate::{
         Dataset,
@@ -3726,6 +3740,37 @@ mod tests {
         _test_dir: TempDir,
         dataset: Arc<Dataset>,
         expected: Vec<u8>,
+    }
+
+    #[test]
+    fn test_blob_version_rejects_malformed_v2_descriptor_layout() {
+        let descriptions = StructArray::try_new(
+            vec![
+                Field::new("kind", DataType::UInt8, false),
+                Field::new("position", DataType::UInt64, false),
+                Field::new("size", DataType::UInt32, false),
+                Field::new("blob_id", DataType::UInt32, false),
+                Field::new("blob_uri", DataType::Utf8, false),
+            ]
+            .into(),
+            vec![
+                Arc::new(UInt8Array::from(vec![BlobKind::Inline as u8])),
+                Arc::new(UInt64Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(StringArray::from(vec![""])),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let error = blob_version_from_descriptions(&descriptions).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("expected v1 descriptor or v2 descriptor layout")
+        );
     }
 
     fn nested_blob_v2_batch(blob_array: ArrayRef) -> (Arc<Schema>, RecordBatch) {
@@ -4426,6 +4471,78 @@ mod tests {
             assert_eq!(blob1.position(), blob2.position());
             assert_eq!(blob1.size(), blob2.size());
             assert_eq!(blob1.data_path(), blob2.data_path());
+        }
+
+        // Unsorted indices spanning fragments use the take remapping path, which
+        // carries _rowaddr internally and must still preserve the requested order.
+        let indices = [33_u64, 17, 5, 28, 12, 39];
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&indices, "blobs")
+            .await
+            .unwrap();
+        for (blob, index) in blobs.iter().zip(indices) {
+            let actual = blob.as_ref().unwrap().read().await.unwrap();
+            let index = index as usize;
+            let expected = fixture.data[index / 10]
+                .column(1)
+                .as_binary::<i64>()
+                .value(index % 10);
+            assert_eq!(actual.as_ref(), expected);
+        }
+    }
+
+    #[rstest]
+    #[case::all_valid_first(false)]
+    #[case::nullable_first(true)]
+    #[tokio::test]
+    async fn test_write_blob_batches_with_mixed_nullability(#[case] nulls_first: bool) {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+        ]));
+        let batch = |values: Vec<Option<&[u8]>>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeBinaryArray::from(values))],
+            )
+            .unwrap()
+        };
+
+        // Definition-level semantics come from each batch's validity bitmap. Both
+        // transitions must start a new descriptor page so nulls remain distinct
+        // from valid empty blobs.
+        let all_valid = batch(vec![Some(b"a".as_slice()), Some(b"".as_slice())]);
+        let with_null = batch(vec![Some(b"c".as_slice()), None]);
+        let (batches, expected) = if nulls_first {
+            (
+                vec![with_null, all_valid],
+                vec![Some(b"c".as_slice()), None, Some(b"a"), Some(b"")],
+            )
+        } else {
+            (
+                vec![all_valid, with_null],
+                vec![Some(b"a".as_slice()), Some(b""), Some(b"c"), None],
+            )
+        };
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let dataset = Arc::new(Dataset::write(reader, &test_dir, None).await.unwrap());
+
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1, 2, 3], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), expected.len());
+        for (row_idx, (blob, expected)) in blobs.into_iter().zip(expected).enumerate() {
+            let actual = match blob {
+                Some(blob) => Some(blob.read().await.unwrap()),
+                None => None,
+            };
+            assert_eq!(actual.as_deref(), expected, "row {row_idx}");
         }
     }
 

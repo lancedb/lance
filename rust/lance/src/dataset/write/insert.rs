@@ -12,6 +12,7 @@ use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
@@ -19,7 +20,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
 use crate::Dataset;
-use crate::blob::normalize_prepared_blob_schema;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
@@ -214,6 +215,7 @@ impl<'a> InsertBuilder<'a> {
         .await?;
 
         let (written_fragments, written_schema) = write_fragments_internal(
+            context.storage_version,
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -322,7 +324,7 @@ impl<'a> InsertBuilder<'a> {
             schema_cmp_opts.allow_missing_if_nullable = true;
             schema_cmp_opts.ignore_field_order = true;
 
-            let normalized_data_schema = normalize_prepared_blob_schema(data_schema)?;
+            let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
             normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
@@ -366,7 +368,10 @@ impl<'a> InsertBuilder<'a> {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
-                dataset.commit_handler.clone(),
+                params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| dataset.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
                 let registry = params
@@ -456,6 +461,7 @@ mod test {
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
+    use lance_table::io::commit::{RenameCommitHandler, commit_handler_from_url};
 
     use crate::session::Session;
 
@@ -505,6 +511,42 @@ mod test {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn dataset_destination_honors_explicit_commit_handler() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let initial_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(initial_batch)],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+            .await
+            .unwrap();
+
+        let append_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
+                .unwrap();
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(Arc::new(RenameCommitHandler)),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(append_batch)], schema),
+            Arc::new(dataset),
+            Some(params),
+        )
+        .await
+        .expect("the explicit per-write commit handler should override the dataset handler");
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
     }
 
     #[rstest::rstest]

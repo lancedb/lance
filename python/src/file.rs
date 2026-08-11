@@ -229,6 +229,26 @@ impl LanceFileMetadata {
     }
 }
 
+/// Summary of a completed Lance file write
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceFileWriteSummary {
+    /// The number of rows written to the file
+    pub num_rows: u64,
+    /// The final size of the file, in bytes
+    pub size_bytes: u64,
+}
+
+#[pymethods]
+impl LanceFileWriteSummary {
+    fn __repr__(&self) -> String {
+        format!(
+            "FileWriteSummary(num_rows={}, size_bytes={})",
+            self.num_rows, self.size_bytes
+        )
+    }
+}
+
 #[pyclass]
 pub struct LanceFileWriter {
     inner: Arc<Mutex<Box<FileWriter>>>,
@@ -348,11 +368,18 @@ impl LanceFileWriter {
         .infer_error()
     }
 
-    pub fn finish(&self) -> PyResult<u64> {
-        rt().block_on(None, async {
-            self.inner.lock().await.finish().await.map(|s| s.num_rows)
-        })?
-        .infer_error()
+    /// Finish the file and return the row count and the final file size
+    ///
+    /// The size is reported by the object writer once the file has been closed
+    /// and so it is accurate for object stores as well as local filesystems.
+    pub fn finish(&self) -> PyResult<LanceFileWriteSummary> {
+        let summary = rt()
+            .block_on(None, async { self.inner.lock().await.finish().await })?
+            .infer_error()?;
+        Ok(LanceFileWriteSummary {
+            num_rows: summary.num_rows,
+            size_bytes: summary.size_bytes,
+        })
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {

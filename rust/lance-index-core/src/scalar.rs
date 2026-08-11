@@ -4,7 +4,7 @@
 //! Abstract scalar index traits and types for Lance index plugins
 
 use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -554,6 +554,16 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// Returns the value type expected by [`Self::update`], when the index has
+    /// a durable type contract for its training data.
+    ///
+    /// Wrapper indices use this to transform new data to the same type as the
+    /// loaded index instead of inferring a potentially different type from an
+    /// update batch. Index types without such a contract may return `None`.
+    fn training_data_type(&self) -> Option<DataType> {
+        None
+    }
 
     /// Global `[min, max]` of the indexed column from index metadata, without a
     /// scan, or `None` if this index type cannot supply a sound bound. When

@@ -32,7 +32,7 @@ use crate::ffi::JNIEnvExt;
 use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
 use crate::utils::extract_storage_options;
 use crate::{
-    RT,
+    block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::FromJString,
     utils::extract_write_params,
@@ -80,7 +80,7 @@ fn inner_count_rows_native(
             "Fragment not found: {fragment_id}"
         )));
     };
-    let res = RT.block_on(fragment.count_rows(None))?;
+    let res = block_on(fragment.count_rows(None))?;
     Ok(res)
 }
 
@@ -366,7 +366,7 @@ fn create_fragment<'a>(
         builder = builder.schema(&schema);
     }
 
-    let fragments = RT.block_on(builder.write_fragments(source))?;
+    let fragments = block_on(builder.write_fragments(source))?;
     export_vec(env, &fragments)
 }
 
@@ -408,7 +408,7 @@ fn inner_delete_rows<'local>(
         .map(|x| x as u32)
         .collect();
 
-    let res = RT.block_on(async move { fragment.extend_deletions(indexes).await });
+    let res = block_on(async move { fragment.extend_deletions(indexes).await });
 
     let obj = match res {
         Ok(Some(f)) => f.metadata().into_java(env)?,
@@ -480,7 +480,7 @@ fn inner_merge_column<'local>(
     let right_on_str: String = right_on.extract(env)?;
 
     let (new_frag, new_schema) =
-        RT.block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id))?;
+        block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id))?;
     let result = FragmentMergeResult {
         fragment: new_frag,
         schema: new_schema,
@@ -537,8 +537,7 @@ fn inner_update_column<'local>(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
-    let r =
-        RT.block_on(fragment.update_columns_with_offsets(reader, &left_on_str, &right_on_str))?;
+    let r = block_on(fragment.update_columns_with_offsets(reader, &left_on_str, &right_on_str))?;
     let updated_row_offsets: Vec<i64> = r.matched_offsets.iter().map(|o| o as i64).collect();
     let result = FragmentUpdateResult {
         updated_fragment: r.fragment,
@@ -569,7 +568,7 @@ fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String
     env.get_long_array_region(row_ids, 0, buf.as_mut_slice())?;
     let ids: Vec<u64> = buf.into_iter().map(|x| x as u64).collect();
     let seq = RowIdSequence::from(ids.as_slice());
-    let meta = RowIdMeta::Inline(write_row_ids(&seq));
+    let meta = RowIdMeta::Inline(write_row_ids(&seq).into());
     let json = serde_json::to_string(&meta)?;
     Ok(json)
 }

@@ -13,6 +13,7 @@
  */
 package org.lance.index.scalar;
 
+import org.lance.DocumentGranularity;
 import org.lance.util.JsonUtils;
 
 import org.junit.jupiter.api.Test;
@@ -40,6 +41,16 @@ class InvertedIndexParamsTest {
 
     Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
     assertEquals(128, ((Number) json.get("block_size")).intValue());
+    assertEquals("row", json.get("document_granularity"));
+  }
+
+  @Test
+  void documentGranularityIsSerialized() {
+    ScalarIndexParams params =
+        InvertedIndexParams.builder().documentGranularity(DocumentGranularity.LIST_ELEMENT).build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals("list_element", json.get("document_granularity"));
   }
 
   @Test
