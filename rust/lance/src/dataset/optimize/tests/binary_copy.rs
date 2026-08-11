@@ -196,6 +196,9 @@ async fn do_test_binary_copy_skipped_after_metadata_only_add_column(version: Lan
     let after = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(after.num_rows(), 4);
     assert_eq!(after["a"].as_ref(), &Int32Array::from(vec![1, 2, 3, 4]));
+    // The columns that were already in the data files must survive the
+    // re-encode fallback untouched, not just the one the scan used to trip on.
+    assert_eq!(after["b"].as_ref(), &Int32Array::from(vec![10, 20, 30, 40]));
     assert_eq!(after["c"].null_count(), 4);
 }
 
