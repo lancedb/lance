@@ -137,15 +137,6 @@ macro_rules! committer {
     };
 }
 
-fn matches_final_location(
-    location: &ManifestLocation,
-    final_path: &str,
-    size: u64,
-    e_tag: &Option<String>,
-) -> bool {
-    location.path.as_ref() == final_path && location.size == Some(size) && &location.e_tag == e_tag
-}
-
 impl DynamoDBExternalManifestStore {
     pub async fn new_external_store(
         client: Arc<Client>,
@@ -549,7 +540,11 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
         if self
             .get_manifest_location(base_uri, version)
             .await
-            .is_ok_and(|location| matches_final_location(&location, final_path, size, &e_tag))
+            .is_ok_and(|location| {
+                location.path.as_ref() == final_path
+                    && location.size == Some(size)
+                    && location.e_tag == e_tag
+            })
         {
             return Ok(());
         }
@@ -583,62 +578,5 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::io::commit::ManifestNamingScheme;
-
-    #[test]
-    fn final_location_match_requires_exact_metadata() {
-        let final_path = Path::from("dataset/_versions/1.manifest");
-        let mut location = ManifestLocation {
-            version: 1,
-            path: final_path.clone(),
-            size: Some(42),
-            naming_scheme: ManifestNamingScheme::V2,
-            e_tag: Some("final-etag".to_string()),
-        };
-
-        assert!(matches_final_location(
-            &location,
-            final_path.as_ref(),
-            42,
-            &Some("final-etag".to_string()),
-        ));
-        assert!(!matches_final_location(
-            &location,
-            "dataset/_versions/2.manifest",
-            42,
-            &Some("final-etag".to_string()),
-        ));
-        assert!(!matches_final_location(
-            &location,
-            final_path.as_ref(),
-            43,
-            &Some("final-etag".to_string()),
-        ));
-        assert!(!matches_final_location(
-            &location,
-            final_path.as_ref(),
-            42,
-            &Some("stale-etag".to_string()),
-        ));
-        assert!(!matches_final_location(
-            &location,
-            final_path.as_ref(),
-            42,
-            &None,
-        ));
-
-        location.size = None;
-        assert!(!matches_final_location(
-            &location,
-            final_path.as_ref(),
-            42,
-            &Some("final-etag".to_string()),
-        ));
     }
 }

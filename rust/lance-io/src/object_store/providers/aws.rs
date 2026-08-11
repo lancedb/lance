@@ -250,15 +250,16 @@ pub fn supports_external_manifest_create_only_copy(
             .get("use_opendal")
             .map(|value| value == "true")
             .unwrap_or(false)
-        || check_s3_express(url, storage_options)
     {
         return false;
     }
 
-    let s3_options = storage_options.as_s3_options();
-    !s3_options.contains_key(&AmazonS3ConfigKey::Endpoint)
-        && !s3_options.contains_key(&AmazonS3ConfigKey::S3Endpoint)
-        && !s3_options.contains_key(&AmazonS3ConfigKey::CopyIfNotExists)
+    default_native_s3_copy_if_not_exists(
+        &storage_options.as_s3_options(),
+        check_s3_express(url, storage_options),
+        true,
+    )
+    .is_some()
 }
 
 fn default_native_s3_copy_if_not_exists(
@@ -638,7 +639,6 @@ mod tests {
     use aws_credential_types::provider::error::CredentialsError;
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
-    use rstest::rstest;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
@@ -818,76 +818,59 @@ mod tests {
         }
     }
 
-    #[rstest]
-    #[case::native("s3+ddb://bucket/path", HashMap::new(), true)]
-    #[case::plain_s3("s3://bucket/path", HashMap::new(), false)]
-    #[case::opendal(
-        "s3+ddb://bucket/path",
-        HashMap::from([("use_opendal".to_string(), "true".to_string())]),
-        false
-    )]
-    #[case::custom_endpoint(
-        "s3+ddb://bucket/path",
-        HashMap::from([("aws_endpoint".to_string(), "https://example.com".to_string())]),
-        false
-    )]
-    #[case::express_option(
-        "s3+ddb://bucket/path",
-        HashMap::from([("aws_s3_express".to_string(), "true".to_string())]),
-        false
-    )]
-    #[case::explicit_copy_mode(
-        "s3+ddb://bucket/path",
-        HashMap::from([("aws_copy_if_not_exists".to_string(), "multipart".to_string())]),
-        false
-    )]
-    #[case::express_bucket("s3+ddb://bucket--x-s3/path", HashMap::new(), false)]
-    fn test_supports_external_manifest_create_only_copy(
-        #[case] uri: &str,
-        #[case] storage_map: HashMap<String, String>,
-        #[case] expected: bool,
-    ) {
-        let url = Url::parse(uri).unwrap();
-        let storage_options = StorageOptions(storage_map);
-        assert_eq!(
-            supports_external_manifest_create_only_copy(&url, &storage_options),
-            expected
-        );
-    }
-
-    #[rstest]
-    #[case::external_native_s3(None, false, false, true, true)]
-    #[case::plain_native_s3(None, false, false, false, false)]
-    #[case::custom_endpoint(Some(AmazonS3ConfigKey::Endpoint), false, false, true, false)]
-    #[case::custom_s3_endpoint(Some(AmazonS3ConfigKey::S3Endpoint), false, false, true, false)]
-    #[case::explicit_config(None, true, false, true, false)]
-    #[case::s3_express(None, false, true, true, false)]
-    fn test_default_native_s3_copy_if_not_exists(
-        #[case] endpoint_key: Option<AmazonS3ConfigKey>,
-        #[case] has_explicit_config: bool,
-        #[case] is_s3_express: bool,
-        #[case] uses_external_manifest: bool,
-        #[case] expects_default: bool,
-    ) {
-        let mut storage_options = HashMap::new();
-        if let Some(endpoint_key) = endpoint_key {
-            storage_options.insert(
-                endpoint_key,
-                "https://s3-compatible.example.com".to_string(),
+    #[test]
+    fn test_external_manifest_create_only_copy_support() {
+        let configured =
+            |key: &str, value: &str| HashMap::from([(key.to_string(), value.to_string())]);
+        for (uri, options, expected) in [
+            ("s3+ddb://bucket/path", HashMap::new(), true),
+            ("s3://bucket/path", HashMap::new(), false),
+            (
+                "s3+ddb://bucket/path",
+                configured("use_opendal", "true"),
+                false,
+            ),
+            (
+                "s3+ddb://bucket/path",
+                configured("aws_endpoint", "https://example.com"),
+                false,
+            ),
+            (
+                "s3+ddb://bucket/path",
+                configured("aws_endpoint_url_s3", "https://example.com"),
+                false,
+            ),
+            (
+                "s3+ddb://bucket/path",
+                configured("aws_s3_express", "true"),
+                false,
+            ),
+            (
+                "s3+ddb://bucket/path",
+                configured("aws_copy_if_not_exists", "multipart"),
+                false,
+            ),
+            ("s3+ddb://bucket--x-s3/path", HashMap::new(), false),
+        ] {
+            assert_eq!(
+                supports_external_manifest_create_only_copy(
+                    &Url::parse(uri).unwrap(),
+                    &StorageOptions(options)
+                ),
+                expected,
+                "unexpected capability for {uri}"
             );
         }
-        if has_explicit_config {
-            storage_options.insert(AmazonS3ConfigKey::CopyIfNotExists, "multipart".to_string());
-        }
 
-        let actual = default_native_s3_copy_if_not_exists(
-            &storage_options,
-            is_s3_express,
-            uses_external_manifest,
+        let expected = S3CopyIfNotExists::Header("If-None-Match".to_string(), "*".to_string());
+        assert_eq!(
+            default_native_s3_copy_if_not_exists(&HashMap::new(), false, true),
+            Some(expected)
         );
-        let expected = expects_default
-            .then(|| S3CopyIfNotExists::Header("If-None-Match".to_string(), "*".to_string()));
-        assert_eq!(actual, expected);
+        assert_eq!(
+            default_native_s3_copy_if_not_exists(&HashMap::new(), false, false),
+            None
+        );
     }
 
     #[tokio::test]

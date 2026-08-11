@@ -42,13 +42,8 @@ use crate::io::commit::{CommitError, CommitHandler};
 /// <https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04>
 #[async_trait]
 pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
-    /// Whether this store is paired with an object store whose
-    /// `copy_if_not_exists` implementation is known to provide an atomic,
-    /// synchronous destination create.
-    ///
-    /// The conservative default preserves the existing copy behavior. Stores
-    /// that opt in use destination creation as the object-level linearization
-    /// point for supported manifest sizes.
+    /// Whether the paired object store provides an atomic, synchronous
+    /// `copy_if_not_exists` for supported manifest sizes.
     fn use_create_only_manifest_copy(&self) -> bool {
         false
     }
@@ -179,13 +174,8 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         e_tag: Option<String>,
     ) -> Result<()>;
 
-    /// Publish a finalized manifest only while the external row still points at
-    /// the staging object being materialized.
-    ///
-    /// Stores with conditional-write support should override this method with
-    /// an atomic compare-and-swap. The default preserves compatibility for
-    /// stores where create-only object materialization is the only available
-    /// serialization primitive.
+    /// Publish `final_path` only while the row still points at `staging_path`.
+    /// Conditional stores should override this with an atomic compare-and-swap.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_staging_manifest(
         &self,
@@ -348,35 +338,14 @@ async fn copy_via_read_rewrite(
 const MANIFEST_COMPARE_RANGE_BYTES: u64 = 8 * 1024 * 1024;
 
 enum MaterializeManifestResult {
-    Created(ObjectMeta),
-    Existing(ObjectMeta),
-    /// Compatibility path for stores or object sizes without an atomic
-    /// create-only copy primitive.
-    Overwritten(ObjectMeta),
-    SourceMissing,
+    Available(ObjectMeta),
+    SourceMissing(u64),
 }
 
 enum ManifestComparison {
     Match,
     Different,
     SourceMissing,
-}
-
-fn published_location_matches_object(
-    published: &ManifestLocation,
-    final_path: &Path,
-    final_meta: &ObjectMeta,
-) -> bool {
-    published.path == *final_path
-        && published
-            .size
-            .map(|size| size == final_meta.size)
-            .unwrap_or(true)
-        && published
-            .e_tag
-            .as_ref()
-            .map(|e_tag| Some(e_tag) == final_meta.e_tag.as_ref())
-            .unwrap_or(true)
 }
 
 fn validate_materialized_size(
@@ -436,7 +405,7 @@ async fn resolve_existing_manifest(
     )?;
 
     match manifests_match(store, staging_path, final_path, staging_size).await {
-        Ok(ManifestComparison::Match) => Ok(MaterializeManifestResult::Existing(final_meta)),
+        Ok(ManifestComparison::Match) => Ok(MaterializeManifestResult::Available(final_meta)),
         Ok(ManifestComparison::Different) => Err(Error::corrupt_file(
             final_path.clone(),
             format!(
@@ -444,7 +413,9 @@ async fn resolve_existing_manifest(
                 staging_path
             ),
         )),
-        Ok(ManifestComparison::SourceMissing) => Ok(MaterializeManifestResult::SourceMissing),
+        Ok(ManifestComparison::SourceMissing) => {
+            Ok(MaterializeManifestResult::SourceMissing(staging_size))
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -478,13 +449,14 @@ async fn materialize_manifest_create(
     if use_create_only_copy && size < MAX_SERVER_SIDE_COPY_BYTES {
         match store.copy_if_not_exists(staging_path, final_path).await {
             Ok(()) => {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
                 let final_meta = validate_materialized_size(
                     store.head(final_path).await?,
                     final_path,
                     staging_path,
                     size,
                 )?;
-                return Ok(MaterializeManifestResult::Created(final_meta));
+                return Ok(MaterializeManifestResult::Available(final_meta));
             }
             Err(ObjectStoreError::AlreadyExists { .. })
             | Err(ObjectStoreError::Precondition { .. }) => {
@@ -500,21 +472,18 @@ async fn materialize_manifest_create(
 
     match copy_size_aware(store, staging_path, final_path, size).await {
         Ok(()) => {
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
             let final_meta = validate_materialized_size(
                 store.head(final_path).await?,
                 final_path,
                 staging_path,
                 size,
             )?;
-            Ok(MaterializeManifestResult::Overwritten(final_meta))
+            Ok(MaterializeManifestResult::Available(final_meta))
         }
-        Err(error @ ObjectStoreError::NotFound { .. }) => match store.head(final_path).await {
-            Ok(meta) => {
-                validate_materialized_size(meta, final_path, staging_path, size)?;
-                Ok(MaterializeManifestResult::SourceMissing)
-            }
-            Err(_) => Err(error.into()),
-        },
+        Err(ObjectStoreError::NotFound { .. }) => {
+            Ok(MaterializeManifestResult::SourceMissing(size))
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -530,42 +499,22 @@ async fn complete_manifest_finalization<S: ExternalManifestStore + ?Sized>(
     object_store: &dyn OSObjectStore,
     materialized: MaterializeManifestResult,
 ) -> Result<ManifestLocation> {
-    let (final_meta, published_e_tag) = match materialized {
-        MaterializeManifestResult::Created(meta) => {
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
-            let e_tag = meta.e_tag.clone();
-            (meta, e_tag)
-        }
-        MaterializeManifestResult::Existing(meta) => {
-            let e_tag = meta.e_tag.clone();
-            (meta, e_tag)
-        }
-        MaterializeManifestResult::Overwritten(meta) => {
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
-            let e_tag = meta.e_tag.clone();
-            (meta, e_tag)
-        }
-        MaterializeManifestResult::SourceMissing => {
-            let current_meta = object_store.head(&final_path).await?;
-            let published = external_store
-                .get_manifest_location(base_path.as_ref(), version)
-                .await?;
-            if published_location_matches_object(&published, &final_path, &current_meta) {
-                return Ok(ManifestLocation {
-                    version,
-                    path: final_path,
-                    size: Some(current_meta.size),
-                    naming_scheme,
-                    e_tag: current_meta.e_tag,
-                });
-            }
-            return Err(Error::corrupt_file(
-                staging_path.clone(),
-                format!(
-                    "Staging manifest disappeared before final metadata for version {} was published",
-                    version
-                ),
-            ));
+    let final_meta = match materialized {
+        MaterializeManifestResult::Available(meta) => meta,
+        MaterializeManifestResult::SourceMissing(staging_size) => {
+            let current_meta = validate_materialized_size(
+                object_store.head(&final_path).await?,
+                &final_path,
+                staging_path,
+                staging_size,
+            )?;
+            return Ok(ManifestLocation {
+                version,
+                path: final_path,
+                size: Some(current_meta.size),
+                naming_scheme,
+                e_tag: current_meta.e_tag,
+            });
         }
     };
 
@@ -574,7 +523,7 @@ async fn complete_manifest_finalization<S: ExternalManifestStore + ?Sized>(
         path: final_path,
         size: Some(final_meta.size),
         naming_scheme,
-        e_tag: published_e_tag,
+        e_tag: final_meta.e_tag.clone(),
     };
 
     external_store
@@ -996,6 +945,10 @@ mod tests {
     struct LostPutResponseStore {
         manifests: Mutex<HashMap<(String, u64), StoredManifest>>,
         fail_next_put_response: AtomicBool,
+        block_first_final_publish: bool,
+        final_publish_calls: AtomicUsize,
+        first_final_publish_started: Notify,
+        release_first_final_publish: Notify,
     }
 
     impl Default for LostPutResponseStore {
@@ -1003,12 +956,30 @@ mod tests {
             Self {
                 manifests: Mutex::new(HashMap::new()),
                 fail_next_put_response: AtomicBool::new(true),
+                block_first_final_publish: false,
+                final_publish_calls: AtomicUsize::new(0),
+                first_final_publish_started: Notify::new(),
+                release_first_final_publish: Notify::new(),
+            }
+        }
+    }
+
+    impl LostPutResponseStore {
+        fn blocking_first_final_publish() -> Self {
+            Self {
+                fail_next_put_response: AtomicBool::new(false),
+                block_first_final_publish: true,
+                ..Default::default()
             }
         }
     }
 
     #[async_trait]
     impl ExternalManifestStore for LostPutResponseStore {
+        fn use_create_only_manifest_copy(&self) -> bool {
+            self.block_first_final_publish
+        }
+
         async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
             self.manifests
                 .lock()
@@ -1091,6 +1062,12 @@ mod tests {
             size: u64,
             e_tag: Option<String>,
         ) -> Result<()> {
+            if self.block_first_final_publish
+                && self.final_publish_calls.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                self.first_final_publish_started.notify_one();
+                self.release_first_final_publish.notified().await;
+            }
             let key = (base_uri.to_string(), version);
             let mut manifests = self.manifests.lock().unwrap();
             let manifest = manifests
@@ -1102,81 +1079,6 @@ mod tests {
                 e_tag,
             };
             Ok(())
-        }
-    }
-
-    #[derive(Debug)]
-    struct FirstFinalPublishBlockedStore {
-        inner: LostPutResponseStore,
-        final_publish_calls: AtomicUsize,
-        first_final_publish_started: Notify,
-        release_first_final_publish: Notify,
-    }
-
-    impl Default for FirstFinalPublishBlockedStore {
-        fn default() -> Self {
-            Self {
-                inner: LostPutResponseStore {
-                    manifests: Mutex::new(HashMap::new()),
-                    fail_next_put_response: AtomicBool::new(false),
-                },
-                final_publish_calls: AtomicUsize::new(0),
-                first_final_publish_started: Notify::new(),
-                release_first_final_publish: Notify::new(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl ExternalManifestStore for FirstFinalPublishBlockedStore {
-        fn use_create_only_manifest_copy(&self) -> bool {
-            true
-        }
-
-        async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
-            self.inner.get(base_uri, version).await
-        }
-
-        async fn get_manifest_location(
-            &self,
-            base_uri: &str,
-            version: u64,
-        ) -> Result<ManifestLocation> {
-            self.inner.get_manifest_location(base_uri, version).await
-        }
-
-        async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
-            self.inner.get_latest_version(base_uri).await
-        }
-
-        async fn put_if_not_exists(
-            &self,
-            base_uri: &str,
-            version: u64,
-            path: &str,
-            size: u64,
-            e_tag: Option<String>,
-        ) -> Result<()> {
-            self.inner
-                .put_if_not_exists(base_uri, version, path, size, e_tag)
-                .await
-        }
-
-        async fn put_if_exists(
-            &self,
-            base_uri: &str,
-            version: u64,
-            path: &str,
-            size: u64,
-            e_tag: Option<String>,
-        ) -> Result<()> {
-            if self.final_publish_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                self.first_final_publish_started.notify_one();
-                self.release_first_final_publish.notified().await;
-            }
-            self.inner
-                .put_if_exists(base_uri, version, path, size, e_tag)
-                .await
         }
     }
 
@@ -1225,7 +1127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_existing_final_manifest_must_match_staging_bytes() {
+    async fn test_existing_manifest_validation() {
         let object_store = ObjectStore::memory();
         let staging_path = Path::from("dataset/_versions/1.manifest-staging-test");
         let final_path = Path::from("dataset/_versions/1.manifest");
@@ -1237,6 +1139,14 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let missing_final =
+            manifests_match(object_store.inner.as_ref(), &staging_path, &final_path, 7).await;
+        assert!(matches!(
+            missing_final,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
+
         object_store
             .inner
             .put(
@@ -1265,61 +1175,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_missing_final_is_not_mistaken_for_missing_staging() {
-        let object_store = ObjectStore::memory();
-        let staging_path = Path::from("dataset/_versions/1.manifest-staging-test");
-        let final_path = Path::from("dataset/_versions/1.manifest");
-        object_store
-            .inner
-            .put(
-                &staging_path,
-                object_store::PutPayload::from_static(b"staging"),
-            )
-            .await
-            .unwrap();
-
-        let result =
-            manifests_match(object_store.inner.as_ref(), &staging_path, &final_path, 7).await;
-        assert!(matches!(result, Err(ObjectStoreError::NotFound { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_source_missing_accepts_path_only_store_metadata() {
-        let object_store = ObjectStore::memory();
-        let final_path = Path::from("dataset/_versions/1.manifest");
-        object_store
-            .inner
-            .put(
-                &final_path,
-                object_store::PutPayload::from_static(b"manifest"),
-            )
-            .await
-            .unwrap();
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
-        let published = ManifestLocation {
-            version: 1,
-            path: final_path.clone(),
-            size: None,
-            naming_scheme: ManifestNamingScheme::V1,
-            e_tag: None,
-        };
-
-        assert!(published_location_matches_object(
-            &published,
-            &final_path,
-            &final_meta
-        ));
-
-        let mut stale = published;
-        stale.e_tag = Some("stale-etag".to_string());
-        assert!(!published_location_matches_object(
-            &stale,
-            &final_path,
-            &final_meta
-        ));
-    }
-
     #[rstest::rstest]
     #[case(ManifestNamingScheme::V1)]
     #[case(ManifestNamingScheme::V2)]
@@ -1327,7 +1182,7 @@ mod tests {
     async fn test_concurrent_direct_and_reader_finalization_preserves_winner_metadata(
         #[case] naming_scheme: ManifestNamingScheme,
     ) {
-        let external_store = Arc::new(FirstFinalPublishBlockedStore::default());
+        let external_store = Arc::new(LostPutResponseStore::blocking_first_final_publish());
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
@@ -1343,12 +1198,8 @@ mod tests {
                 object_store::PutPayload::from_static(b"manifest body"),
             )
             .await
-            .expect("seed staging manifest");
-        let staging_meta = object_store
-            .inner
-            .head(&staging_path)
-            .await
-            .expect("read staging metadata");
+            .unwrap();
+        let staging_meta = object_store.inner.head(&staging_path).await.unwrap();
 
         let writer_store = object_store.inner.clone();
         let writer_external_store = external_store.clone();
@@ -1384,34 +1235,23 @@ mod tests {
             .await;
 
         external_store.release_first_final_publish.notify_one();
-        let reader_location = reader_result.expect("reader-assisted finalization should succeed");
-        let writer_location = writer
-            .await
-            .expect("direct finalizer task should not panic")
-            .expect("direct finalization should succeed");
+        let reader_location = reader_result.unwrap();
+        let writer_location = writer.await.unwrap().unwrap();
 
-        let final_meta = object_store
-            .inner
-            .head(&final_path)
-            .await
-            .expect("read finalized metadata");
+        let final_meta = object_store.inner.head(&final_path).await.unwrap();
         let stored_location = external_store
             .get_manifest_location(base_path.as_ref(), version)
             .await
-            .expect("read published manifest location");
+            .unwrap();
 
-        assert_eq!(stored_location.path, final_path);
-        assert_eq!(stored_location.size, Some(final_meta.size));
-        assert_eq!(
-            stored_location.e_tag, final_meta.e_tag,
-            "external metadata must describe the materialized winner"
-        );
-        assert_eq!(writer_location.path, final_path);
-        assert_eq!(writer_location.size, Some(final_meta.size));
-        assert_eq!(writer_location.e_tag, final_meta.e_tag);
-        assert_eq!(reader_location.path, final_path);
-        assert_eq!(reader_location.size, Some(final_meta.size));
-        assert_eq!(reader_location.e_tag, final_meta.e_tag);
+        for location in [&stored_location, &writer_location, &reader_location] {
+            assert_eq!(location.path, final_path);
+            assert_eq!(location.size, Some(final_meta.size));
+            assert_eq!(
+                location.e_tag, final_meta.e_tag,
+                "all finalizers must describe the materialized winner"
+            );
+        }
 
         handler
             .resolve_version_location(&base_path, version, object_store.inner.as_ref())
