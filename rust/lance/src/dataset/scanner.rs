@@ -88,13 +88,15 @@ use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
+use super::versions;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{
-    load_segment_details, load_segments, resolve_fts_field, resolve_query_document_granularity,
+    fts_index_fragment_bitmap, load_segment_details, load_segments, resolve_fts_field,
+    resolve_query_document_granularity,
 };
 use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
@@ -432,10 +434,10 @@ impl MaterializationStyle {
 }
 
 #[derive(Debug)]
-struct PlannedFilteredScan {
-    plan: Arc<dyn ExecutionPlan>,
-    limit_pushed_down: bool,
-    filter_pushed_down: bool,
+pub(super) struct PlannedFilteredScan {
+    pub(super) plan: Arc<dyn ExecutionPlan>,
+    pub(super) limit_pushed_down: bool,
+    pub(super) filter_pushed_down: bool,
 }
 
 pub struct FilterPlan {
@@ -897,7 +899,7 @@ pub struct Scanner {
     /// the smaller row count selected by either limit.
     batch_size_bytes: Option<u64>,
 
-    /// Number of batches to prefetch
+    /// Number of batches to decode concurrently
     batch_readahead: usize,
 
     /// Number of fragments to read concurrently
@@ -1523,9 +1525,11 @@ impl Scanner {
         self
     }
 
-    /// Set the fragment readahead.
+    /// Set the number of fragments whose reads may be scheduled concurrently.
     ///
-    /// This is only used if ``scan_in_order`` is set to false.
+    /// This applies to both ordered and unordered scans. [`Self::scan_in_order`]
+    /// controls result ordering, not whether fragment I/O overlaps. Set this to
+    /// `1` to read one fragment at a time.
     pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
         self.fragment_readahead = Some(nfragments);
         self
@@ -3012,7 +3016,7 @@ impl Scanner {
     // Do not call this directly, use filtered_read instead
     //
     // First return value is the plan, second is whether the limit was pushed down
-    async fn legacy_filtered_read(
+    pub(super) async fn legacy_filtered_read(
         &self,
         filter_plan: &ExprFilterPlan,
         projection: Projection,
@@ -3116,7 +3120,7 @@ impl Scanner {
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
-    async fn new_filtered_read(
+    pub(super) async fn new_filtered_read(
         &self,
         filter_plan: &ExprFilterPlan,
         projection: Projection,
@@ -3230,43 +3234,29 @@ impl Scanner {
     // Helper function for filtered read
     //
     // Delegates to legacy or new filtered read based on dataset storage version
-    async fn filtered_read(
-        &self,
-        filter_plan: &ExprFilterPlan,
+    fn filtered_read<'a>(
+        &'a self,
+        filter_plan: &'a ExprFilterPlan,
         projection: Projection,
         make_deletions_null: bool,
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
-    ) -> Result<PlannedFilteredScan> {
-        // Use legacy path if dataset uses legacy storage format
-        if self.dataset.is_legacy_storage() {
-            self.legacy_filtered_read(
-                filter_plan,
-                projection,
-                make_deletions_null,
-                fragments,
-                scan_range,
-                is_prefilter,
-            )
-            .await
-        } else {
-            let limit_pushed_down = scan_range.is_some();
-            let plan = self
-                .new_filtered_read(
-                    filter_plan,
-                    projection,
-                    make_deletions_null,
-                    fragments,
-                    scan_range,
-                )
-                .await?;
-            Ok(PlannedFilteredScan {
-                filter_pushed_down: true,
-                limit_pushed_down,
-                plan,
-            })
-        }
+    ) -> BoxFuture<'a, Result<PlannedFilteredScan>> {
+        versions::filtered_read(
+            self.dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format(),
+            self,
+            filter_plan,
+            projection,
+            make_deletions_null,
+            fragments,
+            scan_range,
+            is_prefilter,
+        )
+        .boxed()
     }
 
     fn row_ids_as_take_input(&self, row_ids: RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
@@ -3491,25 +3481,14 @@ impl Scanner {
         document_granularity: DocumentGranularity,
         accum: &mut RoaringBitmap,
     ) -> Result<bool> {
-        let index = self
-            .dataset
-            .load_scalar_index(
-                IndexCriteria::default()
-                    .for_column(column)
-                    .supports_fts()
-                    .with_fts_document_granularity(document_granularity),
-            )
-            .await?;
-        match index {
-            Some(index) => match &index.fragment_bitmap {
-                Some(fragmap) => {
-                    *accum |= fragmap;
-                    Ok(true)
-                }
-                None => Ok(false),
-            },
-            None => Ok(false),
-        }
+        let Some(fragment_bitmap) =
+            fts_index_fragment_bitmap(&self.dataset, column, document_granularity).await?
+        else {
+            return Ok(false);
+        };
+        *accum |= fragment_bitmap;
+
+        Ok(true)
     }
 
     #[async_recursion]
@@ -6227,11 +6206,26 @@ impl Scanner {
             return Ok(input);
         }
 
+        versions::take(
+            self.dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format(),
+            self,
+            input,
+            output_projection,
+        )
+    }
+
+    pub(super) fn take_current(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        output_projection: Projection,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let input_schema = input.schema();
         let has_row_id = input_schema.column_with_name(ROW_ID).is_some();
         let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
-        // The v1 reader cannot serve a FilteredReadExec
-        if !self.dataset.is_legacy_storage() && (has_row_id || has_row_addr) {
+        if has_row_id || has_row_addr {
             // Pass the full (un-subtracted) target so a rebuild against a
             // different child re-derives what to fetch, and preserve carried
             // identity columns (downstream nodes may key off them; the final
@@ -6258,6 +6252,15 @@ impl Scanner {
             )?));
         }
 
+        self.take_legacy(input, output_projection)
+    }
+
+    #[allow(deprecated)]
+    pub(super) fn take_legacy(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        output_projection: Projection,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let coalesced = Arc::new(CoalesceBatchesExec::new(
             input.clone(),
             self.get_batch_size(),
@@ -6623,18 +6626,41 @@ pub mod test_dataset {
             Ok(())
         }
 
-        pub async fn make_fts_index(&mut self) -> Result<()> {
+        fn fts_index_params() -> InvertedIndexParams {
             // These scanner tests search for the token "s" (from the `s-{N}`
             // column values) to exercise fragment/append coverage, and "s" is
             // in the full English stop-word list. Keep the token searchable;
             // stop-word behavior itself is covered by the tokenizer tests.
-            let params = InvertedIndexParams::default()
+            InvertedIndexParams::default()
                 .with_position(true)
-                .remove_stop_words(false);
+                .remove_stop_words(false)
+        }
+
+        pub async fn make_fts_index(&mut self) -> Result<()> {
+            let params = Self::fts_index_params();
             self.dataset
                 .create_index(&["s"], IndexType::Inverted, None, &params, true)
                 .await?;
             Ok(())
+        }
+
+        pub async fn make_segmented_fts_index(&mut self) -> Result<()> {
+            let params = Self::fts_index_params();
+            let fragments = self.dataset.get_fragments();
+            let mut segments = Vec::with_capacity(fragments.len());
+            for fragment in fragments {
+                let segment = self
+                    .dataset
+                    .create_index_builder(&["s"], IndexType::Inverted, &params)
+                    .name("s_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await?;
+                segments.push(segment);
+            }
+            self.dataset
+                .commit_existing_index_segments("s_idx", "s", segments)
+                .await
         }
 
         pub async fn append_new_data(&mut self) -> Result<()> {
@@ -8874,6 +8900,30 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_filter_legacy_dataset_with_stable_row_ids() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, true)
+            .await
+            .unwrap();
+
+        let batch = test_ds
+            .dataset
+            .scan()
+            .batch_readahead(get_num_compute_intensive_cpus())
+            .project(&["vec"])
+            .unwrap()
+            .with_row_id()
+            .filter_expr(col("vec").is_not_null())
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let unique_row_ids = row_ids.values().iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(unique_row_ids.len(), 400);
+        assert_eq!(row_ids.len(), unique_row_ids.len());
+    }
+
+    #[tokio::test]
     async fn test_scan_unordered_with_row_id() {
         // This test doesn't make sense for v2 files, there is no way to get an out-of-order scan
         let test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, false)
@@ -10166,6 +10216,14 @@ mod test {
             }
         }
 
+        fn uses_legacy_scan(&self) -> bool {
+            self.dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format()
+                == lance_file::version::ConcreteFileVersion::V1
+        }
+
         async fn check_vector_scalar_indexed_and_refine(&self, params: &ScalarTestParams) {
             let (query_plan, batch) = self
                 .run_query(
@@ -10175,7 +10233,7 @@ mod test {
                 )
                 .await;
             // Materialization is always required if there is a refine
-            if self.dataset.is_legacy_storage() {
+            if self.uses_legacy_scan() {
                 assert!(query_plan.contains("MaterializeIndex"));
             }
             // The result should not include the sample query
@@ -10207,7 +10265,7 @@ mod test {
             let (query_plan, batch) = self
                 .run_query("indexed != 50", Some(self.sample_query()), params)
                 .await;
-            if self.dataset.is_legacy_storage() {
+            if self.uses_legacy_scan() {
                 if params.use_index {
                     // An ANN search whose prefilter is fully satisfied by the index should be
                     // able to use a ScalarIndexQuery
@@ -10256,7 +10314,7 @@ mod test {
         async fn check_simple_indexed_only(&self, params: &ScalarTestParams) {
             let (query_plan, batch) = self.run_query("indexed != 50", None, params).await;
             // Materialization is always required for non-vector search
-            if self.dataset.is_legacy_storage() {
+            if self.uses_legacy_scan() {
                 assert!(query_plan.contains("MaterializeIndex"));
             } else {
                 assert!(query_plan.contains("LanceRead"));
@@ -10297,7 +10355,7 @@ mod test {
                 params
             ).await;
             // Materialization is always required for non-vector search
-            if self.dataset.is_legacy_storage() {
+            if self.uses_legacy_scan() {
                 assert!(query_plan.contains("MaterializeIndex"));
             } else {
                 assert!(query_plan.contains("LanceRead"));
@@ -15103,8 +15161,20 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
 
-        // Create FTS index on first 2 fragments
-        test_ds.make_fts_index().await.unwrap();
+        // Create one FTS physical segment per indexed fragment.
+        test_ds.make_segmented_fts_index().await.unwrap();
+        let expected_index_coverage = test_ds
+            .dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<RoaringBitmap>();
+        let fragment_bitmap =
+            fts_index_fragment_bitmap(&test_ds.dataset, "s", DocumentGranularity::Row)
+                .await
+                .unwrap()
+                .expect("segmented FTS index");
+        assert_eq!(fragment_bitmap, expected_index_coverage);
 
         // Append two more unindexed fragments
         test_ds.append_data_with_range(400, 410).await.unwrap();
@@ -15116,6 +15186,41 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(fragments.len(), 4);
 
         // "s-5" matches: s-5, s-50..s-59, s-150..s-159 (frag 0), s-250..s-259, s-350..s-359 (frag 1), s-405 (frag 2), s-415 (frag 3)
+        async fn fts_ids(dataset: &Dataset, fragments: Option<Vec<Fragment>>) -> Vec<i32> {
+            let mut scanner = dataset.scan();
+            scanner
+                .full_text_search(FullTextSearchQuery::new("s-5".into()))
+                .unwrap();
+            if let Some(fragments) = fragments {
+                scanner.with_fragments(fragments);
+            }
+            let batch = scanner.try_into_batch().await.unwrap();
+            let mut ids = batch
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        let global_ids = fts_ids(&test_ds.dataset, None).await;
+        let mut fragmented_ids = Vec::with_capacity(global_ids.len());
+        for (fragment, expected_range) in
+            fragments.iter().zip([0..200, 200..400, 400..410, 410..420])
+        {
+            let ids = fts_ids(&test_ds.dataset, Some(vec![fragment.clone()])).await;
+            assert!(
+                !ids.is_empty() && ids.iter().all(|id| expected_range.contains(id)),
+                "fragment {} should return only matching rows in {expected_range:?}",
+                fragment.id,
+            );
+            fragmented_ids.extend(ids);
+        }
+        fragmented_ids.sort_unstable();
+        assert_eq!(fragmented_ids, global_ids);
+
         test_fragment_list_filtering(&test_ds, fragments, |dataset| {
             let mut scanner = dataset.scan();
             scanner
@@ -15124,5 +15229,24 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             scanner
         })
         .await;
+        for (fragment, (phrase, expected_i)) in
+            fragments[..2].iter().zip([("s 5", 5), ("s 205", 205)])
+        {
+            let mut scanner = test_ds.dataset.scan();
+            scanner.with_fragments(vec![fragment.clone()]);
+            scanner
+                .full_text_search(FullTextSearchQuery::new_query(
+                    PhraseQuery::new(phrase.to_string())
+                        .with_column(Some("s".to_string()))
+                        .into(),
+                ))
+                .unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            let i_array = batch
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<Int32Type>();
+            assert_eq!(i_array.values(), &[expected_i]);
+        }
     }
 }

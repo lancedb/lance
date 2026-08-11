@@ -22,7 +22,7 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter
-from lance.fragment import write_fragments
+from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
 
@@ -1095,3 +1095,225 @@ def test_fragment_update_columns_with_json_column(tmp_path):
             assert "x" in meta_val or "x" in str(meta), (
                 f"id={id_val} should have original value, got {meta_val}"
             )
+
+
+def test_row_id_sequence_from_range():
+    # A step-of-one range is the compact case and must not materialize its ids.
+    sequence = RowIdSequence(range(10))
+
+    assert len(sequence) == 10
+    assert sequence.to_pyarrow() == pa.array(range(10), type=pa.uint64())
+    assert sequence.to_pyarrow().type == pa.uint64()
+    assert list(sequence) == list(range(10))
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param(pa.array([1, 2, 3]), id="pyarrow_array"),
+        pytest.param(pa.array([1, 2, 3], type=pa.uint64()), id="pyarrow_uint64_array"),
+        pytest.param(pa.array([1, 2, 3], type=pa.int8()), id="pyarrow_int8_array"),
+        pytest.param(pa.array([1, 2, 3], type=pa.uint16()), id="pyarrow_uint16_array"),
+        # A slice carries an offset into a larger buffer; only the slice counts.
+        pytest.param(pa.array([9, 1, 2, 3, 9]).slice(1, 3), id="pyarrow_sliced_array"),
+        pytest.param(pa.chunked_array([[1], [2, 3]]), id="pyarrow_chunked_array"),
+        pytest.param((x for x in [1, 2, 3]), id="generator"),
+        pytest.param([1, 2, 3], id="list"),
+        pytest.param(range(1, 4), id="range"),
+        pytest.param(range(3, 0, -1), id="descending_range"),
+    ],
+)
+def test_row_id_sequence_accepts_input_types(row_ids):
+    sequence = RowIdSequence(row_ids)
+
+    assert sorted(sequence) == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param([], id="empty_list"),
+        pytest.param(range(0), id="empty_range"),
+        pytest.param(pa.array([], type=pa.uint64()), id="empty_array"),
+    ],
+)
+def test_row_id_sequence_empty(row_ids):
+    sequence = RowIdSequence(row_ids)
+
+    assert len(sequence) == 0
+    assert list(sequence) == []
+    assert sequence.to_pyarrow() == pa.array([], type=pa.uint64())
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param(list(range(4100)), id="contiguous"),
+        pytest.param(list(range(0, 8200, 2)), id="gapped"),
+        pytest.param(list(range(4100))[::-1], id="unsorted"),
+    ],
+)
+def test_row_id_sequence_iterates_large_sequences(row_ids):
+    # Each shape picks a different segment encoding, so all of them have to
+    # round-trip through iteration.
+    sequence = RowIdSequence(row_ids)
+
+    assert list(sequence) == row_ids
+    # Each call must hand back a fresh iterator rather than a spent one.
+    assert list(sequence) == row_ids
+
+
+def test_row_id_sequence_from_range_above_isize():
+    # Range bounds are read as isize; beyond that the values are read one at a
+    # time instead, which must still cover the whole uint64 row id domain.
+    start = 2**63
+    sequence = RowIdSequence(range(start, start + 3))
+
+    assert list(sequence) == [start, start + 1, start + 2]
+
+
+def test_row_id_sequence_unsorted_round_trips():
+    sequence = RowIdSequence([12, 11, 10])
+
+    assert list(sequence) == [12, 11, 10]
+    assert sequence.to_pyarrow() == pa.array([12, 11, 10], type=pa.uint64())
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param([1, 1, 2], id="adjacent"),
+        pytest.param([1, 2, 3, 1], id="separated"),
+        pytest.param(pa.array([5, 3, 5]), id="unsorted_array"),
+    ],
+)
+def test_row_id_sequence_rejects_duplicates(row_ids):
+    with pytest.raises(ValueError, match="Row ids must be unique"):
+        RowIdSequence(row_ids)
+
+
+@pytest.mark.parametrize(
+    ("row_ids", "message"),
+    [
+        pytest.param(pa.array([1, None, 3]), "must not be null", id="null_in_array"),
+        pytest.param(pa.array([1.5, 2.5]), "array of integers", id="float_array"),
+        pytest.param(pa.array([-1, 2]), "uint64", id="negative_in_array"),
+        pytest.param(range(-5, 5), "non-negative", id="negative_range"),
+        pytest.param(5, "iterable of integers", id="not_iterable"),
+    ],
+)
+def test_row_id_sequence_rejects_invalid_input(row_ids, message):
+    with pytest.raises((ValueError, TypeError), match=message):
+        RowIdSequence(row_ids)
+
+
+def test_row_id_sequence_metadata_round_trip():
+    sequence = RowIdSequence([7, 12, 3])
+
+    metadata = sequence.to_inline_metadata()
+    assert isinstance(metadata, RowIdMeta)
+    assert RowIdSequence.from_inline_metadata(metadata) == sequence
+
+
+def test_row_id_sequence_equality_and_repr():
+    assert RowIdSequence(range(3)) == RowIdSequence([0, 1, 2])
+    assert RowIdSequence(range(3)) != RowIdSequence([0, 1])
+    # Comparing against an unrelated type is False rather than an error.
+    assert RowIdSequence(range(3)) != "not a sequence"
+
+    assert repr(RowIdSequence([1, 2])) == "RowIdSequence([1, 2])"
+    assert repr(RowIdSequence(range(12))) == (
+        "RowIdSequence([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ...], len=12)"
+    )
+
+
+def test_row_id_sequence_pickle():
+    sequence = RowIdSequence([7, 12, 3])
+
+    assert pickle.loads(pickle.dumps(sequence)) == sequence
+
+
+def _row_ids_by_id(dataset: LanceDataset) -> dict:
+    table = dataset.to_table(columns=["id"], with_row_id=True)
+    return dict(zip(table["id"].to_pylist(), table["_rowid"].to_pylist()))
+
+
+def test_row_id_sequence_preserves_ids_in_manual_update(tmp_path: Path):
+    # An update assembled externally (delete the old row, append a replacement)
+    # keeps the row's identity only if the new fragment carries its row id.
+    dataset = write_dataset(
+        pa.table({"id": [1, 2, 3, 4], "v": [10, 20, 30, 40]}),
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=True,
+    )
+    row_ids_before = _row_ids_by_id(dataset)
+
+    updated_fragment = dataset.get_fragments()[0].delete("id = 2")
+    (new_fragment,) = write_fragments(pa.table({"id": [2], "v": [99]}), tmp_path)
+    new_fragment.row_id_meta = RowIdSequence([row_ids_before[2]]).to_inline_metadata()
+
+    dataset = LanceDataset.commit(
+        tmp_path,
+        LanceOperation.Update(
+            removed_fragment_ids=[],
+            updated_fragments=[updated_fragment],
+            new_fragments=[new_fragment],
+            fields_modified=[],
+        ),
+        read_version=dataset.version,
+    )
+
+    assert _row_ids_by_id(dataset) == row_ids_before
+    assert dataset.to_table().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3, 4],
+        "v": [10, 99, 30, 40],
+    }
+
+
+def test_row_id_sequence_reads_back_fragment_metadata(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(10)}),
+        tmp_path,
+        max_rows_per_file=5,
+        enable_stable_row_ids=True,
+    )
+
+    sequences = [
+        RowIdSequence.from_inline_metadata(fragment.metadata.row_id_meta)
+        for fragment in dataset.get_fragments()
+    ]
+
+    assert [list(sequence) for sequence in sequences] == [
+        [0, 1, 2, 3, 4],
+        [5, 6, 7, 8, 9],
+    ]
+
+
+def test_fragment_validate(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(100), "b": range(100)}),
+        tmp_path,
+        max_rows_per_file=50,
+    )
+    # A valid fragment validates without raising.
+    for fragment in dataset.get_fragments():
+        assert fragment.validate() is None
+
+
+def test_fragment_validate_across_data_files(tmp_path: Path):
+    # add_columns writes a second data file per fragment; validate must still
+    # pass (field ids increasing and unique across a fragment's data files).
+    dataset = write_dataset(pa.table({"a": range(100)}), tmp_path, max_rows_per_file=50)
+    dataset.add_columns({"b": "a + 1"})
+    for fragment in dataset.get_fragments():
+        assert len(fragment.data_files()) > 1
+        fragment.validate()
+
+
+def test_fragment_validate_after_delete(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(100)}), tmp_path, max_rows_per_file=50)
+    dataset.delete("a < 10")
+    # A fragment carrying a deletion vector still validates.
+    for fragment in dataset.get_fragments():
+        fragment.validate()

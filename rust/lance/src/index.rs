@@ -42,7 +42,10 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_index::{INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex};
+use lance_index::{
+    FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmResult, FtsPrewarmSegmentStatus,
+    INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex,
+};
 use lance_index::{
     IndexCriteria, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
@@ -86,7 +89,9 @@ use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{
+    IndexCatchupAdvance, Operation, Transaction, TransactionBuilder,
+};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
@@ -97,6 +102,7 @@ use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_in
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
+use lance_table::system_index::mem_wal::CompactedSsTable;
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     if segments.is_empty() {
@@ -352,6 +358,117 @@ async fn prewarm_opened_index(
     }
 }
 
+struct SegmentPrewarmResult {
+    partition_count: usize,
+}
+
+struct OpenedSegmentPrewarmResult {
+    index_uuid: Uuid,
+    index: Arc<dyn Index>,
+    partition_count: usize,
+}
+
+async fn prewarm_opened_index_result(
+    index: Arc<dyn Index>,
+    options: &PrewarmOptions,
+) -> Result<SegmentPrewarmResult> {
+    match options {
+        PrewarmOptions::Fts(fts_options) => {
+            let inverted = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "FTS prewarm options are only supported for inverted indices, got {:?}",
+                        index.index_type()
+                    ))
+                })?;
+            inverted.prewarm_with_options_result(fts_options).await?;
+            Ok(SegmentPrewarmResult {
+                partition_count: inverted.partition_count(),
+            })
+        }
+        _ => Err(Error::not_supported(
+            "unsupported prewarm options for this lance version".to_owned(),
+        )),
+    }
+}
+
+async fn aggregate_fts_prewarm_results(
+    dataset: &Dataset,
+    segment_results: Vec<OpenedSegmentPrewarmResult>,
+    options: Option<&PrewarmOptions>,
+) -> Result<FtsPrewarmResult> {
+    let partition_count = segment_results
+        .iter()
+        .map(|result| result.partition_count)
+        .sum();
+    let mut failing_segments = Vec::new();
+    let mut failing_partitions = Vec::new();
+    let mut best_effort = false;
+
+    for segment in segment_results {
+        let segment_id = segment.index_uuid.to_string();
+        let prewarmed_inverted = segment.index.as_any().downcast_ref::<InvertedIndex>();
+        let Some(fts_options) = (match options {
+            Some(PrewarmOptions::Fts(fts_options)) => Some(fts_options.clone()),
+            None if prewarmed_inverted.is_some() => Some(FtsPrewarmOptions::default()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        best_effort |= fts_options.mode.is_best_effort();
+
+        let cached_index =
+            scalar::cached_scalar_index_container(dataset, &segment.index_uuid).await;
+        let cached_inverted = cached_index
+            .as_ref()
+            .and_then(|index| index.as_any().downcast_ref::<InvertedIndex>());
+        let container_resident = cached_inverted.is_some();
+        let container_matches_prewarmed = match (prewarmed_inverted, cached_inverted) {
+            (Some(prewarmed), Some(cached)) => std::ptr::addr_eq(prewarmed, cached),
+            _ => false,
+        };
+
+        if !container_resident || !container_matches_prewarmed {
+            failing_segments.push(FtsPrewarmSegmentStatus {
+                segment_id: segment_id.clone(),
+                scalar_index_container_resident: container_resident,
+                scalar_index_container_matches_prewarmed: container_matches_prewarmed,
+            });
+        }
+
+        if let Some(cached_inverted) = cached_inverted
+            && let Some(mut diagnostics) = cached_inverted
+                .prewarm_residency_result(fts_options.with_position)
+                .await
+                .diagnostics
+        {
+            failing_segments.append(&mut diagnostics.failing_segments);
+            failing_partitions.extend(diagnostics.failing_partitions.drain(..).map(
+                |mut partition| {
+                    partition.segment_id = Some(segment_id.clone());
+                    partition
+                },
+            ));
+        }
+    }
+
+    let diagnostics = FtsPrewarmDiagnostics {
+        partition_count,
+        failing_segments,
+        failing_partitions,
+    };
+
+    if diagnostics.fully_resident() {
+        Ok(FtsPrewarmResult::fully_resident())
+    } else if best_effort {
+        Ok(FtsPrewarmResult::partial(diagnostics))
+    } else {
+        Err(Error::internal(diagnostics.to_string()))
+    }
+}
+
 fn total_index_segment_size_bytes(indices: &[IndexMetadata]) -> Option<u64> {
     let mut total = 0u64;
     for index_meta in indices {
@@ -379,7 +496,7 @@ async fn prewarm_index_segments_by_metadata(
     options: Option<&PrewarmOptions>,
     available_segment_count: usize,
     requested_segment_count: Option<usize>,
-) -> Result<()> {
+) -> Result<FtsPrewarmResult> {
     let request_started = Instant::now();
     let selected_segment_count = indices.len();
     let selected_size_bytes = total_index_segment_size_bytes(&indices);
@@ -446,16 +563,34 @@ async fn prewarm_index_segments_by_metadata(
             }
         };
 
-        if let Err(err) = prewarm_opened_index(index, options).await {
-            warn!(
-                index_name = name,
-                %index_uuid,
-                error = %err,
-                elapsed_ms = segment_started.elapsed().as_millis() as u64,
-                "prewarm index segment failed"
-            );
-            return Err(err);
-        }
+        let segment_result = match options {
+            Some(options) => match prewarm_opened_index_result(index.clone(), options).await {
+                Ok(result) => result,
+                Err(err) => {
+                    warn!(
+                        index_name = name,
+                        %index_uuid,
+                        error = %err,
+                        elapsed_ms = segment_started.elapsed().as_millis() as u64,
+                        "prewarm index segment failed"
+                    );
+                    return Err(err);
+                }
+            },
+            None => {
+                if let Err(err) = prewarm_opened_index(index.clone(), None).await {
+                    warn!(
+                        index_name = name,
+                        %index_uuid,
+                        error = %err,
+                        elapsed_ms = segment_started.elapsed().as_millis() as u64,
+                        "prewarm index segment failed"
+                    );
+                    return Err(err);
+                }
+                SegmentPrewarmResult { partition_count: 0 }
+            }
+        };
 
         info!(
             index_name = name,
@@ -463,16 +598,22 @@ async fn prewarm_index_segments_by_metadata(
             elapsed_ms = segment_started.elapsed().as_millis() as u64,
             "prewarm index segment finished"
         );
-        Ok(())
+        Ok(OpenedSegmentPrewarmResult {
+            index_uuid,
+            index,
+            partition_count: segment_result.partition_count,
+        })
     }))
     .await;
 
     match result {
-        Ok(_) => {
+        Ok(segment_results) => {
             let cache_stats_after = dataset.session.index_cache_stats().await;
+            let result = aggregate_fts_prewarm_results(dataset, segment_results, options).await?;
             info!(
                 index_name = name,
                 selected_segment_count,
+                fts_fully_resident = result.fully_resident,
                 index_cache_entries_after = cache_stats_after.num_entries,
                 index_cache_entries_delta = cache_size_delta(
                     cache_stats_after.num_entries,
@@ -484,7 +625,7 @@ async fn prewarm_index_segments_by_metadata(
                 elapsed_ms = request_started.elapsed().as_millis() as u64,
                 "prewarm index segments finished"
             );
-            Ok(())
+            Ok(result)
         }
         Err(err) => {
             let cache_stats_after = dataset.session.index_cache_stats().await;
@@ -1293,6 +1434,56 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 }
 
+/// Describe, for each named index, the segments it will consist of after this
+/// commit and the catch-up generations to record for it.
+///
+/// Built here rather than by the caller: an advance must name the exact segments
+/// it describes, and those do not exist until the merge runs. The final segment
+/// set for a name is what survives the `CreateIndex` apply -- the existing
+/// segments this commit neither removes nor replaces, plus the ones it adds.
+fn build_index_catchup_advances(
+    names: &[String],
+    existing: &[IndexMetadata],
+    new_indices: &[IndexMetadata],
+    removed_indices: &[IndexMetadata],
+    generations: &[CompactedSsTable],
+    inspected_fragments: &RoaringBitmap,
+) -> Vec<IndexCatchupAdvance> {
+    let replaced: HashSet<Uuid> = removed_indices
+        .iter()
+        .chain(new_indices.iter())
+        .map(|idx| idx.uuid)
+        .collect();
+
+    // Driven by the requested names, not by what was rebuilt: an index that
+    // already covered everything produces no new segment, and that is exactly
+    // the repair that most needs to record its catch-up.
+    names
+        .iter()
+        .unique()
+        .map(|name| {
+            let segments: Vec<&IndexMetadata> = existing
+                .iter()
+                .filter(|idx| &idx.name == name && !replaced.contains(&idx.uuid))
+                .chain(new_indices.iter().filter(|idx| &idx.name == name))
+                .collect();
+            let mut expected_fragment_bitmap = RoaringBitmap::new();
+            for segment in &segments {
+                if let Some(bitmap) = segment.fragment_bitmap.as_ref() {
+                    expected_fragment_bitmap |= bitmap;
+                }
+            }
+            IndexCatchupAdvance {
+                index_name: name.clone(),
+                expected_index_segment_uuids: segments.iter().map(|s| s.uuid).collect(),
+                caught_up_generations: generations.to_vec(),
+                expected_fragment_bitmap,
+                inspected_fragments: inspected_fragments.clone(),
+            }
+        })
+        .collect()
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
@@ -1372,6 +1563,7 @@ impl DatasetIndexExt for Dataset {
             Operation::CreateIndex {
                 new_indices: vec![],
                 removed_indices: indices.clone(),
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -1391,9 +1583,20 @@ impl DatasetIndexExt for Dataset {
         let available_segment_count = indices.len();
         prewarm_index_segments_by_metadata(self, name, indices, None, available_segment_count, None)
             .await
+            .map(|_| ())
     }
 
     async fn prewarm_index_with_options(&self, name: &str, options: &PrewarmOptions) -> Result<()> {
+        self.prewarm_index_with_options_result(name, options)
+            .await
+            .map(|_| ())
+    }
+
+    async fn prewarm_index_with_options_result(
+        &self,
+        name: &str,
+        options: &PrewarmOptions,
+    ) -> Result<FtsPrewarmResult> {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
             return Err(Error::index_not_found(format!("name={}", name)));
@@ -1428,6 +1631,7 @@ impl DatasetIndexExt for Dataset {
             Some(segment_ids.len()),
         )
         .await
+        .map(|_| ())
     }
 
     async fn prewarm_index_segments_with_options(
@@ -1436,6 +1640,17 @@ impl DatasetIndexExt for Dataset {
         segment_ids: &[Uuid],
         options: &PrewarmOptions,
     ) -> Result<()> {
+        self.prewarm_index_segments_with_options_result(name, segment_ids, options)
+            .await
+            .map(|_| ())
+    }
+
+    async fn prewarm_index_segments_with_options_result(
+        &self,
+        name: &str,
+        segment_ids: &[Uuid],
+        options: &PrewarmOptions,
+    ) -> Result<FtsPrewarmResult> {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
             return Err(Error::index_not_found(format!("name={}", name)));
@@ -1831,6 +2046,7 @@ impl DatasetIndexExt for Dataset {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -1906,6 +2122,7 @@ impl DatasetIndexExt for Dataset {
     }
 
     #[instrument(skip_all)]
+
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
@@ -1963,7 +2180,79 @@ impl DatasetIndexExt for Dataset {
             new_indices.push(new_idx);
         }
 
-        if new_indices.is_empty() {
+        // Built here rather than by the caller: an advance must name the exact
+        // segments it describes, and those only exist now. Recording it in this
+        // commit is what keeps the index result and its catch-up from
+        // disagreeing.
+        //
+        // Built *before* the no-work early return below. A repair whose index
+        // already covers every fragment has nothing to rebuild, and that is the
+        // ordinary case after a remap: coverage was dropped because the segment
+        // changed, while the index still spans the table. Returning early there
+        // would leave catch-up missing forever and the repair rescheduling
+        // itself.
+        let mem_wal_index_catchup_advances = if options.mem_wal_index_catchup.is_empty() {
+            Vec::new()
+        } else {
+            let Some(names) = options.index_names.as_ref().filter(|n| !n.is_empty()) else {
+                return Err(Error::invalid_input(
+                    "optimize_indices: index_names must name the indices to record \
+                     catch-up for; recording it for every index on the table is \
+                     never what a repair means",
+                ));
+            };
+            // The caller may only claim what the version it read had already
+            // compacted. Anything compacted since landed in fragments this call
+            // never inspected, so its rows are not covered by the index being
+            // published.
+            let details = indices
+                .iter()
+                .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                .map(|idx| crate::index::mem_wal::load_mem_wal_index_details(idx.clone()))
+                .transpose()?
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "optimize_indices: cannot record catch-up, the {} system \
+                         index does not exist on this table",
+                        MEM_WAL_INDEX_NAME
+                    ))
+                })?;
+            for proposed in &options.mem_wal_index_catchup {
+                let inspected = details
+                    .compacted_sstables
+                    .iter()
+                    .find(|sstable| sstable.shard_id == proposed.shard_id)
+                    .map(|sstable| sstable.generation);
+                if inspected.is_none_or(|inspected| proposed.generation > inspected) {
+                    return Err(Error::invalid_input(format!(
+                        "optimize_indices: cannot record catch-up to generation {} for \
+                         shard {}: the version this call read had compacted {}",
+                        proposed.generation,
+                        proposed.shard_id,
+                        inspected
+                            .map(|g| g.to_string())
+                            .unwrap_or_else(|| "nothing".to_string())
+                    )));
+                }
+            }
+            build_index_catchup_advances(
+                names,
+                &indices,
+                &new_indices,
+                &removed_indices,
+                &options.mem_wal_index_catchup,
+                // The table as this call read it; anything appended since is a
+                // later catch-up gap, not something these generations claim.
+                &self
+                    .manifest
+                    .fragments
+                    .iter()
+                    .map(|f| f.id as u32)
+                    .collect(),
+            )
+        };
+
+        if new_indices.is_empty() && mem_wal_index_catchup_advances.is_empty() {
             return Ok(());
         }
 
@@ -1972,6 +2261,7 @@ impl DatasetIndexExt for Dataset {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                mem_wal_index_catchup_advances,
             },
         )
         .transaction_properties(options.transaction_properties.clone())
@@ -7897,6 +8187,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: legacy,
                 removed_indices: current,
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );

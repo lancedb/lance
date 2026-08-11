@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::{
     encoding::populate_schema_dictionaries, reader::FileReader as V1FileReader,
 };
@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
+use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -250,7 +251,7 @@ impl Manifest {
             .iter()
             .map(|fragment| {
                 let mut cloned_fragment = fragment.clone();
-                for file in &mut cloned_fragment.files {
+                for file in cloned_fragment.referenced_lance_files_mut() {
                     if file.base_id.is_none() {
                         file.base_id = Some(ref_base_id);
                     }
@@ -275,8 +276,11 @@ impl Manifest {
             index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            // Not derivable from the manifest, so it would be lost like any
+            // other zeroed word -- and a clone of a table that requires index
+            // catch-up would silently come back as legacy.
+            reader_feature_flags: self.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            writer_feature_flags: self.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
@@ -503,10 +507,6 @@ impl Manifest {
         pb_manifest.encode_to_vec()
     }
 
-    pub fn should_use_legacy_format(&self) -> bool {
-        self.data_storage_format.version == ConcreteFileVersion::V1
-    }
-
     /// Get the summary information of a manifest.
     ///
     /// This function calculates various statistics about the manifest, including:
@@ -659,16 +659,11 @@ impl DataStorageFormat {
     pub fn lance_file_format(&self) -> ConcreteFileVersion {
         self.version
     }
-
-    // Retained until all selector-based execution APIs migrate to exact versions.
-    pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
-        Ok(self.version.into())
-    }
 }
 
 impl Default for DataStorageFormat {
     fn default() -> Self {
-        Self::new(ConcreteFileVersion::from(LanceFileVersion::Stable))
+        Self::new(stable_file_version())
     }
 }
 
@@ -935,7 +930,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 } else {
                     // No fragments to inspect, best we can do is look at writer flags
                     if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
-                        DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable))
+                        DataStorageFormat::new(stable_file_version())
                     } else {
                         DataStorageFormat::new(ConcreteFileVersion::V1)
                     }
@@ -1115,6 +1110,51 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
 
+    /// A shallow clone points every local file at the parent through `base_id`.
+    /// An overlay's data file lives in the parent too, so it needs the same
+    /// stamp; without it the clone looks for the overlay under its own root.
+    #[test]
+    fn shallow_clone_stamps_base_id_on_overlay_files() {
+        use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let mut fragment = Fragment::with_file_legacy(0, "base.lance", &schema, Some(10));
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        }];
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let cloned = manifest.shallow_clone(
+            Some("parent".to_string()),
+            "memory://parent".to_string(),
+            7,
+            None,
+            String::new(),
+        );
+
+        let fragment = &cloned.fragments[0];
+        assert_eq!(fragment.files[0].base_id, Some(7));
+        assert_eq!(
+            fragment.overlays[0].data_file.base_id,
+            Some(7),
+            "the overlay's data file resolves against the parent as well"
+        );
+    }
+
     #[test]
     fn old_empty_manifest_recovers_v1_or_current_stable() {
         let old_manifest = pb::Manifest {
@@ -1134,7 +1174,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             recovered_stable.data_storage_format.lance_file_format(),
-            ConcreteFileVersion::from(LanceFileVersion::Stable)
+            stable_file_version()
         );
     }
 
@@ -1598,7 +1638,7 @@ mod tests {
                 "data_with_deletion.lance",
                 vec![0, 1],
                 vec![0, 1],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                stable_file_version(),
                 NonZero::new(1000),
             )
             .with_physical_rows(50);

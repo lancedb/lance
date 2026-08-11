@@ -228,7 +228,7 @@ async fn do_take_rows(
             .with_row_created_at_version(with_row_created_at_version_in_projection)
             .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection);
         let reader = fragment.open(&physical_schema, read_config).await?;
-        reader.legacy_read_range_as_batch(range).await
+        reader.read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
         // Don't need to re-arrange data, just concatenate
         let mut batches: Vec<_> = Vec::new();

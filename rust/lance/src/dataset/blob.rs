@@ -4634,6 +4634,24 @@ mod tests {
             assert_eq!(blob1.size(), blob2.size());
             assert_eq!(blob1.data_path(), blob2.data_path());
         }
+
+        // Unsorted indices spanning fragments use the take remapping path, which
+        // carries _rowaddr internally and must still preserve the requested order.
+        let indices = [33_u64, 17, 5, 28, 12, 39];
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&indices, "blobs")
+            .await
+            .unwrap();
+        for (blob, index) in blobs.iter().zip(indices) {
+            let actual = blob.as_ref().unwrap().read().await.unwrap();
+            let index = index as usize;
+            let expected = fixture.data[index / 10]
+                .column(1)
+                .as_binary::<i64>()
+                .value(index % 10);
+            assert_eq!(actual.as_ref(), expected);
+        }
     }
 
     #[rstest]

@@ -456,7 +456,7 @@ impl WriteParams {
     }
 
     pub fn storage_version_or_default(&self) -> ConcreteFileVersion {
-        self.data_storage_version.unwrap_or_default().into()
+        self.data_storage_version.unwrap_or_default().resolve()
     }
 
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
@@ -803,6 +803,11 @@ pub(crate) async fn cleanup_data_fragments(
     let data_dir = base_dir.clone().join(DATA_DIR);
     let mut skipped_external = 0usize;
     for fragment in fragments {
+        // Deliberately not `referenced_lance_files()`: callers decide which
+        // files belong to the failed write. `schema_evolution` passes a live
+        // fragment whose `files` it narrowed to the newly written ones while
+        // leaving `overlays` untouched, so including overlays here would delete
+        // live data.
         for file in &fragment.files {
             let (store, file_dir) = if let Some(base_id) = file.base_id {
                 match target_bases.and_then(|bases| bases.iter().find(|b| b.base_id == base_id)) {
@@ -2232,7 +2237,8 @@ mod tests {
             LanceFileVersion::Next,
         ];
         for version in versions {
-            let (major, minor) = ConcreteFileVersion::from(version).to_data_file_numbers();
+            let (major, minor) = version.resolve().to_data_file_numbers();
+
             let write_params = WriteParams {
                 data_storage_version: Some(version),
                 // This parameter should be ignored
@@ -2582,7 +2588,7 @@ mod tests {
         let base_dir = Path::from("test/bucket2");
 
         let mut inner_writer = versions::open_writer(
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             &object_store,
             &schema,
             &base_dir,

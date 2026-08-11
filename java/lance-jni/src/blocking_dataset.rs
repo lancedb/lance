@@ -22,7 +22,6 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatchIterator;
-use arrow_schema::DataType;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
 use jni::objects::{JMap, JString, JValue};
@@ -62,7 +61,6 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::iter::empty;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use uuid::Uuid;
@@ -2080,7 +2078,7 @@ fn inner_get_lance_file_format_version<'local>(
             .inner
             .manifest()
             .data_storage_format
-            .lance_file_version()?;
+            .lance_file_format();
         version.to_string()
     };
 
@@ -2314,17 +2312,23 @@ pub extern "system" fn Java_org_lance_Dataset_nativeAlterColumns(
     mut env: JNIEnv,
     java_dataset: JObject,
     column_alterations_obj: JObject, // List<ColumnAlteration>
+    cast_schema_addr: jlong,
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_alter_columns(&mut env, java_dataset, column_alterations_obj)
+        inner_alter_columns(
+            &mut env,
+            java_dataset,
+            column_alterations_obj,
+            cast_schema_addr
+        )
     )
 }
 
 fn create_column_alteration(
     env: &mut JNIEnv,
     column_alteration_jobj: JObject, // ColumnAlteration
-) -> Result<ColumnAlteration> {
+) -> Result<(ColumnAlteration, bool)> {
     let path_obj = env
         .get_field(&column_alteration_jobj, "path", "Ljava/lang/String;")?
         .l()?;
@@ -2363,48 +2367,55 @@ fn create_column_alteration(
         None
     };
 
+    // The cast target type (if any) is not read here: it is transferred separately through the
+    // Arrow C Data Interface (see inner_alter_columns), because ArrowType#toString() does not
+    // round-trip through DataType::from_str for parameterized types. This flag records whether a
+    // cast was requested so the caller can attach the imported type in order.
     let data_type_obj = env
         .get_field(&column_alteration_jobj, "dataType", "Ljava/util/Optional;")?
         .l()?;
-    let data_type = if env
+    let wants_cast = env
         .call_method(&data_type_obj, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let j_data_type: JObject = env
-            .call_method(data_type_obj, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let jstring: JString = env
-            .call_method(j_data_type, "toString", "()Ljava/lang/String;", &[])?
-            .l()?
-            .into();
-        let data_type_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
-        DataType::from_str(&data_type_str)
-            .map_err(|e| Error::input_error(e.to_string()))
-            .ok()
-    } else {
-        None
-    };
+        .z()?;
 
-    Ok(ColumnAlteration {
+    let alteration = ColumnAlteration {
         path,
         rename,
         nullable,
-        data_type,
-    })
+        data_type: None,
+    };
+    Ok((alteration, wants_cast))
 }
 
 fn inner_alter_columns(
     env: &mut JNIEnv,
     java_dataset: JObject,
     column_alterations_obj: JObject, // List<ColumnAlteration>
+    cast_schema_addr: jlong,
 ) -> Result<()> {
     let list = env.get_list(&column_alterations_obj)?;
     let mut iter = list.iter(env)?;
     let mut column_alterations = Vec::new();
+    let mut cast_flags = Vec::new();
 
     while let Some(elem) = iter.next(env)? {
-        let alteration = create_column_alteration(env, elem)?;
+        let (alteration, wants_cast) = create_column_alteration(env, elem)?;
         column_alterations.push(alteration);
+        cast_flags.push(wants_cast);
+    }
+
+    // Cast target types arrive as one Arrow schema field per requested cast, in the same order
+    // as the alterations that requested one.
+    let cast_schema = unsafe { FFI_ArrowSchema::from_raw(cast_schema_addr as *mut _) };
+    let cast_schema = ArrowSchema::try_from(&cast_schema)
+        .map_err(|_| Error::input_error("ArrowSchema conversion error".to_string()))?;
+    let mut cast_types = cast_schema.fields.iter().map(|f| f.data_type().clone());
+    for (alteration, wants_cast) in column_alterations.iter_mut().zip(cast_flags) {
+        if wants_cast {
+            alteration.data_type = Some(cast_types.next().ok_or_else(|| {
+                Error::input_error("Missing cast type for column alteration".to_string())
+            })?);
+        }
     }
 
     let mut dataset_guard =

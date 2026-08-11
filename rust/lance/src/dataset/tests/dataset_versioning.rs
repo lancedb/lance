@@ -844,6 +844,30 @@ async fn test_create_branch_and_shallow_clone_from_other_branch() {
 }
 
 #[tokio::test]
+async fn test_cannot_delete_branch_referenced_by_tag() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+    let branch = dataset
+        .create_branch("dev", /*version=*/ 1, /*store_params=*/ None)
+        .await
+        .unwrap();
+    dataset
+        .tags()
+        .create("keep-dev", ("dev", branch.version().version))
+        .await
+        .unwrap();
+
+    let error = dataset.delete_branch("dev").await.unwrap_err();
+    assert!(matches!(&error, Error::RefConflict { .. }));
+    assert!(error.to_string().contains("keep-dev"));
+    dataset.checkout_version("keep-dev").await.unwrap();
+}
+
+#[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();
@@ -1174,6 +1198,7 @@ async fn test_branch() {
     let cleaned_path = Path::parse(format!("{}/tree/feature", test_uri)).unwrap();
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
+    dataset.tags().delete("tag1").await.unwrap();
     dataset.delete_branch("dev/branch2").await.unwrap();
     dataset.delete_branch("branch1").await.unwrap();
 

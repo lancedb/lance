@@ -383,6 +383,28 @@ class BlobFile(io.RawIOBase):
         """Read a blob-local byte range without changing the current cursor."""
         return self.inner.read_range(offset, length)
 
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        """
+        Read multiple blob-local byte ranges without changing the current cursor.
+
+        Each range is an ``(offset, length)`` pair, matching
+        :py:meth:`read_range`. The underlying physical reads may be reordered,
+        coalesced, or split for efficiency. For every range, offset plus length
+        must fit in an unsigned 64-bit integer and must not extend beyond the
+        blob size.
+
+        Parameters
+        ----------
+        ranges : List[Tuple[int, int]]
+            The ``(offset, length)`` byte ranges to read.
+
+        Returns
+        -------
+        data : List[bytes]
+            One payload per requested range, in input order.
+        """
+        return self.inner.read_ranges(ranges)
+
     def readinto(self, b: bytearray) -> int:
         return self.inner.read_into(b)
 

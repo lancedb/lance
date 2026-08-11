@@ -6,7 +6,6 @@ use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
 
@@ -76,7 +75,13 @@ impl Updater {
             (None, None)
         };
 
-        let legacy_batch_size = reader.legacy_num_rows_in_batch(0);
+        let storage_version = fragment
+            .dataset()
+            .manifest()
+            .data_storage_format
+            .lance_file_format();
+        let legacy_batch_size =
+            versions::row_group_size_for_rewrite(storage_version, &fragment).await?;
 
         let batch_size = match (&legacy_batch_size, batch_size) {
             // If this is a v1 dataset we must use the row group size of the file
@@ -149,10 +154,10 @@ impl Updater {
             .dataset()
             .manifest()
             .data_storage_format
-            .lance_file_version()?;
+            .lance_file_format();
 
         versions::open_update_writer(
-            data_storage_version.into(),
+            data_storage_version,
             self.dataset(),
             &schema,
             self.allow_external_blob_outside_bases,
@@ -246,6 +251,11 @@ impl Updater {
         }
 
         let mut fragment = Fragment::new(self.fragment.id() as u64);
+        let storage_version = self
+            .dataset()
+            .manifest()
+            .data_storage_format
+            .lance_file_format();
         // cleanup_data_fragments only needs path/base_id to remove the unfinished
         // data file and any blob sidecars. Build a minimal synthetic fragment so
         // we can reuse the shared cleanup path without fabricating full metadata.
@@ -253,7 +263,7 @@ impl Updater {
             path,
             vec![],
             vec![],
-            ConcreteFileVersion::V1,
+            storage_version,
             None,
             base_id,
         ));

@@ -5577,6 +5577,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![new_meta],
                 removed_indices: vec![old_meta.clone()],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -6404,7 +6405,6 @@ mod tests {
 
     struct OptimizeAfterDelete {
         deleted_row_ids: HashSet<u64>,
-        partition_row_ids_before: Vec<Vec<u64>>,
         index_row_ids: HashSet<u64>,
         num_partitions_after: usize,
         stats_json: String,
@@ -6449,17 +6449,6 @@ mod tests {
             .await
             .unwrap();
 
-        let index_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
-        let flat = index_ctx
-            .index
-            .as_any()
-            .downcast_ref::<IvfFlatIndex>()
-            .expect("expected IvfFlat index");
-        let mut partition_row_ids_before = Vec::with_capacity(nlist);
-        for part in 0..flat.ivf.num_partitions() {
-            partition_row_ids_before.push(load_flat_partition_row_ids(flat, part).await);
-        }
-
         let deleted_row_ids = row_ids_matching(&dataset, delete_predicate).await;
         let live_row_ids = row_ids_matching(&dataset, keep_predicate).await;
         dataset.delete(delete_predicate).await.unwrap();
@@ -6499,7 +6488,6 @@ mod tests {
 
         OptimizeAfterDelete {
             deleted_row_ids,
-            partition_row_ids_before,
             index_row_ids,
             num_partitions_after,
             stats_json,
@@ -6519,29 +6507,15 @@ mod tests {
             run.stats_json
         );
 
-        // Only the joined partition is rebuilt from live rows; untouched
-        // partitions keep their deleted ids (filtered at query time).
-        let missing = run
-            .deleted_row_ids
-            .difference(&run.index_row_ids)
-            .copied()
-            .collect::<HashSet<_>>();
-        assert!(
-            !missing.is_empty(),
-            "joined partition should have contained deleted row ids"
-        );
-        let matches_one_partition = run.partition_row_ids_before.iter().any(|part_ids| {
-            let part_deleted = part_ids
-                .iter()
-                .copied()
-                .filter(|id| run.deleted_row_ids.contains(id))
-                .collect::<HashSet<_>>();
-            part_deleted == missing
-        });
-        assert!(
-            matches_one_partition,
-            "row ids dropped from the index should be exactly the joined partition's deleted ids"
-        );
+        // The join reads every partition's stored rows through the merge filter, so
+        // deleted ids are dropped index-wide and not just from the joined partition.
+        for row_id in &run.deleted_row_ids {
+            assert!(
+                !run.index_row_ids.contains(row_id),
+                "deleted row id {} still in index after join",
+                row_id
+            );
+        }
     }
 
     #[tokio::test]
