@@ -13,8 +13,8 @@ from .lance import RewriteResult as RewriteResult
 # from .lance import CompactionPlan as CompactionPlan
 
 
-class CompactionOptions(TypedDict):
     """Options for compaction."""
+class CompactionOptions(TypedDict, total=False):
 
     target_rows_per_fragment: Optional[int]
     """
