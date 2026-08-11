@@ -12,7 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [package.metadata.docs.rs]
-features = []
+# Publish the feature-gated metrics catalogue; keep cloud backends off.
+features = ["metrics"]
 no-default-features = true
 
 [package.metadata.cargo-machete]

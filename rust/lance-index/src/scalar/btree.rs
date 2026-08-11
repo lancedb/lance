@@ -2368,6 +2368,10 @@ impl ScalarIndex for BTreeIndex {
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
+
+    fn training_data_type(&self) -> Option<DataType> {
+        Some(self.data_type.clone())
+    }
 }
 
 struct BatchStats {

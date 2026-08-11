@@ -36,6 +36,7 @@ public class Index {
   private final int indexVersion;
   private final Instant createdAt;
   private final Integer baseId;
+  private final Long sizeBytes;
   private final IndexType indexType;
 
   private Index(
@@ -48,6 +49,7 @@ public class Index {
       int indexVersion,
       Instant createdAt,
       Integer baseId,
+      Long sizeBytes,
       IndexType indexType) {
     this.uuid = uuid;
     this.fields = fields;
@@ -58,6 +60,7 @@ public class Index {
     this.indexVersion = indexVersion;
     this.createdAt = createdAt;
     this.baseId = baseId;
+    this.sizeBytes = sizeBytes;
     this.indexType = indexType;
   }
 
@@ -105,6 +108,17 @@ public class Index {
   }
 
   /**
+   * Get the total size of all files in this physical index segment.
+   *
+   * <p>The size is unavailable for indices created before index file sizes were tracked.
+   *
+   * @return the segment size in bytes, or empty if unavailable
+   */
+  public Optional<Long> getSizeBytes() {
+    return Optional.ofNullable(sizeBytes);
+  }
+
+  /**
    * Get the index version.
    *
    * @return the index version
@@ -145,6 +159,7 @@ public class Index {
         && Arrays.equals(indexDetails, index.indexDetails)
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId)
+        && Objects.equals(sizeBytes, index.sizeBytes)
         && indexType == index.indexType;
   }
 
@@ -159,6 +174,7 @@ public class Index {
             indexVersion,
             createdAt,
             baseId,
+            sizeBytes,
             fragments,
             indexType);
     result = 31 * result + Arrays.hashCode(indexDetails);
@@ -176,6 +192,7 @@ public class Index {
         .add("indexType", indexType)
         .add("createdAt", createdAt)
         .add("baseId", baseId)
+        .add("sizeBytes", sizeBytes)
         .toString();
   }
 
@@ -199,6 +216,7 @@ public class Index {
     private int indexVersion;
     private Instant createdAt;
     private Integer baseId;
+    private Long sizeBytes;
     private IndexType indexType;
 
     private Builder() {}
@@ -248,6 +266,11 @@ public class Index {
       return this;
     }
 
+    public Builder sizeBytes(Long sizeBytes) {
+      this.sizeBytes = sizeBytes;
+      return this;
+    }
+
     public Builder indexType(IndexType indexType) {
       this.indexType = indexType;
       return this;
@@ -264,6 +287,7 @@ public class Index {
           indexVersion,
           createdAt,
           baseId,
+          sizeBytes,
           indexType);
     }
   }

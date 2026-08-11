@@ -28,7 +28,10 @@ they should return an "unsupported" error on any read or write operation.
 | 4        | `FLAG_USE_V2_FORMAT_DEPRECATED` | No              | No              | Files are written with the new v2 format. This flag is deprecated and no longer used.                       |
 | 8        | `FLAG_TABLE_CONFIG`             | No              | Yes             | Table config is present in the manifest.                                                                    |
 | 16       | `FLAG_BASE_PATHS`               | Yes             | Yes             | Dataset uses multiple base paths (for shallow clones or multi-base datasets).                               |
+| 32       | `FLAG_DISABLE_TRANSACTION_FILE` | No              | Yes             | Transactions are recorded in the manifest rather than in a separate transaction file.                       |
+| 64       | `FLAG_UNSTABLE_DATA_OVERLAY_FILES` | Yes          | Yes             | Fragments may carry data overlay files. Unstable: release builds reject it unless explicitly opted in.      |
+| 128      | `FLAG_MEM_WAL_INDEX_CATCHUP`    | Yes             | Yes             | `index_catchup` is maintained on this table, so an index absent from it is *not* caught up. See [MemWAL](mem_wal.md). |
 
 </div>
 
-Flags with bit values 32 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.
+Flags with bit values 256 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.
