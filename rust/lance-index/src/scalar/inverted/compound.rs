@@ -307,7 +307,11 @@ impl CompoundScorerPlan {
         }
     }
 
-    fn build<'a>(&self, leaves: &mut [Option<BoxScorer<'a>>]) -> Result<BoxScorer<'a>> {
+    fn build<'a>(
+        &self,
+        leaves: &mut [Option<BoxScorer<'a>>],
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxScorer<'a>> {
         match self {
             Self::Leaf { index, boost } => {
                 let leaf = leaves
@@ -325,14 +329,14 @@ impl CompoundScorerPlan {
                 negative,
                 negative_boost,
             } => Ok(Box::new(BoostScorer::try_new(
-                positive.build(leaves)?,
-                negative.build(leaves)?,
+                positive.build(leaves, metrics)?,
+                negative.build(leaves, metrics)?,
                 *negative_boost,
             )?)),
             Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
                 children
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
                 DisjunctionScore::Max,
             )?)),
@@ -340,18 +344,19 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new(
+            } => Ok(Box::new(BooleanScorer::try_new_with_metrics(
                 should
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
                 must.iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
                 must_not
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
+                Some(metrics),
             )?)),
         }
     }
@@ -1954,10 +1959,20 @@ pub(super) struct BooleanScorer<'a> {
 }
 
 impl<'a> BooleanScorer<'a> {
+    #[cfg(test)]
     pub(super) fn try_new(
         should: Vec<BoxScorer<'a>>,
         must: Vec<BoxScorer<'a>>,
         must_not: Vec<BoxScorer<'a>>,
+    ) -> Result<Self> {
+        Self::try_new_with_metrics(should, must, must_not, None)
+    }
+
+    fn try_new_with_metrics(
+        should: Vec<BoxScorer<'a>>,
+        must: Vec<BoxScorer<'a>>,
+        must_not: Vec<BoxScorer<'a>>,
+        metrics: Option<&'a dyn MetricsCollector>,
     ) -> Result<Self> {
         let (driver, optional) = if must.is_empty() {
             if should.is_empty() {
@@ -1966,7 +1981,7 @@ impl<'a> BooleanScorer<'a> {
                 ));
             }
             let driver = if let Some(global_bounds) = ShouldMaxScoreScorer::global_bounds(&should) {
-                Box::new(ShouldMaxScoreScorer::new(should, global_bounds)) as BoxScorer<'a>
+                Box::new(ShouldMaxScoreScorer::new(should, global_bounds, metrics)) as BoxScorer<'a>
             } else {
                 Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
                     as BoxScorer<'a>
@@ -2493,7 +2508,7 @@ where
             Some(scorer)
         })
         .collect::<Vec<_>>();
-    let mut scorer = plan.build(&mut leaf_scorers)?;
+    let mut scorer = plan.build(&mut leaf_scorers, metrics)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "compound FTS scorer did not consume every prepared leaf",
@@ -2833,9 +2848,53 @@ mod tests {
         Box::new(MaterializedScorer::try_new(rows(values)).unwrap())
     }
 
-    fn should_maxscore(children: Vec<BoxScorer<'_>>) -> ShouldMaxScoreScorer<'_> {
+    fn should_maxscore<'a>(
+        children: Vec<BoxScorer<'a>>,
+        metrics: Option<&'a dyn MetricsCollector>,
+    ) -> ShouldMaxScoreScorer<'a> {
         let global_bounds = ShouldMaxScoreScorer::global_bounds(&children).unwrap();
-        ShouldMaxScoreScorer::new(children, global_bounds)
+        ShouldMaxScoreScorer::new(children, global_bounds, metrics)
+    }
+
+    #[derive(Default)]
+    struct ShouldMetrics {
+        reports: AtomicUsize,
+        skipped_windows: AtomicUsize,
+        bound_recomputations: AtomicUsize,
+        essential_evaluations: AtomicUsize,
+        non_essential_evaluations: AtomicUsize,
+    }
+
+    impl MetricsCollector for ShouldMetrics {
+        fn record_parts_loaded(&self, _num_parts: usize) {}
+
+        fn record_index_loads(&self, _num_loads: usize) {}
+
+        fn record_comparisons(&self, _num_comparisons: usize) {}
+
+        fn record_compound_should_skipped_windows(&self, num_windows: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
+            self.skipped_windows
+                .fetch_add(num_windows, AtomicOrdering::Relaxed);
+        }
+
+        fn record_compound_should_bound_recomputations(&self, num_recomputations: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
+            self.bound_recomputations
+                .fetch_add(num_recomputations, AtomicOrdering::Relaxed);
+        }
+
+        fn record_compound_should_essential_evaluations(&self, num_evaluations: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
+            self.essential_evaluations
+                .fetch_add(num_evaluations, AtomicOrdering::Relaxed);
+        }
+
+        fn record_compound_should_non_essential_evaluations(&self, num_evaluations: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
+            self.non_essential_evaluations
+                .fetch_add(num_evaluations, AtomicOrdering::Relaxed);
+        }
     }
 
     #[test]
@@ -3595,9 +3654,10 @@ mod tests {
         let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
         let eager_comparisons = scorer_advances(&eager_work);
 
+        let metrics = ShouldMetrics::default();
         let (children, optimized_work) = pure_should_canary_children();
         let optimized_results = {
-            let mut optimized = should_maxscore(children);
+            let mut optimized = should_maxscore(children, Some(&metrics));
             TopKCollector::new(1).collect(&mut optimized).unwrap()
         };
         let optimized_comparisons = scorer_advances(&optimized_work);
@@ -3609,6 +3669,16 @@ mod tests {
             optimized_comparisons * 5 <= eager_comparisons * 4,
             "pure-SHOULD MAXSCORE should reduce posting candidate probes by at least 20%: \
              optimized={optimized_comparisons} eager={eager_comparisons}"
+        );
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
+        assert!(metrics.skipped_windows.load(AtomicOrdering::Relaxed) > 0);
+        assert!(metrics.bound_recomputations.load(AtomicOrdering::Relaxed) > 0);
+        assert!(metrics.essential_evaluations.load(AtomicOrdering::Relaxed) > 0);
+        assert!(
+            metrics
+                .non_essential_evaluations
+                .load(AtomicOrdering::Relaxed)
+                > 0
         );
     }
 
@@ -3634,8 +3704,10 @@ mod tests {
             for limit in [1, 7, 31, 512] {
                 let expected = exhaustive_should_top_k(&children, limit);
 
-                let mut optimized =
-                    should_maxscore(children.iter().map(|values| materialized(values)).collect());
+                let mut optimized = should_maxscore(
+                    children.iter().map(|values| materialized(values)).collect(),
+                    None,
+                );
                 let actual = TopKCollector::new(limit).collect(&mut optimized).unwrap();
                 assert_eq!(actual, expected, "seed={seed} limit={limit}");
             }
@@ -3645,15 +3717,19 @@ mod tests {
     #[test]
     fn pure_should_maxscore_confirms_two_phase_children_before_scoring() {
         let (phrase, _, confirmations) = two_phase(&[(1, 100.0)], Vec::new(), Some(10.0));
+        let metrics = ShouldMetrics::default();
         let competitive_score = Arc::new(CompetitiveScore::default());
         competitive_score.raise(10.0);
         let results = {
-            let mut scorer = should_maxscore(vec![
-                materialized(&[(0, 10.0)]),
-                phrase,
-                materialized(&[(1, 6.0)]),
-                materialized(&[(1, 5.0)]),
-            ]);
+            let mut scorer = should_maxscore(
+                vec![
+                    materialized(&[(0, 10.0)]),
+                    phrase,
+                    materialized(&[(1, 6.0)]),
+                    materialized(&[(1, 5.0)]),
+                ],
+                Some(&metrics),
+            );
             TopKCollector::with_competitive_score(1, competitive_score)
                 .collect(&mut scorer)
                 .unwrap()
@@ -3661,16 +3737,25 @@ mod tests {
 
         assert_eq!(results, rows(&[(1, 11.0)]));
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert!(
+            metrics
+                .non_essential_evaluations
+                .load(AtomicOrdering::Relaxed)
+                > 0
+        );
     }
 
     #[test]
     fn pure_should_maxscore_preserves_query_score_order_and_terminal_doc() {
-        let mut scorer = should_maxscore(vec![
-            materialized(&[(u64::MAX, 16_777_216.0)]),
-            materialized(&[(u64::MAX, 1.0)]),
-            materialized(&[(u64::MAX, 1.0)]),
-            materialized(&[]),
-        ]);
+        let mut scorer = should_maxscore(
+            vec![
+                materialized(&[(u64::MAX, 16_777_216.0)]),
+                materialized(&[(u64::MAX, 1.0)]),
+                materialized(&[(u64::MAX, 1.0)]),
+                materialized(&[]),
+            ],
+            None,
+        );
 
         assert_eq!(
             TopKCollector::new(1).collect(&mut scorer).unwrap(),
@@ -3697,6 +3782,7 @@ mod tests {
                 .into_iter()
                 .map(|score| materialized(&[(7, score)]))
                 .collect(),
+            None,
         );
         let competitive_score = Arc::new(CompetitiveScore::default());
         competitive_score.raise(exact_score);
@@ -3729,8 +3815,9 @@ mod tests {
             )
             .unwrap(),
         );
+        let metrics = ShouldMetrics::default();
         let results = {
-            let mut scorer = BooleanScorer::try_new(
+            let mut scorer = BooleanScorer::try_new_with_metrics(
                 vec![
                     nested_dismax,
                     nested_boolean,
@@ -3738,18 +3825,21 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
+                Some(&metrics),
             )
             .unwrap();
             TopKCollector::new(1).collect(&mut scorer).unwrap()
         };
 
         assert_eq!(results, rows(&[(2, 6.5)]));
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
     }
 
     #[test]
     fn pure_should_maxscore_applies_must_not_before_raising_the_floor() {
+        let metrics = ShouldMetrics::default();
         let results = {
-            let mut scorer = BooleanScorer::try_new(
+            let mut scorer = BooleanScorer::try_new_with_metrics(
                 vec![
                     materialized(&[(0, 10.0), (1, 5.0)]),
                     materialized(&[(0, 1.0), (1, 1.0)]),
@@ -3757,16 +3847,19 @@ mod tests {
                 ],
                 Vec::new(),
                 vec![materialized(&[(0, 1.0)])],
+                Some(&metrics),
             )
             .unwrap();
             TopKCollector::new(1).collect(&mut scorer).unwrap()
         };
 
         assert_eq!(results, rows(&[(2, 8.0)]));
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
     }
 
     #[test]
     fn pure_should_uses_exact_fallback_for_unsupported_shapes() {
+        let signed_metrics = ShouldMetrics::default();
         let signed_results = {
             let signed = Box::new(
                 BoostScorer::try_new(
@@ -3776,7 +3869,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut scorer = BooleanScorer::try_new(
+            let mut scorer = BooleanScorer::try_new_with_metrics(
                 vec![
                     signed,
                     materialized(&[(0, 1.0), (1, 1.0)]),
@@ -3784,17 +3877,20 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
+                Some(&signed_metrics),
             )
             .unwrap();
             TopKCollector::new(2).collect(&mut scorer).unwrap()
         };
         assert_eq!(signed_results, rows(&[(0, 4.0), (1, 3.0)]));
+        assert_eq!(signed_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
+        let unbounded_metrics = ShouldMetrics::default();
         let unbounded_results = {
             let unbounded = Box::new(UnboundedScorer {
                 inner: MaterializedScorer::try_new(rows(&[(0, 1.0), (2, 3.0)])).unwrap(),
             });
-            let mut scorer = BooleanScorer::try_new(
+            let mut scorer = BooleanScorer::try_new_with_metrics(
                 vec![
                     unbounded,
                     materialized(&[(0, 2.0), (1, 2.0)]),
@@ -3802,17 +3898,21 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
+                Some(&unbounded_metrics),
             )
             .unwrap();
             TopKCollector::new(3).collect(&mut scorer).unwrap()
         };
         assert_eq!(unbounded_results, rows(&[(1, 6.0), (0, 3.0), (2, 3.0)]));
+        assert_eq!(unbounded_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
+        let low_count_metrics = ShouldMetrics::default();
         {
-            let mut scorer = BooleanScorer::try_new(
+            let mut scorer = BooleanScorer::try_new_with_metrics(
                 vec![materialized(&[(0, 1.0)]), materialized(&[(1, 2.0)])],
                 Vec::new(),
                 Vec::new(),
+                Some(&low_count_metrics),
             )
             .unwrap();
             assert_eq!(
@@ -3820,10 +3920,12 @@ mod tests {
                 rows(&[(1, 2.0), (0, 1.0)])
             );
         }
+        assert_eq!(low_count_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
+        let overflow_metrics = ShouldMetrics::default();
         let large_score = f32::MAX / 2.0;
         {
-            let mut scorer = BooleanScorer::try_new(
+            let mut scorer = BooleanScorer::try_new_with_metrics(
                 vec![
                     materialized(&[(0, large_score)]),
                     materialized(&[(1, large_score)]),
@@ -3831,6 +3933,7 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
+                Some(&overflow_metrics),
             )
             .unwrap();
             assert_eq!(
@@ -3838,5 +3941,6 @@ mod tests {
                 rows(&[(0, large_score), (1, large_score), (2, large_score)])
             );
         }
+        assert_eq!(overflow_metrics.reports.load(AtomicOrdering::Relaxed), 0);
     }
 }
