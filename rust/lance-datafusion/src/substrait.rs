@@ -199,7 +199,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             Ok(())
         }
         RexType::IfThen(ifthen) => {
-            for clause in ifthen.ifs.iter_mut() {
+            for (i, clause) in ifthen.ifs.iter_mut().enumerate() {
                 remap_expr_references(
                     clause
                         .r#if
@@ -207,10 +207,12 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                         .ok_or_else(|| missing_field("if clause condition"))?,
                     mapping,
                 )?;
-                // The leading clause may omit `then`, in which case its condition is the case
-                // expression being matched against.
-                if let Some(then) = clause.then.as_mut() {
-                    remap_expr_references(then, mapping)?;
+                match clause.then.as_mut() {
+                    Some(then) => remap_expr_references(then, mapping)?,
+                    // Only the leading clause may omit `then`, in which case its condition is
+                    // the case expression being matched against.
+                    None if i == 0 => {}
+                    None => return Err(missing_field("if clause result")),
                 }
             }
             if let Some(otherwise) = ifthen.r#else.as_mut() {
@@ -819,6 +821,40 @@ mod tests {
                 when_then_expr: vec![],
                 else_expr: None,
             })
+        );
+    }
+
+    /// DataFusion only tolerates an omitted `then` on the leading clause, so a later clause
+    /// missing one has to be rejected here rather than reaching the consumer.
+    #[tokio::test]
+    async fn test_unpruned_if_then_missing_nonleading_then() {
+        let condition = || Expression {
+            rex_type: Some(RexType::Literal(Literal {
+                nullable: false,
+                type_variation_reference: 0,
+                literal_type: Some(LiteralType::Boolean(true)),
+            })),
+        };
+
+        let err = parse_unpruned_expr(RexType::IfThen(Box::new(IfThen {
+            ifs: vec![
+                IfClause {
+                    r#if: Some(condition()),
+                    then: Some(condition()),
+                },
+                IfClause {
+                    r#if: Some(condition()),
+                    then: None,
+                },
+            ],
+            r#else: None,
+        })))
+        .await
+        .expect_err("a non-leading clause without `then` is not valid");
+
+        assert!(
+            err.to_string().contains("if clause result"),
+            "unexpected error: {err}"
         );
     }
 
