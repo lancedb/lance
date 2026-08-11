@@ -4142,19 +4142,28 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             updated_fragments,
             new_fragments,
             updated_fragment_offsets,
+            update_mode,
             ..
         } => {
             schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
             schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)?;
-            if let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets {
-                let updated_ids: HashSet<u64> = updated_fragments.iter().map(|f| f.id).collect();
-                for &frag_id in off_map.keys() {
-                    if !updated_ids.contains(&frag_id) {
-                        return Err(Error::invalid_input(format!(
-                            "updatedFragmentOffsets key {} is not in updated_fragments; \
-                             offsets must reference only fragments being rewritten",
-                            frag_id
-                        )));
+            // Key-presence check only applies to RewriteColumns: that is the only
+            // mode where build_manifest stamps version metadata using off_map keys,
+            // so a stray key can corrupt an unrelated fragment's metadata.
+            // Other modes (e.g. rewrite_rows) may supply offsets for fragments
+            // outside updated_fragments for their own purposes.
+            if matches!(update_mode, Some(UpdateMode::RewriteColumns)) {
+                if let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets {
+                    let updated_ids: HashSet<u64> =
+                        updated_fragments.iter().map(|f| f.id).collect();
+                    for &frag_id in off_map.keys() {
+                        if !updated_ids.contains(&frag_id) {
+                            return Err(Error::invalid_input(format!(
+                                "updatedFragmentOffsets key {} is not in updated_fragments; \
+                                 offsets must reference only fragments being rewritten",
+                                frag_id
+                            )));
+                        }
                     }
                 }
             }
