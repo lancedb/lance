@@ -157,6 +157,22 @@ public class DatasetTest {
       try (Dataset historicalDataset = Dataset.open(historicalPath, allocator)) {
         assertTrue(historicalDataset.getWriterVersion().isEmpty());
       }
+
+      // This fixture was written by lance 2.0.0-beta.1. Reading it through Dataset verifies
+      // that the manifest's prerelease qualifier survives the Rust-to-Java JNI mapping.
+      String prereleasePath =
+          Path.of("..", "test_data", "pre_file_sizes", "index_without_file_sizes")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset prereleaseDataset = Dataset.open(prereleasePath, allocator)) {
+        WriterVersion writerVersion =
+            prereleaseDataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertEquals("2.0.0", writerVersion.getVersion());
+        assertEquals("beta.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+        assertTrue(writerVersion.getBuildMetadata().isEmpty());
+      }
     }
   }
 
