@@ -2581,6 +2581,13 @@ impl Transaction {
                         let Some(bitmap) = off_map.get(&fragment.id) else {
                             continue;
                         };
+                        // Defense-in-depth: only stamp fragments that were actually
+                        // rewritten. validate_operation enforces this invariant before
+                        // build_manifest is called; this guard catches any path that
+                        // bypasses validation.
+                        if !updated_by_id.contains_key(&fragment.id) {
+                            continue;
+                        }
                         if bitmap.is_empty() {
                             continue;
                         }
@@ -2589,6 +2596,27 @@ impl Transaction {
                         // last_updated stamp for rows that never had one.
                         if fragment.last_updated_at_version_meta.is_none() {
                             continue;
+                        }
+                        let max_allowed = existing_fragments
+                            .iter()
+                            .find(|f| f.id == fragment.id)
+                            .and_then(|f| f.physical_rows)
+                            .unwrap_or(1 << 24);
+                        if bitmap.len() as usize > max_allowed {
+                            return Err(Error::invalid_input(format!(
+                                "updatedFragmentOffsets cardinality {} exceeds fragment {} limit {}",
+                                bitmap.len(),
+                                fragment.id,
+                                max_allowed
+                            )));
+                        }
+                        if let Some(max_off) = bitmap.max()
+                            && max_off as usize >= max_allowed
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "updatedFragmentOffsets max offset {} exceeds fragment {} limit {}",
+                                max_off, fragment.id, max_allowed
+                            )));
                         }
                         let offsets: Vec<usize> = bitmap.iter().map(|o| o as usize).collect();
                         lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
@@ -4755,10 +4783,32 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         Operation::Update {
             updated_fragments,
             new_fragments,
+            updated_fragment_offsets,
+            update_mode,
             ..
         } => {
             schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
-            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)
+            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)?;
+            // Key-presence check only applies to RewriteColumns: that is the only
+            // mode where build_manifest stamps version metadata using off_map keys,
+            // so a stray key can corrupt an unrelated fragment's metadata.
+            // Other modes (e.g. rewrite_rows) may supply offsets for fragments
+            // outside updated_fragments for their own purposes.
+            if matches!(update_mode, Some(UpdateMode::RewriteColumns))
+                && let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets
+            {
+                let updated_ids: HashSet<u64> = updated_fragments.iter().map(|f| f.id).collect();
+                for &frag_id in off_map.keys() {
+                    if !updated_ids.contains(&frag_id) {
+                        return Err(Error::invalid_input(format!(
+                            "updatedFragmentOffsets key {} is not in updated_fragments; \
+                             offsets must reference only fragments being rewritten",
+                            frag_id
+                        )));
+                    }
+                }
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -6087,6 +6137,239 @@ mod tests {
         assert!(
             out.fragments[0].last_updated_at_version_meta.is_none(),
             "fragment with no prior version metadata must not have fabricated prev_version stamped on unmatched rows"
+        );
+    }
+
+    #[test]
+    fn test_bitmap_cardinality_exceeds_physical_rows() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            None,
+            None,
+        );
+
+        let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
+
+        let fragment = Fragment {
+            id: 1,
+            files: vec![data_file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
+
+        // Bitmap with 10 offsets but fragment only has 5 physical rows.
+        let off_map = HashMap::from([(1u64, RoaringBitmap::from_iter(0u32..10))]);
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            },
+            None,
+        );
+
+        let result = tx.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cardinality"),
+            "expected cardinality error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_bitmap_max_offset_exceeds_physical_rows() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            None,
+            None,
+        );
+
+        let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
+
+        let fragment = Fragment {
+            id: 1,
+            files: vec![data_file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
+
+        // Only 2 offsets (within cardinality) but max offset 100 exceeds physical_rows 5.
+        let off_map = HashMap::from([(1u64, RoaringBitmap::from_iter([0u32, 100]))]);
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            },
+            None,
+        );
+
+        let result = tx.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("max offset"),
+            "expected max offset error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_bitmap_at_exact_physical_rows_boundary_succeeds() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            None,
+            None,
+        );
+
+        let version_seq = RowDatasetVersionSequence::from_uniform_row_count(5, 1);
+        let version_meta = RowDatasetVersionMeta::from_sequence(&version_seq).unwrap();
+
+        let fragment = Fragment {
+            id: 1,
+            files: vec![data_file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
+
+        // All 5 offsets on a 5-row fragment — exactly at the boundary, should succeed.
+        let off_map = HashMap::from([(1u64, RoaringBitmap::from_iter(0u32..5))]);
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            },
+            None,
+        );
+
+        tx.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        )
+        .expect("bitmap at exact physical_rows boundary should succeed");
+    }
+
+    #[test]
+    fn test_updated_fragment_offsets_key_not_in_updated_fragments_is_rejected() {
+        // Fragment A is being rewritten; fragment B exists in the manifest but is
+        // NOT in updated_fragments. Supplying an offset key for B must be rejected
+        // so that B's version metadata cannot be stamped by an unrelated commit.
+        let make_fragment = |id: u64| {
+            let row_ids = RowIdSequence::from([id * 10].as_slice());
+            let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+            Fragment {
+                id,
+                files: vec![DataFile::new(
+                    format!("{id}.lance"),
+                    vec![0],
+                    vec![0],
+                    ConcreteFileVersion::from(LanceFileVersion::Stable),
+                    None,
+                    None,
+                )],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta,
+                physical_rows: Some(5),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            }
+        };
+
+        let frag_a = make_fragment(1);
+        let frag_b = make_fragment(2);
+        let manifest = make_stable_row_id_manifest(vec![frag_a.clone(), frag_b.clone()]);
+
+        // updated_fragments contains only A; offsets are keyed to B — must fail.
+        let off_map = HashMap::from([(frag_b.id, RoaringBitmap::from_iter([0u32, 1, 2]))]);
+        let operation = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![frag_a],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            compacted_sstables: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+        };
+
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
+        assert!(
+            err.to_string().contains("not in updated_fragments"),
+            "expected key-presence error, got: {err}"
         );
     }
 
