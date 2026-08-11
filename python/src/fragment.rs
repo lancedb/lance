@@ -512,6 +512,11 @@ impl FileFragment {
         rt().block_on(None, self.fragment.physical_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
+
+    fn validate(&self) -> PyResult<()> {
+        rt().block_on(None, self.fragment.validate())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
 }
 
 impl From<FileFragment> for LanceFragment {

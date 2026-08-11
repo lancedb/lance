@@ -92,7 +92,7 @@ impl Index for JsonIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        todo!()
+        self.target_index.statistics()
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {

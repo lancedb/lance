@@ -1714,6 +1714,10 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     ds = lance.write_dataset(table, base_dir, mode="append")
 
     assert len(ds.versions()) == 4
+    with pytest.raises(OSError, match="retain_versions must be greater than 0, got 0"):
+        ds.cleanup_old_versions(retain_versions=0)
+    assert len(ds.versions()) == 4
+
     stats = ds.cleanup_old_versions(retain_versions=3)
     assert stats.old_versions == 1
     assert stats.data_files_removed == 1
@@ -2081,6 +2085,52 @@ def test_merge_insert_with_commit():
     assert dataset.to_table().sort_by("id") == pa.table(
         {"id": range(10), "updated": [False] + [True] + [False] * 8}
     )
+
+
+def test_update_with_commit_updated_fragment_offsets():
+    table = pa.table({"id": range(10), "updated": [False] * 10})
+    dataset = lance.write_dataset(table, "memory://test")
+
+    updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
+    transaction, _ = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .execute_uncommitted(updates)
+    )
+    assert transaction.operation.updated_fragment_offsets is None
+
+    # Portable RoaringBitmap serializations of {1, 3, 5, 7} and {0, 2, 100000}.
+    offsets = {
+        0: (
+            b"\x3a\x30\x00\x00\x01\x00\x00\x00\x00\x00\x03\x00"
+            b"\x10\x00\x00\x00\x01\x00\x03\x00\x05\x00\x07\x00"
+        ),
+        2: (
+            b"\x3a\x30\x00\x00\x02\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00"
+            b"\x00\x18\x00\x00\x00\x1c\x00\x00\x00\x00\x00\x02\x00\xa0\x86"
+        ),
+    }
+    transaction.operation.updated_fragment_offsets = offsets
+
+    dataset = lance.LanceDataset.commit(dataset, transaction)
+    read_back = dataset.read_transaction(dataset.version)
+    assert read_back.operation.updated_fragment_offsets == offsets
+
+
+def test_update_with_commit_rejects_invalid_offset_bytes():
+    table = pa.table({"id": range(10), "updated": [False] * 10})
+    dataset = lance.write_dataset(table, "memory://test")
+
+    updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
+    transaction, _ = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .execute_uncommitted(updates)
+    )
+    transaction.operation.updated_fragment_offsets = {0: b"not a bitmap"}
+
+    with pytest.raises(ValueError, match="RoaringBitmap"):
+        lance.LanceDataset.commit(dataset, transaction)
 
 
 def test_merge_with_commit(tmp_path: Path):

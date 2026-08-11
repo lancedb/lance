@@ -39,7 +39,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::metrics::{
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
@@ -4157,6 +4157,26 @@ async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
     dataset
 }
 
+#[tokio::test]
+async fn test_json_btree_index_statistics() {
+    let dataset = json_btree_dataset(vec![
+        r#"{"val": 1000}"#,
+        r#"{"val": 2000}"#,
+        r#"{"val": 3000}"#,
+    ])
+    .await;
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("json_idx").await.unwrap()).unwrap();
+
+    assert_eq!(stats["name"], "json_idx");
+    assert_eq!(stats["num_indices"], 1);
+    assert_eq!(stats["num_indexed_rows"], 3);
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    assert_eq!(stats["indices"][0]["min"], "1000");
+    assert_eq!(stats["indices"][0]["max"], "3000");
+}
+
 #[rstest]
 #[case::merge(false)]
 #[case::append_rebuild(true)]
@@ -5050,7 +5070,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Verify that the index file uses the same version as the dataset
     assert_eq!(
         index_reader.metadata().version(),
-        dataset_version.into(),
+        dataset_version.resolve(),
         "Index file should use the same format version as the dataset"
     );
 
@@ -5079,7 +5099,7 @@ async fn test_index_inherits_dataset_file_version() {
 
         assert_eq!(
             aux_reader.metadata().version(),
-            dataset_version.into(),
+            dataset_version.resolve(),
             "Auxiliary index file should use the same format version as the dataset"
         );
     }
@@ -5158,7 +5178,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Verify that the index file uses V2_0 (not legacy)
     assert_eq!(
         index_reader.metadata().version(),
-        LanceFileVersion::V2_0.into(),
+        ConcreteFileVersion::V2_0,
         "Index files should never use legacy format, even for legacy datasets"
     );
 }
