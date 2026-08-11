@@ -1714,6 +1714,10 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     ds = lance.write_dataset(table, base_dir, mode="append")
 
     assert len(ds.versions()) == 4
+    with pytest.raises(OSError, match="retain_versions must be greater than 0, got 0"):
+        ds.cleanup_old_versions(retain_versions=0)
+    assert len(ds.versions()) == 4
+
     stats = ds.cleanup_old_versions(retain_versions=3)
     assert stats.old_versions == 1
     assert stats.data_files_removed == 1
