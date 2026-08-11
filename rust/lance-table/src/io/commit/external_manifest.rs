@@ -927,6 +927,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use tokio::sync::Notify;
 
@@ -942,7 +943,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct LostPutResponseStore {
+    struct TestExternalManifestStore {
         manifests: Mutex<HashMap<(String, u64), StoredManifest>>,
         fail_next_put_response: AtomicBool,
         block_first_final_publish: bool,
@@ -951,31 +952,28 @@ mod tests {
         release_first_final_publish: Notify,
     }
 
-    impl Default for LostPutResponseStore {
-        fn default() -> Self {
+    impl TestExternalManifestStore {
+        fn new(fail_next_put_response: bool) -> Self {
             Self {
                 manifests: Mutex::new(HashMap::new()),
-                fail_next_put_response: AtomicBool::new(true),
+                fail_next_put_response: AtomicBool::new(fail_next_put_response),
                 block_first_final_publish: false,
                 final_publish_calls: AtomicUsize::new(0),
                 first_final_publish_started: Notify::new(),
                 release_first_final_publish: Notify::new(),
             }
         }
-    }
 
-    impl LostPutResponseStore {
         fn blocking_first_final_publish() -> Self {
             Self {
-                fail_next_put_response: AtomicBool::new(false),
                 block_first_final_publish: true,
-                ..Default::default()
+                ..Self::new(false)
             }
         }
     }
 
     #[async_trait]
-    impl ExternalManifestStore for LostPutResponseStore {
+    impl ExternalManifestStore for TestExternalManifestStore {
         fn use_create_only_manifest_copy(&self) -> bool {
             self.block_first_final_publish
         }
@@ -1082,21 +1080,25 @@ mod tests {
         }
     }
 
+    fn test_manifest() -> Manifest {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable)),
+            HashMap::new(),
+        )
+    }
+
     #[tokio::test]
     async fn test_lost_external_store_response_retains_staging_manifest() {
-        let external_store = Arc::new(LostPutResponseStore::default());
+        let external_store = Arc::new(TestExternalManifestStore::new(true));
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
         let object_store = ObjectStore::memory();
         let base_path = Path::from("dataset");
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
-        let mut manifest = Manifest::new(
-            Schema::try_from(&arrow_schema).unwrap(),
-            Arc::new(vec![]),
-            DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable)),
-            HashMap::new(),
-        );
+        let mut manifest = test_manifest();
 
         let commit_error = handler
             .commit(
@@ -1182,7 +1184,7 @@ mod tests {
     async fn test_concurrent_direct_and_reader_finalization_preserves_winner_metadata(
         #[case] naming_scheme: ManifestNamingScheme,
     ) {
-        let external_store = Arc::new(LostPutResponseStore::blocking_first_final_publish());
+        let external_store = Arc::new(TestExternalManifestStore::blocking_first_final_publish());
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
@@ -1257,5 +1259,112 @@ mod tests {
             .resolve_version_location(&base_path, version, object_store.inner.as_ref())
             .await
             .expect("a strict reader should accept the finalized manifest");
+    }
+
+    #[tokio::test]
+    async fn test_copy_failure_after_external_store_commit_retains_staging_manifest() {
+        let external_store = Arc::new(TestExternalManifestStore::new(false));
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+
+        let mut object_store = ObjectStore::memory();
+        let fail_next_copy = Arc::new(AtomicBool::new(true));
+        let failed_copy_source = Arc::new(Mutex::new(None));
+        let mut policy = ProxyObjectStorePolicy::new();
+        let policy_fail_next_copy = fail_next_copy.clone();
+        let policy_failed_copy_source = failed_copy_source.clone();
+        policy.set_before_policy(
+            "fail-copy-once",
+            Arc::new(move |method, location| {
+                if method == "copy" && policy_fail_next_copy.swap(false, Ordering::SeqCst) {
+                    *policy_failed_copy_source.lock().unwrap() = Some(location.clone());
+                    return Err(Error::io("simulated copy failure"));
+                }
+                Ok(())
+            }),
+        );
+        let policy = Arc::new(Mutex::new(policy));
+        object_store.inner = Arc::new(ProxyObjectStore::new(
+            object_store.inner.clone(),
+            policy.clone(),
+        ));
+
+        let base_path = Path::from("dataset");
+        let mut manifest = test_manifest();
+        let version = manifest.version;
+        let canonical_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+
+        let commit_error = handler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .expect_err("the simulated copy failure must be surfaced");
+        assert!(matches!(commit_error, CommitError::CommitConflict));
+        assert!(
+            !fail_next_copy.load(Ordering::SeqCst),
+            "the one-shot copy failure must be consumed"
+        );
+
+        let recorded_location = external_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+            .expect("the external store must retain the committed staging location");
+        let staging_path = failed_copy_source
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the failure must be injected at copy(staging, canonical)");
+        assert_eq!(recorded_location.path, staging_path);
+        object_store
+            .inner
+            .head(&staging_path)
+            .await
+            .expect("the winning staging manifest must be retained");
+
+        let canonical_error = object_store
+            .inner
+            .head(&canonical_path)
+            .await
+            .expect_err("copy failed before creating the canonical manifest");
+        assert!(
+            matches!(canonical_error, ObjectStoreError::NotFound { .. }),
+            "unexpected canonical manifest error: {canonical_error}"
+        );
+
+        policy.lock().unwrap().clear_before_policy("fail-copy-once");
+        let resolved = handler
+            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .await
+            .expect("the retained staging manifest must allow finalization");
+        assert_eq!(resolved.path, canonical_path);
+
+        let finalized_location = external_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+            .expect("the external store must publish the canonical location");
+        assert_eq!(finalized_location.path, canonical_path);
+        object_store
+            .inner
+            .head(&canonical_path)
+            .await
+            .expect("the canonical manifest must exist after finalization");
+
+        let staging_error = object_store
+            .inner
+            .head(&staging_path)
+            .await
+            .expect_err("successful finalization must clean up the staging manifest");
+        assert!(
+            matches!(staging_error, ObjectStoreError::NotFound { .. }),
+            "unexpected staging manifest error: {staging_error}"
+        );
     }
 }

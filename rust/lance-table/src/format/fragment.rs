@@ -169,7 +169,7 @@ impl DataFile {
         full_schema.project_by_ids(&self.fields, false)
     }
 
-    pub fn is_legacy_file(&self) -> bool {
+    fn uses_v1_data_file_encoding(&self) -> bool {
         self.file_major_version == 0 && self.file_minor_version < 3
     }
 
@@ -182,7 +182,7 @@ impl DataFile {
     }
 
     pub fn validate(&self, base_path: &Path) -> Result<()> {
-        if self.is_legacy_file() {
+        if self.uses_v1_data_file_encoding() {
             // A tombstone marks a field superseded by a later data file. It is
             // not a field id, so it carries no ordering; the live ids around it
             // must still be sorted and distinct.
@@ -641,12 +641,6 @@ impl Fragment {
     pub fn add_file_legacy(&mut self, path: &str, schema: &Schema) {
         self.files
             .push(DataFile::new_legacy(path, schema, None, None));
-    }
-
-    // True if this fragment is made up of legacy v1 files, false otherwise
-    pub fn has_legacy_files(&self) -> bool {
-        // If any file in a fragment is legacy then all files in the fragment must be
-        self.files[0].is_legacy_file()
     }
 
     // Helper method to infer the Lance version from a set of fragments
