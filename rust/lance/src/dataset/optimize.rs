@@ -4911,6 +4911,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_bloom_filter_index_with_defer_index_remap() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BloomFilter,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        assert_eq!(
+            dataset.count_rows(Some("id = 2".to_owned())).await.unwrap(),
+            1
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.filter("id = 2").unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery: query=[id = 2]@id_idx(BloomFilter)"),
+            "Expected BloomFilter index query in plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_btree_index_with_defer_index_remap() {
         // Create a dataset with an incremental ID column
         let mut dataset = lance_datagen::gen_batch()

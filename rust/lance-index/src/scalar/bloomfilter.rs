@@ -482,14 +482,26 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-        if let BloomFilterQuery::IsNull() = query
+        let result = if let BloomFilterQuery::IsNull() = query
             && let Some(null_rows) = &self.null_rows
         {
-            return Ok(SearchResult::exact(null_rows.clone()));
-        }
+            SearchResult::exact(null_rows.clone())
+        } else {
+            search_zones(&self.zones, metrics, |block| {
+                self.evaluate_block_against_query(block, query)
+            })?
+        };
 
-        search_zones(&self.zones, metrics, |block| {
-            self.evaluate_block_against_query(block, query)
+        let Some(remapper) = &self.frag_reuse_index else {
+            return Ok(result);
+        };
+        let selected = remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows());
+        let nulls = remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows());
+
+        Ok(match result {
+            SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
+            SearchResult::AtMost(_) => SearchResult::at_most(selected).with_nulls(nulls),
+            SearchResult::AtLeast(_) => SearchResult::at_least(selected).with_nulls(nulls),
         })
     }
 
