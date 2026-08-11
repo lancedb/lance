@@ -4195,14 +4195,17 @@ impl TryFrom<pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
                 fragments,
                 schema,
-                schema_metadata: _schema_metadata, // TODO: handle metadata
+                schema_metadata,
                 preserves_nullability,
             })) => Operation::Merge {
                 fragments: fragments
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                schema: Schema::try_from(&Fields(schema))?,
+                schema: Schema::try_from(FieldsWithMeta {
+                    fields: Fields(schema),
+                    metadata: schema_metadata,
+                })?,
                 // False for a writer that predates the field: no assertion, so
                 // a legacy required-field merge still conflicts and a legacy
                 // nullable merge over-conflicts, which only retries.
@@ -4635,12 +4638,15 @@ impl From<&Transaction> for pb::Transaction {
                 fragments,
                 schema,
                 preserves_nullability,
-            } => pb::transaction::Operation::Merge(pb::transaction::Merge {
-                fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                schema: Fields::from(schema).0,
-                schema_metadata: Default::default(), // TODO: handle metadata
-                preserves_nullability: *preserves_nullability,
-            }),
+            } => {
+                let fields_with_meta = FieldsWithMeta::from(schema);
+                pb::transaction::Operation::Merge(pb::transaction::Merge {
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    schema: fields_with_meta.fields.0,
+                    schema_metadata: fields_with_meta.metadata,
+                    preserves_nullability: *preserves_nullability,
+                })
+            }
             Operation::ExactMerge {
                 basis,
                 fragments,
@@ -8499,6 +8505,90 @@ mod tests {
                 "encoded={encoded:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_merge_protobuf_round_trip_preserves_schema_metadata() {
+        // A2 staged publish accepts caller schema metadata through the output
+        // Arrow schema; Merge wire encoding must preserve it so retry/rebase
+        // cannot publish schema/values without the same metadata.
+        let arrow_schema = ArrowSchema::new_with_metadata(
+            vec![
+                ArrowField::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                    "field_owner".to_string(),
+                    "merge_candidate".to_string(),
+                )])),
+            ],
+            HashMap::from([("schema_owner".to_string(), "a2_staged_publish".to_string())]),
+        );
+        let schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert!(!schema.metadata.is_empty());
+        assert!(!schema.fields[0].metadata.is_empty());
+
+        let fragments = vec![Fragment::new(7)];
+        let preserves_nullability = true;
+        let tx = Transaction::new(
+            1,
+            Operation::Merge {
+                fragments: fragments.clone(),
+                schema: schema.clone(),
+                preserves_nullability,
+            },
+            None,
+        );
+
+        let pb_tx: pb::Transaction = pb::Transaction::from(&tx);
+        let Some(pb::transaction::Operation::Merge(ref pb_merge)) = pb_tx.operation else {
+            panic!("expected Merge operation in encoded transaction");
+        };
+        assert!(
+            !pb_merge.schema_metadata.is_empty(),
+            "encoded Merge schema_metadata must carry top-level schema metadata"
+        );
+
+        let decoded = Transaction::try_from(pb_tx).unwrap();
+        let Operation::Merge {
+            fragments: decoded_fragments,
+            schema: decoded_schema,
+            preserves_nullability: decoded_preserves_nullability,
+        } = decoded.operation
+        else {
+            panic!("expected decoded Operation::Merge");
+        };
+
+        assert_eq!(decoded_fragments, fragments);
+        assert_eq!(decoded_preserves_nullability, preserves_nullability);
+        assert_eq!(
+            decoded_schema.fields, schema.fields,
+            "field layout and field metadata must survive Merge protobuf round-trip"
+        );
+        assert_eq!(
+            decoded_schema.metadata, schema.metadata,
+            "top-level schema metadata must survive Merge protobuf round-trip"
+        );
+
+        // Historical writers leave schema_metadata empty; decode must still
+        // succeed with empty top-level metadata.
+        let legacy = Transaction::try_from(pb::Transaction {
+            read_version: 1,
+            uuid: "legacy-merge".to_string(),
+            operation: Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
+                fragments: vec![],
+                schema: Fields::from(&schema).0,
+                schema_metadata: Default::default(),
+                preserves_nullability: false,
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+        let Operation::Merge {
+            schema: legacy_schema,
+            ..
+        } = legacy.operation
+        else {
+            panic!("expected decoded Operation::Merge from legacy empty schema_metadata");
+        };
+        assert!(legacy_schema.metadata.is_empty());
     }
 
     mod mem_wal_index_coverage {
