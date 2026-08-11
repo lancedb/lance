@@ -1822,6 +1822,8 @@ impl Transaction {
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        // Ensure stable row IDs are monotonically increasing.
+        manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         Ok((manifest, indices))
     }
 

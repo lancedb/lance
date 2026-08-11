@@ -2028,13 +2028,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restore_does_not_decrease_max_fragment_id() {
+    async fn test_restore_does_not_decrease_id_high_water_marks() {
         let reader = gen_batch()
             .col("i", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(3), BatchCount::from(1));
-        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
-        // Append a few times to advance max_fragment_id and create newer versions.
+        // Append a few times to advance the fragment and row ID high water marks.
         for _ in 0..2 {
             let reader = gen_batch()
                 .col("i", array::step::<Int32Type>())
@@ -2043,18 +2052,22 @@ mod tests {
         }
 
         let latest_max = dataset.manifest.max_fragment_id().unwrap_or(0);
+        let latest_next_row_id = dataset.manifest.next_row_id;
 
         // Restore an earlier version (version 1) as the latest.
         let mut dataset_v1 = dataset.checkout_version(1).await.unwrap();
         dataset_v1.restore().await.unwrap();
 
-        // After restore, max_fragment_id should not decrease compared to the latest value before restore.
         let restored_max = dataset_v1.manifest.max_fragment_id().unwrap_or(0);
         assert!(
             restored_max >= latest_max,
             "max_fragment_id should not decrease on restore: before={}, after={}",
             latest_max,
             restored_max
+        );
+        assert_eq!(
+            dataset_v1.manifest.next_row_id, latest_next_row_id,
+            "next_row_id should not decrease on restore"
         );
     }
 
