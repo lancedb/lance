@@ -4648,6 +4648,80 @@ async fn test_stale_append_vs_cast(#[case] tighten_first: bool, #[case] expect_c
     }
 }
 
+/// Recasting a nullable nested field still claims when its top-level parent is
+/// required: a stale append omits the new child id, and the reader cannot
+/// synthesize that child under a required parent. A nullable parent can mask
+/// the missing nullable child, so that append remains compatible.
+#[rstest]
+#[case::nullable_child_required_parent_conflicts(false, true)]
+#[case::nullable_child_nullable_parent_commits(true, false)]
+#[tokio::test]
+async fn test_stale_append_vs_nested_cast(
+    #[case] parent_nullable: bool,
+    #[case] expect_conflict: bool,
+) {
+    let child = Arc::new(ArrowField::new("c", DataType::Int32, true));
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "b",
+        DataType::Struct(Fields::from(vec![child.clone()])),
+        parent_nullable,
+    )]));
+    let struct_batch = |values: Vec<i32>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![(
+                child.clone(),
+                Arc::new(Int32Array::from(values)) as ArrayRef,
+            )]))],
+        )
+        .unwrap()
+    };
+
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(struct_batch(vec![1, 2]))], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let append = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![struct_batch(vec![3])])
+        .await
+        .unwrap();
+
+    dataset
+        .alter_columns(&[ColumnAlteration::new("b.c".into()).cast_to(DataType::Int64)])
+        .await
+        .unwrap();
+
+    let result = CommitBuilder::new(Arc::new(dataset)).execute(append).await;
+    assert_eq!(
+        result.is_err(),
+        expect_conflict,
+        "parent_nullable={parent_nullable}: got {result:?}"
+    );
+    if let Ok(committed) = result {
+        let batch = committed.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(
+            batch["b"]
+                .as_struct()
+                .column_by_name("c")
+                .unwrap()
+                .null_count(),
+            1
+        );
+    }
+}
+
 /// A subcolumn addition (V2.2+) merges a new child into an existing struct.
 /// Stale rows supply the parent, so a required new child would read as
 /// unmasked null: the merge claims and the stale append conflicts. A nullable

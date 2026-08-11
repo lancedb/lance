@@ -880,10 +880,28 @@ pub(super) async fn alter_columns(
         let output_schema = Arc::new(ArrowSchema::from(&new_col_schema));
 
         // A cast rewrites the column under a new field id, so data staged
-        // against the pre-cast schema omits that id and its rows read as null.
-        // Withhold the assertion when any recast field is non-nullable, at any
-        // depth: a nested field sits under parent values stale rows do supply.
-        let cast_touches_required = cast_fields.iter().any(|(_old, new)| !new.nullable);
+        // against the pre-cast schema omits that id. A required recast field
+        // reads as unmasked null. Even when a nested field is nullable, a
+        // required top-level ancestor cannot safely synthesize the missing
+        // child, following the same rule as `merge_introduces_required_field`.
+        let cast_touches_required = cast_fields.iter().try_fold(
+            false,
+            |touches_required, (_old, new)| -> Result<bool> {
+                if touches_required || !new.nullable {
+                    return Ok(true);
+                }
+                let top_level = new_schema
+                    .field_ancestry_by_id(new.id)
+                    .and_then(|ancestry| ancestry.first().copied())
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "Could not find field id {} for column {} while determining cast nullability",
+                            new.id, new.name
+                        ))
+                    })?;
+                Ok(!top_level.nullable)
+            },
+        )?;
 
         let mapper = move |batch: &RecordBatch| {
             if batch.num_columns() != output_schema.fields().len() {
