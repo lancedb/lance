@@ -301,19 +301,9 @@ pub async fn parse_substrait(
         let (substrait_schema, _, index_mapping) =
             remove_extension_types(envelope.base_schema.as_ref().unwrap(), input_schema.clone())?;
 
-        if substrait_schema.r#struct.as_ref().unwrap().types.len()
-            != envelope
-                .base_schema
-                .as_ref()
-                .unwrap()
-                .r#struct
-                .as_ref()
-                .unwrap()
-                .types
-                .len()
-        {
-            remap_expr_references(&mut expr, &index_mapping)?;
-        }
+        // Always walk the expression: this also rejects operators we cannot push down. When no
+        // fields were removed the mapping is the identity, so the remap itself is a no-op.
+        remap_expr_references(&mut expr, &index_mapping)?;
 
         substrait_schema
     } else {
@@ -662,6 +652,67 @@ mod tests {
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)), None)),
         });
         assert_eq!(df_expr, expected);
+    }
+
+    /// A base schema with no extension types needs no field pruning, which is the case that
+    /// used to skip validation entirely.
+    async fn parse_unpruned_expr(rex_type: RexType) -> lance_core::Result<Expr> {
+        let expr = ExtendedExpression {
+            version: Some(Version {
+                major_number: 0,
+                minor_number: 63,
+                patch_number: 1,
+                git_hash: "".to_string(),
+                producer: "unit-test".to_string(),
+            }),
+            extension_urns: vec![],
+            extensions: vec![],
+            referred_expr: vec![ExpressionReference {
+                output_names: vec!["filter_mask".to_string()],
+                expr_type: Some(ExprType::Expression(Expression {
+                    rex_type: Some(rex_type),
+                })),
+            }],
+            base_schema: Some(NamedStruct {
+                names: vec!["x".to_string()],
+                r#struct: Some(Struct {
+                    types: vec![Type {
+                        kind: Some(Kind::I32(I32 {
+                            type_variation_reference: 0,
+                            nullability: Nullability::Nullable as i32,
+                        })),
+                    }],
+                    type_variation_reference: 0,
+                    nullability: Nullability::Required as i32,
+                }),
+            }),
+            advanced_extensions: None,
+            expected_type_urls: vec![],
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
+        parse_substrait(expr.encode_to_vec().as_slice(), schema, &session_state()).await
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_operator_rejected_without_pruning() {
+        let err = parse_unpruned_expr(RexType::Subquery(Box::default()))
+            .await
+            .expect_err("subqueries should be rejected in filter expressions");
+        assert!(
+            err.to_string()
+                .contains("Window functions or subqueries not allowed in filter expression"),
+            "unexpected error: {err}"
+        );
+
+        let err = parse_unpruned_expr(RexType::Lambda(Box::default()))
+            .await
+            .expect_err("lambdas should be rejected in filter expressions");
+        assert!(
+            err.to_string()
+                .contains("Lambda expressions not allowed in filter expression"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
