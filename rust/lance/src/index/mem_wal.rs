@@ -208,6 +208,41 @@ mod tests {
             .unwrap()
     }
 
+    /// UpdateMemWalState touches indexes, not data, so it must carry the
+    /// fragment list forward. The operation builds its manifest from scratch,
+    /// and an unpopulated fragment list is published as an empty one.
+    #[tokio::test]
+    async fn test_update_mem_wal_state_preserves_fragments() {
+        let dataset = test_dataset_with_mem_wal().await;
+        let rows_before = dataset.count_rows(None).await.unwrap();
+        let fragments_before: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        assert!(rows_before > 0, "precondition: the table holds rows");
+
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(Uuid::new_v4(), 1)],
+                require_index_catchup: false,
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+            fragments_before,
+            "UpdateMemWalState dropped fragments"
+        );
+        assert_eq!(
+            dataset.count_rows(None).await.unwrap(),
+            rows_before,
+            "UpdateMemWalState dropped rows"
+        );
+    }
+
     /// Test that UpdateMemWalState with lower generation than committed fails without retry.
     /// Per spec: If committed_generation >= to_commit_generation, abort without retry.
     #[tokio::test]
