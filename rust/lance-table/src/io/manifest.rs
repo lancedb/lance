@@ -169,6 +169,10 @@ async fn do_write_manifest(
         };
         let pos = writer.write_protobuf(&section).await?;
         manifest.index_section = Some(pos);
+    } else {
+        // No index section is written to this file, so an inherited offset
+        // would point at unrelated bytes in the new manifest file.
+        manifest.index_section = None;
     }
 
     // Write inline transaction if presented.
@@ -297,6 +301,33 @@ mod test {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_clears_unwritten_index_section() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/clear_unwritten_index_section");
+        let mut writer = store.create(&path).await.unwrap();
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.index_section = Some(42);
+
+        let pos = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        assert!(manifest.index_section.is_none());
+        let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
+        assert!(roundtripped_manifest.index_section.is_none());
     }
 
     #[tokio::test]

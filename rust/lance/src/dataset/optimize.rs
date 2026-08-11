@@ -94,6 +94,7 @@ use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
+use super::versions;
 use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
@@ -124,12 +125,11 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-mod binary_copy;
+pub(super) mod binary_copy;
 pub mod remapping;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
-use binary_copy::rewrite_files_binary_copy;
 use lance_table::io::deletion::deletion_file_path;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
@@ -509,7 +509,8 @@ async fn can_use_binary_copy(
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
-    can_use_binary_copy_impl(dataset, options, fragments)
+    let version = dataset.manifest.data_storage_format.lance_file_format();
+    versions::can_use_binary_copy(version, dataset, options, fragments)
         .await
         .unwrap_or_else(|err| {
             log::warn!("Binary copy disabled due to error: {}", err);
@@ -517,13 +518,12 @@ async fn can_use_binary_copy(
         })
 }
 
-async fn can_use_binary_copy_impl(
+pub(super) async fn can_use_binary_copy_current(
     dataset: &Dataset,
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> Result<bool> {
     use lance_file::reader::FileReader as LFReader;
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
     if matches!(options.compaction_mode(), CompactionMode::Reencode) {
@@ -540,27 +540,10 @@ async fn can_use_binary_copy_impl(
         return Ok(false);
     }
 
-    let storage_ok = dataset
-        .manifest
-        .data_storage_format
-        .lance_file_version()
-        .map(|v| !matches!(v.resolve(), LanceFileVersion::Legacy))
-        .unwrap_or(false);
-    if !storage_ok {
-        log::debug!("Binary copy disabled: dataset uses legacy storage format");
-        return Ok(false);
-    }
-
     if fragments.is_empty() {
         log::debug!("Binary copy disabled: no fragments to compact");
         return Ok(false);
     }
-
-    let storage_file_version = dataset
-        .manifest
-        .data_storage_format
-        .lance_file_version()?
-        .resolve();
 
     if fragments[0].files.is_empty() {
         log::debug!(
@@ -571,8 +554,6 @@ async fn can_use_binary_copy_impl(
     }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
-    let mut is_same_version = true;
-
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
             log::debug!(
@@ -583,13 +564,6 @@ async fn can_use_binary_copy_impl(
         }
 
         for data_file in &fragment.files {
-            let version_ok = data_file
-                .file_version()
-                .is_ok_and(|v| v == ConcreteFileVersion::from(storage_file_version));
-
-            if !version_ok {
-                is_same_version = false;
-            }
             if data_file.fields != *ref_fields || data_file.column_indices != *ref_cols {
                 return Ok(false);
             }
@@ -624,11 +598,6 @@ async fn can_use_binary_copy_impl(
                 return Ok(false);
             }
         }
-    }
-
-    if !is_same_version {
-        log::debug!("Binary copy disabled: data files use different file versions");
-        return Ok(false);
     }
 
     Ok(true)
@@ -2098,7 +2067,9 @@ async fn rewrite_files(
     }
 
     if can_binary_copy {
-        new_fragments = rewrite_files_binary_copy(
+        let version = dataset.manifest.data_storage_format.lance_file_format();
+        new_fragments = versions::rewrite_files_binary_copy(
+            version,
             dataset.as_ref(),
             &fragments,
             &params,
@@ -9258,7 +9229,7 @@ mod tests {
         let filename = format!("{}.lance", Uuid::new_v4());
         let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
         let obj_writer = dataset.object_store.create(&path).await.unwrap();
-        let file_version = lance_file::version::ConcreteFileVersion::from(LanceFileVersion::Stable);
+        let file_version = LanceFileVersion::Stable.resolve();
         let mut writer = lance_file::versions::create_writer(
             file_version,
             obj_writer,

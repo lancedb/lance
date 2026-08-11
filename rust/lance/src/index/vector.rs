@@ -591,7 +591,7 @@ async fn prepare_vector_segment_build(
     let shuffler = create_ivf_shuffler(
         temp_dir_path,
         num_partitions,
-        format_version,
+        format_version.to_selector(),
         Some(progress),
     );
 
@@ -1345,7 +1345,7 @@ pub(crate) async fn build_vector_index_incremental(
     let shuffler = create_ivf_shuffler(
         temp_dir_path,
         ivf_model.num_partitions(),
-        format_version,
+        format_version.to_selector(),
         Some(progress.clone()),
     );
 
@@ -1961,6 +1961,7 @@ pub async fn initialize_vector_index(
         Operation::CreateIndex {
             new_indices: vec![new_idx],
             removed_indices: vec![],
+            mem_wal_index_catchup_advances: Vec::new(),
         },
         None,
     );

@@ -1155,3 +1155,32 @@ def test_row_id_sequence_reads_back_fragment_metadata(tmp_path: Path):
         [0, 1, 2, 3, 4],
         [5, 6, 7, 8, 9],
     ]
+
+
+def test_fragment_validate(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(100), "b": range(100)}),
+        tmp_path,
+        max_rows_per_file=50,
+    )
+    # A valid fragment validates without raising.
+    for fragment in dataset.get_fragments():
+        assert fragment.validate() is None
+
+
+def test_fragment_validate_across_data_files(tmp_path: Path):
+    # add_columns writes a second data file per fragment; validate must still
+    # pass (field ids increasing and unique across a fragment's data files).
+    dataset = write_dataset(pa.table({"a": range(100)}), tmp_path, max_rows_per_file=50)
+    dataset.add_columns({"b": "a + 1"})
+    for fragment in dataset.get_fragments():
+        assert len(fragment.data_files()) > 1
+        fragment.validate()
+
+
+def test_fragment_validate_after_delete(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(100)}), tmp_path, max_rows_per_file=50)
+    dataset.delete("a < 10")
+    # A fragment carrying a deletion vector still validates.
+    for fragment in dataset.get_fragments():
+        fragment.validate()

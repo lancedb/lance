@@ -81,6 +81,48 @@ message Transaction {
   message CreateIndex {
     repeated IndexMetadata new_indices = 1;
     repeated IndexMetadata removed_indices = 2;
+
+    // Records that one logical index now covers named per-shard compaction
+    // generations, published in the same commit as the index change it
+    // describes.
+    message IndexCatchupAdvance {
+      // One user-visible logical index, possibly backed by several segments.
+      string index_name = 1;
+
+      // Exact final physical segment UUID set expected after this operation.
+      // Ordering has no meaning; duplicates are rejected. The commit fails if
+      // the segments actually present differ, so a repair cannot claim
+      // coverage for an index that something else replaced underneath it.
+      repeated UUID expected_index_segment_uuids = 2;
+
+      // Compaction numbers captured when the repair job opened the table.
+      // Recording only these, rather than whatever is current at commit time,
+      // keeps the claim to what the job actually indexed.
+      repeated CompactedSsTable caught_up_generations = 3;
+
+      // Serialized roaring bitmap: the fragments the named segments covered
+      // when the repair inspected them. UUIDs alone are not a fence -- an
+      // operation can prune a segment's fragment bitmap while keeping its
+      // UUID, so a claim made before the prune would still match. The commit
+      // fails unless the published segments cover exactly these fragments.
+      bytes expected_fragment_bitmap = 4;
+
+      // Serialized roaring bitmap: every fragment live in the table when the
+      // repair inspected it. The index must cover all of them, which is what
+      // ties the claim to the generations it names -- there is no mapping from
+      // a generation to the fragments its rows landed in, so covering the whole
+      // inspected table is how the repair shows it covered those rows.
+      // Fragments appended after that snapshot are a later catch-up gap and are
+      // not required.
+      bytes inspected_fragments = 5;
+    }
+
+    // Empty for every ordinary index operation. Creating, reindexing,
+    // appending to, or remapping an index changes it without saying how far it
+    // has caught up, so that index's index_catchup entry is removed and a later
+    // repair records a fresh one. Empty means "this operation reports no new
+    // coverage"; it never means "inherit the previous index's catch-up".
+    repeated IndexCatchupAdvance mem_wal_index_catchup_advances = 3;
   }
 
   // An operation that rewrites but does not change the data in the table. These
@@ -144,12 +186,24 @@ message Transaction {
     repeated lance.file.Field schema = 2;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
+    // Set when this merge makes no nullability-affecting schema change: it
+    // introduces no field that data staged against an earlier schema could
+    // not safely omit. Without the assertion (including transactions written
+    // before this field existed) the merge conservatively conflicts with
+    // concurrent value-writes, which can only cause a retry.
+    bool preserves_nullability = 4;
   }
 
   // An operation that projects a subset of columns, altering the schema.
   message Project {
     // The new schema
     repeated lance.file.Field schema = 1;
+    // Set when this projection makes no nullability-affecting schema change,
+    // as a rename or a drop does not. Without the assertion (including
+    // transactions written before this field existed) the projection
+    // conservatively conflicts with concurrent value-writes, which can only
+    // cause a retry. A nullability tightening must not set this.
+    bool preserves_nullability = 2;
   }
 
   // An operation that restores a dataset to a previous version.
@@ -254,7 +308,12 @@ message Transaction {
     // Only tracks keys from INSERT operations during merge insert, not updates.
     optional KeyExistenceFilter inserted_rows = 8;
     // Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).
+    // Deprecated: use updated_fragment_offset_bitmaps (field 10) instead.
     map<uint64, UInt32List> updated_fragment_offsets = 9;
+    // Per-fragment matched offsets as portable RoaringBitmap bytes (replaces field 9).
+    // Writers emit field 10 only. Readers prefer field 10; fall back to field 9 for
+    // manifests written before this change.
+    map<uint64, bytes> updated_fragment_offset_bitmaps = 10;
   }
 
   // The mode of update operation
@@ -343,6 +402,14 @@ message Transaction {
   message UpdateMemWalState {
     // SSTables being marked as compacted.
     repeated CompactedSsTable compacted_sstables = 1;
+
+    // Presence with true requests the one-way migration to required catch-up.
+    // False is invalid; absence is an ordinary progress update.
+    //
+    // The migration is one-way because returning to legacy semantics — where a
+    // missing coverage entry reads as "fully caught up" — is unsafe once any
+    // SSTable has been retired against a recorded catch-up position.
+    optional bool require_index_catchup = 2;
   }
 
   // An operation that updates base paths in the dataset.
