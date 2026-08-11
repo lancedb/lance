@@ -4798,18 +4798,17 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             // so a stray key can corrupt an unrelated fragment's metadata.
             // Other modes (e.g. rewrite_rows) may supply offsets for fragments
             // outside updated_fragments for their own purposes.
-            if matches!(update_mode, Some(UpdateMode::RewriteColumns)) {
-                if let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets {
-                    let updated_ids: HashSet<u64> =
-                        updated_fragments.iter().map(|f| f.id).collect();
-                    for &frag_id in off_map.keys() {
-                        if !updated_ids.contains(&frag_id) {
-                            return Err(Error::invalid_input(format!(
-                                "updatedFragmentOffsets key {} is not in updated_fragments; \
-                                 offsets must reference only fragments being rewritten",
-                                frag_id
-                            )));
-                        }
+            if matches!(update_mode, Some(UpdateMode::RewriteColumns))
+                && let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets
+            {
+                let updated_ids: HashSet<u64> = updated_fragments.iter().map(|f| f.id).collect();
+                for &frag_id in off_map.keys() {
+                    if !updated_ids.contains(&frag_id) {
+                        return Err(Error::invalid_input(format!(
+                            "updatedFragmentOffsets key {} is not in updated_fragments; \
+                             offsets must reference only fragments being rewritten",
+                            frag_id
+                        )));
                     }
                 }
             }
@@ -6328,7 +6327,7 @@ mod tests {
             Fragment {
                 id,
                 files: vec![DataFile::new(
-                    &format!("{id}.lance"),
+                    format!("{id}.lance"),
                     vec![0],
                     vec![0],
                     ConcreteFileVersion::from(LanceFileVersion::Stable),
