@@ -133,6 +133,16 @@ impl UpdateBuilder {
                 ))
             })?;
 
+        if crate::dataset::optimize::field_contains_blob_v2(field) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "Direct updates to column '{}' containing blob v2 values are not supported",
+                    column.as_ref()
+                )
+                .into(),
+            ));
+        }
+
         // TODO: support nested column references. This is mostly blocked on the
         // ability to insert them into the RecordBatch properly.
         if column.as_ref().contains('.') {
@@ -2093,6 +2103,19 @@ mod tests {
             .await
             .unwrap(),
         );
+
+        for column in ["payload", "info"] {
+            let error = UpdateBuilder::new(dataset.clone())
+                .set(column, column)
+                .unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(
+                error.to_string().contains(&format!(
+                    "Direct updates to column '{column}' containing blob v2 values are not supported"
+                )),
+                "unexpected error: {error}"
+            );
+        }
 
         let result = UpdateBuilder::new(dataset)
             .update_where(&format!("id = {selected_id}"))
