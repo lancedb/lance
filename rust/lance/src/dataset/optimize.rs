@@ -1237,7 +1237,7 @@ fn arrow_field_with_data_type(field: &ArrowField, data_type: ArrowDataType) -> A
     )
 }
 
-fn field_contains_blob_v2(field: &LanceField) -> bool {
+pub(crate) fn field_contains_blob_v2(field: &LanceField) -> bool {
     field.is_blob_v2() || field.children.iter().any(field_contains_blob_v2)
 }
 
