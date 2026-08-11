@@ -12,8 +12,6 @@ and `delete` or `list` tags.
 
 The `reference` parameter (used in `create`, `update`, and `checkout_version`) accepts:
 
-- When omitted from `create` or `update`: the dataset's **currently checked-out
-  version**
 - An **integer**: version number in the **current branch** (e.g., `1`)
 - A **string**: tag name (e.g., `"stable"`)
 - A **tuple** `(branch_name, version)`: a specific version in a named branch
