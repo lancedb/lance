@@ -6324,6 +6324,24 @@ def test_shallow_clone(tmp_path: Path):
     assert lance.dataset(clone_branch_v3).to_table() == table_v3
 
 
+def test_default_reference_uses_checked_out_version(tmp_path: Path):
+    base_dir = tmp_path / "default_reference"
+    table_v1 = pa.table({"value": ["v1"]})
+    table_v2 = pa.table({"value": ["v2"]})
+    ds = lance.write_dataset(table_v1, base_dir)
+    ds = lance.write_dataset(table_v2, base_dir, mode="overwrite")
+
+    historical = ds.checkout_version(1)
+    branch = historical.create_branch("from-v1")
+    historical.tags.create("from-v1")
+
+    assert ds.version == 2
+    assert branch.version == 1
+    assert branch.to_table() == table_v1
+    assert historical.tags.get_version("from-v1") == 1
+    assert historical.checkout_version("from-v1").to_table() == table_v1
+
+
 def test_branches(tmp_path: Path):
     # Step 1: create branch1 from main → append to branch1 → create branch2 from tag
     base_dir = tmp_path / "test_branches"

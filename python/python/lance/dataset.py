@@ -1042,9 +1042,10 @@ class LanceDataset(pa.dataset.Dataset):
         branch: str
             Name of the branch to create.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
-            An integer specifies a version number in the current branch; a string
-            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
-            a version number in a specified branch. (None, None) means the latest
+            If omitted or None, use the currently checked-out version. An integer
+            specifies a version number in the current branch; a string specifies a
+            tag name; a Tuple[Optional[str], Optional[int]] specifies a version
+            number in a specified branch. (None, None) means the latest
             version_number on the main branch.
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
@@ -7384,9 +7385,10 @@ class Tags:
             The name of the tag to create. This name must be unique among all tag
             names for the dataset.
         reference : int, str or Tuple[Optional[str], Optional[int]]
-            An integer specifies a version number in the current branch; a string
-            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
-            a version number in a specified branch. (None, None) means the latest
+            If omitted or None, use the currently checked-out version. An integer
+            specifies a version number in the current branch; a string specifies a
+            tag name; a Tuple[Optional[str], Optional[int]] specifies a version
+            number in a specified branch. (None, None) means the latest
             version_number on the main branch.
         """
         self._ds.create_tag(tag, reference)
@@ -7416,9 +7418,10 @@ class Tags:
         tag: str,
             The name of the tag to update.
         reference : int, str or Tuple[Optional[str], Optional[int]]
-            An integer specifies a version number in the current branch; a string
-            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
-            a version number in a specified branch. (None, None) means the latest
+            If omitted or None, use the currently checked-out version. An integer
+            specifies a version number in the current branch; a string specifies a
+            tag name; a Tuple[Optional[str], Optional[int]] specifies a version
+            number in a specified branch. (None, None) means the latest
             version_number on the main branch.
         """
         self._ds.update_tag(tag, reference)
