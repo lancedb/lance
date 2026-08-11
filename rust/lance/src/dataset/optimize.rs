@@ -500,6 +500,7 @@ impl CompactionOptions {
 /// - No fragment has a deletion file
 ///   TODO: Need to support schema evolution case like add column and drop column
 /// - All data files share identical schema mappings (`fields`, `column_indices`)
+/// - That shared mapping matches the dataset schema's physical column layout
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
@@ -551,6 +552,28 @@ pub(super) async fn can_use_binary_copy_current(
     }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
+
+    // Binary copy only moves the physical columns that exist in the input files,
+    // but it describes the output file with the dataset schema: both the footer
+    // schema and the new `fields` / `column_indices` mapping are derived from it.
+    // A metadata-only schema change (an all-null `add_columns`, a `drop_columns`)
+    // leaves the inputs covering a different set of physical columns than the
+    // dataset schema describes, so that mapping would name columns the output file
+    // does not have. Re-encoding materializes those columns, so fall back to it.
+    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let (schema_fields, schema_cols) =
+        lance_file::versions::data_file_columns(version, dataset.schema());
+    if ref_fields.as_ref() != schema_fields || ref_cols.as_ref() != schema_cols {
+        log::debug!(
+            "Binary copy disabled: data files map fields {:?} to columns {:?} but the dataset schema maps fields {:?} to columns {:?}",
+            ref_fields,
+            ref_cols,
+            schema_fields,
+            schema_cols
+        );
+        return Ok(false);
+    }
+
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
             log::debug!(
