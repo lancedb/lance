@@ -26,7 +26,10 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    ListResult, ObjectMeta, ObjectStore as OSObjectStore, PutMode, PutOptions, PutPayload,
+    path::Path,
+};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -823,6 +826,45 @@ impl ObjectStore {
         Writer::shutdown(writer.as_mut()).await
     }
 
+    /// Atomically creates an object without replacing an existing object.
+    ///
+    /// Local stores publish a uniquely named staging object with a conditional
+    /// rename. Other stores use their conditional create operation.
+    pub async fn put_if_absent(
+        &self,
+        path: &Path,
+        content: PutPayload,
+    ) -> object_store::Result<()> {
+        if self.is_local() {
+            let staging_path =
+                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            self.inner.put(&staging_path, content).await?;
+            let result = self.inner.rename_if_not_exists(&staging_path, path).await;
+            if result.is_err()
+                && let Err(error) = self.inner.delete(&staging_path).await
+            {
+                log::warn!(
+                    "Failed to remove staging object {} after atomic create failed: {}",
+                    staging_path,
+                    error
+                );
+            }
+            result
+        } else {
+            self.inner
+                .put_opts(
+                    path,
+                    content,
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+        }
+    }
+
     pub async fn delete(&self, path: &Path) -> Result<()> {
         self.inner.delete(path).await?;
         Ok(())
@@ -1295,6 +1337,29 @@ mod tests {
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
+    }
+
+    #[tokio::test]
+    async fn test_put_if_absent() {
+        let temp_dir = TempStrDir::default();
+        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let store = ObjectStore::local();
+        store
+            .put_if_absent(&path, Bytes::from_static(b"first").into())
+            .await
+            .unwrap();
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"second").into())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }
+        ));
+        assert_eq!(
+            store.read_one_all(&path).await.unwrap(),
+            b"first".as_slice()
+        );
     }
 
     #[test]

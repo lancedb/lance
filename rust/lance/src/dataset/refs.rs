@@ -8,7 +8,7 @@ use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::CommitHandler;
-use object_store::{Error as ObjectStoreError, PutMode, PutOptions, path::Path};
+use object_store::{Error as ObjectStoreError, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -151,17 +151,8 @@ async fn put_ref_if_absent(
     conflict_message: String,
 ) -> Result<()> {
     object_store
-        .inner
-        .put_opts(
-            path,
-            contents.into(),
-            PutOptions {
-                mode: PutMode::Create,
-                ..Default::default()
-            },
-        )
+        .put_if_absent(path, contents.into())
         .await
-        .map(|_| ())
         .map_err(|error| match error {
             ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
                 Error::RefConflict {
