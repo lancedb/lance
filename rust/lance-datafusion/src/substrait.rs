@@ -153,8 +153,21 @@ fn remove_extension_types(
     Ok((new_substrait_schema, new_arrow_schema, index_mapping))
 }
 
+/// Substrait's optional message fields are `None` when a producer omits them, so unwrapping one
+/// turns a malformed (or merely terse) filter into a panic. This walker runs on every filter, so
+/// report the missing field instead.
+fn missing_field(what: &str) -> Error {
+    Error::invalid_input(format!(
+        "filter expression was missing a required {what} field"
+    ))
+}
+
 fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
-    match expr.rex_type.as_mut().unwrap() {
+    match expr
+        .rex_type
+        .as_mut()
+        .ok_or_else(|| missing_field("expression"))?
+    {
         // Simple, no field references possible
         RexType::Literal(_) | RexType::Nested(_) | RexType::DynamicParameter(_) => Ok(()),
         // Enum literals are deprecated in Substrait and should only appear in older plans.
@@ -174,7 +187,11 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                 remap_expr_references(arg, mapping)?;
             }
             for arg in &mut func.arguments {
-                match arg.arg_type.as_mut().unwrap() {
+                match arg
+                    .arg_type
+                    .as_mut()
+                    .ok_or_else(|| missing_field("function argument"))?
+                {
                     ArgType::Value(expr) => remap_expr_references(expr, mapping)?,
                     ArgType::Enum(_) | ArgType::Type(_) => {}
                 }
@@ -183,24 +200,46 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
         }
         RexType::IfThen(ifthen) => {
             for clause in ifthen.ifs.iter_mut() {
-                remap_expr_references(clause.r#if.as_mut().unwrap(), mapping)?;
-                remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
+                remap_expr_references(
+                    clause
+                        .r#if
+                        .as_mut()
+                        .ok_or_else(|| missing_field("if clause condition"))?,
+                    mapping,
+                )?;
+                // The leading clause may omit `then`, in which case its condition is the case
+                // expression being matched against.
+                if let Some(then) = clause.then.as_mut() {
+                    remap_expr_references(then, mapping)?;
+                }
             }
-            remap_expr_references(ifthen.r#else.as_mut().unwrap(), mapping)?;
+            if let Some(otherwise) = ifthen.r#else.as_mut() {
+                remap_expr_references(otherwise, mapping)?;
+            }
             Ok(())
         }
         RexType::SwitchExpression(switch) => {
             for clause in switch.ifs.iter_mut() {
-                remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
+                if let Some(then) = clause.then.as_mut() {
+                    remap_expr_references(then, mapping)?;
+                }
             }
-            remap_expr_references(switch.r#else.as_mut().unwrap(), mapping)?;
+            if let Some(otherwise) = switch.r#else.as_mut() {
+                remap_expr_references(otherwise, mapping)?;
+            }
             Ok(())
         }
         RexType::SingularOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
                 remap_expr_references(opt, mapping)?;
             }
-            remap_expr_references(orlist.value.as_mut().unwrap(), mapping)?;
+            remap_expr_references(
+                orlist
+                    .value
+                    .as_mut()
+                    .ok_or_else(|| missing_field("IN list value"))?,
+                mapping,
+            )?;
             Ok(())
         }
         RexType::MultiOrList(orlist) => {
@@ -215,22 +254,35 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
             Ok(())
         }
         RexType::Cast(cast) => {
-            remap_expr_references(cast.input.as_mut().unwrap(), mapping)?;
+            remap_expr_references(
+                cast.input
+                    .as_mut()
+                    .ok_or_else(|| missing_field("cast input"))?,
+                mapping,
+            )?;
             Ok(())
         }
         RexType::Selection(sel) => {
-            // Finally, the selection, which might actually have field references
-            let root_type = sel.root_type.as_mut().unwrap();
-            // These types of references do not reference input fields so no remap needed
+            // Finally, the selection, which might actually have field references.
+            // An omitted root is a reference into the input, same as RootReference.
             if matches!(
-                root_type,
-                RootType::Expression(_) | RootType::OuterReference(_)
+                sel.root_type.as_mut(),
+                Some(RootType::Expression(_) | RootType::OuterReference(_))
             ) {
+                // These types of references do not reference input fields so no remap needed
                 return Ok(());
             }
-            match sel.reference_type.as_mut().unwrap() {
+            match sel
+                .reference_type
+                .as_mut()
+                .ok_or_else(|| missing_field("field reference"))?
+            {
                 ReferenceType::DirectReference(direct) => {
-                    match direct.reference_type.as_mut().unwrap() {
+                    match direct
+                        .reference_type
+                        .as_mut()
+                        .ok_or_else(|| missing_field("reference segment"))?
+                    {
                         reference_segment::ReferenceType::ListElement(_)
                         | reference_segment::ReferenceType::MapKey(_) => Err(Error::invalid_input(
                             "map/list nested references not supported in pushdown filters",
@@ -529,7 +581,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         execution::SessionState,
-        logical_expr::{BinaryExpr, Operator},
+        logical_expr::{BinaryExpr, Case, Operator},
         prelude::{Expr, SessionContext},
     };
     use datafusion_common::{Column, ScalarValue};
@@ -537,8 +589,9 @@ mod tests {
         Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
         Version,
         expression::{
-            FieldReference, Literal, ReferenceSegment, RexType, ScalarFunction,
+            FieldReference, IfThen, Literal, ReferenceSegment, RexType, ScalarFunction,
             field_reference::{ReferenceType, RootReference, RootType},
+            if_then::IfClause,
             literal::LiteralType,
             reference_segment::{self, StructField},
         },
@@ -712,6 +765,60 @@ mod tests {
             err.to_string()
                 .contains("Lambda expressions not allowed in filter expression"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unpruned_selection_without_explicit_root() {
+        let expr = parse_unpruned_expr(RexType::Selection(Box::new(FieldReference {
+            reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
+                reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                    StructField {
+                        field: 0,
+                        child: None,
+                    },
+                ))),
+            })),
+            root_type: None,
+        })))
+        .await
+        .unwrap();
+
+        assert_eq!(expr, Expr::Column(Column::new_unqualified("x")));
+    }
+
+    /// Optional message fields that a producer may legitimately omit must not panic the walker.
+    #[tokio::test]
+    async fn test_unpruned_if_then_with_omitted_optional_fields() {
+        let condition = Expression {
+            rex_type: Some(RexType::Literal(Literal {
+                nullable: false,
+                type_variation_reference: 0,
+                literal_type: Some(LiteralType::Boolean(true)),
+            })),
+        };
+
+        // A leading clause without `then` supplies the case expression, and `else` is optional.
+        let expr = parse_unpruned_expr(RexType::IfThen(Box::new(IfThen {
+            ifs: vec![IfClause {
+                r#if: Some(condition),
+                then: None,
+            }],
+            r#else: None,
+        })))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            expr,
+            Expr::Case(Case {
+                expr: Some(Box::new(Expr::Literal(
+                    ScalarValue::Boolean(Some(true)),
+                    None
+                ))),
+                when_then_expr: vec![],
+                else_expr: None,
+            })
         );
     }
 
