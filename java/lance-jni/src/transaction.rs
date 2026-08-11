@@ -1426,7 +1426,6 @@ fn convert_to_rust_operation(
             return Ok(Operation::CreateIndex {
                 new_indices,
                 removed_indices,
-                mem_wal_index_catchup_advances: Vec::new(),
             });
         }
         _ => unimplemented!(),

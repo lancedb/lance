@@ -499,7 +499,6 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                 let op = Operation::CreateIndex {
                     new_indices,
                     removed_indices,
-                    mem_wal_index_catchup_advances: Vec::new(),
                 };
                 Ok(Self(op))
             }

@@ -1929,12 +1929,6 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
-        // `mem_wal_index_catchup_advances` is deliberately carried through the
-        // rebase untouched: it names the exact segment set the repair expects,
-        // and apply-time validation re-checks that against the rebased final
-        // index list. If an ordinary reindex won the race, the expected set no
-        // longer matches and the repair fails rather than claiming coverage for
-        // an index it did not build.
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
@@ -2725,7 +2719,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index0.clone()],
                 removed_indices: vec![index0.clone()],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             Operation::Delete {
                 updated_fragments: vec![fragment0.clone()],
@@ -2869,7 +2862,6 @@ mod tests {
                 Operation::CreateIndex {
                     new_indices: vec![index0.clone()],
                     removed_indices: vec![index0],
-                    mem_wal_index_catchup_advances: Vec::new(),
                 },
                 // Conflicts with row-id-changing operations and same-name CreateIndex.
                 [
@@ -3290,7 +3282,6 @@ mod tests {
                 Operation::CreateIndex {
                     new_indices: vec![],
                     removed_indices: vec![],
-                    mem_wal_index_catchup_advances: Vec::new(),
                 },
                 Compatible,
             ),
@@ -3799,7 +3790,6 @@ mod tests {
                 Operation::CreateIndex {
                     new_indices: vec![index],
                     removed_indices: vec![],
-                    mem_wal_index_catchup_advances: Vec::new(),
                 },
                 None,
             ),
@@ -3861,7 +3851,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index0.clone()],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3882,7 +3871,6 @@ mod tests {
                     ..index0
                 }],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3891,7 +3879,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index1],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3920,7 +3907,6 @@ mod tests {
                         files: None,
                     }],
                     removed_indices: vec![],
-                    mem_wal_index_catchup_advances: Vec::new(),
                 },
                 None,
             ),
@@ -3987,7 +3973,6 @@ mod tests {
                     Operation::CreateIndex {
                         new_indices: vec![ngram_index(covered_fragment)],
                         removed_indices: vec![],
-                        mem_wal_index_catchup_advances: Vec::new(),
                     },
                     None,
                 ),
@@ -4859,7 +4844,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -4933,7 +4917,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
