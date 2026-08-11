@@ -4331,7 +4331,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_index_uncommitted(
         self,
         column: Union[str, List[str]],
-        index_type: str,
+        index_type: Union[str, IndexConfig],
         name: Optional[str] = None,
         metric: str = "L2",
         replace: bool = False,
