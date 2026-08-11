@@ -2120,6 +2120,53 @@ async fn append_dictionary(
 }
 
 #[rstest]
+#[case::appended_null_value(
+    (0..=i8::MAX)
+        .map(|value| Some(format!("value-{value}")))
+        .collect(),
+    (0..=i8::MAX).map(Some).chain([None]).collect()
+)]
+#[case::existing_unaddressable_null_value(
+    (0..130)
+        .map(|value| (value != 129).then(|| format!("value-{value}")))
+        .collect(),
+    vec![Some(0_i8), None]
+)]
+#[tokio::test]
+async fn write_rejects_dictionary_null_index_outside_declared_key_range(
+    #[case] values: Vec<Option<String>>,
+    #[case] indices: Vec<Option<i8>>,
+) {
+    let dictionary = Arc::new(StringArray::from(values));
+    let indices = Int8Array::from(indices);
+    let dictionary = Int8DictionaryArray::try_new(indices, dictionary).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect_err("the widened indices cannot be represented by Int8");
+
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("dictionary indices use 32 bits but the declared Int8 key type uses 8 bits")
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn overwrite_dataset(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
