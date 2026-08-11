@@ -132,7 +132,7 @@ use lance_table::feature_flags::{
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
-    BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
+    BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, StagedAddColumns, UDFCheckpointStore,
 };
 pub use take::TakeBuilder;
 use uuid::Uuid;
@@ -3437,6 +3437,8 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
 /// supported that mirror common SQL operations:
 ///
 /// - [Self::add_columns()]: Add new columns to the dataset, similar to `ALTER TABLE ADD COLUMN`.
+/// - [Self::stage_add_columns()]: Stage new columns without publishing them until
+///   [`StagedAddColumns::commit`].
 /// - [Self::drop_columns()]: Drop columns from the dataset, similar to `ALTER TABLE DROP COLUMN`.
 /// - [Self::alter_columns()]: Modify columns in the dataset, changing their name, type, or nullability.
 ///   Similar to `ALTER TABLE ALTER COLUMN`.
@@ -3448,7 +3450,29 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
 /// with most other concurrent operations. Therefore, they should be performed
 /// when no other write operations are being run.
 impl Dataset {
+    /// Stage new columns without publishing them.
+    ///
+    /// Uses the same transform / `read_columns` / `batch_size` inputs as
+    /// [`Self::add_columns`], but takes `&self` and performs only staging.
+    /// Candidate values and schema changes stay invisible until
+    /// [`StagedAddColumns::commit`] succeeds. Dropping the returned handle does
+    /// not publish; unreferenced candidate files may remain for dataset GC.
+    ///
+    /// See [`StagedAddColumns`] for snapshot ownership, Merge read-version
+    /// basis, and concurrency semantics.
+    pub async fn stage_add_columns(
+        &self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> Result<StagedAddColumns> {
+        schema_evolution::stage_add_columns(self, transforms, read_columns, batch_size).await
+    }
+
     /// Append new columns to the dataset.
+    ///
+    /// Equivalent to [`Self::stage_add_columns`] followed by
+    /// [`StagedAddColumns::commit`], mutating `self` on success.
     pub async fn add_columns(
         &mut self,
         transforms: NewColumnTransform,

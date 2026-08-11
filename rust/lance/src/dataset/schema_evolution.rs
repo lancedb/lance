@@ -439,12 +439,76 @@ pub(super) fn merge_introduces_required_field(old: &Schema, merged: &Schema) -> 
     )
 }
 
-pub(super) async fn add_columns(
-    dataset: &mut Dataset,
+/// In-process handle for a staged [`Dataset::stage_add_columns`] operation.
+///
+/// Candidate column values and schema changes remain invisible until
+/// [`Self::commit`] succeeds. Dropping or abandoning this handle does not
+/// publish the change; unreferenced candidate data files may remain for
+/// dataset GC.
+///
+/// The handle privately owns a clone of the [`Dataset`] snapshot that created
+/// it. [`Self::commit`] builds an [`Operation::Merge`] transaction whose read
+/// version is that snapshot's version. It does not yet validate an exact basis
+/// of input values, row membership, field types, or physical layout; concurrent
+/// changes are resolved by the existing [`Operation::Merge`] conflict rules.
+/// The handle is not serializable and has no persistent staging ID.
+///
+/// This type intentionally does not implement [`Clone`]: commit consumes the
+/// handle so the safe API publishes at most once.
+#[must_use = "staged columns are not published until commit(); drop abandons without publishing"]
+#[derive(Debug)]
+pub struct StagedAddColumns {
+    dataset: Dataset,
+    fragments: Vec<Fragment>,
+    schema: Schema,
+    preserves_nullability: bool,
+}
+
+impl StagedAddColumns {
+    /// Consume this handle and publish the staged columns in a single commit.
+    ///
+    /// Builds exactly one [`Operation::Merge`] transaction using the owned
+    /// snapshot's version as the read basis and returns the updated
+    /// [`Dataset`] on success.
+    ///
+    /// On any commit error, candidate files are left in place because the
+    /// outcome may be ambiguous (the commit may have landed despite the error).
+    pub async fn commit(self) -> Result<Dataset> {
+        let Self {
+            mut dataset,
+            fragments,
+            schema,
+            preserves_nullability,
+        } = self;
+        let operation = Operation::Merge {
+            fragments,
+            schema,
+            preserves_nullability,
+        };
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        // Once the manifest commit has been attempted, an error does not prove
+        // that the new files are unreferenced: the commit may have landed and
+        // only its response (or a post-commit callback) may have failed. Leave
+        // files from failed attempts for dataset GC instead of risking
+        // live-data loss.
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+        Ok(dataset)
+    }
+}
+
+/// Stage new columns without publishing them to the dataset.
+///
+/// Writes candidate fragment data and prepares the merged schema, but leaves
+/// the caller's dataset snapshot unchanged until
+/// [`StagedAddColumns::commit`] succeeds.
+pub(super) async fn stage_add_columns(
+    dataset: &Dataset,
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
-) -> Result<()> {
+) -> Result<StagedAddColumns> {
     let (fragments, schema, _fragments_to_cleanup, preserves_nullability) =
         add_columns_to_fragments(
             dataset,
@@ -455,19 +519,23 @@ pub(super) async fn add_columns(
         )
         .await?;
 
-    let operation = Operation::Merge {
+    Ok(StagedAddColumns {
+        dataset: dataset.clone(),
         fragments,
         schema,
         preserves_nullability,
-    };
-    let transaction = Transaction::new(dataset.manifest.version, operation, None);
-    // Once the manifest commit has been attempted, an error does not prove
-    // that the new files are unreferenced: the commit may have landed and only
-    // its response (or a post-commit callback) may have failed. Leave files
-    // from failed attempts for dataset GC instead of risking live-data loss.
-    dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
+    })
+}
+
+pub(super) async fn add_columns(
+    dataset: &mut Dataset,
+    transforms: NewColumnTransform,
+    read_columns: Option<Vec<String>>,
+    batch_size: Option<u32>,
+) -> Result<()> {
+    let staged = stage_add_columns(dataset, transforms, read_columns, batch_size).await?;
+    *dataset = staged.commit().await?;
+    Ok(())
 }
 
 async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
@@ -1101,10 +1169,13 @@ mod test {
 
     use super::*;
     use arrow_schema::Fields as ArrowFields;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_table::format::{BasePath, DataFile};
     use rstest::rstest;
+    use std::future::pending;
+    use tokio::sync::oneshot;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -1294,6 +1365,336 @@ mod test {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(double_id, &Int32Array::from(vec![0, 2, 4, 6, 8]));
+
+        Ok(())
+    }
+
+    // A2 public stage/publish contract tests: Dataset::stage_add_columns ->
+    // StagedAddColumns, then StagedAddColumns::commit(self) -> Result<Dataset>.
+    const A2_SCHEMA_META_KEY: &str = "a2_stage_schema_meta";
+    const A2_SCHEMA_META_VALUE: &str = "schema-meta-v1";
+    const A2_FIELD_META_KEY: &str = "a2_stage_field_meta";
+    const A2_FIELD_META_VALUE: &str = "field-meta-v1";
+    const A2_NEW_COLUMN: &str = "staged_col";
+
+    async fn write_a2_three_fragment_dataset(
+        test_uri: &str,
+        mut write_params: WriteParams,
+    ) -> Result<Dataset> {
+        let num_rows = 6i32;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        write_params.max_rows_per_file = 2;
+        let dataset = Dataset::write(reader, test_uri, Some(write_params)).await?;
+        assert_eq!(dataset.get_fragments().len(), 3);
+        assert_eq!(dataset.count_rows(None).await?, 6);
+        Ok(dataset)
+    }
+
+    fn a2_output_schema() -> Arc<ArrowSchema> {
+        let field = ArrowField::new(A2_NEW_COLUMN, DataType::Int32, false).with_metadata(
+            [(
+                A2_FIELD_META_KEY.to_string(),
+                A2_FIELD_META_VALUE.to_string(),
+            )]
+            .into(),
+        );
+        Arc::new(ArrowSchema::new_with_metadata(
+            vec![field],
+            [(
+                A2_SCHEMA_META_KEY.to_string(),
+                A2_SCHEMA_META_VALUE.to_string(),
+            )]
+            .into(),
+        ))
+    }
+
+    fn a2_output_column_reader(num_rows: i32) -> Box<dyn RecordBatchReader + Send> {
+        let schema = a2_output_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(
+                (0..num_rows).map(|i| i * 10),
+            ))],
+        )
+        .unwrap();
+        Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))
+    }
+
+    fn assert_a2_base_schema_unchanged(dataset: &Dataset, version_before: u64) {
+        assert_eq!(dataset.version().version, version_before);
+        assert_eq!(dataset.schema().fields.len(), 1);
+        assert!(dataset.schema().field("id").is_some());
+        assert!(dataset.schema().field(A2_NEW_COLUMN).is_none());
+        assert!(!dataset.schema().metadata.contains_key(A2_SCHEMA_META_KEY));
+    }
+
+    /// Stage then commit across three fragments; callers see metadata/values
+    /// only after a successful one-shot commit.
+    #[tokio::test]
+    async fn test_stage_add_columns_publish_multi_fragment_with_caller_metadata() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+        let schema_before = ArrowSchema::from(dataset.schema());
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                None,
+                None,
+            )
+            .await?;
+
+        let before_commit = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&before_commit, version_before);
+        assert_eq!(
+            ArrowSchema::from(before_commit.schema()),
+            schema_before.clone()
+        );
+        let before_data = before_commit.scan().try_into_batch().await?;
+        assert!(before_data.column_by_name(A2_NEW_COLUMN).is_none());
+
+        let committed = staged.commit().await?;
+
+        assert_a2_base_schema_unchanged(&dataset, version_before);
+        assert_eq!(ArrowSchema::from(dataset.schema()), schema_before);
+
+        assert_eq!(committed.version().version, version_before + 1);
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before + 1);
+        assert_eq!(reopened.get_fragments().len(), 3);
+        assert_eq!(
+            reopened.schema().metadata.get(A2_SCHEMA_META_KEY),
+            Some(&A2_SCHEMA_META_VALUE.to_string())
+        );
+        let new_field = reopened
+            .schema()
+            .field(A2_NEW_COLUMN)
+            .expect("committed schema must include staged column");
+        assert_eq!(
+            new_field.metadata.get(A2_FIELD_META_KEY),
+            Some(&A2_FIELD_META_VALUE.to_string())
+        );
+        let field_id = new_field.id;
+        assert!(
+            reopened.fragments().iter().all(|fragment| {
+                fragment
+                    .files
+                    .iter()
+                    .any(|file| file.fields.contains(&field_id))
+            }),
+            "every fragment must carry the staged output field"
+        );
+
+        let data = reopened.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 6);
+        let staged_col = data
+            .column_by_name(A2_NEW_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(staged_col, &Int32Array::from(vec![0, 10, 20, 30, 40, 50]));
+
+        Ok(())
+    }
+
+    /// Dropping a staged handle without commit must leave the visible dataset
+    /// unchanged (orphan candidates may remain for GC).
+    #[tokio::test]
+    async fn test_stage_add_columns_abandon_does_not_publish() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+        let schema_before = ArrowSchema::from(dataset.schema());
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                None,
+                None,
+            )
+            .await?;
+        drop(staged);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&reopened, version_before);
+        assert_eq!(ArrowSchema::from(reopened.schema()), schema_before);
+        let data = reopened.scan().try_into_batch().await?;
+        assert!(data.column_by_name(A2_NEW_COLUMN).is_none());
+
+        Ok(())
+    }
+
+    /// A staging failure after work has begun must not publish schema, values,
+    /// or metadata.
+    #[tokio::test]
+    async fn test_stage_add_columns_failure_does_not_publish() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+        let schema_before = ArrowSchema::from(dataset.schema());
+
+        // Three fragments / six rows, but only two output rows: staging must
+        // fail after the first fragment has begun work.
+        let err = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(2)),
+                None,
+                None,
+            )
+            .await
+            .expect_err("short reader must fail staging after beginning work");
+        assert!(
+            err.to_string()
+                .contains("Stream ended before producing values for all rows in dataset"),
+            "expected early-end staging failure, got: {err:?}"
+        );
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&reopened, version_before);
+        assert_eq!(ArrowSchema::from(reopened.schema()), schema_before);
+        let data = reopened.scan().try_into_batch().await?;
+        assert!(data.column_by_name(A2_NEW_COLUMN).is_none());
+
+        Ok(())
+    }
+
+    /// A before-land commit failure keeps the visible version unchanged.
+    #[tokio::test]
+    async fn test_stage_add_columns_commit_fail_outright_does_not_publish() -> Result<()> {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let dataset = write_a2_three_fragment_dataset(
+            test_uri,
+            WriteParams {
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let version_before = dataset.version().version;
+        let schema_before = ArrowSchema::from(dataset.schema());
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                None,
+                None,
+            )
+            .await?;
+
+        handler.fail_next(AmbiguousFailure::FailOutright);
+        let err = staged
+            .commit()
+            .await
+            .expect_err("FailOutright must reject commit before land");
+        assert!(
+            err.to_string()
+                .contains("simulated outright commit failure"),
+            "expected outright commit failure, got: {err:?}"
+        );
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&reopened, version_before);
+        assert_eq!(ArrowSchema::from(reopened.schema()), schema_before);
+        assert!(!reopened.schema().metadata.contains_key(A2_SCHEMA_META_KEY));
+        let data = reopened.scan().try_into_batch().await?;
+        assert!(data.column_by_name(A2_NEW_COLUMN).is_none());
+
+        Ok(())
+    }
+
+    /// Cancelling staging after the first fragment's output is consumed must not
+    /// publish schema, metadata, or values. The stream signals only on the poll
+    /// that requests the second fragment, then stays pending (no sleep/timeout).
+    #[tokio::test]
+    async fn test_stage_add_columns_cancel_in_flight_does_not_publish() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+        let schema_before = ArrowSchema::from(dataset.schema());
+
+        let output_schema = a2_output_schema();
+        let first_fragment_batch = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![0, 10]))],
+        )?;
+
+        let (second_poll_tx, second_poll_rx) = oneshot::channel::<()>();
+        enum CancelStreamPhase {
+            EmitFirst(RecordBatch, oneshot::Sender<()>),
+            Hang(oneshot::Sender<()>),
+        }
+        let output_stream = Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            futures::stream::unfold(
+                CancelStreamPhase::EmitFirst(first_fragment_batch, second_poll_tx),
+                |phase| async move {
+                    match phase {
+                        CancelStreamPhase::EmitFirst(batch, tx) => {
+                            Some((Ok(batch), CancelStreamPhase::Hang(tx)))
+                        }
+                        CancelStreamPhase::Hang(tx) => {
+                            // Staging finished the first fragment and is asking
+                            // for the second fragment's rows.
+                            tx.send(()).expect("test must await the second-poll signal");
+                            pending::<()>().await;
+                            None
+                        }
+                    }
+                },
+            ),
+        ));
+
+        let dataset_for_stage = dataset.clone();
+        let stage_task = tokio::spawn(async move {
+            dataset_for_stage
+                .stage_add_columns(NewColumnTransform::Stream(output_stream), None, None)
+                .await
+        });
+
+        second_poll_rx
+            .await
+            .expect("staging must request the second fragment after the first");
+        stage_task.abort();
+        let join_err = stage_task
+            .await
+            .expect_err("aborted staging task must end as JoinError");
+        assert!(
+            join_err.is_cancelled(),
+            "expected cancelled JoinError, got: {join_err:?}"
+        );
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&reopened, version_before);
+        assert_eq!(ArrowSchema::from(reopened.schema()), schema_before);
+        assert!(!reopened.schema().metadata.contains_key(A2_SCHEMA_META_KEY));
+        let data = reopened.scan().try_into_batch().await?;
+        assert!(data.column_by_name(A2_NEW_COLUMN).is_none());
+        let ids = data
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids, &Int32Array::from_iter_values(0..6));
 
         Ok(())
     }
