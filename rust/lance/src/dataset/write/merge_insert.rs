@@ -12242,6 +12242,303 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_8282() {
+        for seed in 0..250u64 {
+            probe_8282_one(seed).await;
+        }
+    }
+
+    async fn probe_8282_one(seed: u64) {
+        use std::collections::BTreeMap;
+        let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as u32
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+            Field::new("other", DataType::Int32, true),
+        ]));
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let mk = |keys: &[i32], vals: &[i32], others: &[i32]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(keys.to_vec())),
+                    Arc::new(Int32Array::from(vals.to_vec())),
+                    Arc::new(Int32Array::from(others.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Model of the expected dataset contents.
+        let mut model: BTreeMap<i32, (Option<i32>, Option<i32>)> = BTreeMap::new();
+        let mut log: Vec<String> = Vec::new();
+
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let init_keys: Vec<i32> = (0..12).collect();
+        let init_vals: Vec<i32> = init_keys.iter().map(|k| k * 10).collect();
+        let init_others: Vec<i32> = init_keys.iter().map(|k| k * 100).collect();
+        for (i, k) in init_keys.iter().enumerate() {
+            model.insert(*k, (Some(init_vals[i]), Some(init_others[i])));
+        }
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(mk(&init_keys, &init_vals, &init_others))],
+                schema.clone(),
+            ),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 5,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut next_key = 12i32;
+        let mut have_index = false;
+
+        for step in 0..20 {
+            let op = next() % 8;
+            match op {
+                0 => {
+                    // append fresh keys
+                    let n = (next() % 6 + 1) as i32;
+                    let keys: Vec<i32> = (next_key..next_key + n).collect();
+                    next_key += n;
+                    let vals: Vec<i32> = keys.iter().map(|k| k * 10).collect();
+                    let others: Vec<i32> = keys.iter().map(|k| k * 100).collect();
+                    for (i, k) in keys.iter().enumerate() {
+                        model.insert(*k, (Some(vals[i]), Some(others[i])));
+                    }
+                    log.push(format!("append {:?}", keys));
+                    ds.append(
+                        RecordBatchIterator::new(vec![Ok(mk(&keys, &vals, &others))], schema.clone()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                1 => {
+                    // update
+                    let m = (next() % 3 + 2) as i32;
+                    let r = (next() % (m as u32)) as i32;
+                    log.push(format!("update other=999 where key % {} = {}", m, r));
+                    let res = crate::dataset::UpdateBuilder::new(Arc::new(ds.clone()))
+                        .update_where(&format!("key % {} = {}", m, r))
+                        .unwrap()
+                        .set("other", "999")
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                        .execute()
+                        .await
+                        .unwrap();
+                    for (k, v) in model.iter_mut() {
+                        if k.rem_euclid(m) == r {
+                            v.1 = Some(999);
+                        }
+                    }
+                    ds = res.new_dataset.as_ref().clone();
+                }
+                2 => {
+                    // delete
+                    let m = (next() % 4 + 2) as i32;
+                    let r = (next() % (m as u32)) as i32;
+                    log.push(format!("delete where key % {} = {}", m, r));
+                    ds.delete(&format!("key % {} = {}", m, r)).await.unwrap();
+                    model.retain(|k, _| k.rem_euclid(m) != r);
+                }
+                6 => {
+                    log.push("compact".into());
+                    crate::dataset::optimize::compact_files(
+                        &mut ds,
+                        crate::dataset::optimize::CompactionOptions {
+                            target_rows_per_fragment: 8,
+                            materialize_deletions: true,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                7 => {
+                    // "full upsert" whose source has every column but in a
+                    // different order, which takes the subschema/patch path.
+                    let n = (next() % 8 + 1) as i32;
+                    let base = (next() % 20) as i32;
+                    let keys: Vec<i32> = (base..base + n).collect();
+                    let vals: Vec<i32> = keys.iter().map(|k| k * 7 + step).collect();
+                    let others: Vec<i32> = keys.iter().map(|k| k * 3 + step).collect();
+                    log.push(format!("reordered full upsert {:?}", keys));
+                    let reordered_schema = Arc::new(Schema::new(vec![
+                        Field::new("other", DataType::Int32, true),
+                        Field::new("value", DataType::Int32, true),
+                        Field::new("key", DataType::Int32, false),
+                    ]));
+                    let src = RecordBatch::try_new(
+                        reordered_schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from(others.clone())),
+                            Arc::new(Int32Array::from(vals.clone())),
+                            Arc::new(Int32Array::from(keys.clone())),
+                        ],
+                    )
+                    .unwrap();
+                    let mut b =
+                        MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["key".into()])
+                            .unwrap();
+                    b.when_matched(WhenMatched::UpdateAll);
+                    b.when_not_matched(WhenNotMatched::InsertAll);
+                    let res = b
+                        .try_build()
+                        .unwrap()
+                        .execute_reader(RecordBatchIterator::new(
+                            vec![Ok(src)],
+                            reordered_schema,
+                        ))
+                        .await;
+                    let (new_ds, _) = res.unwrap_or_else(|e| {
+                        panic!("seed {} failed at step {}: {:?}\nlog: {:#?}", seed, step, e, log)
+                    });
+                    for (i, k) in keys.iter().enumerate() {
+                        model.insert(*k, (Some(vals[i]), Some(others[i])));
+                    }
+                    next_key = next_key.max(keys[keys.len() - 1] + 1);
+                    ds = new_ds.as_ref().clone();
+                }
+                3 => {
+                    if !have_index {
+                        log.push("create index".into());
+                        ds.create_index(
+                            &["key"],
+                            IndexType::BTree,
+                            None,
+                            &ScalarIndexParams::default(),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                        have_index = true;
+                    } else {
+                        log.push("optimize index".into());
+                        ds.optimize_indices(&Default::default()).await.unwrap();
+                    }
+                }
+                4 => {
+                    // partial-schema upsert
+                    let n = (next() % 8 + 1) as i32;
+                    let base = (next() % 20) as i32;
+                    let keys: Vec<i32> = (base..base + n).collect();
+                    let vals: Vec<i32> = keys.iter().map(|k| k * 7 + step).collect();
+                    log.push(format!("subschema upsert {:?}", keys));
+                    let src = RecordBatch::try_new(
+                        sub_schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from(keys.clone())),
+                            Arc::new(Int32Array::from(vals.clone())),
+                        ],
+                    )
+                    .unwrap();
+                    let mut b =
+                        MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["key".into()])
+                            .unwrap();
+                    b.when_matched(WhenMatched::UpdateAll);
+                    b.when_not_matched(WhenNotMatched::InsertAll);
+                    let res = b
+                        .try_build()
+                        .unwrap()
+                        .execute_reader(RecordBatchIterator::new(
+                            vec![Ok(src)],
+                            sub_schema.clone(),
+                        ))
+                        .await;
+                    let (new_ds, _) = res.unwrap_or_else(|e| {
+                        panic!("seed {} failed at step {}: {:?}\nlog: {:#?}", seed, step, e, log)
+                    });
+                    for (i, k) in keys.iter().enumerate() {
+                        let entry = model.entry(*k).or_insert((None, None));
+                        entry.0 = Some(vals[i]);
+                    }
+                    next_key = next_key.max(keys[keys.len() - 1] + 1);
+                    ds = new_ds.as_ref().clone();
+                }
+                _ => {
+                    // full-schema upsert
+                    let n = (next() % 8 + 1) as i32;
+                    let base = (next() % 20) as i32;
+                    let keys: Vec<i32> = (base..base + n).collect();
+                    let vals: Vec<i32> = keys.iter().map(|k| k * 7 + step).collect();
+                    let others: Vec<i32> = keys.iter().map(|k| k * 3 + step).collect();
+                    log.push(format!("full upsert {:?}", keys));
+                    let src = mk(&keys, &vals, &others);
+                    let mut b =
+                        MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["key".into()])
+                            .unwrap();
+                    b.when_matched(WhenMatched::UpdateAll);
+                    b.when_not_matched(WhenNotMatched::InsertAll);
+                    let res = b
+                        .try_build()
+                        .unwrap()
+                        .execute_reader(RecordBatchIterator::new(vec![Ok(src)], schema.clone()))
+                        .await;
+                    let (new_ds, _) = res.unwrap_or_else(|e| {
+                        panic!("seed {} failed at step {}: {:?}\nlog: {:#?}", seed, step, e, log)
+                    });
+                    for (i, k) in keys.iter().enumerate() {
+                        model.insert(*k, (Some(vals[i]), Some(others[i])));
+                    }
+                    next_key = next_key.max(keys[keys.len() - 1] + 1);
+                    ds = new_ds.as_ref().clone();
+                }
+            }
+
+            // Verify contents against the model after every step.
+            let batches = ds
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut actual: BTreeMap<i32, (Option<i32>, Option<i32>)> = BTreeMap::new();
+            for b in &batches {
+                let k = b.column_by_name("key").unwrap().as_primitive::<Int32Type>();
+                let v = b.column_by_name("value").unwrap().as_primitive::<Int32Type>();
+                let o = b.column_by_name("other").unwrap().as_primitive::<Int32Type>();
+                for i in 0..b.num_rows() {
+                    let key = k.value(i);
+                    let prev = actual.insert(
+                        key,
+                        (
+                            (!v.is_null(i)).then(|| v.value(i)),
+                            (!o.is_null(i)).then(|| o.value(i)),
+                        ),
+                    );
+                    assert!(prev.is_none(), "seed {} step {}: duplicate key {}\nlog: {:#?}", seed, step, key, log);
+                }
+            }
+            assert_eq!(
+                actual, model,
+                "seed {} step {} mismatch\nlog: {:#?}",
+                seed, step, log
+            );
+        }
+    }
+
     fn id_value_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),
