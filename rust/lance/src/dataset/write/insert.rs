@@ -23,7 +23,9 @@ use crate::Dataset;
 use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{
+    Operation, SchemaMetadataUpdates, Transaction, TransactionBuilder,
+};
 use crate::dataset::write::{
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
@@ -53,6 +55,8 @@ pub struct InsertBuilder<'a> {
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
+    /// Optional schema/field metadata patch published atomically with Append data.
+    schema_metadata_updates: Option<SchemaMetadataUpdates>,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -61,12 +65,26 @@ impl<'a> InsertBuilder<'a> {
             dest: dest.into(),
             params: None,
             write_progress: None,
+            schema_metadata_updates: None,
         }
     }
 
     pub fn with_params(mut self, params: &'a WriteParams) -> Self {
         self.params = Some(params);
         self
+    }
+
+    /// Attach schema/field metadata updates to publish atomically with Append data.
+    ///
+    /// The patch is stored on the Append [`Transaction`] and committed in the same
+    /// version as the written fragments, so readers never observe new data without
+    /// the metadata (or vice versa). Only supported when the resolved write mode is
+    /// [`WriteMode::Append`]; Create and Overwrite are rejected with
+    /// [`Error::InvalidInput`]. Empty / no-op patches are also rejected.
+    pub fn with_schema_metadata_updates(mut self, updates: SchemaMetadataUpdates) -> Result<Self> {
+        updates.validate_non_empty()?;
+        self.schema_metadata_updates = Some(updates);
+        Ok(self)
     }
 
     /// Register a callback that is invoked after each batch of rows is written.
@@ -226,12 +244,13 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
+        let transaction = self.build_transaction(written_schema, written_fragments, &context)?;
 
         Ok((transaction, context))
     }
 
     fn build_transaction(
+        &self,
         schema: Schema,
         fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
@@ -287,7 +306,10 @@ impl<'a> InsertBuilder<'a> {
         .transaction_properties(context.params.transaction_properties.clone())
         .build();
 
-        Ok(transaction)
+        match &self.schema_metadata_updates {
+            Some(updates) => transaction.with_schema_metadata_updates(updates.clone()),
+            None => Ok(transaction),
+        }
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
@@ -301,6 +323,17 @@ impl<'a> InsertBuilder<'a> {
                 context.params.mode = WriteMode::Create;
             }
             _ => {}
+        }
+
+        // Schema/field metadata attachment is Append-only (after mode resolution).
+        if self.schema_metadata_updates.is_some()
+            && !matches!(context.params.mode, WriteMode::Append)
+        {
+            return Err(Error::invalid_input(format!(
+                "schema_metadata_updates attachment is only supported with \
+                 WriteMode::Append; got {:?}",
+                context.params.mode
+            )));
         }
 
         // Validate schema
@@ -827,5 +860,235 @@ mod test {
         assert!(last.bytes_written > 0, "final bytes_written must be > 0");
         assert_eq!(last.rows_written, 300, "all 300 rows must be reported");
         assert_eq!(last.files_written, 1, "a single file should be written");
+    }
+
+    // -------------------------------------------------------------------------
+    // A4.4a: InsertBuilder schema metadata attachment (Append-only)
+    // -------------------------------------------------------------------------
+
+    use crate::dataset::transaction::{SchemaMetadataUpdates, UpdateMap, UpdateMapEntry};
+    use lance_core::utils::tempfile::TempStrDir;
+
+    const A44_SCHEMA_KEY: &str = "a44.schema";
+    const A44_SCHEMA_VALUE: &str = "schema-v1";
+    const A44_FIELD_KEY: &str = "a44.field";
+    const A44_FIELD_VALUE: &str = "field-v1";
+
+    fn a44_metadata_updates() -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry::from((A44_SCHEMA_KEY, A44_SCHEMA_VALUE))],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::from([(
+                0i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from((A44_FIELD_KEY, A44_FIELD_VALUE))],
+                    replace: false,
+                },
+            )]),
+        }
+    }
+
+    fn a44_id_batch(values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap()
+    }
+
+    async fn a44_create_dataset(uri: &str) -> Dataset {
+        InsertBuilder::new(uri)
+            .execute(vec![a44_id_batch(vec![1, 2, 3])])
+            .await
+            .expect("A4.4a fixture create must succeed")
+    }
+
+    fn a44_assert_metadata_absent(dataset: &Dataset) {
+        assert!(
+            !dataset.schema().metadata.contains_key(A44_SCHEMA_KEY),
+            "{A44_SCHEMA_KEY} must be absent, got {:?}",
+            dataset.schema().metadata
+        );
+        let field0 = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("field id 0 must exist");
+        assert!(
+            !field0.metadata.contains_key(A44_FIELD_KEY),
+            "{A44_FIELD_KEY} must be absent, got {:?}",
+            field0.metadata
+        );
+    }
+
+    fn a44_assert_metadata_present(dataset: &Dataset) {
+        assert_eq!(
+            dataset
+                .schema()
+                .metadata
+                .get(A44_SCHEMA_KEY)
+                .map(String::as_str),
+            Some(A44_SCHEMA_VALUE),
+            "schema metadata patch must be published"
+        );
+        let field0 = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("field id 0 must exist");
+        assert_eq!(
+            field0.metadata.get(A44_FIELD_KEY).map(String::as_str),
+            Some(A44_FIELD_VALUE),
+            "field id 0 metadata patch must be published"
+        );
+    }
+
+    /// A4.4a: Append via InsertBuilder publishes data + schema/field metadata in
+    /// exactly one version; a fresh Dataset::open from the filesystem URI agrees.
+    #[tokio::test]
+    async fn test_a44a_append_publishes_data_and_metadata_in_one_version() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let dataset = a44_create_dataset(uri).await;
+        let before_version = dataset.version().version;
+        let before_rows = dataset.count_rows(None).await.unwrap();
+        a44_assert_metadata_absent(&dataset);
+
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let committed = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&params)
+            .with_schema_metadata_updates(a44_metadata_updates())
+            .expect("Append attachment must construct")
+            .execute(vec![a44_id_batch(vec![4, 5])])
+            .await
+            .expect("attached Append must commit");
+
+        assert_eq!(
+            committed.version().version,
+            before_version + 1,
+            "exactly one new version"
+        );
+        assert_eq!(
+            committed.count_rows(None).await.unwrap(),
+            before_rows + 2,
+            "Append must add the new rows"
+        );
+        a44_assert_metadata_present(&committed);
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.version().version, committed.version().version);
+        assert_eq!(
+            reopened.count_rows(None).await.unwrap(),
+            committed.count_rows(None).await.unwrap()
+        );
+        a44_assert_metadata_present(&reopened);
+    }
+
+    /// A4.4a: execute_uncommitted preserves the Append + exact attachment without
+    /// publishing; CommitBuilder then lands data and metadata together.
+    #[tokio::test]
+    async fn test_a44a_execute_uncommitted_preserves_attachment_until_commit() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let dataset = Arc::new(a44_create_dataset(uri).await);
+        let before_version = dataset.version().version;
+        let before_rows = dataset.count_rows(None).await.unwrap();
+        a44_assert_metadata_absent(&dataset);
+
+        let updates = a44_metadata_updates();
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(dataset.clone())
+            .with_params(&params)
+            .with_schema_metadata_updates(updates.clone())
+            .expect("Append attachment must construct")
+            .execute_uncommitted(vec![a44_id_batch(vec![4])])
+            .await
+            .expect("uncommitted attached Append must stage");
+
+        assert!(
+            matches!(&transaction.operation, Operation::Append { .. }),
+            "uncommitted transaction must be Append, got {:?}",
+            transaction.operation
+        );
+        assert_eq!(
+            transaction.schema_metadata_updates.as_ref(),
+            Some(&updates),
+            "attachment must be preserved exactly on the Transaction"
+        );
+
+        assert_eq!(dataset.version().version, before_version);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), before_rows);
+        a44_assert_metadata_absent(&dataset);
+
+        let before_commit = Dataset::open(uri).await.unwrap();
+        assert_eq!(before_commit.version().version, before_version);
+        assert_eq!(before_commit.count_rows(None).await.unwrap(), before_rows);
+        a44_assert_metadata_absent(&before_commit);
+
+        let committed = CommitBuilder::new(dataset.clone())
+            .execute(transaction)
+            .await
+            .expect("committing attached Append must succeed");
+        assert_eq!(committed.version().version, before_version + 1);
+        assert_eq!(committed.count_rows(None).await.unwrap(), before_rows + 1);
+        a44_assert_metadata_present(&committed);
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.version().version, committed.version().version);
+        assert_eq!(
+            reopened.count_rows(None).await.unwrap(),
+            committed.count_rows(None).await.unwrap()
+        );
+        a44_assert_metadata_present(&reopened);
+    }
+
+    /// A4.4a: Overwrite with an attachment is InvalidInput; visible table state
+    /// (version, rows, metadata) is unchanged after reopen.
+    #[tokio::test]
+    async fn test_a44a_overwrite_with_attachment_rejects_without_publishing() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let dataset = a44_create_dataset(uri).await;
+        let before_version = dataset.version().version;
+        let before_rows = dataset.count_rows(None).await.unwrap();
+        a44_assert_metadata_absent(&dataset);
+
+        let params = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
+        let result = match InsertBuilder::new(Arc::new(dataset))
+            .with_params(&params)
+            .with_schema_metadata_updates(a44_metadata_updates())
+        {
+            Err(e) => Err(e),
+            Ok(builder) => {
+                builder
+                    .execute(vec![a44_id_batch(vec![100, 200, 300, 400])])
+                    .await
+            }
+        };
+
+        let err = result.expect_err("Overwrite with attachment must be rejected");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "Overwrite with attachment must be InvalidInput, got {err:?}"
+        );
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            reopened.version().version,
+            before_version,
+            "failed Overwrite must not advance version"
+        );
+        assert_eq!(
+            reopened.count_rows(None).await.unwrap(),
+            before_rows,
+            "failed Overwrite must not change row count"
+        );
+        a44_assert_metadata_absent(&reopened);
     }
 }

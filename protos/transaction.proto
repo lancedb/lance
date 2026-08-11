@@ -342,6 +342,10 @@ message Transaction {
     repeated UpdateMapEntry update_entries = 1;
     // If true, the map will be replaced entirely with the new entries.
     // If false, the new entries will be merged with the existing map.
+    //
+    // Effective emptiness matches apply semantics: replace=false with empty
+    // update_entries is a no-op. replace=true with empty update_entries clears
+    // the target and is substantive. An entry with unset value deletes a key.
     bool replace = 2;
   }
   
@@ -451,6 +455,36 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  // Generic schema/field metadata patch attached to a data mutation.
+  //
+  // Absent `schema_metadata_updates` means no schema-level patch. A present
+  // UpdateMap is distinct from absence, but presence alone is not enough: an
+  // UpdateMap is a no-op when replace=false and update_entries is empty.
+  // replace=true with zero entries clears metadata and remains a valid
+  // substantive patch. A valid envelope requires a substantive patch: the
+  // schema map and/or at least one field map must be non-no-op (field keys
+  // that only hold no-op maps do not count).
+  message SchemaMetadataUpdates {
+    optional UpdateMap schema_metadata_updates = 1;
+    map<int32, UpdateMap> field_metadata_updates = 2;
+  }
+
+  // Atomic data mutation plus schema/field metadata patch.
+  //
+  // Encoded as its own Transaction.operation variant so an old reader sees an
+  // unknown operation and fails closed instead of committing data while
+  // ignoring metadata. Limited to Append, Delete, and Update.
+  message DataAndSchemaMetadata {
+    // Required. Missing or empty updates must fail closed on decode.
+    optional SchemaMetadataUpdates updates = 1;
+    // Required. Missing data must fail closed on decode.
+    oneof data {
+      Append append = 2;
+      Delete delete = 3;
+      Update update = 4;
+    }
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -470,6 +504,7 @@ message Transaction {
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
     ExactMerge exact_merge = 116;
+    DataAndSchemaMetadata data_and_schema_metadata = 117;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

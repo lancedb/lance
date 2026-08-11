@@ -825,6 +825,7 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             operation,
             tag: None,
             transaction_properties,
+            schema_metadata_updates: None,
         }))
     }
 }

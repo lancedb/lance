@@ -5153,6 +5153,7 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
+            schema_metadata_updates: None,
         };
         let dataset = Arc::new(
             CommitBuilder::new(dataset)
@@ -5336,6 +5337,7 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
+            schema_metadata_updates: None,
         };
         let dataset = Arc::new(
             CommitBuilder::new(dataset)

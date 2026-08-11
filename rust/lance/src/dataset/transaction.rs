@@ -266,6 +266,12 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Optional schema/field metadata patch for Append, Delete, or Update.
+    ///
+    /// When present, the transaction encodes as the independent
+    /// `DataAndSchemaMetadata` protobuf envelope so old readers fail closed.
+    /// Absent for ordinary transactions that keep their historical wire form.
+    pub schema_metadata_updates: Option<SchemaMetadataUpdates>,
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -318,13 +324,73 @@ impl From<(&str, &str)> for UpdateMapEntry {
     }
 }
 
-/// Represents updates to a map (either incremental or replacement)
+/// Represents updates to a map (either incremental or replacement).
+///
+/// Effective emptiness matches apply semantics:
+/// - no-op only when `replace` is false and [`Self::update_entries`] is empty
+/// - `replace: true` with zero entries clears the target and is substantive
+/// - an entry with `value: None` deletes a key and is substantive
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct UpdateMap {
     pub update_entries: Vec<UpdateMapEntry>,
     /// If true, the map will be replaced entirely with the new entries.
     /// If false, the new entries will be merged with the existing map.
     pub replace: bool,
+}
+
+impl UpdateMap {
+    /// Returns true when this map is a no-op under apply semantics.
+    ///
+    /// A map is a no-op only when `replace` is false and `update_entries` is
+    /// empty. Mere presence of an [`UpdateMap`] is not enough: `replace: true`
+    /// with zero entries clears the target, and an entry whose value is `None`
+    /// deletes a key; both remain substantive.
+    pub fn is_empty(&self) -> bool {
+        !self.replace && self.update_entries.is_empty()
+    }
+}
+
+/// Generic schema/field metadata patch attached to Append, Delete, or Update.
+///
+/// A valid patch is substantive (not a no-op): the optional schema map and/or
+/// at least one field map must be a non-empty [`UpdateMap`]. Presence of a
+/// no-op map (`replace: false`, empty entries), including field keys that only
+/// hold no-op maps, does not satisfy the invariant. Clearing via
+/// `replace: true` with zero entries remains valid.
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+pub struct SchemaMetadataUpdates {
+    pub schema_metadata_updates: Option<UpdateMap>,
+    pub field_metadata_updates: HashMap<i32, UpdateMap>,
+}
+
+impl SchemaMetadataUpdates {
+    /// Returns true when this patch is a no-op under apply semantics.
+    ///
+    /// Empty when the optional schema map is absent or itself a no-op
+    /// ([`UpdateMap::is_empty`]) and every field map is a no-op. Field map keys
+    /// alone do not make the patch substantive.
+    pub fn is_empty(&self) -> bool {
+        self.schema_metadata_updates
+            .as_ref()
+            .is_none_or(UpdateMap::is_empty)
+            && self
+                .field_metadata_updates
+                .values()
+                .all(UpdateMap::is_empty)
+    }
+
+    /// Rejects a no-op patch with a stable [`Error::InvalidInput`].
+    pub fn validate_non_empty(&self) -> Result<()> {
+        if self.is_empty() {
+            Err(Error::invalid_input(
+                "SchemaMetadataUpdates must be non-empty: provide a substantive \
+                 schema_metadata_updates and/or field_metadata_updates \
+                 (replace=true clears; replace=false with empty entries is a no-op)",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Non-system logical index name -> its physical segments, ordered by UUID.
@@ -1844,6 +1910,127 @@ fn apply_update_map(
     }
 }
 
+/// Apply schema-level and field-level metadata updates onto a candidate Manifest.
+///
+/// Shared by [`Operation::UpdateConfig`] and attached
+/// [`Transaction::schema_metadata_updates`] so reserved primary/clustering-key
+/// rules stay a single implementation. Mutates only the provided candidate.
+fn apply_schema_and_field_metadata_updates(
+    manifest: &mut Manifest,
+    schema_metadata_updates: Option<&UpdateMap>,
+    field_metadata_updates: &HashMap<i32, UpdateMap>,
+) -> Result<()> {
+    if let Some(schema_metadata_updates) = schema_metadata_updates {
+        let mut schema_metadata = manifest.schema.metadata.clone();
+        apply_update_map(&mut schema_metadata, schema_metadata_updates);
+        manifest.schema.metadata = schema_metadata;
+    }
+    // The unenforced primary and clustering keys are reserved
+    // schema properties: each is immutable once set, and its
+    // reserved metadata keys cannot be written with an invalid
+    // value. Capture the prior keys, and whether this transaction
+    // writes a reserved key, before applying the updates so
+    // violations can be rejected below. This runs on every apply,
+    // including conflict-rebase, so it also rejects the
+    // concurrent-writer race.
+    let primary_key_before: Vec<i32> = manifest
+        .schema
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+    let writes_primary_key = field_metadata_updates.values().any(|update| {
+        update.update_entries.iter().any(|entry| {
+            entry.key == LANCE_UNENFORCED_PRIMARY_KEY
+                || entry.key == LANCE_UNENFORCED_PRIMARY_KEY_POSITION
+        })
+    });
+    let clustering_key_before: Vec<i32> = manifest
+        .schema
+        .unenforced_clustering_key()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+    let writes_clustering_key = field_metadata_updates.values().any(|update| {
+        update
+            .update_entries
+            .iter()
+            .any(|entry| entry.key == LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+    });
+    for (field_id, field_metadata_update) in field_metadata_updates {
+        if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
+            apply_update_map(&mut field.metadata, field_metadata_update);
+            // Also set unenforced primary key based on updated field metadata.
+            field.unenforced_primary_key_position = field
+                .metadata
+                .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+                .and_then(|s| s.parse::<u32>().ok())
+                .or_else(|| {
+                    field
+                        .metadata
+                        .get(LANCE_UNENFORCED_PRIMARY_KEY)
+                        .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                        .map(|_| 0)
+                });
+            // Also set unenforced clustering key based on updated
+            // field metadata.
+            field.unenforced_clustering_key_position = field
+                .metadata
+                .get(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+                .and_then(|s| s.parse::<u32>().ok());
+        } else {
+            return Err(Error::invalid_input_source(
+                format!("Field with id {} does not exist", field_id).into(),
+            ));
+        }
+    }
+    let primary_key_after: Vec<i32> = manifest
+        .schema
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+    if !primary_key_before.is_empty() {
+        // The primary key is already set: reject any change to it,
+        // and any write that touches a reserved primary key.
+        if writes_primary_key || primary_key_after != primary_key_before {
+            return Err(Error::invalid_input(
+                "the unenforced primary key is a reserved key and cannot be changed once set",
+            ));
+        }
+    } else if writes_primary_key && primary_key_after.is_empty() {
+        // A reserved primary key was written but did not install a
+        // valid primary key (e.g. a non-marker flag value or a
+        // non-numeric position).
+        return Err(Error::invalid_input(
+            "the unenforced primary key is a reserved key and cannot be set to an invalid value",
+        ));
+    }
+    let clustering_key_after: Vec<i32> = manifest
+        .schema
+        .unenforced_clustering_key()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+    if !clustering_key_before.is_empty() {
+        // The clustering key is already set: reject any change to
+        // it, and any write that touches the reserved key.
+        if writes_clustering_key || clustering_key_after != clustering_key_before {
+            return Err(Error::invalid_input(
+                "the unenforced clustering key is a reserved key and cannot be changed once set",
+            ));
+        }
+    } else if writes_clustering_key && clustering_key_after.is_empty() {
+        // The reserved clustering key was written but did not
+        // install a valid clustering key (e.g. a non-numeric
+        // position value).
+        return Err(Error::invalid_input(
+            "the unenforced clustering key is a reserved key and cannot be set to an invalid value",
+        ));
+    }
+    Ok(())
+}
+
 /// Helper function to translate old-style config updates to new UpdateMap format
 pub fn translate_config_updates(
     upsert_values: &std::collections::HashMap<String, String>,
@@ -1923,6 +2110,40 @@ impl From<&pb::transaction::UpdateMap> for UpdateMap {
     }
 }
 
+impl From<&SchemaMetadataUpdates> for pb::transaction::SchemaMetadataUpdates {
+    fn from(updates: &SchemaMetadataUpdates) -> Self {
+        Self {
+            schema_metadata_updates: updates
+                .schema_metadata_updates
+                .as_ref()
+                .map(pb::transaction::UpdateMap::from),
+            field_metadata_updates: updates
+                .field_metadata_updates
+                .iter()
+                .map(|(field_id, update_map)| {
+                    (*field_id, pb::transaction::UpdateMap::from(update_map))
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&pb::transaction::SchemaMetadataUpdates> for SchemaMetadataUpdates {
+    fn from(updates: &pb::transaction::SchemaMetadataUpdates) -> Self {
+        Self {
+            schema_metadata_updates: updates
+                .schema_metadata_updates
+                .as_ref()
+                .map(UpdateMap::from),
+            field_metadata_updates: updates
+                .field_metadata_updates
+                .iter()
+                .map(|(field_id, update_map)| (*field_id, UpdateMap::from(update_map)))
+                .collect(),
+        }
+    }
+}
+
 /// Add TransactionBuilder for flexibly setting option without using `mut`
 pub struct TransactionBuilder {
     read_version: u64,
@@ -1972,6 +2193,7 @@ impl TransactionBuilder {
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            schema_metadata_updates: None,
         }
     }
 }
@@ -1985,6 +2207,51 @@ impl Transaction {
         TransactionBuilder::new(read_version, operation)
             .tag(tag)
             .build()
+    }
+
+    /// Attach a non-empty schema/field metadata patch to an Append, Delete, or Update.
+    ///
+    /// Rejects empty patches and unsupported operations with
+    /// [`Error::InvalidInput`]. Valid attachments encode as the independent
+    /// `DataAndSchemaMetadata` protobuf envelope.
+    pub fn with_schema_metadata_updates(mut self, updates: SchemaMetadataUpdates) -> Result<Self> {
+        Self::validate_schema_metadata_attachment(&self.operation, &updates)?;
+        self.schema_metadata_updates = Some(updates);
+        Ok(self)
+    }
+
+    /// Whole-transaction attachment preflight used at commit boundaries.
+    ///
+    /// When [`Self::schema_metadata_updates`] is `None`, accepts. When `Some`,
+    /// reuses the same effective-non-empty and Append/Delete/Update rules as
+    /// [`Self::with_schema_metadata_updates`] / [`Self::build_manifest`].
+    pub(crate) fn validate_schema_metadata_updates(&self) -> Result<()> {
+        match &self.schema_metadata_updates {
+            Some(updates) => Self::validate_schema_metadata_attachment(&self.operation, updates),
+            None => Ok(()),
+        }
+    }
+
+    /// Shared non-empty + supported-operation checks for attached schema metadata.
+    ///
+    /// Used by [`Self::with_schema_metadata_updates`],
+    /// [`Self::validate_schema_metadata_updates`], and [`Self::build_manifest`]
+    /// so low-level callers cannot bypass the same fail-closed rules.
+    fn validate_schema_metadata_attachment(
+        operation: &Operation,
+        updates: &SchemaMetadataUpdates,
+    ) -> Result<()> {
+        updates.validate_non_empty()?;
+        match operation {
+            Operation::Append { .. } | Operation::Delete { .. } | Operation::Update { .. } => {
+                Ok(())
+            }
+            other => Err(Error::invalid_input(format!(
+                "schema_metadata_updates attachment is only supported on Append, Delete, \
+                 or Update; got {}",
+                other.name()
+            ))),
+        }
     }
 
     fn fragments_with_ids<'a, T>(
@@ -3303,116 +3570,11 @@ impl Transaction {
                     apply_update_map(&mut table_metadata, table_metadata_updates);
                     manifest.table_metadata = table_metadata;
                 }
-                if let Some(schema_metadata_updates) = schema_metadata_updates {
-                    let mut schema_metadata = manifest.schema.metadata.clone();
-                    apply_update_map(&mut schema_metadata, schema_metadata_updates);
-                    manifest.schema.metadata = schema_metadata;
-                }
-                // The unenforced primary and clustering keys are reserved
-                // schema properties: each is immutable once set, and its
-                // reserved metadata keys cannot be written with an invalid
-                // value. Capture the prior keys, and whether this transaction
-                // writes a reserved key, before applying the updates so
-                // violations can be rejected below. This runs on every apply,
-                // including conflict-rebase, so it also rejects the
-                // concurrent-writer race.
-                let primary_key_before: Vec<i32> = manifest
-                    .schema
-                    .unenforced_primary_key()
-                    .iter()
-                    .map(|field| field.id)
-                    .collect();
-                let writes_primary_key = field_metadata_updates.values().any(|update| {
-                    update.update_entries.iter().any(|entry| {
-                        entry.key == LANCE_UNENFORCED_PRIMARY_KEY
-                            || entry.key == LANCE_UNENFORCED_PRIMARY_KEY_POSITION
-                    })
-                });
-                let clustering_key_before: Vec<i32> = manifest
-                    .schema
-                    .unenforced_clustering_key()
-                    .iter()
-                    .map(|field| field.id)
-                    .collect();
-                let writes_clustering_key = field_metadata_updates.values().any(|update| {
-                    update
-                        .update_entries
-                        .iter()
-                        .any(|entry| entry.key == LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
-                });
-                for (field_id, field_metadata_update) in field_metadata_updates {
-                    if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
-                        apply_update_map(&mut field.metadata, field_metadata_update);
-                        // Also set unenforced primary key based on updated field metadata.
-                        field.unenforced_primary_key_position = field
-                            .metadata
-                            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .or_else(|| {
-                                field
-                                    .metadata
-                                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                                    .filter(|s| {
-                                        matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
-                                    })
-                                    .map(|_| 0)
-                            });
-                        // Also set unenforced clustering key based on updated
-                        // field metadata.
-                        field.unenforced_clustering_key_position = field
-                            .metadata
-                            .get(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
-                            .and_then(|s| s.parse::<u32>().ok());
-                    } else {
-                        return Err(Error::invalid_input_source(
-                            format!("Field with id {} does not exist", field_id).into(),
-                        ));
-                    }
-                }
-                let primary_key_after: Vec<i32> = manifest
-                    .schema
-                    .unenforced_primary_key()
-                    .iter()
-                    .map(|field| field.id)
-                    .collect();
-                if !primary_key_before.is_empty() {
-                    // The primary key is already set: reject any change to it,
-                    // and any write that touches a reserved primary key.
-                    if writes_primary_key || primary_key_after != primary_key_before {
-                        return Err(Error::invalid_input(
-                            "the unenforced primary key is a reserved key and cannot be changed once set",
-                        ));
-                    }
-                } else if writes_primary_key && primary_key_after.is_empty() {
-                    // A reserved primary key was written but did not install a
-                    // valid primary key (e.g. a non-marker flag value or a
-                    // non-numeric position).
-                    return Err(Error::invalid_input(
-                        "the unenforced primary key is a reserved key and cannot be set to an invalid value",
-                    ));
-                }
-                let clustering_key_after: Vec<i32> = manifest
-                    .schema
-                    .unenforced_clustering_key()
-                    .iter()
-                    .map(|field| field.id)
-                    .collect();
-                if !clustering_key_before.is_empty() {
-                    // The clustering key is already set: reject any change to
-                    // it, and any write that touches the reserved key.
-                    if writes_clustering_key || clustering_key_after != clustering_key_before {
-                        return Err(Error::invalid_input(
-                            "the unenforced clustering key is a reserved key and cannot be changed once set",
-                        ));
-                    }
-                } else if writes_clustering_key && clustering_key_after.is_empty() {
-                    // The reserved clustering key was written but did not
-                    // install a valid clustering key (e.g. a non-numeric
-                    // position value).
-                    return Err(Error::invalid_input(
-                        "the unenforced clustering key is a reserved key and cannot be set to an invalid value",
-                    ));
-                }
+                apply_schema_and_field_metadata_updates(
+                    &mut manifest,
+                    schema_metadata_updates.as_ref(),
+                    field_metadata_updates,
+                )?;
             }
             _ => {}
         }
@@ -3457,6 +3619,18 @@ impl Transaction {
 
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
+        }
+
+        // Attached schema/field metadata lands on the same local candidate after
+        // the data operation has fully materialized it. Failure returns Err with
+        // no candidate; the borrowed input Manifest is never mutated here.
+        if let Some(updates) = &self.schema_metadata_updates {
+            Self::validate_schema_metadata_attachment(&self.operation, updates)?;
+            apply_schema_and_field_metadata_updates(
+                &mut manifest,
+                updates.schema_metadata_updates.as_ref(),
+                &updates.field_metadata_updates,
+            )?;
         }
 
         Ok((manifest, final_indices))
@@ -4076,7 +4250,41 @@ impl TryFrom<pb::Transaction> for Transaction {
     type Error = Error;
 
     fn try_from(message: pb::Transaction) -> Result<Self> {
-        let operation = match message.operation {
+        let mut schema_metadata_updates = None;
+        // Unwrap DataAndSchemaMetadata into its inner Append/Delete/Update so the
+        // existing operation arms stay authoritative for data conversion.
+        let operation_message = match message.operation {
+            Some(pb::transaction::Operation::DataAndSchemaMetadata(envelope)) => {
+                let updates = envelope.updates.ok_or_else(|| {
+                    Error::invalid_input(
+                        "DataAndSchemaMetadata transaction is missing required \
+                         SchemaMetadataUpdates",
+                    )
+                })?;
+                let updates = SchemaMetadataUpdates::from(&updates);
+                updates.validate_non_empty()?;
+                schema_metadata_updates = Some(updates);
+                match envelope.data {
+                    Some(pb::transaction::data_and_schema_metadata::Data::Append(append)) => {
+                        Some(pb::transaction::Operation::Append(append))
+                    }
+                    Some(pb::transaction::data_and_schema_metadata::Data::Delete(delete)) => {
+                        Some(pb::transaction::Operation::Delete(delete))
+                    }
+                    Some(pb::transaction::data_and_schema_metadata::Data::Update(update)) => {
+                        Some(pb::transaction::Operation::Update(update))
+                    }
+                    None => {
+                        return Err(Error::invalid_input(
+                            "DataAndSchemaMetadata transaction is missing required \
+                             inner data operation",
+                        ));
+                    }
+                }
+            }
+            other => other,
+        };
+        let operation = match operation_message {
             Some(pb::transaction::Operation::Append(pb::transaction::Append { fragments })) => {
                 Operation::Append {
                     fragments: fragments
@@ -4453,6 +4661,12 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            Some(pb::transaction::Operation::DataAndSchemaMetadata(_)) => {
+                // Unreachable: DataAndSchemaMetadata is unwrapped before this match.
+                return Err(Error::internal(
+                    "DataAndSchemaMetadata should have been unwrapped before decoding".to_string(),
+                ));
+            }
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
@@ -4473,6 +4687,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            schema_metadata_updates,
         })
     }
 }
@@ -4541,9 +4756,47 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     }
 }
 
+/// Encode an attached transaction as `DataAndSchemaMetadata`.
+///
+/// Valid Append/Delete/Update with a non-empty patch keep their exact inner
+/// data operation. Empty patches and unsupported operations produce a
+/// malformed envelope (`data = None`) so they never silently encode as an
+/// ordinary historical operation. `From<&Transaction>` is infallible, so
+/// fail-closed happens on decode.
+fn encode_data_and_schema_metadata_envelope(
+    ordinary: pb::transaction::Operation,
+    updates: &SchemaMetadataUpdates,
+) -> pb::transaction::DataAndSchemaMetadata {
+    let data = if updates.is_empty() {
+        None
+    } else {
+        match ordinary {
+            pb::transaction::Operation::Append(append) => Some(
+                pb::transaction::data_and_schema_metadata::Data::Append(append),
+            ),
+            pb::transaction::Operation::Delete(delete) => Some(
+                pb::transaction::data_and_schema_metadata::Data::Delete(delete),
+            ),
+            pb::transaction::Operation::Update(update) => Some(
+                pb::transaction::data_and_schema_metadata::Data::Update(update),
+            ),
+            // Unsupported attached operations must not keep their ordinary arm.
+            _ => None,
+        }
+    };
+    pb::transaction::DataAndSchemaMetadata {
+        updates: if updates.is_empty() {
+            None
+        } else {
+            Some(pb::transaction::SchemaMetadataUpdates::from(updates))
+        },
+        data,
+    }
+}
+
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
-        let operation = match &value.operation {
+        let ordinary = match &value.operation {
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
@@ -4796,6 +5049,13 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
+        };
+
+        let operation = match value.schema_metadata_updates.as_ref() {
+            Some(updates) => pb::transaction::Operation::DataAndSchemaMetadata(
+                encode_data_and_schema_metadata_envelope(ordinary, updates),
+            ),
+            None => ordinary,
         };
 
         let transaction_properties = value
@@ -5560,6 +5820,8 @@ mod tests {
     use crate::Dataset;
     use crate::dataset::write::WriteParams;
     use crate::session::Session;
+    use prost::Name;
+    use rstest::rstest;
 
     fn sample_manifest() -> Manifest {
         sample_manifest_with_fragments(0..1)
@@ -8589,6 +8851,720 @@ mod tests {
             panic!("expected decoded Operation::Merge from legacy empty schema_metadata");
         };
         assert!(legacy_schema.metadata.is_empty());
+    }
+
+    fn sample_schema_metadata_updates() -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry::from(("schema_owner", "a41"))],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::from([(
+                1i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from(("field_unit", "m"))],
+                    replace: true,
+                },
+            )]),
+        }
+    }
+
+    fn sample_append_operation() -> Operation {
+        Operation::Append {
+            fragments: vec![Fragment::new(1)],
+        }
+    }
+
+    fn sample_delete_operation() -> Operation {
+        Operation::Delete {
+            updated_fragments: vec![Fragment::new(1)],
+            deleted_fragment_ids: vec![2],
+            predicate: "id > 0".to_string(),
+        }
+    }
+
+    fn sample_update_operation() -> Operation {
+        Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![Fragment::new(3)],
+            fields_modified: vec![],
+            compacted_sstables: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteRows),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        }
+    }
+
+    /// A4.1: attached Append/Delete/Update encode as pb DataAndSchemaMetadata and
+    /// round-trip data op + schema/field UpdateMaps + txn envelope fields.
+    #[rstest]
+    #[case::append(sample_append_operation())]
+    #[case::delete(sample_delete_operation())]
+    #[case::update(sample_update_operation())]
+    fn test_data_and_schema_metadata_round_trip(#[case] operation: Operation) {
+        assert_eq!(
+            pb::transaction::DataAndSchemaMetadata::NAME,
+            "DataAndSchemaMetadata",
+            "generated protobuf variant must be DataAndSchemaMetadata"
+        );
+
+        let updates = sample_schema_metadata_updates();
+        let properties = Arc::new(HashMap::from([(
+            "prop_key".to_string(),
+            "prop_val".to_string(),
+        )]));
+        let tx = TransactionBuilder::new(7, operation.clone())
+            .uuid("11111111-1111-1111-1111-111111111111".to_string())
+            .tag(Some("a41-tag".to_string()))
+            .transaction_properties(Some(properties.clone()))
+            .build()
+            .with_schema_metadata_updates(updates.clone())
+            .expect("non-empty attachment on Append/Delete/Update must succeed");
+
+        let pb_tx: pb::Transaction = pb::Transaction::from(&tx);
+        let Some(pb::transaction::Operation::DataAndSchemaMetadata(envelope)) = &pb_tx.operation
+        else {
+            panic!("attached transaction must encode as DataAndSchemaMetadata");
+        };
+        let pb_updates = envelope
+            .updates
+            .as_ref()
+            .expect("encoded envelope must carry required metadata patch");
+        assert_eq!(
+            pb_updates
+                .schema_metadata_updates
+                .as_ref()
+                .map(UpdateMap::from),
+            updates.schema_metadata_updates
+        );
+        assert_eq!(
+            pb_updates
+                .field_metadata_updates
+                .iter()
+                .map(|(field_id, update_map)| (*field_id, UpdateMap::from(update_map)))
+                .collect::<HashMap<_, _>>(),
+            updates.field_metadata_updates
+        );
+        match (&operation, envelope.data.as_ref()) {
+            (
+                Operation::Append { .. },
+                Some(pb::transaction::data_and_schema_metadata::Data::Append(_)),
+            )
+            | (
+                Operation::Delete { .. },
+                Some(pb::transaction::data_and_schema_metadata::Data::Delete(_)),
+            )
+            | (
+                Operation::Update { .. },
+                Some(pb::transaction::data_and_schema_metadata::Data::Update(_)),
+            ) => {}
+            (op, data) => panic!("inner data must match {op:?}, got {data:?}"),
+        }
+
+        let decoded = Transaction::try_from(pb_tx).expect("valid envelope must decode");
+        assert_eq!(decoded.read_version, 7);
+        assert_eq!(decoded.uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(decoded.tag.as_deref(), Some("a41-tag"));
+        assert_eq!(decoded.transaction_properties, Some(properties));
+        assert_eq!(decoded.operation, operation);
+        assert_eq!(decoded.schema_metadata_updates.as_ref(), Some(&updates));
+    }
+
+    /// A4.1: transactions without attachment keep historical Append wire bytes.
+    #[test]
+    fn test_append_without_schema_metadata_updates_keeps_legacy_append_wire() {
+        let fragments = vec![Fragment::new(9)];
+        let tx = TransactionBuilder::new(
+            3,
+            Operation::Append {
+                fragments: fragments.clone(),
+            },
+        )
+        .uuid("22222222-2222-2222-2222-222222222222".to_string())
+        .build();
+
+        let pb_tx: pb::Transaction = pb::Transaction::from(&tx);
+        let Some(pb::transaction::Operation::Append(pb_append)) = &pb_tx.operation else {
+            panic!("unattached Append must encode as ordinary pb Append");
+        };
+        assert_eq!(pb_append.fragments.len(), 1);
+        assert_eq!(pb_append.fragments[0].id, 9);
+
+        let decoded = Transaction::try_from(pb_tx).unwrap();
+        assert_eq!(decoded.operation, Operation::Append { fragments });
+        assert!(
+            decoded.schema_metadata_updates.is_none(),
+            "unattached transaction must expose no schema metadata attachment"
+        );
+    }
+
+    /// A4.1: DataAndSchemaMetadata fails closed on missing/empty patch or missing data.
+    #[test]
+    fn test_data_and_schema_metadata_rejects_invalid_envelope() {
+        let append_data = Some(pb::transaction::data_and_schema_metadata::Data::Append(
+            pb::transaction::Append {
+                fragments: vec![pb::DataFragment::from(&Fragment::new(1))],
+            },
+        ));
+        let non_empty_updates = Some(pb::transaction::SchemaMetadataUpdates {
+            schema_metadata_updates: Some(pb::transaction::UpdateMap::from(
+                &sample_schema_metadata_updates()
+                    .schema_metadata_updates
+                    .unwrap(),
+            )),
+            field_metadata_updates: HashMap::new(),
+        });
+
+        let missing_updates = pb::Transaction {
+            read_version: 1,
+            uuid: "missing-updates".to_string(),
+            operation: Some(pb::transaction::Operation::DataAndSchemaMetadata(
+                pb::transaction::DataAndSchemaMetadata {
+                    updates: None,
+                    data: append_data.clone(),
+                },
+            )),
+            ..Default::default()
+        };
+        let err = Transaction::try_from(missing_updates).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "missing updates must be InvalidInput, got {err:?}"
+        );
+
+        let empty_updates = pb::Transaction {
+            read_version: 1,
+            uuid: "empty-updates".to_string(),
+            operation: Some(pb::transaction::Operation::DataAndSchemaMetadata(
+                pb::transaction::DataAndSchemaMetadata {
+                    updates: Some(pb::transaction::SchemaMetadataUpdates {
+                        schema_metadata_updates: None,
+                        field_metadata_updates: HashMap::new(),
+                    }),
+                    data: append_data,
+                },
+            )),
+            ..Default::default()
+        };
+        let err = Transaction::try_from(empty_updates).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "empty updates must be InvalidInput, got {err:?}"
+        );
+
+        let missing_data = pb::Transaction {
+            read_version: 1,
+            uuid: "missing-data".to_string(),
+            operation: Some(pb::transaction::Operation::DataAndSchemaMetadata(
+                pb::transaction::DataAndSchemaMetadata {
+                    updates: non_empty_updates,
+                    data: None,
+                },
+            )),
+            ..Default::default()
+        };
+        let err = Transaction::try_from(missing_data).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "missing inner data must be InvalidInput, got {err:?}"
+        );
+    }
+
+    /// A4.1: attachment validation rejects empty patches and unsupported ops before encode.
+    #[test]
+    fn test_with_schema_metadata_updates_rejects_empty_and_unsupported_merge() {
+        let empty = SchemaMetadataUpdates {
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+        let append_tx = Transaction::new(1, sample_append_operation(), None);
+        let err = append_tx
+            .with_schema_metadata_updates(empty)
+            .expect_err("empty SchemaMetadataUpdates must be rejected");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "empty updates must be InvalidInput, got {err:?}"
+        );
+
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let merge_tx = Transaction::new(
+            1,
+            Operation::Merge {
+                fragments: vec![],
+                schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let err = merge_tx
+            .with_schema_metadata_updates(sample_schema_metadata_updates())
+            .expect_err("Merge must not accept schema metadata attachment");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unsupported Merge attachment must be InvalidInput, got {err:?}"
+        );
+    }
+
+    /// A4.1: `UpdateMap { replace: false, update_entries: [] }` is a no-op per
+    /// `apply_update_map` and must not satisfy the non-empty patch invariant.
+    #[test]
+    fn test_schema_metadata_empty_update_map_semantics_rejects_schema_noop() {
+        let schema_noop = SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::new(),
+        };
+        let err = Transaction::new(1, sample_append_operation(), None)
+            .with_schema_metadata_updates(schema_noop)
+            .expect_err("schema-only no-op UpdateMap must be rejected");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "schema-only no-op must be InvalidInput, got {err:?}"
+        );
+    }
+
+    /// A4.1: field map keys alone are not substantive when every field UpdateMap
+    /// is a merge no-op (`replace: false`, empty entries).
+    #[test]
+    fn test_schema_metadata_empty_update_map_semantics_rejects_field_noop() {
+        let field_noop = SchemaMetadataUpdates {
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                1i32,
+                UpdateMap {
+                    update_entries: vec![],
+                    replace: false,
+                },
+            )]),
+        };
+        let err = Transaction::new(1, sample_append_operation(), None)
+            .with_schema_metadata_updates(field_noop)
+            .expect_err("field-only no-op UpdateMaps must be rejected");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "field-only no-op must be InvalidInput, got {err:?}"
+        );
+    }
+
+    /// A4.1: decode must reject envelopes whose patch is only no-op UpdateMaps.
+    #[test]
+    fn test_schema_metadata_empty_update_map_semantics_rejects_pb_noop_patch() {
+        let append_data = Some(pb::transaction::data_and_schema_metadata::Data::Append(
+            pb::transaction::Append {
+                fragments: vec![pb::DataFragment::from(&Fragment::new(1))],
+            },
+        ));
+        let noop_map = pb::transaction::UpdateMap {
+            update_entries: vec![],
+            replace: false,
+        };
+
+        let schema_noop = pb::Transaction {
+            read_version: 1,
+            uuid: "schema-noop-patch".to_string(),
+            operation: Some(pb::transaction::Operation::DataAndSchemaMetadata(
+                pb::transaction::DataAndSchemaMetadata {
+                    updates: Some(pb::transaction::SchemaMetadataUpdates {
+                        schema_metadata_updates: Some(noop_map.clone()),
+                        field_metadata_updates: HashMap::new(),
+                    }),
+                    data: append_data.clone(),
+                },
+            )),
+            ..Default::default()
+        };
+        let err =
+            Transaction::try_from(schema_noop).expect_err("schema no-op patch must not decode");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "schema no-op patch must be InvalidInput, got {err:?}"
+        );
+
+        let field_noop = pb::Transaction {
+            read_version: 1,
+            uuid: "field-noop-patch".to_string(),
+            operation: Some(pb::transaction::Operation::DataAndSchemaMetadata(
+                pb::transaction::DataAndSchemaMetadata {
+                    updates: Some(pb::transaction::SchemaMetadataUpdates {
+                        schema_metadata_updates: None,
+                        field_metadata_updates: HashMap::from([(1i32, noop_map)]),
+                    }),
+                    data: append_data,
+                },
+            )),
+            ..Default::default()
+        };
+        let err = Transaction::try_from(field_noop).expect_err("field no-op patch must not decode");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "field no-op patch must be InvalidInput, got {err:?}"
+        );
+    }
+
+    /// A4.1: `replace: true` with zero entries clears the target and is a valid
+    /// non-empty patch that round-trips through DataAndSchemaMetadata.
+    #[test]
+    fn test_schema_metadata_empty_update_map_semantics_accepts_clearing_replace() {
+        let clearing = SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![],
+                replace: true,
+            }),
+            field_metadata_updates: HashMap::new(),
+        };
+        let tx = TransactionBuilder::new(1, sample_append_operation())
+            .uuid("33333333-3333-3333-3333-333333333333".to_string())
+            .build()
+            .with_schema_metadata_updates(clearing.clone())
+            .expect("replace=true empty UpdateMap is a clearing patch");
+
+        let pb_tx: pb::Transaction = pb::Transaction::from(&tx);
+        let Some(pb::transaction::Operation::DataAndSchemaMetadata(envelope)) = &pb_tx.operation
+        else {
+            panic!("clearing patch must encode as DataAndSchemaMetadata");
+        };
+        let pb_updates = envelope
+            .updates
+            .as_ref()
+            .expect("clearing patch must encode updates");
+        assert_eq!(
+            pb_updates
+                .schema_metadata_updates
+                .as_ref()
+                .map(UpdateMap::from),
+            clearing.schema_metadata_updates
+        );
+        assert!(pb_updates.field_metadata_updates.is_empty());
+
+        let decoded = Transaction::try_from(pb_tx).expect("clearing patch must decode");
+        assert_eq!(decoded.schema_metadata_updates.as_ref(), Some(&clearing));
+    }
+
+    /// A4.1: a directly constructed unsupported attachment must never silently
+    /// encode as its ordinary operation. `From` is infallible, so the wire form
+    /// is a fail-closed DataAndSchemaMetadata envelope that decode rejects.
+    #[test]
+    fn test_unsupported_attached_transaction_never_encodes_as_ordinary_operation() {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let mut tx = Transaction::new(
+            1,
+            Operation::Merge {
+                fragments: vec![],
+                schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+        tx.schema_metadata_updates = Some(sample_schema_metadata_updates());
+
+        let pb_tx: pb::Transaction = pb::Transaction::from(&tx);
+        assert!(
+            !matches!(pb_tx.operation, Some(pb::transaction::Operation::Merge(_))),
+            "unsupported attached Merge must not encode as ordinary Merge"
+        );
+        let Some(pb::transaction::Operation::DataAndSchemaMetadata(envelope)) = &pb_tx.operation
+        else {
+            panic!("unsupported attached transaction must encode as DataAndSchemaMetadata");
+        };
+        assert!(
+            envelope.data.is_none(),
+            "unsupported inner operation must omit data so decode fails closed"
+        );
+        assert!(
+            envelope.updates.is_some(),
+            "non-empty attachment must not be stripped from the fail-closed envelope"
+        );
+
+        let err = Transaction::try_from(pb_tx).expect_err("malformed envelope must not decode");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "malformed attached envelope must be InvalidInput, got {err:?}"
+        );
+    }
+
+    /// A4.2a apply fixture: same UpdateMap shape as [`sample_schema_metadata_updates`]
+    /// but targets field id 0 from [`sample_manifest`].
+    fn sample_schema_metadata_updates_field0() -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry::from(("schema_owner", "a42a"))],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::from([(
+                0i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from(("field_unit", "m"))],
+                    replace: false,
+                },
+            )]),
+        }
+    }
+
+    /// A4.2a: attached Append/Delete/Update must apply data mutation and the
+    /// caller-owned schema/field metadata patch onto the same candidate Manifest.
+    #[rstest]
+    #[case::append("append")]
+    #[case::delete("delete")]
+    #[case::update("update")]
+    fn test_attached_build_manifest_applies_data_and_schema_metadata(#[case] kind: &str) {
+        let updates = sample_schema_metadata_updates_field0();
+        let (current, operation, expected_fragment_ids) = match kind {
+            "append" => (
+                sample_manifest(),
+                Operation::Append {
+                    fragments: vec![Fragment::new(1)],
+                },
+                vec![0u64, 1],
+            ),
+            "delete" => {
+                let mut updated2 = Fragment::new(2);
+                updated2.physical_rows = Some(42);
+                (
+                    sample_manifest_with_fragments(0..5),
+                    Operation::Delete {
+                        updated_fragments: vec![updated2],
+                        deleted_fragment_ids: vec![1, 3],
+                        predicate: "id > 0".to_string(),
+                    },
+                    vec![0u64, 2, 4],
+                )
+            }
+            "update" => {
+                let mut updated2 = Fragment::new(2);
+                updated2.physical_rows = Some(42);
+                (
+                    sample_manifest_with_fragments(0..5),
+                    Operation::Update {
+                        removed_fragment_ids: vec![1],
+                        updated_fragments: vec![updated2],
+                        new_fragments: vec![Fragment::new(10)],
+                        fields_modified: vec![],
+                        compacted_sstables: vec![],
+                        fields_for_preserving_frag_bitmap: vec![],
+                        update_mode: None,
+                        inserted_rows_filter: None,
+                        updated_fragment_offsets: None,
+                    },
+                    vec![0u64, 2, 3, 4, 10],
+                )
+            }
+            other => panic!("unexpected case {other}"),
+        };
+
+        let transaction = Transaction::new(current.version, operation, None)
+            .with_schema_metadata_updates(updates)
+            .expect("non-empty attachment on Append/Delete/Update must succeed");
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&current),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .expect("attached data+metadata commit must return a candidate Manifest");
+
+        let fragment_ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(
+            fragment_ids, expected_fragment_ids,
+            "{kind}: data effect must be present on the candidate"
+        );
+        if kind == "delete" || kind == "update" {
+            let updated = new_manifest
+                .fragments
+                .iter()
+                .find(|f| f.id == 2)
+                .expect("fragment 2 must remain after delete/update");
+            assert_eq!(updated.physical_rows, Some(42), "{kind}: fragment update");
+        }
+
+        assert_eq!(
+            new_manifest
+                .schema
+                .metadata
+                .get("schema_owner")
+                .map(String::as_str),
+            Some("a42a"),
+            "{kind}: schema metadata patch must land on the same candidate"
+        );
+        let field0 = new_manifest
+            .schema
+            .field_by_id(0)
+            .expect("sample_manifest field id 0 must exist on candidate");
+        assert_eq!(
+            field0.metadata.get("field_unit").map(String::as_str),
+            Some("m"),
+            "{kind}: field metadata patch for id 0 must land on the same candidate"
+        );
+    }
+
+    /// A4.2a: nonexistent field id must fail closed like UpdateConfig; input
+    /// Manifest must stay unchanged and no candidate is returned.
+    #[test]
+    fn test_attached_build_manifest_rejects_nonexistent_field_id() {
+        let current = sample_manifest();
+        let before = current.clone();
+        let updates = SchemaMetadataUpdates {
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                999i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from(("field_unit", "m"))],
+                    replace: false,
+                },
+            )]),
+        };
+        let transaction = Transaction::new(
+            current.version,
+            Operation::Append {
+                fragments: vec![Fragment::new(1)],
+            },
+            None,
+        )
+        .with_schema_metadata_updates(updates)
+        .unwrap();
+
+        let err = transaction
+            .build_manifest(
+                Some(&current),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .expect_err("nonexistent field id must reject the whole candidate");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "nonexistent field id must be InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("999") && err.to_string().contains("does not exist"),
+            "error must name the missing field id, got {err}"
+        );
+        assert_eq!(
+            current, before,
+            "failed apply must leave the input Manifest unchanged"
+        );
+    }
+
+    /// A4.2a: invalid reserved primary-key marker must reuse UpdateConfig's
+    /// InvalidInput rule; input Manifest unchanged, no candidate returned.
+    #[test]
+    fn test_attached_build_manifest_rejects_invalid_reserved_key() {
+        let current = sample_manifest();
+        let before = current.clone();
+        let updates = SchemaMetadataUpdates {
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                0i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from((
+                        LANCE_UNENFORCED_PRIMARY_KEY,
+                        "false",
+                    ))],
+                    replace: false,
+                },
+            )]),
+        };
+        let transaction = Transaction::new(
+            current.version,
+            Operation::Append {
+                fragments: vec![Fragment::new(1)],
+            },
+            None,
+        )
+        .with_schema_metadata_updates(updates)
+        .unwrap();
+
+        let err = transaction
+            .build_manifest(
+                Some(&current),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .expect_err("invalid reserved primary-key value must reject the candidate");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "invalid reserved key must be InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(
+                "the unenforced primary key is a reserved key and cannot be set to an invalid value"
+            ),
+            "must reuse UpdateConfig reserved-key wording, got {err}"
+        );
+        assert_eq!(
+            current, before,
+            "failed apply must leave the input Manifest unchanged"
+        );
+    }
+
+    /// A4.2a: `replace: true` with empty entries clears schema metadata on the
+    /// candidate Manifest, not merely on the wire attachment.
+    #[test]
+    fn test_attached_build_manifest_replace_clears_schema_metadata() {
+        let mut current = sample_manifest();
+        current
+            .schema
+            .metadata
+            .insert("schema_owner".to_string(), "stale".to_string());
+
+        let clearing = SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![],
+                replace: true,
+            }),
+            field_metadata_updates: HashMap::new(),
+        };
+        let transaction = Transaction::new(
+            current.version,
+            Operation::Append {
+                fragments: vec![Fragment::new(1)],
+            },
+            None,
+        )
+        .with_schema_metadata_updates(clearing)
+        .expect("replace=true empty UpdateMap is a clearing patch");
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&current),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .expect("clearing patch must still return a data candidate");
+
+        let fragment_ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(fragment_ids, vec![0, 1], "Append data effect must remain");
+        assert!(
+            new_manifest.schema.metadata.is_empty(),
+            "replace=true must clear schema metadata on the candidate, got {:?}",
+            new_manifest.schema.metadata
+        );
+        assert_eq!(
+            current
+                .schema
+                .metadata
+                .get("schema_owner")
+                .map(String::as_str),
+            Some("stale"),
+            "input Manifest must not be mutated by a successful apply"
+        );
     }
 
     mod mem_wal_index_coverage {

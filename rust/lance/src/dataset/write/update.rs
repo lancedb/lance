@@ -10,7 +10,7 @@ use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{Operation, SchemaMetadataUpdates, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
@@ -79,6 +79,8 @@ pub struct UpdateBuilder {
     conflict_retries: u32,
     /// Total timeout for retries.
     retry_timeout: Duration,
+    /// Optional schema/field metadata patch published atomically with the Update.
+    schema_metadata_updates: Option<SchemaMetadataUpdates>,
 }
 
 impl UpdateBuilder {
@@ -89,6 +91,7 @@ impl UpdateBuilder {
             updates: HashMap::new(),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
+            schema_metadata_updates: None,
         }
     }
 
@@ -212,6 +215,18 @@ impl UpdateBuilder {
         self
     }
 
+    /// Attach schema/field metadata updates to publish atomically with the Update.
+    ///
+    /// The patch is stored on the Update [`Transaction`] and committed in the same
+    /// version as the row updates, so readers never observe rewritten rows without
+    /// the metadata (or vice versa). Empty / no-op patches are rejected with
+    /// [`Error::InvalidInput`].
+    pub fn with_schema_metadata_updates(mut self, updates: SchemaMetadataUpdates) -> Result<Self> {
+        updates.validate_non_empty()?;
+        self.schema_metadata_updates = Some(updates);
+        Ok(self)
+    }
+
     // TODO: set write params
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
@@ -237,6 +252,7 @@ impl UpdateBuilder {
             updates,
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
+            schema_metadata_updates: self.schema_metadata_updates,
         })
     }
 }
@@ -265,6 +281,8 @@ pub struct UpdateJob {
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
     conflict_retries: u32,
     retry_timeout: Duration,
+    /// Copied from [`UpdateBuilder`] so retries and clones retain the patch.
+    schema_metadata_updates: Option<SchemaMetadataUpdates>,
 }
 
 impl UpdateJob {
@@ -426,6 +444,10 @@ impl UpdateJob {
         };
 
         let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = match &self.schema_metadata_updates {
+            Some(updates) => transaction.with_schema_metadata_updates(updates.clone())?,
+            None => transaction,
+        };
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)
@@ -529,6 +551,7 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::transaction::{SchemaMetadataUpdates, UpdateMap, UpdateMapEntry};
     use crate::dataset::{WriteDestination, WriteMode};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
@@ -1944,5 +1967,284 @@ mod tests {
 
         let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
         assert_eq!(blobs.value(idx_foo), b"foo");
+    }
+
+    // -------------------------------------------------------------------------
+    // A4.4c: UpdateBuilder schema metadata attachment
+    // -------------------------------------------------------------------------
+
+    const A44C_SCHEMA_KEY: &str = "a44c.schema";
+    const A44C_SCHEMA_VALUE: &str = "schema-v1";
+    const A44C_FIELD_KEY: &str = "a44c.field";
+    const A44C_FIELD_VALUE: &str = "field-v1";
+
+    fn a44c_upsert_map(key: &str, value: &str) -> UpdateMap {
+        UpdateMap {
+            update_entries: vec![UpdateMapEntry::from((key, value))],
+            replace: false,
+        }
+    }
+
+    fn a44c_metadata_updates(field_id: i32) -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(a44c_upsert_map(A44C_SCHEMA_KEY, A44C_SCHEMA_VALUE)),
+            field_metadata_updates: HashMap::from([(
+                field_id,
+                a44c_upsert_map(A44C_FIELD_KEY, A44C_FIELD_VALUE),
+            )]),
+        }
+    }
+
+    fn a44c_schema_only() -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(a44c_upsert_map(A44C_SCHEMA_KEY, A44C_SCHEMA_VALUE)),
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    fn a44c_field_only(field_id: i32) -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                field_id,
+                a44c_upsert_map(A44C_FIELD_KEY, A44C_FIELD_VALUE),
+            )]),
+        }
+    }
+
+    fn a44c_fixture_field0_id(dataset: &Dataset) -> i32 {
+        let field = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("make_test_dataset must expose stable field id 0");
+        assert_eq!(field.id, 0, "fixture field id 0 must be stable");
+        field.id
+    }
+
+    fn a44c_assert_metadata_absent(dataset: &Dataset) {
+        assert!(
+            !dataset.schema().metadata.contains_key(A44C_SCHEMA_KEY),
+            "{A44C_SCHEMA_KEY} must be absent, got {:?}",
+            dataset.schema().metadata
+        );
+        let field0 = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("field id 0 must exist");
+        assert!(
+            !field0.metadata.contains_key(A44C_FIELD_KEY),
+            "{A44C_FIELD_KEY} must be absent, got {:?}",
+            field0.metadata
+        );
+    }
+
+    fn a44c_assert_metadata_present(dataset: &Dataset) {
+        assert_eq!(
+            dataset
+                .schema()
+                .metadata
+                .get(A44C_SCHEMA_KEY)
+                .map(String::as_str),
+            Some(A44C_SCHEMA_VALUE),
+            "schema metadata patch must be published"
+        );
+        let field0 = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("field id 0 must exist");
+        assert_eq!(
+            field0.metadata.get(A44C_FIELD_KEY).map(String::as_str),
+            Some(A44C_FIELD_VALUE),
+            "field id 0 metadata patch must be published"
+        );
+    }
+
+    async fn a44c_assert_name_counts(dataset: &Dataset, updated: usize, unchanged: usize) {
+        assert_eq!(
+            dataset
+                .count_rows(Some("name = 'updated'".into()))
+                .await
+                .unwrap(),
+            updated
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("name = 'foo'".into()))
+                .await
+                .unwrap(),
+            unchanged
+        );
+    }
+
+    /// A4.4c: Update via UpdateBuilder publishes row updates + schema/field
+    /// metadata in exactly one version; a fresh Dataset::open agrees.
+    #[tokio::test]
+    async fn test_a44c_update_publishes_data_and_metadata_in_one_version() {
+        let (dataset, test_dir) = make_test_dataset(LanceFileVersion::Stable, false).await;
+        let uri = test_dir.as_str();
+        let before_version = dataset.version().version;
+        let field0_id = a44c_fixture_field0_id(&dataset);
+        a44c_assert_metadata_absent(&dataset);
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where("id < 5")
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .with_schema_metadata_updates(a44c_metadata_updates(field0_id))
+            .expect("Update attachment must construct")
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .expect("attached Update must commit");
+
+        assert_eq!(result.rows_updated, 5);
+        assert_eq!(
+            result.new_dataset.version().version,
+            before_version + 1,
+            "exactly one new version"
+        );
+        a44c_assert_name_counts(&result.new_dataset, 5, 25).await;
+        a44c_assert_metadata_present(&result.new_dataset);
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            reopened.version().version,
+            result.new_dataset.version().version
+        );
+        a44c_assert_name_counts(&reopened, 5, 25).await;
+        a44c_assert_metadata_present(&reopened);
+    }
+
+    /// A4.4c: a substantive patch targeting nonexistent field id 999 must fail
+    /// atomically; neither row updates nor metadata are visible on reopen.
+    #[tokio::test]
+    async fn test_a44c_nonexistent_field_attached_update_publishes_neither_side() {
+        let (dataset, test_dir) = make_test_dataset(LanceFileVersion::Stable, false).await;
+        let uri = test_dir.as_str();
+        let before_version = dataset.version().version;
+        a44c_fixture_field0_id(&dataset);
+        a44c_assert_metadata_absent(&dataset);
+
+        let updates = SchemaMetadataUpdates {
+            schema_metadata_updates: Some(a44c_upsert_map(A44C_SCHEMA_KEY, A44C_SCHEMA_VALUE)),
+            field_metadata_updates: HashMap::from([(
+                999i32,
+                a44c_upsert_map(A44C_FIELD_KEY, A44C_FIELD_VALUE),
+            )]),
+        };
+
+        let err = UpdateBuilder::new(dataset)
+            .update_where("id < 3")
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .with_schema_metadata_updates(updates)
+            .expect("setter may accept; field validity is manifest-relative")
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .expect_err("nonexistent field id must reject the Update");
+
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "nonexistent field id must be InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("999"),
+            "error must name the missing field id, got {err}"
+        );
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            reopened.version().version,
+            before_version,
+            "failed Update must not advance version"
+        );
+        a44c_assert_name_counts(&reopened, 0, 30).await;
+        a44c_assert_metadata_absent(&reopened);
+    }
+
+    /// A4.4c: concurrent same-row Updates with disjoint metadata scopes both
+    /// succeed via retry; both patches and a single updated row are visible.
+    #[tokio::test]
+    async fn test_a44c_concurrent_retry_preserves_disjoint_metadata_patches() {
+        let (dataset, test_dir) = make_test_dataset(LanceFileVersion::Stable, false).await;
+        let uri = test_dir.as_str();
+        let initial_version = dataset.version().version;
+        let field0_id = a44c_fixture_field0_id(&dataset);
+        a44c_assert_metadata_absent(&dataset);
+
+        let job_a = UpdateBuilder::new(dataset.clone())
+            .update_where("id = 0")
+            .unwrap()
+            .set("name", "'concurrent'")
+            .unwrap()
+            .conflict_retries(20)
+            .with_schema_metadata_updates(a44c_schema_only())
+            .expect("schema-only Update attachment must construct")
+            .build()
+            .unwrap();
+        let job_b = UpdateBuilder::new(dataset.clone())
+            .update_where("id = 0")
+            .unwrap()
+            .set("name", "'concurrent'")
+            .unwrap()
+            .conflict_retries(20)
+            .with_schema_metadata_updates(a44c_field_only(field0_id))
+            .expect("field-only Update attachment must construct")
+            .build()
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_a = barrier.clone();
+        let barrier_b = barrier.clone();
+        let handle_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            job_a.execute().await
+        });
+        let handle_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            job_b.execute().await
+        });
+
+        let (res_a, res_b) = tokio::join!(handle_a, handle_b);
+        let result_a = res_a
+            .expect("job A task must join")
+            .expect("job A Update must succeed after retry");
+        let result_b = res_b
+            .expect("job B task must join")
+            .expect("job B Update must succeed after retry");
+
+        let mut versions = [
+            result_a.new_dataset.version().version,
+            result_b.new_dataset.version().version,
+        ];
+        versions.sort();
+        assert_eq!(
+            versions,
+            [initial_version + 1, initial_version + 2],
+            "both commits must land as consecutive versions"
+        );
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            reopened
+                .count_rows(Some("id = 0 AND name = 'concurrent'".into()))
+                .await
+                .unwrap(),
+            1,
+            "exactly one target row must carry the updated value"
+        );
+        assert_eq!(
+            reopened
+                .count_rows(Some("name = 'foo'".into()))
+                .await
+                .unwrap(),
+            29
+        );
+        a44c_assert_metadata_present(&reopened);
     }
 }

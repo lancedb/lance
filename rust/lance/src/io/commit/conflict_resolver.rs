@@ -8,7 +8,8 @@ use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
     dataset::transaction::{
-        DataOverlayGroup, Operation, Transaction, UpdateMode, expand_exact_merge_output_field_ids,
+        DataOverlayGroup, Operation, SchemaMetadataUpdates, Transaction, UpdateMap, UpdateMode,
+        expand_exact_merge_output_field_ids,
     },
 };
 use futures::{StreamExt, TryStreamExt};
@@ -37,6 +38,150 @@ fn update_config_touches_schema_or_field_metadata(operation: &Operation) -> bool
         } => schema_metadata_updates.is_some() || !field_metadata_updates.is_empty(),
         _ => false,
     }
+}
+
+/// Outcome of the attachment-aware conflict precheck (A4.3).
+enum AttachmentConflict {
+    None,
+    Retryable,
+    Incompatible,
+}
+
+/// Effective schema/field metadata scopes for attachment-aware checks.
+///
+/// Only substantive maps ([`UpdateMap`] that is not empty) contribute. Structural
+/// presence of a no-op map does not enlarge the conflict scope.
+#[derive(Debug, Default)]
+struct EffectiveMetadataScope {
+    touches_schema: bool,
+    field_ids: HashSet<i32>,
+}
+
+impl EffectiveMetadataScope {
+    fn from_attachment(updates: &SchemaMetadataUpdates) -> Self {
+        Self {
+            touches_schema: updates
+                .schema_metadata_updates
+                .as_ref()
+                .is_some_and(|m| !m.is_empty()),
+            field_ids: updates
+                .field_metadata_updates
+                .iter()
+                .filter(|(_, m)| !m.is_empty())
+                .map(|(id, _)| *id)
+                .collect(),
+        }
+    }
+
+    fn from_update_config(
+        schema_metadata_updates: &Option<UpdateMap>,
+        field_metadata_updates: &HashMap<i32, UpdateMap>,
+    ) -> Self {
+        Self {
+            touches_schema: schema_metadata_updates
+                .as_ref()
+                .is_some_and(|m| !m.is_empty()),
+            field_ids: field_metadata_updates
+                .iter()
+                .filter(|(_, m)| !m.is_empty())
+                .map(|(id, _)| *id)
+                .collect(),
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        (self.touches_schema && other.touches_schema)
+            || self.field_ids.iter().any(|id| other.field_ids.contains(id))
+    }
+}
+
+fn substantive_attachment(txn: &Transaction) -> Option<&SchemaMetadataUpdates> {
+    txn.schema_metadata_updates
+        .as_ref()
+        .filter(|updates| !updates.is_empty())
+}
+
+fn is_schema_replacement_retryable(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Merge { .. } | Operation::Project { .. } | Operation::ExactMerge { .. }
+    )
+}
+
+fn is_schema_replacement_incompatible(op: &Operation) -> bool {
+    matches!(op, Operation::Overwrite { .. } | Operation::Restore { .. })
+}
+
+fn update_config_effective_scope(op: &Operation) -> Option<EffectiveMetadataScope> {
+    match op {
+        Operation::UpdateConfig {
+            schema_metadata_updates,
+            field_metadata_updates,
+            ..
+        } => Some(EffectiveMetadataScope::from_update_config(
+            schema_metadata_updates,
+            field_metadata_updates,
+        )),
+        _ => None,
+    }
+}
+
+/// Attachment-aware conflict precheck.
+///
+/// Inspects complete local and concurrent [`Transaction`] values before
+/// nullability and operation-specific dispatch. Returns
+/// [`AttachmentConflict::None`] when there is no attachment-level conflict so
+/// every existing rule runs unchanged. Does not mutate rebase state and does
+/// not compare metadata key/value content beyond effective scope overlap.
+fn check_attachment_aware_conflict(
+    local: &Transaction,
+    concurrent: &Transaction,
+) -> AttachmentConflict {
+    let local_attachment = substantive_attachment(local);
+    let concurrent_attachment = substantive_attachment(concurrent);
+    if local_attachment.is_none() && concurrent_attachment.is_none() {
+        return AttachmentConflict::None;
+    }
+
+    // Schema replacement/pinning fence when either side carries an attachment.
+    if is_schema_replacement_retryable(&local.operation)
+        || is_schema_replacement_retryable(&concurrent.operation)
+    {
+        return AttachmentConflict::Retryable;
+    }
+    if is_schema_replacement_incompatible(&local.operation)
+        || is_schema_replacement_incompatible(&concurrent.operation)
+    {
+        return AttachmentConflict::Incompatible;
+    }
+
+    // Scope overlap: attachment vs attachment, or attachment vs UpdateConfig.
+    match (local_attachment, concurrent_attachment) {
+        (Some(left), Some(right)) => {
+            if EffectiveMetadataScope::from_attachment(left)
+                .overlaps(&EffectiveMetadataScope::from_attachment(right))
+            {
+                return AttachmentConflict::Incompatible;
+            }
+        }
+        (Some(attachment), None) => {
+            if let Some(other_scope) = update_config_effective_scope(&concurrent.operation)
+                && EffectiveMetadataScope::from_attachment(attachment).overlaps(&other_scope)
+            {
+                return AttachmentConflict::Incompatible;
+            }
+        }
+        (None, Some(attachment)) => {
+            if let Some(other_scope) = update_config_effective_scope(&local.operation)
+                && EffectiveMetadataScope::from_attachment(attachment).overlaps(&other_scope)
+            {
+                return AttachmentConflict::Incompatible;
+            }
+        }
+        (None, None) => {}
+    }
+
+    AttachmentConflict::None
 }
 
 /// True when any newly created index field intersects ExactMerge output coverage.
@@ -287,6 +432,16 @@ impl<'a> TransactionRebase<'a> {
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+        match check_attachment_aware_conflict(&self.transaction, other_transaction) {
+            AttachmentConflict::Retryable => {
+                return Err(self.retryable_conflict_err(other_transaction, other_version));
+            }
+            AttachmentConflict::Incompatible => {
+                return Err(self.incompatible_conflict_err(other_transaction, other_version));
+            }
+            AttachmentConflict::None => {}
+        }
+
         // Either order: the claim was checked without the write's data.
         let ours = &self.transaction.operation;
         let theirs = &other_transaction.operation;
@@ -7353,5 +7508,519 @@ mod tests {
                 "escape must be InvalidInput, got {err:?}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // A4.3 attached schema/field metadata conflict semantics.
+    //
+    // TransactionRebase::check_txn receives complete Transactions but currently
+    // dispatches only on Operation, so schema_metadata_updates attachments are
+    // ignored. These tests pin the attachment-aware contract: scope overlap
+    // only (schema vs schema, same field id); no key/value comparison.
+    // -------------------------------------------------------------------------
+
+    use crate::dataset::transaction::{SchemaMetadataUpdates, UpdateMap, UpdateMapEntry};
+
+    fn a43_upsert_map(key: &str, value: &str) -> UpdateMap {
+        UpdateMap {
+            update_entries: vec![UpdateMapEntry::from((key, value))],
+            replace: false,
+        }
+    }
+
+    /// Merge no-op under UpdateMap apply semantics (`replace=false`, zero entries).
+    fn a43_noop_map() -> UpdateMap {
+        UpdateMap {
+            update_entries: vec![],
+            replace: false,
+        }
+    }
+
+    fn a43_schema_attachment(key: &str, value: &str) -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(a43_upsert_map(key, value)),
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    fn a43_field_attachment(field_id: i32, key: &str, value: &str) -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(field_id, a43_upsert_map(key, value))]),
+        }
+    }
+
+    fn a43_attach(operation: Operation, updates: SchemaMetadataUpdates) -> Transaction {
+        Transaction::new(0, operation, None)
+            .with_schema_metadata_updates(updates)
+            .expect("A4.3 fixture attachment must be valid for Append/Delete/Update")
+    }
+
+    /// Build a rebase from a complete Transaction using the existing
+    /// modified_fragment_ids test pattern (no dataset IO).
+    fn a43_rebase_from_txn(transaction: Transaction) -> TransactionRebase<'static> {
+        let modified_fragment_ids =
+            modified_fragment_ids(&transaction.operation).collect::<HashSet<_>>();
+        TransactionRebase {
+            transaction,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids,
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        }
+    }
+
+    fn a43_check_matches(
+        label: &str,
+        transaction: Transaction,
+        other: &Transaction,
+        expected: ConflictResult,
+    ) -> std::result::Result<(), String> {
+        let mut rebase = a43_rebase_from_txn(transaction);
+        let result = rebase.check_txn(other, 1);
+        let ok = match expected {
+            ConflictResult::Compatible => result.is_ok(),
+            ConflictResult::NotCompatible => {
+                matches!(result, Err(Error::IncompatibleTransaction { .. }))
+            }
+            ConflictResult::Retryable => {
+                matches!(result, Err(Error::RetryableCommitConflict { .. }))
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("{label}: expected {expected:?}, got {result:?}"))
+        }
+    }
+
+    fn a43_check_both_orders(
+        name: &str,
+        left: Transaction,
+        right: Transaction,
+        expected: ConflictResult,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        if let Err(err) = a43_check_matches(
+            &format!("{name} (left over right)"),
+            left.clone(),
+            &right,
+            expected,
+        ) {
+            failures.push(err);
+        }
+        if let Err(err) =
+            a43_check_matches(&format!("{name} (right over left)"), right, &left, expected)
+        {
+            failures.push(err);
+        }
+        failures
+    }
+
+    fn a43_assert_both_orders(
+        name: &str,
+        left: Transaction,
+        right: Transaction,
+        expected: ConflictResult,
+    ) {
+        let failures = a43_check_both_orders(name, left, right, expected);
+        assert!(
+            failures.is_empty(),
+            "A4.3 mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    fn a43_assert_matrix(cases: Vec<(&str, Transaction, Transaction, ConflictResult)>) {
+        let mut failures = Vec::new();
+        for (name, left, right, expected) in cases {
+            failures.extend(a43_check_both_orders(name, left, right, expected));
+        }
+        assert!(
+            failures.is_empty(),
+            "A4.3 mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    fn a43_append_op() -> Operation {
+        Operation::Append {
+            fragments: vec![Fragment::new(10)],
+        }
+    }
+
+    fn a43_merge_op() -> Operation {
+        Operation::Merge {
+            fragments: vec![Fragment::new(0)],
+            schema: lance_core::datatypes::Schema::default(),
+            preserves_nullability: true,
+        }
+    }
+
+    fn a43_project_op() -> Operation {
+        Operation::Project {
+            schema: lance_core::datatypes::Schema::try_from(&Schema::new(vec![Field::new(
+                "a",
+                DataType::Int32,
+                false,
+            )]))
+            .unwrap(),
+            preserves_nullability: true,
+        }
+    }
+
+    fn a43_overwrite_op() -> Operation {
+        Operation::Overwrite {
+            fragments: vec![Fragment::new(0)],
+            schema: lance_core::datatypes::Schema::default(),
+            config_upsert_values: None,
+            initial_bases: None,
+        }
+    }
+
+    fn a43_restore_op() -> Operation {
+        Operation::Restore { version: 1 }
+    }
+
+    fn a43_exact_merge_op() -> Operation {
+        a3_exact_merge(
+            vec![a3_source_fragment()],
+            vec![a3_candidate_fragment()],
+            vec![0],
+            vec![2],
+        )
+    }
+
+    /// Attachment vs attachment: same *effective* schema scope or same
+    /// *effective* field id is IncompatibleTransaction regardless of key;
+    /// schema-vs-field and distinct field ids stay attachment-compatible
+    /// (Append/Append => Ok). Structural presence of a no-op UpdateMap
+    /// (`replace=false`, empty entries) must not enlarge the conflict scope.
+    #[test]
+    fn test_a43_attachment_vs_attachment_scope_matrix() {
+        use ConflictResult::*;
+
+        a43_assert_matrix(vec![
+            (
+                "both_schema_metadata",
+                a43_attach(a43_append_op(), a43_schema_attachment("owner", "a")),
+                a43_attach(a43_append_op(), a43_schema_attachment("other_key", "b")),
+                NotCompatible,
+            ),
+            (
+                "same_field_id",
+                a43_attach(a43_append_op(), a43_field_attachment(0, "unit", "m")),
+                a43_attach(a43_append_op(), a43_field_attachment(0, "other_key", "cm")),
+                NotCompatible,
+            ),
+            (
+                "schema_vs_field",
+                a43_attach(a43_append_op(), a43_schema_attachment("owner", "a")),
+                a43_attach(a43_append_op(), a43_field_attachment(0, "unit", "m")),
+                Compatible,
+            ),
+            (
+                "distinct_field_ids",
+                a43_attach(a43_append_op(), a43_field_attachment(0, "unit", "m")),
+                a43_attach(a43_append_op(), a43_field_attachment(1, "unit", "m")),
+                Compatible,
+            ),
+            // Schema-level no-op map must not claim schema scope; effective
+            // scopes are field 0 vs (schema + field 1) — disjoint.
+            (
+                "schema_noop_plus_field0_vs_schema_plus_field1",
+                a43_attach(
+                    a43_append_op(),
+                    SchemaMetadataUpdates {
+                        schema_metadata_updates: Some(a43_noop_map()),
+                        field_metadata_updates: HashMap::from([(0, a43_upsert_map("unit", "m"))]),
+                    },
+                ),
+                a43_attach(
+                    a43_append_op(),
+                    SchemaMetadataUpdates {
+                        schema_metadata_updates: Some(a43_upsert_map("owner", "a")),
+                        field_metadata_updates: HashMap::from([(1, a43_upsert_map("unit", "m"))]),
+                    },
+                ),
+                Compatible,
+            ),
+            // Field-0 no-op map must not claim field 0; effective scopes are
+            // schema vs field 0 — still attachment-compatible.
+            (
+                "schema_plus_field0_noop_vs_field0",
+                a43_attach(
+                    a43_append_op(),
+                    SchemaMetadataUpdates {
+                        schema_metadata_updates: Some(a43_upsert_map("owner", "a")),
+                        field_metadata_updates: HashMap::from([(0, a43_noop_map())]),
+                    },
+                ),
+                a43_attach(a43_append_op(), a43_field_attachment(0, "unit", "m")),
+                Compatible,
+            ),
+        ]);
+    }
+
+    /// Attachment vs Operation::UpdateConfig: same schema/field scope is
+    /// IncompatibleTransaction; distinct scopes and config/table-only updates
+    /// remain attachment-compatible under otherwise-compatible Append.
+    #[test]
+    fn test_a43_attachment_vs_update_config_scope_matrix() {
+        use ConflictResult::*;
+
+        a43_assert_matrix(vec![
+            (
+                "schema_attachment_vs_schema_update_config",
+                a43_attach(a43_append_op(), a43_schema_attachment("owner", "a")),
+                Transaction::new(
+                    0,
+                    create_update_config_for_test(
+                        None,
+                        None,
+                        Some(HashMap::from([("other_key".to_string(), "b".to_string())])),
+                        None,
+                    ),
+                    None,
+                ),
+                NotCompatible,
+            ),
+            (
+                "field_attachment_vs_same_field_update_config",
+                a43_attach(a43_append_op(), a43_field_attachment(0, "unit", "m")),
+                Transaction::new(
+                    0,
+                    create_update_config_for_test(
+                        None,
+                        None,
+                        None,
+                        Some(HashMap::from([(
+                            0u32,
+                            HashMap::from([("other_key".to_string(), "cm".to_string())]),
+                        )])),
+                    ),
+                    None,
+                ),
+                NotCompatible,
+            ),
+            (
+                "distinct_field_ids_vs_update_config",
+                a43_attach(a43_append_op(), a43_field_attachment(0, "unit", "m")),
+                Transaction::new(
+                    0,
+                    create_update_config_for_test(
+                        None,
+                        None,
+                        None,
+                        Some(HashMap::from([(
+                            1u32,
+                            HashMap::from([("unit".to_string(), "m".to_string())]),
+                        )])),
+                    ),
+                    None,
+                ),
+                Compatible,
+            ),
+            (
+                "schema_attachment_vs_field_update_config",
+                a43_attach(a43_append_op(), a43_schema_attachment("owner", "a")),
+                Transaction::new(
+                    0,
+                    create_update_config_for_test(
+                        None,
+                        None,
+                        None,
+                        Some(HashMap::from([(
+                            0u32,
+                            HashMap::from([("unit".to_string(), "m".to_string())]),
+                        )])),
+                    ),
+                    None,
+                ),
+                Compatible,
+            ),
+            (
+                "field_attachment_vs_schema_update_config",
+                a43_attach(a43_append_op(), a43_field_attachment(0, "unit", "m")),
+                Transaction::new(
+                    0,
+                    create_update_config_for_test(
+                        None,
+                        None,
+                        Some(HashMap::from([("owner".to_string(), "a".to_string())])),
+                        None,
+                    ),
+                    None,
+                ),
+                Compatible,
+            ),
+            (
+                "attachment_vs_config_only_update_config",
+                a43_attach(a43_append_op(), a43_schema_attachment("owner", "a")),
+                Transaction::new(
+                    0,
+                    create_update_config_for_test(
+                        Some(HashMap::from([("lance.a43".to_string(), "ok".to_string())])),
+                        None,
+                        None,
+                        None,
+                    ),
+                    None,
+                ),
+                Compatible,
+            ),
+            (
+                "attachment_vs_table_metadata_only_update_config",
+                a43_attach(a43_append_op(), a43_schema_attachment("owner", "a")),
+                Transaction::new(
+                    0,
+                    Operation::UpdateConfig {
+                        config_updates: None,
+                        table_metadata_updates: Some(a43_upsert_map("table_k", "v")),
+                        schema_metadata_updates: None,
+                        field_metadata_updates: HashMap::new(),
+                    },
+                    None,
+                ),
+                Compatible,
+            ),
+        ]);
+    }
+
+    /// Any attachment versus schema replacement/pinning: Merge/Project/ExactMerge
+    /// => RetryableCommitConflict; Overwrite/Restore => IncompatibleTransaction.
+    /// Attached Append isolates metadata behavior from ordinary data overlap.
+    #[test]
+    fn test_a43_attachment_vs_schema_replacement_ops() {
+        use ConflictResult::*;
+
+        let attached = a43_attach(a43_append_op(), a43_schema_attachment("owner", "a"));
+        a43_assert_matrix(vec![
+            (
+                "attachment_vs_merge",
+                attached.clone(),
+                Transaction::new(0, a43_merge_op(), None),
+                Retryable,
+            ),
+            (
+                "attachment_vs_project",
+                attached.clone(),
+                Transaction::new(0, a43_project_op(), None),
+                Retryable,
+            ),
+            (
+                "attachment_vs_exact_merge",
+                attached.clone(),
+                Transaction::new(0, a43_exact_merge_op(), None),
+                Retryable,
+            ),
+            (
+                "attachment_vs_overwrite",
+                attached.clone(),
+                Transaction::new(0, a43_overwrite_op(), None),
+                NotCompatible,
+            ),
+            (
+                "attachment_vs_restore",
+                attached,
+                Transaction::new(0, a43_restore_op(), None),
+                NotCompatible,
+            ),
+        ]);
+    }
+
+    /// Unrelated CreateIndex / ReserveFragments / config-only UpdateConfig remain
+    /// compatible with an attached Append.
+    #[test]
+    fn test_a43_attachment_compatible_with_unrelated_ops() {
+        use ConflictResult::*;
+
+        let attached = a43_attach(a43_append_op(), a43_schema_attachment("owner", "a"));
+        let index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "a43_idx".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        a43_assert_both_orders(
+            "attachment_vs_create_index",
+            attached.clone(),
+            Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                    mem_wal_index_catchup_advances: Vec::new(),
+                },
+                None,
+            ),
+            Compatible,
+        );
+        a43_assert_both_orders(
+            "attachment_vs_reserve_fragments",
+            attached.clone(),
+            Transaction::new(0, Operation::ReserveFragments { num_fragments: 3 }, None),
+            Compatible,
+        );
+        a43_assert_both_orders(
+            "attachment_vs_config_only_update_config",
+            attached,
+            Transaction::new(
+                0,
+                create_update_config_for_test(
+                    Some(HashMap::from([("lance.a43".to_string(), "ok".to_string())])),
+                    None,
+                    None,
+                    None,
+                ),
+                None,
+            ),
+            Compatible,
+        );
+    }
+
+    /// Underlying data conflicts are not masked by attachments: overlapping
+    /// Delete/Update still yields the existing RetryableCommitConflict category.
+    #[test]
+    fn test_a43_attachment_does_not_mask_data_conflicts() {
+        use ConflictResult::*;
+
+        let attached_delete = a43_attach(
+            Operation::Delete {
+                updated_fragments: vec![Fragment::new(0)],
+                deleted_fragment_ids: vec![],
+                predicate: "a > 0".to_string(),
+            },
+            a43_schema_attachment("owner", "a"),
+        );
+        let overlapping_update = Transaction::new(
+            0,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![Fragment::new(0)],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+        a43_assert_both_orders(
+            "attached_delete_vs_overlapping_update",
+            attached_delete,
+            overlapping_update,
+            Retryable,
+        );
     }
 }

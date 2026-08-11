@@ -279,6 +279,10 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        // Fail closed on empty/unsupported attachments before any store resolve,
+        // dataset load, or transaction-file / manifest write I/O.
+        transaction.validate_schema_metadata_updates()?;
+
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -527,6 +531,16 @@ impl<'a> CommitBuilder<'a> {
                 "No transactions to commit".into(),
             ));
         }
+        // Batch merge currently drops attachments; reject instead of silently
+        // stripping schema/field patches from any input transaction.
+        if transactions
+            .iter()
+            .any(|t| t.schema_metadata_updates.is_some())
+        {
+            return Err(Error::not_supported_source(
+                "schema_metadata_updates attachments are not supported in batch commits".into(),
+            ));
+        }
         if transactions
             .iter()
             .any(|t| !matches!(t.operation, Operation::Append { .. }))
@@ -552,6 +566,7 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             tag: None,
             transaction_properties: None,
+            schema_metadata_updates: None,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -569,6 +584,9 @@ pub struct BatchCommitResult {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
@@ -578,13 +596,13 @@ mod tests {
         DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
     };
     use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
-    use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
 
-    use crate::utils::test::ThrottledStoreWrapper;
-
+    use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::transaction::{SchemaMetadataUpdates, UpdateMap, UpdateMapEntry};
     use crate::dataset::{InsertBuilder, WriteParams};
+    use crate::utils::test::ThrottledStoreWrapper;
 
     use super::*;
 
@@ -621,6 +639,7 @@ mod tests {
             read_version,
             tag: None,
             transaction_properties: None,
+            schema_metadata_updates: None,
         }
     }
 
@@ -646,6 +665,129 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Err(CommitError::CommitConflict)
         }
+    }
+
+    /// Immediate conflict fixture for A4.2b: never lands a manifest write.
+    #[derive(Debug)]
+    struct ImmediateConflictingCommitHandler;
+
+    #[async_trait::async_trait]
+    impl CommitHandler for ImmediateConflictingCommitHandler {
+        fn is_version_not_found_definitive(&self) -> bool {
+            true
+        }
+
+        async fn commit(
+            &self,
+            _manifest: &mut Manifest,
+            _indices: Option<Vec<IndexMetadata>>,
+            _base_path: &object_store::path::Path,
+            _object_store: &ObjectStore,
+            _manifest_writer: ManifestWriter,
+            _naming_scheme: ManifestNamingScheme,
+            _transaction: Option<TableTransaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            Err(CommitError::CommitConflict)
+        }
+    }
+
+    fn a42b_metadata_updates() -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry::from(("schema_owner", "a42b"))],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::from([(
+                0i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from(("field_unit", "m"))],
+                    replace: false,
+                },
+            )]),
+        }
+    }
+
+    fn empty_noop_metadata_updates() -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    async fn a42b_one_fragment_dataset(uri: &str, session: Arc<Session>) -> Arc<Dataset> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        Arc::new(
+            InsertBuilder::new(uri)
+                .with_params(&WriteParams {
+                    session: Some(session),
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap(),
+        )
+    }
+
+    async fn a42b_reopen(uri: &str, session: Arc<Session>) -> Dataset {
+        DatasetBuilder::from_uri(uri)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap()
+    }
+
+    fn a42b_fragment_ids(dataset: &Dataset) -> Vec<u64> {
+        dataset.manifest().fragments.iter().map(|f| f.id).collect()
+    }
+
+    fn a42b_assert_metadata_absent(dataset: &Dataset) {
+        assert!(
+            !dataset.schema().metadata.contains_key("schema_owner"),
+            "schema_owner must be absent, got {:?}",
+            dataset.schema().metadata
+        );
+        let field0 = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("field id 0 must exist");
+        assert!(
+            !field0.metadata.contains_key("field_unit"),
+            "field_unit must be absent, got {:?}",
+            field0.metadata
+        );
+    }
+
+    fn a42b_assert_metadata_present(dataset: &Dataset) {
+        assert_eq!(
+            dataset
+                .schema()
+                .metadata
+                .get("schema_owner")
+                .map(String::as_str),
+            Some("a42b"),
+            "schema metadata patch must be published"
+        );
+        let field0 = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("field id 0 must exist");
+        assert_eq!(
+            field0.metadata.get("field_unit").map(String::as_str),
+            Some("m"),
+            "field id 0 metadata patch must be published"
+        );
     }
 
     #[tokio::test]
@@ -1093,6 +1235,7 @@ mod tests {
             read_version: 1,
             tag: None,
             transaction_properties: None,
+            schema_metadata_updates: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])
@@ -1196,5 +1339,242 @@ mod tests {
             "read_iops = {}; a full listing was likely used",
             io_stats.read_iops
         );
+    }
+
+    /// A4.2b: a valid attached Append publishes data + schema/field metadata in
+    /// one table version, and a same-session reopen still sees them together.
+    #[tokio::test]
+    async fn test_a42b_attached_append_publishes_data_and_metadata_atomically() {
+        let session = Arc::new(Session::default());
+        let uri = "memory://a42b-attached-append";
+        let dataset = a42b_one_fragment_dataset(uri, session.clone()).await;
+        let read_version = dataset.manifest().version;
+        let before_fragments = a42b_fragment_ids(&dataset);
+        assert_eq!(
+            before_fragments.len(),
+            1,
+            "fixture must start with one fragment"
+        );
+        a42b_assert_metadata_absent(&dataset);
+
+        let transaction = sample_transaction(read_version)
+            .with_schema_metadata_updates(a42b_metadata_updates())
+            .expect("non-empty attached Append must construct");
+
+        let committed = CommitBuilder::new(dataset.clone())
+            .execute(transaction)
+            .await
+            .expect("valid attached Append must commit");
+
+        assert_eq!(
+            committed.manifest().version,
+            read_version + 1,
+            "exactly one new version"
+        );
+        let committed_fragments = a42b_fragment_ids(&committed);
+        assert_eq!(
+            committed_fragments.len(),
+            before_fragments.len() + 1,
+            "Append must add exactly one fragment"
+        );
+        assert!(
+            before_fragments
+                .iter()
+                .all(|id| committed_fragments.contains(id)),
+            "prior fragment identity must be preserved; before={before_fragments:?} after={committed_fragments:?}"
+        );
+        a42b_assert_metadata_present(&committed);
+
+        let reopened = a42b_reopen(uri, session).await;
+        assert_eq!(reopened.manifest().version, committed.manifest().version);
+        assert_eq!(a42b_fragment_ids(&reopened), committed_fragments);
+        a42b_assert_metadata_present(&reopened);
+    }
+
+    /// A4.2b: an effective-empty attached patch must fail closed before any
+    /// transaction-file or manifest write I/O.
+    #[tokio::test]
+    async fn test_a42b_empty_attached_patch_rejects_before_write() {
+        let session = Arc::new(Session::default());
+        let uri = "memory://a42b-empty-patch";
+        let dataset = a42b_one_fragment_dataset(uri, session.clone()).await;
+        let read_version = dataset.manifest().version;
+        let before_fragments = a42b_fragment_ids(&dataset);
+        a42b_assert_metadata_absent(&dataset);
+
+        // Bypass with_schema_metadata_updates so CommitBuilder must preflight.
+        let mut transaction = sample_transaction(read_version);
+        transaction.schema_metadata_updates = Some(empty_noop_metadata_updates());
+        assert!(
+            transaction
+                .schema_metadata_updates
+                .as_ref()
+                .is_some_and(SchemaMetadataUpdates::is_empty),
+            "fixture must carry an effective no-op attachment"
+        );
+
+        dataset.object_store.as_ref().io_stats_incremental();
+        let err = CommitBuilder::new(dataset.clone())
+            .execute(transaction)
+            .await
+            .expect_err("empty attached patch must be rejected");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "empty attached patch must be InvalidInput, got {err:?}"
+        );
+
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_io_eq!(
+            io_stats,
+            write_iops,
+            0,
+            "validation must precede transaction-file / manifest writes"
+        );
+
+        assert_eq!(dataset.manifest().version, read_version);
+        assert_eq!(a42b_fragment_ids(&dataset), before_fragments);
+        a42b_assert_metadata_absent(&dataset);
+
+        let reopened = a42b_reopen(uri, session).await;
+        assert_eq!(reopened.manifest().version, read_version);
+        assert_eq!(a42b_fragment_ids(&reopened), before_fragments);
+        a42b_assert_metadata_absent(&reopened);
+    }
+
+    /// A4.2b: a non-empty patch targeting a nonexistent field must publish
+    /// neither the Append data effect nor any metadata side.
+    #[tokio::test]
+    async fn test_a42b_nonexistent_field_attached_append_publishes_neither_side() {
+        let session = Arc::new(Session::default());
+        let uri = "memory://a42b-missing-field";
+        let dataset = a42b_one_fragment_dataset(uri, session.clone()).await;
+        let read_version = dataset.manifest().version;
+        let before_fragments = a42b_fragment_ids(&dataset);
+        a42b_assert_metadata_absent(&dataset);
+
+        let updates = SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry::from(("schema_owner", "a42b"))],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::from([(
+                999i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from(("field_unit", "m"))],
+                    replace: false,
+                },
+            )]),
+        };
+        let transaction = sample_transaction(read_version)
+            .with_schema_metadata_updates(updates)
+            .expect("non-empty attachment targeting field 999 must construct");
+
+        let err = CommitBuilder::new(dataset.clone())
+            .execute(transaction)
+            .await
+            .expect_err("nonexistent field id must reject the commit");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "nonexistent field id must be InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("999") && err.to_string().contains("does not exist"),
+            "error must name the missing field id, got {err}"
+        );
+
+        assert_eq!(dataset.manifest().version, read_version);
+        assert_eq!(a42b_fragment_ids(&dataset), before_fragments);
+        a42b_assert_metadata_absent(&dataset);
+
+        let reopened = a42b_reopen(uri, session).await;
+        assert_eq!(reopened.manifest().version, read_version);
+        assert_eq!(a42b_fragment_ids(&reopened), before_fragments);
+        a42b_assert_metadata_absent(&reopened);
+    }
+
+    /// A4.2b: execute_batch must reject attached Appends instead of merging data
+    /// and silently dropping schema/field patches.
+    #[tokio::test]
+    async fn test_a42b_execute_batch_rejects_attached_append() {
+        let session = Arc::new(Session::default());
+        let uri = "memory://a42b-batch-attached";
+        let dataset = a42b_one_fragment_dataset(uri, session.clone()).await;
+        let read_version = dataset.manifest().version;
+        let before_fragments = a42b_fragment_ids(&dataset);
+
+        let attached = sample_transaction(read_version)
+            .with_schema_metadata_updates(a42b_metadata_updates())
+            .expect("non-empty attached Append must construct");
+        let unattached = sample_transaction(read_version);
+
+        dataset.object_store.as_ref().io_stats_incremental();
+        let res = CommitBuilder::new(dataset.clone())
+            .execute_batch(vec![unattached, attached])
+            .await;
+        let Err(err) = res else {
+            panic!("batch commit must reject attached Append instead of merging/dropping patches");
+        };
+        assert!(
+            matches!(err, Error::NotSupported { .. } | Error::InvalidInput { .. }),
+            "attached batch must be NotSupported or InvalidInput, got {err:?}"
+        );
+
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_io_eq!(
+            io_stats,
+            write_iops,
+            0,
+            "rejected attached batch must not write"
+        );
+        assert_eq!(dataset.manifest().version, read_version);
+        assert_eq!(a42b_fragment_ids(&dataset), before_fragments);
+        a42b_assert_metadata_absent(&dataset);
+
+        let reopened = a42b_reopen(uri, session).await;
+        assert_eq!(reopened.manifest().version, read_version);
+        assert_eq!(a42b_fragment_ids(&reopened), before_fragments);
+        a42b_assert_metadata_absent(&reopened);
+    }
+
+    /// A4.2b: when a valid attached candidate's manifest write never lands,
+    /// reopen must show neither the data nor the metadata side.
+    #[tokio::test]
+    async fn test_a42b_manifest_conflict_leaves_attached_effects_absent() {
+        let session = Arc::new(Session::default());
+        let uri = "memory://a42b-manifest-conflict";
+        let dataset = a42b_one_fragment_dataset(uri, session.clone()).await;
+        let read_version = dataset.manifest().version;
+        let before_fragments = a42b_fragment_ids(&dataset);
+        a42b_assert_metadata_absent(&dataset);
+
+        let transaction = sample_transaction(read_version)
+            .with_schema_metadata_updates(a42b_metadata_updates())
+            .expect("non-empty attached Append must construct");
+
+        let err = CommitBuilder::new(dataset.clone())
+            .with_commit_handler(Arc::new(ImmediateConflictingCommitHandler))
+            .with_max_retries(1)
+            .with_timeout(None)
+            .execute(transaction)
+            .await
+            .expect_err("conflicting handler must prevent the manifest write");
+        assert!(
+            matches!(
+                err,
+                Error::CommitConflict { .. }
+                    | Error::TooMuchWriteContention { .. }
+                    | Error::RetryableCommitConflict { .. }
+            ),
+            "expected a commit-conflict style error, got {err:?}"
+        );
+
+        assert_eq!(dataset.manifest().version, read_version);
+        assert_eq!(a42b_fragment_ids(&dataset), before_fragments);
+        a42b_assert_metadata_absent(&dataset);
+
+        let reopened = a42b_reopen(uri, session).await;
+        assert_eq!(reopened.manifest().version, read_version);
+        assert_eq!(a42b_fragment_ids(&reopened), before_fragments);
+        a42b_assert_metadata_absent(&reopened);
     }
 }

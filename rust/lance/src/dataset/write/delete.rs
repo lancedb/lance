@@ -5,7 +5,7 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::scanner::ExprFilter;
 use crate::{
     Dataset,
-    dataset::transaction::{Operation, Transaction},
+    dataset::transaction::{Operation, SchemaMetadataUpdates, Transaction},
     dataset::utils::make_rowid_capture_stream,
 };
 use datafusion::logical_expr::Expr;
@@ -123,6 +123,8 @@ pub struct DeleteBuilder {
     filter: ExprFilter,
     conflict_retries: u32,
     retry_timeout: Duration,
+    /// Optional schema/field metadata patch published atomically with the Delete.
+    schema_metadata_updates: Option<SchemaMetadataUpdates>,
 }
 
 impl DeleteBuilder {
@@ -133,6 +135,7 @@ impl DeleteBuilder {
             filter: ExprFilter::Sql(predicate.into()),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
+            schema_metadata_updates: None,
         }
     }
 
@@ -143,6 +146,7 @@ impl DeleteBuilder {
             filter: ExprFilter::Datafusion(expr),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
+            schema_metadata_updates: None,
         }
     }
 
@@ -158,11 +162,24 @@ impl DeleteBuilder {
         self
     }
 
+    /// Attach schema/field metadata updates to publish atomically with the Delete.
+    ///
+    /// The patch is stored on the Delete [`Transaction`] and committed in the same
+    /// version as the row deletions, so readers never observe deleted rows without
+    /// the metadata (or vice versa). Empty / no-op patches are rejected with
+    /// [`Error::InvalidInput`].
+    pub fn with_schema_metadata_updates(mut self, updates: SchemaMetadataUpdates) -> Result<Self> {
+        updates.validate_non_empty()?;
+        self.schema_metadata_updates = Some(updates);
+        Ok(self)
+    }
+
     /// Execute the delete operation
     pub async fn execute(self) -> Result<DeleteResult> {
         let job = DeleteJob {
             dataset: self.dataset.clone(),
             filter: self.filter,
+            schema_metadata_updates: self.schema_metadata_updates,
         };
 
         let config = RetryConfig {
@@ -203,6 +220,7 @@ impl DeleteBuilder {
         let job = DeleteJob {
             dataset: self.dataset,
             filter: self.filter,
+            schema_metadata_updates: self.schema_metadata_updates,
         };
         let data = job.execute_impl().await?;
         let DeleteData {
@@ -215,7 +233,7 @@ impl DeleteBuilder {
             job.dataset.as_ref(),
             updated_fragments,
             deleted_fragment_ids,
-        );
+        )?;
         Ok(UncommittedDelete {
             transaction,
             affected_rows,
@@ -229,6 +247,8 @@ impl DeleteBuilder {
 struct DeleteJob {
     dataset: Arc<Dataset>,
     filter: ExprFilter,
+    /// Copied from [`DeleteBuilder`] so retries and clones retain the patch.
+    schema_metadata_updates: Option<SchemaMetadataUpdates>,
 }
 
 /// Data returned by delete operation
@@ -245,7 +265,7 @@ impl DeleteJob {
         dataset: &Dataset,
         updated_fragments: Vec<Fragment>,
         deleted_fragment_ids: Vec<u64>,
-    ) -> Transaction {
+    ) -> Result<Transaction> {
         let predicate = match &self.filter {
             ExprFilter::Sql(s) => s.clone(),
             ExprFilter::Datafusion(expr) => expr.to_string(),
@@ -258,7 +278,11 @@ impl DeleteJob {
             deleted_fragment_ids,
             predicate,
         };
-        Transaction::new(dataset.manifest.version, operation, None)
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        match &self.schema_metadata_updates {
+            Some(updates) => transaction.with_schema_metadata_updates(updates.clone()),
+            None => Ok(transaction),
+        }
     }
 }
 
@@ -360,7 +384,7 @@ impl RetryExecutor for DeleteJob {
             num_deleted_rows,
         } = data;
         let transaction =
-            self.build_transaction(dataset.as_ref(), updated_fragments, deleted_fragment_ids);
+            self.build_transaction(dataset.as_ref(), updated_fragments, deleted_fragment_ids)?;
 
         let mut builder = CommitBuilder::new(dataset);
 
@@ -376,6 +400,7 @@ impl RetryExecutor for DeleteJob {
     }
 
     fn update_dataset(&mut self, dataset: Arc<Dataset>) {
+        // Retry refreshes only the dataset reference; the metadata patch stays.
         self.dataset = dataset;
     }
 }
@@ -394,6 +419,7 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<DeleteResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::transaction::{SchemaMetadataUpdates, UpdateMap, UpdateMapEntry};
     use crate::dataset::{InsertBuilder, UpdateBuilder};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
@@ -407,7 +433,7 @@ mod tests {
     use lance_file::version::LanceFileVersion;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use rstest::rstest;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::sync::Arc;
 
@@ -993,6 +1019,7 @@ mod tests {
         let delete_job = DeleteJob {
             dataset: dataset_arc.clone(),
             filter: ExprFilter::Sql("true".to_string()),
+            schema_metadata_updates: None,
         };
         let delete_data = delete_job.execute_impl().await.unwrap();
 
@@ -1068,5 +1095,237 @@ mod tests {
 
         dataset.checkout_latest().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 90);
+    }
+
+    // -------------------------------------------------------------------------
+    // A4.4b: DeleteBuilder schema metadata attachment
+    // -------------------------------------------------------------------------
+
+    const A44B_SCHEMA_KEY: &str = "a44b.schema";
+    const A44B_SCHEMA_VALUE: &str = "schema-v1";
+    const A44B_FIELD_KEY: &str = "a44b.field";
+    const A44B_FIELD_VALUE: &str = "field-v1";
+
+    fn a44b_metadata_updates() -> SchemaMetadataUpdates {
+        SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry::from((A44B_SCHEMA_KEY, A44B_SCHEMA_VALUE))],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::from([(
+                0i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from((A44B_FIELD_KEY, A44B_FIELD_VALUE))],
+                    replace: false,
+                },
+            )]),
+        }
+    }
+
+    fn a44b_id_batch(values: Vec<u32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from(values))]).unwrap()
+    }
+
+    async fn a44b_create_dataset(uri: &str) -> Dataset {
+        InsertBuilder::new(uri)
+            .execute(vec![a44b_id_batch((0..10).collect())])
+            .await
+            .expect("A4.4b fixture create must succeed")
+    }
+
+    fn a44b_assert_metadata_absent(dataset: &Dataset) {
+        assert!(
+            !dataset.schema().metadata.contains_key(A44B_SCHEMA_KEY),
+            "{A44B_SCHEMA_KEY} must be absent, got {:?}",
+            dataset.schema().metadata
+        );
+        let field0 = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("field id 0 must exist");
+        assert!(
+            !field0.metadata.contains_key(A44B_FIELD_KEY),
+            "{A44B_FIELD_KEY} must be absent, got {:?}",
+            field0.metadata
+        );
+    }
+
+    fn a44b_assert_metadata_present(dataset: &Dataset) {
+        assert_eq!(
+            dataset
+                .schema()
+                .metadata
+                .get(A44B_SCHEMA_KEY)
+                .map(String::as_str),
+            Some(A44B_SCHEMA_VALUE),
+            "schema metadata patch must be published"
+        );
+        let field0 = dataset
+            .schema()
+            .field_by_id(0)
+            .expect("field id 0 must exist");
+        assert_eq!(
+            field0.metadata.get(A44B_FIELD_KEY).map(String::as_str),
+            Some(A44B_FIELD_VALUE),
+            "field id 0 metadata patch must be published"
+        );
+    }
+
+    async fn a44b_assert_remaining_ids(dataset: &Dataset, expected: &[u32]) {
+        assert_eq!(dataset.count_rows(None).await.unwrap(), expected.len());
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let values: Vec<u32> = batch["i"].as_primitive::<UInt32Type>().values().to_vec();
+        assert_eq!(values, expected);
+    }
+
+    /// A4.4b: Delete via DeleteBuilder publishes row deletes + schema/field
+    /// metadata in exactly one version; a fresh Dataset::open agrees.
+    #[tokio::test]
+    async fn test_a44b_delete_publishes_data_and_metadata_in_one_version() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let dataset = a44b_create_dataset(uri).await;
+        let before_version = dataset.version().version;
+        a44b_assert_metadata_absent(&dataset);
+
+        let result = DeleteBuilder::new(Arc::new(dataset), "i < 3")
+            .with_schema_metadata_updates(a44b_metadata_updates())
+            .expect("Delete attachment must construct")
+            .execute()
+            .await
+            .expect("attached Delete must commit");
+
+        assert_eq!(result.num_deleted_rows, 3);
+        assert_eq!(
+            result.new_dataset.version().version,
+            before_version + 1,
+            "exactly one new version"
+        );
+        a44b_assert_remaining_ids(&result.new_dataset, &(3..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_present(&result.new_dataset);
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            reopened.version().version,
+            result.new_dataset.version().version
+        );
+        a44b_assert_remaining_ids(&reopened, &(3..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_present(&reopened);
+    }
+
+    /// A4.4b: execute_uncommitted preserves Delete + exact attachment without
+    /// publishing; CommitBuilder with affected_rows then lands both sides.
+    #[tokio::test]
+    async fn test_a44b_execute_uncommitted_preserves_attachment_until_commit() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let dataset = Arc::new(a44b_create_dataset(uri).await);
+        let before_version = dataset.version().version;
+        a44b_assert_metadata_absent(&dataset);
+
+        let updates = a44b_metadata_updates();
+        let staged_delete = DeleteBuilder::new(dataset.clone(), "i < 3")
+            .with_schema_metadata_updates(updates.clone())
+            .expect("Delete attachment must construct")
+            .execute_uncommitted()
+            .await
+            .expect("uncommitted attached Delete must stage");
+
+        assert!(
+            matches!(
+                &staged_delete.transaction.operation,
+                Operation::Delete { .. }
+            ),
+            "uncommitted transaction must be Delete, got {:?}",
+            staged_delete.transaction.operation
+        );
+        assert_eq!(
+            staged_delete.transaction.schema_metadata_updates.as_ref(),
+            Some(&updates),
+            "attachment must be preserved exactly on the Transaction"
+        );
+        assert_eq!(staged_delete.num_deleted_rows, 3);
+
+        assert_eq!(dataset.version().version, before_version);
+        a44b_assert_remaining_ids(&dataset, &(0..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_absent(&dataset);
+
+        let before_commit = Dataset::open(uri).await.unwrap();
+        assert_eq!(before_commit.version().version, before_version);
+        a44b_assert_remaining_ids(&before_commit, &(0..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_absent(&before_commit);
+
+        let mut commit_builder = CommitBuilder::new(dataset.clone());
+        if let Some(affected_rows) = staged_delete.affected_rows {
+            commit_builder = commit_builder.with_affected_rows(affected_rows);
+        }
+        let committed = commit_builder
+            .execute(staged_delete.transaction)
+            .await
+            .expect("committing attached Delete must succeed");
+
+        assert_eq!(committed.version().version, before_version + 1);
+        a44b_assert_remaining_ids(&committed, &(3..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_present(&committed);
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.version().version, committed.version().version);
+        a44b_assert_remaining_ids(&reopened, &(3..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_present(&reopened);
+    }
+
+    /// A4.4b: a substantive patch targeting nonexistent field id 999 must fail
+    /// atomically at execute; neither deletes nor metadata are visible on reopen.
+    #[tokio::test]
+    async fn test_a44b_nonexistent_field_attached_delete_publishes_neither_side() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let dataset = a44b_create_dataset(uri).await;
+        let before_version = dataset.version().version;
+        a44b_assert_metadata_absent(&dataset);
+
+        let updates = SchemaMetadataUpdates {
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry::from((A44B_SCHEMA_KEY, A44B_SCHEMA_VALUE))],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::from([(
+                999i32,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry::from((A44B_FIELD_KEY, A44B_FIELD_VALUE))],
+                    replace: false,
+                },
+            )]),
+        };
+
+        let err = DeleteBuilder::new(Arc::new(dataset), "i < 3")
+            .with_schema_metadata_updates(updates)
+            .expect("setter may accept; field validity is manifest-relative")
+            .execute()
+            .await
+            .expect_err("nonexistent field id must reject the Delete");
+
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "nonexistent field id must be InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("999"),
+            "error must name the missing field id, got {err}"
+        );
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            reopened.version().version,
+            before_version,
+            "failed Delete must not advance version"
+        );
+        a44b_assert_remaining_ids(&reopened, &(0..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_absent(&reopened);
     }
 }
