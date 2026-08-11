@@ -81,11 +81,6 @@ message Transaction {
   message CreateIndex {
     repeated IndexMetadata new_indices = 1;
     repeated IndexMetadata removed_indices = 2;
-
-    // Briefly held a catch-up field that never reached a release; index
-    // catch-up is now derived from the version a commit read. Held back only so
-    // a transaction file written from main in that window cannot be misread.
-    reserved 3;
   }
 
   // An operation that rewrites but does not change the data in the table. These
