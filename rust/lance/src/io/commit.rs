@@ -909,8 +909,14 @@ fn must_recalculate_fragment_bitmap(
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 /// Indices might also be missing `files` (file sizes), so this function will collect them.
-async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
+///
+/// Returns the logical indices whose `fragment_bitmap` this replaced. Those are
+/// the only changes here that alter what an index covers, and the caller has to
+/// withdraw MemWAL catch-up for them: this runs after the coverage derivation,
+/// and it keeps the segment's UUID.
+async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<Vec<String>> {
     infer_missing_vector_details(dataset, indices).await;
+    let mut recovered_coverage = Vec::new();
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
         Err(BadFragmentBitmapError { bad_indices }) => {
@@ -928,7 +934,11 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             let idx = dataset
                 .open_generic_index(&idx_field.name, &index.uuid, &NoOpMetricsCollector)
                 .await?;
-            index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
+            let recalculated = idx.calculate_included_frags().await?;
+            if index.fragment_bitmap.as_ref() != Some(&recalculated) {
+                recovered_coverage.push(index.name.clone());
+            }
+            index.fragment_bitmap = Some(recalculated);
         }
         // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
         // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
@@ -973,7 +983,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         }
     }
 
-    Ok(())
+    Ok(recovered_coverage)
 }
 
 pub(crate) struct BadFragmentBitmapError {
@@ -1073,21 +1083,14 @@ pub(crate) async fn do_commit_detached_transaction(
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
         check_fragment_ids(&manifest)?;
-        // `migrate_indices` can recalculate a fragment bitmap while keeping its
-        // UUID, so coverage derived during `build_manifest` may describe an index
-        // that no longer exists. Only withdraws, never credits.
-        let segments_at_build = (manifest.reader_feature_flags
-            & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
-            != 0)
-            .then(|| Transaction::logical_index_segments(&indices));
-        migrate_indices(dataset, &mut indices).await?;
-        if let Some(segments_at_build) = segments_at_build {
-            Transaction::withdraw_coverage_invalidated_after_build(
-                &mut indices,
-                &segments_at_build,
-                manifest.version,
-            )?;
-        }
+        // Runs after the coverage derivation and can replace a fragment bitmap
+        // while keeping its UUID, so anything it narrowed loses its position.
+        let recovered_coverage = migrate_indices(dataset, &mut indices).await?;
+        Transaction::withdraw_coverage_invalidated_after_build(
+            &mut indices,
+            &recovered_coverage,
+            manifest.version,
+        )?;
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -1442,21 +1445,14 @@ pub(crate) async fn commit_transaction(
         check_column_indices(&manifest)?;
         check_fragment_ids(&manifest)?;
 
-        // `migrate_indices` can recalculate a fragment bitmap while keeping its
-        // UUID, so coverage derived during `build_manifest` may describe an index
-        // that no longer exists. Only withdraws, never credits.
-        let segments_at_build = (manifest.reader_feature_flags
-            & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
-            != 0)
-            .then(|| Transaction::logical_index_segments(&indices));
-        migrate_indices(&dataset, &mut indices).await?;
-        if let Some(segments_at_build) = segments_at_build {
-            Transaction::withdraw_coverage_invalidated_after_build(
-                &mut indices,
-                &segments_at_build,
-                target_version,
-            )?;
-        }
+        // Runs after the coverage derivation and can replace a fragment bitmap
+        // while keeping its UUID, so anything it narrowed loses its position.
+        let recovered_coverage = migrate_indices(&dataset, &mut indices).await?;
+        Transaction::withdraw_coverage_invalidated_after_build(
+            &mut indices,
+            &recovered_coverage,
+            target_version,
+        )?;
 
         // Try to commit the manifest
         let result = write_manifest_file(

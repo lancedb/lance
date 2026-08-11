@@ -90,7 +90,7 @@ use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{Operation, ReadVersionState, Transaction, TransactionBuilder};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
@@ -1433,29 +1433,45 @@ impl IndexDescription for IndexDescriptionImpl {
 }
 
 impl Dataset {
-    /// Whether a commit on this table could record a new MemWAL catch-up
-    /// position: it is on the protocol, and something has been compacted for an
-    /// index to be behind on.
-    async fn mem_wal_catch_up_may_advance(&self) -> Result<bool> {
+    /// Whether an otherwise empty commit would record a new MemWAL catch-up
+    /// position.
+    ///
+    /// Dry-runs the derivation rather than restating its conditions: a second
+    /// copy of "is this index behind" would be one more place to keep in step
+    /// with the real rule. A no-work optimize publishes no new segment, so the
+    /// index list it would commit is the one already loaded, and the version it
+    /// would read is the current one -- which makes the speculative answer the
+    /// same one the commit reaches.
+    fn mem_wal_catch_up_would_advance(&self, indices: &[IndexMetadata]) -> Result<bool> {
         if self.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
             || self.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
         {
             return Ok(false);
         }
-        let Some(system_index) = self
-            .load_indices()
-            .await?
-            .iter()
-            .find(|index| index.name == MEM_WAL_INDEX_NAME)
-            .cloned()
-        else {
-            return Ok(false);
+        let catchup_of = |indices: &[IndexMetadata]| -> Result<Option<Vec<_>>> {
+            indices
+                .iter()
+                .find(|index| index.name == MEM_WAL_INDEX_NAME)
+                .cloned()
+                .map(|index| {
+                    crate::index::mem_wal::load_mem_wal_index_details(index)
+                        .map(|details| details.index_catchup)
+                })
+                .transpose()
         };
-        Ok(
-            !crate::index::mem_wal::load_mem_wal_index_details(system_index)?
-                .compacted_sstables
-                .is_empty(),
-        )
+
+        let mut speculative = indices.to_vec();
+        Transaction::apply_mem_wal_index_coverage(
+            &mut speculative,
+            &Transaction::logical_index_segments(indices),
+            Some(ReadVersionState {
+                manifest: &self.manifest,
+                indices,
+            }),
+            true,
+            self.manifest.version + 1,
+        )?;
+        Ok(catchup_of(&speculative)? != catchup_of(indices)?)
     }
 }
 
@@ -2160,7 +2176,7 @@ impl DatasetIndexExt for Dataset {
         // remap or a compaction that advanced a generation without changing
         // fragments. Returning early there leaves the position missing forever
         // and the repair rescheduling itself.
-        if new_indices.is_empty() && !self.mem_wal_catch_up_may_advance().await? {
+        if new_indices.is_empty() && !self.mem_wal_catch_up_would_advance(&indices)? {
             return Ok(());
         }
 

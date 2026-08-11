@@ -749,6 +749,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(catch_up_generation(&dataset, "idx").await, Some(9));
+
+        // And once it is current, the next pass must not commit again:
+        // periodic maintenance would otherwise mint a version forever.
+        let after_repair = dataset.manifest.version;
+        dataset
+            .optimize_indices(&OptimizeOptions::append().index_names(vec!["idx".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, after_repair);
     }
 
     /// A no-op optimize on a table that is not on the protocol must stay a

@@ -82,11 +82,10 @@ message Transaction {
     repeated IndexMetadata new_indices = 1;
     repeated IndexMetadata removed_indices = 2;
 
-    // Held by mem_wal_index_catchup_advances, which briefly shipped: index
-    // catch-up is derived from the version a commit read, not reported by the
-    // writer. Transaction files carrying the old field may exist.
+    // Briefly held a catch-up field that never reached a release; index
+    // catch-up is now derived from the version a commit read. Held back only so
+    // a transaction file written from main in that window cannot be misread.
     reserved 3;
-    reserved "mem_wal_index_catchup_advances";
   }
 
   // An operation that rewrites but does not change the data in the table. These

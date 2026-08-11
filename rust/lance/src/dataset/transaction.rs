@@ -333,12 +333,14 @@ type LogicalIndexSegments = BTreeMap<String, Vec<CoverageIdentity>>;
 
 /// What one physical index segment contributes to coverage.
 ///
-/// Deliberately not the whole [`IndexMetadata`]. The UUID alone is not enough:
-/// an operation can prune a segment's fragment bitmap in place and keep the
-/// UUID, so a UUID-only comparison carries a position an index no longer earns.
-/// Everything else -- file lists, timestamps, inferred details -- can change
-/// without changing which rows the index answers for, and migrations fill those
-/// in routinely, so including them would withdraw coverage for no reason.
+/// Deliberately not the whole [`IndexMetadata`]. It rests on one contract:
+/// changing an index's physical contents mints a new UUID. Of the mutations
+/// sanctioned under an existing UUID, only the fragment bitmap changes which
+/// rows the index answers for -- an `Update` prunes it in place, and
+/// `migrate_indices` recalculates it -- so the UUID alone is not enough and the
+/// bitmap has to be compared too. The rest of the metadata, file lists and
+/// timestamps and inferred details, is filled in by migrations routinely;
+/// comparing it would withdraw coverage for no reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoverageIdentity {
     uuid: Uuid,
@@ -1985,7 +1987,7 @@ impl Transaction {
     /// "not caught up" and the SSTables stay. A legacy table reads a missing
     /// entry as "fully caught up", so this leaves it untouched rather than
     /// making the table look more covered than it is.
-    fn apply_mem_wal_index_coverage(
+    pub(crate) fn apply_mem_wal_index_coverage(
         final_indices: &mut [IndexMetadata],
         segments_before: &LogicalIndexSegments,
         read_version_state: Option<ReadVersionState<'_>>,
@@ -2092,10 +2094,10 @@ impl Transaction {
 
         let mut rebuilt: Vec<IndexCatchupProgress> = Vec::new();
         for (name, after) in segments_after.iter() {
-            // Whole metadata, not one segment UUID: an Update that touches an
-            // indexed field prunes a segment's fragment bitmap in place while
-            // keeping its UUID, so a UUID-only comparison would carry a position
-            // forward that the index no longer earns.
+            // Compared by [`CoverageIdentity`], not segment UUID: an Update
+            // that touches an indexed field prunes a segment's fragment bitmap
+            // in place while keeping its UUID, so a UUID-only comparison would
+            // carry a position forward that the index no longer earns.
             let unchanged = segments_before.get(name) == Some(after);
             let carried = unchanged
                 .then(|| catchup_before.iter().find(|e| e.index_name == *name))
@@ -2155,27 +2157,21 @@ impl Transaction {
         Ok(())
     }
 
-    /// Drop coverage for any index a post-`build_manifest` step changed.
+    /// Drop coverage for indices a post-`build_manifest` step narrowed.
     ///
-    /// The derivation runs while the manifest is being built, but the index
-    /// list is not final there: `migrate_indices` can recalculate a segment's
+    /// The derivation runs while the manifest is being built, but the index list
+    /// is not final there: `migrate_indices` can recalculate a segment's
     /// fragment bitmap and keep its UUID, so an index can narrow after its
-    /// position was decided. This only ever removes entries, so a step that
-    /// changes nothing costs nothing.
+    /// position was decided. It reports which ones it touched rather than the
+    /// caller re-snapshotting every bitmap to find out. Only ever removes.
     pub(crate) fn withdraw_coverage_invalidated_after_build(
         indices: &mut [IndexMetadata],
-        segments_at_build: &LogicalIndexSegments,
+        changed: &[String],
         new_version: u64,
     ) -> Result<()> {
-        let changed: Vec<String> = Self::logical_index_segments(indices)
-            .into_iter()
-            .filter(|(name, after)| segments_at_build.get(name) != Some(after))
-            .map(|(name, _)| name)
-            .collect();
         if changed.is_empty() {
             return Ok(());
         }
-
         let Some(pos) = indices
             .iter()
             .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
@@ -2192,7 +2188,7 @@ impl Transaction {
         }
         log::info!(
             "MemWAL index catch-up withdrawn at version {new_version} for {changed:?}: \
-             these indices changed after their coverage was derived"
+             these indices were recalculated after their coverage was derived"
         );
         indices[pos] = new_mem_wal_index_meta(new_version, details)?;
         Ok(())
@@ -8517,16 +8513,16 @@ mod tests {
         fn a_bitmap_narrowed_after_the_build_loses_its_position() {
             let shard = Uuid::new_v4();
             let uuid = Uuid::new_v4();
-            let at_build = Transaction::logical_index_segments(&table(
-                &[0, 1],
-                uuid,
-                progress_with_catchup(shard, 5, 5),
-            ));
-            // What migrate_indices leaves behind: same UUID, fewer fragments.
+            // What migrate_indices leaves behind: same UUID, fewer fragments,
+            // and it says so.
             let mut migrated = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
 
-            Transaction::withdraw_coverage_invalidated_after_build(&mut migrated, &at_build, 3)
-                .unwrap();
+            Transaction::withdraw_coverage_invalidated_after_build(
+                &mut migrated,
+                &["idx".to_string()],
+                3,
+            )
+            .unwrap();
 
             assert_eq!(coverage_for(&migrated, "idx"), None);
         }
@@ -8538,17 +8534,12 @@ mod tests {
         fn metadata_migration_that_does_not_narrow_keeps_its_position() {
             let shard = Uuid::new_v4();
             let uuid = Uuid::new_v4();
-            let at_build = Transaction::logical_index_segments(&table(
-                &[0, 1],
-                uuid,
-                progress_with_catchup(shard, 5, 5),
-            ));
             let mut migrated = table(&[0, 1], uuid, progress_with_catchup(shard, 5, 5));
             migrated[0].files = Some(Vec::new());
             migrated[0].created_at = Some(chrono::Utc::now());
 
-            Transaction::withdraw_coverage_invalidated_after_build(&mut migrated, &at_build, 3)
-                .unwrap();
+            // Nothing narrowed, so migration reports nothing.
+            Transaction::withdraw_coverage_invalidated_after_build(&mut migrated, &[], 3).unwrap();
 
             assert_eq!(coverage_for(&migrated, "idx"), Some(compacted(shard, 5)));
         }
