@@ -462,8 +462,10 @@ async fn materialize_manifest_create(
             | Err(ObjectStoreError::Precondition { .. }) => {
                 return resolve_existing_manifest(store, staging_path, final_path, size).await;
             }
-            Err(ObjectStoreError::NotImplemented { .. })
-            | Err(ObjectStoreError::NotSupported { .. }) => {}
+            Err(error @ ObjectStoreError::NotImplemented { .. })
+            | Err(error @ ObjectStoreError::NotSupported { .. }) => {
+                return Err(error.into());
+            }
             Err(error) => {
                 return resolve_create_error(store, staging_path, final_path, size, error).await;
             }
@@ -508,6 +510,26 @@ async fn complete_manifest_finalization<S: ExternalManifestStore + ?Sized>(
                 staging_path,
                 staging_size,
             )?;
+            let published_location = external_store
+                .get_manifest_location(base_path.as_ref(), version)
+                .await?;
+            if published_location.path != final_path
+                || published_location.size != Some(current_meta.size)
+                || published_location.e_tag != current_meta.e_tag
+            {
+                return Err(Error::corrupt_file(
+                    final_path.clone(),
+                    format!(
+                        "Staging manifest '{}' is missing, but external metadata for version {} \
+                         does not match the finalized object (path '{}', size {:?}, ETag {:?})",
+                        staging_path,
+                        version,
+                        published_location.path,
+                        published_location.size,
+                        published_location.e_tag,
+                    ),
+                ));
+            }
             return Ok(ManifestLocation {
                 version,
                 path: final_path,
@@ -926,9 +948,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::stream::BoxStream;
     use lance_core::datatypes::Schema;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_file::version::LanceFileVersion;
+    use object_store::{
+        CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
     use tokio::sync::Notify;
 
     use super::*;
@@ -940,6 +967,90 @@ mod tests {
         path: String,
         size: u64,
         e_tag: Option<String>,
+    }
+
+    #[derive(Debug)]
+    struct UnsupportedCreateCopyStore {
+        target: Arc<dyn OSObjectStore>,
+        overwrite_copy_calls: AtomicUsize,
+    }
+
+    impl std::fmt::Display for UnsupportedCreateCopyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "UnsupportedCreateCopyStore({})", self.target)
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for UnsupportedCreateCopyStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.target.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            self.target.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            if options.mode == CopyMode::Create {
+                return Err(ObjectStoreError::NotSupported {
+                    source: "create-only copy unavailable".into(),
+                });
+            }
+            self.overwrite_copy_calls.fetch_add(1, Ordering::SeqCst);
+            self.target.copy_opts(from, to, options).await
+        }
     }
 
     #[derive(Debug)]
@@ -1085,7 +1196,7 @@ mod tests {
         Manifest::new(
             Schema::try_from(&arrow_schema).unwrap(),
             Arc::new(vec![]),
-            DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable)),
+            DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
             HashMap::new(),
         )
     }
@@ -1175,6 +1286,112 @@ mod tests {
                 .contains("does not match staging manifest"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_only_copy_does_not_fallback_to_overwrite() {
+        let target = ObjectStore::memory().inner;
+        let store = UnsupportedCreateCopyStore {
+            target: target.clone(),
+            overwrite_copy_calls: AtomicUsize::new(0),
+        };
+        let staging_path = Path::from("dataset/_versions/1.manifest-staging-test");
+        let final_path = Path::from("dataset/_versions/1.manifest");
+        target
+            .put(&staging_path, PutPayload::from_static(b"manifest"))
+            .await
+            .unwrap();
+
+        let result = materialize_manifest_create(
+            &store,
+            &staging_path,
+            &final_path,
+            b"manifest".len() as u64,
+            true,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("an opted-in store must not downgrade create-only copy to overwrite");
+        };
+        assert!(
+            matches!(&error, Error::IO { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("Operation not supported"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(store.overwrite_copy_calls.load(Ordering::SeqCst), 0);
+        let final_error = target
+            .head(&final_path)
+            .await
+            .expect_err("the destination must remain absent");
+        assert!(matches!(final_error, ObjectStoreError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_source_missing_requires_published_final_location() {
+        let external_store = TestExternalManifestStore::new(false);
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let version = 1;
+        let staging_path = Path::from("dataset/_versions/1.manifest-staging-test");
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+        object_store
+            .inner
+            .put(&final_path, PutPayload::from_static(b"foreign"))
+            .await
+            .unwrap();
+        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        external_store
+            .put_if_not_exists(
+                base_path.as_ref(),
+                version,
+                staging_path.as_ref(),
+                final_meta.size,
+                Some("staging-etag".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let materialized = materialize_manifest_create(
+            object_store.inner.as_ref(),
+            &staging_path,
+            &final_path,
+            final_meta.size,
+            true,
+        )
+        .await
+        .unwrap();
+        let result = complete_manifest_finalization(
+            &external_store,
+            &base_path,
+            version,
+            &staging_path,
+            final_path,
+            ManifestNamingScheme::V2,
+            object_store.inner.as_ref(),
+            materialized,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("a foreign final object must not be accepted while metadata is staging");
+        };
+        assert!(
+            matches!(&error, Error::CorruptFile { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the finalized object"),
+            "unexpected error: {error}"
+        );
+        let recorded = external_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+            .unwrap();
+        assert_eq!(recorded.path, staging_path);
     }
 
     #[rstest::rstest]

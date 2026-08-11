@@ -6122,7 +6122,7 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            ConcreteFileVersion::from(LanceFileVersion::Stable)
+            LanceFileVersion::Stable.resolve()
         );
 
         let mismatched_path = dataset.data_dir().join("mismatched_file.lance");
