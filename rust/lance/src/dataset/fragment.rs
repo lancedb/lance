@@ -24,7 +24,7 @@ use futures::future::{BoxFuture, try_join_all};
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
 use lance_arrow::{RecordBatchExt, SchemaExt};
-use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
+use lance_core::datatypes::{BlobHandling, OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -1758,11 +1758,15 @@ impl FileFragment {
     /// at a time. This can be useful to control memory usage when processing very large
     /// fields. The batch_size will only be used if the dataset is a v2 dataset.  It will
     /// be ignored for v1 datasets.
+    ///
+    /// The `blob_handling` parameter controls the in-memory representation of blob
+    /// columns read by the updater. If unset, the dataset schema is used unchanged.
     pub(crate) async fn updater<T: AsRef<str>>(
         &self,
         columns: Option<&[T]>,
         schemas: Option<(Schema, Schema)>,
         batch_size: Option<u32>,
+        blob_handling: Option<BlobHandling>,
     ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
@@ -1780,6 +1784,14 @@ impl FileFragment {
                 }
             }
             schema = schema.project(&projection)?;
+        }
+
+        if let Some(blob_handling) = blob_handling {
+            schema.fields = schema
+                .fields
+                .into_iter()
+                .map(|field| blob_handling.unload_if_needed(field))
+                .collect();
         }
 
         // If there is no projection, we at least need to read the row addresses
@@ -1851,7 +1863,7 @@ impl FileFragment {
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        let mut updater = self.updater(Some(&[join_column]), None, None).await?;
+        let mut updater = self.updater(Some(&[join_column]), None, None, None).await?;
 
         while let Some(batch) = updater.next().await? {
             let batch = joiner
@@ -1930,13 +1942,50 @@ impl FileFragment {
         if !read_columns.iter().any(|n| n.as_str() == ROW_ADDR) {
             read_columns.push(ROW_ADDR.to_string());
         }
+        let selected_field_ids = read_columns
+            .iter()
+            .filter_map(|column| self.schema().field(column))
+            .map(|field| field.id)
+            .collect::<Vec<_>>();
+        let descriptor_blob_ids = self
+            .schema()
+            .project_by_ids(&selected_field_ids, true)
+            .fields_pre_order()
+            .filter(|field| field.is_blob_v2())
+            .filter_map(|field| u32::try_from(field.id).ok())
+            .collect::<HashSet<_>>();
+        let has_blob_v2 = !descriptor_blob_ids.is_empty();
+        let blob_handling = has_blob_v2.then(|| {
+            let materialized_blob_ids = self
+                .schema()
+                .fields_pre_order()
+                .filter(|field| field.is_blob())
+                .filter_map(|field| u32::try_from(field.id).ok())
+                .filter(|field_id| !descriptor_blob_ids.contains(field_id))
+                .collect();
+            BlobHandling::SomeBlobsBinary(materialized_blob_ids)
+        });
         let mut updater = self
             .updater(
                 Some(&read_columns),
                 Some((write_schema.clone(), self.schema().clone())),
                 None,
+                blob_handling,
             )
             .await?;
+        if has_blob_v2 {
+            updater.allow_external_blob_outside_bases();
+        }
+        let external_base_resolver = if has_blob_v2 {
+            super::write::blob_v2_external_base_resolver(
+                Some(self.dataset()),
+                &WriteParams::default(),
+                &write_schema,
+            )
+            .await?
+        } else {
+            None
+        };
         // Hash join: rows matched on the right-hand stream rewrite columns; track physical offsets via `_rowaddr`.
         // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary) in the right stream
         // so they match the physical storage format read from the fragment's left batch.
@@ -1958,6 +2007,17 @@ impl FileFragment {
             ))
         })?;
         while let Some(batch) = updater.next().await? {
+            let batch = if has_blob_v2 {
+                crate::dataset::optimize::transform_blob_v2_batch(
+                    &self.dataset,
+                    self.schema(),
+                    batch.clone(),
+                    true,
+                )
+                .await?
+            } else {
+                batch.clone()
+            };
             let index_column = batch[left_on].clone();
             let matched = joiner.matched_join_rows(index_column.clone())?;
             if let Some(addr_col) = batch.column_by_name(ROW_ADDR) {
@@ -1973,8 +2033,12 @@ impl FileFragment {
                 }
             }
             let updated_batch = joiner
-                .collect_with_fallback(batch, index_column, self.dataset())
+                .collect_with_fallback(&batch, index_column, self.dataset())
                 .await?;
+            if let Some(resolver) = external_base_resolver.as_deref() {
+                super::blob::validate_external_blob_references(resolver, &updated_batch, &matched)
+                    .await?;
+            }
             updater.update(updated_batch).await?;
         }
 
@@ -5720,7 +5784,10 @@ mod tests {
             let mut merged_fragments = Vec::new();
             for fragment_id in fragment_ids {
                 let fragment = &mut dataset.get_fragment(fragment_id).unwrap();
-                let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
+                let mut updater = fragment
+                    .updater(Some(&["i"]), None, None, None)
+                    .await
+                    .unwrap();
                 while let Some(batch) = updater.next().await.unwrap() {
                     let input_col = batch.column_by_name("i").unwrap();
                     let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
@@ -5976,7 +6043,7 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Write batch_s using add_columns
-        let mut updater = fragment.updater(Some(&["i"]), None, None).await?;
+        let mut updater = fragment.updater(Some(&["i"]), None, None, None).await?;
         updater.next().await?;
         updater.update(batch_s.clone()).await?;
         let frag = updater.finish().await?;
