@@ -16,8 +16,8 @@ use lance_table::io::commit::ManifestNamingScheme;
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use arrow_array::Array;
-use arrow_array::RecordBatch;
 use arrow_array::{Int32Array, RecordBatchIterator, StringArray, types::Int32Type};
+use arrow_array::{RecordBatch, record_batch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array};
@@ -728,6 +728,55 @@ async fn test_list_detached_manifests() {
     let versions = dataset.versions().await.unwrap();
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].version, 1);
+}
+
+#[tokio::test]
+async fn test_restore_rejects_divergent_detached_stable_row_ids() {
+    let batch = record_batch!(("id", Int32, [0])).unwrap();
+    let schema = batch.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let dataset = Arc::new(dataset);
+    let append_params = WriteParams {
+        mode: WriteMode::Append,
+        ..Default::default()
+    };
+
+    let detached_transaction = InsertBuilder::new(dataset.clone())
+        .with_params(&append_params)
+        .execute_uncommitted(vec![batch.clone()])
+        .await
+        .unwrap();
+    let mut detached = CommitBuilder::new(dataset.clone())
+        .with_detached(true)
+        .execute(detached_transaction)
+        .await
+        .unwrap();
+
+    let mut attached = dataset.as_ref().clone();
+    attached
+        .append(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            Some(append_params),
+        )
+        .await
+        .unwrap();
+
+    let error = detached.restore().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("restoring it could reuse stable row IDs"),
+        "unexpected error: {error}"
+    );
 }
 
 /// Transaction properties large enough to push the transaction over the

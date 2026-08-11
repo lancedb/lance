@@ -1390,6 +1390,9 @@ impl Dataset {
         let (latest_manifest, _) = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
+        self.validate_stable_row_ids_for_restore(latest_version)
+            .await?;
+
         let transaction = Transaction::new(
             latest_version,
             Operation::Restore {
@@ -1400,6 +1403,30 @@ impl Dataset {
 
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
+
+        Ok(())
+    }
+
+    async fn validate_stable_row_ids_for_restore(&self, latest_version: u64) -> Result<()> {
+        if !self.manifest.uses_stable_row_ids()
+            || !lance_table::format::is_detached_version(self.manifest.version)
+        {
+            return Ok(());
+        }
+
+        // A detached commit may allocate the same row IDs as later attached commits, so only restore it if its base is still the latest version.
+        let transaction = self.read_transaction().await?.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Cannot restore detached version {} with stable row IDs because its base version cannot be determined",
+                self.manifest.version
+            ))
+        })?;
+        if transaction.read_version != latest_version {
+            return Err(Error::invalid_input(format!(
+                "Cannot restore detached version {} with stable row IDs because its base version {} is not the latest version {}; restoring it could reuse stable row IDs",
+                self.manifest.version, transaction.read_version, latest_version
+            )));
+        }
 
         Ok(())
     }
