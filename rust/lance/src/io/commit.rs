@@ -1289,7 +1289,6 @@ pub(crate) async fn commit_transaction(
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
-    let original_dataset = dataset.clone();
 
     // read_version sometimes defaults to zero for overwrite.
     // If num_retries is zero, we are in "strict overwrite" mode.
@@ -1305,6 +1304,9 @@ pub(crate) async fn commit_transaction(
             // If the dataset version is the same as the read version, we can use it directly.
             dataset.clone()
         };
+
+    // `dataset` advances past the read version inside the retry loop.
+    let read_version_dataset = dataset.clone();
 
     let mut transaction = transaction.clone();
 
@@ -1336,7 +1338,8 @@ pub(crate) async fn commit_transaction(
             // started at exact same time better.
 
             let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+                TransactionRebase::try_new(&read_version_dataset, transaction, affected_rows)
+                    .await?;
 
             for (other_version, other_transaction) in other_transactions.iter() {
                 rebase.check_txn(other_transaction, *other_version)?;
