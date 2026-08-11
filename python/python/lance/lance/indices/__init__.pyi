@@ -48,7 +48,9 @@ def train_pq_model(
     distance_type: str,
     sample_rate: int,
     max_iters: int,
-    ivf_model: pa.FixedSizeListArray,
+    # Kept as the ``Array`` base type: callers pass ``IvfModel.centroids``,
+    # which the public ``IvfModel`` constructor accepts as a plain ``pa.Array``.
+    ivf_model: pa.Array,
     fragment_ids: Optional[list[int]] = None,
     num_bits: int = 8,
 ) -> pa.FixedSizeListArray: ...
