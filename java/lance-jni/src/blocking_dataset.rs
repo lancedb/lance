@@ -2078,7 +2078,7 @@ fn inner_get_lance_file_format_version<'local>(
             .inner
             .manifest()
             .data_storage_format
-            .lance_file_version()?;
+            .lance_file_format();
         version.to_string()
     };
 

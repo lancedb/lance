@@ -644,6 +644,7 @@ impl<'a> CreateIndexBuilder<'a> {
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
                 removed_indices,
+                mem_wal_index_catchup_advances: Vec::new(),
             },
         )
         .transaction_properties(self.transaction_properties.clone())
@@ -786,6 +787,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 Operation::CreateIndex {
                     new_indices,
                     removed_indices,
+                    mem_wal_index_catchup_advances: Vec::new(),
                 },
             )
             .transaction_properties(self.transaction_properties.clone())
@@ -860,6 +862,7 @@ impl<'a> CreateIndexBuilder<'a> {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                mem_wal_index_catchup_advances: Vec::new(),
             },
         )
         .transaction_properties(self.transaction_properties.clone())
