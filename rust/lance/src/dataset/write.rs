@@ -2253,7 +2253,7 @@ mod tests {
 
             let object_store = Arc::new(ObjectStore::memory());
             let (fragments, _) = write_fragments_internal(
-                ConcreteFileVersion::from(version),
+                version.resolve(),
                 None,
                 object_store,
                 &Path::from("test"),

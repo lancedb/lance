@@ -25,7 +25,7 @@ use arrow_schema::DataType;
 use lance::Result;
 use lance::datatypes::Schema;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_file::versions::v1::writer::FileWriter as PreviousFileWriter;
+use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_index::vector::hnsw::{HNSW, builder::HnswBuildParams};
 use lance_index::vector::kmeans::{
     KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams, compute_partitions,
@@ -242,7 +242,7 @@ impl Hnsw {
         let mut writer = rt()
             .block_on(
                 Some(py),
-                PreviousFileWriter::<ManifestDescribing>::try_new(
+                V1FileWriter::<ManifestDescribing>::try_new(
                     &object_store,
                     &path,
                     Schema::try_from(HNSW::schema().as_ref())

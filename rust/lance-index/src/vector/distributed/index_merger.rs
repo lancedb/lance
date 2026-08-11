@@ -953,9 +953,8 @@ pub async fn merge_partial_vector_auxiliary_files(
         let idx_type = detected_index_type
             .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
 
-        let fv = format_version.ok_or_else(|| {
-            Error::internal("first shard did not provide a concrete file version".to_string())
-        })?;
+        // Preserve the historical fallback while keeping the writer boundary exact.
+        let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
 
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
@@ -1683,6 +1682,7 @@ mod tests {
         lengths: &[u32],
         base_row_id: u64,
         distance_type: DistanceType,
+        file_version: ConcreteFileVersion,
     ) -> Result<usize> {
         let arrow_schema = ArrowSchema::new(vec![
             (*ROW_ID_FIELD).clone(),
@@ -1694,7 +1694,8 @@ mod tests {
         ]);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = versions::v2_1::create_writer(
+        let mut v2w = versions::create_writer(
+            file_version,
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -1825,12 +1826,28 @@ mod tests {
         let lengths1 = vec![1_u32, 2_u32];
         let dim = 2_i32;
 
-        write_flat_partial_aux(&object_store, &aux0, dim, &lengths0, 0, DistanceType::L2)
-            .await
-            .unwrap();
-        write_flat_partial_aux(&object_store, &aux1, dim, &lengths1, 100, DistanceType::L2)
-            .await
-            .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux0,
+            dim,
+            &lengths0,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_2,
+        )
+        .await
+        .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux1,
+            dim,
+            &lengths1,
+            100,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
 
         let progress = Arc::new(RecordingProgress::default());
         merge_partial_vector_auxiliary_files(
@@ -1934,6 +1951,7 @@ mod tests {
         .await
         .unwrap();
         let meta = reader.metadata();
+        assert_eq!(meta.version(), ConcreteFileVersion::V2_2);
 
         // Validate IVF lengths aggregation.
         let ivf_idx: u32 = meta
@@ -1993,9 +2011,17 @@ mod tests {
         let lengths = vec![2_u32, 2_u32];
         let dim = 2_i32;
 
-        write_flat_partial_aux(&object_store, &aux0, dim, &lengths, 0, DistanceType::L2)
-            .await
-            .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux0,
+            dim,
+            &lengths,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
         write_flat_partial_aux(
             &object_store,
             &aux1,
@@ -2003,6 +2029,7 @@ mod tests {
             &lengths,
             100,
             DistanceType::Cosine,
+            ConcreteFileVersion::V2_1,
         )
         .await
         .unwrap();

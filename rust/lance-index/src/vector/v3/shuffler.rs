@@ -477,7 +477,7 @@ impl Shuffler for TwoFileShuffler {
         let mut file_writer = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&schema)?,
-            FileWriterOptions::default(),
+            Default::default(),
         )?
         .with_page_metadata_spill(self.object_store.clone(), spill_path);
 
@@ -488,7 +488,7 @@ impl Shuffler for TwoFileShuffler {
         let mut offsets_writer = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(offsets_schema.as_ref())?,
-            FileWriterOptions::default(),
+            Default::default(),
         )?
         .with_page_metadata_spill(self.object_store.clone(), spill_path);
 
@@ -852,9 +852,33 @@ mod tests {
         // Partition 2: rows with values 30
         let batch = make_batch(&[0, 1, 2, 0, 1], &[10, 20, 30, 40, 50], None);
 
-        let shuffler = TwoFileShuffler::new(output_dir, num_partitions);
+        let shuffler = TwoFileShuffler::new(output_dir.clone(), num_partitions);
         let stream = batches_to_stream(vec![batch]);
         let reader = shuffler.shuffle(stream).await.unwrap();
+
+        let object_store = Arc::new(ObjectStore::local());
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        for filename in ["shuffle_data.lance", "shuffle_offsets.lance"] {
+            let file_reader = FileReader::try_open(
+                scheduler
+                    .open_file(
+                        &output_dir.clone().join(filename),
+                        &CachedFileSize::unknown(),
+                    )
+                    .await
+                    .unwrap(),
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(file_reader.version(), ConcreteFileVersion::V2_1);
+        }
 
         // Verify partition sizes
         assert_eq!(reader.partition_size(0).unwrap(), 2);

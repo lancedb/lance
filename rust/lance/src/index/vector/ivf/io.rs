@@ -10,9 +10,8 @@ use super::IVFIndex;
 use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{PQIndex, build_pq_storage};
 use arrow::compute::concat;
-use arrow_array::UInt64Array;
 use arrow_array::{
-    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
+    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array,
     cast::AsArray,
     types::{ArrowPrimitiveType, UInt8Type, UInt64Type},
 };

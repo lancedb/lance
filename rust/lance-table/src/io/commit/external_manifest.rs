@@ -747,7 +747,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_file::version::LanceFileVersion;
 
     use super::*;
     use crate::format::DataStorageFormat;
@@ -885,7 +885,7 @@ mod tests {
         let mut manifest = Manifest::new(
             Schema::try_from(&arrow_schema).unwrap(),
             Arc::new(vec![]),
-            DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable)),
+            DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
             HashMap::new(),
         );
 
