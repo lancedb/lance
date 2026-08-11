@@ -27,10 +27,7 @@ use lance_core::datatypes::{
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_file::{
-    datatypes::Fields,
-    version::{ConcreteFileVersion, LanceFileVersion},
-};
+use lance_file::{datatypes::Fields, version::ConcreteFileVersion};
 use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME};
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
@@ -1938,12 +1935,12 @@ impl Transaction {
 
     fn data_storage_format_from_files(
         fragments: &[Fragment],
-        user_requested: Option<LanceFileVersion>,
+        user_requested: Option<ConcreteFileVersion>,
     ) -> Result<DataStorageFormat> {
         if let Some(file_version) = Fragment::try_infer_version(fragments)? {
             // Ensure user-requested matches data files
             if let Some(user_requested) = user_requested
-                && ConcreteFileVersion::from(user_requested) != file_version
+                && user_requested != file_version
             {
                 return Err(Error::invalid_input(format!(
                     "User requested data storage version ({}) does not match version in data files ({})",
@@ -1954,7 +1951,6 @@ impl Transaction {
         } else {
             // If no files use user-requested or default
             Ok(user_requested
-                .map(ConcreteFileVersion::from)
                 .map(DataStorageFormat::new)
                 .unwrap_or_default())
         }
@@ -2932,9 +2928,8 @@ impl Transaction {
                     // just add it to the final fragments. Push the DataFile as
                     // given so every field (including base_id) is preserved.
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
-                        new_file
-                            .file_version()
-                            .expect("Expected valid file version");
+                        new_file.file_version()?;
+
                         new_frag.files.push(new_file.clone());
                     }
 
@@ -3079,9 +3074,9 @@ impl Transaction {
         }
 
         let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
-            (None, Some(true)) => Some(LanceFileVersion::Legacy),
-            (None, Some(false)) => Some(LanceFileVersion::V2_0),
+            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
+            (None, Some(true)) => Some(ConcreteFileVersion::V1),
+            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
             (None, None) => None,
         };
 
@@ -3120,8 +3115,7 @@ impl Transaction {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format =
-                    DataStorageFormat::new(ConcreteFileVersion::from(user_requested_version));
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
             }
 
             prev_manifest
@@ -4792,11 +4786,20 @@ fn schema_fragments_valid(
     schema: &Schema,
     fragments: &[Fragment],
 ) -> Result<()> {
-    if let Some(manifest) = manifest
-        && manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy
-    {
-        return schema_fragments_legacy_valid(schema, fragments);
+    if let Some(manifest) = manifest {
+        return super::versions::validate_fragment_schema(
+            manifest.data_storage_format.lance_file_format(),
+            schema,
+            fragments,
+        );
     }
+    schema_fragments_modern_valid(schema, fragments)
+}
+
+pub(crate) fn schema_fragments_modern_valid(
+    _schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
     // validate that each data file at least contains one field.
     for fragment in fragments {
         for data_file in &fragment.files {
@@ -4814,7 +4817,7 @@ fn schema_fragments_valid(
 /// Check that each fragment contains all fields in the schema.
 /// It is not required that the schema contains all fields in the fragment.
 /// There may be masked fields.
-fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+pub(crate) fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     // TODO: add additional validation. Consider consolidating with various
     // validate() methods in the codebase.
     for fragment in fragments {
@@ -6034,7 +6037,7 @@ mod tests {
             "data.lance",
             vec![0],
             vec![0],
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             None,
             None,
         );
@@ -6537,7 +6540,7 @@ mod tests {
                 path,
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 None,
                 None,
             )
@@ -6615,7 +6618,7 @@ mod tests {
             "same.lance",
             vec![0],
             vec![0],
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             None,
             None,
         );
@@ -6699,7 +6702,7 @@ mod tests {
                 path,
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 None,
                 None,
             )
@@ -6771,7 +6774,7 @@ mod tests {
                 path,
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 None,
                 None,
             )
