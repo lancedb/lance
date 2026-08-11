@@ -519,8 +519,8 @@ impl RabitQuantizationStorage {
 
     fn residual_query_factor(&self, dist_q_c: f32) -> f32 {
         match self.distance_type {
-            DistanceType::L2 => dist_q_c,
-            DistanceType::Cosine | DistanceType::Dot => dist_q_c - 1.0,
+            DistanceType::L2 | DistanceType::Cosine => dist_q_c,
+            DistanceType::Dot => dist_q_c - 1.0,
             _ => unimplemented!(
                 "RabitQ does not support distance type: {}",
                 self.distance_type
@@ -4298,20 +4298,33 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_batch_keeps_cosine_for_legacy_residual_query() {
+    fn test_residual_query_cosine_uses_l2_query_factor() {
         let original_codes = make_test_codes(50, 64);
         let mut metadata = make_test_metadata(original_codes.value_length() as usize * 8);
         metadata.query_estimator = RabitQueryEstimator::ResidualQuery;
+        let batch = make_test_batch(original_codes);
 
-        let storage = RabitQuantizationStorage::try_from_batch(
-            make_test_batch(original_codes),
+        let cosine_storage = RabitQuantizationStorage::try_from_batch(
+            batch.clone(),
             &metadata,
             DistanceType::Cosine,
             None,
         )
         .unwrap();
+        let l2_storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
 
-        assert_eq!(storage.distance_type(), DistanceType::Cosine);
+        assert_eq!(cosine_storage.distance_type(), DistanceType::Cosine);
+
+        let query = Arc::new(Float32Array::from(vec![0.125; 64])) as ArrayRef;
+        let dist_q_c = 0.25;
+        let cosine_distances = cosine_storage
+            .dist_calculator(query.clone(), dist_q_c)
+            .distance_all(0);
+        let l2_distances = l2_storage.dist_calculator(query, dist_q_c).distance_all(0);
+
+        assert_eq!(cosine_distances, l2_distances);
     }
 
     #[test]

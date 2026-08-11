@@ -411,6 +411,7 @@ fn convert_to_java_operation_inner<'local>(
         Operation::CreateIndex {
             new_indices,
             removed_indices,
+            ..
         } => {
             let java_new_indices = export_vec(env, &new_indices)?;
             let java_removed_indices = export_vec(env, &removed_indices)?;
@@ -470,13 +471,19 @@ fn convert_to_java_operation_inner<'local>(
                 ],
             )?)
         }
-        Operation::Project { schema } => {
+        Operation::Project {
+            schema,
+            preserves_nullability,
+        } => {
             let java_schema = convert_to_java_schema(env, schema)?;
 
             Ok(env.new_object(
                 "org/lance/operation/Project",
-                "(Lorg/apache/arrow/vector/types/pojo/Schema;)V",
-                &[JValue::Object(&java_schema)],
+                "(Lorg/apache/arrow/vector/types/pojo/Schema;Z)V",
+                &[
+                    JValue::Object(&java_schema),
+                    JValue::Bool(preserves_nullability as u8),
+                ],
             )?)
         }
         Operation::Rewrite {
@@ -552,16 +559,18 @@ fn convert_to_java_operation_inner<'local>(
         Operation::Merge {
             fragments: rust_fragments,
             schema,
+            preserves_nullability,
         } => {
             let java_fragments = export_vec(env, &rust_fragments)?;
             let java_schema = convert_to_java_schema(env, schema)?;
 
             Ok(env.new_object(
                 "org/lance/operation/Merge",
-                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;)V",
+                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;Z)V",
                 &[
                     JValue::Object(&java_fragments),
                     JValue::Object(&java_schema),
+                    JValue::Bool(preserves_nullability as u8),
                 ],
             )?)
         }
@@ -1044,6 +1053,8 @@ fn convert_to_rust_operation(
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => Operation::Project {
+            preserves_nullability: env
+                .get_boolean_from_method(java_operation, "preservesNullability")?,
             schema: convert_schema_from_operation(
                 env,
                 java_operation,
@@ -1283,6 +1294,8 @@ fn convert_to_rust_operation(
                 })?;
             Operation::Merge {
                 fragments,
+                preserves_nullability: env
+                    .get_boolean_from_method(java_operation, "preservesNullability")?,
                 schema: convert_schema_from_operation(
                     env,
                     java_operation,
@@ -1320,6 +1333,7 @@ fn convert_to_rust_operation(
             return Ok(Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                mem_wal_index_catchup_advances: Vec::new(),
             });
         }
         _ => unimplemented!(),

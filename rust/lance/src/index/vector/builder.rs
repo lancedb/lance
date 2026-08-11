@@ -305,7 +305,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
-            format_version,
+            format_version: format_version.to_selector(),
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -372,7 +372,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
-            format_version,
+            format_version: format_version.to_selector(),
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }

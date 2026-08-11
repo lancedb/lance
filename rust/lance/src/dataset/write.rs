@@ -456,7 +456,7 @@ impl WriteParams {
     }
 
     pub fn storage_version_or_default(&self) -> ConcreteFileVersion {
-        self.data_storage_version.unwrap_or_default().into()
+        self.data_storage_version.unwrap_or_default().resolve()
     }
 
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
@@ -2235,7 +2235,8 @@ mod tests {
             LanceFileVersion::Next,
         ];
         for version in versions {
-            let (major, minor) = ConcreteFileVersion::from(version).to_data_file_numbers();
+            let (major, minor) = version.resolve().to_data_file_numbers();
+
             let write_params = WriteParams {
                 data_storage_version: Some(version),
                 // This parameter should be ignored
@@ -2585,7 +2586,7 @@ mod tests {
         let base_dir = Path::from("test/bucket2");
 
         let mut inner_writer = versions::open_writer(
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             &object_store,
             &schema,
             &base_dir,

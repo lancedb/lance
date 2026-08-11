@@ -65,6 +65,7 @@ use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
     get_default_io_buffer_size_override,
 };
+use crate::dataset::versions;
 
 use super::utils::IoMetrics;
 
@@ -1947,13 +1948,9 @@ impl FilteredReadExec {
         options: FilteredReadOptions,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Self> {
-        if dataset.is_legacy_storage() {
-            return Err(Error::not_supported_source(
-                "taking rows through FilteredReadExec requires the v2 storage format"
-                    .to_string()
-                    .into(),
-            ));
-        }
+        versions::validate_row_stream_read(
+            dataset.manifest().data_storage_format.lance_file_format(),
+        )?;
         if options.refine_filter.is_some() || options.full_filter.is_some() {
             return Err(Error::invalid_input_source(
                 "filters are not supported when taking rows from an input plan".into(),

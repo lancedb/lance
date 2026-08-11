@@ -198,6 +198,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -219,6 +220,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -233,6 +235,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -256,6 +259,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -269,6 +273,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -293,6 +298,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -307,6 +313,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -331,6 +338,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -345,6 +353,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -382,6 +391,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -403,6 +413,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -449,6 +460,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -462,6 +474,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -472,6 +485,230 @@ mod tests {
             "Expected non-retryable IncompatibleTransaction when UpdateMemWalState generation is lower than CreateIndex, got {:?}",
             result
         );
+    }
+
+    /// The bit must survive being written and read back, not just
+    /// `build_manifest`. `apply_feature_flags` runs a second time inside
+    /// `write_manifest_file`, so a version of this that stops at the in-memory
+    /// manifest passes while the stored table stays legacy.
+    #[tokio::test]
+    async fn required_catch_up_survives_a_persisted_round_trip() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
+
+        // A real directory, not `memory://`: reopening by URI builds a fresh
+        // store registry, and the point of this test is to read back what was
+        // actually written.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new(uri)
+            .with_params(&write_params)
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        // Install the system index, then require catch-up.
+        let mem_wal_index =
+            new_mem_wal_index_meta(dataset.manifest.version, MemWalIndexDetails::default())
+                .unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        dataset.require_mem_wal_index_catchup().await.unwrap();
+
+        let reopened = crate::dataset::builder::DatasetBuilder::from_uri(uri)
+            .load()
+            .await
+            .unwrap();
+        assert_ne!(
+            reopened.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0,
+            "activation did not reach storage"
+        );
+        assert_ne!(
+            reopened.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0,
+            "activation did not reach storage"
+        );
+
+        // An ordinary commit must not walk it back.
+        let txn = Transaction::new(
+            reopened.manifest.version,
+            Operation::UpdateConfig {
+                config_updates: Some(crate::dataset::transaction::UpdateMap {
+                    update_entries: vec![crate::dataset::transaction::UpdateMapEntry {
+                        key: "k".to_string(),
+                        value: Some("v".to_string()),
+                    }],
+                    replace: false,
+                }),
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(reopened))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        let reopened = crate::dataset::builder::DatasetBuilder::from_uri(uri)
+            .load()
+            .await
+            .unwrap();
+        assert_ne!(
+            reopened.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0,
+            "an ordinary commit downgraded the stored table"
+        );
+        assert_ne!(
+            reopened.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            0,
+            "an ordinary commit downgraded the stored table"
+        );
+    }
+
+    /// The ordinary case after a remap: the index still spans the table, so a
+    /// repair has nothing to rebuild. It must still record its catch-up, or the
+    /// agent reschedules the same repair forever and the SSTables never retire.
+    #[tokio::test]
+    async fn a_repair_with_no_index_work_still_records_catch_up() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use lance_index::optimize::OptimizeOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new(uri).execute(vec![data]).await.unwrap();
+        let scalar_params = lance_index::scalar::ScalarIndexParams::for_builtin(
+            lance_index::scalar::BuiltinIndexType::BTree,
+        );
+        dataset
+            .create_index(
+                &["a"],
+                lance_index::IndexType::BTree,
+                Some("a_idx".to_string()),
+                &scalar_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A MemWAL table that has compacted through generation 7 and requires
+        // catch-up, with no catch-up recorded for the index yet.
+        let shard = Uuid::new_v4();
+        let mem_wal_index =
+            new_mem_wal_index_meta(dataset.manifest.version, MemWalIndexDetails::default())
+                .unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        // Activation refuses a table already carrying compaction progress, so
+        // the progress lands after it.
+        dataset.require_mem_wal_index_catchup().await.unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 7)],
+                require_index_catchup: false,
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        // The index already covers every fragment, so this rebuilds nothing.
+        dataset
+            .optimize_indices(
+                &OptimizeOptions::append()
+                    .index_names(vec!["a_idx".to_string()])
+                    .mem_wal_index_catchup(vec![CompactedSsTable::new(shard, 7)]),
+            )
+            .await
+            .unwrap();
+
+        let recorded = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .index_catchup
+            .into_iter()
+            .find(|entry| entry.index_name == "a_idx")
+            .expect("a repair that rebuilt nothing still has to record its catch-up");
+        assert_eq!(
+            recorded.caught_up_generations,
+            vec![CompactedSsTable::new(shard, 7)]
+        );
+    }
+
+    /// A claim may not exceed what the version this call read had compacted:
+    /// anything compacted since is in fragments this call never inspected.
+    #[tokio::test]
+    async fn a_claim_beyond_the_inspected_compaction_is_refused() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let dataset = test_dataset_with_mem_wal().await;
+        let shard = Uuid::new_v4();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        let err = dataset
+            .optimize_indices(
+                &OptimizeOptions::append()
+                    .index_names(vec!["a_idx".to_string()])
+                    .mem_wal_index_catchup(vec![CompactedSsTable::new(shard, 10)]),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("had compacted 5"), "{err}");
     }
 
     /// One `__lance_mem_wal` entry carrying `details`, as a real table has.
@@ -553,7 +790,7 @@ mod tests {
         assert_eq!(compacted_generation(&indices, shard), Some(10));
     }
 
-    /// Equal is also refused: it proves nothing new, and accepting it would let
+    /// Equal is also refused: it reports nothing new, and accepting it would let
     /// a retry publish a second set of row mutations under the same marker.
     #[test]
     fn an_equal_generation_rejects() {
@@ -618,7 +855,7 @@ mod tests {
     fn recording_progress_keeps_the_system_index_position() {
         let shard = Uuid::new_v4();
         let mut indices = indices_with(MemWalIndexDetails::default());
-        // A neighbour to prove the entry is replaced in place, not moved.
+        // A neighbour to show the entry is replaced in place, not moved.
         indices.push(IndexMetadata {
             name: "other_index".to_string(),
             ..indices[0].clone()
@@ -689,6 +926,7 @@ mod tests {
                 version,
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                    require_index_catchup: false,
                 },
                 None,
             ))
@@ -758,6 +996,10 @@ mod tests {
         );
     }
 
+    /// The system index holds the catch-up positions the WAL pod retires SSTables against.
+    /// Erasing it through the ordinary index API would leave the table claiming
+    /// nothing was ever compacted while the SSTables are already gone.
+
     #[test]
     fn test_empty_compacted_sstables_noop() {
         let mut indices = Vec::new();
@@ -798,6 +1040,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 1)],
+                require_index_catchup: false,
             },
             None,
         );

@@ -588,6 +588,20 @@ def test_optimize_indices_second_call_is_noop(tmp_path: Path):
     must not write any new files to the dataset directory."""
     base_dir = tmp_path / "dataset"
 
+    def assert_optimize_is_noop(dataset: lance.LanceDataset):
+        version_before = dataset.version
+        files_before = {
+            path.relative_to(base_dir) for path in base_dir.rglob("*") if path.is_file()
+        }
+
+        dataset.optimize.optimize_indices()
+
+        files_after = {
+            path.relative_to(base_dir) for path in base_dir.rglob("*") if path.is_file()
+        }
+        assert dataset.version == version_before
+        assert files_after == files_before
+
     n = 1024
     rng = np.random.default_rng(0)
     vectors = rng.standard_normal((n, 8)).astype(np.float32)
@@ -642,16 +656,20 @@ def test_optimize_indices_second_call_is_noop(tmp_path: Path):
 
     # First optimize: should pull the new fragment into each index.
     dataset.optimize.optimize_indices()
+    assert_optimize_is_noop(dataset)
 
-    files_before = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
+    # Consolidate the vector delta so every fragment has the same physical index
+    # coverage; compaction intentionally avoids mixing fragments that do not.
+    dataset.optimize.optimize_indices(num_indices_to_merge=10)
 
-    # Second optimize: nothing has changed, so this must be a no-op on disk.
+    # Compaction invalidates the old fragment coverage, so one optimize is needed
+    # to rebuild each index. Further calls must return to the same steady state.
+    compaction = dataset.optimize.compact_files(
+        target_rows_per_fragment=2 * (n + extra_rows), num_threads=1
+    )
+    assert compaction.fragments_removed > 0
     dataset.optimize.optimize_indices()
-
-    files_after = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
-
-    new_files = files_after - files_before
-    assert not new_files, f"second optimize_indices created new files: {new_files}"
+    assert_optimize_is_noop(dataset)
 
 
 def test_compaction_generates_rewrite_transaction(tmp_path: Path):
