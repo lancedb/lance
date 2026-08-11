@@ -6149,7 +6149,7 @@ mod tests {
             "data.lance",
             vec![0],
             vec![0],
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             None,
             None,
         );
@@ -6211,7 +6211,7 @@ mod tests {
             "data.lance",
             vec![0],
             vec![0],
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             None,
             None,
         );
@@ -6273,7 +6273,7 @@ mod tests {
             "data.lance",
             vec![0],
             vec![0],
-            ConcreteFileVersion::from(LanceFileVersion::Stable),
+            LanceFileVersion::Stable.resolve(),
             None,
             None,
         );
@@ -6335,7 +6335,7 @@ mod tests {
                     format!("{id}.lance"),
                     vec![0],
                     vec![0],
-                    ConcreteFileVersion::from(LanceFileVersion::Stable),
+                    LanceFileVersion::Stable.resolve(),
                     None,
                     None,
                 )],
