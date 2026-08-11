@@ -1845,6 +1845,7 @@ impl ManifestNamespace {
             .unwrap_or(0);
         manifest.set_timestamp(timestamp_nanos);
         manifest.update_max_fragment_id();
+        manifest.update_max_field_id();
 
         // Commit through the dataset's own object store, not `self.object_store`: for
         // stores like `memory://` the namespace and the dataset can hold different

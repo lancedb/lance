@@ -39,12 +39,21 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// invalidating the catch-up position recorded for that index, leaving a stale
 /// position behind. Both must refuse the table.
 pub const FLAG_MEM_WAL_INDEX_CATCHUP: u64 = 128;
+/// Persistent field-ID high-water (`Manifest.max_field_id`) is present.
+///
+/// Set on both reader and writer flags. There is no separate schema-mutation
+/// writer gate on older Lance builds, so a writer-only bit would still let an
+/// old build open the table and allocate field IDs without honoring the
+/// high-water. Old builds whose unknown boundary is 256 therefore fail closed
+/// at dataset open. Setting this bit is one-way.
+pub const FLAG_PERSISTENT_MAX_FIELD_ID: u64 = 256;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 256;
+pub const FLAG_UNKNOWN: u64 = 512;
 
 // This build only understands flags below the unknown boundary, so a bit
 // allocated at or above it would be refused by the very readers meant to use it.
-const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP < FLAG_PERSISTENT_MAX_FIELD_ID);
+const _: () = assert!(FLAG_PERSISTENT_MAX_FIELD_ID < FLAG_UNKNOWN);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -136,6 +145,13 @@ pub fn apply_feature_flags(
 
     manifest.reader_feature_flags |= mem_wal_index_catchup;
     manifest.writer_feature_flags |= mem_wal_index_catchup;
+
+    // New writers always persist `max_field_id` on commit. Both reader and
+    // writer bits are required so old Lance builds (unknown boundary 256) fail
+    // closed at open and cannot reach unsafe schema writes. One-way: every
+    // commit through this helper sets both bits.
+    manifest.reader_feature_flags |= FLAG_PERSISTENT_MAX_FIELD_ID;
+    manifest.writer_feature_flags |= FLAG_PERSISTENT_MAX_FIELD_ID;
 
     Ok(())
 }
@@ -244,6 +260,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_PERSISTENT_MAX_FIELD_ID));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -320,6 +337,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(super::FLAG_PERSISTENT_MAX_FIELD_ID));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -333,8 +351,35 @@ mod tests {
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
                 | super::FLAG_TABLE_CONFIG
                 | super::FLAG_BASE_PATHS
+                | super::FLAG_PERSISTENT_MAX_FIELD_ID
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn persistent_max_field_id_is_reader_and_writer_and_below_unknown() {
+        let mut manifest = empty_manifest();
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(
+            manifest.reader_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+        // A build that still treated bit 1<<8 as FLAG_UNKNOWN would refuse open.
+        assert_eq!(FLAG_PERSISTENT_MAX_FIELD_ID, 256);
+        assert_eq!(FLAG_UNKNOWN, 512);
+        assert!(can_read_dataset(FLAG_PERSISTENT_MAX_FIELD_ID));
+        assert!(can_write_dataset(FLAG_PERSISTENT_MAX_FIELD_ID));
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+        assert_eq!(
+            supported_flags_when(true) & FLAG_PERSISTENT_MAX_FIELD_ID,
+            FLAG_PERSISTENT_MAX_FIELD_ID
+        );
+        assert_eq!(supported_flags_when(true) & FLAG_UNKNOWN, 0);
     }
 
     #[test]

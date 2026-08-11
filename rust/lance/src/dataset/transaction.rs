@@ -32,8 +32,8 @@ use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{
-    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
+    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_PERSISTENT_MAX_FIELD_ID, FLAG_STABLE_ROW_IDS,
+    apply_feature_flags, inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
 };
 use lance_table::rowids::read_row_ids;
 use lance_table::{
@@ -1979,6 +1979,13 @@ impl Transaction {
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        // Field IDs are never reused: keep the allocation high-water at least as
+        // high as the current tip, even when restoring an older schema.
+        let restored_field_hw = manifest.max_field_id();
+        let current_field_hw = current_manifest.max_field_id();
+        manifest.max_field_id = Some(restored_field_hw.max(current_field_hw));
+        manifest.reader_feature_flags |= FLAG_PERSISTENT_MAX_FIELD_ID;
+        manifest.writer_feature_flags |= FLAG_PERSISTENT_MAX_FIELD_ID;
         // A version from before catch-up was required carries MemWAL state this
         // protocol never validated -- catch-up values activation deliberately
         // cleared, or compaction progress it deliberately refused to trust.
@@ -3147,7 +3154,7 @@ impl Transaction {
             )?;
         }
         // Carried from the manifest this one is derived from. `new_from_previous`
-        // zeroes both feature words, so `apply_feature_flags` cannot see the
+        // zeroes the MemWAL feature bits, so `apply_feature_flags` cannot see the
         // previous state and every ordinary commit would otherwise drop the bit.
         if let Some(current_manifest) = current_manifest {
             inherit_mem_wal_index_catchup(&mut manifest, current_manifest)?;
@@ -3194,6 +3201,7 @@ impl Transaction {
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
         manifest.update_max_fragment_id();
+        manifest.update_max_field_id();
 
         match &self.operation {
             Operation::Overwrite {

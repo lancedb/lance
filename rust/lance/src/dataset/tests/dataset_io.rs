@@ -1039,7 +1039,7 @@ async fn test_write_manifest(
     let write_fut = require_send(write_fut);
     let mut dataset = write_fut.await.unwrap();
 
-    // Check it has no flags
+    // Fresh write: only the persistent field-ID high-water fence.
     let manifest = read_manifest(
         dataset.object_store.as_ref(),
         &dataset
@@ -1061,7 +1061,14 @@ async fn test_write_manifest(
         manifest.data_storage_format.version.to_manifest_string(),
         "stable" | "next"
     ));
-    assert_eq!(manifest.reader_feature_flags, 0);
+    assert_eq!(
+        manifest.reader_feature_flags,
+        feature_flags::FLAG_PERSISTENT_MAX_FIELD_ID
+    );
+    assert_eq!(
+        manifest.writer_feature_flags,
+        feature_flags::FLAG_PERSISTENT_MAX_FIELD_ID
+    );
 
     // Create one with deletions
     dataset.delete("i < 10").await.unwrap();
@@ -1082,11 +1089,11 @@ async fn test_write_manifest(
     .unwrap();
     assert_eq!(
         manifest.writer_feature_flags,
-        feature_flags::FLAG_DELETION_FILES
+        feature_flags::FLAG_DELETION_FILES | feature_flags::FLAG_PERSISTENT_MAX_FIELD_ID
     );
     assert_eq!(
         manifest.reader_feature_flags,
-        feature_flags::FLAG_DELETION_FILES
+        feature_flags::FLAG_DELETION_FILES | feature_flags::FLAG_PERSISTENT_MAX_FIELD_ID
     );
 
     // Write with custom manifest

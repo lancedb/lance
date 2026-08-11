@@ -125,6 +125,12 @@ message Manifest {
   //   MemWAL SSTables still hold. Writers must refuse it too: one that does not
   //   maintain index_catchup can change an index without withdrawing the
   //   position recorded for it. Setting it is one-way.
+  // * 1 << 8: persistent field ID high-water (`max_field_id`) is present.
+  //   Required for both readers and writers. Older Lance builds whose unknown
+  //   feature-flag boundary is 256 fail closed at dataset open and cannot reach
+  //   schema mutations that would ignore the high-water. Current Lance always
+  //   understands the bit; old manifests without the field remain readable and
+  //   upgrade on the next successful commit. Setting it is one-way.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -217,6 +223,21 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // The highest field ID that has been allocated so far.
+  //
+  // Field IDs are stable identities and are never reused. This high-water may
+  // refer to a field that is no longer present in the current schema or in any
+  // current fragment data file (for example after drop + compaction).
+  //
+  // Absent means an old manifest written before this field existed. Readers
+  // derive the recoverable maximum from the current schema and fragment
+  // data-file field IDs only; they must not invent an unverifiable historical
+  // value. Writers persist the effective high-water (max of any stored value,
+  // current schema maximum, and current fragment data-file field IDs) on the
+  // next successful commit and must never decrease it when deriving a new
+  // manifest.
+  optional int32 max_field_id = 22;
 } // Manifest
 
 // external dataset base path

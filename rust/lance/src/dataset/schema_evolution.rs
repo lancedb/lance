@@ -2727,6 +2727,12 @@ mod test {
         .await?;
 
         let original_fragments = dataset.fragments().to_vec();
+        let a_id = dataset.schema().field("a").unwrap().id;
+        let b_id = dataset.schema().field("b").unwrap().id;
+        let c_id = dataset.schema().field("b.c").unwrap().id;
+        let high_water_before = dataset.manifest.max_field_id();
+        assert_eq!((a_id, b_id, c_id), (0, 1, 2));
+        assert_eq!(high_water_before, 2);
 
         // Rename a top-level column
         dataset
@@ -2737,6 +2743,10 @@ mod test {
         dataset.validate().await?;
         assert_eq!(dataset.manifest.version, 2);
         assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(dataset.schema().field("x").unwrap().id, a_id);
+        assert_eq!(dataset.schema().field("b").unwrap().id, b_id);
+        assert_eq!(dataset.schema().field("b.c").unwrap().id, c_id);
+        assert_eq!(dataset.manifest.max_field_id(), high_water_before);
 
         let expected_schema = ArrowSchema::new_with_metadata(
             vec![
@@ -2769,6 +2779,10 @@ mod test {
         dataset.validate().await?;
         assert_eq!(dataset.manifest.version, 3);
         assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(dataset.schema().field("x").unwrap().id, a_id);
+        assert_eq!(dataset.schema().field("b").unwrap().id, b_id);
+        assert_eq!(dataset.schema().field("b.d").unwrap().id, c_id);
+        assert_eq!(dataset.manifest.max_field_id(), high_water_before);
 
         let expected_schema = ArrowSchema::new_with_metadata(
             vec![
@@ -2786,6 +2800,13 @@ mod test {
             metadata.clone(),
         );
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        // Reopen must preserve stable field IDs and the high-water after rename.
+        let dataset = Dataset::open(test_uri).await?;
+        assert_eq!(dataset.schema().field("x").unwrap().id, a_id);
+        assert_eq!(dataset.schema().field("b").unwrap().id, b_id);
+        assert_eq!(dataset.schema().field("b.d").unwrap().id, c_id);
+        assert_eq!(dataset.manifest.max_field_id(), high_water_before);
 
         Ok(())
     }
@@ -3588,6 +3609,76 @@ mod test {
 
     #[rstest]
     #[tokio::test]
+    async fn test_restore_preserves_field_id_high_water(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let version_one = dataset.version().version;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("x".into(), "i + 1".into())]),
+                Some(vec!["i".into()]),
+                None,
+            )
+            .await?;
+        assert_eq!(dataset.schema().field("x").unwrap().id, 1);
+        let pre_restore_high_water = dataset.manifest.max_field_id();
+        assert_eq!(pre_restore_high_water, 1);
+
+        let mut dataset = dataset.checkout_version(version_one).await?;
+        dataset.restore().await?;
+        assert!(
+            dataset.manifest.max_field_id() >= pre_restore_high_water,
+            "restore must not drop the field-ID high-water: before={}, after={}",
+            pre_restore_high_water,
+            dataset.manifest.max_field_id()
+        );
+        assert!(dataset.schema().field("x").is_none());
+
+        let mut dataset = Dataset::open(test_uri).await?;
+        assert!(dataset.manifest.max_field_id() >= pre_restore_high_water);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("y".into(), "i + 2".into())]),
+                Some(vec!["i".into()]),
+                None,
+            )
+            .await?;
+        let y_id = dataset.schema().field("y").unwrap().id;
+        assert!(
+            y_id > pre_restore_high_water,
+            "post-restore add must allocate above historical high-water: y_id={y_id}, hw={pre_restore_high_water}"
+        );
+        assert_eq!(dataset.manifest.max_field_id(), y_id);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn test_drop_add_columns(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
@@ -3615,8 +3706,8 @@ mod test {
         .await?;
         assert_eq!(dataset.manifest.max_field_id(), 0);
 
-        // Test we can add 1 column, drop it, then add another column. Validate
-        // the field ids are as expected.
+        // Field IDs are stable identities and must never be reused. After add ->
+        // drop -> reopen -> add, allocation must stay strictly monotonic.
         dataset
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("x".into(), "i + 1".into())]),
@@ -3624,10 +3715,14 @@ mod test {
                 None,
             )
             .await?;
+        assert_eq!(dataset.schema().field("x").unwrap().id, 1);
         assert_eq!(dataset.manifest.max_field_id(), 1);
 
         dataset.drop_columns(&["x"]).await?;
-        assert_eq!(dataset.manifest.max_field_id(), 0);
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        let mut dataset = Dataset::open(test_uri).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 1);
 
         dataset
             .add_columns(
@@ -3636,7 +3731,8 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 1);
+        assert_eq!(dataset.schema().field("y").unwrap().id, 2);
+        assert_eq!(dataset.manifest.max_field_id(), 2);
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_data = RecordBatch::try_new(
@@ -3648,10 +3744,13 @@ mod test {
         )?;
         assert_eq!(data, expected_data);
         dataset.drop_columns(&["y"]).await?;
-        assert_eq!(dataset.manifest.max_field_id(), 0);
+        assert_eq!(dataset.manifest.max_field_id(), 2);
 
-        // Test we can add 2 columns, drop 1, then add another column. Validate
-        // the field ids are as expected.
+        let mut dataset = Dataset::open(test_uri).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 2);
+
+        // Add 2 columns, drop 1, then add another. IDs must continue above the
+        // historical high-water mark even when file evidence remains for a sibling.
         dataset
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![
@@ -3662,12 +3761,14 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 2);
+        assert_eq!(dataset.schema().field("a").unwrap().id, 3);
+        assert_eq!(dataset.schema().field("b").unwrap().id, 4);
+        assert_eq!(dataset.manifest.max_field_id(), 4);
 
         dataset.drop_columns(&["b"]).await?;
         // Even though we dropped a column, we still have the fragment with a and
         // b. So it should still act as if that field id is still in play.
-        assert_eq!(dataset.manifest.max_field_id(), 2);
+        assert_eq!(dataset.manifest.max_field_id(), 4);
 
         dataset
             .add_columns(
@@ -3676,7 +3777,8 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 3);
+        assert_eq!(dataset.schema().field("c").unwrap().id, 5);
+        assert_eq!(dataset.manifest.max_field_id(), 5);
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = Arc::new(ArrowSchema::new(vec![
@@ -3693,6 +3795,295 @@ mod test {
             ],
         )?;
         assert_eq!(data, expected_data);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_nested_field_ids_not_reused_after_drop_readd(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        let nested_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("d", DataType::Int32, true),
+                ArrowField::new("l", DataType::Int32, true),
+            ])),
+            true,
+        )]));
+        let nested_batch = RecordBatch::try_new(
+            nested_schema.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(ArrowField::new("d", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("l", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![Some(20), Some(30)])) as ArrayRef,
+                ),
+            ])) as ArrayRef],
+        )?;
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(nested_batch)],
+                    nested_schema,
+                ))),
+                None,
+                None,
+            )
+            .await?;
+
+        let first_struct_id = dataset.schema().field("s").unwrap().id;
+        let first_d_id = dataset.schema().field("s.d").unwrap().id;
+        let first_l_id = dataset.schema().field("s.l").unwrap().id;
+        assert_eq!((first_struct_id, first_d_id, first_l_id), (1, 2, 3));
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+
+        dataset.drop_columns(&["s"]).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+
+        let mut dataset = Dataset::open(test_uri).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+
+        let nested_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("d", DataType::Int32, true),
+                ArrowField::new("l", DataType::Int32, true),
+            ])),
+            true,
+        )]));
+        let nested_batch = RecordBatch::try_new(
+            nested_schema.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(ArrowField::new("d", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![Some(11), Some(12)])) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("l", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![Some(21), Some(22)])) as ArrayRef,
+                ),
+            ])) as ArrayRef],
+        )?;
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(nested_batch)],
+                    nested_schema,
+                ))),
+                None,
+                None,
+            )
+            .await?;
+
+        let second_struct_id = dataset.schema().field("s").unwrap().id;
+        let second_d_id = dataset.schema().field("s.d").unwrap().id;
+        let second_l_id = dataset.schema().field("s.l").unwrap().id;
+        assert_eq!((second_struct_id, second_d_id, second_l_id), (4, 5, 6));
+        assert_eq!(dataset.manifest.max_field_id(), 6);
+        assert!(second_struct_id > first_l_id);
+        assert!(second_d_id > first_l_id);
+        assert!(second_l_id > first_l_id);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_field_ids_survive_compaction_after_drop(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("x", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )?;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        // Two fragments so compaction has neighbors to merge and rewrite.
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(dataset.schema().field("x").unwrap().id, 1);
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        dataset.drop_columns(&["x"]).await?;
+        // Dropped field id is still present in fragment file metadata.
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .any(|fragment| { fragment.files.iter().any(|file| file.fields.contains(&1)) })
+        );
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+        dataset.validate().await?;
+        assert_eq!(dataset.get_fragments().len(), 1);
+        // Physical rewrite must remove the last file evidence for field 1, but
+        // the dataset high-water mark must still remember it.
+        assert!(
+            !dataset
+                .fragments()
+                .iter()
+                .any(|fragment| { fragment.files.iter().any(|file| file.fields.contains(&1)) })
+        );
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        let mut dataset = Dataset::open(test_uri).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 1);
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("y".into(), "i + 100".into())]),
+                Some(vec!["i".into()]),
+                None,
+            )
+            .await?;
+        assert_eq!(dataset.schema().field("y").unwrap().id, 2);
+        assert_eq!(dataset.manifest.max_field_id(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_add_columns_never_reuses_field_ids() -> Result<()> {
+        use std::collections::HashMap;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(batches, test_uri, None).await?;
+        assert_eq!(dataset.manifest.max_field_id(), 0);
+
+        // Two handles on the same basis version; both allocate from that high-water.
+        let mut ds_a = Dataset::open(test_uri).await?;
+        let mut ds_b = Dataset::open(test_uri).await?;
+        assert_eq!(ds_a.version().version, ds_b.version().version);
+
+        let (result_a, result_b) = tokio::join!(
+            ds_a.add_columns(
+                NewColumnTransform::SqlExpressions(vec![("a".into(), "i + 1".into())]),
+                None,
+                None,
+            ),
+            ds_b.add_columns(
+                NewColumnTransform::SqlExpressions(vec![("b".into(), "i + 2".into())]),
+                None,
+                None,
+            ),
+        );
+        assert!(
+            result_a.is_ok() || result_b.is_ok(),
+            "at least one concurrent add must commit: a={result_a:?} b={result_b:?}"
+        );
+        // Same-basis Merge commits conflict; both succeeding would require reuse or rebase.
+        assert!(
+            result_a.is_err() || result_b.is_err(),
+            "concurrent same-basis adds must conflict: a={result_a:?} b={result_b:?}"
+        );
+
+        let mut latest = Dataset::open(test_uri).await?;
+        let winner_high_water = latest.manifest.max_field_id();
+        assert!(winner_high_water >= 1);
+
+        let mut id_to_name: HashMap<i32, String> = HashMap::new();
+        let mut prior_high_water = -1_i32;
+        for version_meta in latest.versions().await? {
+            let versioned = latest.checkout_version(version_meta.version).await?;
+            assert!(
+                versioned.manifest.max_field_id() >= prior_high_water,
+                "field-ID high-water decreased at version {}",
+                version_meta.version
+            );
+            prior_high_water = versioned.manifest.max_field_id();
+            for field in versioned.schema().fields_pre_order() {
+                if let Some(existing) = id_to_name.get(&field.id) {
+                    assert_eq!(
+                        existing, &field.name,
+                        "field id {} reused for '{}' after '{}'",
+                        field.id, field.name, existing
+                    );
+                } else {
+                    id_to_name.insert(field.id, field.name.clone());
+                }
+            }
+        }
+
+        latest
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("c".into(), "i + 3".into())]),
+                None,
+                None,
+            )
+            .await?;
+        let c_id = latest.schema().field("c").unwrap().id;
+        assert!(
+            c_id > winner_high_water,
+            "next add must allocate above the winner high-water: c_id={c_id}, winner={winner_high_water}"
+        );
+        assert_eq!(latest.manifest.max_field_id(), c_id);
 
         Ok(())
     }

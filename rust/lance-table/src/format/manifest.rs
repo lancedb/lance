@@ -18,8 +18,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{
+    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_PERSISTENT_MAX_FIELD_ID, FLAG_STABLE_ROW_IDS,
+    has_deprecated_v2_feature_flag,
+};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -75,6 +77,13 @@ pub struct Manifest {
     /// The max fragment id used so far
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
+
+    /// Persisted field-ID high-water mark.
+    ///
+    /// `None` means an old manifest that predates this field. The effective
+    /// high-water used for allocation is [`Self::max_field_id`], which never
+    /// decreases when a new manifest is derived.
+    pub max_field_id: Option<i32>,
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
@@ -191,6 +200,7 @@ impl Manifest {
             reader_feature_flags: 0,
             writer_feature_flags: 0,
             max_fragment_id: None,
+            max_field_id: None,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -219,9 +229,14 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            // Preserve the one-way high-water reader/writer bits; other flags are
+            // recomputed on commit. Needed when auto_set_feature_flags is false.
+            reader_feature_flags: previous.reader_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            writer_feature_flags: previous.writer_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
             max_fragment_id: previous.max_fragment_id,
+            // Floor at the previous effective high-water so drop/compaction
+            // cannot reuse field IDs after file evidence disappears.
+            max_field_id: Some(previous.max_field_id()),
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -278,10 +293,14 @@ impl Manifest {
             tag: None,
             // Not derivable from the manifest, so it would be lost like any
             // other zeroed word -- and a clone of a table that requires index
-            // catch-up would silently come back as legacy.
-            reader_feature_flags: self.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            writer_feature_flags: self.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            // catch-up would silently come back as legacy. Same for the
+            // persistent field-ID high-water fence.
+            reader_feature_flags: self.reader_feature_flags
+                & (FLAG_MEM_WAL_INDEX_CATCHUP | FLAG_PERSISTENT_MAX_FIELD_ID),
+            writer_feature_flags: self.writer_feature_flags
+                & (FLAG_MEM_WAL_INDEX_CATCHUP | FLAG_PERSISTENT_MAX_FIELD_ID),
             max_fragment_id: self.max_fragment_id,
+            max_field_id: Some(self.max_field_id()),
             transaction_file: Some(transaction_file),
             transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
@@ -410,6 +429,19 @@ impl Manifest {
         }
     }
 
+    /// Persist the effective field-ID high-water mark.
+    ///
+    /// The effective value is the max of any stored high-water, the current
+    /// schema maximum, and all current fragment data-file field IDs. Calling
+    /// this never decreases the stored value. Also sets
+    /// [`FLAG_PERSISTENT_MAX_FIELD_ID`] on both reader and writer flags so old
+    /// Lance builds fail closed at dataset open.
+    pub fn update_max_field_id(&mut self) {
+        self.max_field_id = Some(self.max_field_id());
+        self.reader_feature_flags |= FLAG_PERSISTENT_MAX_FIELD_ID;
+        self.writer_feature_flags |= FLAG_PERSISTENT_MAX_FIELD_ID;
+    }
+
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
     ///
@@ -427,7 +459,8 @@ impl Manifest {
     /// Get the max used field id
     ///
     /// This is different than [Schema::max_field_id] because it also considers
-    /// the field ids in the data files that have been dropped from the schema.
+    /// the field ids in the data files that have been dropped from the schema
+    /// and any persisted high-water mark from prior versions.
     pub fn max_field_id(&self) -> i32 {
         let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
         let fragment_max_id = self
@@ -435,9 +468,10 @@ impl Manifest {
             .iter()
             .flat_map(|f| f.files.iter().flat_map(|file| file.fields.iter()))
             .max()
-            .copied();
-        let fragment_max_id = fragment_max_id.unwrap_or(-1);
-        schema_max_id.max(fragment_max_id)
+            .copied()
+            .unwrap_or(-1);
+        let stored_max_id = self.max_field_id.unwrap_or(-1);
+        schema_max_id.max(fragment_max_id).max(stored_max_id)
     }
 
     /// Return the fragments that are newer than the given manifest.
@@ -953,6 +987,9 @@ impl TryFrom<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            // Absent means an old manifest; effective high-water is derived from
+            // schema/fragments until the next commit persists it.
+            max_field_id: p.max_field_id,
             fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
@@ -1015,6 +1052,16 @@ impl From<&Manifest> for pb::Manifest {
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
+            // Persist the effective high-water once high-water semantics are
+            // active (stored value present and/or fencing bit set).
+            max_field_id: if m.max_field_id.is_some()
+                || m.reader_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID != 0
+                || m.writer_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID != 0
+            {
+                Some(m.max_field_id())
+            } else {
+                None
+            },
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
@@ -1528,6 +1575,143 @@ mod tests {
         );
 
         assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    fn simple_manifest_with_field_ids(schema_ids: &[i32], file_ids: &[i32]) -> Manifest {
+        let fields = schema_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, id)| {
+                let mut field = Field::try_from(ArrowField::new(
+                    format!("f{idx}"),
+                    arrow_schema::DataType::Int64,
+                    false,
+                ))
+                .unwrap();
+                let mut next_id = *id;
+                field.set_id(-1, &mut next_id);
+                field
+            })
+            .collect();
+        let schema = Schema {
+            fields,
+            metadata: Default::default(),
+        };
+        let fragments = if file_ids.is_empty() {
+            vec![]
+        } else {
+            vec![Fragment {
+                id: 0,
+                files: vec![DataFile::new_legacy_from_fields(
+                    "path1",
+                    file_ids.to_vec(),
+                    None,
+                )],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(1),
+                created_at_version_meta: None,
+                last_updated_at_version_meta: None,
+            }]
+        };
+        Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn max_field_id_protobuf_round_trip() {
+        let mut manifest = simple_manifest_with_field_ids(&[0, 1], &[0, 1]);
+        manifest.update_max_field_id();
+        assert_eq!(manifest.max_field_id, Some(1));
+        assert_ne!(
+            manifest.reader_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+
+        let pb = pb::Manifest::from(&manifest);
+        assert_eq!(pb.max_field_id, Some(1));
+        let encoded = pb.encode_to_vec();
+        let decoded_pb = pb::Manifest::decode(encoded.as_slice()).unwrap();
+        let decoded = Manifest::try_from(decoded_pb).unwrap();
+        assert_eq!(decoded.max_field_id, Some(1));
+        assert_eq!(decoded.max_field_id(), 1);
+        assert_ne!(
+            decoded.reader_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+        assert_ne!(
+            decoded.writer_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+    }
+
+    #[test]
+    fn old_manifest_without_max_field_id_falls_back_to_schema_and_fragments() {
+        let manifest = simple_manifest_with_field_ids(&[0], &[0, 7]);
+        let mut pb = pb::Manifest::from(&manifest);
+        pb.max_field_id = None;
+        // Strip fencing bits so encode path would not re-attach the field.
+        pb.reader_feature_flags &= !FLAG_PERSISTENT_MAX_FIELD_ID;
+        pb.writer_feature_flags &= !FLAG_PERSISTENT_MAX_FIELD_ID;
+
+        let recovered = Manifest::try_from(pb).unwrap();
+        assert_eq!(recovered.max_field_id, None);
+        assert_eq!(recovered.max_field_id(), 7);
+
+        // Next derived manifest persists the recoverable high-water.
+        let next =
+            Manifest::new_from_previous(&recovered, recovered.schema.clone(), Arc::new(vec![]));
+        assert_eq!(next.max_field_id, Some(7));
+        assert_eq!(next.max_field_id(), 7);
+    }
+
+    #[test]
+    fn max_field_id_never_decreases_across_new_from_previous_and_shallow_clone() {
+        let mut manifest = simple_manifest_with_field_ids(&[0, 1], &[0, 1]);
+        manifest.update_max_field_id();
+        assert_eq!(manifest.max_field_id(), 1);
+
+        // Schema and fragments no longer mention field 1 (drop + rewrite).
+        let reduced = simple_manifest_with_field_ids(&[0], &[0]);
+        let derived =
+            Manifest::new_from_previous(&manifest, reduced.schema.clone(), reduced.fragments);
+        assert_eq!(derived.max_field_id, Some(1));
+        assert_eq!(derived.max_field_id(), 1);
+        assert_ne!(
+            derived.reader_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+        assert_ne!(
+            derived.writer_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+
+        let cloned = derived.shallow_clone(
+            Some("v1".to_string()),
+            "file:///parent".to_string(),
+            0,
+            None,
+            "0-txn".to_string(),
+        );
+        assert_eq!(cloned.max_field_id, Some(1));
+        assert_eq!(cloned.max_field_id(), 1);
+        assert_ne!(
+            cloned.reader_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
+        assert_ne!(
+            cloned.writer_feature_flags & FLAG_PERSISTENT_MAX_FIELD_ID,
+            0
+        );
     }
 
     #[test]
