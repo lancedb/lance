@@ -18,6 +18,7 @@ import com.google.common.base.MoreObjects;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.OptionalDataException;
 import java.io.Serializable;
 import java.util.Optional;
 
@@ -28,6 +29,10 @@ import java.util.Optional;
  * default values.
  */
 public class CompactionOptions implements Serializable {
+  // Pinned to the UID generated before maxSourceRows/maxSourceBytes were added, so that
+  // CompactionTask streams queued by older workers still deserialize during a rolling upgrade.
+  private static final long serialVersionUID = 3114922060085417942L;
+
   // these fields are effectively final, but not marked as final for de/ser
   private Optional<Long> targetRowsPerFragment;
   private Optional<Long> maxRowsPerGroup;
@@ -185,8 +190,25 @@ public class CompactionOptions implements Serializable {
     }
     this.binaryCopyReadBatchBytes = Optional.ofNullable((Long) input.readObject());
     this.maxSourceFragments = Optional.ofNullable((Long) input.readObject());
-    this.maxSourceRows = Optional.ofNullable((Long) input.readObject());
-    this.maxSourceBytes = Optional.ofNullable((Long) input.readObject());
+    this.maxSourceRows = readTrailingLong(input);
+    this.maxSourceBytes = readTrailingLong(input);
+  }
+
+  /**
+   * Reads a trailing Long field that older writers did not emit. Streams written before the field
+   * was added end here, which surfaces as an {@link OptionalDataException} with {@code eof} set; in
+   * that case the field is treated as unset.
+   */
+  private static Optional<Long> readTrailingLong(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      return Optional.ofNullable((Long) input.readObject());
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Optional.empty();
+    }
   }
 
   /** Builder for CompactionOptions. */
