@@ -232,7 +232,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![frag_reuse_index],
                 removed_indices: Vec::new(),
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
