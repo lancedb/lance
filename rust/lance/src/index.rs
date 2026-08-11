@@ -58,6 +58,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
+use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -1431,9 +1432,32 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 }
 
-/// Describe, for each named index, the segments it will consist of after this
-/// commit and the catch-up generations to record for it.
-///
+impl Dataset {
+    /// Whether a commit on this table could record a new MemWAL catch-up
+    /// position: it is on the protocol, and something has been compacted for an
+    /// index to be behind on.
+    async fn mem_wal_catch_up_may_advance(&self) -> Result<bool> {
+        if self.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
+            || self.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
+        {
+            return Ok(false);
+        }
+        let Some(system_index) = self
+            .load_indices()
+            .await?
+            .iter()
+            .find(|index| index.name == MEM_WAL_INDEX_NAME)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        Ok(
+            !crate::index::mem_wal::load_mem_wal_index_details(system_index)?
+                .compacted_sstables
+                .is_empty(),
+        )
+    }
+}
 
 #[async_trait]
 impl DatasetIndexExt for Dataset {
@@ -2129,7 +2153,14 @@ impl DatasetIndexExt for Dataset {
             new_indices.push(new_idx);
         }
 
-        if new_indices.is_empty() {
+        // A no-work optimize still has to commit on a table that requires
+        // catch-up. Coverage is derived at commit time, so an index that
+        // already spans the table records its position only if there is a
+        // commit to record it on -- and that is the ordinary case after a
+        // remap or a compaction that advanced a generation without changing
+        // fragments. Returning early there leaves the position missing forever
+        // and the repair rescheduling itself.
+        if new_indices.is_empty() && !self.mem_wal_catch_up_may_advance().await? {
             return Ok(());
         }
 

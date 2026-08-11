@@ -699,6 +699,88 @@ mod tests {
         assert_eq!(catch_up_generation(&dataset, "idx").await, Some(5));
     }
 
+    /// A repair with nothing to rebuild still has to commit.
+    ///
+    /// Coverage is derived at commit time, so an index that already spans the
+    /// table records its position only if there is a commit to record it on.
+    /// That is the ordinary case after a remap, or after a compaction that
+    /// advanced a generation without changing which fragments exist: the
+    /// optimize finds no unindexed fragments and has no new segment to publish.
+    /// Skipping the commit there leaves the position missing forever, the
+    /// scheduler repeating the same repair, and the last SSTable unretirable.
+    #[tokio::test]
+    async fn a_no_work_repair_still_records_derived_catch_up() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let shard = Uuid::new_v4();
+        let dataset = activated_dataset(shard, 7).await;
+        // Already spans the table, so the optimize below has nothing to build.
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        // Compaction advances without adding a fragment, so the index still
+        // covers and the optimize stays a no-op.
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 9)],
+                require_index_catchup: false,
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append().index_names(vec!["idx".to_string()]))
+            .await
+            .unwrap();
+
+        assert_eq!(catch_up_generation(&dataset, "idx").await, Some(9));
+    }
+
+    /// A no-op optimize on a table that is not on the protocol must stay a
+    /// no-op: the early return is what keeps ordinary tables from committing an
+    /// empty version on every maintenance pass.
+    #[tokio::test]
+    async fn a_no_work_optimize_off_protocol_commits_nothing() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let dataset = test_dataset_with_mem_wal().await;
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        let before = dataset.manifest.version;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append().index_names(vec!["idx".to_string()]))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.manifest.version, before);
+    }
+
     /// A legacy table reads a missing entry as "fully caught up". Writing one
     /// there would be the first step toward a trim it never agreed to, so the
     /// commit path must not even look.

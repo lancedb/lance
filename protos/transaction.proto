@@ -82,12 +82,11 @@ message Transaction {
     repeated IndexMetadata new_indices = 1;
     repeated IndexMetadata removed_indices = 2;
 
-
-    // Empty for every ordinary index operation. Creating, reindexing,
-    // appending to, or remapping an index changes it without saying how far it
-    // has caught up, so that index's index_catchup entry is removed and a later
-    // repair records a fresh one. Empty means "this operation reports no new
-    // coverage"; it never means "inherit the previous index's catch-up".
+    // Held by mem_wal_index_catchup_advances, which briefly shipped: index
+    // catch-up is derived from the version a commit read, not reported by the
+    // writer. Transaction files carrying the old field may exist.
+    reserved 3;
+    reserved "mem_wal_index_catchup_advances";
   }
 
   // An operation that rewrites but does not change the data in the table. These

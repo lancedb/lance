@@ -329,10 +329,21 @@ pub struct UpdateMap {
 /// prune a segment's fragment bitmap while keeping its UUID, so a UUID-only
 /// comparison would keep coverage for an index that no longer spans the same
 /// base fragments.
-type LogicalIndexSegments = BTreeMap<String, Vec<IndexMetadata>>;
+type LogicalIndexSegments = BTreeMap<String, Vec<CoverageIdentity>>;
 
-/// [`LogicalIndexSegments`] borrowed from an index list the caller still holds.
-type LogicalIndexSegmentRefs<'a> = BTreeMap<&'a str, Vec<&'a IndexMetadata>>;
+/// What one physical index segment contributes to coverage.
+///
+/// Deliberately not the whole [`IndexMetadata`]. The UUID alone is not enough:
+/// an operation can prune a segment's fragment bitmap in place and keep the
+/// UUID, so a UUID-only comparison carries a position an index no longer earns.
+/// Everything else -- file lists, timestamps, inferred details -- can change
+/// without changing which rows the index answers for, and migrations fill those
+/// in routinely, so including them would withdraw coverage for no reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoverageIdentity {
+    uuid: Uuid,
+    fragment_bitmap: Option<RoaringBitmap>,
+}
 
 /// The version a transaction read, as the coverage derivation needs it.
 ///
@@ -342,7 +353,10 @@ type LogicalIndexSegmentRefs<'a> = BTreeMap<&'a str, Vec<&'a IndexMetadata>>;
 /// nothing maps a compaction generation to the fragments its rows landed in.
 ///
 /// `read_version` is fixed for the life of a transaction and survives rebase,
-/// so the derivation gives the same answer on every commit attempt.
+/// so the credit a commit can prove is stable across attempts. The recorded
+/// result may still differ between attempts, because a rebased attempt sees a
+/// different head: other commits move the compacted generations and the
+/// positions already recorded.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReadVersionState<'a> {
     pub manifest: &'a Manifest,
@@ -1926,39 +1940,26 @@ impl Transaction {
         Ok(())
     }
 
-    /// Every non-system logical index, mapped to its segments in a stable order.
+    /// Every non-system logical index, mapped to what determines its coverage.
     ///
     /// A logical index may be backed by several physical segments, so "did this
-    /// index change" is a question about the whole set. Whole metadata rather
-    /// than UUIDs: an operation can prune a segment's fragment bitmap in place
-    /// while keeping its UUID.
-    ///
-    /// Owned, because the caller snapshots this before the operation rewrites
-    /// the index list. Use [`Self::logical_index_segment_refs`] for the side
-    /// that is still in hand.
-    /// [`Self::logical_index_segments`] without the clones, for an index list
-    /// the caller still holds.
-    fn logical_index_segment_refs(indices: &[IndexMetadata]) -> LogicalIndexSegmentRefs<'_> {
-        let mut by_name: LogicalIndexSegmentRefs<'_> = BTreeMap::new();
+    /// index change" is a question about the whole set. Sorted by UUID so the
+    /// two sides compare positionally.
+    pub(crate) fn logical_index_segments(indices: &[IndexMetadata]) -> LogicalIndexSegments {
+        let mut by_name: LogicalIndexSegments = BTreeMap::new();
         for idx in indices.iter().filter(|idx| !is_system_index(idx)) {
-            by_name.entry(idx.name.as_str()).or_default().push(idx);
+            by_name
+                .entry(idx.name.clone())
+                .or_default()
+                .push(CoverageIdentity {
+                    uuid: idx.uuid,
+                    fragment_bitmap: idx.fragment_bitmap.clone(),
+                });
         }
         for segments in by_name.values_mut() {
             segments.sort_unstable_by_key(|segment| segment.uuid);
         }
         by_name
-    }
-
-    fn logical_index_segments(indices: &[IndexMetadata]) -> LogicalIndexSegments {
-        Self::logical_index_segment_refs(indices)
-            .into_iter()
-            .map(|(name, segments)| {
-                (
-                    name.to_string(),
-                    segments.into_iter().cloned().collect::<Vec<_>>(),
-                )
-            })
-            .collect()
     }
 
     /// Apply MemWAL index-coverage rules once the final index list is known.
@@ -2012,7 +2013,7 @@ impl Transaction {
             return Ok(());
         }
 
-        let segments_after = Self::logical_index_segment_refs(final_indices);
+        let segments_after = Self::logical_index_segments(final_indices);
         let catchup_before = std::mem::take(&mut details.index_catchup);
 
         // Per shard: what this commit records as compacted, and the most the
@@ -2063,11 +2064,19 @@ impl Transaction {
                 .collect()
         });
 
-        let covers_read_version = |segments: &[&IndexMetadata]| -> bool {
+        let covers_read_version = |segments: &[CoverageIdentity]| -> bool {
             let Some(required) = read_fragments.as_ref() else {
                 return false;
             };
             if required.is_empty() {
+                // Subset-of-empty is trivially true, so this would credit every
+                // index on a table with no fragments. Refused because an empty
+                // fragment list is not only what an emptied table looks like:
+                // it is also what a manifest written before #8438 looks like,
+                // where UpdateMemWalState published no fragments at all. On
+                // such a table the SSTables are the last copy of those rows,
+                // and crediting coverage would retire them. The cost is that a
+                // genuinely emptied table keeps its SSTables.
                 return false;
             }
             let mut covered = RoaringBitmap::new();
@@ -2087,11 +2096,9 @@ impl Transaction {
             // indexed field prunes a segment's fragment bitmap in place while
             // keeping its UUID, so a UUID-only comparison would carry a position
             // forward that the index no longer earns.
-            let unchanged = segments_before.get(*name).is_some_and(|before| {
-                before.len() == after.len() && before.iter().zip(after.iter()).all(|(b, a)| b == *a)
-            });
+            let unchanged = segments_before.get(name) == Some(after);
             let carried = unchanged
-                .then(|| catchup_before.iter().find(|e| e.index_name == **name))
+                .then(|| catchup_before.iter().find(|e| e.index_name == *name))
                 .flatten();
             let proven = covers_read_version(after);
 
@@ -2108,16 +2115,19 @@ impl Transaction {
                         .and_then(|entry| entry.caught_up_generation_for_shard(&shard_id))
                         .unwrap_or(0);
                     let credited = if proven { creditable } else { 0 };
-                    // Never lowers what an unchanged index already recorded: a
-                    // commit reading an older version still knows this index
-                    // covered more than its own snapshot can prove.
+                    // Takes the better of what this commit proves and what an
+                    // unchanged index already held, so a commit reading an older
+                    // version does not lower a position it cannot re-prove. The
+                    // clamp is the exception: a position above what this commit
+                    // records as compacted describes rows no live commit copied
+                    // in.
                     CompactedSsTable::new(shard_id, prior.max(credited).min(committed))
                 })
                 .collect::<Vec<_>>();
             if generations.iter().all(|g| g.generation == 0) {
                 continue;
             }
-            rebuilt.push(IndexCatchupProgress::new((*name).to_string(), generations));
+            rebuilt.push(IndexCatchupProgress::new(name.clone(), generations));
         }
         rebuilt.sort_by(|a, b| a.index_name.cmp(&b.index_name));
 
@@ -2142,6 +2152,49 @@ impl Transaction {
 
         details.index_catchup = rebuilt;
         final_indices[pos] = new_mem_wal_index_meta(new_version, details)?;
+        Ok(())
+    }
+
+    /// Drop coverage for any index a post-`build_manifest` step changed.
+    ///
+    /// The derivation runs while the manifest is being built, but the index
+    /// list is not final there: `migrate_indices` can recalculate a segment's
+    /// fragment bitmap and keep its UUID, so an index can narrow after its
+    /// position was decided. This only ever removes entries, so a step that
+    /// changes nothing costs nothing.
+    pub(crate) fn withdraw_coverage_invalidated_after_build(
+        indices: &mut [IndexMetadata],
+        segments_at_build: &LogicalIndexSegments,
+        new_version: u64,
+    ) -> Result<()> {
+        let changed: Vec<String> = Self::logical_index_segments(indices)
+            .into_iter()
+            .filter(|(name, after)| segments_at_build.get(name) != Some(after))
+            .map(|(name, _)| name)
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+
+        let Some(pos) = indices
+            .iter()
+            .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        else {
+            return Ok(());
+        };
+        let mut details = load_mem_wal_index_details(indices[pos].clone())?;
+        let before = details.index_catchup.len();
+        details
+            .index_catchup
+            .retain(|entry| !changed.contains(&entry.index_name));
+        if details.index_catchup.len() == before {
+            return Ok(());
+        }
+        log::info!(
+            "MemWAL index catch-up withdrawn at version {new_version} for {changed:?}: \
+             these indices changed after their coverage was derived"
+        );
+        indices[pos] = new_mem_wal_index_meta(new_version, details)?;
         Ok(())
     }
 
@@ -8455,6 +8508,51 @@ mod tests {
             assert_eq!(coverage, expected);
         }
 
+        /// The derivation runs while the manifest is being built, but the
+        /// index list is not final there: `migrate_indices` recalculates a
+        /// segment's fragment bitmap and keeps its UUID. A position decided
+        /// before that must not survive the narrowing, or the WAL pod trims
+        /// against an index that no longer covers those rows.
+        #[test]
+        fn a_bitmap_narrowed_after_the_build_loses_its_position() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let at_build = Transaction::logical_index_segments(&table(
+                &[0, 1],
+                uuid,
+                progress_with_catchup(shard, 5, 5),
+            ));
+            // What migrate_indices leaves behind: same UUID, fewer fragments.
+            let mut migrated = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
+
+            Transaction::withdraw_coverage_invalidated_after_build(&mut migrated, &at_build, 3)
+                .unwrap();
+
+            assert_eq!(coverage_for(&migrated, "idx"), None);
+        }
+
+        /// Migration routinely fills in file lists and inferred details. Those
+        /// do not change which rows an index answers for, so withdrawing on
+        /// them would drop coverage every commit for no reason.
+        #[test]
+        fn metadata_migration_that_does_not_narrow_keeps_its_position() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let at_build = Transaction::logical_index_segments(&table(
+                &[0, 1],
+                uuid,
+                progress_with_catchup(shard, 5, 5),
+            ));
+            let mut migrated = table(&[0, 1], uuid, progress_with_catchup(shard, 5, 5));
+            migrated[0].files = Some(Vec::new());
+            migrated[0].created_at = Some(chrono::Utc::now());
+
+            Transaction::withdraw_coverage_invalidated_after_build(&mut migrated, &at_build, 3)
+                .unwrap();
+
+            assert_eq!(coverage_for(&migrated, "idx"), Some(compacted(shard, 5)));
+        }
+
         /// A commit that changes nothing must not churn the system index: a new
         /// UUID on every append would invalidate its cache entry fleet-wide.
         #[test]
@@ -8580,6 +8678,20 @@ mod tests {
 
             assert_ne!(next.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
             assert_ne!(next.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
+        }
+
+        /// A commit with no read version still withdraws. It can prove nothing,
+        /// so an index it changed keeps no position -- the alternative leaves a
+        /// position describing an index that no longer exists.
+        #[test]
+        fn without_a_read_version_a_changed_index_still_loses_its_position() {
+            let shard = Uuid::new_v4();
+            let before = table(&[0, 1], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            let mut after = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
+            let segments_before = Transaction::logical_index_segments(&before);
+            Transaction::apply_mem_wal_index_coverage(&mut after, &segments_before, None, true, 2)
+                .unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
         }
 
         /// Two attempts against the same read version agree, which is what makes

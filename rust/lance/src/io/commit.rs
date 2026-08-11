@@ -1073,7 +1073,21 @@ pub(crate) async fn do_commit_detached_transaction(
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
         check_fragment_ids(&manifest)?;
+        // `migrate_indices` can recalculate a fragment bitmap while keeping its
+        // UUID, so coverage derived during `build_manifest` may describe an index
+        // that no longer exists. Only withdraws, never credits.
+        let segments_at_build = (manifest.reader_feature_flags
+            & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
+            != 0)
+            .then(|| Transaction::logical_index_segments(&indices));
         migrate_indices(dataset, &mut indices).await?;
+        if let Some(segments_at_build) = segments_at_build {
+            Transaction::withdraw_coverage_invalidated_after_build(
+                &mut indices,
+                &segments_at_build,
+                manifest.version,
+            )?;
+        }
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -1318,7 +1332,9 @@ pub(crate) async fn commit_transaction(
         & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
         != 0
     {
-        Some(read_version_dataset.load_indices().await?.as_ref().clone())
+        // The Arc is kept rather than cloned out: `load_indices` returns shared
+        // cached data, and this runs on every commit to an activated table.
+        Some(read_version_dataset.load_indices().await?)
     } else {
         None
     };
@@ -1426,7 +1442,21 @@ pub(crate) async fn commit_transaction(
         check_column_indices(&manifest)?;
         check_fragment_ids(&manifest)?;
 
+        // `migrate_indices` can recalculate a fragment bitmap while keeping its
+        // UUID, so coverage derived during `build_manifest` may describe an index
+        // that no longer exists. Only withdraws, never credits.
+        let segments_at_build = (manifest.reader_feature_flags
+            & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
+            != 0)
+            .then(|| Transaction::logical_index_segments(&indices));
         migrate_indices(&dataset, &mut indices).await?;
+        if let Some(segments_at_build) = segments_at_build {
+            Transaction::withdraw_coverage_invalidated_after_build(
+                &mut indices,
+                &segments_at_build,
+                target_version,
+            )?;
+        }
 
         // Try to commit the manifest
         let result = write_manifest_file(
