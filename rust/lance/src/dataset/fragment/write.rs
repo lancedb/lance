@@ -8,7 +8,9 @@ use lance_core::Error;
 use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+#[cfg(test)]
+use lance_file::version::LanceFileVersion;
+use lance_file::version::stable_file_version;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
@@ -110,14 +112,15 @@ impl<'a> FragmentCreateBuilder<'a> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
         // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
         // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
-        // multi-fragment and dataset write paths perform this through `do_write_fragments`;
+        // multi-fragment and dataset write paths perform this through
+        // `versions::write_fragments_direct`;
         // the single-fragment create path must do the same or the raw UTF-8 string bytes
         // would be written into a column whose schema declares JSONB, corrupting reads.
         let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);
         let version = self
             .write_params
             .map(|params| params.storage_version_or_default())
-            .unwrap_or_else(|| ConcreteFileVersion::from(LanceFileVersion::Stable));
+            .unwrap_or_else(stable_file_version);
         crate::dataset::versions::write_fragment(
             version,
             self,
@@ -690,8 +693,7 @@ mod tests {
 
         assert!(!fragment.files.is_empty());
         fragment.files.iter().for_each(|f| {
-            let (major_version, minor_version) =
-                ConcreteFileVersion::from(file_version).to_data_file_numbers();
+            let (major_version, minor_version) = file_version.resolve().to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
@@ -723,8 +725,7 @@ mod tests {
 
         assert!(!fragment.is_empty());
         fragment[0].files.iter().for_each(|f| {
-            let (major_version, minor_version) =
-                ConcreteFileVersion::from(file_version).to_data_file_numbers();
+            let (major_version, minor_version) = file_version.resolve().to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })

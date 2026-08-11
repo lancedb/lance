@@ -191,16 +191,14 @@ impl MemTableFlusher {
     /// (data fragments and index files) are written at this same version so the
     /// whole shard stays on one format (e.g. a 2.2 base => 2.2 SSTables).
     ///
-    /// Falls back to [`LanceFileVersion::default`] when no base dataset exists at
+    /// Falls back to the default selector's exact version when no base dataset exists at
     /// `base_uri` (e.g. flusher unit tests that run without a committed base).
     /// In production MemWAL is always initialized on a real dataset, so the base
     /// version is inherited; other open errors are propagated.
-    async fn base_storage_version(&self) -> Result<lance_file::version::LanceFileVersion> {
+    async fn base_storage_version(&self) -> Result<lance_file::version::ConcreteFileVersion> {
         match self.open_base().await {
-            Ok(dataset) => dataset.manifest().data_storage_format.lance_file_version(),
-            Err(Error::DatasetNotFound { .. }) => {
-                Ok(lance_file::version::LanceFileVersion::default())
-            }
+            Ok(dataset) => Ok(dataset.manifest().data_storage_format.lance_file_format()),
+            Err(Error::DatasetNotFound { .. }) => Ok(lance_file::version::stable_file_version()),
             Err(e) => Err(e),
         }
     }
@@ -359,7 +357,7 @@ impl MemTableFlusher {
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
-            data_storage_version: Some(self.base_storage_version().await?),
+            data_storage_version: Some(self.base_storage_version().await?.to_selector()),
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the
             // generation URI: a path-bound store binding would send this write at
@@ -902,6 +900,7 @@ impl MemTableFlusher {
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_core::ROW_ID;
+        use lance_file::versions as file_versions;
         use lance_file::writer::FileWriterOptions;
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
@@ -921,7 +920,8 @@ impl MemTableFlusher {
 
         // Write the index files at the base dataset's storage version (matches
         // the flushed data fragments; 2.2 avoids the v2.1 miniblock chunk cap).
-        let storage_version = self.base_storage_version().await?;
+        let storage_version =
+            crate::dataset::versions::index_file_version(self.base_storage_version().await?);
 
         let index_uuid = uuid::Uuid::new_v4();
         let index_dir = gen_path
@@ -993,8 +993,8 @@ impl MemTableFlusher {
         storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut storage_writer = lance_file::versions::create_writer(
-            lance_file::version::ConcreteFileVersion::from(storage_version),
+        let mut storage_writer = file_versions::create_writer(
+            storage_version,
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
             FileWriterOptions::default(),
@@ -1066,8 +1066,8 @@ impl MemTableFlusher {
             ArrowSchema::new(fields)
         };
         let index_path = index_dir.clone().join(INDEX_FILE_NAME);
-        let mut index_writer = lance_file::versions::create_writer(
-            lance_file::version::ConcreteFileVersion::from(storage_version),
+        let mut index_writer = file_versions::create_writer(
+            storage_version,
             self.object_store.create(&index_path).await?,
             (&index_schema).try_into()?,
             FileWriterOptions::default(),

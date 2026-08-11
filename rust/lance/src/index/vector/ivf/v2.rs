@@ -5577,6 +5577,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![new_meta],
                 removed_indices: vec![old_meta.clone()],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );

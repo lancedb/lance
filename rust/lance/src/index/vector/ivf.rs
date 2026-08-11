@@ -710,7 +710,12 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
+    let shuffler = create_ivf_shuffler(
+        temp_dir_path,
+        num_partitions,
+        format_version.to_selector(),
+        None,
+    );
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let summary = match index_type {
@@ -5426,6 +5431,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index_meta.clone()],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -5523,6 +5529,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![new_index_meta],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
