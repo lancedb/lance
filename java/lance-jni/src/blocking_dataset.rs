@@ -253,8 +253,8 @@ impl BlockingDataset {
         Ok(versions)
     }
 
-    pub fn version_count(&self) -> Result<u64> {
-        Ok(block_on(self.inner.version_count())?)
+    pub fn count_versions(&self) -> Result<u64> {
+        Ok(block_on(self.inner.count_versions())?)
     }
 
     pub fn version(&self) -> Result<Version> {
@@ -1684,7 +1684,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionCount(
 fn inner_get_version_count(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.version_count()
+    dataset_guard.count_versions()
 }
 
 fn inner_list_versions<'local>(

@@ -2633,7 +2633,7 @@ impl Dataset {
     ///
     /// Unlike [`Self::versions`], this only enumerates manifest locations and does not read or
     /// deserialize every manifest.
-    pub async fn version_count(&self) -> Result<u64> {
+    pub async fn count_versions(&self) -> Result<u64> {
         self.commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
             .try_fold(0_u64, |count, _| async move { Ok(count + 1) })
