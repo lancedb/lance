@@ -7,7 +7,9 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{DataOverlayGroup, Operation, Transaction, UpdateMode},
+    dataset::transaction::{
+        DataOverlayGroup, Operation, Transaction, UpdateMode, expand_exact_merge_output_field_ids,
+    },
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
@@ -23,6 +25,37 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+
+/// Whether an [`Operation::UpdateConfig`] mutates schema or field metadata.
+/// ExactMerge treats those updates as conflicting with its source basis.
+fn update_config_touches_schema_or_field_metadata(operation: &Operation) -> bool {
+    match operation {
+        Operation::UpdateConfig {
+            schema_metadata_updates,
+            field_metadata_updates,
+            ..
+        } => schema_metadata_updates.is_some() || !field_metadata_updates.is_empty(),
+        _ => false,
+    }
+}
+
+/// True when any newly created index field intersects ExactMerge output coverage.
+fn create_index_fields_intersect_exact_merge_output(
+    new_indices: &[IndexMetadata],
+    exact_merge: &Operation,
+) -> bool {
+    let Operation::ExactMerge { basis, schema, .. } = exact_merge else {
+        return false;
+    };
+    let output_coverage =
+        expand_exact_merge_output_field_ids(&basis.source_schema, schema, &basis.output_field_ids);
+    new_indices.iter().any(|index| {
+        index
+            .fields
+            .iter()
+            .any(|field_id| output_coverage.contains(field_id))
+    })
+}
 
 #[derive(Debug)]
 pub struct TransactionRebase<'a> {
@@ -187,7 +220,7 @@ impl<'a> TransactionRebase<'a> {
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
-            Operation::Merge { fragments, .. } => {
+            Operation::Merge { fragments, .. } | Operation::ExactMerge { fragments, .. } => {
                 let modified_fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
@@ -282,6 +315,9 @@ impl<'a> TransactionRebase<'a> {
                 self.check_data_overlay_txn(other_transaction, other_version)
             }
             Operation::Merge { .. } => self.check_merge_txn(other_transaction, other_version),
+            Operation::ExactMerge { .. } => {
+                self.check_exact_merge_txn(other_transaction, other_version)
+            }
             Operation::Restore { .. } => self.check_restore_txn(other_transaction, other_version),
             Operation::ReserveFragments { .. } => {
                 self.check_reserve_fragments_txn(other_transaction, other_version)
@@ -390,7 +426,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                Operation::Merge { .. } => {
+                Operation::Merge { .. } | Operation::ExactMerge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
                 Operation::Overwrite { .. }
@@ -591,7 +627,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                Operation::Merge { .. } => {
+                Operation::Merge { .. } | Operation::ExactMerge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
                 Operation::Overwrite { .. } | Operation::Restore { .. } => {
@@ -681,8 +717,18 @@ impl<'a> TransactionRebase<'a> {
                     );
                     Ok(())
                 }
-                // Merge, reserve, and project don't change row ids, so this should be fine.
+                // Merge / reserve / project don't change row ids.
                 Operation::Merge { .. } => Ok(()),
+                Operation::ExactMerge { .. } => {
+                    if create_index_fields_intersect_exact_merge_output(
+                        new_indices,
+                        &other_transaction.operation,
+                    ) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Operation::ReserveFragments { .. } => Ok(()),
                 Operation::Project { .. } => Ok(()),
                 // Should be compatible with rewrite if it didn't move the rows
@@ -894,7 +940,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                Operation::Merge { .. } => {
+                Operation::Merge { .. } | Operation::ExactMerge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
                 Operation::CreateIndex {
@@ -1029,7 +1075,7 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
             }
-            Operation::UpdateMemWalState { .. } => {
+            Operation::UpdateMemWalState { .. } | Operation::ExactMerge { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
             Operation::Append { .. }
@@ -1060,6 +1106,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+            // ExactMerge pins full source coverage; a stale append cannot rebase
+            // over an exact publish (stricter than ordinary nullable Merge).
+            Operation::ExactMerge { .. } => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
             }
             Operation::Append { .. }
             | Operation::Rewrite { .. }
@@ -1093,9 +1144,9 @@ impl<'a> TransactionRebase<'a> {
                 // addresses; the overlay is newer and wins its covered cells.
                 | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
-                Operation::Merge { .. } => {
-                    // Merge rewrites the whole fragment list; always conflict
-                    // (symmetric with check_merge_txn).
+                Operation::Merge { .. } | Operation::ExactMerge { .. } => {
+                    // Merge / ExactMerge rewrite the whole fragment list; always
+                    // conflict (symmetric with check_merge_txn / check_exact_merge_txn).
                     Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
                 Operation::Delete {
@@ -1322,8 +1373,8 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
             }
-            Operation::Merge { .. } => {
-                // Merge rewrites the whole fragment list; always conflict.
+            Operation::Merge { .. } | Operation::ExactMerge { .. } => {
+                // Merge / ExactMerge rewrite the whole fragment list; always conflict.
                 Err(self.retryable_conflict_err(other_transaction, other_version))
             }
             // Overwrite/Restore replace the dataset; UpdateMemWalState does not
@@ -1354,6 +1405,55 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Delete { .. }
             | Operation::Rewrite { .. }
             | Operation::Merge { .. }
+            | Operation::ExactMerge { .. }
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. } => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::Project { .. }
+            | Operation::UpdateMemWalState { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+        }
+    }
+
+    fn check_exact_merge_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        // ExactMerge never rebases onto a changed data/schema snapshot. Only
+        // operations already proven disjoint from full source/candidate
+        // data+schema may coexist.
+        match &other_transaction.operation {
+            Operation::CreateIndex { new_indices, .. } => {
+                if create_index_fields_intersect_exact_merge_output(
+                    new_indices,
+                    &self.transaction.operation,
+                ) {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::ReserveFragments { .. }
+            | Operation::Clone { .. }
+            | Operation::UpdateBases { .. } => Ok(()),
+            Operation::UpdateConfig { .. } => {
+                if update_config_touches_schema_or_field_metadata(&other_transaction.operation) {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::Update { .. }
+            | Operation::Append { .. }
+            | Operation::Delete { .. }
+            | Operation::Rewrite { .. }
+            | Operation::Merge { .. }
+            | Operation::ExactMerge { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => {
                 Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -1388,7 +1488,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Project { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. } => Ok(()),
-            Operation::UpdateMemWalState { .. } => {
+            Operation::UpdateMemWalState { .. } | Operation::ExactMerge { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -1410,6 +1510,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
+            | Operation::ExactMerge { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
@@ -1444,7 +1545,8 @@ impl<'a> TransactionRebase<'a> {
             }
             Operation::Overwrite { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateMemWalState { .. } => {
+            | Operation::UpdateMemWalState { .. }
+            | Operation::ExactMerge { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -1488,6 +1590,13 @@ impl<'a> TransactionRebase<'a> {
                             .modifies_same_metadata(&other_transaction.operation)
                     {
                         Err(self.incompatible_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::ExactMerge { .. } => {
+                    if update_config_touches_schema_or_field_metadata(&self.transaction.operation) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -1577,6 +1686,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::DataReplacement { .. }
                 | Operation::DataOverlay { .. }
                 | Operation::Merge { .. }
+                | Operation::ExactMerge { .. }
                 | Operation::Restore { .. }
                 | Operation::Clone { .. }
                 | Operation::Project { .. } => {
@@ -1672,6 +1782,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Overwrite { .. }
             | Operation::DataReplacement { .. }
             | Operation::Merge { .. }
+            | Operation::ExactMerge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
@@ -2211,7 +2322,7 @@ mod tests {
     use lance_io::assert_io_eq;
     use uuid::Uuid;
 
-    use lance_table::format::IndexMetadata;
+    use lance_table::format::{DataStorageFormat, IndexMetadata};
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
@@ -4374,7 +4485,9 @@ mod tests {
                     .iter()
                     .flat_map(|f| f.old_fragments.iter().map(|f| f.id)),
             ),
-            Operation::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
+            Operation::Merge { fragments, .. } | Operation::ExactMerge { fragments, .. } => {
+                Box::new(fragments.iter().map(|f| f.id))
+            }
             Operation::Update {
                 updated_fragments,
                 removed_fragment_ids,
@@ -5028,5 +5141,2217 @@ mod tests {
         );
 
         assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
+    }
+
+    // -------------------------------------------------------------------------
+    // A3 exact-basis whole-column publish contract.
+    //
+    // ExactMergeBasis pins source fragment membership / deletion / physical
+    // rows / data-file field layout and input/output field identity/types.
+    // Candidate fragments/schema are separate. Ordinary Operation::Merge
+    // semantics stay unchanged.
+    // -------------------------------------------------------------------------
+
+    use crate::dataset::transaction::ExactMergeBasis;
+    use lance_table::format::{DeletionFile, DeletionFileType, pb};
+
+    fn a3_source_schema() -> lance_core::datatypes::Schema {
+        let schema = lance_core::datatypes::Schema::try_from(&Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                    "a3.source.field".to_string(),
+                    "id-meta".to_string(),
+                )])),
+                Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
+                    "a3.source.field".to_string(),
+                    "name-meta".to_string(),
+                )])),
+            ],
+            HashMap::from([("a3.source.schema".to_string(), "source-top".to_string())]),
+        ))
+        .unwrap();
+        assert_eq!(
+            schema.metadata.get("a3.source.schema").map(String::as_str),
+            Some("source-top")
+        );
+        assert_eq!(
+            schema
+                .field_by_id(0)
+                .unwrap()
+                .metadata
+                .get("a3.source.field"),
+            Some(&"id-meta".to_string())
+        );
+        schema
+    }
+
+    /// Valid ExactMerge candidate schema: existing fields match the source
+    /// exactly (types, names, nullability, field metadata). Top-level schema
+    /// metadata may differ; output field 2 carries its own metadata.
+    fn a3_candidate_schema() -> lance_core::datatypes::Schema {
+        let schema = lance_core::datatypes::Schema::try_from(&Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                    "a3.source.field".to_string(),
+                    "id-meta".to_string(),
+                )])),
+                Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
+                    "a3.source.field".to_string(),
+                    "name-meta".to_string(),
+                )])),
+                Field::new("score", DataType::Float32, true).with_metadata(HashMap::from([(
+                    "a3.candidate.field".to_string(),
+                    "score-meta".to_string(),
+                )])),
+            ],
+            HashMap::from([(
+                "a3.candidate.schema".to_string(),
+                "candidate-top".to_string(),
+            )]),
+        ))
+        .unwrap();
+        assert_eq!(
+            schema
+                .metadata
+                .get("a3.candidate.schema")
+                .map(String::as_str),
+            Some("candidate-top")
+        );
+        assert_eq!(
+            schema.field_by_id(0).unwrap().metadata,
+            a3_source_schema().field_by_id(0).unwrap().metadata
+        );
+        assert_eq!(
+            schema.field_by_id(1).unwrap().metadata,
+            a3_source_schema().field_by_id(1).unwrap().metadata
+        );
+        assert_eq!(
+            schema
+                .field_by_id(2)
+                .unwrap()
+                .metadata
+                .get("a3.candidate.field"),
+            Some(&"score-meta".to_string())
+        );
+        schema
+    }
+
+    /// Serialization-only candidate schema with deliberately distinct shared
+    /// field metadata so the protobuf round-trip assertion stays strong.
+    fn a3_candidate_schema_for_protobuf_round_trip() -> lance_core::datatypes::Schema {
+        let schema = lance_core::datatypes::Schema::try_from(&Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                    "a3.candidate.field".to_string(),
+                    "id-cand".to_string(),
+                )])),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("score", DataType::Float32, true).with_metadata(HashMap::from([(
+                    "a3.candidate.field".to_string(),
+                    "score-meta".to_string(),
+                )])),
+            ],
+            HashMap::from([(
+                "a3.candidate.schema".to_string(),
+                "candidate-top".to_string(),
+            )]),
+        ))
+        .unwrap();
+        assert_ne!(
+            schema.field_by_id(0).unwrap().metadata,
+            a3_source_schema().field_by_id(0).unwrap().metadata
+        );
+        schema
+    }
+
+    /// Distinct Project schema: cast input field `id` Int32 -> Int64.
+    fn a3_input_field_cast_schema() -> lance_core::datatypes::Schema {
+        lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+        .unwrap()
+    }
+
+    /// Distinct Project schema: drop input field `name`, keep `id`.
+    fn a3_input_field_drop_schema() -> lance_core::datatypes::Schema {
+        lance_core::datatypes::Schema::try_from(&Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap()
+    }
+
+    fn a3_source_fragment() -> Fragment {
+        Fragment {
+            id: 0,
+            files: vec![DataFile::new_legacy_from_fields(
+                "src0.lance",
+                vec![0, 1],
+                None,
+            )],
+            overlays: vec![],
+            deletion_file: Some(DeletionFile {
+                read_version: 7,
+                id: 1,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(1),
+                base_id: None,
+            }),
+            row_id_meta: None,
+            physical_rows: Some(4),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }
+    }
+
+    fn a3_candidate_fragment() -> Fragment {
+        Fragment {
+            id: 0,
+            files: vec![
+                DataFile::new_legacy_from_fields("src0.lance", vec![0, 1], None),
+                DataFile::new_legacy_from_fields("out0.lance", vec![2], None),
+            ],
+            overlays: vec![],
+            deletion_file: Some(DeletionFile {
+                read_version: 7,
+                id: 1,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(1),
+                base_id: None,
+            }),
+            row_id_meta: None,
+            physical_rows: Some(4),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }
+    }
+
+    fn a3_exact_merge(
+        source_fragments: Vec<Fragment>,
+        candidate_fragments: Vec<Fragment>,
+        input_field_ids: Vec<i32>,
+        output_field_ids: Vec<i32>,
+    ) -> Operation {
+        Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: a3_source_schema(),
+                source_fragments,
+                input_field_ids,
+                output_field_ids,
+            },
+            fragments: candidate_fragments,
+            schema: a3_candidate_schema(),
+        }
+    }
+
+    fn a3_exact_merge_rebase(operation: Operation) -> TransactionRebase<'static> {
+        // Candidate fragments are the published output membership; basis stays
+        // separate for exact source audit and must not drive this set.
+        let modified_fragment_ids = match &operation {
+            Operation::ExactMerge { fragments, .. } => {
+                fragments.iter().map(|f| f.id).collect::<HashSet<_>>()
+            }
+            _ => panic!("a3_exact_merge_rebase requires ExactMerge"),
+        };
+        TransactionRebase {
+            transaction: Transaction::new(1, operation, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids,
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        }
+    }
+
+    /// ExactMerge must pin read_version, ExactMergeBasis (source schema /
+    /// fragments / field ids), and a distinct candidate fragment/schema pair.
+    #[test]
+    fn test_exact_merge_pins_read_version_basis_and_candidate() {
+        let source_fragment = a3_source_fragment();
+        let candidate_fragment = a3_candidate_fragment();
+        assert_ne!(
+            source_fragment, candidate_fragment,
+            "candidate must differ from source basis (adds output field/file)"
+        );
+        assert!(
+            !source_fragment.files.iter().any(|f| f.fields.contains(&2)),
+            "source basis data-file layout must not include output field 2"
+        );
+        assert!(
+            candidate_fragment
+                .files
+                .iter()
+                .any(|f| f.fields.contains(&2)),
+            "candidate fragments must include output field 2"
+        );
+
+        let source_schema = a3_source_schema();
+        let candidate_schema = a3_candidate_schema();
+        assert_eq!(source_schema.field_by_id(0).unwrap().id, 0);
+        assert_eq!(source_schema.field_by_id(1).unwrap().id, 1);
+        assert_eq!(
+            source_schema.field_by_id(0).unwrap().data_type(),
+            DataType::Int32
+        );
+        assert_eq!(
+            source_schema.field_by_id(1).unwrap().data_type(),
+            DataType::Utf8
+        );
+        assert_eq!(candidate_schema.field_by_id(2).unwrap().id, 2);
+        assert_eq!(
+            candidate_schema.field_by_id(2).unwrap().data_type(),
+            DataType::Float32
+        );
+
+        let op = a3_exact_merge(
+            vec![source_fragment.clone()],
+            vec![candidate_fragment.clone()],
+            vec![0],
+            vec![2],
+        );
+        let txn = Transaction::new(7, op, None);
+
+        assert_eq!(txn.read_version, 7);
+        match &txn.operation {
+            Operation::ExactMerge {
+                basis:
+                    ExactMergeBasis {
+                        source_schema: basis_schema,
+                        source_fragments,
+                        input_field_ids,
+                        output_field_ids,
+                    },
+                fragments,
+                schema,
+            } => {
+                assert_eq!(input_field_ids, &vec![0i32]);
+                assert_eq!(output_field_ids, &vec![2i32]);
+                assert_eq!(basis_schema, &source_schema);
+                assert_eq!(
+                    basis_schema.field_by_id(0).unwrap().data_type(),
+                    DataType::Int32
+                );
+                assert_eq!(
+                    basis_schema.field_by_id(1).unwrap().data_type(),
+                    DataType::Utf8
+                );
+                assert_eq!(source_fragments, &vec![source_fragment]);
+                assert_eq!(source_fragments[0].physical_rows, Some(4));
+                assert_eq!(
+                    source_fragments[0]
+                        .deletion_file
+                        .as_ref()
+                        .map(|d| d.num_deleted_rows),
+                    Some(Some(1))
+                );
+                assert_eq!(source_fragments[0].files[0].fields.as_ref(), &[0, 1][..]);
+                assert_eq!(fragments, &vec![candidate_fragment]);
+                assert_eq!(schema, &candidate_schema);
+                assert_eq!(
+                    schema.field_by_id(2).unwrap().data_type(),
+                    DataType::Float32
+                );
+                assert_ne!(source_fragments, fragments);
+            }
+            other => panic!("expected ExactMerge pin carrier, got {other:?}"),
+        }
+    }
+
+    /// Full A3 conflict matrix for ExactMerge vs relevant intervening ops.
+    /// Field cast and field drop are distinct Project operations/schemas.
+    #[test]
+    fn test_exact_merge_conflict_matrix() {
+        use ConflictResult::*;
+
+        let fragment0 = Fragment::new(0);
+        let fragment1 = Fragment::new(1);
+        let input_field = 0i32;
+        let output_field = 2i32;
+        let cast_schema = a3_input_field_cast_schema();
+        let drop_schema = a3_input_field_drop_schema();
+        assert_ne!(cast_schema, drop_schema);
+        assert_eq!(cast_schema.fields.len(), 2);
+        assert_eq!(drop_schema.fields.len(), 1);
+        assert_eq!(
+            cast_schema.field("id").unwrap().data_type(),
+            DataType::Int64
+        );
+        assert_eq!(
+            drop_schema.field("id").unwrap().data_type(),
+            DataType::Int32
+        );
+        assert!(drop_schema.field("name").is_none());
+
+        let exact = a3_exact_merge(
+            vec![a3_source_fragment()],
+            vec![a3_candidate_fragment()],
+            vec![input_field],
+            vec![output_field],
+        );
+
+        let index_on_input = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "a3_input_idx".to_string(),
+            fields: vec![input_field],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        // (name, intervening operation, expected conflict when ExactMerge rebases)
+        let cases: Vec<(&str, Operation, ConflictResult)> = vec![
+            (
+                "input_update",
+                Operation::Update {
+                    removed_fragment_ids: vec![],
+                    updated_fragments: vec![fragment0.clone()],
+                    new_fragments: vec![],
+                    fields_modified: vec![input_field as u32],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(UpdateMode::RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Retryable,
+            ),
+            (
+                "delete",
+                Operation::Delete {
+                    updated_fragments: vec![fragment0.clone()],
+                    deleted_fragment_ids: vec![],
+                    predicate: "id > 0".to_string(),
+                },
+                Retryable,
+            ),
+            (
+                "append_coverage_change",
+                Operation::Append {
+                    fragments: vec![fragment1.clone()],
+                },
+                Retryable,
+            ),
+            (
+                "input_field_cast",
+                Operation::Project {
+                    schema: cast_schema,
+                    preserves_nullability: true,
+                },
+                NotCompatible,
+            ),
+            (
+                "input_field_drop",
+                Operation::Project {
+                    schema: drop_schema,
+                    preserves_nullability: true,
+                },
+                NotCompatible,
+            ),
+            (
+                "fragment_rewrite_compaction",
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: vec![fragment0.clone()],
+                        new_fragments: vec![fragment1],
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                },
+                Retryable,
+            ),
+            (
+                "concurrent_output_field_write",
+                Operation::Update {
+                    removed_fragment_ids: vec![],
+                    updated_fragments: vec![fragment0],
+                    new_fragments: vec![],
+                    fields_modified: vec![output_field as u32],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(UpdateMode::RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Retryable,
+            ),
+            (
+                "proven_disjoint_update_config",
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
+                        "lance.a3.disjoint".to_string(),
+                        "ok".to_string(),
+                    )])),
+                    None,
+                    None,
+                    None,
+                ),
+                Compatible,
+            ),
+            (
+                "proven_disjoint_create_index",
+                Operation::CreateIndex {
+                    new_indices: vec![index_on_input],
+                    removed_indices: vec![],
+                    mem_wal_index_catchup_advances: Vec::new(),
+                },
+                Compatible,
+            ),
+        ];
+
+        for (name, other_op, expected) in cases {
+            let mut rebase = a3_exact_merge_rebase(exact.clone());
+            let other = Transaction::new(0, other_op.clone(), None);
+            let result = rebase.check_txn(&other, 2);
+            match expected {
+                Compatible => assert!(
+                    result.is_ok(),
+                    "ExactMerge vs {name}: expected Compatible, got {result:?}"
+                ),
+                NotCompatible => assert!(
+                    matches!(result, Err(Error::IncompatibleTransaction { .. })),
+                    "ExactMerge vs {name}: expected IncompatibleTransaction, got {result:?}"
+                ),
+                Retryable => assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "ExactMerge vs {name}: expected RetryableCommitConflict, got {result:?}"
+                ),
+            }
+        }
+    }
+
+    /// Reverse-order race: ExactMerge publishes first; a stale append attempting
+    /// to rebase over that exact publish must conflict (coverage change). This
+    /// is stricter than ordinary nullable Merge, which can still accept append
+    /// rebase when preserves_nullability is true.
+    #[test]
+    fn test_exact_merge_blocks_stale_append_rebase_after_publish() {
+        let exact = a3_exact_merge(
+            vec![a3_source_fragment()],
+            vec![a3_candidate_fragment()],
+            vec![0],
+            vec![2],
+        );
+        let append = Operation::Append {
+            fragments: vec![Fragment::new(1)],
+        };
+
+        let mut append_rebase = TransactionRebase {
+            transaction: Transaction::new(0, append, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = append_rebase.check_txn(&Transaction::new(0, exact, None), 1);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "stale append rebasing over ExactMerge must be RetryableCommitConflict, got {result:?}"
+        );
+    }
+
+    /// ExactMerge and its full basis/candidate schema metadata must survive
+    /// transaction protobuf encode/decode.
+    ///
+    /// Note: ordinary [`Operation::Merge`] still has a schema-metadata TODO in
+    /// the encode/decode path (`schema_metadata: Default::default()`). This
+    /// test requires ExactMerge to preserve auditable source/candidate schema
+    /// metadata and field metadata; it does not fix the Merge metadata gap.
+    ///
+    /// Uses a serialization-only candidate schema with deliberately distinct
+    /// shared-field metadata so the lossless wire assertion stays strong.
+    #[test]
+    fn test_exact_merge_transaction_protobuf_round_trip() {
+        let source_fragment = a3_source_fragment();
+        let candidate_fragment = a3_candidate_fragment();
+        let source_schema = a3_source_schema();
+        let candidate_schema = a3_candidate_schema_for_protobuf_round_trip();
+        assert_ne!(
+            source_schema.metadata, candidate_schema.metadata,
+            "fixture must use distinct top-level schema metadata"
+        );
+        assert_ne!(
+            source_schema.field_by_id(0).unwrap().metadata,
+            candidate_schema.field_by_id(0).unwrap().metadata,
+            "fixture must use distinct field metadata on shared field ids"
+        );
+        let txn = Transaction::new(
+            7,
+            Operation::ExactMerge {
+                basis: ExactMergeBasis {
+                    source_schema: source_schema.clone(),
+                    source_fragments: vec![source_fragment.clone()],
+                    input_field_ids: vec![0],
+                    output_field_ids: vec![2],
+                },
+                fragments: vec![candidate_fragment.clone()],
+                schema: candidate_schema.clone(),
+            },
+            None,
+        );
+
+        let pb_tx: pb::Transaction = pb::Transaction::from(&txn);
+        let decoded = Transaction::try_from(pb_tx).expect("ExactMerge must decode");
+
+        assert_eq!(decoded.read_version, 7);
+        match decoded.operation {
+            Operation::ExactMerge {
+                basis:
+                    ExactMergeBasis {
+                        source_schema: decoded_source_schema,
+                        source_fragments,
+                        input_field_ids,
+                        output_field_ids,
+                    },
+                fragments,
+                schema,
+            } => {
+                assert_eq!(input_field_ids, vec![0]);
+                assert_eq!(output_field_ids, vec![2]);
+                assert_eq!(decoded_source_schema, source_schema);
+                assert_eq!(
+                    decoded_source_schema
+                        .metadata
+                        .get("a3.source.schema")
+                        .map(String::as_str),
+                    Some("source-top")
+                );
+                assert_eq!(
+                    decoded_source_schema
+                        .field_by_id(0)
+                        .unwrap()
+                        .metadata
+                        .get("a3.source.field"),
+                    Some(&"id-meta".to_string())
+                );
+                assert_eq!(
+                    decoded_source_schema
+                        .field_by_id(1)
+                        .unwrap()
+                        .metadata
+                        .get("a3.source.field"),
+                    Some(&"name-meta".to_string())
+                );
+                assert_eq!(
+                    decoded_source_schema.field_by_id(0).unwrap().data_type(),
+                    DataType::Int32
+                );
+                assert_eq!(
+                    decoded_source_schema.field_by_id(1).unwrap().data_type(),
+                    DataType::Utf8
+                );
+                assert_eq!(source_fragments, vec![source_fragment]);
+                assert_eq!(fragments, vec![candidate_fragment]);
+                assert_eq!(schema, candidate_schema);
+                assert_eq!(
+                    schema
+                        .metadata
+                        .get("a3.candidate.schema")
+                        .map(String::as_str),
+                    Some("candidate-top")
+                );
+                assert_eq!(
+                    schema
+                        .field_by_id(0)
+                        .unwrap()
+                        .metadata
+                        .get("a3.candidate.field"),
+                    Some(&"id-cand".to_string())
+                );
+                assert_eq!(
+                    schema
+                        .field_by_id(2)
+                        .unwrap()
+                        .metadata
+                        .get("a3.candidate.field"),
+                    Some(&"score-meta".to_string())
+                );
+                assert_eq!(
+                    schema.field_by_id(2).unwrap().data_type(),
+                    DataType::Float32
+                );
+                assert_ne!(source_fragments, fragments);
+            }
+            other => panic!("expected ExactMerge after round-trip, got {other:?}"),
+        }
+    }
+
+    /// Fail-closed protobuf decode: ExactMerge retaining operation/candidate but
+    /// missing required ExactMergeBasis must be rejected as InvalidInput.
+    /// A valid ExactMerge still round-trips.
+    #[test]
+    fn test_exact_merge_transaction_protobuf_rejects_missing_basis() {
+        let source_fragment = a3_source_fragment();
+        let candidate_fragment = a3_candidate_fragment();
+        let source_schema = a3_source_schema();
+        let candidate_schema = a3_candidate_schema_for_protobuf_round_trip();
+        let txn = Transaction::new(
+            7,
+            Operation::ExactMerge {
+                basis: ExactMergeBasis {
+                    source_schema,
+                    source_fragments: vec![source_fragment],
+                    input_field_ids: vec![0],
+                    output_field_ids: vec![2],
+                },
+                fragments: vec![candidate_fragment],
+                schema: candidate_schema,
+            },
+            None,
+        );
+
+        let mut pb_tx: pb::Transaction = pb::Transaction::from(&txn);
+        let decoded = Transaction::try_from(pb_tx.clone()).expect("valid ExactMerge must decode");
+        assert_eq!(decoded, txn, "valid ExactMerge must round-trip");
+
+        match pb_tx.operation.as_mut() {
+            Some(pb::transaction::Operation::ExactMerge(exact)) => {
+                // Keep ExactMerge operation and candidate fragments/schema;
+                // clear only the required basis.
+                exact.basis = None;
+            }
+            other => panic!("expected ExactMerge protobuf operation, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                &pb_tx.operation,
+                Some(pb::transaction::Operation::ExactMerge(exact))
+                    if exact.basis.is_none()
+                        && !exact.fragments.is_empty()
+                        && !exact.schema.is_empty()
+            ),
+            "fixture must retain ExactMerge candidate after clearing basis"
+        );
+
+        let err = Transaction::try_from(pb_tx)
+            .expect_err("ExactMerge missing ExactMergeBasis must fail closed");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput for missing ExactMergeBasis, got {err:?}"
+        );
+
+        // Direct regression: a transaction with no operation is also rejected.
+        Transaction::try_from(pb::Transaction {
+            read_version: 7,
+            uuid: txn.uuid,
+            operation: None,
+            ..Default::default()
+        })
+        .expect_err("transaction with operation None must be rejected");
+    }
+
+    #[test]
+    fn test_exact_merge_rejects_duplicate_and_unknown_field_ids() {
+        use crate::dataset::transaction::validate_exact_merge_field_ids;
+        use crate::dataset::transaction::validate_operation;
+        use lance_table::format::Manifest;
+
+        let source = a3_source_schema();
+        let candidate = a3_candidate_schema();
+
+        let err = validate_exact_merge_field_ids(&source, &candidate, &[0, 0], &[2])
+            .expect_err("duplicate input ids");
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+
+        let err = validate_exact_merge_field_ids(&source, &candidate, &[0], &[2, 2])
+            .expect_err("duplicate output ids");
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+
+        let err = validate_exact_merge_field_ids(&source, &candidate, &[99], &[2])
+            .expect_err("unknown input id");
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+
+        let err = validate_exact_merge_field_ids(&source, &candidate, &[0], &[99])
+            .expect_err("unknown output id");
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+
+        let err = validate_exact_merge_field_ids(&source, &candidate, &[0], &[])
+            .expect_err("empty output ids");
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+
+        // Empty input is valid for literal-only computation.
+        validate_exact_merge_field_ids(&source, &candidate, &[], &[2]).unwrap();
+
+        let mut manifest = Manifest::new(
+            source.clone(),
+            Arc::new(vec![a3_source_fragment()]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.version = 3;
+        let stale_basis = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: source,
+                // Basis fragments diverge from the conditional-commit manifest.
+                source_fragments: vec![Fragment::new(99)],
+                input_field_ids: vec![0],
+                output_field_ids: vec![2],
+            },
+            fragments: vec![a3_candidate_fragment()],
+            schema: candidate,
+        };
+        let err = validate_operation(Some(&manifest), &stale_basis)
+            .expect_err("stale source basis must not validate");
+        assert!(
+            matches!(
+                err,
+                Error::RetryableCommitConflict { .. } | Error::IncompatibleTransaction { .. }
+            ),
+            "expected typed conflict for basis mismatch, got {err:?}"
+        );
+    }
+
+    fn a3_matching_tip_manifest() -> lance_table::format::Manifest {
+        use lance_table::format::Manifest;
+        let mut manifest = Manifest::new(
+            a3_source_schema(),
+            Arc::new(vec![a3_source_fragment()]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.version = 7;
+        manifest
+    }
+
+    fn a3_exact_merge_valid_at_read_tip() -> Transaction {
+        Transaction::new(
+            7,
+            a3_exact_merge(
+                vec![a3_source_fragment()],
+                vec![a3_candidate_fragment()],
+                vec![0],
+                vec![2],
+            ),
+            None,
+        )
+    }
+
+    /// CommitBuilder validates the caller snapshot only once. The per-attempt
+    /// boundary (`Transaction::build_manifest`) must revalidate ExactMerge
+    /// basis against the current tip manifest; otherwise a concurrent
+    /// schema/fragment change after the initial check can still publish.
+    #[test]
+    fn test_exact_merge_build_manifest_revalidates_basis_each_attempt() {
+        use crate::dataset::ManifestWriteConfig;
+        use crate::dataset::transaction::validate_operation;
+
+        let txn = a3_exact_merge_valid_at_read_tip();
+        let tip = a3_matching_tip_manifest();
+        validate_operation(Some(&tip), &txn.operation).expect("valid at read tip");
+        txn.build_manifest(Some(&tip), vec![], "txn", &ManifestWriteConfig::default())
+            .expect("matching tip must build");
+
+        let mut failures = Vec::new();
+
+        // Fragment identity changed at tip (coverage / layout stale).
+        let mut frag_changed = tip.clone();
+        let mut changed_fragment = a3_source_fragment();
+        changed_fragment.files[0].path = "src0-rewritten.lance".to_string();
+        frag_changed.fragments = Arc::new(vec![changed_fragment]);
+        frag_changed.version = 8;
+        match txn.build_manifest(
+            Some(&frag_changed),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        ) {
+            Ok(_) => failures.push(
+                "changed tip fragments: expected typed conflict at build_manifest, got Ok".into(),
+            ),
+            Err(err)
+                if !matches!(
+                    err,
+                    Error::RetryableCommitConflict { .. } | Error::IncompatibleTransaction { .. }
+                ) =>
+            {
+                failures.push(format!(
+                    "changed tip fragments: expected typed conflict, got {err:?}"
+                ))
+            }
+            Err(_) => {}
+        }
+
+        // Source schema identity changed at tip.
+        let mut schema_changed = tip.clone();
+        schema_changed.schema = a3_input_field_cast_schema();
+        schema_changed.version = 8;
+        match txn.build_manifest(
+            Some(&schema_changed),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        ) {
+            Ok(_) => failures.push(
+                "changed tip schema: expected typed conflict at build_manifest, got Ok".into(),
+            ),
+            Err(err)
+                if !matches!(
+                    err,
+                    Error::RetryableCommitConflict { .. } | Error::IncompatibleTransaction { .. }
+                ) =>
+            {
+                failures.push(format!(
+                    "changed tip schema: expected typed conflict, got {err:?}"
+                ))
+            }
+            Err(_) => {}
+        }
+
+        // Table config / index metadata alone must remain allowed.
+        let mut config_only = tip;
+        config_only
+            .config
+            .insert("lance.a3.tip".to_string(), "ok".to_string());
+        config_only.version = 8;
+        let index_meta = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "a3_tip_idx".to_string(),
+            fields: vec![0],
+            dataset_version: 8,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        if let Err(err) = txn.build_manifest(
+            Some(&config_only),
+            vec![index_meta],
+            "txn",
+            &ManifestWriteConfig::default(),
+        ) {
+            failures.push(format!(
+                "config/index-only tip drift must remain allowed, got {err:?}"
+            ));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "ExactMerge per-attempt tip revalidation gaps:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// `DataFile.file_size_bytes` is a mutable AtomicU64 cache and must not
+    /// participate in ExactMerge source-basis identity.
+    #[test]
+    fn test_exact_merge_basis_ignores_cached_file_size_bytes() {
+        use crate::dataset::transaction::validate_operation;
+        use lance_io::utils::CachedFileSize;
+        use lance_table::format::{Manifest, RowIdMeta};
+        use lance_table::rowids::RowIdSequence;
+        use lance_table::rowids::write_row_ids;
+        use roaring::RoaringBitmap;
+
+        let source_fragment = a3_source_fragment();
+        assert!(
+            source_fragment.files[0].file_size_bytes.get().is_none(),
+            "fixture basis file size must start unknown"
+        );
+
+        let mut tip_fragment = source_fragment.clone();
+        tip_fragment.files[0].file_size_bytes = CachedFileSize::new(4096);
+        assert_ne!(
+            source_fragment, tip_fragment,
+            "direct Fragment equality currently includes CachedFileSize"
+        );
+
+        let mut tip = Manifest::new(
+            a3_source_schema(),
+            Arc::new(vec![tip_fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        tip.version = 7;
+
+        let op = a3_exact_merge(
+            vec![source_fragment.clone()],
+            vec![a3_candidate_fragment()],
+            vec![0],
+            vec![2],
+        );
+        let mut failures = Vec::new();
+        match validate_operation(Some(&tip), &op) {
+            Ok(()) => {}
+            Err(err) => failures.push(format!("cached file size must be ignored, got {err:?}")),
+        }
+
+        // True identity fields must still reject.
+        let identity_cases: Vec<(&str, Fragment)> = vec![
+            ("path", {
+                let mut f = source_fragment.clone();
+                f.files[0].path = "other.lance".to_string();
+                f
+            }),
+            ("fields", {
+                let mut f = source_fragment.clone();
+                f.files[0].fields = Arc::from([0i32]);
+                f
+            }),
+            ("column_indices", {
+                let mut f = source_fragment.clone();
+                f.files[0].column_indices = Arc::from([0i32]);
+                f
+            }),
+            ("file_version", {
+                let mut f = source_fragment.clone();
+                f.files[0].file_major_version = 2;
+                f.files[0].file_minor_version = 1;
+                f
+            }),
+            ("base_id", {
+                let mut f = source_fragment.clone();
+                f.files[0].base_id = Some(9);
+                f
+            }),
+            ("overlays", {
+                let mut f = source_fragment.clone();
+                f.overlays = vec![lance_table::format::overlay::DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    coverage: lance_table::format::overlay::OverlayCoverage::Shared(Arc::new(
+                        RoaringBitmap::from([0]),
+                    )),
+                    committed_version: 1,
+                }];
+                f
+            }),
+            ("deletion_file", {
+                let mut f = source_fragment.clone();
+                f.deletion_file = None;
+                f
+            }),
+            ("row_id_meta", {
+                let mut f = source_fragment.clone();
+                let seq = RowIdSequence::from([1u64, 2, 3, 4].as_slice());
+                f.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&seq).into()));
+                f
+            }),
+            ("physical_rows", {
+                let mut f = source_fragment.clone();
+                f.physical_rows = Some(99);
+                f
+            }),
+            ("row_version_meta", {
+                use lance_table::rowids::version::{
+                    RowDatasetVersionMeta, RowDatasetVersionSequence,
+                };
+                let mut f = source_fragment;
+                let seq = RowDatasetVersionSequence::from_uniform_row_count(4, 1);
+                f.last_updated_at_version_meta =
+                    Some(RowDatasetVersionMeta::from_sequence(&seq).unwrap());
+                f
+            }),
+        ];
+
+        for (name, changed) in identity_cases {
+            let mut bad_tip = Manifest::new(
+                a3_source_schema(),
+                Arc::new(vec![changed]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            bad_tip.version = 7;
+            match validate_operation(Some(&bad_tip), &op) {
+                Ok(()) => failures.push(format!(
+                    "{name}: expected typed conflict for basis identity, got Ok(())"
+                )),
+                Err(err)
+                    if !matches!(
+                        err,
+                        Error::RetryableCommitConflict { .. }
+                            | Error::IncompatibleTransaction { .. }
+                    ) =>
+                {
+                    failures.push(format!("{name}: expected typed conflict, got {err:?}"))
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "ExactMerge semantic fragment equality gaps:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Whole-column ExactMerge candidates must preserve source fragment/row
+    /// membership and may change physical/schema state only under declared
+    /// output field subtree(s). Top-level candidate schema metadata is
+    /// caller-owned publish metadata and may change.
+    #[test]
+    fn test_exact_merge_candidate_shape_validation() {
+        use crate::dataset::transaction::validate_operation;
+        use lance_table::format::RowIdMeta;
+        use lance_table::rowids::RowIdSequence;
+        use lance_table::rowids::write_row_ids;
+
+        let tip = a3_matching_tip_manifest();
+        let source_fragment = a3_source_fragment();
+        let candidate_fragment = a3_candidate_fragment();
+        let source_schema = a3_source_schema();
+        let candidate_schema = a3_candidate_schema();
+
+        let valid = a3_exact_merge(
+            vec![source_fragment.clone()],
+            vec![candidate_fragment.clone()],
+            vec![0],
+            vec![2],
+        );
+        validate_operation(Some(&tip), &valid)
+            .expect("candidate that only adds declared output field must pass");
+
+        // Top-level candidate schema metadata may change freely.
+        let mut meta_changed_schema = candidate_schema.clone();
+        meta_changed_schema
+            .metadata
+            .insert("a3.publish".to_string(), "caller-owned".to_string());
+        let meta_ok = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: source_schema.clone(),
+                source_fragments: vec![source_fragment.clone()],
+                input_field_ids: vec![0],
+                output_field_ids: vec![2],
+            },
+            fragments: vec![candidate_fragment.clone()],
+            schema: meta_changed_schema,
+        };
+        validate_operation(Some(&tip), &meta_ok)
+            .expect("top-level candidate schema metadata may change");
+
+        let cases: Vec<(&str, Operation)> = vec![
+            ("adds_fragment", {
+                let mut fragments = vec![candidate_fragment.clone()];
+                fragments.push(Fragment::new(1));
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments,
+                    schema: candidate_schema.clone(),
+                }
+            }),
+            ("removes_fragment", {
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments: vec![],
+                    schema: candidate_schema.clone(),
+                }
+            }),
+            ("changes_deletion_file", {
+                let mut frag = candidate_fragment.clone();
+                frag.deletion_file = None;
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments: vec![frag],
+                    schema: candidate_schema.clone(),
+                }
+            }),
+            ("changes_row_id_meta", {
+                let mut frag = candidate_fragment.clone();
+                let seq = RowIdSequence::from([10u64, 11, 12, 13].as_slice());
+                frag.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&seq).into()));
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments: vec![frag],
+                    schema: candidate_schema.clone(),
+                }
+            }),
+            ("changes_physical_rows", {
+                let mut frag = candidate_fragment.clone();
+                frag.physical_rows = Some(99);
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments: vec![frag],
+                    schema: candidate_schema.clone(),
+                }
+            }),
+            ("rewrites_undeclared_input_field_file", {
+                let mut frag = candidate_fragment.clone();
+                frag.files[0].path = "src0-rewritten.lance".to_string();
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments: vec![frag],
+                    schema: candidate_schema.clone(),
+                }
+            }),
+            ("rewrites_unrelated_field_file", {
+                // Field 1 (`name`) is neither declared input nor output.
+                let mut frag = candidate_fragment.clone();
+                frag.files = vec![
+                    DataFile::new_legacy_from_fields("src0.lance", vec![0], None),
+                    DataFile::new_legacy_from_fields("name-rewritten.lance", vec![1], None),
+                    DataFile::new_legacy_from_fields("out0.lance", vec![2], None),
+                ];
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments: vec![frag],
+                    schema: candidate_schema.clone(),
+                }
+            }),
+            ("changes_non_output_field_type", {
+                let schema = lance_core::datatypes::Schema::try_from(&Schema::new_with_metadata(
+                    vec![
+                        Field::new("id", DataType::Int64, false),
+                        Field::new("name", DataType::Utf8, true),
+                        Field::new("score", DataType::Float32, true),
+                    ],
+                    HashMap::from([(
+                        "a3.candidate.schema".to_string(),
+                        "candidate-top".to_string(),
+                    )]),
+                ))
+                .unwrap();
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments: vec![candidate_fragment.clone()],
+                    schema,
+                }
+            }),
+            ("changes_non_output_field_metadata", {
+                let schema = lance_core::datatypes::Schema::try_from(&Schema::new_with_metadata(
+                    vec![
+                        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                            "mutated".to_string(),
+                            "yes".to_string(),
+                        )])),
+                        Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
+                            "a3.source.field".to_string(),
+                            "name-meta".to_string(),
+                        )])),
+                        Field::new("score", DataType::Float32, true).with_metadata(HashMap::from(
+                            [("a3.candidate.field".to_string(), "score-meta".to_string())],
+                        )),
+                    ],
+                    HashMap::from([(
+                        "a3.candidate.schema".to_string(),
+                        "candidate-top".to_string(),
+                    )]),
+                ))
+                .unwrap();
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema: source_schema.clone(),
+                        source_fragments: vec![source_fragment.clone()],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![2],
+                    },
+                    fragments: vec![candidate_fragment.clone()],
+                    schema,
+                }
+            }),
+            ("omits_changed_output_field_id", {
+                // Candidate publishes new field 2, but declares only field 0.
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema,
+                        source_fragments: vec![source_fragment],
+                        input_field_ids: vec![0],
+                        output_field_ids: vec![0],
+                    },
+                    fragments: vec![candidate_fragment],
+                    schema: candidate_schema,
+                }
+            }),
+        ];
+
+        let mut failures = Vec::new();
+        for (name, operation) in cases {
+            match validate_operation(Some(&tip), &operation) {
+                Ok(()) => failures.push(format!("{name}: expected InvalidInput, got Ok(())")),
+                Err(err) if !matches!(err, Error::InvalidInput { .. }) => {
+                    failures.push(format!("{name}: expected InvalidInput, got {err:?}"))
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "ExactMerge candidate shape gaps:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Candidate shape must preserve ordered fragment IDs, ordered non-output
+    /// schema skeleton, and ordered non-output / mixed physical resolution
+    /// (base files and overlays). Output-only entries may change freely.
+    #[test]
+    fn test_exact_merge_candidate_order_validation() {
+        use crate::dataset::transaction::validate_operation;
+        use lance_table::format::Manifest;
+        use lance_table::format::overlay::DataOverlayFile;
+
+        let source_schema = a3_source_schema();
+        let candidate_schema = a3_candidate_schema();
+        let deletion_file = a3_source_fragment().deletion_file;
+
+        // --- reject: reversed fragment order with identical IDs/contents ---
+        let source_frag_0 = a3_source_fragment();
+        let mut source_frag_1 = a3_source_fragment();
+        source_frag_1.id = 1;
+        source_frag_1.files[0].path = "src1.lance".to_string();
+        let cand_frag_0 = a3_candidate_fragment();
+        let mut cand_frag_1 = a3_candidate_fragment();
+        cand_frag_1.id = 1;
+        cand_frag_1.files[0].path = "src1.lance".to_string();
+        cand_frag_1.files[1].path = "out1.lance".to_string();
+        let two_frag_tip = {
+            let mut manifest = Manifest::new(
+                source_schema.clone(),
+                Arc::new(vec![source_frag_0.clone(), source_frag_1.clone()]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            manifest.version = 7;
+            manifest
+        };
+        let reversed_fragments = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: source_schema.clone(),
+                source_fragments: vec![source_frag_0, source_frag_1],
+                input_field_ids: vec![0],
+                output_field_ids: vec![2],
+            },
+            // Same IDs and persistent contents, but fragment list order reversed.
+            fragments: vec![cand_frag_1, cand_frag_0],
+            schema: candidate_schema.clone(),
+        };
+
+        // --- reject: non-output schema field order swapped while adding output ---
+        let tip = a3_matching_tip_manifest();
+        let mut reordered_schema = candidate_schema.clone();
+        reordered_schema.fields.swap(0, 1);
+        assert_eq!(reordered_schema.fields[0].id, 1);
+        assert_eq!(reordered_schema.fields[1].id, 0);
+        assert_eq!(reordered_schema.fields[2].id, 2);
+        let reordered_schema_op = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: source_schema.clone(),
+                source_fragments: vec![a3_source_fragment()],
+                input_field_ids: vec![0],
+                output_field_ids: vec![2],
+            },
+            fragments: vec![a3_candidate_fragment()],
+            schema: reordered_schema,
+        };
+
+        // --- reject: swap two non-output base files while adding output-only ---
+        let source_split_files = Fragment {
+            id: 0,
+            files: vec![
+                DataFile::new_legacy_from_fields("id.lance", vec![0], None),
+                DataFile::new_legacy_from_fields("name.lance", vec![1], None),
+            ],
+            overlays: vec![],
+            deletion_file: deletion_file.clone(),
+            row_id_meta: None,
+            physical_rows: Some(4),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let split_tip = {
+            let mut manifest = Manifest::new(
+                source_schema.clone(),
+                Arc::new(vec![source_split_files.clone()]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            manifest.version = 7;
+            manifest
+        };
+        let swapped_files = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: source_schema.clone(),
+                source_fragments: vec![source_split_files.clone()],
+                input_field_ids: vec![0],
+                output_field_ids: vec![2],
+            },
+            fragments: vec![Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("name.lance", vec![1], None),
+                    DataFile::new_legacy_from_fields("id.lance", vec![0], None),
+                    DataFile::new_legacy_from_fields("out0.lance", vec![2], None),
+                ],
+                overlays: vec![],
+                deletion_file: source_split_files.deletion_file,
+                row_id_meta: None,
+                physical_rows: Some(4),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            }],
+            schema: candidate_schema.clone(),
+        };
+
+        // --- reject: swap same-version overlays on a non-output field ---
+        // Stable committed_version sort still passes; list-position tie-break
+        // would change resolved values, so candidate order must be exact.
+        let overlay_a = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("ov-a.lance", vec![0], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: 5,
+        };
+        let overlay_b = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("ov-b.lance", vec![0], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: 5,
+        };
+        assert_ne!(overlay_a.data_file.path, overlay_b.data_file.path);
+        let mut source_with_overlays = a3_source_fragment();
+        source_with_overlays.overlays = vec![overlay_a.clone(), overlay_b.clone()];
+        let overlay_tip = {
+            let mut manifest = Manifest::new(
+                source_schema.clone(),
+                Arc::new(vec![source_with_overlays.clone()]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            manifest.version = 7;
+            manifest
+        };
+        let mut candidate_swapped_overlays = a3_candidate_fragment();
+        candidate_swapped_overlays.overlays = vec![overlay_b, overlay_a];
+        let swapped_overlays = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema,
+                source_fragments: vec![source_with_overlays],
+                input_field_ids: vec![0],
+                output_field_ids: vec![2],
+            },
+            fragments: vec![candidate_swapped_overlays],
+            schema: candidate_schema.clone(),
+        };
+
+        let reject_cases: Vec<(&str, Option<&Manifest>, Operation)> = vec![
+            (
+                "reversed_fragment_order",
+                Some(&two_frag_tip),
+                reversed_fragments,
+            ),
+            (
+                "reordered_non_output_schema_fields",
+                Some(&tip),
+                reordered_schema_op,
+            ),
+            (
+                "swapped_non_output_base_files",
+                Some(&split_tip),
+                swapped_files,
+            ),
+            (
+                "swapped_same_version_non_output_overlays",
+                Some(&overlay_tip),
+                swapped_overlays,
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (name, tip_manifest, operation) in reject_cases {
+            match validate_operation(tip_manifest, &operation) {
+                Ok(()) => failures.push(format!("{name}: expected InvalidInput, got Ok(())")),
+                Err(err) if !matches!(err, Error::InvalidInput { .. }) => {
+                    failures.push(format!("{name}: expected InvalidInput, got {err:?}"))
+                }
+                Err(_) => {}
+            }
+        }
+
+        // --- accept: output-only files may be inserted/replaced/removed/reordered ---
+        let source_with_output_file = Fragment {
+            id: 0,
+            files: vec![
+                DataFile::new_legacy_from_fields("id.lance", vec![0], None),
+                DataFile::new_legacy_from_fields("old-out.lance", vec![2], None),
+                DataFile::new_legacy_from_fields("name.lance", vec![1], None),
+            ],
+            overlays: vec![],
+            deletion_file: deletion_file.clone(),
+            row_id_meta: None,
+            physical_rows: Some(4),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        // Source already publishes field 2 so tip/candidate schemas stay aligned
+        // for this physical-layout case; non-output skeleton remains [id, name].
+        let source_schema_with_score = candidate_schema;
+        let output_layout_tip = {
+            let mut manifest = Manifest::new(
+                source_schema_with_score.clone(),
+                Arc::new(vec![source_with_output_file.clone()]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            manifest.version = 7;
+            manifest
+        };
+        let output_only_layout_ok = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: source_schema_with_score.clone(),
+                source_fragments: vec![source_with_output_file],
+                input_field_ids: vec![0],
+                output_field_ids: vec![2],
+            },
+            fragments: vec![Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("new-out-a.lance", vec![2], None),
+                    DataFile::new_legacy_from_fields("id.lance", vec![0], None),
+                    DataFile::new_legacy_from_fields("new-out-b.lance", vec![2], None),
+                    DataFile::new_legacy_from_fields("name.lance", vec![1], None),
+                ],
+                overlays: vec![],
+                deletion_file,
+                row_id_meta: None,
+                physical_rows: Some(4),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            }],
+            schema: source_schema_with_score,
+        };
+        if let Err(err) = validate_operation(Some(&output_layout_tip), &output_only_layout_ok) {
+            failures.push(format!(
+                "output_only_files_may_reorder: expected Ok(()), got {err:?}"
+            ));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "ExactMerge candidate order gaps:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Index disjointness must be proven: CreateIndex on a declared output
+    /// field (including a child under an output struct) conflicts with
+    /// ExactMerge in both rebase orders. An index on an unchanged non-output
+    /// input field remains compatible.
+    #[test]
+    fn test_exact_merge_create_index_output_field_disjointness() {
+        let exact = a3_exact_merge(
+            vec![a3_source_fragment()],
+            vec![a3_candidate_fragment()],
+            vec![0],
+            vec![2],
+        );
+        let output_field = 2i32;
+        let input_field = 0i32;
+
+        let index_on_output = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "a3_output_idx".to_string(),
+            fields: vec![output_field],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let index_on_input = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "a3_input_idx".to_string(),
+            fields: vec![input_field],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let create_output = Operation::CreateIndex {
+            new_indices: vec![index_on_output],
+            removed_indices: vec![],
+            mem_wal_index_catchup_advances: Vec::new(),
+        };
+        let create_input = Operation::CreateIndex {
+            new_indices: vec![index_on_input],
+            removed_indices: vec![],
+            mem_wal_index_catchup_advances: Vec::new(),
+        };
+
+        fn typed_conflict(result: &Result<()>) -> bool {
+            matches!(
+                result,
+                Err(Error::RetryableCommitConflict { .. })
+                    | Err(Error::IncompatibleTransaction { .. })
+            )
+        }
+
+        let mut failures = Vec::new();
+
+        // ExactMerge rebases over CreateIndex on output → conflict.
+        let mut exact_rebase = a3_exact_merge_rebase(exact.clone());
+        let result = exact_rebase.check_txn(&Transaction::new(0, create_output.clone(), None), 2);
+        if !typed_conflict(&result) {
+            failures.push(format!(
+                "ExactMerge vs CreateIndex(output): expected typed conflict, got {result:?}"
+            ));
+        }
+
+        // Stale CreateIndex rebases over already-landed ExactMerge → conflict.
+        let mut create_rebase = TransactionRebase {
+            transaction: Transaction::new(0, create_output, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = create_rebase.check_txn(&Transaction::new(0, exact.clone(), None), 1);
+        if !typed_conflict(&result) {
+            failures.push(format!(
+                "CreateIndex(output) vs ExactMerge: expected typed conflict, got {result:?}"
+            ));
+        }
+
+        // Non-output / input field index remains compatible both ways.
+        let mut exact_rebase = a3_exact_merge_rebase(exact.clone());
+        if let Err(err) =
+            exact_rebase.check_txn(&Transaction::new(0, create_input.clone(), None), 2)
+        {
+            failures.push(format!(
+                "ExactMerge vs CreateIndex(input) must remain Compatible, got {err:?}"
+            ));
+        }
+        let mut create_rebase = TransactionRebase {
+            transaction: Transaction::new(0, create_input, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        if let Err(err) = create_rebase.check_txn(&Transaction::new(0, exact, None), 1) {
+            failures.push(format!(
+                "CreateIndex(input) vs ExactMerge must remain Compatible, got {err:?}"
+            ));
+        }
+
+        // Child beneath an output struct is also an output-field conflict.
+        let source_schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )]))
+            .unwrap();
+        let candidate_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "payload",
+                DataType::Struct(vec![Field::new("score", DataType::Float32, true)].into()),
+                true,
+            ),
+        ]))
+        .unwrap();
+        let payload = candidate_schema.field("payload").unwrap();
+        let score_id = payload.children[0].id;
+        let payload_id = payload.id;
+        assert_ne!(score_id, payload_id);
+
+        let source_frag = Fragment {
+            id: 0,
+            files: vec![DataFile::new_legacy_from_fields("src.lance", vec![0], None)],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(2),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let candidate_frag = Fragment {
+            id: 0,
+            files: vec![
+                DataFile::new_legacy_from_fields("src.lance", vec![0], None),
+                DataFile::new_legacy_from_fields("out.lance", vec![payload_id, score_id], None),
+            ],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(2),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let exact_struct = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema,
+                source_fragments: vec![source_frag],
+                input_field_ids: vec![0],
+                output_field_ids: vec![payload_id],
+            },
+            fragments: vec![candidate_frag],
+            schema: candidate_schema,
+        };
+        let index_on_child = Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                uuid: uuid::Uuid::new_v4(),
+                name: "a3_struct_child_idx".to_string(),
+                fields: vec![score_id],
+                dataset_version: 1,
+                fragment_bitmap: None,
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }],
+            removed_indices: vec![],
+            mem_wal_index_catchup_advances: Vec::new(),
+        };
+
+        let mut exact_rebase = a3_exact_merge_rebase(exact_struct.clone());
+        let result = exact_rebase.check_txn(&Transaction::new(0, index_on_child.clone(), None), 2);
+        if !typed_conflict(&result) {
+            failures.push(format!(
+                "ExactMerge vs CreateIndex(output child): expected typed conflict, got {result:?}"
+            ));
+        }
+        let mut create_rebase = TransactionRebase {
+            transaction: Transaction::new(0, index_on_child, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = create_rebase.check_txn(&Transaction::new(0, exact_struct, None), 1);
+        if !typed_conflict(&result) {
+            failures.push(format!(
+                "CreateIndex(output child) vs ExactMerge: expected typed conflict, got {result:?}"
+            ));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "ExactMerge CreateIndex disjointness gaps:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Output coverage must be the union of each declared root and descendants
+    /// found in BOTH source and candidate schemas.
+    ///
+    /// Candidate-only expansion misses a removed/replaced source child under a
+    /// retained output root: shape validation rejects a valid subtree rewrite,
+    /// and CreateIndex on the removed source child fails to conflict.
+    #[test]
+    fn test_exact_merge_output_coverage_unions_source_and_candidate_subtrees() {
+        use crate::dataset::transaction::validate_operation;
+        use lance_table::format::Manifest;
+
+        // Source: id(0), payload(1){old(2)}
+        let source_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "payload",
+                DataType::Struct(vec![Field::new("old", DataType::Float32, true)].into()),
+                true,
+            ),
+        ]))
+        .unwrap();
+        // Candidate keeps declared output root id 1 but replaces child 2 with a
+        // distinct new child id 3 (high-water style assignment after a drop).
+        let mut candidate_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "payload",
+                DataType::Struct(vec![Field::new("new", DataType::Utf8, true)].into()),
+                true,
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(candidate_schema.field_by_id(2).unwrap().name, "new");
+        candidate_schema.field_by_id_mut(2).unwrap().id = 3;
+
+        let payload_id = 1i32;
+        let removed_child_id = 2i32;
+        let new_child_id = 3i32;
+        let input_field_id = 0i32;
+        assert!(source_schema.field_by_id(removed_child_id).is_some());
+        assert!(candidate_schema.field_by_id(removed_child_id).is_none());
+        assert!(candidate_schema.field_by_id(new_child_id).is_some());
+        assert_eq!(
+            source_schema.field_by_id(payload_id).unwrap().id,
+            candidate_schema.field_by_id(payload_id).unwrap().id
+        );
+
+        let source_frag = Fragment {
+            id: 0,
+            files: vec![
+                DataFile::new_legacy_from_fields("src.lance", vec![input_field_id], None),
+                DataFile::new_legacy_from_fields(
+                    "payload-old.lance",
+                    vec![payload_id, removed_child_id],
+                    None,
+                ),
+            ],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(2),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let candidate_frag = Fragment {
+            id: 0,
+            files: vec![
+                DataFile::new_legacy_from_fields("src.lance", vec![input_field_id], None),
+                DataFile::new_legacy_from_fields(
+                    "payload-new.lance",
+                    vec![payload_id, new_child_id],
+                    None,
+                ),
+            ],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(2),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let exact = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: source_schema.clone(),
+                source_fragments: vec![source_frag.clone()],
+                input_field_ids: vec![input_field_id],
+                // Only the root is declared; coverage must still include both
+                // the removed source child and the new candidate child.
+                output_field_ids: vec![payload_id],
+            },
+            fragments: vec![candidate_frag],
+            schema: candidate_schema,
+        };
+
+        let mut tip = Manifest::new(
+            source_schema,
+            Arc::new(vec![source_frag]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        tip.version = 1;
+
+        validate_operation(Some(&tip), &exact).expect(
+            "candidate that replaces an entire declared output subtree under a retained root \
+             must pass shape validation when coverage unions source+candidate descendants",
+        );
+
+        fn typed_conflict(result: &Result<()>) -> bool {
+            matches!(
+                result,
+                Err(Error::RetryableCommitConflict { .. })
+                    | Err(Error::IncompatibleTransaction { .. })
+            )
+        }
+
+        let create_removed_child = Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                uuid: uuid::Uuid::new_v4(),
+                name: "a3_removed_output_child_idx".to_string(),
+                fields: vec![removed_child_id],
+                dataset_version: 1,
+                fragment_bitmap: None,
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }],
+            removed_indices: vec![],
+            mem_wal_index_catchup_advances: Vec::new(),
+        };
+        let create_input = Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                uuid: uuid::Uuid::new_v4(),
+                name: "a3_unchanged_input_idx".to_string(),
+                fields: vec![input_field_id],
+                dataset_version: 1,
+                fragment_bitmap: None,
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }],
+            removed_indices: vec![],
+            mem_wal_index_catchup_advances: Vec::new(),
+        };
+
+        let mut failures = Vec::new();
+
+        let mut exact_rebase = a3_exact_merge_rebase(exact.clone());
+        let result =
+            exact_rebase.check_txn(&Transaction::new(0, create_removed_child.clone(), None), 2);
+        if !typed_conflict(&result) {
+            failures.push(format!(
+                "ExactMerge vs CreateIndex(removed source child): expected typed conflict, got {result:?}"
+            ));
+        }
+
+        let mut create_rebase = TransactionRebase {
+            transaction: Transaction::new(0, create_removed_child, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = create_rebase.check_txn(&Transaction::new(0, exact.clone(), None), 1);
+        if !typed_conflict(&result) {
+            failures.push(format!(
+                "CreateIndex(removed source child) vs ExactMerge: expected typed conflict, got {result:?}"
+            ));
+        }
+
+        let mut exact_rebase = a3_exact_merge_rebase(exact.clone());
+        if let Err(err) =
+            exact_rebase.check_txn(&Transaction::new(0, create_input.clone(), None), 2)
+        {
+            failures.push(format!(
+                "ExactMerge vs CreateIndex(unchanged input) must remain Compatible, got {err:?}"
+            ));
+        }
+        let mut create_rebase = TransactionRebase {
+            transaction: Transaction::new(0, create_input, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        if let Err(err) = create_rebase.check_txn(&Transaction::new(0, exact, None), 1) {
+            failures.push(format!(
+                "CreateIndex(unchanged input) vs ExactMerge must remain Compatible, got {err:?}"
+            ));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "ExactMerge source+candidate output coverage gaps:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// ExactMerge may replace children under a declared retained root, but must
+    /// reject boundary crossing by pre-existing field IDs: capture of a source
+    /// non-output ID under a candidate output root, and escape of a surviving
+    /// source output-descendant outside all candidate output roots.
+    #[test]
+    fn test_exact_merge_rejects_output_boundary_crossing() {
+        use crate::dataset::transaction::validate_operation;
+        use lance_table::format::Manifest;
+
+        fn tip_manifest(
+            source_schema: lance_core::datatypes::Schema,
+            source_frag: Fragment,
+        ) -> Manifest {
+            let mut tip = Manifest::new(
+                source_schema,
+                Arc::new(vec![source_frag]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            tip.version = 1;
+            tip
+        }
+
+        fn remap_field_ids(schema: &mut lance_core::datatypes::Schema, remaps: &[(i32, i32)]) {
+            // Use temporary IDs so pairwise swaps never collide mid-pass.
+            for (from, _) in remaps {
+                schema.field_by_id_mut(*from).unwrap().id = -(*from + 1000);
+            }
+            for (from, to) in remaps {
+                schema.field_by_id_mut(-(*from + 1000)).unwrap().id = *to;
+            }
+        }
+
+        // Positive: retained output root may drop a source-only child and add a
+        // genuinely new candidate-only child.
+        {
+            let source_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "payload",
+                    DataType::Struct(vec![Field::new("old", DataType::Float32, true)].into()),
+                    true,
+                ),
+            ]))
+            .unwrap();
+            let mut candidate_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "payload",
+                    DataType::Struct(vec![Field::new("new", DataType::Utf8, true)].into()),
+                    true,
+                ),
+            ]))
+            .unwrap();
+            // Natural candidate child id is 2; assign a new high-water id 3.
+            candidate_schema.field_by_id_mut(2).unwrap().id = 3;
+
+            let source_frag = Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("src.lance", vec![0], None),
+                    DataFile::new_legacy_from_fields("payload-old.lance", vec![1, 2], None),
+                ],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(2),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            };
+            let candidate_frag = Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("src.lance", vec![0], None),
+                    DataFile::new_legacy_from_fields("payload-new.lance", vec![1, 3], None),
+                ],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(2),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            };
+            let tip = tip_manifest(source_schema.clone(), source_frag.clone());
+            let exact = Operation::ExactMerge {
+                basis: ExactMergeBasis {
+                    source_schema,
+                    source_fragments: vec![source_frag],
+                    input_field_ids: vec![0],
+                    output_field_ids: vec![1],
+                },
+                fragments: vec![candidate_frag],
+                schema: candidate_schema,
+            };
+            validate_operation(Some(&tip), &exact).expect(
+                "retained output root may replace a source-only child with a new candidate-only child",
+            );
+        }
+
+        // Reject: candidate captures a pre-existing protected source field ID
+        // beneath a declared output root.
+        {
+            // Source: id(0), protected(1), payload(2){child(3)}
+            let source_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("protected", DataType::Int32, true),
+                Field::new(
+                    "payload",
+                    DataType::Struct(vec![Field::new("child", DataType::Float32, true)].into()),
+                    true,
+                ),
+            ]))
+            .unwrap();
+            assert_eq!(source_schema.field_by_id(1).unwrap().name, "protected");
+            assert_eq!(source_schema.field_by_id(2).unwrap().name, "payload");
+
+            // Candidate: id(0), payload(2){child(3), protected(1)}
+            let mut candidate_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "payload",
+                    DataType::Struct(
+                        vec![
+                            Field::new("child", DataType::Float32, true),
+                            Field::new("protected", DataType::Int32, true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+            ]))
+            .unwrap();
+            // Natural: id=0, payload=1, child=2, protected=3 → remap to source IDs.
+            remap_field_ids(&mut candidate_schema, &[(1, 2), (2, 3), (3, 1)]);
+            candidate_schema.field_by_id_mut(2).unwrap().parent_id = -1;
+            candidate_schema.field_by_id_mut(3).unwrap().parent_id = 2;
+            candidate_schema.field_by_id_mut(1).unwrap().parent_id = 2;
+            assert_eq!(candidate_schema.field_by_id(1).unwrap().name, "protected");
+            assert_eq!(
+                candidate_schema.field_by_id(1).unwrap().parent_id,
+                2,
+                "captured field must sit under the output root"
+            );
+
+            let source_frag = Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("src.lance", vec![0], None),
+                    DataFile::new_legacy_from_fields("protected.lance", vec![1], None),
+                    DataFile::new_legacy_from_fields("payload.lance", vec![2, 3], None),
+                ],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(2),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            };
+            let candidate_frag = Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("src.lance", vec![0], None),
+                    DataFile::new_legacy_from_fields("payload.lance", vec![2, 3, 1], None),
+                ],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(2),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            };
+            let tip = tip_manifest(source_schema.clone(), source_frag.clone());
+            let exact = Operation::ExactMerge {
+                basis: ExactMergeBasis {
+                    source_schema,
+                    source_fragments: vec![source_frag],
+                    input_field_ids: vec![0],
+                    output_field_ids: vec![2],
+                },
+                fragments: vec![candidate_frag],
+                schema: candidate_schema,
+            };
+            let err = validate_operation(Some(&tip), &exact).expect_err(
+                "capturing a source non-output field ID under a declared output root must fail",
+            );
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "capture must be InvalidInput, got {err:?}"
+            );
+        }
+
+        // Reject: candidate moves a surviving source output-descendant ID
+        // outside all candidate output roots.
+        {
+            // Source: id(0), payload(1){surviving(2)}
+            let source_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "payload",
+                    DataType::Struct(vec![Field::new("surviving", DataType::Float32, true)].into()),
+                    true,
+                ),
+            ]))
+            .unwrap();
+            assert_eq!(source_schema.field_by_id(2).unwrap().name, "surviving");
+
+            // Candidate: id(0), escaped(2), payload(1){fresh(3)}
+            let mut candidate_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("escaped", DataType::Float32, true),
+                Field::new(
+                    "payload",
+                    DataType::Struct(vec![Field::new("fresh", DataType::Utf8, true)].into()),
+                    true,
+                ),
+            ]))
+            .unwrap();
+            // Natural: id=0, escaped=1, payload=2, fresh=3 → keep surviving id 2 as escaped.
+            remap_field_ids(&mut candidate_schema, &[(1, 2), (2, 1)]);
+            candidate_schema.field_by_id_mut(2).unwrap().parent_id = -1;
+            candidate_schema.field_by_id_mut(1).unwrap().parent_id = -1;
+            candidate_schema.field_by_id_mut(3).unwrap().parent_id = 1;
+            assert_eq!(candidate_schema.field_by_id(2).unwrap().name, "escaped");
+            assert_eq!(candidate_schema.field_by_id(2).unwrap().parent_id, -1);
+            assert_eq!(candidate_schema.field_by_id(1).unwrap().children[0].id, 3);
+
+            let source_frag = Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("src.lance", vec![0], None),
+                    DataFile::new_legacy_from_fields("payload.lance", vec![1, 2], None),
+                ],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(2),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            };
+            let candidate_frag = Fragment {
+                id: 0,
+                files: vec![
+                    DataFile::new_legacy_from_fields("src.lance", vec![0], None),
+                    // Escaped id stays outside output-only files so union-only
+                    // filtering would have accepted the case before boundary validation.
+                    DataFile::new_legacy_from_fields("escaped.lance", vec![2], None),
+                    DataFile::new_legacy_from_fields("payload.lance", vec![1, 3], None),
+                ],
+                overlays: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(2),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            };
+            let tip = tip_manifest(source_schema.clone(), source_frag.clone());
+            let exact = Operation::ExactMerge {
+                basis: ExactMergeBasis {
+                    source_schema,
+                    source_fragments: vec![source_frag],
+                    input_field_ids: vec![0],
+                    output_field_ids: vec![1],
+                },
+                fragments: vec![candidate_frag],
+                schema: candidate_schema,
+            };
+            let err = validate_operation(Some(&tip), &exact).expect_err(
+                "escaping a surviving source output-descendant outside candidate output roots must fail",
+            );
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "escape must be InvalidInput, got {err:?}"
+            );
+        }
     }
 }

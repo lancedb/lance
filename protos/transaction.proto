@@ -396,6 +396,39 @@ message Transaction {
     repeated DataOverlayGroup groups = 1;
   }
 
+  // Exact source basis pinned by an ExactMerge commit.
+  //
+  // Captures the full source schema and fragment list observed when the
+  // candidate was staged, plus the caller-fixed input/output field IDs.
+  // Absence of this message on decode must fail closed.
+  message ExactMergeBasis {
+    // Source schema field list (includes per-field metadata).
+    repeated lance.file.Field source_schema = 1;
+    // Source schema-level metadata.
+    map<string, bytes> source_schema_metadata = 2;
+    // Source fragments at the pinned snapshot (membership, deletion, layout).
+    repeated DataFragment source_fragments = 3;
+    // Stable input field IDs the candidate was computed from.
+    // Empty is allowed for literal-only computation.
+    repeated int32 input_field_ids = 4;
+    // Stable output field IDs the candidate publishes. Must be non-empty.
+    repeated int32 output_field_ids = 5;
+  }
+
+  // Publish a whole-column candidate only when the exact source basis still
+  // matches the conditional-commit manifest. Unlike Merge, this operation is
+  // never rebased onto a changed data or schema snapshot.
+  message ExactMerge {
+    // Required. Missing basis must fail closed on decode.
+    optional ExactMergeBasis basis = 1;
+    // Candidate fragments to publish as the new fragment list.
+    repeated DataFragment fragments = 2;
+    // Candidate schema field list (includes per-field metadata).
+    repeated lance.file.Field schema = 3;
+    // Candidate schema-level metadata.
+    map<string, bytes> schema_metadata = 4;
+  }
+
   // Update SSTable compaction progress in the MemWAL index.
   // This operation is used during merge-insert to atomically record which
   // SSTables have been compacted into the base table.
@@ -436,6 +469,7 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    ExactMerge exact_merge = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

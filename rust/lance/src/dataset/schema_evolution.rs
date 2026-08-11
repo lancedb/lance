@@ -9,7 +9,7 @@ use std::{
 use super::fragment::FileFragment;
 use super::{
     Dataset,
-    transaction::{Operation, Transaction},
+    transaction::{ExactMergeBasis, Operation, Transaction, validate_exact_merge_field_ids},
     write::cleanup_data_fragments,
 };
 use crate::index::DatasetIndexExt;
@@ -442,20 +442,21 @@ pub(super) fn merge_introduces_required_field(old: &Schema, merged: &Schema) -> 
 /// In-process handle for a staged [`Dataset::stage_add_columns`] operation.
 ///
 /// Candidate column values and schema changes remain invisible until
-/// [`Self::commit`] succeeds. Dropping or abandoning this handle does not
-/// publish the change; unreferenced candidate data files may remain for
-/// dataset GC.
+/// [`Self::commit`] or [`Self::commit_exact`] succeeds. Dropping or abandoning
+/// this handle does not publish the change; unreferenced candidate data files
+/// may remain for dataset GC.
 ///
 /// The handle privately owns a clone of the [`Dataset`] snapshot that created
-/// it. [`Self::commit`] builds an [`Operation::Merge`] transaction whose read
-/// version is that snapshot's version. It does not yet validate an exact basis
-/// of input values, row membership, field types, or physical layout; concurrent
-/// changes are resolved by the existing [`Operation::Merge`] conflict rules.
+/// it. [`Self::commit`] builds an ordinary [`Operation::Merge`] transaction
+/// whose read version is that snapshot's version and follows existing Merge
+/// conflict rules. [`Self::commit_exact`] builds an [`Operation::ExactMerge`]
+/// that pins the full source schema/fragments plus caller-fixed input/output
+/// field IDs and rejects concurrent data/schema changes in both commit orders.
 /// The handle is not serializable and has no persistent staging ID.
 ///
 /// This type intentionally does not implement [`Clone`]: commit consumes the
 /// handle so the safe API publishes at most once.
-#[must_use = "staged columns are not published until commit(); drop abandons without publishing"]
+#[must_use = "staged columns are not published until commit()/commit_exact(); drop abandons without publishing"]
 #[derive(Debug)]
 pub struct StagedAddColumns {
     dataset: Dataset,
@@ -465,11 +466,24 @@ pub struct StagedAddColumns {
 }
 
 impl StagedAddColumns {
-    /// Consume this handle and publish the staged columns in a single commit.
+    /// Unpublished candidate schema for this staged operation.
+    ///
+    /// Includes Lance-assigned field IDs for newly staged columns so callers
+    /// can resolve exact output IDs by name before [`Self::commit_exact`].
+    /// The candidate remains invisible to table readers until
+    /// [`Self::commit`] or [`Self::commit_exact`] succeeds.
+    pub fn candidate_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Consume this handle and publish the staged columns with ordinary Merge
+    /// concurrency semantics.
     ///
     /// Builds exactly one [`Operation::Merge`] transaction using the owned
     /// snapshot's version as the read basis and returns the updated
-    /// [`Dataset`] on success.
+    /// [`Dataset`] on success. This path does not pin an exact source basis;
+    /// use [`Self::commit_exact`] when bidirectional exact-basis fencing is
+    /// required.
     ///
     /// On any commit error, candidate files are left in place because the
     /// outcome may be ambiguous (the commit may have landed despite the error).
@@ -491,6 +505,51 @@ impl StagedAddColumns {
         // only its response (or a post-commit callback) may have failed. Leave
         // files from failed attempts for dataset GC instead of risking
         // live-data loss.
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+        Ok(dataset)
+    }
+
+    /// Consume this handle and publish with exact source-basis fencing.
+    ///
+    /// Captures the owned snapshot's schema and fragments as
+    /// [`crate::dataset::transaction::ExactMergeBasis`], validates
+    /// `input_field_ids` / `output_field_ids` before any manifest commit, and
+    /// commits a single [`Operation::ExactMerge`]. Empty `input_field_ids` is
+    /// allowed for literal-only computation; `output_field_ids` must be
+    /// non-empty. Duplicates and IDs missing from the source/candidate schemas
+    /// return [`Error::InvalidInput`].
+    ///
+    /// On any commit error after the commit attempt begins, candidate files are
+    /// left in place because the outcome may be ambiguous.
+    pub async fn commit_exact(
+        self,
+        input_field_ids: &[i32],
+        output_field_ids: &[i32],
+    ) -> Result<Dataset> {
+        let Self {
+            mut dataset,
+            fragments,
+            schema,
+            preserves_nullability: _,
+        } = self;
+        let source_schema = dataset.schema().clone();
+        let source_fragments = dataset.manifest.fragments.as_ref().to_vec();
+        validate_exact_merge_field_ids(&source_schema, &schema, input_field_ids, output_field_ids)?;
+        let operation = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema,
+                source_fragments,
+                input_field_ids: input_field_ids.to_vec(),
+                output_field_ids: output_field_ids.to_vec(),
+            },
+            fragments,
+            schema,
+        };
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        // Same ambiguous-outcome policy as [`Self::commit`]: never delete
+        // candidate files after a commit attempt.
         dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
@@ -1695,6 +1754,132 @@ mod test {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(ids, &Int32Array::from_iter_values(0..6));
+
+        Ok(())
+    }
+
+    /// End-to-end API shape: commit_exact pins stable input/output field IDs and
+    /// returns a typed conflict when a relevant intervening input update lands.
+    ///
+    /// Callers discover the Lance-assigned output field ID from
+    /// [`StagedAddColumns::candidate_schema`] by name — never via
+    /// `input_id + 1` or max-id arithmetic (unsafe after drops / high-water).
+    #[tokio::test]
+    async fn test_stage_add_columns_commit_exact_rejects_intervening_input_update() -> Result<()> {
+        use crate::dataset::UpdateBuilder;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+        let input_field_id = dataset.schema().field("id").expect("fixture has id").id;
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                Some(vec!["id".into()]),
+                None,
+            )
+            .await?;
+
+        // Resolve the staged output ID from the unpublished candidate schema.
+        assert!(
+            dataset.schema().field(A2_NEW_COLUMN).is_none(),
+            "candidate remains invisible to table readers before commit_exact"
+        );
+        let output_field_id = staged
+            .candidate_schema()
+            .field(A2_NEW_COLUMN)
+            .expect("staged candidate schema must expose the new output field by name")
+            .id;
+
+        // Intervening mutation of the pinned input field after staging.
+        let updated = UpdateBuilder::new(Arc::new(Dataset::open(test_uri).await?))
+            .update_where("id >= 0")?
+            .set("id", "id + 1")?
+            .build()?
+            .execute()
+            .await?
+            .new_dataset;
+        assert!(updated.version().version > version_before);
+
+        let err = staged
+            .commit_exact(&[input_field_id], &[output_field_id])
+            .await
+            .expect_err("exact publish must reject intervening input update");
+        assert!(
+            matches!(
+                err,
+                Error::RetryableCommitConflict { .. } | Error::IncompatibleTransaction { .. }
+            ),
+            "expected typed RetryableCommitConflict or IncompatibleTransaction, got: {err:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Crash / ambiguous outcome: ExactMerge lands but the store reports conflict;
+    /// retry / verification must converge to success with values visible once.
+    ///
+    /// Output field IDs are resolved from [`StagedAddColumns::candidate_schema`]
+    /// before the handle is consumed by `commit_exact`.
+    #[tokio::test]
+    async fn test_stage_add_columns_commit_exact_land_and_conflict_converges() -> Result<()> {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let dataset = write_a2_three_fragment_dataset(
+            test_uri,
+            WriteParams {
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let version_before = dataset.version().version;
+        let input_field_id = dataset.schema().field("id").expect("fixture has id").id;
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                Some(vec!["id".into()]),
+                None,
+            )
+            .await?;
+
+        assert!(
+            dataset.schema().field(A2_NEW_COLUMN).is_none(),
+            "candidate remains invisible to table readers before commit_exact"
+        );
+        let output_field_id = staged
+            .candidate_schema()
+            .field(A2_NEW_COLUMN)
+            .expect("staged candidate schema must expose the new output field by name")
+            .id;
+
+        handler.fail_next(AmbiguousFailure::LandAndConflict);
+        let committed = staged
+            .commit_exact(&[input_field_id], &[output_field_id])
+            .await
+            .expect("landed ExactMerge reported as conflict must converge to success");
+
+        assert_eq!(committed.version().version, version_before + 1);
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before + 1);
+        assert!(
+            reopened.schema().field(A2_NEW_COLUMN).is_some(),
+            "exact publish must be visible after ambiguous conflict converges"
+        );
+        let data = reopened.scan().try_into_batch().await?;
+        let staged_col = data
+            .column_by_name(A2_NEW_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(staged_col, &Int32Array::from(vec![0, 10, 20, 30, 40, 50]));
 
         Ok(())
     }

@@ -21,13 +21,17 @@ use crate::index::mem_wal::{
     load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
 };
 use crate::utils::temporal::timestamp_to_nanos;
+use lance_core::datatypes::Field;
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_file::{datatypes::Fields, version::ConcreteFileVersion};
+use lance_file::{
+    datatypes::{Fields, FieldsWithMeta},
+    version::ConcreteFileVersion,
+};
 use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME};
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
@@ -453,6 +457,42 @@ impl TryFrom<pb::transaction::create_index::IndexCatchupAdvance> for IndexCatchu
     }
 }
 
+/// Exact source basis pinned by [`Operation::ExactMerge`].
+///
+/// Captures the full source schema and fragment list observed when a candidate
+/// was staged, plus the caller-fixed input/output field IDs. Candidate
+/// fragments/schema live on [`Operation::ExactMerge`] itself and must not be
+/// conflated with this basis.
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+pub struct ExactMergeBasis {
+    pub(crate) source_schema: Schema,
+    pub(crate) source_fragments: Vec<Fragment>,
+    pub(crate) input_field_ids: Vec<i32>,
+    pub(crate) output_field_ids: Vec<i32>,
+}
+
+impl ExactMergeBasis {
+    /// Source schema at the pinned snapshot, including field and schema metadata.
+    pub fn source_schema(&self) -> &Schema {
+        &self.source_schema
+    }
+
+    /// Source fragments at the pinned snapshot.
+    pub fn source_fragments(&self) -> &[Fragment] {
+        &self.source_fragments
+    }
+
+    /// Stable input field IDs the candidate was computed from.
+    pub fn input_field_ids(&self) -> &[i32] {
+        &self.input_field_ids
+    }
+
+    /// Stable output field IDs the candidate publishes.
+    pub fn output_field_ids(&self) -> &[i32] {
+        &self.output_field_ids
+    }
+}
+
 /// An operation on a dataset.
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Operation {
@@ -552,6 +592,19 @@ pub enum Operation {
         /// with concurrent appends in either commit order, since a stale
         /// append omits new columns entirely and its rows read as null.
         preserves_nullability: bool,
+    },
+    /// Publish a whole-column candidate only when [`ExactMergeBasis`] still
+    /// matches the conditional-commit manifest.
+    ///
+    /// Unlike [`Self::Merge`], this operation is never rebased onto a changed
+    /// data or schema snapshot. Ordinary [`Self::Merge`] semantics are unchanged.
+    ExactMerge {
+        /// Source proof pinned at staging time.
+        basis: ExactMergeBasis,
+        /// Candidate fragments to publish as the new fragment list.
+        fragments: Vec<Fragment>,
+        /// Candidate schema to publish.
+        schema: Schema,
     },
     /// Restore an old version of the database
     Restore { version: u64 },
@@ -687,6 +740,7 @@ impl std::fmt::Display for Operation {
             Self::CreateIndex { .. } => write!(f, "CreateIndex"),
             Self::Rewrite { .. } => write!(f, "Rewrite"),
             Self::Merge { .. } => write!(f, "Merge"),
+            Self::ExactMerge { .. } => write!(f, "ExactMerge"),
             Self::Restore { .. } => write!(f, "Restore"),
             Self::ReserveFragments { .. } => write!(f, "ReserveFragments"),
             Self::Update { .. } => write!(f, "Update"),
@@ -826,6 +880,20 @@ impl PartialEq for Operation {
                 compare_vec(a_fragments, b_fragments)
                     && a_schema == b_schema
                     && a_preserves == b_preserves
+            }
+            (
+                Self::ExactMerge {
+                    basis: a_basis,
+                    fragments: a_fragments,
+                    schema: a_schema,
+                },
+                Self::ExactMerge {
+                    basis: b_basis,
+                    fragments: b_fragments,
+                    schema: b_schema,
+                },
+            ) => {
+                a_basis == b_basis && compare_vec(a_fragments, b_fragments) && a_schema == b_schema
             }
             (Self::Restore { version: a }, Self::Restore { version: b }) => a == b,
             (
@@ -1565,6 +1633,7 @@ impl PartialEq for Operation {
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
+            (Self::ExactMerge { .. }, _) | (_, Self::ExactMerge { .. }) => false,
         }
     }
 }
@@ -1735,6 +1804,7 @@ impl Operation {
             Self::CreateIndex { .. } => "CreateIndex",
             Self::Rewrite { .. } => "Rewrite",
             Self::Merge { .. } => "Merge",
+            Self::ExactMerge { .. } => "ExactMerge",
             Self::ReserveFragments { .. } => "ReserveFragments",
             Self::Restore { .. } => "Restore",
             Self::Update { .. } => "Update",
@@ -2363,6 +2433,11 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        // ExactMerge must revalidate its pinned source basis against the tip
+        // on every conditional-commit attempt, before candidate/index mutation.
+        if matches!(self.operation, Operation::ExactMerge { .. }) {
+            validate_operation(current_manifest, &self.operation)?;
+        }
         if config.use_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
@@ -2407,7 +2482,9 @@ impl Transaction {
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
-            Operation::Merge { ref schema, .. } => schema.clone(),
+            Operation::Merge { ref schema, .. } | Operation::ExactMerge { ref schema, .. } => {
+                schema.clone()
+            }
             Operation::Project { ref schema, .. } => schema.clone(),
             _ => {
                 if let Some(current_manifest) = current_manifest {
@@ -2786,7 +2863,7 @@ impl Transaction {
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
-            Operation::Merge { fragments, .. } => {
+            Operation::Merge { fragments, .. } | Operation::ExactMerge { fragments, .. } => {
                 let existing_fragments = maybe_existing_fragments?;
                 let mut merged_fragments = fragments.clone();
                 if next_row_id.is_some() {
@@ -2818,9 +2895,9 @@ impl Transaction {
                 }
                 final_fragments.extend(merged_fragments);
 
-                // A Merge can rewrite a column's data file in place; the field stays
-                // in the schema, so the index is retained -- prune its now-stale
-                // entries for the rewritten fragments.
+                // A Merge / ExactMerge can rewrite a column's data file in place;
+                // the field stays in the schema, so the index is retained -- prune
+                // its now-stale entries for the rewritten fragments.
                 Self::prune_merge_rewritten_fields_from_indices(
                     &mut final_indices,
                     existing_fragments,
@@ -4131,6 +4208,43 @@ impl TryFrom<pb::Transaction> for Transaction {
                 // nullable merge over-conflicts, which only retries.
                 preserves_nullability,
             },
+            Some(pb::transaction::Operation::ExactMerge(pb::transaction::ExactMerge {
+                basis,
+                fragments,
+                schema,
+                schema_metadata,
+            })) => {
+                let basis = basis.ok_or_else(|| {
+                    Error::invalid_input(
+                        "ExactMerge transaction is missing required ExactMergeBasis".to_string(),
+                    )
+                })?;
+                let source_schema = Schema::try_from(FieldsWithMeta {
+                    fields: Fields(basis.source_schema),
+                    metadata: basis.source_schema_metadata,
+                })?;
+                let candidate_schema = Schema::try_from(FieldsWithMeta {
+                    fields: Fields(schema),
+                    metadata: schema_metadata,
+                })?;
+                Operation::ExactMerge {
+                    basis: ExactMergeBasis {
+                        source_schema,
+                        source_fragments: basis
+                            .source_fragments
+                            .into_iter()
+                            .map(Fragment::try_from)
+                            .collect::<Result<Vec<_>>>()?,
+                        input_field_ids: basis.input_field_ids,
+                        output_field_ids: basis.output_field_ids,
+                    },
+                    fragments: fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                    schema: candidate_schema,
+                }
+            }
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
             }
@@ -4527,6 +4641,30 @@ impl From<&Transaction> for pb::Transaction {
                 schema_metadata: Default::default(), // TODO: handle metadata
                 preserves_nullability: *preserves_nullability,
             }),
+            Operation::ExactMerge {
+                basis,
+                fragments,
+                schema,
+            } => {
+                let source_fields_with_meta = FieldsWithMeta::from(&basis.source_schema);
+                let candidate_fields_with_meta = FieldsWithMeta::from(schema);
+                pb::transaction::Operation::ExactMerge(pb::transaction::ExactMerge {
+                    basis: Some(pb::transaction::ExactMergeBasis {
+                        source_schema: source_fields_with_meta.fields.0,
+                        source_schema_metadata: source_fields_with_meta.metadata,
+                        source_fragments: basis
+                            .source_fragments
+                            .iter()
+                            .map(pb::DataFragment::from)
+                            .collect(),
+                        input_field_ids: basis.input_field_ids.clone(),
+                        output_field_ids: basis.output_field_ids.clone(),
+                    }),
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    schema: candidate_fields_with_meta.fields.0,
+                    schema_metadata: candidate_fields_with_meta.metadata,
+                })
+            }
             Operation::Restore { version } => {
                 pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
             }
@@ -4749,6 +4887,42 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             merge_fragments_valid(manifest, fragments)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
+        Operation::ExactMerge {
+            basis,
+            fragments,
+            schema,
+        } => {
+            validate_exact_merge_field_ids(
+                &basis.source_schema,
+                schema,
+                &basis.input_field_ids,
+                &basis.output_field_ids,
+            )?;
+            if !exact_merge_source_basis_matches(
+                &basis.source_schema,
+                &manifest.schema,
+                &basis.source_fragments,
+                manifest.fragments.as_ref(),
+            ) {
+                return Err(Error::retryable_commit_conflict_source(
+                    manifest.version,
+                    format!(
+                        "ExactMerge source basis does not match manifest schema/fragments at version {}",
+                        manifest.version
+                    )
+                    .into(),
+                ));
+            }
+            validate_exact_merge_candidate_shape(
+                &basis.source_schema,
+                &basis.source_fragments,
+                schema,
+                fragments,
+                &basis.output_field_ids,
+            )?;
+            merge_fragments_valid(manifest, fragments)?;
+            schema_fragments_valid(Some(manifest), schema, fragments)
+        }
         Operation::Overwrite {
             fragments, schema, ..
         } => {
@@ -4870,6 +5044,431 @@ fn merge_fragment_physically_rewritten(prev: &Fragment, merged: &Fragment) -> bo
             || p.file_minor_version != m.file_minor_version
             || p.base_id != m.base_id
     })
+}
+
+/// Validate ExactMerge caller-fixed input/output field ID sets.
+///
+/// Duplicates are invalid. Each input ID must exist in the source schema; each
+/// output ID must exist in the candidate schema. Empty input is allowed for
+/// literal-only computation; output must be non-empty.
+pub(crate) fn validate_exact_merge_field_ids(
+    source_schema: &Schema,
+    candidate_schema: &Schema,
+    input_field_ids: &[i32],
+    output_field_ids: &[i32],
+) -> Result<()> {
+    let mut seen_inputs = HashSet::with_capacity(input_field_ids.len());
+    for field_id in input_field_ids {
+        if !seen_inputs.insert(*field_id) {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge input_field_ids contains duplicate field id {field_id}"
+            )));
+        }
+        if source_schema.field_by_id(*field_id).is_none() {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge input_field_ids contains field id {field_id} which does not exist in the source schema"
+            )));
+        }
+    }
+
+    if output_field_ids.is_empty() {
+        return Err(Error::invalid_input(
+            "ExactMerge output_field_ids must be non-empty".to_string(),
+        ));
+    }
+    let mut seen_outputs = HashSet::with_capacity(output_field_ids.len());
+    for field_id in output_field_ids {
+        if !seen_outputs.insert(*field_id) {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge output_field_ids contains duplicate field id {field_id}"
+            )));
+        }
+        if candidate_schema.field_by_id(*field_id).is_none() {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge output_field_ids contains field id {field_id} which does not exist in the candidate schema"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Expand ExactMerge output roots through a single schema.
+///
+/// Coverage is each declared root and all of its descendants that genuinely
+/// belong to that root in `schema`. Roots missing from the schema are skipped.
+fn expand_exact_merge_schema_output_field_ids(
+    schema: &Schema,
+    output_field_ids: &[i32],
+) -> HashSet<i32> {
+    let mut covered = HashSet::with_capacity(output_field_ids.len());
+    for &root_id in output_field_ids {
+        if let Some(root) = schema.field_by_id(root_id) {
+            insert_field_subtree_ids(root, &mut covered);
+        }
+    }
+    covered
+}
+
+/// Expand ExactMerge output roots through source and candidate schemas.
+///
+/// Coverage is the union of each declared root and all of its descendants
+/// found in either schema. A retained root therefore covers removal/replacement
+/// of source-only children as well as newly added candidate children. Roots
+/// missing from the candidate are skipped here; callers must reject them via
+/// [`validate_exact_merge_field_ids`] because output IDs must publish an
+/// existing candidate field.
+///
+/// This union is for schema/file/overlay filtering and index intersection.
+/// Boundary validation (capture/escape of pre-existing field IDs) uses the
+/// per-schema coverages from [`expand_exact_merge_schema_output_field_ids`].
+pub(crate) fn expand_exact_merge_output_field_ids(
+    source_schema: &Schema,
+    candidate_schema: &Schema,
+    output_field_ids: &[i32],
+) -> HashSet<i32> {
+    let mut covered = expand_exact_merge_schema_output_field_ids(source_schema, output_field_ids);
+    covered.extend(expand_exact_merge_schema_output_field_ids(
+        candidate_schema,
+        output_field_ids,
+    ));
+    covered
+}
+
+fn insert_field_subtree_ids(field: &Field, covered: &mut HashSet<i32>) {
+    covered.insert(field.id);
+    for child in &field.children {
+        insert_field_subtree_ids(child, covered);
+    }
+}
+
+/// Reject ExactMerge candidates that move pre-existing field IDs across the
+/// output-root boundary.
+///
+/// Union coverage still permits dropping source-only children and adding
+/// candidate-only children under a retained root. It must not allow:
+/// - capture: a source non-output field ID reparented under a candidate output root
+/// - escape: a surviving source output-descendant ID moved outside all candidate
+///   output roots
+fn validate_exact_merge_output_boundary(
+    source_schema: &Schema,
+    candidate_schema: &Schema,
+    output_field_ids: &[i32],
+) -> Result<()> {
+    let source_coverage =
+        expand_exact_merge_schema_output_field_ids(source_schema, output_field_ids);
+    let candidate_coverage =
+        expand_exact_merge_schema_output_field_ids(candidate_schema, output_field_ids);
+
+    for field in source_schema.fields_pre_order() {
+        if !source_coverage.contains(&field.id) && candidate_coverage.contains(&field.id) {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge candidate captures source non-output field id {} \
+                 under a declared output root",
+                field.id
+            )));
+        }
+    }
+
+    for field in source_schema.fields_pre_order() {
+        if source_coverage.contains(&field.id)
+            && candidate_schema.field_by_id(field.id).is_some()
+            && !candidate_coverage.contains(&field.id)
+        {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge candidate moves source output field id {} \
+                 outside all declared output roots",
+                field.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// ExactMerge source-basis equality: schema must match exactly (fields and
+/// top-level metadata); fragments match by persistent identity while ignoring
+/// only [`DataFile::file_size_bytes`] (including nested overlay data files).
+pub(crate) fn exact_merge_source_basis_matches(
+    source_schema: &Schema,
+    tip_schema: &Schema,
+    source_fragments: &[Fragment],
+    tip_fragments: &[Fragment],
+) -> bool {
+    source_schema.fields == tip_schema.fields
+        && source_schema.metadata == tip_schema.metadata
+        && exact_merge_fragments_persistently_eq(source_fragments, tip_fragments)
+}
+
+fn exact_merge_fragments_persistently_eq(left: &[Fragment], right: &[Fragment]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| exact_merge_fragment_persistently_eq(a, b))
+}
+
+fn exact_merge_fragment_persistently_eq(left: &Fragment, right: &Fragment) -> bool {
+    left.id == right.id
+        && left.files.len() == right.files.len()
+        && left
+            .files
+            .iter()
+            .zip(right.files.iter())
+            .all(|(a, b)| exact_merge_data_file_persistently_eq(a, b))
+        && left.overlays.len() == right.overlays.len()
+        && left
+            .overlays
+            .iter()
+            .zip(right.overlays.iter())
+            .all(|(a, b)| exact_merge_overlay_persistently_eq(a, b))
+        && left.deletion_file == right.deletion_file
+        && left.row_id_meta == right.row_id_meta
+        && left.physical_rows == right.physical_rows
+        && left.last_updated_at_version_meta == right.last_updated_at_version_meta
+        && left.created_at_version_meta == right.created_at_version_meta
+}
+
+fn exact_merge_overlay_persistently_eq(left: &DataOverlayFile, right: &DataOverlayFile) -> bool {
+    exact_merge_data_file_persistently_eq(&left.data_file, &right.data_file)
+        && left.coverage == right.coverage
+        && left.committed_version == right.committed_version
+}
+
+fn exact_merge_data_file_persistently_eq(left: &DataFile, right: &DataFile) -> bool {
+    // file_size_bytes is a mutable AtomicU64 cache and must not participate.
+    left.path == right.path
+        && left.fields == right.fields
+        && left.column_indices == right.column_indices
+        && left.file_major_version == right.file_major_version
+        && left.file_minor_version == right.file_minor_version
+        && left.base_id == right.base_id
+}
+
+/// Validate that an ExactMerge candidate preserves source fragment/row
+/// membership and order, and only mutates schema/data under declared output
+/// roots. Non-output schema skeleton, fragment ID sequence, and non-output /
+/// mixed base-file and overlay sequences must match by ordered persistent
+/// identity; output-only entries may change freely.
+fn validate_exact_merge_candidate_shape(
+    source_schema: &Schema,
+    source_fragments: &[Fragment],
+    candidate_schema: &Schema,
+    candidate_fragments: &[Fragment],
+    output_field_ids: &[i32],
+) -> Result<()> {
+    validate_exact_merge_output_boundary(source_schema, candidate_schema, output_field_ids)?;
+    let output_coverage =
+        expand_exact_merge_output_field_ids(source_schema, candidate_schema, output_field_ids);
+    validate_exact_merge_candidate_schema_shape(source_schema, candidate_schema, &output_coverage)?;
+    validate_exact_merge_candidate_fragments_shape(
+        source_fragments,
+        candidate_fragments,
+        &output_coverage,
+    )
+}
+
+fn field_props_eq_excluding_children(left: &Field, right: &Field) -> bool {
+    left.name == right.name
+        && left.id == right.id
+        && left.parent_id == right.parent_id
+        && left.logical_type == right.logical_type
+        && left.metadata == right.metadata
+        && left.encoding == right.encoding
+        && left.nullable == right.nullable
+        && left.dictionary == right.dictionary
+        && left.unenforced_primary_key_position == right.unenforced_primary_key_position
+        && left.unenforced_clustering_key_position == right.unenforced_clustering_key_position
+}
+
+fn validate_exact_merge_candidate_schema_shape(
+    source_schema: &Schema,
+    candidate_schema: &Schema,
+    output_coverage: &HashSet<i32>,
+) -> Result<()> {
+    // Top-level schema metadata may change. After filtering every field ID
+    // covered by the unioned output subtrees, the remaining pre-order field
+    // skeleton (identity + non-child properties) must match exactly in order.
+    let source_skeleton: Vec<&Field> = source_schema
+        .fields_pre_order()
+        .filter(|field| !output_coverage.contains(&field.id))
+        .collect();
+    let candidate_skeleton: Vec<&Field> = candidate_schema
+        .fields_pre_order()
+        .filter(|field| !output_coverage.contains(&field.id))
+        .collect();
+
+    if source_skeleton.len() != candidate_skeleton.len() {
+        return Err(Error::invalid_input(format!(
+            "ExactMerge candidate must preserve the ordered non-output schema skeleton; \
+             source has {} non-output fields, candidate has {}",
+            source_skeleton.len(),
+            candidate_skeleton.len()
+        )));
+    }
+
+    for (source_field, candidate_field) in source_skeleton.iter().zip(candidate_skeleton.iter()) {
+        if !field_props_eq_excluding_children(source_field, candidate_field) {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge candidate changed or reordered non-output field id {} \
+                 (candidate has field id {} at the same skeleton position)",
+                source_field.id, candidate_field.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_merge_candidate_fragments_shape(
+    source_fragments: &[Fragment],
+    candidate_fragments: &[Fragment],
+    output_coverage: &HashSet<i32>,
+) -> Result<()> {
+    if candidate_fragments.len() != source_fragments.len() {
+        return Err(Error::invalid_input(format!(
+            "ExactMerge candidate must preserve exact source fragment sequence; \
+             source has {} fragments, candidate has {}",
+            source_fragments.len(),
+            candidate_fragments.len()
+        )));
+    }
+
+    for (position, (source_fragment, candidate_fragment)) in source_fragments
+        .iter()
+        .zip(candidate_fragments.iter())
+        .enumerate()
+    {
+        if source_fragment.id != candidate_fragment.id {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge candidate must preserve exact source fragment IDs in order; \
+                 at position {position} source has fragment id {}, candidate has fragment id {}",
+                source_fragment.id, candidate_fragment.id
+            )));
+        }
+        validate_exact_merge_candidate_fragment_shape(
+            source_fragment,
+            candidate_fragment,
+            output_coverage,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_exact_merge_candidate_fragment_shape(
+    source: &Fragment,
+    candidate: &Fragment,
+    output_coverage: &HashSet<i32>,
+) -> Result<()> {
+    if source.deletion_file != candidate.deletion_file
+        || source.row_id_meta != candidate.row_id_meta
+        || source.physical_rows != candidate.physical_rows
+        || source.last_updated_at_version_meta != candidate.last_updated_at_version_meta
+        || source.created_at_version_meta != candidate.created_at_version_meta
+    {
+        return Err(Error::invalid_input(format!(
+            "ExactMerge candidate changed row membership metadata for fragment {}",
+            source.id
+        )));
+    }
+
+    validate_exact_merge_candidate_files_shape(
+        &source.files,
+        &candidate.files,
+        output_coverage,
+        source.id,
+    )?;
+    validate_exact_merge_candidate_overlays_shape(
+        &source.overlays,
+        &candidate.overlays,
+        output_coverage,
+        source.id,
+    )
+}
+
+fn data_file_only_output(file: &DataFile, output_coverage: &HashSet<i32>) -> bool {
+    !file.fields.is_empty()
+        && file
+            .fields
+            .iter()
+            .all(|field_id| output_coverage.contains(field_id))
+}
+
+fn validate_exact_merge_candidate_files_shape(
+    source_files: &[DataFile],
+    candidate_files: &[DataFile],
+    output_coverage: &HashSet<i32>,
+    fragment_id: u64,
+) -> Result<()> {
+    // Output-only entries may be inserted, replaced, removed, or reordered.
+    // Everything else (non-output and mixed) forms an ordered persistent-identity
+    // sequence that must match exactly.
+    let source_protected: Vec<&DataFile> = source_files
+        .iter()
+        .filter(|file| !data_file_only_output(file, output_coverage))
+        .collect();
+    let candidate_protected: Vec<&DataFile> = candidate_files
+        .iter()
+        .filter(|file| !data_file_only_output(file, output_coverage))
+        .collect();
+
+    if source_protected.len() != candidate_protected.len() {
+        return Err(Error::invalid_input(format!(
+            "ExactMerge candidate must preserve ordered non-output/mixed data files \
+             in fragment {fragment_id}; source has {} protected files, candidate has {}",
+            source_protected.len(),
+            candidate_protected.len()
+        )));
+    }
+
+    for (source_file, candidate_file) in source_protected.iter().zip(candidate_protected.iter()) {
+        if !exact_merge_data_file_persistently_eq(source_file, candidate_file) {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge candidate changed or reordered protected data file {:?} \
+                 in fragment {fragment_id}",
+                source_file.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_merge_candidate_overlays_shape(
+    source_overlays: &[DataOverlayFile],
+    candidate_overlays: &[DataOverlayFile],
+    output_coverage: &HashSet<i32>,
+    fragment_id: u64,
+) -> Result<()> {
+    // Overlay list position is significant (committed_version tie-break).
+    // Output-only overlays may change freely; protected overlays must keep
+    // exact ordered persistent identity.
+    let source_protected: Vec<&DataOverlayFile> = source_overlays
+        .iter()
+        .filter(|overlay| !data_file_only_output(&overlay.data_file, output_coverage))
+        .collect();
+    let candidate_protected: Vec<&DataOverlayFile> = candidate_overlays
+        .iter()
+        .filter(|overlay| !data_file_only_output(&overlay.data_file, output_coverage))
+        .collect();
+
+    if source_protected.len() != candidate_protected.len() {
+        return Err(Error::invalid_input(format!(
+            "ExactMerge candidate must preserve ordered non-output/mixed overlays \
+             in fragment {fragment_id}; source has {} protected overlays, candidate has {}",
+            source_protected.len(),
+            candidate_protected.len()
+        )));
+    }
+
+    for (source_overlay, candidate_overlay) in
+        source_protected.iter().zip(candidate_protected.iter())
+    {
+        if !exact_merge_overlay_persistently_eq(source_overlay, candidate_overlay) {
+            return Err(Error::invalid_input(format!(
+                "ExactMerge candidate changed or reordered protected overlay {:?} \
+                 in fragment {fragment_id}",
+                source_overlay.data_file.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate that Merge operations preserve all original fragments.
