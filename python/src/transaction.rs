@@ -499,6 +499,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                 let op = Operation::CreateIndex {
                     new_indices,
                     removed_indices,
+                    mem_wal_index_catchup_advances: Vec::new(),
                 };
                 Ok(Self(op))
             }
@@ -731,6 +732,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                ..
             } => {
                 let new_indices_py = export_vec(py, new_indices.as_slice())?;
                 let removed_indices_py = export_vec(py, removed_indices.as_slice())?;
