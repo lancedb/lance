@@ -829,12 +829,24 @@ impl ObjectStore {
     /// Atomically creates an object without replacing an existing object.
     ///
     /// Local stores publish a uniquely named staging object with a conditional
-    /// rename. Other stores use their conditional create operation.
+    /// rename. Other stores use their conditional create operation. Tencent COS
+    /// is rejected because it can silently ignore conditional create requests.
+    ///
+    /// Returns [`object_store::Error::NotSupported`] without writing when the
+    /// backend cannot reliably provide put-if-absent semantics.
     pub async fn put_if_absent(
         &self,
         path: &Path,
         content: PutPayload,
     ) -> object_store::Result<()> {
+        if self.scheme == "cos" {
+            return Err(object_store::Error::NotSupported {
+                source: "Tencent COS does not reliably enforce put-if-absent after bucket \
+                         versioning has ever been enabled"
+                    .into(),
+            });
+        }
+
         if self.is_local() {
             let staging_path =
                 Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
@@ -1360,6 +1372,21 @@ mod tests {
             store.read_one_all(&path).await.unwrap(),
             b"first".as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn test_put_if_absent_rejects_cos() {
+        let mut store = ObjectStore::memory();
+        store.scheme = "cos".to_string();
+        let path = Path::from("atomic-create");
+
+        let error = store
+            .put_if_absent(&path, Bytes::from_static(b"value").into())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, object_store::Error::NotSupported { .. }));
+        assert!(!store.exists(&path).await.unwrap());
     }
 
     #[test]
