@@ -16,7 +16,7 @@ use crate::index::scalar::infer_scalar_index_details;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::ConcreteFileVersion;
 use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions};
+use super::versions;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatasetIndexRemapperOptions {}
@@ -157,18 +158,12 @@ pub trait LanceIndexStoreExt {
         Self: Sized;
 }
 
-/// Extract the lance file version from a dataset, floored at V2_0.
+/// Select the exact file version used for index files in this dataset version.
 ///
 /// Index files should never use the legacy format. If the dataset uses legacy
-/// format or doesn't have a version set, V2_0 is used as the minimum.
-pub(crate) fn dataset_format_version(dataset: &Dataset) -> LanceFileVersion {
-    dataset
-        .manifest
-        .data_storage_format
-        .lance_file_version()
-        .ok()
-        .map(|v| v.resolve().max(LanceFileVersion::V2_0))
-        .unwrap_or(LanceFileVersion::V2_0)
+/// format, V2_0 is selected explicitly by the dataset composition table.
+pub(crate) fn dataset_format_version(dataset: &Dataset) -> ConcreteFileVersion {
+    versions::index_file_version(dataset.manifest.data_storage_format.lance_file_format())
 }
 
 #[async_trait]
@@ -181,7 +176,7 @@ impl LanceIndexStoreExt for LanceIndexStore {
             dataset.object_store.clone(),
             index_dir,
             Arc::new(cache),
-            format_version,
+            format_version.to_selector(),
         ))
     }
 
@@ -192,8 +187,12 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         let object_store = dataset.object_store_for_index(index).await?;
-        let store =
-            Self::with_format_version(object_store, index_dir, Arc::new(cache), format_version);
+        let store = Self::with_format_version(
+            object_store,
+            index_dir,
+            Arc::new(cache),
+            format_version.to_selector(),
+        );
         Ok(store.with_file_sizes(index.file_size_map()))
     }
 }
@@ -237,6 +236,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![frag_reuse_index],
                 removed_indices: Vec::new(),
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );

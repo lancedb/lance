@@ -1542,6 +1542,325 @@ impl ComposableScorer for BoostScorer<'_> {
     }
 }
 
+/// Required-plus-optional scorer that only touches the optional side when it
+/// can change competitiveness or an exact score is requested.
+///
+/// The required scorer drives iteration. Once a score floor is available,
+/// block bounds may either skip the whole range or temporarily turn the
+/// optional approximation into a required iterator when the required score
+/// cannot reach the floor on its own.
+#[derive(Clone, Copy)]
+struct ReqOptBounds {
+    up_to: u64,
+    required: ScoreBounds,
+    combined: ScoreBounds,
+}
+
+struct ReqOptScorer<'a> {
+    required: BoxScorer<'a>,
+    optional: BoxScorer<'a>,
+    current: Option<u64>,
+    exhausted: bool,
+    optional_initialized: bool,
+    optional_is_required: bool,
+    optional_checked_doc: Option<u64>,
+    optional_matches: bool,
+    confirmed_doc: Option<u64>,
+    confirmed: bool,
+    min_competitive_score: f32,
+    shallow_bounds: Option<ReqOptBounds>,
+}
+
+impl<'a> ReqOptScorer<'a> {
+    fn new(required: BoxScorer<'a>, optional: BoxScorer<'a>) -> Self {
+        debug_assert!(required.scores_non_negative());
+        debug_assert!(optional.scores_non_negative());
+        Self {
+            required,
+            optional,
+            current: None,
+            exhausted: false,
+            optional_initialized: false,
+            optional_is_required: false,
+            optional_checked_doc: None,
+            optional_matches: false,
+            confirmed_doc: None,
+            confirmed: false,
+            min_competitive_score: f32::NEG_INFINITY,
+            shallow_bounds: None,
+        }
+    }
+
+    fn set_current(&mut self, current: Option<u64>) {
+        if self.current != current {
+            self.optional_checked_doc = None;
+            self.optional_matches = false;
+            self.confirmed_doc = None;
+            self.confirmed = false;
+        }
+        self.current = current;
+        self.optional_is_required = false;
+    }
+
+    fn set_optional_required(&mut self, required: bool) {
+        if self.optional_is_required != required {
+            self.confirmed_doc = None;
+            self.confirmed = false;
+        }
+        self.optional_is_required = required;
+    }
+
+    fn exhaust(&mut self) -> Option<u64> {
+        self.exhausted = true;
+        self.set_current(None);
+        None
+    }
+
+    fn ensure_optional_at_or_after(&mut self, target: u64) -> Result<Option<u64>> {
+        if !self.optional_initialized || self.optional.doc().is_some_and(|doc| doc < target) {
+            self.optional.advance(target)?;
+            self.optional_initialized = true;
+        }
+        Ok(self.optional.doc())
+    }
+
+    fn optional_matches_current(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
+            return Ok(false);
+        };
+        if self.optional_checked_doc == Some(current) {
+            return Ok(self.optional_matches);
+        }
+        self.optional_matches = self.ensure_optional_at_or_after(current)? == Some(current)
+            && self.optional.matches()?;
+        self.optional_checked_doc = Some(current);
+        Ok(self.optional_matches)
+    }
+
+    fn usable_bounds(bounds: ScoreBounds) -> bool {
+        bounds.lower.is_finite() && bounds.upper.is_finite() && bounds.lower <= bounds.upper
+    }
+
+    fn bounds(&mut self, up_to: u64) -> Result<ReqOptBounds> {
+        if let Some(bounds) = self.shallow_bounds
+            && bounds.up_to == up_to
+        {
+            return Ok(bounds);
+        }
+
+        let required = self.required.score_bounds(up_to)?;
+        let optional = if self.optional.doc().is_some_and(|doc| doc <= up_to) {
+            let bounds = self.optional.score_bounds(up_to)?;
+            if Self::usable_bounds(bounds) {
+                bounds.include_zero()
+            } else {
+                ScoreBounds::UNBOUNDED
+            }
+        } else {
+            ScoreBounds::ZERO
+        };
+        let combined = required.add(optional);
+        let bounds = ReqOptBounds {
+            up_to,
+            required,
+            combined,
+        };
+        self.shallow_bounds = Some(bounds);
+        Ok(bounds)
+    }
+
+    fn position(&mut self, mut target: u64) -> Result<Option<u64>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        'search: loop {
+            let bounds = self.shallow_bounds.filter(|bounds| target <= bounds.up_to);
+
+            if self.min_competitive_score.is_finite()
+                && self.min_competitive_score > 0.0
+                && let Some(bounds) = bounds
+                && Self::usable_bounds(bounds.required)
+                && Self::usable_bounds(bounds.combined)
+            {
+                if bounds.combined.upper < self.min_competitive_score {
+                    if bounds.up_to == u64::MAX {
+                        return Ok(self.exhaust());
+                    }
+                    target = bounds.up_to + 1;
+                    self.shallow_bounds = None;
+                    continue;
+                }
+
+                if bounds.required.upper < self.min_competitive_score {
+                    // The optional contribution is necessary throughout this
+                    // cached shallow range. Intersect approximations until
+                    // both sides agree or the range is exhausted.
+                    let Some(mut required_doc) = self.required.advance(target)? else {
+                        return Ok(self.exhaust());
+                    };
+                    if required_doc > bounds.up_to {
+                        target = required_doc;
+                        self.shallow_bounds = None;
+                        continue;
+                    }
+                    self.set_current(Some(required_doc));
+                    self.set_optional_required(true);
+                    loop {
+                        self.set_current(Some(required_doc));
+                        self.set_optional_required(true);
+                        let Some(optional_doc) = self.ensure_optional_at_or_after(required_doc)?
+                        else {
+                            if bounds.up_to == u64::MAX {
+                                return Ok(self.exhaust());
+                            }
+                            target = bounds.up_to + 1;
+                            self.shallow_bounds = None;
+                            continue 'search;
+                        };
+                        if optional_doc > bounds.up_to {
+                            if bounds.up_to == u64::MAX {
+                                return Ok(self.exhaust());
+                            }
+                            target = bounds.up_to + 1;
+                            self.shallow_bounds = None;
+                            continue 'search;
+                        }
+                        if optional_doc == required_doc {
+                            return Ok(self.current);
+                        }
+                        let Some(next_required) = self.required.advance(optional_doc)? else {
+                            return Ok(self.exhaust());
+                        };
+                        if next_required > bounds.up_to {
+                            target = next_required;
+                            self.shallow_bounds = None;
+                            continue 'search;
+                        }
+                        required_doc = next_required;
+                    }
+                }
+            }
+
+            let Some(required_doc) = self.required.advance(target)? else {
+                return Ok(self.exhaust());
+            };
+            self.set_current(Some(required_doc));
+            self.set_optional_required(false);
+            return Ok(self.current);
+        }
+    }
+
+    fn ensure_confirmed(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
+            return Ok(false);
+        };
+        if self.confirmed_doc == Some(current) {
+            return Ok(self.confirmed);
+        }
+        self.confirmed = self.required.matches()?
+            && (!self.optional_is_required || self.optional_matches_current()?);
+        self.confirmed_doc = Some(current);
+        Ok(self.confirmed)
+    }
+}
+
+impl ComposableScorer for ReqOptScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.current
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.required.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        let target = match self.current {
+            None => 0,
+            Some(u64::MAX) => return Ok(self.exhaust()),
+            Some(current) => current + 1,
+        };
+        self.position(target)
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        self.position(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.required.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        if !self.ensure_confirmed()? {
+            return Err(Error::internal(
+                "required-plus-optional FTS score requested for an unconfirmed document",
+            ));
+        }
+        let mut score = self.required.score()?;
+        if self.optional_matches_current()? {
+            score += self.optional.score()?;
+        }
+        checked_score(score, "required-plus-optional FTS scorer")
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let target = self.current.map_or(target, |current| target.max(current));
+        if let Some(bounds) = self.shallow_bounds
+            && target <= bounds.up_to
+        {
+            return Ok(bounds.up_to);
+        }
+        self.shallow_bounds = None;
+        let mut up_to = self.required.advance_shallow(target)?;
+        match self.ensure_optional_at_or_after(target)? {
+            Some(optional_doc) if optional_doc <= target => {
+                up_to = up_to.min(self.optional.advance_shallow(target)?);
+            }
+            Some(optional_doc) => {
+                up_to = up_to.min(optional_doc.saturating_sub(1));
+            }
+            None => {}
+        }
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        Ok(self.bounds(up_to)?.combined)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        if min_score > self.min_competitive_score {
+            self.min_competitive_score = min_score;
+        }
+        Ok(())
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.required
+            .match_cost()
+            .into_iter()
+            .chain(self.optional.match_cost())
+            .reduce(|left, right| left + right)
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        true
+    }
+}
+
 /// Boolean scorer preserving the current membership and score semantics.
 pub(super) struct BooleanScorer<'a> {
     driver: BoxScorer<'a>,
@@ -1570,7 +1889,21 @@ impl<'a> BooleanScorer<'a> {
                 Error::invalid_input("boolean query must have at least one should/must query")
             })?
         } else {
-            Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>
+            let required = Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>;
+            if required.scores_non_negative()
+                && optional
+                    .as_ref()
+                    .is_some_and(|optional| optional.scores_non_negative())
+            {
+                Box::new(ReqOptScorer::new(
+                    required,
+                    optional
+                        .take()
+                        .expect("checked that the optional scorer is present"),
+                )) as BoxScorer<'a>
+            } else {
+                required
+            }
         };
         let prohibited = if must_not.is_empty() {
             None
@@ -2573,6 +2906,137 @@ mod tests {
         (Box::new(scorer), approximations, confirmations)
     }
 
+    #[derive(Default)]
+    struct ScorerWork {
+        advances: AtomicUsize,
+        confirmations: AtomicUsize,
+        shallow_advances: AtomicUsize,
+        bounds: AtomicUsize,
+    }
+
+    struct InstrumentedScorer<'a> {
+        inner: BoxScorer<'a>,
+        work: Arc<ScorerWork>,
+    }
+
+    impl ComposableScorer for InstrumentedScorer<'_> {
+        fn doc(&self) -> Option<u64> {
+            self.inner.doc()
+        }
+
+        fn document_key(&self) -> Option<u64> {
+            self.inner.document_key()
+        }
+
+        fn next(&mut self) -> Result<Option<u64>> {
+            let doc = self.inner.next()?;
+            if doc.is_some() {
+                self.work.advances.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Ok(doc)
+        }
+
+        fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+            let doc = self.inner.advance(target)?;
+            if doc.is_some() {
+                self.work.advances.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Ok(doc)
+        }
+
+        fn cost(&self) -> usize {
+            self.inner.cost()
+        }
+
+        fn score(&mut self) -> Result<f32> {
+            self.inner.score()
+        }
+
+        fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+            self.work
+                .shallow_advances
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.advance_shallow(target)
+        }
+
+        fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+            self.work.bounds.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.score_bounds(up_to)
+        }
+
+        fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+            self.inner.set_min_competitive_score(min_score)
+        }
+
+        fn matches(&mut self) -> Result<bool> {
+            self.work
+                .confirmations
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.matches()
+        }
+
+        fn match_cost(&self) -> Option<f32> {
+            self.inner.match_cost()
+        }
+
+        fn scores_non_negative(&self) -> bool {
+            self.inner.scores_non_negative()
+        }
+    }
+
+    fn instrumented<'a>(inner: BoxScorer<'a>) -> (BoxScorer<'a>, Arc<ScorerWork>) {
+        let work = Arc::new(ScorerWork::default());
+        (
+            Box::new(InstrumentedScorer {
+                inner,
+                work: work.clone(),
+            }),
+            work,
+        )
+    }
+
+    struct UnboundedScorer {
+        inner: MaterializedScorer,
+    }
+
+    impl ComposableScorer for UnboundedScorer {
+        fn doc(&self) -> Option<u64> {
+            self.inner.doc()
+        }
+
+        fn next(&mut self) -> Result<Option<u64>> {
+            self.inner.next()
+        }
+
+        fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+            self.inner.advance(target)
+        }
+
+        fn cost(&self) -> usize {
+            self.inner.cost()
+        }
+
+        fn score(&mut self) -> Result<f32> {
+            self.inner.score()
+        }
+
+        fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+            self.inner.advance_shallow(target)
+        }
+
+        fn score_bounds(&mut self, _up_to: u64) -> Result<ScoreBounds> {
+            Ok(ScoreBounds::UNBOUNDED)
+        }
+
+        fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+            self.inner.set_min_competitive_score(min_score)
+        }
+
+        fn scores_non_negative(&self) -> bool {
+            true
+        }
+    }
+
     struct CountingScorer {
         inner: MaterializedScorer,
         cost: usize,
@@ -2800,5 +3264,148 @@ mod tests {
         .unwrap();
         let results = TopKCollector::new(2).collect(&mut dismax).unwrap();
         assert_eq!(results, rows(&[(1, 4.0), (2, 4.0)]));
+    }
+
+    #[test]
+    fn reqopt_delays_sparse_optional_probes() {
+        let values = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
+        let build = || {
+            let required =
+                Box::new(RequiredConjunctionScorer::try_new(vec![materialized(&values)]).unwrap());
+            let optional = Box::new(
+                DisjunctionScorer::try_new(
+                    vec![materialized(&[(99, 100.0)])],
+                    DisjunctionScore::Sum,
+                )
+                .unwrap(),
+            );
+            let (required, required_work) = instrumented(required);
+            let (optional, optional_work) = instrumented(optional);
+            (required, required_work, optional, optional_work)
+        };
+
+        let (required, _, optional, eager_optional_work) = build();
+        let mut eager = BooleanScorer {
+            driver: required,
+            optional: Some(optional),
+            prohibited: None,
+            current: None,
+            optional_matches: false,
+        };
+        let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
+
+        let (required, required_work, optional, optional_work) = build();
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let results = TopKCollector::new(1).collect(&mut scorer).unwrap();
+
+        assert_eq!(eager_results, rows(&[(99, 101.0)]));
+        assert_eq!(results, rows(&[(99, 101.0)]));
+        let required_advances = required_work.advances.load(AtomicOrdering::Relaxed);
+        let eager_optional_probes = eager_optional_work.advances.load(AtomicOrdering::Relaxed);
+        let optional_probes = optional_work.advances.load(AtomicOrdering::Relaxed);
+        assert_eq!(required_advances, 100);
+        assert_eq!(eager_optional_probes, 100);
+        assert_eq!(optional_probes, 1);
+        assert_eq!(
+            required_work.shallow_advances.load(AtomicOrdering::Relaxed),
+            2
+        );
+        assert_eq!(required_work.bounds.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(
+            required_work.confirmations.load(AtomicOrdering::Relaxed),
+            100
+        );
+        assert_eq!(optional_work.confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert!(
+            optional_probes * 5 <= eager_optional_probes * 4,
+            "lazy required-plus-optional scoring should reduce optional probes by at least 20%: \
+             {optional_probes}/{eager_optional_probes}"
+        );
+    }
+
+    #[test]
+    fn reqopt_temporarily_requires_optional_contribution() {
+        let values = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
+        let (required, required_work) = instrumented(materialized(&values));
+        let (optional, optional_work) = instrumented(materialized(&[(50, 10.0)]));
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(10.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(50, 11.0)]));
+        assert!(required_work.advances.load(AtomicOrdering::Relaxed) < 10);
+        assert_eq!(required_work.confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(optional_work.advances.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(optional_work.confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn boolean_reqopt_keeps_current_confirmation_stable_after_bounds() {
+        let mut scorer = BooleanScorer::try_new(
+            vec![materialized(&[(1, 10.0)])],
+            vec![materialized(&[(0, 1.0), (1, 1.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(5.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(1, 11.0)]));
+    }
+
+    #[test]
+    fn boolean_gates_reqopt_and_signed_boost_uses_exact_fallback() {
+        let supported = BooleanScorer::try_new(
+            vec![materialized(&[(1, 4.0)])],
+            vec![materialized(&[(1, 2.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(supported.optional.is_none());
+
+        let signed_optional = Box::new(
+            BoostScorer::try_new(
+                materialized(&[(1, 4.0), (2, 1.0)]),
+                materialized(&[(1, 1.0), (2, 4.0)]),
+                0.5,
+            )
+            .unwrap(),
+        );
+        let mut fallback = BooleanScorer::try_new(
+            vec![signed_optional],
+            vec![materialized(&[(1, 2.0), (2, 2.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(fallback.optional.is_some());
+        assert_eq!(
+            TopKCollector::new(2).collect(&mut fallback).unwrap(),
+            rows(&[(1, 5.5), (2, 1.0)])
+        );
+    }
+
+    #[test]
+    fn reqopt_uses_exact_iteration_for_unbounded_scorers() {
+        let required = Box::new(UnboundedScorer {
+            inner: MaterializedScorer::try_new(rows(&[(1, 1.0), (2, 1.0)])).unwrap(),
+        });
+        let optional = materialized(&[(2, 10.0)]);
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(5.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(2, 11.0)]));
     }
 }

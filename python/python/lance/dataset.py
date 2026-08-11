@@ -6012,6 +6012,11 @@ class LanceOperation:
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        updated_fragment_offsets: dict[int, bytes], optional
+            Physical row offsets that matched the update, keyed by fragment id,
+            each serialized in the portable RoaringBitmap format. Set on
+            ``rewrite_columns`` updates over stable row ids so the commit
+            refreshes row-level version metadata for the matched rows only.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6024,6 +6029,7 @@ class LanceOperation:
             default_factory=list
         )
         update_mode: str = ""
+        updated_fragment_offsets: Optional[Dict[int, bytes]] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
