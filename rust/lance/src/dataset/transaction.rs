@@ -264,20 +264,20 @@ pub struct Transaction {
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
-/// The MemWAL state of the version a transaction read.
+/// The table as the version a transaction read, for the parts of building a
+/// manifest that depend on what the transaction *saw* rather than what it is
+/// committing onto.
 ///
-/// An index this transaction publishes was built against this fragment set, so
-/// covering it proves the index holds every row compacted as of
-/// `compacted_sstables`. Neither half can be recovered while building the
-/// manifest, which sees only the version being committed onto -- by then
-/// fragments may have been appended, and compaction may have advanced into
-/// them.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct MemWalReadSnapshot {
-    /// Fragments live in the table at that version.
-    pub fragments: RoaringBitmap,
-    /// Per-shard SSTable compaction progress recorded at that version.
-    pub compacted_sstables: Vec<CompactedSsTable>,
+/// The two differ whenever anything committed in between, which is exactly when
+/// the distinction matters: an index published here was built against this
+/// state, not the one it lands on.
+///
+/// Held as the materialized version rather than its number because building a
+/// manifest does no I/O, so it cannot resolve one into the other.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadVersionState<'a> {
+    pub manifest: &'a Manifest,
+    pub indices: &'a [IndexMetadata],
 }
 
 /// Every non-system logical index, mapped to its sorted physical segment UUIDs.
@@ -1887,7 +1887,8 @@ impl Transaction {
     fn apply_mem_wal_index_coverage(
         final_indices: &mut [IndexMetadata],
         segments_before: &LogicalIndexSegments,
-        read_snapshot: &MemWalReadSnapshot,
+        read_fragments: &RoaringBitmap,
+        read_compacted_sstables: &[CompactedSsTable],
         new_version: u64,
     ) -> Result<()> {
         let Some(position) = final_indices
@@ -1923,8 +1924,7 @@ impl Transaction {
             .compacted_sstables
             .iter()
             .map(|committed| {
-                let inspected = read_snapshot
-                    .compacted_sstables
+                let inspected = read_compacted_sstables
                     .iter()
                     .find(|sstable| sstable.shard_id == committed.shard_id)
                     .map_or(0, |sstable| sstable.generation);
@@ -1958,7 +1958,7 @@ impl Transaction {
                 }
             }
 
-            let proven = covered.is_some_and(|covered| read_snapshot.fragments.is_subset(&covered));
+            let proven = covered.is_some_and(|covered| read_fragments.is_subset(&covered));
 
             // Only an index that is still physically the same may carry its old
             // position forward; otherwise that position was recorded against an
@@ -2005,17 +2005,17 @@ impl Transaction {
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
     ///
-    /// `mem_wal_read_snapshot` describes the version this transaction read, and
-    /// is what lets an index published here record how far it has caught up. It
-    /// is `None` when the table has no MemWAL state to maintain, and on paths
-    /// with no version to read (dataset creation, detached commits).
+    /// `read_version_state` is the table as the version this transaction read,
+    /// which is what lets an index published here record how far it has caught
+    /// up. It is `None` on paths with no version to read: dataset creation and
+    /// detached commits.
     pub(crate) fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
-        mem_wal_read_snapshot: Option<&MemWalReadSnapshot>,
+        read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
@@ -2088,7 +2088,7 @@ impl Transaction {
         // Taken before the operation rewrites the list, so coverage can be
         // compared against what each logical index looked like going in. Only
         // tables carrying MemWAL state pay for it.
-        let mem_wal_segments_before = mem_wal_read_snapshot
+        let mem_wal_segments_before = read_version_state
             .is_some_and(|_| {
                 final_indices
                     .iter()
@@ -2726,14 +2726,28 @@ impl Transaction {
 
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one operation arm
-        // intended.
-        if let (Some(segments_before), Some(read_snapshot)) =
-            (&mem_wal_segments_before, mem_wal_read_snapshot)
+        // intended. The read version is parsed here rather than by the commit
+        // path, which has no business knowing what MemWAL keeps in its system
+        // index.
+        if let (Some(segments_before), Some(read_version_state)) =
+            (&mem_wal_segments_before, read_version_state)
+            && let Some(read_mem_wal_index) = read_version_state
+                .indices
+                .iter()
+                .find(|index| index.name == MEM_WAL_INDEX_NAME)
         {
+            let read_details = load_mem_wal_index_details(read_mem_wal_index.clone())?;
+            let read_fragments: RoaringBitmap = read_version_state
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect();
             Self::apply_mem_wal_index_coverage(
                 &mut final_indices,
                 segments_before,
-                read_snapshot,
+                &read_fragments,
+                &read_details.compacted_sstables,
                 new_version,
             )?;
         }
@@ -7358,14 +7372,19 @@ mod tests {
             new_mem_wal_index_meta(1, details).unwrap()
         }
 
-        fn snapshot(fragments: &[u32], compacted: &[(Uuid, u64)]) -> MemWalReadSnapshot {
-            MemWalReadSnapshot {
-                fragments: fragments.iter().copied().collect(),
-                compacted_sstables: compacted
+        /// What `build_manifest` derives from the read version before applying
+        /// coverage: the fragments live there, and its compaction progress.
+        fn snapshot(
+            fragments: &[u32],
+            compacted: &[(Uuid, u64)],
+        ) -> (RoaringBitmap, Vec<CompactedSsTable>) {
+            (
+                fragments.iter().copied().collect(),
+                compacted
                     .iter()
                     .map(|&(shard, generation)| CompactedSsTable::new(shard, generation))
                     .collect(),
-            }
+            )
         }
 
         /// Apply coverage to `indices`, treating `before` as the pre-operation
@@ -7373,14 +7392,15 @@ mod tests {
         fn recorded(
             indices: &mut [IndexMetadata],
             before: &[IndexMetadata],
-            read_snapshot: &MemWalReadSnapshot,
+            read_snapshot: &(RoaringBitmap, Vec<CompactedSsTable>),
             shard: Uuid,
         ) -> Vec<(String, u64)> {
             let segments_before = Transaction::logical_index_segments(before);
             Transaction::apply_mem_wal_index_coverage(
                 indices,
                 &segments_before,
-                read_snapshot,
+                &read_snapshot.0,
+                &read_snapshot.1,
                 VERSION,
             )
             .unwrap();
@@ -7617,13 +7637,14 @@ mod tests {
         fn a_table_that_has_never_compacted_records_nothing() {
             let before = vec![segment("idx", Some(&[0])), mem_wal_index(&[], &[])];
             let mut after = before.clone();
-            let read_snapshot = snapshot(&[0, 1], &[]);
+            let (read_fragments, read_compacted) = snapshot(&[0, 1], &[]);
 
             let segments_before = Transaction::logical_index_segments(&before);
             Transaction::apply_mem_wal_index_coverage(
                 &mut after,
                 &segments_before,
-                &read_snapshot,
+                &read_fragments,
+                &read_compacted,
                 VERSION,
             )
             .unwrap();
