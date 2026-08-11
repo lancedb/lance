@@ -2506,6 +2506,7 @@ impl DirectoryNamespace {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                ..
             } if new_indices.is_empty() && !removed_indices.is_empty() => "DropIndex".to_string(),
             _ => transaction.operation.to_string(),
         }

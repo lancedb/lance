@@ -1961,6 +1961,7 @@ pub async fn initialize_vector_index(
         Operation::CreateIndex {
             new_indices: vec![new_idx],
             removed_indices: vec![],
+            mem_wal_index_catchup_advances: Vec::new(),
         },
         None,
     );
