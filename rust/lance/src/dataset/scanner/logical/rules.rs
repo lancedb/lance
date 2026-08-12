@@ -1,25 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Stage 3: Lance-owned optimizer rules.
+//! Stage 3: Lance-owned logical rules.
 //!
 //! Each rule holds an [`Arc<ScanPlanningContext>`], which is the whole point of the staging: a
-//! synchronous `OptimizerRule` gets to make decisions that needed I/O to inform.
+//! synchronous rule gets to make decisions that needed I/O to inform.
 //!
 //! These rules are logical-to-logical. They resolve *which* access path a search will use rather
 //! than building it, so that by the time the extension planner runs there is nothing left to
 //! decide. That is the bet this spike is testing — that index reasoning fits in rules, and
 //! lowering can stay mechanical.
+//!
+//! Most of them are [`AnalyzerRule`]s, not `OptimizerRule`s. DataFusion documents an
+//! `OptimizerRule` as computing "the same results, but in a potentially more efficient way", and
+//! directs semantics-changing rewrites to the analyzer. These rules are not optional: skip access
+//! path resolution or the coverage split and a search silently returns the wrong rows. The
+//! analyzer also runs each rule exactly once, where the optimizer re-runs rules until the plan
+//! stops changing — which is why none of these rules needs to recognize its own output.
+//!
+//! [`ResolvePrefilterSource`] is the exception, and an instructive one: it is equally mandatory but
+//! has to observe the plan *after* `PushDownFilter` has moved the predicate, so it cannot run in a
+//! stage that precedes the optimizer.
 
 use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::{provider_as_source, source_as_provider};
 use datafusion::logical_expr::{
     EmptyRelation, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNodeCore,
 };
-use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion::optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::prelude::col;
 use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
@@ -72,19 +84,10 @@ impl ResolveVectorAccessPath {
     }
 }
 
-impl OptimizerRule for ResolveVectorAccessPath {
-    fn name(&self) -> &str {
-        "resolve_vector_access_path"
-    }
-
-    fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::BottomUp)
-    }
-
-    fn rewrite(
+impl ResolveVectorAccessPath {
+    fn rewrite_node(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
     ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
         let LogicalPlan::Extension(extension) = &plan else {
             return Ok(Transformed::no(plan));
@@ -92,6 +95,9 @@ impl OptimizerRule for ResolveVectorAccessPath {
         let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() else {
             return Ok(Transformed::no(plan));
         };
+        // Not an idempotence guard: the builder resolves a search to `Flat` when its candidates
+        // are the search space (a vector search over FTS results), and that is a decision, not a
+        // default. See `builder::build`.
         if search.access_path_resolution().is_some() {
             return Ok(Transformed::no(plan));
         }
@@ -117,6 +123,33 @@ impl OptimizerRule for ResolveVectorAccessPath {
             node: Arc::new(resolved),
         })))
     }
+}
+
+impl AnalyzerRule for ResolveVectorAccessPath {
+    fn name(&self) -> &str {
+        "resolve_vector_access_path"
+    }
+
+    fn analyze(
+        &self,
+        plan: LogicalPlan,
+        _config: &ConfigOptions,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        analyze_bottom_up(plan, |node| self.rewrite_node(node))
+    }
+}
+
+/// Apply a node rewrite bottom-up over the whole plan.
+///
+/// An [`AnalyzerRule`] receives the entire plan, so the traversal that
+/// [`OptimizerRule::apply_order`] used to supply is written out here instead. Bottom-up matters for
+/// the same reason it did there: a rule that replaces a node with a subtree must not then descend
+/// into the subtree it just built.
+pub(super) fn analyze_bottom_up(
+    plan: LogicalPlan,
+    rewrite: impl FnMut(LogicalPlan) -> datafusion::common::Result<Transformed<LogicalPlan>>,
+) -> datafusion::common::Result<LogicalPlan> {
+    Ok(plan.transform_up(rewrite)?.data)
 }
 
 /// Record whether an indexed search has a prefilter, and therefore whether its child plan is a
@@ -308,19 +341,24 @@ impl SplitOnIndexCoverage {
     }
 }
 
-impl OptimizerRule for SplitOnIndexCoverage {
+impl AnalyzerRule for SplitOnIndexCoverage {
     fn name(&self) -> &str {
         "split_on_index_coverage"
     }
 
-    fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::BottomUp)
-    }
-
-    fn rewrite(
+    fn analyze(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        _config: &ConfigOptions,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        analyze_bottom_up(plan, |node| self.rewrite_node(node))
+    }
+}
+
+impl SplitOnIndexCoverage {
+    fn rewrite_node(
+        &self,
+        plan: LogicalPlan,
     ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
         let Some(node) = splittable(&plan) else {
             return Ok(Transformed::no(plan));
@@ -376,11 +414,10 @@ impl OptimizerRule for SplitOnIndexCoverage {
 impl SplittableSearch for VectorSearchNode {
     fn is_splittable(&self) -> bool {
         // Only an indexed search can have a coverage gap; a flat search already reads everything.
-        // `input_fully_indexed` is what stops the rewrite from recursing into its own output.
         matches!(
             self.access_path_resolution(),
             Some(VectorAccessPath::Index { .. })
-        ) && !self.input_fully_indexed()
+        )
     }
 
     fn coverage(&self, context: &ScanPlanningContext) -> IndexCoverage {
@@ -433,12 +470,7 @@ impl SplittableSearch for VectorSearchNode {
         block: Option<Arc<RowAddrTreeMap>>,
     ) -> LogicalPlan {
         LogicalPlan::Extension(Extension {
-            node: Arc::new(
-                self.clone()
-                    .with_input(input)
-                    .with_overlay_block(block)
-                    .covering_only_indexed_input(),
-            ),
+            node: Arc::new(self.clone().with_input(input).with_overlay_block(block)),
         })
     }
 
@@ -561,19 +593,24 @@ impl ExpandVectorRefine {
     }
 }
 
-impl OptimizerRule for ExpandVectorRefine {
+impl AnalyzerRule for ExpandVectorRefine {
     fn name(&self) -> &str {
         "expand_vector_refine"
     }
 
-    fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::BottomUp)
-    }
-
-    fn rewrite(
+    fn analyze(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        _config: &ConfigOptions,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        analyze_bottom_up(plan, |node| self.rewrite_node(node))
+    }
+}
+
+impl ExpandVectorRefine {
+    fn rewrite_node(
+        &self,
+        plan: LogicalPlan,
     ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
         let LogicalPlan::Extension(extension) = &plan else {
             return Ok(Transformed::no(plan));
@@ -581,9 +618,8 @@ impl OptimizerRule for ExpandVectorRefine {
         let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() else {
             return Ok(Transformed::no(plan));
         };
-        // Only an indexed search produces approximate distances worth refining, and only once.
-        if search.refine_expanded()
-            || search.query().refine_factor.is_none()
+        // Only an indexed search produces approximate distances worth refining.
+        if search.query().refine_factor.is_none()
             || !matches!(
                 search.access_path_resolution(),
                 Some(VectorAccessPath::Index { .. })
@@ -594,7 +630,7 @@ impl OptimizerRule for ExpandVectorRefine {
 
         let column = &search.query().column;
         let approximate = LogicalPlan::Extension(Extension {
-            node: Arc::new(search.clone().with_refine_expanded()),
+            node: Arc::new(search.clone()),
         });
         let candidates = LogicalPlanBuilder::new(LogicalPlan::Extension(Extension {
             node: Arc::new(LanceTakeNode::try_new(
@@ -617,8 +653,7 @@ impl OptimizerRule for ExpandVectorRefine {
                     .clone()
                     .with_input(candidates)
                     .with_resolution(VectorAccessPath::Flat)
-                    .with_prefilter(PrefilterSourceKind::None)
-                    .with_refine_expanded(),
+                    .with_prefilter(PrefilterSourceKind::None),
             ),
         })))
     }

@@ -14,8 +14,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use datafusion::common::plan_err;
 use datafusion::common::{DFSchema, DFSchemaRef};
-use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion::logical_expr::{Expr, InvariantLevel, LogicalPlan, UserDefinedLogicalNodeCore};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::Projection;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -154,18 +155,6 @@ pub struct VectorSearchNode {
     distance_type: DistanceType,
     resolution: Option<VectorAccessPath>,
     prefilter: PrefilterSourceKind,
-    /// Whether the input is known to contain only fragments the index covers.
-    ///
-    /// False until [`SplitPartiallyIndexedSearch`](super::rules::SplitPartiallyIndexedSearch)
-    /// establishes it. Without this the rule would re-split its own indexed branch on the
-    /// optimizer's next pass, and the branch's scan — already narrowed to `[_rowid]` — cannot
-    /// supply the vectors the nested brute-force branch would ask for.
-    input_fully_indexed: bool,
-    /// Whether [`ExpandVectorRefine`](super::rules::ExpandVectorRefine) has already put the exact
-    /// re-rank above this node. The third such marker in the module, and for the same reason as
-    /// `input_fully_indexed`: a rule that rewrites structure must recognize its own output, since
-    /// the optimizer runs the rule list to fixpoint.
-    refine_expanded: bool,
     /// Rows the index must not emit, because a data overlay committed after the index was built
     /// changed a value the index covers. Set by
     /// [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage), which puts the same rows on a
@@ -199,8 +188,6 @@ impl VectorSearchNode {
             distance_type,
             resolution: None,
             prefilter: PrefilterSourceKind::default(),
-            input_fully_indexed: false,
-            refine_expanded: false,
             overlay_block: None,
             schema,
         })
@@ -218,24 +205,6 @@ impl VectorSearchNode {
 
     pub fn prefilter(&self) -> PrefilterSourceKind {
         self.prefilter
-    }
-
-    pub fn covering_only_indexed_input(mut self) -> Self {
-        self.input_fully_indexed = true;
-        self
-    }
-
-    pub fn input_fully_indexed(&self) -> bool {
-        self.input_fully_indexed
-    }
-
-    pub fn with_refine_expanded(mut self) -> Self {
-        self.refine_expanded = true;
-        self
-    }
-
-    pub fn refine_expanded(&self) -> bool {
-        self.refine_expanded
     }
 
     pub fn with_overlay_block(mut self, block: Option<Arc<RowAddrTreeMap>>) -> Self {
@@ -287,7 +256,6 @@ impl PartialEq for VectorSearchNode {
             && self.accuracy == other.accuracy
             && self.resolution == other.resolution
             && self.prefilter == other.prefilter
-            && self.input_fully_indexed == other.input_fully_indexed
             && self.overlay_block == other.overlay_block
     }
 }
@@ -302,7 +270,6 @@ impl Hash for VectorSearchNode {
         self.accuracy.hash(state);
         self.resolution.hash(state);
         self.prefilter.hash(state);
-        self.input_fully_indexed.hash(state);
         // `RowAddrTreeMap` is not `Hash`, and the flag is the part that distinguishes plans: two
         // nodes with different block lists cannot share an input anyway.
         self.overlay_block.is_some().hash(state);
@@ -321,6 +288,22 @@ impl PartialOrd for VectorSearchNode {
 impl UserDefinedLogicalNodeCore for VectorSearchNode {
     fn name(&self) -> &str {
         "VectorSearch"
+    }
+
+    /// An unresolved search is not executable.
+    ///
+    /// The rules that resolve it are mandatory, and a missed one used to mean silently wrong rows
+    /// — a brute-force fallback where an index was expected, or an index consulted for rows it no
+    /// longer describes. DataFusion checks this at the end of the analyzer, which is the stage
+    /// those rules run in, so a rule that fails to fire becomes a planning error instead.
+    fn check_invariants(&self, check: InvariantLevel) -> datafusion::common::Result<()> {
+        if matches!(check, InvariantLevel::Executable) && self.resolution.is_none() {
+            return plan_err!(
+                "vector search on column '{}' reached execution with no access path resolved",
+                self.query.column
+            );
+        }
+        Ok(())
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -383,8 +366,6 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             distance_type: self.distance_type,
             resolution: self.resolution.clone(),
             prefilter: self.prefilter,
-            input_fully_indexed: self.input_fully_indexed,
-            refine_expanded: self.refine_expanded,
             overlay_block: self.overlay_block.clone(),
             schema: self.schema.clone(),
         })

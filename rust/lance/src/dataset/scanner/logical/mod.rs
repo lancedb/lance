@@ -13,10 +13,11 @@
 //! 2. **Collect** a [`ScanPlanningContext`](context::ScanPlanningContext) by walking that plan and
 //!    prefetching everything the later stages need — index metadata, plus the manifest's fragment
 //!    metadata, which is already in memory. This is the only stage that does I/O.
-//! 3. **Derive** the Lance-owned optimizer rules from the context. Each rule holds an
-//!    `Arc<ScanPlanningContext>`, which is how a synchronous `OptimizerRule` gets at information
-//!    that took I/O to obtain.
-//! 4. **Optimize and lower**, logical rules then physical.
+//! 3. **Derive** the Lance-owned rules from the context. Each rule holds an
+//!    `Arc<ScanPlanningContext>`, which is how a synchronous rule gets at information that took
+//!    I/O to obtain. Rewrites that must happen for the plan to be *correct* are `AnalyzerRule`s;
+//!    only rewrites that are optional are `OptimizerRule`s.
+//! 4. **Optimize and lower**, analyzer then logical rules then physical.
 //!
 //! This path is off by default. See [`is_enabled`].
 
@@ -34,11 +35,11 @@ mod tests;
 use std::sync::Arc;
 
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::optimizer::OptimizerRule;
 use datafusion::optimizer::optimize_projections::OptimizeProjections;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::push_down_limit::PushDownLimit;
 use datafusion::optimizer::simplify_expressions::SimplifyExpressions;
+use datafusion::optimizer::{Analyzer, AnalyzerRule, OptimizerRule};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_plan::ExecutionPlan;
@@ -75,6 +76,7 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(session_config(scanner))
+        .with_analyzer_rules(analyzer_rules(&context))
         .with_optimizer_rules(optimizer_rules(&context))
         .with_physical_optimizer_rules(physical_optimizer_rules())
         .build();
@@ -96,27 +98,36 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
 /// cannot silently change what runs — the same discipline `get_physical_optimizer` already
 /// applies on the physical side. Anything that could move a predicate or limit *across* a search
 /// node is deliberately absent.
-fn optimizer_rules(
-    context: &Arc<ScanPlanningContext>,
-) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-    let mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![Arc::new(
-        rules::ResolveVectorAccessPath::new(context.clone()),
-    )];
+fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    // DataFusion's own analyzer rules stay: `TypeCoercion` in particular has to run over the
+    // predicates the builder produced before anything duplicates them onto two branches.
+    let mut rules = Analyzer::new().rules;
+    rules.push(Arc::new(rules::ResolveVectorAccessPath::new(
+        context.clone(),
+    )));
     // The FTS rules are contributed as a block by the module that owns the FTS nodes, which is
     // the closest the spike gets to the doc's "each index plugin provides its own rules".
-    rules.extend(fts::rules(context));
-    rules.extend::<Vec<Arc<dyn OptimizerRule + Send + Sync>>>(vec![
-        // Before PushDownFilter, so a prefilter predicate is still a `Filter` node that gets
-        // duplicated onto both branches; each branch's scan then absorbs its own copy.
+    rules.extend(fts::analyzer_rules(context));
+    rules.extend::<Vec<Arc<dyn AnalyzerRule + Send + Sync>>>(vec![
         Arc::new(rules::SplitOnIndexCoverage::new(context.clone())),
         // After the split, so the refine lands on the *indexed branch* of a partially-covered
         // search rather than above the union — the nesting the imperative path produces.
         Arc::new(rules::ExpandVectorRefine::new(context.clone())),
+    ]);
+    rules
+}
+
+fn optimizer_rules(
+    context: &Arc<ScanPlanningContext>,
+) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+    let mut rules = fts::optimizer_rules(context);
+    rules.extend::<Vec<Arc<dyn OptimizerRule + Send + Sync>>>(vec![
         Arc::new(SimplifyExpressions::new()),
         Arc::new(PushDownFilter::new()),
         Arc::new(PushDownLimit::new()),
-        // After PushDownFilter, so the predicate has reached its final position, and after the
-        // access-path rules, whose choice decides what each child must produce.
+        // After PushDownFilter, so the predicate has reached its final position. This rule is as
+        // mandatory as the analyzer ones, but it reads a *structural* fact — is there a predicate
+        // below the search — that pushdown is what settles, so it cannot run before the optimizer.
         Arc::new(rules::ResolvePrefilterSource),
         Arc::new(OptimizeProjections::new()),
     ]);

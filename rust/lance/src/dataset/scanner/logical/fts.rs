@@ -32,14 +32,16 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow_schema::{Schema as ArrowSchema, SortOptions};
+use datafusion::common::plan_err;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError};
+use datafusion::config::ConfigOptions;
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{
-    Expr, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode,
+    Expr, Extension, InvariantLevel, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode,
     UserDefinedLogicalNodeCore,
 };
-use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion::optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
@@ -257,7 +259,6 @@ pub struct FtsLeafNode {
     /// Set by [`SplitPartiallyIndexedFts`] on the branch it restricts to indexed fragments, for
     /// the same reason the vector path needs it: without it the rule re-splits its own output on
     /// DataFusion's next optimizer pass.
-    input_fully_indexed: bool,
     /// Whether the input's row order is the answer's row order.
     ///
     /// A bounded flat leaf normally has to sort by score to produce the global top-k. When the
@@ -307,7 +308,6 @@ impl FtsLeafNode {
             field,
             resolution: None,
             prefilter: PrefilterSourceKind::default(),
-            input_fully_indexed: false,
             retains_input_order: false,
             overlay_block: None,
             schema,
@@ -338,10 +338,6 @@ impl FtsLeafNode {
         self.prefilter
     }
 
-    pub fn input_fully_indexed(&self) -> bool {
-        self.input_fully_indexed
-    }
-
     pub fn with_input(mut self, input: LogicalPlan) -> Self {
         self.input = input;
         self
@@ -354,11 +350,6 @@ impl FtsLeafNode {
 
     pub fn with_prefilter(mut self, prefilter: PrefilterSourceKind) -> Self {
         self.prefilter = prefilter;
-        self
-    }
-
-    pub fn covering_only_indexed_input(mut self) -> Self {
-        self.input_fully_indexed = true;
         self
     }
 
@@ -385,7 +376,6 @@ impl PartialEq for FtsLeafNode {
             && self.granularity == other.granularity
             && self.resolution == other.resolution
             && self.prefilter == other.prefilter
-            && self.input_fully_indexed == other.input_fully_indexed
             && self.overlay_block == other.overlay_block
     }
 }
@@ -399,7 +389,6 @@ impl Hash for FtsLeafNode {
         self.granularity.hash(state);
         self.resolution.hash(state);
         self.prefilter.hash(state);
-        self.input_fully_indexed.hash(state);
         // `RowAddrTreeMap` is not `Hash`; see the note on `VectorSearchNode`'s impl.
         self.overlay_block.is_some().hash(state);
     }
@@ -421,6 +410,19 @@ impl PartialOrd for FtsLeafNode {
 impl UserDefinedLogicalNodeCore for FtsLeafNode {
     fn name(&self) -> &str {
         "FtsLeaf"
+    }
+
+    /// An unresolved leaf is not executable. See [`VectorSearchNode::check_invariants`].
+    ///
+    /// [`VectorSearchNode::check_invariants`]: super::nodes::VectorSearchNode
+    fn check_invariants(&self, check: InvariantLevel) -> datafusion::common::Result<()> {
+        if matches!(check, InvariantLevel::Executable) && self.resolution.is_none() {
+            return plan_err!(
+                "full-text search on column '{}' reached execution with no access path resolved",
+                self.column()
+            );
+        }
+        Ok(())
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -1111,12 +1113,21 @@ pub fn dedupe_rows(input: LogicalPlan) -> Result<LogicalPlan> {
 // Stage 3: rules
 // ---------------------------------------------------------------------------------------------
 
-/// The FTS-owned optimizer rules, in the order they must run.
-pub fn rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-    vec![
-        Arc::new(ResolveFtsAccessPath::new(context.clone())),
-        Arc::new(UseFtsCompoundScorer::new(context.clone())),
-    ]
+/// The FTS-owned mandatory rewrites. Deciding whether a leaf can use its index is not an
+/// optimization — an unresolved leaf cannot be lowered at all.
+pub fn analyzer_rules(
+    context: &Arc<ScanPlanningContext>,
+) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    vec![Arc::new(ResolveFtsAccessPath::new(context.clone()))]
+}
+
+/// The FTS-owned optimizations. `UseFtsCompoundScorer` is the only rule in the spike that fits
+/// `OptimizerRule`'s documented contract: drop it and the plan still returns the same rows, just
+/// by scoring each leaf separately and combining afterwards.
+pub fn optimizer_rules(
+    context: &Arc<ScanPlanningContext>,
+) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+    vec![Arc::new(UseFtsCompoundScorer::new(context.clone()))]
 }
 
 /// Decide whether each leaf uses its inverted index or scans text.
@@ -1135,19 +1146,24 @@ impl ResolveFtsAccessPath {
     }
 }
 
-impl OptimizerRule for ResolveFtsAccessPath {
+impl AnalyzerRule for ResolveFtsAccessPath {
     fn name(&self) -> &str {
         "resolve_fts_access_path"
     }
 
-    fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::BottomUp)
-    }
-
-    fn rewrite(
+    fn analyze(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        _config: &ConfigOptions,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        super::rules::analyze_bottom_up(plan, |node| self.rewrite_node(node))
+    }
+}
+
+impl ResolveFtsAccessPath {
+    fn rewrite_node(
+        &self,
+        plan: LogicalPlan,
     ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
         let LogicalPlan::Extension(extension) = &plan else {
             return Ok(Transformed::no(plan));
@@ -1155,6 +1171,9 @@ impl OptimizerRule for ResolveFtsAccessPath {
         let Some(leaf) = extension.node.as_any().downcast_ref::<FtsLeafNode>() else {
             return Ok(Transformed::no(plan));
         };
+        // Not an idempotence guard: the builder resolves a leaf to `Flat` when its input already
+        // *is* the candidate set — an FTS query scoring the output of a vector filter — and that
+        // is a decision, not a default.
         if leaf.resolution.is_some() {
             return Ok(Transformed::no(plan));
         }
@@ -1286,7 +1305,7 @@ impl OptimizerRule for UseFtsCompoundScorer {
 /// exactly what `Scanner::combine_fts_leaf_plans` builds by hand.
 impl SplittableSearch for FtsLeafNode {
     fn is_splittable(&self) -> bool {
-        matches!(self.resolution, Some(FtsAccessPath::Index { .. })) && !self.input_fully_indexed()
+        matches!(self.resolution, Some(FtsAccessPath::Index { .. }))
     }
 
     fn coverage(&self, context: &ScanPlanningContext) -> IndexCoverage {
@@ -1341,12 +1360,7 @@ impl SplittableSearch for FtsLeafNode {
         block: Option<Arc<RowAddrTreeMap>>,
     ) -> LogicalPlan {
         LogicalPlan::Extension(Extension {
-            node: Arc::new(
-                self.clone()
-                    .with_input(input)
-                    .with_overlay_block(block)
-                    .covering_only_indexed_input(),
-            ),
+            node: Arc::new(self.clone().with_input(input).with_overlay_block(block)),
         })
     }
 

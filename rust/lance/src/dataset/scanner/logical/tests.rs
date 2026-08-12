@@ -1386,3 +1386,30 @@ async fn test_paths_agree_on_a_scalar_index_over_an_overlay() {
         }
     }
 }
+
+/// The check that replaced the deleted idempotence markers: a search whose access path was never
+/// resolved is rejected as non-executable rather than lowered to a silent brute-force fallback.
+///
+/// DataFusion runs this check at the end of the analyzer, which is the stage the resolving rules
+/// live in, so a rule that fails to fire surfaces as a planning error.
+#[tokio::test]
+async fn test_an_unresolved_search_is_not_executable() {
+    use datafusion::logical_expr::InvariantLevel;
+
+    let dataset = vector_dataset().await;
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query_vector(), 5).unwrap();
+
+    let prepared = super::prepare::PreparedQueries::resolve(&scan)
+        .await
+        .unwrap();
+    let plan = super::builder::build(&scan, &prepared).unwrap();
+
+    let err = plan
+        .check_invariants(InvariantLevel::Executable)
+        .expect_err("an unresolved search must not pass the executable check");
+    assert!(
+        err.to_string().contains("no access path resolved"),
+        "unexpected error: {err}"
+    );
+}
