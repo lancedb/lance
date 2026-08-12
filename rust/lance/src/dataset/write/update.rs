@@ -217,10 +217,11 @@ impl UpdateBuilder {
 
     /// Attach schema/field metadata updates to publish atomically with the Update.
     ///
-    /// The patch is stored on the Update [`Transaction`] and committed in the same
-    /// version as the row updates, so readers never observe rewritten rows without
-    /// the metadata (or vice versa). Empty / no-op patches are rejected with
-    /// [`Error::InvalidInput`].
+    /// When the Update modifies at least one row, the patch is stored on the Update
+    /// [`Transaction`] and committed in the same version as the row updates, so
+    /// readers never observe rewritten rows without the metadata (or vice versa).
+    /// If zero rows match the predicate, the patch is not attached. Empty / no-op
+    /// patches are rejected with [`Error::InvalidInput`].
     pub fn with_schema_metadata_updates(mut self, updates: SchemaMetadataUpdates) -> Result<Self> {
         updates.validate_non_empty()?;
         self.schema_metadata_updates = Some(updates);
@@ -445,8 +446,10 @@ impl UpdateJob {
 
         let transaction = Transaction::new(dataset.manifest.version, operation, None);
         let transaction = match &self.schema_metadata_updates {
-            Some(updates) => transaction.with_schema_metadata_updates(updates.clone())?,
-            None => transaction,
+            Some(updates) if update_data.num_updated_rows > 0 => {
+                transaction.with_schema_metadata_updates(updates.clone())?
+            }
+            _ => transaction,
         };
 
         let new_dataset = CommitBuilder::new(dataset)
@@ -2115,6 +2118,37 @@ mod tests {
         );
         a44c_assert_name_counts(&reopened, 5, 25).await;
         a44c_assert_metadata_present(&reopened);
+    }
+
+    /// A4.4c: a no-op Update (predicate matches zero rows) must not publish
+    /// attached schema/field metadata. Version advancement is unconstrained.
+    #[tokio::test]
+    async fn test_a44c_noop_update_does_not_publish_metadata() {
+        let (dataset, test_dir) = make_test_dataset(LanceFileVersion::Stable, false).await;
+        let uri = test_dir.as_str();
+        let field0_id = a44c_fixture_field0_id(&dataset);
+        a44c_assert_metadata_absent(&dataset);
+        a44c_assert_name_counts(&dataset, 0, 30).await;
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where("id < 0")
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .with_schema_metadata_updates(a44c_metadata_updates(field0_id))
+            .expect("Update attachment must construct")
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .expect("no-op attached Update must complete");
+
+        assert_eq!(result.rows_updated, 0, "predicate must match zero rows");
+        a44c_assert_name_counts(&result.new_dataset, 0, 30).await;
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        a44c_assert_name_counts(&reopened, 0, 30).await;
+        a44c_assert_metadata_absent(&reopened);
     }
 
     /// A4.4c: a substantive patch targeting nonexistent field id 999 must fail
