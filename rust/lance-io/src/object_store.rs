@@ -1786,26 +1786,33 @@ mod tests {
     #[allow(deprecated)]
     async fn test_direct_store_carries_explicit_native_directory_path() {
         let url = Url::parse("file:///tmp/table.lance").unwrap();
-        let params = ObjectStoreParams {
-            object_store: Some((Arc::new(InMemory::new()), url.clone())),
-            native_directory_path_resolver: Some(NativeDirectoryPathResolver::new(|path| {
-                PathBuf::from("/native").join(path.as_ref())
-            })),
-            ..Default::default()
-        };
+        let cases: [(Option<Arc<dyn WrappingObjectStore>>, bool); 3] = [
+            (None, true),
+            (Some(Arc::new(PassthroughWrapper)), false),
+            (Some(Arc::new(NativeDirectoryPreservingWrapper)), true),
+        ];
 
-        let (store, path) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
-            url.as_ref(),
-            &params,
-        )
-        .await
-        .unwrap();
+        for (wrapper, should_preserve) in cases {
+            let params = ObjectStoreParams {
+                object_store: Some((Arc::new(InMemory::new()), url.clone())),
+                native_directory_path_resolver: Some(NativeDirectoryPathResolver::new(|path| {
+                    PathBuf::from("/native").join(path.as_ref())
+                })),
+                object_store_wrapper: wrapper,
+                ..Default::default()
+            };
 
-        assert_eq!(
-            store.native_directory_path(&path),
-            Some(PathBuf::from("/native/tmp/table.lance"))
-        );
+            let (store, path) = ObjectStore::from_uri_and_params(
+                Arc::new(ObjectStoreRegistry::default()),
+                url.as_ref(),
+                &params,
+            )
+            .await
+            .unwrap();
+
+            let expected = should_preserve.then(|| PathBuf::from("/native/tmp/table.lance"));
+            assert_eq!(store.native_directory_path(&path), expected);
+        }
     }
 
     #[tokio::test]
