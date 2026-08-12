@@ -23,6 +23,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::LogicalPlan;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_linalg::distance::DistanceType;
+use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
@@ -31,8 +32,90 @@ use lance_index::scalar::inverted::DocumentGranularity;
 use super::fts::{self, FtsIndexInfo};
 use super::nodes::{TakeSettings, VectorSearchNode};
 use crate::Result;
+use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
+use crate::dataset::rowids::translate_addr_treemap_to_row_ids;
 use crate::dataset::{Dataset, Scanner};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+
+/// What a data overlay did to an index's entries.
+///
+/// A data overlay committed after an index was built, touching a field that index covers, makes
+/// the index's entries for the overlaid rows describe values that no longer exist. This is the
+/// row-level half of index coverage, and it is prefetched for the same reason fragment coverage is:
+/// deciding it needs the index metadata and, under stable row ids, a row-id translation.
+#[derive(Debug, Clone, Default)]
+pub enum OverlayStaleness {
+    /// No overlay touches a field this index covers.
+    #[default]
+    None,
+    /// Exactly these rows' entries are stale; the rest of the index is current.
+    Rows(Arc<RowAddrTreeMap>),
+    /// An overlay touched an indexed field of a segment that cannot say which rows it indexed, so
+    /// no entry can be trusted.
+    Unknown,
+}
+
+/// How to treat a segment that does not record which fragments it indexed.
+///
+/// Legacy segments predate `fragment_bitmap`, and the two index kinds make different calls here —
+/// which is why it is a parameter rather than a policy baked into the helper.
+pub enum OpaqueSegments {
+    /// Assume the segment indexed every fragment, so its stale rows are the overlaid ones. Safe
+    /// for a vector index: blocking a row address works no matter which segment produced it.
+    Covering,
+    /// Refuse to trust the index at all. An inverted segment's scores depend on the whole indexed
+    /// document set, so "which rows did you index" is not a question the FTS path can leave open.
+    Opaque,
+}
+
+/// The rows whose entries in `segments` an overlay has invalidated, in the domain index results
+/// use.
+///
+/// Index results are in the row-id domain, and a physical row address equals its row id only when
+/// the dataset does not use stable row ids — hence the translation, which is the one piece of this
+/// that needs I/O and the reason it lives in stage 2.
+pub async fn overlay_staleness(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+    fragments: &[Fragment],
+    opaque: OpaqueSegments,
+) -> Result<OverlayStaleness> {
+    // Overlays are rare; this is the check that keeps the whole mechanism off the common path.
+    let overlaid = overlaid_fragments(fragments);
+    if overlaid.is_empty() {
+        return Ok(OverlayStaleness::None);
+    }
+
+    let mut stale: HashMap<u32, RoaringBitmap> = HashMap::new();
+    for segment in segments {
+        if segment.fragment_bitmap.is_none() && matches!(opaque, OpaqueSegments::Opaque) {
+            let mut opaque_stale = HashMap::new();
+            collect_overlay_stale_rows_for_segment(
+                segment,
+                &overlaid,
+                &mut opaque_stale,
+                dataset.schema(),
+            )?;
+            if !opaque_stale.is_empty() {
+                return Ok(OverlayStaleness::Unknown);
+            }
+            continue;
+        }
+        collect_overlay_stale_rows_for_segment(segment, &overlaid, &mut stale, dataset.schema())?;
+    }
+    if stale.is_empty() {
+        return Ok(OverlayStaleness::None);
+    }
+
+    let mut rows = RowAddrTreeMap::new();
+    for (fragment, offsets) in stale {
+        rows.insert_bitmap(fragment, offsets);
+    }
+    if dataset.manifest.uses_stable_row_ids() {
+        rows = translate_addr_treemap_to_row_ids(dataset, &rows).await?;
+    }
+    Ok(OverlayStaleness::Rows(Arc::new(rows)))
+}
 
 /// Everything known about the vector index covering one column.
 #[derive(Debug, Clone)]
@@ -44,6 +127,8 @@ pub struct VectorIndexInfo {
     /// else to record it, and "user asked for a different metric, so fall back to brute force"
     /// is a planning decision that cannot wait until execution.
     pub metric: DistanceType,
+    /// Row-level coverage: which of this index's entries a data overlay has invalidated.
+    pub staleness: OverlayStaleness,
 }
 
 impl VectorIndexInfo {
@@ -93,6 +178,12 @@ impl ScanPlanningContext {
             Ok(TreeNodeRecursion::Continue)
         })?;
 
+        let fragments = scanner
+            .fragments
+            .clone()
+            .map(Arc::new)
+            .unwrap_or_else(|| dataset.fragments().clone());
+
         let mut vector = HashMap::with_capacity(searched_columns.len());
         if !searched_columns.is_empty() {
             let indices = dataset.load_indices().await?;
@@ -100,20 +191,23 @@ impl ScanPlanningContext {
                 if vector.contains_key(&column) {
                     continue;
                 }
-                if let Some(info) = load_vector_index(&dataset, &indices, &column).await? {
+                if let Some(info) =
+                    load_vector_index(&dataset, &indices, &column, &fragments).await?
+                {
                     vector.insert(column, info);
                 }
             }
         }
 
-        let fragments = scanner
-            .fragments
-            .clone()
-            .map(Arc::new)
-            .unwrap_or_else(|| dataset.fragments().clone());
         let target_fragments =
             RoaringBitmap::from_iter(fragments.iter().map(|fragment| fragment.id as u32));
-        let fts = fts::prefetch(&dataset, &fts::collect_requests(plan), &target_fragments).await?;
+        let fts = fts::prefetch(
+            &dataset,
+            &fts::collect_requests(plan),
+            &target_fragments,
+            &fragments,
+        )
+        .await?;
 
         Ok(Self {
             fragments,
@@ -210,6 +304,7 @@ async fn load_vector_index(
     dataset: &Arc<Dataset>,
     indices: &[IndexMetadata],
     column: &str,
+    fragments: &[Fragment],
 ) -> Result<Option<VectorIndexInfo>> {
     let Ok(field_id) = dataset.schema().field_id(column) else {
         return Ok(None);
@@ -229,9 +324,13 @@ async fn load_vector_index(
             .metric_type(),
     };
 
+    let segments = dataset.load_indices_by_name(&index.name).await?.to_vec();
+    let staleness =
+        overlay_staleness(dataset, &segments, fragments, OpaqueSegments::Covering).await?;
     Ok(Some(VectorIndexInfo {
-        segments: dataset.load_indices_by_name(&index.name).await?.to_vec(),
+        segments,
         metric,
+        staleness,
     }))
 }
 

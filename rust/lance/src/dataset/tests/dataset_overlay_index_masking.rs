@@ -46,7 +46,7 @@ async fn create_base_dataset() -> Dataset {
     create_base_dataset_with(false).await
 }
 
-async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
+pub async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, true),
         ArrowField::new("age", DataType::Int32, true),
@@ -70,7 +70,7 @@ async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
         .unwrap()
 }
 
-async fn build_age_index(dataset: &mut Dataset) {
+pub async fn build_age_index(dataset: &mut Dataset) {
     dataset
         .create_index(
             &["age"],
@@ -86,7 +86,7 @@ async fn build_age_index(dataset: &mut Dataset) {
 /// Write an overlay file covering `fields` of `fragment_id` with `coverage` and the given
 /// per-field value columns, then commit it as a `DataOverlay` transaction. `name` makes
 /// the overlay file unique.
-async fn commit_overlay(
+pub async fn commit_overlay(
     dataset: Dataset,
     name: &str,
     fragment_id: u64,
@@ -190,7 +190,7 @@ fn ids_from_batches(batches: &[RecordBatch]) -> Vec<i32> {
         .collect()
 }
 
-fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
+pub fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
     Arc::new(Int32Array::from_iter(values))
 }
 
@@ -205,7 +205,7 @@ fn string_lists(rows: &[&[&str]]) -> ArrayRef {
     Arc::new(builder.finish())
 }
 
-fn fsl(rows: Vec<Vec<f32>>, dim: i32) -> ArrayRef {
+pub fn fsl(rows: Vec<Vec<f32>>, dim: i32) -> ArrayRef {
     let flat: Vec<f32> = rows.into_iter().flatten().collect();
     let item = Arc::new(ArrowField::new("item", DataType::Float32, true));
     Arc::new(
@@ -481,7 +481,7 @@ async fn test_btree_overlay_stale_row_with_prior_deletion(
 
 const VEC_DIM: i32 = 8;
 
-fn vec_query() -> Vec<f32> {
+pub fn vec_query() -> Vec<f32> {
     vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 
@@ -493,7 +493,7 @@ fn vec_query() -> Vec<f32> {
 /// Overlaying fragment 1 (ids 32..64) is deliberate: a physical address diverges from the
 /// stable row id there, so both the ANN prefilter block and the flat re-score take must operate
 /// in the row-id domain when `stable_row_ids` is enabled.
-async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
+pub async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
     let query = vec_query();
     let far = vec![0.0_f32, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
@@ -730,7 +730,7 @@ async fn test_update_nonindexed_column_preserves_overlay_masking() {
 
 /// Text dataset: two fragments, 6 rows each. Schema: id (Int32), text (Utf8).
 /// Texts are unique tokens so each row can be identified by its term.
-async fn create_text_dataset(stable_row_ids: bool) -> Dataset {
+pub async fn create_text_dataset(stable_row_ids: bool) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, true),
         ArrowField::new("text", DataType::Utf8, true),
@@ -768,7 +768,7 @@ async fn create_text_dataset(stable_row_ids: bool) -> Dataset {
         .unwrap()
 }
 
-async fn build_text_fts_index(dataset: &mut Dataset) {
+pub async fn build_text_fts_index(dataset: &mut Dataset) {
     dataset
         .create_index(
             &["text"],

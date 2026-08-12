@@ -53,12 +53,15 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{FtsQuery, FtsSearchParams, MatchQuery, Operator};
 use lance_index::scalar::inverted::{DocumentGranularity, SCORE_COL, fts_schema};
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+use lance_select::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use super::context::ScanPlanningContext;
+use super::context::{OpaqueSegments, OverlayStaleness, ScanPlanningContext};
 use super::nodes::{LanceTakeNode, PrefilterSourceKind, TakeSettings};
+use super::rules::{IndexCoverage, SplittableSearch};
+use super::source::ScanRestriction;
 use crate::dataset::{Dataset, Scanner};
 use crate::index::scalar::inverted::{ResolvedFtsField, load_segment_details, resolve_fts_field};
 use crate::io::exec::PreFilterSource;
@@ -81,6 +84,8 @@ pub struct FtsIndexInfo {
     /// Whether the index stores token positions. Only phrase queries need it, and finding out
     /// requires reading the index details, so it is resolved here rather than at lowering time.
     pub with_position: bool,
+    /// Row-level coverage: which of this index's entries a data overlay has invalidated.
+    pub staleness: OverlayStaleness,
 }
 
 impl FtsIndexInfo {
@@ -137,6 +142,7 @@ pub async fn prefetch(
     dataset: &Arc<Dataset>,
     requests: &[FtsIndexRequest],
     target_fragments: &RoaringBitmap,
+    fragments: &[Fragment],
 ) -> Result<HashMap<(String, DocumentGranularity), FtsIndexInfo>> {
     let mut loaded = HashMap::with_capacity(requests.len());
     for request in requests {
@@ -156,9 +162,20 @@ pub async fn prefetch(
         } else {
             false
         };
+        // `Opaque`, not `Covering`: a legacy segment cannot say which rows it indexed, and a BM25
+        // score depends on the whole indexed document set, so a relevant overlay invalidates it
+        // wholesale rather than row by row.
+        let staleness = super::context::overlay_staleness(
+            dataset,
+            &segments,
+            fragments,
+            OpaqueSegments::Opaque,
+        )
+        .await?;
         let info = FtsIndexInfo {
             segments,
             with_position,
+            staleness,
         };
         // A phrase query only needs positions from an index it will actually read. When the index
         // covers none of the target fragments the query is answered by a flat scan, which computes
@@ -248,6 +265,10 @@ pub struct FtsLeafNode {
     /// `query_filter`), the ordering contract belongs to that upstream search, and sorting here
     /// would reshuffle it.
     retains_input_order: bool,
+    /// Rows the index must not emit, because a data overlay changed a value the index covers. Set
+    /// by [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage), which puts the same rows on
+    /// a flat branch so they are scored from their current text.
+    overlay_block: Option<Arc<RowAddrTreeMap>>,
     schema: DFSchemaRef,
 }
 
@@ -288,6 +309,7 @@ impl FtsLeafNode {
             prefilter: PrefilterSourceKind::default(),
             input_fully_indexed: false,
             retains_input_order: false,
+            overlay_block: None,
             schema,
         })
     }
@@ -345,6 +367,11 @@ impl FtsLeafNode {
         self
     }
 
+    pub fn with_overlay_block(mut self, block: Option<Arc<RowAddrTreeMap>>) -> Self {
+        self.overlay_block = block;
+        self
+    }
+
     fn reads_text(&self) -> bool {
         !matches!(self.resolution, Some(FtsAccessPath::Index { .. }))
     }
@@ -359,6 +386,7 @@ impl PartialEq for FtsLeafNode {
             && self.resolution == other.resolution
             && self.prefilter == other.prefilter
             && self.input_fully_indexed == other.input_fully_indexed
+            && self.overlay_block == other.overlay_block
     }
 }
 
@@ -372,6 +400,8 @@ impl Hash for FtsLeafNode {
         self.resolution.hash(state);
         self.prefilter.hash(state);
         self.input_fully_indexed.hash(state);
+        // `RowAddrTreeMap` is not `Hash`; see the note on `VectorSearchNode`'s impl.
+        self.overlay_block.is_some().hash(state);
     }
 }
 
@@ -420,6 +450,9 @@ impl UserDefinedLogicalNodeCore for FtsLeafNode {
         }
         if self.prefilter != PrefilterSourceKind::None {
             write!(f, ", prefilter={:?}", self.prefilter)?;
+        }
+        if self.overlay_block.is_some() {
+            write!(f, ", overlay_block")?;
         }
         Ok(())
     }
@@ -1083,7 +1116,6 @@ pub fn rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn OptimizerRule + 
     vec![
         Arc::new(ResolveFtsAccessPath::new(context.clone())),
         Arc::new(UseFtsCompoundScorer::new(context.clone())),
-        Arc::new(SplitPartiallyIndexedFts::new(context.clone())),
     ]
 }
 
@@ -1247,97 +1279,102 @@ impl OptimizerRule for UseFtsCompoundScorer {
     }
 }
 
-/// Split an FTS leaf over partially-indexed data into an indexed branch and a flat branch.
+/// The FTS half of [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage).
 ///
-/// The FTS twin of
-/// [`SplitPartiallyIndexedSearch`](super::rules::SplitPartiallyIndexedSearch), and structurally
-/// simpler: there is no re-rank, because BM25 scores from the two branches are directly
-/// comparable. The merge is a stock `Union` + `Sort` + `Limit`, which is exactly what
-/// `Scanner::combine_fts_leaf_plans` builds by hand.
-#[derive(Debug)]
-pub struct SplitPartiallyIndexedFts {
-    context: Arc<ScanPlanningContext>,
-}
-
-impl SplitPartiallyIndexedFts {
-    pub fn new(context: Arc<ScanPlanningContext>) -> Self {
-        Self { context }
-    }
-}
-
-impl OptimizerRule for SplitPartiallyIndexedFts {
-    fn name(&self) -> &str {
-        "split_partially_indexed_fts"
+/// Structurally simpler than the vector half: there is no re-rank, because BM25 scores from the
+/// two branches are directly comparable. The merge is a stock `Union` + `Sort` + `Limit`, which is
+/// exactly what `Scanner::combine_fts_leaf_plans` builds by hand.
+impl SplittableSearch for FtsLeafNode {
+    fn is_splittable(&self) -> bool {
+        matches!(self.resolution, Some(FtsAccessPath::Index { .. })) && !self.input_fully_indexed()
     }
 
-    fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::BottomUp)
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
-        let LogicalPlan::Extension(extension) = &plan else {
-            return Ok(Transformed::no(plan));
-        };
-        let Some(leaf) = extension.node.as_any().downcast_ref::<FtsLeafNode>() else {
-            return Ok(Transformed::no(plan));
-        };
-        if !matches!(leaf.resolution, Some(FtsAccessPath::Index { .. }))
-            || leaf.input_fully_indexed()
-            || self.context.fast_search()
-        {
-            return Ok(Transformed::no(plan));
-        }
-        let Some(unindexed) = self
-            .context
-            .fts_unindexed_fragments(leaf.column(), leaf.granularity())
-        else {
-            return Ok(Transformed::no(plan));
-        };
-        if unindexed.is_empty() {
-            return Ok(Transformed::no(plan));
-        }
-        let Some(indexed) = self
-            .context
-            .fts_indexed_fragments(leaf.column(), leaf.granularity())
-        else {
-            return Ok(Transformed::no(plan));
+    fn coverage(&self, context: &ScanPlanningContext) -> IndexCoverage {
+        let staleness = context
+            .fts_index(self.column(), self.granularity())
+            .map(|index| &index.staleness)
+            .unwrap_or(&OverlayStaleness::None);
+        let stale = match staleness {
+            OverlayStaleness::Rows(rows) => Some(rows.clone()),
+            OverlayStaleness::None => None,
+            // A BM25 score depends on the whole indexed document set, so a segment that cannot say
+            // which rows it indexed has nothing salvageable once an overlay touches it.
+            OverlayStaleness::Unknown => return IndexCoverage::Unusable,
         };
 
-        // Nothing is indexed among the fragments we will touch: this is a flat search that
-        // happens to have an index sitting next to it.
+        let (Some(unindexed), Some(indexed)) = (
+            context.fts_unindexed_fragments(self.column(), self.granularity()),
+            context.fts_indexed_fragments(self.column(), self.granularity()),
+        ) else {
+            return IndexCoverage::Complete;
+        };
+        // Nothing is indexed among the fragments we will touch: this is a flat search that happens
+        // to have an index sitting next to it.
         if indexed.is_empty() {
-            return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
-                node: Arc::new(leaf.clone().with_resolution(FtsAccessPath::Flat)),
-            })));
+            return IndexCoverage::Unusable;
+        }
+        if unindexed.is_empty() && stale.is_none() {
+            return IndexCoverage::Complete;
         }
 
-        let indexed_branch = LogicalPlan::Extension(Extension {
+        let mut gaps = Vec::with_capacity(2);
+        if !unindexed.is_empty() {
+            gaps.push(ScanRestriction::Fragments(Arc::new(unindexed)));
+        }
+        if let Some(rows) = &stale {
+            gaps.push(ScanRestriction::Rows(rows.clone()));
+        }
+        IndexCoverage::Partial {
+            indexed,
+            gaps,
+            block: stale,
+        }
+    }
+
+    fn input(&self) -> &LogicalPlan {
+        &self.input
+    }
+
+    fn indexed_branch(
+        &self,
+        input: LogicalPlan,
+        block: Option<Arc<RowAddrTreeMap>>,
+    ) -> LogicalPlan {
+        LogicalPlan::Extension(Extension {
             node: Arc::new(
-                leaf.clone()
-                    .with_input(super::rules::restrict_scan(leaf.input(), indexed)?)
+                self.clone()
+                    .with_input(input)
+                    .with_overlay_block(block)
                     .covering_only_indexed_input(),
             ),
-        });
-        let flat_branch = LogicalPlan::Extension(Extension {
-            node: Arc::new(
-                leaf.clone()
-                    .with_input(super::rules::restrict_scan(leaf.input(), unindexed)?)
-                    .with_resolution(FtsAccessPath::Flat)
-                    .with_prefilter(PrefilterSourceKind::None),
-            ),
-        });
+        })
+    }
 
-        let mut merged = LogicalPlanBuilder::new(indexed_branch)
-            .union(flat_branch)?
+    fn flat_branch(&self, input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                self.clone()
+                    .with_input(input)
+                    .with_resolution(FtsAccessPath::Flat)
+                    .with_prefilter(PrefilterSourceKind::None)
+                    .with_overlay_block(None),
+            ),
+        })
+    }
+
+    fn merge(
+        &self,
+        indexed: LogicalPlan,
+        flat: LogicalPlan,
+        _context: &ScanPlanningContext,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        let mut merged = LogicalPlanBuilder::new(indexed)
+            .union(flat)?
             .sort(vec![datafusion::prelude::col(SCORE_COL).sort(false, false)])?;
-        if let Some(limit) = leaf.params.limit {
+        if let Some(limit) = self.params.limit {
             merged = merged.limit(0, Some(limit))?;
         }
-        Ok(Transformed::yes(merged.build()?))
+        merged.build()
     }
 }
 
@@ -1413,26 +1450,38 @@ fn plan_leaf(node: &FtsLeafNode, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dy
     match &node.resolution {
         Some(FtsAccessPath::Index { segments }) => {
             let prefilter = prefilter_source(node.prefilter, input);
+            let block = node
+                .overlay_block
+                .as_ref()
+                .map(|rows| RowAddrMask::from_block(rows.as_ref().clone()));
             let plan: Arc<dyn ExecutionPlan> = match &node.query {
                 FtsQuery::Match(query) => {
-                    Arc::new(MatchQueryExec::new_with_segments_and_document_granularity(
+                    let mut exec = MatchQueryExec::new_with_segments_and_document_granularity(
                         node.dataset.clone(),
                         query.clone(),
                         node.params.clone(),
                         prefilter,
                         segments.clone(),
                         node.granularity,
-                    ))
+                    );
+                    if let Some(block) = block {
+                        exec = exec.with_overlay_block(block);
+                    }
+                    Arc::new(exec)
                 }
                 FtsQuery::Phrase(query) => {
-                    Arc::new(PhraseQueryExec::new_with_segments_and_document_granularity(
+                    let mut exec = PhraseQueryExec::new_with_segments_and_document_granularity(
                         node.dataset.clone(),
                         query.clone(),
                         node.params.clone(),
                         prefilter,
                         segments.clone(),
                         node.granularity,
-                    ))
+                    );
+                    if let Some(block) = block {
+                        exec = exec.with_overlay_block(block);
+                    }
+                    Arc::new(exec)
                 }
                 other => {
                     return Err(Error::internal(format!(

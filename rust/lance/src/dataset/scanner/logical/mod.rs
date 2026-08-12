@@ -108,7 +108,7 @@ fn optimizer_rules(
     rules.extend::<Vec<Arc<dyn OptimizerRule + Send + Sync>>>(vec![
         // Before PushDownFilter, so a prefilter predicate is still a `Filter` node that gets
         // duplicated onto both branches; each branch's scan then absorbs its own copy.
-        Arc::new(rules::SplitPartiallyIndexedSearch::new(context.clone())),
+        Arc::new(rules::SplitOnIndexCoverage::new(context.clone())),
         // After the split, so the refine lands on the *indexed branch* of a partially-covered
         // search rather than above the union — the nesting the imperative path produces.
         Arc::new(rules::ExpandVectorRefine::new(context.clone())),
@@ -185,9 +185,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
     }
     if scanner.index_segments.is_some() {
         return unsupported("index segment selection");
-    }
-    if !crate::dataset::overlay::overlaid_fragments(scanner.dataset.fragments()).is_empty() {
-        return unsupported("datasets with data overlays");
     }
     Ok(())
 }

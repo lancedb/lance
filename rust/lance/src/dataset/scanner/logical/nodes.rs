@@ -21,6 +21,7 @@ use lance_core::datatypes::Projection;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{ApproxMode, DIST_COL, Query};
 use lance_linalg::distance::DistanceType;
+use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
 use uuid::Uuid;
 
@@ -165,6 +166,11 @@ pub struct VectorSearchNode {
     /// `input_fully_indexed`: a rule that rewrites structure must recognize its own output, since
     /// the optimizer runs the rule list to fixpoint.
     refine_expanded: bool,
+    /// Rows the index must not emit, because a data overlay committed after the index was built
+    /// changed a value the index covers. Set by
+    /// [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage), which puts the same rows on a
+    /// brute-force branch so they are answered from their current values.
+    overlay_block: Option<Arc<RowAddrTreeMap>>,
     schema: DFSchemaRef,
 }
 
@@ -195,6 +201,7 @@ impl VectorSearchNode {
             prefilter: PrefilterSourceKind::default(),
             input_fully_indexed: false,
             refine_expanded: false,
+            overlay_block: None,
             schema,
         })
     }
@@ -229,6 +236,15 @@ impl VectorSearchNode {
 
     pub fn refine_expanded(&self) -> bool {
         self.refine_expanded
+    }
+
+    pub fn with_overlay_block(mut self, block: Option<Arc<RowAddrTreeMap>>) -> Self {
+        self.overlay_block = block;
+        self
+    }
+
+    pub fn overlay_block(&self) -> Option<&Arc<RowAddrTreeMap>> {
+        self.overlay_block.as_ref()
     }
 
     pub fn input(&self) -> &LogicalPlan {
@@ -272,6 +288,7 @@ impl PartialEq for VectorSearchNode {
             && self.resolution == other.resolution
             && self.prefilter == other.prefilter
             && self.input_fully_indexed == other.input_fully_indexed
+            && self.overlay_block == other.overlay_block
     }
 }
 
@@ -286,6 +303,9 @@ impl Hash for VectorSearchNode {
         self.resolution.hash(state);
         self.prefilter.hash(state);
         self.input_fully_indexed.hash(state);
+        // `RowAddrTreeMap` is not `Hash`, and the flag is the part that distinguishes plans: two
+        // nodes with different block lists cannot share an input anyway.
+        self.overlay_block.is_some().hash(state);
     }
 }
 
@@ -333,6 +353,9 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
         if self.prefilter != PrefilterSourceKind::None {
             write!(f, ", prefilter={:?}", self.prefilter)?;
         }
+        if self.overlay_block.is_some() {
+            write!(f, ", overlay_block")?;
+        }
         Ok(())
     }
 
@@ -362,6 +385,7 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             prefilter: self.prefilter,
             input_fully_indexed: self.input_fully_indexed,
             refine_expanded: self.refine_expanded,
+            overlay_block: self.overlay_block.clone(),
             schema: self.schema.clone(),
         })
     }

@@ -25,6 +25,7 @@ use datafusion_physical_expr::PhysicalSortExpr;
 use lance_core::ROW_ID;
 use lance_index::vector::DIST_COL;
 use lance_linalg::distance::DistanceType;
+use lance_select::mask::RowAddrMask;
 
 use lance_table::format::IndexMetadata;
 
@@ -112,7 +113,10 @@ fn plan_indexed_search(
     prefilter: PreFilterSource,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let query = node.query();
-    let fanout = new_knn_exec(node.dataset().clone(), segments, query, prefilter, None)?;
+    let block = node
+        .overlay_block()
+        .map(|rows| RowAddrMask::from_block(rows.as_ref().clone()));
+    let fanout = new_knn_exec(node.dataset().clone(), segments, query, prefilter, block)?;
 
     // Over-fetch when refining: the extra candidates are what the exact re-rank chooses from.
     let fetch = query.k * query.refine_factor.unwrap_or(1) as usize;

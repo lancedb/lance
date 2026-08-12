@@ -26,7 +26,11 @@ use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::{Dataset, Scanner};
 use crate::utils::test::assert_plan_node_equals;
 
-type ScanConfig = fn(&mut Scanner) -> Result<&mut Scanner>;
+/// A scanner-configuring closure. Generic rather than a `fn` pointer so a case can close over
+/// its query vector or filter string, and taken by reference internally because every oracle
+/// applies it twice — once per path.
+trait ScanConfig: Fn(&mut Scanner) -> Result<&mut Scanner> {}
+impl<F: Fn(&mut Scanner) -> Result<&mut Scanner>> ScanConfig for F {}
 
 /// Sort a result batch by `_rowid` so two plans can be compared as sets.
 ///
@@ -57,7 +61,10 @@ fn sorted_by_row_id(batch: &RecordBatch) -> Result<RecordBatch> {
 ///
 /// `target_parallelism(1)` pins `EnforceDistribution`'s output so plan strings do not depend on
 /// the machine's CPU count, matching the convention in the scanner's own plan tests.
-async fn logical_plan_for(dataset: &Dataset, config: ScanConfig) -> Result<Arc<dyn ExecutionPlan>> {
+async fn logical_plan_for(
+    dataset: &Dataset,
+    config: impl ScanConfig,
+) -> Result<Arc<dyn ExecutionPlan>> {
     let mut scan = dataset.scan();
     scan.target_parallelism(1);
     config(&mut scan)?;
@@ -66,7 +73,7 @@ async fn logical_plan_for(dataset: &Dataset, config: ScanConfig) -> Result<Arc<d
 
 async fn imperative_plan_for(
     dataset: &Dataset,
-    config: ScanConfig,
+    config: impl ScanConfig,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut scan = dataset.scan();
     scan.target_parallelism(1);
@@ -74,7 +81,11 @@ async fn imperative_plan_for(
     scan.create_plan().await
 }
 
-async fn assert_logical_plan(dataset: &Dataset, config: ScanConfig, expected: &str) -> Result<()> {
+async fn assert_logical_plan(
+    dataset: &Dataset,
+    config: impl ScanConfig,
+    expected: &str,
+) -> Result<()> {
     let plan = logical_plan_for(dataset, config).await?;
     assert_plan_node_equals(plan, expected).await
 }
@@ -88,9 +99,9 @@ async fn run(plan: Arc<dyn ExecutionPlan>) -> Result<RecordBatch> {
 }
 
 /// Execute both planning paths and assert they produce the same rows.
-async fn assert_paths_agree(dataset: &Dataset, config: ScanConfig) -> Result<()> {
-    let expected = run(imperative_plan_for(dataset, config).await?).await?;
-    let actual = run(logical_plan_for(dataset, config).await?).await?;
+async fn assert_paths_agree(dataset: &Dataset, config: impl ScanConfig) -> Result<()> {
+    let expected = run(imperative_plan_for(dataset, &config).await?).await?;
+    let actual = run(logical_plan_for(dataset, &config).await?).await?;
 
     assert_eq!(
         expected.schema(),
@@ -107,9 +118,9 @@ async fn assert_paths_agree(dataset: &Dataset, config: ScanConfig) -> Result<()>
 }
 
 /// As [`assert_paths_agree`], but comparing row *sets* rather than row sequences.
-async fn assert_paths_agree_unordered(dataset: &Dataset, config: ScanConfig) -> Result<()> {
-    let expected = sorted_by_row_id(&run(imperative_plan_for(dataset, config).await?).await?)?;
-    let actual = sorted_by_row_id(&run(logical_plan_for(dataset, config).await?).await?)?;
+async fn assert_paths_agree_unordered(dataset: &Dataset, config: impl ScanConfig) -> Result<()> {
+    let expected = sorted_by_row_id(&run(imperative_plan_for(dataset, &config).await?).await?)?;
+    let actual = sorted_by_row_id(&run(logical_plan_for(dataset, &config).await?).await?)?;
 
     assert_eq!(
         expected.schema(),
@@ -762,6 +773,17 @@ fn vector_filter_query() -> lance_index::vector::Query {
     }
 }
 
+/// As [`match_query`], but against the `text` column of the overlay fixtures.
+fn text_match_query(terms: &str) -> lance_index::scalar::FullTextSearchQuery {
+    use lance_index::scalar::FullTextSearchQuery;
+    use lance_index::scalar::inverted::query::MatchQuery;
+    FullTextSearchQuery::new_query(
+        MatchQuery::new(terms.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into(),
+    )
+}
+
 fn match_query(terms: &str) -> lance_index::scalar::FullTextSearchQuery {
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::scalar::inverted::query::MatchQuery;
@@ -1258,6 +1280,109 @@ async fn test_flat_knn_large_limit_stays_globally_ordered() {
                 pair[0],
                 pair[1]
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Data overlays: index coverage at row granularity
+// ---------------------------------------------------------------------------------------------
+//
+// A data overlay committed after an index was built, touching a field that index covers, leaves
+// the index describing values that no longer exist. Those rows are a coverage gap in exactly the
+// sense a fragment the index never saw is one, and `SplitOnIndexCoverage` fills both the same way.
+// The exhaustive behavioral coverage lives in `dataset::tests::dataset_overlay_index_masking`,
+// which runs against whichever path the flag selects; these assert the two paths agree.
+
+use crate::dataset::tests::dataset_overlay_index_masking as overlay_fixtures;
+
+#[tokio::test]
+async fn test_paths_agree_on_a_vector_search_over_an_overlay() {
+    for stable_row_ids in [false, true] {
+        let dataset = overlay_fixtures::create_vector_overlay_dataset(stable_row_ids).await;
+        let query = arrow_array::Float32Array::from(overlay_fixtures::vec_query());
+        assert_paths_agree_unordered(&dataset, |scan| {
+            scan.nearest("vec", &query, 3)?
+                .minimum_nprobes(1)
+                .with_row_id()
+                .project(&["id"])
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// `fast_search` blocks the stale rows but does not re-score them, so the two paths have to agree
+/// on dropping the stale hit *and* on not surfacing the moved-on match.
+#[tokio::test]
+async fn test_paths_agree_on_a_fast_search_over_an_overlay() {
+    let dataset = overlay_fixtures::create_vector_overlay_dataset(false).await;
+    let query = arrow_array::Float32Array::from(overlay_fixtures::vec_query());
+    assert_paths_agree_unordered(&dataset, |scan| {
+        scan.nearest("vec", &query, 3)?
+            .minimum_nprobes(1)
+            .fast_search()
+            .with_row_id()
+            .project(&["id"])
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_paths_agree_on_an_fts_search_over_an_overlay() {
+    let mut dataset = overlay_fixtures::create_text_dataset(false).await;
+    overlay_fixtures::build_text_fts_index(&mut dataset).await;
+    let dataset = overlay_fixtures::commit_overlay(
+        dataset,
+        "logical_fts_overlay",
+        0,
+        &[1],
+        lance_table::format::overlay::OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([
+            1,
+        ])),
+        vec![std::sync::Arc::new(arrow_array::StringArray::from(vec![
+            "banana bread",
+        ]))],
+    )
+    .await;
+
+    assert_paths_agree_unordered(&dataset, |scan| {
+        scan.project(&["id"])?
+            .with_row_id()
+            .full_text_search(text_match_query("apple"))
+    })
+    .await
+    .unwrap();
+}
+
+/// The coverage split the shared rule cannot reach: a scalar index query is derived inside the
+/// scan leaf, not carried by a logical node, so its stale rows are handled there.
+#[tokio::test]
+async fn test_paths_agree_on_a_scalar_index_over_an_overlay() {
+    for stable_row_ids in [false, true] {
+        let mut dataset = overlay_fixtures::create_base_dataset_with(stable_row_ids).await;
+        overlay_fixtures::build_age_index(&mut dataset).await;
+        let dataset = overlay_fixtures::commit_overlay(
+            dataset,
+            "logical_scalar_overlay",
+            0,
+            &[1],
+            lance_table::format::overlay::OverlayCoverage::dense(
+                roaring::RoaringBitmap::from_iter([1]),
+            ),
+            vec![overlay_fixtures::i32_array([Some(50)])],
+        )
+        .await;
+
+        // `age = 50` now matches the overlaid row (whose index entry says 10) and the untouched
+        // row that always said 50, so both the block and the re-read have to be right.
+        for filter in ["age = 50", "age = 10", "age = 20"] {
+            assert_paths_agree_unordered(&dataset, |scan| {
+                scan.filter(filter)?.with_row_id().project(&["id"])
+            })
+            .await
+            .unwrap();
         }
     }
 }

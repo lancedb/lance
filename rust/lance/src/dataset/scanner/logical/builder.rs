@@ -342,5 +342,6 @@ fn source_options(scanner: &Scanner) -> ScanSourceOptions {
         index_expr_result_format: scanner.index_expr_result_format(),
         use_scalar_index: scanner.use_scalar_index,
         fast_search: scanner.fast_search,
+        rows: None,
     }
 }

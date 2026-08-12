@@ -17,25 +17,46 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use lance_arrow::SchemaExt as ArrowSchemaExt;
 use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::{
     ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
+use lance_datafusion::exec::OneShotExec;
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::PlannerIndexExt;
-use lance_select::result::IndexExprResultWireFormat;
+use lance_index::scalar::expression::{PlannerIndexExt, ScalarIndexExpr};
+use lance_select::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_select::result::{IndexExprResult, IndexExprResultWireFormat};
 use lance_table::format::Fragment;
 
-use crate::Result;
+use super::context::{OpaqueSegments, OverlayStaleness, overlay_staleness};
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar::load_named_scalar_segments;
 use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::scalar_index::ScalarIndexExec;
-use crate::io::exec::{FilterPlan as ExprFilterPlan, Planner};
+use crate::io::exec::{FilterPlan as ExprFilterPlan, LanceFilterExec, Planner, project};
+use crate::{Error, Result};
+
+/// How a branch's scan is narrowed to the rows that branch is responsible for.
+///
+/// The two variants are the same statement at two granularities, which is the point: index
+/// coverage has holes at fragment level (the index never saw those rows) and at row level (the
+/// index saw the row before a data overlay changed it), and both holes are filled by a
+/// brute-force branch reading exactly the rows in the hole.
+#[derive(Debug, Clone)]
+pub enum ScanRestriction {
+    /// Read only these fragments.
+    Fragments(Arc<Vec<Fragment>>),
+    /// Read only these rows, identified by row id.
+    Rows(Arc<RowAddrTreeMap>),
+}
 
 /// The subset of [`Scanner`](crate::dataset::Scanner) state that reaches the scan leaf.
 ///
@@ -54,6 +75,13 @@ pub struct ScanSourceOptions {
     /// Answer from indices only: fragments a scalar index does not cover are skipped rather than
     /// scanned. Only meaningful alongside an index query.
     pub fast_search: bool,
+    /// Read only these rows, from [`ScanRestriction::Rows`].
+    ///
+    /// The row set arrives through the same leaf slot a scalar-index result would, so a scan
+    /// restricted this way cannot also consult a scalar index — which is exactly right for the
+    /// case that produces one: these rows were singled out *because* their index entries are no
+    /// longer trustworthy.
+    pub rows: Option<Arc<RowAddrTreeMap>>,
 }
 
 pub struct LanceScanSource {
@@ -100,18 +128,26 @@ impl LanceScanSource {
         })
     }
 
-    /// The same source restricted to a subset of fragments.
+    /// The same source narrowed to part of the dataset.
     ///
-    /// Used by [`SplitPartiallyIndexedSearch`](super::rules::SplitPartiallyIndexedSearch) to give
-    /// the indexed and unindexed branches disjoint halves of the dataset. The schema is
-    /// unchanged, so a `TableScan`'s `projected_schema` stays valid across the swap.
-    pub fn restricted_to(&self, fragments: Vec<Fragment>) -> Self {
-        Self {
-            dataset: self.dataset.clone(),
-            options: ScanSourceOptions {
-                fragments: Some(Arc::new(fragments)),
+    /// Used by [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage) to give the indexed
+    /// and brute-force branches disjoint row sets. The schema is unchanged, so a `TableScan`'s
+    /// `projected_schema` stays valid across the swap.
+    pub fn restricted_to(&self, restriction: &ScanRestriction) -> Self {
+        let options = match restriction {
+            ScanRestriction::Fragments(fragments) => ScanSourceOptions {
+                fragments: Some(fragments.clone()),
                 ..self.options.clone()
             },
+            ScanRestriction::Rows(rows) => ScanSourceOptions {
+                rows: Some(rows.clone()),
+                use_scalar_index: false,
+                ..self.options.clone()
+            },
+        };
+        Self {
+            dataset: self.dataset.clone(),
+            options,
             full_schema: self.full_schema.clone(),
             row_id_idx: self.row_id_idx,
             row_addr_idx: self.row_addr_idx,
@@ -168,11 +204,101 @@ impl LanceScanSource {
         Ok(plan)
     }
 
+    /// Present a row allow list in the shape the leaf's index-result slot expects.
+    ///
+    /// Mirrors `Scanner::row_ids_as_take_input`. The one-shot stream is why a row-restricted scan
+    /// can only be executed once, which is also true of the imperative path's stale-row take.
+    fn rows_as_index_input(&self, rows: &RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
+        let result = IndexExprResult::exact(RowAddrMask::from_allowed(rows.clone()));
+        let batch = result.serialize(
+            self.dataset.fragment_bitmap.as_ref(),
+            self.options.index_expr_result_format,
+        )?;
+        let schema = batch.schema();
+        let stream = futures::stream::once(async move { Ok(batch) });
+        Ok(Arc::new(OneShotExec::new(Box::pin(
+            RecordBatchStreamAdapter::new(schema, stream),
+        ))))
+    }
+
     fn fragments(&self) -> &Arc<Vec<Fragment>> {
         self.options
             .fragments
             .as_ref()
             .unwrap_or_else(|| self.dataset.fragments())
+    }
+
+    /// The rows a scalar-index query cannot be trusted for, because a data overlay changed a value
+    /// one of its indices covers.
+    ///
+    /// Mirrors `Scanner::overlay_stale_index_rows`. The segment metadata is cached, so on the
+    /// common path — no fragment carries an overlay — the caller skips this entirely.
+    async fn index_query_staleness(
+        &self,
+        index_query: &ScalarIndexExpr,
+    ) -> Result<OverlayStaleness> {
+        let mut segments = Vec::new();
+        let mut stack = vec![index_query];
+        while let Some(expr) = stack.pop() {
+            match expr {
+                ScalarIndexExpr::Not(inner) => stack.push(inner),
+                ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                ScalarIndexExpr::Query(search) => segments.extend(
+                    load_named_scalar_segments(
+                        self.dataset.as_ref(),
+                        &search.column,
+                        &search.index_name,
+                    )
+                    .await?,
+                ),
+            }
+        }
+        overlay_staleness(
+            &self.dataset,
+            &segments,
+            self.fragments(),
+            OpaqueSegments::Covering,
+        )
+        .await
+    }
+
+    /// Re-read the stale rows from their current values and re-apply the whole predicate.
+    ///
+    /// These rows were withheld from the index result, so this is the only path that can surface
+    /// them.
+    ///
+    /// This is the third instance of the coverage split — and the one
+    /// [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage) cannot reach, because a scalar
+    /// index query is not a node in the logical plan: it is derived here, from predicates
+    /// DataFusion pushed into the leaf. Unifying it would mean giving the index query a logical
+    /// node of its own, which is a much larger change than this spike.
+    async fn stale_rows_branch(
+        &self,
+        rows: &RowAddrTreeMap,
+        filter: &Expr,
+        projection: Projection,
+        schema: &ArrowSchema,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let filter_columns = Planner::column_names_in_expr(filter);
+        let projection = projection.union_columns(filter_columns, OnMissing::Error)?;
+        let mut options = FilteredReadOptions::new(projection);
+        if let Some(fragments) = self.options.fragments.clone() {
+            options = options.with_fragments(fragments);
+        }
+        let read = Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            options,
+            Some(self.rows_as_index_input(rows)?),
+        )?);
+        let planner = Planner::new(read.schema());
+        let filtered = Arc::new(LanceFilterExec::try_new(
+            planner.optimize_expr(filter.clone())?,
+            read,
+        )?);
+        Ok(Arc::new(project(filtered, schema)?))
     }
 
     async fn scan_impl(
@@ -187,6 +313,7 @@ impl LanceScanSource {
             // stand-in. Matches `Scanner::filtered_read_source`.
             projection.with_row_addr = true;
         }
+        let user_projection = projection.clone();
         let filter_plan = self.build_filter_plan(filters).await?;
 
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
@@ -220,18 +347,52 @@ impl LanceScanSource {
             read_options = read_options.with_scan_range_before_filter(0..limit as u64)?;
         }
 
-        let index_input = filter_plan.index_query.map(|index_query| {
-            Arc::new(ScalarIndexExec::new(
-                self.dataset.clone(),
-                index_query,
-                self.options.index_expr_result_format,
-            )) as Arc<dyn ExecutionPlan>
-        });
+        // Row-level index coverage: block the rows a data overlay has invalidated from the index
+        // result, and re-read them below. Row coverage, unlike the fragment coverage the rules
+        // handle, has to be resolved here — the scalar index query is derived in this method, not
+        // carried by a node.
+        let mut stale_rows = None;
+        if let Some(index_query) = filter_plan.index_query.as_ref()
+            && self.fragments().iter().any(|f| !f.overlays.is_empty())
+            && let OverlayStaleness::Rows(rows) = self.index_query_staleness(index_query).await?
+        {
+            read_options =
+                read_options.with_overlay_block(RowAddrMask::from_block(rows.as_ref().clone()));
+            stale_rows = Some(rows);
+        }
 
-        Ok(Arc::new(FilteredReadExec::try_new(
+        // A row restriction and a scalar-index query compete for the same slot, and
+        // `restricted_to` has already turned the index off in that case.
+        let index_input = match &self.options.rows {
+            Some(rows) => Some(self.rows_as_index_input(rows)?),
+            None => filter_plan.index_query.clone().map(|index_query| {
+                Arc::new(ScalarIndexExec::new(
+                    self.dataset.clone(),
+                    index_query,
+                    self.options.index_expr_result_format,
+                )) as Arc<dyn ExecutionPlan>
+            }),
+        };
+
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
             read_options,
             index_input,
+        )?);
+
+        let Some(rows) = stale_rows else {
+            return Ok(plan);
+        };
+        let filter = filter_plan.full_expr.as_ref().ok_or_else(|| {
+            Error::internal("a scalar index query without a predicate to re-apply".to_string())
+        })?;
+        let stale_branch = self
+            .stale_rows_branch(&rows, filter, user_projection, plan.schema().as_ref())
+            .await?;
+        let unioned = UnionExec::try_new(vec![plan, stale_branch])?;
+        Ok(Arc::new(RepartitionExec::try_new(
+            unioned,
+            Partitioning::RoundRobinBatch(1),
         )?))
     }
 }

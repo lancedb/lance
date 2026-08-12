@@ -23,12 +23,13 @@ use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::prelude::col;
 use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
+use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::Fragment;
 
-use super::context::ScanPlanningContext;
+use super::context::{OverlayStaleness, ScanPlanningContext};
 use super::fts::{FtsAccessPath, FtsLeafNode};
 use super::nodes::{LanceTakeNode, PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
-use super::source::LanceScanSource;
+use super::source::{LanceScanSource, ScanRestriction};
 
 /// Decide whether each vector search uses its index or brute force.
 ///
@@ -187,39 +188,129 @@ pub(super) fn prefilter_kind(input: &LogicalPlan) -> PrefilterSourceKind {
     }
 }
 
-/// Split a search over partially-indexed data into an indexed branch and a brute-force branch.
+/// What an index does not answer for, among the rows a scan will touch.
 ///
-/// This is the design doc's Appendix A, expressed as a logical rewrite rather than as fan-out
-/// inside the extension planner. A search whose index does not cover every fragment becomes:
+/// The whole point of this type is that fragment-level and row-level coverage are the same
+/// statement. `SplitPartiallyIndexedSearch` and `SplitPartiallyIndexedFts` in the imperative path
+/// split on fragment coverage; the overlay stale-row handling threaded through
+/// `Scanner::new_filtered_read`, `knn_combined`, and `plan_flat_match_query` splits on row
+/// coverage. Both produce a brute-force branch reading exactly the rows in the hole, and the only
+/// difference is how that branch's scan is narrowed — which is what [`ScanRestriction`] carries.
+pub(super) enum IndexCoverage {
+    /// The index answers for every row the scan will touch. Also the answer when coverage cannot
+    /// be determined: an index that will not say what it covers is used as-is, which is what the
+    /// imperative path does too.
+    Complete,
+    /// The index cannot be trusted for any row.
+    Unusable,
+    /// The indexed branch reads `indexed` and must not emit `block`; the brute-force branch reads
+    /// the rows described by `gaps`.
+    Partial {
+        indexed: Vec<Fragment>,
+        gaps: Vec<ScanRestriction>,
+        block: Option<Arc<RowAddrTreeMap>>,
+    },
+}
+
+impl IndexCoverage {
+    /// Drop the brute-force branch, keeping the block mask.
+    ///
+    /// This is `fast_search`: "answer from indices only" means a coverage gap is not filled, it is
+    /// simply not answered — and a stale entry is not an answer either, so the block stays.
+    fn indexed_only(self) -> Self {
+        match self {
+            Self::Partial {
+                indexed,
+                gaps: _,
+                block,
+            } => Self::Partial {
+                indexed,
+                gaps: Vec::new(),
+                block,
+            },
+            other => other,
+        }
+    }
+}
+
+/// A search node that answers from an index and can fall back to brute force for the rows its
+/// index does not cover.
+///
+/// The trait is the seam that lets [`SplitOnIndexCoverage`] be one rule: what counts as coverage,
+/// and how the branches merge back together, are per-index-kind decisions, while the split itself
+/// is not.
+pub(super) trait SplittableSearch {
+    /// `false` when this node is already brute force, or is already the output of a split.
+    fn is_splittable(&self) -> bool;
+    fn coverage(&self, context: &ScanPlanningContext) -> IndexCoverage;
+    fn input(&self) -> &LogicalPlan;
+    /// This node reading only indexed rows, with `block` withheld from the index result.
+    fn indexed_branch(&self, input: LogicalPlan, block: Option<Arc<RowAddrTreeMap>>)
+    -> LogicalPlan;
+    /// This node as a brute-force search over `input`.
+    fn flat_branch(&self, input: LogicalPlan) -> LogicalPlan;
+    /// Combine the branches into one plan producing this node's schema.
+    fn merge(
+        &self,
+        indexed: LogicalPlan,
+        flat: LogicalPlan,
+        context: &ScanPlanningContext,
+    ) -> datafusion::common::Result<LogicalPlan>;
+}
+
+/// Recognize the node kinds that can be split.
+///
+/// This downcast list is the one place the shared rule has to know which index kinds exist, and it
+/// is exactly the registry a plugin system would own instead.
+fn splittable(plan: &LogicalPlan) -> Option<&dyn SplittableSearch> {
+    let LogicalPlan::Extension(extension) = plan else {
+        return None;
+    };
+    let node = extension.node.as_any();
+    if let Some(search) = node.downcast_ref::<VectorSearchNode>() {
+        return Some(search);
+    }
+    if let Some(leaf) = node.downcast_ref::<FtsLeafNode>() {
+        return Some(leaf);
+    }
+    None
+}
+
+/// Split a search into an indexed branch and a brute-force branch over the rows the index does not
+/// answer for.
+///
+/// This is the design doc's Appendix A, generalized: a rewrite rather than fan-out inside the
+/// extension planner, and driven by [`IndexCoverage`] rather than by fragment lists alone. For a
+/// vector search it produces
 ///
 /// ```text
 /// VectorSearch{Flat, k}              <- exact re-rank over the merged candidates
 ///   Projection [_rowid, vec]         <- drop the branches' approximate _distance
 ///     LanceTake [vec]                <- fetch vectors for the candidates
 ///       Union
-///         VectorSearch{Index}  over the indexed fragments
-///         VectorSearch{Flat}   over the unindexed fragments
+///         VectorSearch{Index}  over the indexed fragments, minus the stale rows
+///         VectorSearch{Flat}   over the union of the coverage gaps
 /// ```
 ///
-/// Two things fall out of writing it this way. The outer exact search *is* the re-rank — the
-/// same node type, no special-purpose operator — which is the structural version of the doc's
-/// observation that the combined path reuses the refine mechanism. And the single `Filter` child
-/// is duplicated onto both branches by ordinary plan surgery, so the "one predicate, two physical
-/// placements" problem is solved once here instead of inside the planner.
+/// Three things fall out of writing it this way. The outer exact search *is* the re-rank — the
+/// same node type, no special-purpose operator. The single `Filter` child is duplicated onto both
+/// branches by ordinary plan surgery, so the "one predicate, two physical placements" problem is
+/// solved once here instead of inside the planner. And a data overlay's stale rows need no
+/// machinery of their own: they are one more coverage gap, and the same union absorbs them.
 #[derive(Debug)]
-pub struct SplitPartiallyIndexedSearch {
+pub struct SplitOnIndexCoverage {
     context: Arc<ScanPlanningContext>,
 }
 
-impl SplitPartiallyIndexedSearch {
+impl SplitOnIndexCoverage {
     pub fn new(context: Arc<ScanPlanningContext>) -> Self {
         Self { context }
     }
 }
 
-impl OptimizerRule for SplitPartiallyIndexedSearch {
+impl OptimizerRule for SplitOnIndexCoverage {
     fn name(&self) -> &str {
-        "split_partially_indexed_search"
+        "split_on_index_coverage"
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
@@ -231,62 +322,152 @@ impl OptimizerRule for SplitPartiallyIndexedSearch {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
-        let LogicalPlan::Extension(extension) = &plan else {
+        let Some(node) = splittable(&plan) else {
             return Ok(Transformed::no(plan));
         };
-        let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() else {
+        if !node.is_splittable() {
             return Ok(Transformed::no(plan));
+        }
+
+        let coverage = match self.context.fast_search() {
+            true => node.coverage(&self.context).indexed_only(),
+            false => node.coverage(&self.context),
         };
-        // Only an indexed search can be partially covered; a flat search already reads everything.
-        // This is also what stops the rewrite from recursing into the exact re-rank it produces.
-        if !matches!(
-            search.access_path_resolution(),
+        match coverage {
+            IndexCoverage::Complete => Ok(Transformed::no(plan)),
+            IndexCoverage::Unusable if self.context.fast_search() => Ok(Transformed::yes(
+                LogicalPlan::EmptyRelation(EmptyRelation {
+                    produce_one_row: false,
+                    schema: plan.schema().clone(),
+                }),
+            )),
+            IndexCoverage::Unusable => Ok(Transformed::yes(node.flat_branch(node.input().clone()))),
+            IndexCoverage::Partial {
+                indexed,
+                gaps,
+                block,
+            } => {
+                let indexed_branch = node.indexed_branch(
+                    restrict_scan(node.input(), &ScanRestriction::Fragments(Arc::new(indexed)))?,
+                    block,
+                );
+                if gaps.is_empty() {
+                    return Ok(Transformed::yes(indexed_branch));
+                }
+                let mut sources = Vec::with_capacity(gaps.len());
+                for gap in &gaps {
+                    sources.push(restrict_scan(node.input(), gap)?);
+                }
+                let mut builder = LogicalPlanBuilder::new(sources.remove(0));
+                for source in sources {
+                    builder = builder.union(source)?;
+                }
+                let flat_branch = node.flat_branch(builder.build()?);
+                Ok(Transformed::yes(node.merge(
+                    indexed_branch,
+                    flat_branch,
+                    &self.context,
+                )?))
+            }
+        }
+    }
+}
+
+impl SplittableSearch for VectorSearchNode {
+    fn is_splittable(&self) -> bool {
+        // Only an indexed search can have a coverage gap; a flat search already reads everything.
+        // `input_fully_indexed` is what stops the rewrite from recursing into its own output.
+        matches!(
+            self.access_path_resolution(),
             Some(VectorAccessPath::Index { .. })
-        ) || search.input_fully_indexed()
-        {
-            return Ok(Transformed::no(plan));
+        ) && !self.input_fully_indexed()
+    }
+
+    fn coverage(&self, context: &ScanPlanningContext) -> IndexCoverage {
+        let column = &self.query().column;
+        let staleness = context
+            .vector_index(column)
+            .map(|index| &index.staleness)
+            .unwrap_or(&OverlayStaleness::None);
+        // An ANN segment that cannot name its fragments still answers by row address, so blocking
+        // and re-scoring works regardless — the vector path never has to give up on the index.
+        let stale = match staleness {
+            OverlayStaleness::Rows(rows) => Some(rows.clone()),
+            OverlayStaleness::None | OverlayStaleness::Unknown => None,
+        };
+
+        let (Some(unindexed), Some(indexed)) = (
+            context.unindexed_fragments(column),
+            context.indexed_fragments(column),
+        ) else {
+            return IndexCoverage::Complete;
+        };
+        if indexed.is_empty() {
+            return IndexCoverage::Unusable;
+        }
+        if unindexed.is_empty() && stale.is_none() {
+            return IndexCoverage::Complete;
         }
 
-        let column = &search.query().column;
-        let Some(unindexed) = self.context.unindexed_fragments(column) else {
-            return Ok(Transformed::no(plan));
-        };
-        if unindexed.is_empty() {
-            return Ok(Transformed::no(plan));
+        let mut gaps = Vec::with_capacity(2);
+        if !unindexed.is_empty() {
+            gaps.push(ScanRestriction::Fragments(Arc::new(unindexed)));
         }
-        let Some(indexed) = self.context.indexed_fragments(column) else {
-            return Ok(Transformed::no(plan));
-        };
+        if let Some(rows) = &stale {
+            gaps.push(ScanRestriction::Rows(rows.clone()));
+        }
+        IndexCoverage::Partial {
+            indexed,
+            gaps,
+            block: stale,
+        }
+    }
 
-        let indexed_branch = LogicalPlan::Extension(Extension {
+    fn input(&self) -> &LogicalPlan {
+        Self::input(self)
+    }
+
+    fn indexed_branch(
+        &self,
+        input: LogicalPlan,
+        block: Option<Arc<RowAddrTreeMap>>,
+    ) -> LogicalPlan {
+        LogicalPlan::Extension(Extension {
             node: Arc::new(
-                search
-                    .clone()
-                    .with_input(restrict_scan(search.input(), indexed)?)
+                self.clone()
+                    .with_input(input)
+                    .with_overlay_block(block)
                     .covering_only_indexed_input(),
             ),
-        });
-        let flat_branch = LogicalPlan::Extension(Extension {
+        })
+    }
+
+    fn flat_branch(&self, input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Extension(Extension {
             node: Arc::new(
-                search
-                    .clone()
-                    .with_input(restrict_scan(search.input(), unindexed)?)
+                self.clone()
+                    .with_input(input)
                     .with_resolution(VectorAccessPath::Flat),
             ),
-        });
+        })
+    }
 
-        let merged = LogicalPlanBuilder::new(indexed_branch)
-            .union(flat_branch)?
-            .build()?;
+    fn merge(
+        &self,
+        indexed: LogicalPlan,
+        flat: LogicalPlan,
+        context: &ScanPlanningContext,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        let column = &self.query().column;
+        let merged = LogicalPlanBuilder::new(indexed).union(flat)?.build()?;
         let with_vectors = LogicalPlan::Extension(Extension {
             node: Arc::new(LanceTakeNode::try_new(
                 merged,
-                search.dataset().clone(),
-                search
-                    .dataset()
+                self.dataset().clone(),
+                self.dataset()
                     .empty_projection()
                     .union_column(column, OnMissing::Error)?,
-                self.context.take_settings().clone(),
+                context.take_settings().clone(),
             )?),
         });
         // The branches' `_distance` values are per-branch and, for the indexed one, approximate.
@@ -295,28 +476,27 @@ impl OptimizerRule for SplitPartiallyIndexedSearch {
         let candidates = LogicalPlanBuilder::new(with_vectors)
             .project(vec![col(ROW_ID), col(column)])?
             .build()?;
-
-        let rerank = search
-            .clone()
-            .with_input(candidates)
-            .with_resolution(VectorAccessPath::Flat)
-            .with_prefilter(PrefilterSourceKind::None);
-        Ok(Transformed::yes(LogicalPlan::Extension(Extension {
-            node: Arc::new(rerank),
-        })))
+        Ok(LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                self.clone()
+                    .with_input(candidates)
+                    .with_resolution(VectorAccessPath::Flat)
+                    .with_prefilter(PrefilterSourceKind::None)
+                    .with_overlay_block(None),
+            ),
+        }))
     }
 }
 
-/// Rebuild `plan`, pointing every scan leaf at the same source restricted to `fragments`.
+/// Rebuild `plan`, pointing every scan leaf at the same source narrowed by `restriction`.
 ///
 /// The recursion exists because the predicate may not have reached the leaf: before
 /// `PushDownFilter` runs there is a `Filter` in between, and that `Filter` has to be duplicated
-/// onto both branches along with the scan.
+/// onto every branch along with the scan.
 pub(super) fn restrict_scan(
     plan: &LogicalPlan,
-    fragments: Vec<Fragment>,
+    restriction: &ScanRestriction,
 ) -> datafusion::common::Result<LogicalPlan> {
-    let fragments = Arc::new(fragments);
     Ok(plan
         .clone()
         .transform_down(|node| {
@@ -331,8 +511,7 @@ pub(super) fn restrict_scan(
                 return Ok(Transformed::no(node));
             };
             let mut scan = scan.clone();
-            scan.source =
-                provider_as_source(Arc::new(source.restricted_to(fragments.as_ref().clone())));
+            scan.source = provider_as_source(Arc::new(source.restricted_to(restriction)));
             Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
         })?
         .data)
