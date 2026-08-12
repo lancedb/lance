@@ -29,6 +29,7 @@
 
 use object_store::ObjectStoreExt;
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -53,6 +54,24 @@ use super::util::{manifest_filename, parse_bit_reversed_filename, shard_manifest
 #[derive(Debug, Serialize, Deserialize)]
 struct VersionHint {
     version: u64,
+}
+
+#[derive(Debug)]
+struct ManifestWriteError {
+    message: String,
+    source: object_store::Error,
+}
+
+impl Display for ManifestWriteError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.message, self.source)
+    }
+}
+
+impl std::error::Error for ManifestWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Store for reading and writing shard manifests.
@@ -204,21 +223,27 @@ impl ShardManifestStore {
                 .await
             {
                 Ok(()) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
+                Err(error @ object_store::Error::AlreadyExists { .. }) => {
                     // Clean up temp file
                     let _ = self.object_store.delete(&temp_path).await;
-                    return Err(Error::io(format!(
-                        "Manifest version {} already exists for shard {}",
-                        version, self.shard_id
-                    )));
+                    return Err(manifest_write_error(
+                        format!(
+                            "Manifest version {} already exists for shard {}",
+                            version, self.shard_id
+                        ),
+                        error,
+                    ));
                 }
-                Err(e) => {
+                Err(error) => {
                     // Clean up temp file
                     let _ = self.object_store.delete(&temp_path).await;
-                    return Err(Error::io(format!(
-                        "Failed to write manifest version {} for shard {}: {}",
-                        version, self.shard_id, e
-                    )));
+                    return Err(manifest_write_error(
+                        format!(
+                            "Failed to write manifest version {} for shard {}",
+                            version, self.shard_id
+                        ),
+                        error,
+                    ));
                 }
             }
         } else {
@@ -232,18 +257,19 @@ impl ShardManifestStore {
                 .inner
                 .put_opts(&path, Bytes::from(bytes).into(), put_opts)
                 .await
-                .map_err(|e| {
-                    if matches!(e, object_store::Error::AlreadyExists { .. }) {
-                        Error::io(format!(
+                .map_err(|error| {
+                    let message = if matches!(&error, object_store::Error::AlreadyExists { .. }) {
+                        format!(
                             "Manifest version {} already exists for shard {}",
                             version, self.shard_id
-                        ))
+                        )
                     } else {
-                        Error::io(format!(
-                            "Failed to write manifest version {} for shard {}: {}",
-                            version, self.shard_id, e
-                        ))
-                    }
+                        format!(
+                            "Failed to write manifest version {} for shard {}",
+                            version, self.shard_id
+                        )
+                    };
+                    manifest_write_error(message, error)
                 })?;
         }
 
@@ -481,10 +507,20 @@ impl ShardManifestStore {
                         .await?
                         .map(|m| m.writer_epoch)
                         .unwrap_or(0);
-                    if latest_epoch >= next_epoch {
-                        return Err(Error::io(format!(
+                    let is_confirmed_conflict = is_manifest_version_conflict(&write_err);
+                    if latest_epoch > next_epoch
+                        || (latest_epoch == next_epoch && is_confirmed_conflict)
+                    {
+                        return Err(Error::fenced_by_peer(format!(
                             "Failed to claim shard {} (version {}): another writer claimed epoch {} (>= our target {}): {}",
                             self.shard_id, next_version, latest_epoch, next_epoch, write_err
+                        )));
+                    }
+                    if latest_epoch == next_epoch {
+                        return Err(Error::io(format!(
+                            "Failed to confirm ownership after claiming epoch {} for shard {} \
+                             (version {}); the manifest write may have committed: {}",
+                            next_epoch, self.shard_id, next_version, write_err
                         )));
                     }
                     last_write_err = Some(write_err);
@@ -579,7 +615,7 @@ impl ShardManifestStore {
                 }
                 Err(e) => {
                     // Check if it's a version conflict (can retry) vs other error
-                    let is_version_conflict = e.to_string().contains("already exists");
+                    let is_version_conflict = is_manifest_version_conflict(&e);
 
                     if is_version_conflict && attempt < MAX_RETRIES - 1 {
                         continue;
@@ -597,9 +633,29 @@ impl ShardManifestStore {
     }
 }
 
+fn is_manifest_version_conflict(error: &Error) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if let Some(store_error) = current.downcast_ref::<object_store::Error>() {
+            return matches!(
+                store_error,
+                object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. }
+            );
+        }
+        source = current.source();
+    }
+    false
+}
+
+fn manifest_write_error(message: String, source: object_store::Error) -> Error {
+    Error::io_source(Box::new(ManifestWriteError { message, source }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::test_util::failing_memory_store;
     use tempfile::TempDir;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, TempDir) {
@@ -768,6 +824,42 @@ mod tests {
         assert_eq!(second_epoch, 2);
         assert_eq!(second.version, 3);
         assert_eq!(second.wal_entry_position_last_seen, 42);
+    }
+
+    #[tokio::test]
+    async fn test_claim_epoch_lost_ack_is_not_peer_fence() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        controls.set_manifest_lost_ack(true);
+        controls.fail_manifest_puts(1);
+
+        let error = manifest_store.claim_epoch(0).await.unwrap_err();
+        assert!(
+            !error.is_mem_wal_fenced(),
+            "an ambiguous response for our own committed claim is not a peer fence: {error}"
+        );
+        assert!(error.to_string().contains("may have committed"));
+
+        let committed = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(committed.writer_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_version_conflict_detection() {
+        let (store, base_path, _controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest = create_test_manifest(shard_id, 1, 1);
+
+        manifest_store.write(&manifest).await.unwrap();
+        let conflict = manifest_store.write(&manifest).await.unwrap_err();
+        assert!(is_manifest_version_conflict(&conflict));
+        assert!(conflict.to_string().contains("already exists"));
+
+        assert!(!is_manifest_version_conflict(&Error::io(
+            "ordinary manifest I/O failure"
+        )));
     }
 
     #[tokio::test]

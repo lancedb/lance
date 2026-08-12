@@ -524,13 +524,44 @@ impl Error {
         .build()
     }
 
-    /// The [`FenceReason`] if this is [`Error::Fenced`], else `None`. Prefer this
-    /// over matching the error message to decide how to react to a fence.
+    /// The [`FenceReason`] if this error or one of its typed sources is
+    /// [`Error::Fenced`], else `None`. Prefer this over matching the error
+    /// message to decide how to react to a fence.
     pub fn fence_reason(&self) -> Option<FenceReason> {
         match self {
             Self::Fenced { reason, .. } => Some(*reason),
-            _ => None,
+            _ => std::error::Error::source(self).and_then(error_source_fence_reason),
         }
+    }
+
+    /// Return whether this error or one of its typed sources reports that a
+    /// MemWAL writer was superseded by a successor's epoch claim.
+    ///
+    /// This is the peer-takeover predicate for errors created by
+    /// [`Error::fenced_by_peer`]. Use [`Error::fence_reason`] when callers also
+    /// need to distinguish errors created by [`Error::writer_poisoned`].
+    ///
+    /// Persistence failures also fence a writer internally, but return `false`
+    /// here because they are not peer epoch takeovers and generally require a
+    /// different recovery policy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_core::{Error, FenceReason};
+    ///
+    /// let peer_fence = Error::fenced_by_peer("successor claimed epoch 4");
+    /// assert!(peer_fence.is_mem_wal_fenced());
+    /// assert_eq!(
+    ///     peer_fence.fence_reason(),
+    ///     Some(FenceReason::PeerClaimedEpoch)
+    /// );
+    ///
+    /// let persistence_failure = Error::writer_poisoned("WAL write failed");
+    /// assert!(!persistence_failure.is_mem_wal_fenced());
+    /// ```
+    pub fn is_mem_wal_fenced(&self) -> bool {
+        self.fence_reason() == Some(FenceReason::PeerClaimedEpoch)
     }
 
     #[track_caller]
@@ -790,6 +821,13 @@ fn error_source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool
     source.source().is_some_and(error_source_is_not_found)
 }
 
+fn error_source_fence_reason(source: &(dyn std::error::Error + 'static)) -> Option<FenceReason> {
+    if let Some(error) = source.downcast_ref::<Error>() {
+        return error.fence_reason();
+    }
+    source.source().and_then(error_source_fence_reason)
+}
+
 pub trait LanceOptionExt<T> {
     /// Unwraps an option, returning an internal error if the option is None.
     ///
@@ -1042,6 +1080,18 @@ impl Clone for CloneableError {
             error if error.is_not_found() => Self(Error::wrapped(Box::new(DisplayError(
                 Error::not_found(error.to_string()),
             )))),
+            Error::Fenced {
+                reason, message, ..
+            } => Self(match reason {
+                FenceReason::PeerClaimedEpoch => Error::fenced_by_peer(message.clone()),
+                FenceReason::PersistenceFailure => Error::writer_poisoned(message.clone()),
+            }),
+            error if error.fence_reason() == Some(FenceReason::PeerClaimedEpoch) => {
+                Self(Error::fenced_by_peer(error.to_string()))
+            }
+            error if error.fence_reason() == Some(FenceReason::PersistenceFailure) => {
+                Self(Error::writer_poisoned(error.to_string()))
+            }
             Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
             Error::IO { source, .. } => Self(Error::io(source.to_string())),
             error => Self(Error::cloned(error.to_string())),
@@ -1061,8 +1111,52 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use rstest::rstest;
     use std::error::Error as _;
     use std::fmt;
+
+    #[test]
+    fn mem_wal_fence_predicate_is_typed_and_source_aware() {
+        let fenced = Error::fenced_by_peer(
+            "local epoch 3 < stored epoch 4 for shard 00000000-0000-0000-0000-000000000000",
+        );
+        assert!(fenced.is_mem_wal_fenced());
+        assert!(fenced.to_string().contains("Writer fenced"));
+
+        let wrapped = Error::wrapped(Box::new(fenced));
+        assert!(wrapped.is_mem_wal_fenced());
+
+        assert!(!Error::io("ordinary object-store failure").is_mem_wal_fenced());
+        let persistence_failure = Error::writer_poisoned("WAL persistence failed");
+        assert!(!persistence_failure.is_mem_wal_fenced());
+        let wrapped = Error::wrapped(Box::new(persistence_failure));
+        assert_eq!(
+            wrapped.fence_reason(),
+            Some(FenceReason::PersistenceFailure)
+        );
+        assert!(!wrapped.is_mem_wal_fenced());
+    }
+
+    #[rstest]
+    #[case::direct_peer(false, FenceReason::PeerClaimedEpoch)]
+    #[case::direct_persistence(false, FenceReason::PersistenceFailure)]
+    #[case::nested_peer(true, FenceReason::PeerClaimedEpoch)]
+    #[case::nested_persistence(true, FenceReason::PersistenceFailure)]
+    fn cloneable_error_preserves_fence_reason(#[case] nested: bool, #[case] expected: FenceReason) {
+        let error = match expected {
+            FenceReason::PeerClaimedEpoch => Error::fenced_by_peer("peer fence"),
+            FenceReason::PersistenceFailure => Error::writer_poisoned("persistence fence"),
+        };
+        let error = if nested {
+            Error::wrapped(Box::new(error))
+        } else {
+            error
+        };
+        let original = CloneableError(error);
+        let cloned = original.clone();
+        assert_eq!(original.0.fence_reason(), Some(expected));
+        assert_eq!(cloned.0.fence_reason(), Some(expected));
+    }
 
     #[test]
     fn cloneable_error_preserves_not_found_contract() {

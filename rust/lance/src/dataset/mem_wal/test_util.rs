@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Test-only object store that injects WAL-write failures (for the WAL
-//! persistence-failure fencing path) and records the paths it serves (for
-//! asserting which opens actually resolved through a given `ObjectStoreParams`).
+//! Test-only object store that injects WAL and manifest write failures and
+//! records the paths it serves.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
@@ -24,7 +23,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
 };
 
-/// Knobs controlling injected WAL-entry write failures, shared with the test.
+/// Knobs controlling injected WAL and manifest write failures, shared with tests.
 #[derive(Debug, Default)]
 pub struct FailControls {
     /// Remaining WAL-entry `put_opts` calls to fail; saturates at 0. Set high to
@@ -35,6 +34,10 @@ pub struct FailControls {
     simulate_lost_ack: AtomicBool,
     /// WAL-entry `put_opts` attempts observed, for assertions.
     wal_put_attempts: AtomicUsize,
+    /// Remaining versioned manifest writes to fail.
+    manifest_put_failures: AtomicUsize,
+    /// When failing a manifest write, commit it before reporting the failure.
+    simulate_manifest_lost_ack: AtomicBool,
     /// Every location written through this store.
     put_paths: StdMutex<Vec<String>>,
     /// Every location read through this store.
@@ -53,6 +56,32 @@ impl FailControls {
     }
     pub fn attempts(&self) -> usize {
         self.wal_put_attempts.load(Ordering::SeqCst)
+    }
+    /// Fail the next `n` versioned manifest writes.
+    ///
+    /// Configure the [`FailControls`] returned by [`failing_memory_store`] before
+    /// invoking the manifest operation under test:
+    ///
+    /// ```text
+    /// let (_, _, controls) = failing_memory_store().await;
+    /// controls.fail_manifest_puts(1);
+    /// ```
+    pub(crate) fn fail_manifest_puts(&self, n: usize) {
+        self.manifest_put_failures.store(n, Ordering::SeqCst);
+    }
+
+    /// Commit failed manifest writes before returning the injected error.
+    ///
+    /// Use this with [`Self::fail_manifest_puts`] to simulate a lost
+    /// acknowledgement:
+    ///
+    /// ```text
+    /// let (_, _, controls) = failing_memory_store().await;
+    /// controls.set_manifest_lost_ack(true);
+    /// controls.fail_manifest_puts(1);
+    /// ```
+    pub(crate) fn set_manifest_lost_ack(&self, v: bool) {
+        self.simulate_manifest_lost_ack.store(v, Ordering::SeqCst);
     }
 
     /// Did any write land on a path containing `needle`? An open that resolved
@@ -105,10 +134,14 @@ impl FailingObjectStore {
         location.as_ref().contains("/wal/")
     }
 
-    fn injected_error() -> object_store::Error {
+    fn is_versioned_manifest(location: &Path) -> bool {
+        location.as_ref().contains("/manifest/") && location.as_ref().ends_with(".binpb")
+    }
+
+    fn injected_error(operation: &str) -> object_store::Error {
         object_store::Error::Generic {
             store: "failing-test-store",
-            source: "injected transient WAL put failure".to_string().into(),
+            source: format!("injected {operation} failure").into(),
         }
     }
 }
@@ -144,8 +177,22 @@ impl OSObjectStore for FailingObjectStore {
                     // The write lands but we still report failure (lost ack).
                     let _ = self.inner.put_opts(location, payload, opts).await;
                 }
-                return Err(Self::injected_error());
+                return Err(Self::injected_error("transient WAL put"));
             }
+        } else if Self::is_versioned_manifest(location)
+            && self.controls.manifest_put_failures.load(Ordering::SeqCst) > 0
+        {
+            self.controls
+                .manifest_put_failures
+                .fetch_sub(1, Ordering::SeqCst);
+            if self
+                .controls
+                .simulate_manifest_lost_ack
+                .load(Ordering::SeqCst)
+            {
+                let _ = self.inner.put_opts(location, payload, opts).await;
+            }
+            return Err(Self::injected_error("manifest put"));
         }
         self.inner.put_opts(location, payload, opts).await
     }
@@ -229,8 +276,8 @@ pub fn observable_store_params() -> (ObjectStoreParams, Arc<FailControls>) {
     (params, controls)
 }
 
-/// Build an in-memory `ObjectStore` whose WAL-entry writes can be failed on
-/// demand. Returns the store, its base path, and the shared controls.
+/// Build an in-memory `ObjectStore` whose WAL and manifest writes can be failed
+/// on demand. Returns the store, its base path, and the shared controls.
 pub async fn failing_memory_store() -> (Arc<ObjectStore>, Path, Arc<FailControls>) {
     let (params, controls) = observable_store_params();
     let (store, base) = ObjectStore::from_uri_and_params(

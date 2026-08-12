@@ -47,6 +47,7 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
+use super::memtable::MemTableFlushWatcher;
 use super::memtable::flush::TriggerMemTableFlush;
 use super::scanner::SsTableWarmer;
 use super::wal::{
@@ -811,7 +812,7 @@ struct WriterState {
     /// Total size of frozen memtables (for backpressure).
     frozen_memtable_bytes: usize,
     /// Flush watchers for frozen memtables (for backpressure).
-    frozen_flush_watchers: VecDeque<(usize, DurabilityWatcher)>,
+    frozen_flush_watchers: VecDeque<(usize, DurabilityWatcher, MemTableFlushWatcher)>,
     /// Sealed memtables, kept queryable so a concurrent reader sees no hole
     /// between `freeze_memtable` and the flush task's manifest commit, and for
     /// `frozen_memtable_grace` beyond it so as-of reads stay batch-resolved.
@@ -1263,6 +1264,7 @@ impl SharedWriterState {
         // its cells and a failed send below can poison-and-return without leaving
         // partial state to unwind.
         let _memtable_flush_watcher = old_memtable.create_memtable_flush_completion();
+        let typed_memtable_flush_watcher = old_memtable.create_typed_memtable_flush_completion()?;
 
         // The outgoing memtable may still owe an index apply — the puts that
         // filled it triggered one, but the task need not have drained yet, and
@@ -1292,9 +1294,11 @@ impl SharedWriterState {
         let flush_watcher = old_memtable
             .get_memtable_flush_watcher()
             .expect("Flush watcher should exist after create_memtable_flush_completion");
-        state
-            .frozen_flush_watchers
-            .push_back((frozen_size, flush_watcher));
+        state.frozen_flush_watchers.push_back((
+            frozen_size,
+            flush_watcher,
+            typed_memtable_flush_watcher,
+        ));
 
         let frozen_memtable = Arc::new(old_memtable);
 
@@ -1474,7 +1478,7 @@ impl SharedWriterState {
             // First try frozen memtable watchers
             s.frozen_flush_watchers
                 .front()
-                .map(|(_, watcher)| watcher.clone())
+                .map(|(_, watcher, _)| watcher.clone())
                 // If no frozen memtables, use active memtable's watcher
                 .or_else(|| s.memtable.get_memtable_flush_watcher())
         })
@@ -2670,7 +2674,7 @@ impl ShardWriter {
     /// landed and been recorded in the manifest. Does not wait on the
     /// active memtable — call [`Self::force_seal_active`] first if you
     /// want everything-on-disk. Errors in WAL-only mode, or if any
-    /// awaited flush reports `DurabilityResult::Failed`.
+    /// awaited flush reports a typed completion failure.
     ///
     /// Useful in tests for deterministic post-flush assertions. In
     /// production prefer [`SealFence::wait`] from the seal itself: this
@@ -2688,11 +2692,11 @@ impl ShardWriter {
         };
 
         loop {
-            let watchers: Vec<DurabilityWatcher> = {
+            let watchers: Vec<MemTableFlushWatcher> = {
                 let st = state_lock.read().await;
                 st.frozen_flush_watchers
                     .iter()
-                    .map(|(_, w)| w.clone())
+                    .map(|(_, _, w)| w.clone())
                     .collect()
             };
             if watchers.is_empty() {
@@ -2700,7 +2704,7 @@ impl ShardWriter {
             }
             for mut w in watchers {
                 match w.await_value().await {
-                    Some(durability) => durability.into_result()?,
+                    Some(result) => result.map_err(WalFlushFailure::into_error)?,
                     None => {
                         return Err(Error::io(
                             "MemTable flush handler exited before reporting completion",
@@ -2879,12 +2883,12 @@ impl ShardWriter {
                     }
                     st.frozen_flush_watchers
                         .iter()
-                        .map(|(_, w)| w.clone())
+                        .map(|(_, _, w)| w.clone())
                         .collect()
                 };
                 for mut watcher in watchers {
                     let stage_result = match watcher.await_value().await {
-                        Some(durability) => durability.into_result(),
+                        Some(result) => result.map_err(WalFlushFailure::into_error),
                         None => Err(Error::io(
                             "MemTable flush handler exited before reporting completion during close",
                         )),
@@ -3489,12 +3493,18 @@ impl MemTableFlushHandler {
             Err(e) => DurabilityResult::err(e.to_string()),
         };
         memtable.signal_memtable_flush_complete(durability);
+        let typed_result = flush_result
+            .as_ref()
+            .map(|_| ())
+            .map_err(WalFlushFailure::from_error);
+        memtable.signal_typed_memtable_flush_complete(typed_result);
 
         {
             let mut state = self.state.write().await;
             // Backpressure drain: unconditional so `wait_for_flush_drain`
             // sees the watcher's error signal, not a dropped channel.
-            if let Some((_size, _watcher)) = state.frozen_flush_watchers.pop_front() {
+            if let Some((_size, _watcher, _typed_watcher)) = state.frozen_flush_watchers.pop_front()
+            {
                 state.frozen_memtable_bytes =
                     state.frozen_memtable_bytes.saturating_sub(memtable_size);
             }
@@ -6107,10 +6117,8 @@ mod tests {
             .put(vec![create_test_batch(&schema, 2, 1)])
             .await
             .expect_err("expected fence error");
-        assert!(
-            err.to_string().contains("Writer fenced"),
-            "unexpected error: {err}"
-        );
+        assert!(err.is_mem_wal_fenced(), "unexpected error: {err}");
+        assert!(err.to_string().contains("Writer fenced"));
 
         writer_b.close().await.unwrap();
     }
@@ -6153,10 +6161,8 @@ mod tests {
             .check_fenced()
             .await
             .expect_err("expected fence error");
-        assert!(
-            err.to_string().contains("Writer fenced"),
-            "unexpected error: {err}"
-        );
+        assert!(err.is_mem_wal_fenced(), "unexpected error: {err}");
+        assert!(err.to_string().contains("Writer fenced"));
 
         // B is the current writer and is not fenced.
         writer_b.check_fenced().await.unwrap();
@@ -7186,6 +7192,7 @@ mod tests {
             Some(FenceReason::PeerClaimedEpoch),
             "replay must abort with a typed peer-fence error, got: {err}"
         );
+        assert!(err.is_mem_wal_fenced());
         let msg = err.to_string();
         assert!(
             msg.contains("WAL replay aborted") && msg.contains("fenced"),
@@ -7348,7 +7355,7 @@ mod tests {
         // Writer B claims epoch 2 and writes its own entry (takes WAL
         // position 1). A is now fenced: A's next put will attempt WAL
         // position 1 (its cached next), collide with B's entry, and
-        // surface a "Writer fenced" error from `check_fenced`.
+        // surface a typed fence error from `check_fenced`.
         let writer_b = ShardWriter::open(
             store,
             base_path,
@@ -7386,6 +7393,8 @@ mod tests {
             r1.is_err() && r2.is_err(),
             "expected both concurrent puts on a fenced writer to fail, got r1={r1:?} r2={r2:?}",
         );
+        assert!(r1.as_ref().is_err_and(|error| error.is_mem_wal_fenced()));
+        assert!(r2.as_ref().is_err_and(|error| error.is_mem_wal_fenced()));
 
         writer_b.close().await.unwrap();
     }
@@ -7850,17 +7859,20 @@ mod tests {
         assert!(writer_b.epoch() > writer_a.epoch());
 
         let error = writer_a
+            .force_seal_active()
+            .await
+            .expect_err("force_seal_active must report the peer fence");
+        assert!(
+            error.is_mem_wal_fenced(),
+            "unexpected force_seal_active error: {error}"
+        );
+
+        let error = writer_a
             .close()
             .await
             .expect_err("close must propagate the fenced MemTable flush");
-        assert!(
-            matches!(error, Error::IO { .. }),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.to_string().contains("Writer fenced"),
-            "unexpected error: {error}"
-        );
+        assert!(error.is_mem_wal_fenced(), "unexpected error: {error}");
+        assert!(error.to_string().contains("Writer fenced"));
 
         writer_b.close().await.unwrap();
     }
@@ -7921,10 +7933,14 @@ mod tests {
             WriterMode::WalOnly { .. } => unreachable!("opened in memtable mode"),
         }
 
-        // The fenced flush fails; the drain surfaces that error.
+        // The fenced flush fails; the drain surfaces the typed error.
+        let error = writer_a
+            .wait_for_flush_drain()
+            .await
+            .expect_err("fenced flush should fail the drain");
         assert!(
-            writer_a.wait_for_flush_drain().await.is_err(),
-            "fenced flush should fail the drain"
+            error.is_mem_wal_fenced(),
+            "unexpected flush drain error: {error}"
         );
 
         // The hole did not reopen: the sealed generation is still queryable
