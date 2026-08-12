@@ -701,6 +701,19 @@ impl ObjectStore {
         self.io_tracker.incremental_stats()
     }
 
+    /// Apply a [`WrappingObjectStore`] to both `inner` and `paginated_lister` together.
+    ///
+    /// Keeps both halves in sync: a wrapper returning `None` from
+    /// [`WrappingObjectStore::wrap_paginated`] clears the lister so that
+    /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
+    pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
+        self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
+        self.paginated_lister = self
+            .paginated_lister
+            .take()
+            .and_then(|lister| wrapper.wrap_paginated(&self.store_prefix, lister));
+    }
+
     /// Open a file for path.
     ///
     /// Parameters
@@ -1782,6 +1795,57 @@ mod tests {
                 .is_none()
         );
         assert_eq!(*log.lock().unwrap(), vec!["first@memory"]);
+    }
+
+    #[test]
+    fn test_apply_wrapper_replaces_inner_and_clears_lister() {
+        // Verify that apply_wrapper keeps inner and paginated_lister in sync: a wrapper
+        // that gives up the pushdown (returns None from wrap_paginated) must also clear
+        // the lister, so read_dir_page cannot reach the backend behind the wrapper's back.
+        let mut store = ObjectStore::memory();
+        store.paginated_lister = Some(Arc::new(StubLister) as Arc<dyn PaginatedDirLister>);
+
+        let replacement = Arc::new(InMemory::new());
+        let wrapper = TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: replacement.clone(),
+        };
+
+        store.apply_wrapper(&wrapper);
+
+        assert!(wrapper.called(), "apply_wrapper must call wrap()");
+        assert!(
+            Arc::ptr_eq(&store.inner, &(replacement as Arc<dyn OSObjectStore>)),
+            "inner must be the replacement from wrap()"
+        );
+        assert!(
+            store.paginated_lister.is_none(),
+            "paginated_lister must be cleared when wrap_paginated returns None"
+        );
+    }
+
+    #[test]
+    fn test_apply_wrapper_keeps_lister_when_wrapper_passes_it_through() {
+        let mut store = ObjectStore::memory();
+        let original_lister: Arc<dyn PaginatedDirLister> = Arc::new(StubLister);
+        store.paginated_lister = Some(original_lister.clone());
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let wrapper = PaginatedTestWrapper {
+            name: "passthrough",
+            log: log.clone(),
+        };
+
+        store.apply_wrapper(&wrapper);
+
+        assert!(
+            store.paginated_lister.is_some(),
+            "paginated_lister must be kept when wrap_paginated returns Some"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![format!("passthrough@{}", store.store_prefix)]
+        );
     }
 
     #[tokio::test]

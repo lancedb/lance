@@ -270,12 +270,7 @@ impl ObjectStoreRegistry {
         crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, &cache_path);
 
         if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(&cache_path, store.inner);
-            // A wrapper that gives up the pushdown leaves the store with no lister, so its
-            // listings go through the wrapped `inner` like every other request.
-            store.paginated_lister = store
-                .paginated_lister
-                .and_then(|lister| wrapper.wrap_paginated(&cache_path, lister));
+            store.apply_wrapper(wrapper.as_ref());
         }
 
         // Always wrap with IO tracking
