@@ -198,6 +198,67 @@ async fn test_with_object_store_wrappers_wraps_primary_store() {
     assert!(tracker.incremental_stats().read_iops > 0);
 }
 
+#[derive(Debug)]
+struct NonPreservingWrapper;
+
+impl WrappingObjectStore for NonPreservingWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        original
+    }
+}
+
+#[derive(Debug)]
+struct NativeDirectoryPreservingWrapper;
+
+impl WrappingObjectStore for NativeDirectoryPreservingWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        original
+    }
+
+    fn preserves_native_directory_path(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn test_with_object_store_wrappers_updates_native_directory_path() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let dataset = Dataset::open(test_dir.to_str().unwrap()).await.unwrap();
+    let native_path = dataset
+        .object_store
+        .native_directory_path(&dataset.base)
+        .unwrap();
+
+    let non_preserving = dataset.with_object_store_wrappers([
+        Arc::new(NonPreservingWrapper) as Arc<dyn WrappingObjectStore>
+    ]);
+    assert!(
+        non_preserving
+            .object_store
+            .native_directory_path(&non_preserving.base)
+            .is_none()
+    );
+
+    let preserving = dataset.with_object_store_wrappers([
+        Arc::new(NativeDirectoryPreservingWrapper) as Arc<dyn WrappingObjectStore>,
+    ]);
+    assert_eq!(
+        preserving
+            .object_store
+            .native_directory_path(&preserving.base),
+        Some(native_path)
+    );
+}
+
 #[tokio::test]
 async fn test_with_object_store_wrappers_wraps_base_store_params() {
     let test_dir = TempStdDir::default();

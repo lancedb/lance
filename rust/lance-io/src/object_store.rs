@@ -533,15 +533,9 @@ impl ObjectStore {
             let mut io_tracker = IOTracker::default();
             meter_store(&mut inner, &mut io_tracker, &store_prefix);
 
-            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                inner = wrapper.wrap(&store_prefix, inner);
-            }
-
-            // Always wrap with IO tracking
-            let tracked_store = io_tracker.wrap("", inner);
-
-            let store = Self {
-                inner: tracked_store,
+            let io_tracking_wrapper = io_tracker.clone();
+            let mut store = Self {
+                inner,
                 scheme: path.scheme().to_string(),
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -553,6 +547,10 @@ impl ObjectStore {
                 store_prefix,
                 native_directory_path_resolver: None,
             };
+            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                store.apply_wrapper(wrapper.as_ref());
+            }
+            store.apply_wrapper(&io_tracking_wrapper);
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
         }
@@ -650,6 +648,17 @@ impl ObjectStore {
         self.native_directory_path_resolver
             .as_ref()
             .map(|resolver| resolver.0(path))
+    }
+
+    /// Apply an object-store wrapper and update capabilities for the effective store.
+    ///
+    /// Native directory paths remain available only when the wrapper explicitly declares
+    /// that it preserves their exact semantics.
+    pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
+        self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
+        if !wrapper.preserves_native_directory_path() {
+            self.native_directory_path_resolver = None;
+        }
     }
 
     /// Opt this resolved store into exact native filesystem directory inspection.
@@ -1260,16 +1269,9 @@ impl ObjectStore {
         let mut io_tracker = IOTracker::default();
         meter_store(&mut store, &mut io_tracker, &store_prefix);
 
-        let store = match wrapper {
-            Some(wrapper) => wrapper.wrap(&store_prefix, store),
-            None => store,
-        };
-
-        // Always wrap with IO tracking
-        let tracked_store = io_tracker.wrap("", store);
-
-        Self {
-            inner: tracked_store,
+        let io_tracking_wrapper = io_tracker.clone();
+        let mut object_store = Self {
+            inner: store,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -1280,7 +1282,12 @@ impl ObjectStore {
             io_tracker,
             store_prefix,
             native_directory_path_resolver: None,
+        };
+        if let Some(wrapper) = wrapper {
+            object_store.apply_wrapper(wrapper.as_ref());
         }
+        object_store.apply_wrapper(&io_tracking_wrapper);
+        object_store
     }
 }
 

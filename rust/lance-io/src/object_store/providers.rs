@@ -12,7 +12,6 @@ use std::{
 use object_store::path::Path;
 use url::Url;
 
-use crate::object_store::WrappingObjectStore;
 use crate::object_store::uri_to_url;
 
 use super::{ObjectStore, ObjectStoreParams, tracing::ObjectStoreTracingExt};
@@ -270,14 +269,12 @@ impl ObjectStoreRegistry {
         crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, &cache_path);
 
         if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(&cache_path, store.inner);
-            if !wrapper.preserves_native_directory_path() {
-                store.native_directory_path_resolver = None;
-            }
+            store.apply_wrapper(wrapper.as_ref());
         }
 
         // Always wrap with IO tracking
-        store.inner = store.io_tracker.wrap("", store.inner);
+        let io_tracking_wrapper = store.io_tracker.clone();
+        store.apply_wrapper(&io_tracking_wrapper);
 
         let store = Arc::new(store);
 
