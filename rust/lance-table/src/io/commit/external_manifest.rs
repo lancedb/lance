@@ -156,34 +156,30 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
         }
 
-        // A successful copy materializes the selected bytes and therefore
-        // preserves their known size. We deliberately do not HEAD merely to
-        // obtain an ETag: that would add an S3 round trip and the token could
-        // become stale immediately after another identical overwrite anyway.
-        // If staging is already gone, confirm that another finalizer left a
-        // size-compatible canonical object before accepting its generation.
-        let (final_size, final_e_tag) = if copied {
-            (size, None)
-        } else {
-            let final_meta = object_store.head(&final_path).await?;
-            if final_meta.size != size {
-                return Err(Error::corrupt_file(
-                    final_path.clone(),
-                    format!(
-                        "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
-                        version, size, final_meta.size
-                    ),
-                ));
-            }
-            (final_meta.size, final_meta.e_tag)
-        };
+        // HEAD serves two purposes that are local to this finalizer: it proves
+        // the canonical object has the selected staging size, and it supplies
+        // the physical generation used to scope this process's manifest cache.
+        // It is deliberately *not* used as durable commit identity. Another
+        // helper may overwrite the same immutable bytes immediately afterward,
+        // making this token stale without changing the logical manifest.
+        let final_meta = object_store.head(&final_path).await?;
+        if final_meta.size != size {
+            return Err(Error::corrupt_file(
+                final_path.clone(),
+                format!(
+                    "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
+                    version, size, final_meta.size
+                ),
+            ));
+        }
+        let final_size = final_meta.size;
 
         let location = ManifestLocation {
             version,
             path: final_path.clone(),
             size: Some(final_size),
             naming_scheme,
-            e_tag: final_e_tag,
+            e_tag: final_meta.e_tag,
         };
 
         // Step 3: Update the external index to the final path.
@@ -522,33 +518,28 @@ impl ExternalManifestCommitHandler {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_manifest_path.as_ref());
         }
 
-        // The successful-copy path already knows the authoritative size and
-        // intentionally avoids a HEAD for an unstable physical ETag. The
-        // source-missing path is different: another helper may have deleted
-        // staging, so confirm the canonical object exists with the selected
-        // staging size before treating its materialization as committed.
-        let (final_size, final_e_tag) = if copied {
-            (size, None)
-        } else {
-            let final_meta = store.head(&final_manifest_path).await?;
-            if final_meta.size != size {
-                return Err(Error::corrupt_file(
-                    final_manifest_path.clone(),
-                    format!(
-                        "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
-                        version, size, final_meta.size
-                    ),
-                ));
-            }
-            (final_meta.size, final_meta.e_tag)
-        };
+        // As in the direct writer path, HEAD verifies the selected size and
+        // gives this process a cache-scoping generation. The token is returned
+        // to the caller but is never published as logical metadata in the
+        // external index, where a later identical overwrite would stale it.
+        let final_meta = store.head(&final_manifest_path).await?;
+        if final_meta.size != size {
+            return Err(Error::corrupt_file(
+                final_manifest_path.clone(),
+                format!(
+                    "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
+                    version, size, final_meta.size
+                ),
+            ));
+        }
+        let final_size = final_meta.size;
 
         let location = ManifestLocation {
             version,
             path: final_manifest_path,
             size: Some(final_size),
             naming_scheme,
-            e_tag: final_e_tag,
+            e_tag: final_meta.e_tag,
         };
 
         // Step 2: point the external index at the final location. As in
@@ -1234,9 +1225,10 @@ mod tests {
 
         // The writer created generation E1. While its final index update is
         // paused, a reader observes the DDB-selected staging path and performs
-        // the same immutable copy, producing generation E2. Neither helper
-        // needs to publish or even fetch those tokens. Both copies have exactly
-        // the same bytes; only their physical object generations differ.
+        // the same immutable copy, producing generation E2. Each helper returns
+        // the generation it observed for local cache scoping, but neither
+        // publishes that token. Both copies have exactly the same bytes; only
+        // their physical object generations differ.
         let reader_location = handler
             .resolve_version_location(&base_path, version, object_store.inner.as_ref())
             .await
@@ -1263,8 +1255,8 @@ mod tests {
             first_generation.e_tag, final_meta.e_tag,
             "the deterministic race must create a new physical generation"
         );
-        assert_eq!(writer_location.e_tag, None);
-        assert_eq!(reader_location.e_tag, None);
+        assert_eq!(writer_location.e_tag, first_generation.e_tag);
+        assert_eq!(reader_location.e_tag, final_meta.e_tag);
         assert_eq!(indexed.path, final_path);
         assert_eq!(indexed.size, Some(final_meta.size));
         assert_eq!(
