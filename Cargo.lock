@@ -4852,7 +4852,6 @@ dependencies = [
  "lance-table",
  "lance-testing",
  "lance-tokenizer",
- "libsais-rs",
  "log",
  "ndarray",
  "num-traits",
@@ -5254,15 +5253,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "libsais-rs"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40fe164dbd47ea0c20e78a121c980ef673326905f1d4fba55e3645a20ef6717f"
-dependencies = [
- "rayon",
 ]
 
 [[package]]

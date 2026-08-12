@@ -47,7 +47,6 @@ lance-file.workspace = true
 lance-geo = { workspace = true, optional = true }
 lance-io.workspace = true
 lance-bitpacking.workspace = true
-libsais-rs = "0.2"
 lance-linalg.workspace = true
 lance-select.workspace = true
 lance-tokenizer.workspace = true
