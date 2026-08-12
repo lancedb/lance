@@ -136,6 +136,24 @@ impl ScanPlanningContext {
         &self.take_settings
     }
 
+    /// The subset of `segments` that could contribute a row this scan is allowed to return.
+    ///
+    /// A segment with no fragment bitmap predates the field, so its coverage is unknown and it has
+    /// to be kept.
+    pub fn reachable_segments(&self, segments: &[IndexMetadata]) -> Vec<IndexMetadata> {
+        let target = RoaringBitmap::from_iter(self.fragments.iter().map(|f| f.id as u32));
+        segments
+            .iter()
+            .filter(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|covered| !covered.is_disjoint(&target))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn fts_index(
         &self,
         column: &str,

@@ -109,6 +109,9 @@ fn optimizer_rules(
         // Before PushDownFilter, so a prefilter predicate is still a `Filter` node that gets
         // duplicated onto both branches; each branch's scan then absorbs its own copy.
         Arc::new(rules::SplitPartiallyIndexedSearch::new(context.clone())),
+        // After the split, so the refine lands on the *indexed branch* of a partially-covered
+        // search rather than above the union — the nesting the imperative path produces.
+        Arc::new(rules::ExpandVectorRefine::new(context.clone())),
         Arc::new(SimplifyExpressions::new()),
         Arc::new(PushDownFilter::new()),
         Arc::new(PushDownLimit::new()),
@@ -170,9 +173,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
     }
     if scanner.aggregate.is_some() {
         return unsupported("aggregates");
-    }
-    if scanner.ordering.is_some() {
-        return unsupported("ordering");
     }
     if scanner.include_deleted_rows {
         return unsupported("include_deleted_rows");

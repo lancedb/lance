@@ -22,6 +22,7 @@ use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
 use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array, gen_batch};
 
 use crate::Result;
+use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::{Dataset, Scanner};
 use crate::utils::test::assert_plan_node_equals;
 
@@ -232,17 +233,22 @@ async fn test_flat_knn_plan() {
     // The projection below the search is narrowed to `[vec, _rowid]` by DataFusion's
     // `optimize_projections` reaching through the extension node via `necessary_children_exprs`;
     // `i` and `s` are fetched afterwards by the take.
+    //
+    // The outer `SortExec` restates the distance ordering above the take. It survives because
+    // `FilteredReadExec` advertises no output ordering, so DataFusion cannot see that the take
+    // already emits rows in the order the top-k produced them.
     assert_logical_plan(
         &dataset,
         |scan| scan.nearest("vec", &query_vector(), 5),
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@1 as _distance]
-  LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
-    ProjectionExec: expr=[_rowid@1 as _rowid, _distance@2 as _distance]
-      FilterExec: _distance@2 IS NOT NULL
-        SortExec: TopK(fetch=5), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST], preserve_partitioning=[false]
-          KNNVectorDistance: metric=l2
-            LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-            row_id=true, row_addr=false, full_filter=--, refine_filter=--",
+  SortExec: expr=[_distance@1 ASC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
+    LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
+      ProjectionExec: expr=[_rowid@1 as _rowid, _distance@2 as _distance]
+        FilterExec: _distance@2 IS NOT NULL
+          SortExec: TopK(fetch=5), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST], preserve_partitioning=[false]
+            KNNVectorDistance: metric=l2
+              LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
+              row_id=true, row_addr=false, full_filter=--, refine_filter=--",
     )
     .await
     .unwrap();
@@ -1127,17 +1133,52 @@ async fn test_paths_agree_on_vector_filter_prefiltering_an_fts_search() {
 async fn test_unsupported_shape_is_rejected() {
     let dataset = test_dataset().await;
     let mut scan = dataset.scan();
-    scan.order_by(Some(vec![
-        crate::dataset::scanner::ColumnOrdering::asc_nulls_first("i".into()),
-    ]))
-    .unwrap();
+    scan.with_row_id().include_deleted_rows();
 
     let err = super::create_plan(&scan).await.unwrap_err();
     assert!(
         matches!(err, crate::Error::NotSupported { .. }),
         "expected NotSupported, got {err:?}"
     );
-    assert!(err.to_string().contains("ordering"), "{err}");
+    assert!(err.to_string().contains("include_deleted_rows"), "{err}");
+}
+
+#[tokio::test]
+async fn test_paths_agree_on_ordering() {
+    let dataset = test_dataset().await;
+    assert_paths_agree(&dataset, |scan| {
+        scan.project(&["s", "i"])?
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("i".into())]))
+    })
+    .await
+    .unwrap();
+}
+
+/// A limit must take the first rows *of the ordering*, which is only true if the sort is below the
+/// limit. It also blocks the scan-range pushdown a bare limit would get.
+#[tokio::test]
+async fn test_paths_agree_on_ordering_with_limit() {
+    let dataset = test_dataset().await;
+    assert_paths_agree(&dataset, |scan| {
+        scan.project(&["s", "i"])?
+            .limit(Some(7), Some(3))?
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("i".into())]))
+    })
+    .await
+    .unwrap();
+}
+
+/// The ordering column is not projected, so it has to be read and then dropped again.
+#[tokio::test]
+async fn test_paths_agree_on_ordering_by_an_unprojected_column() {
+    let dataset = test_dataset().await;
+    assert_paths_agree(&dataset, |scan| {
+        scan.project(&["s"])?
+            .filter("i > 20")?
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("i".into())]))
+    })
+    .await
+    .unwrap();
 }
 
 /// A vector `query_filter` under a *compound* FTS query takes the other rerank branch: the FTS
@@ -1180,4 +1221,43 @@ async fn test_paths_agree_on_an_empty_fragment_selection() {
     })
     .await
     .unwrap();
+}
+
+/// A top-k whose result spans more than one output batch, at real parallelism. Regression test for
+/// the take losing the search's distance ordering: `FilteredReadExec` advertises no output
+/// ordering, so without an explicit sort above it `execute_plan` merges partitions with a plain
+/// coalesce and the global order is scrambled.
+#[tokio::test]
+async fn test_flat_knn_large_limit_stays_globally_ordered() {
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow::datatypes::Float32Type;
+    use arrow_array::cast::AsArray;
+    use lance_index::vector::DIST_COL;
+
+    let dataset = gen_batch()
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+        .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(5_000))
+        .await
+        .unwrap();
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; 16]);
+
+    // BATCH_SIZE_FALLBACK is 8192, so 12k results span batches. The scrambling is a scheduling
+    // race, hence the repeats.
+    for _ in 0..5 {
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, 12_000).unwrap();
+        scan.target_parallelism(8);
+        let batch = run(super::create_plan(&scan).await.unwrap()).await.unwrap();
+
+        assert_eq!(batch.num_rows(), 12_000);
+        let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+        for pair in distances.values().windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "results must be globally sorted by distance, found {} before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
 }

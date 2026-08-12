@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::{provider_as_source, source_as_provider};
-use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{
+    EmptyRelation, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNodeCore,
+};
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::prelude::col;
 use lance_core::ROW_ID;
@@ -53,7 +55,10 @@ impl ResolveVectorAccessPath {
         {
             if index.metric == search.distance_type() {
                 return VectorAccessPath::Index {
-                    segments: index.segments.clone(),
+                    // A delta segment covering none of the fragments this scan will touch has
+                    // nothing to contribute, so it is dropped from the fan-out rather than
+                    // searched and discarded.
+                    segments: self.context.reachable_segments(&index.segments),
                 };
             }
             log::warn!(
@@ -90,7 +95,23 @@ impl OptimizerRule for ResolveVectorAccessPath {
             return Ok(Transformed::no(plan));
         }
 
-        let resolved = search.clone().with_resolution(self.resolve(search));
+        // `fast_search` means "answer from indices only". With no usable index there is nothing to
+        // answer from, so the result is empty rather than a brute-force scan. The partially-indexed
+        // case is the same rule applied to one branch, and lives in `SplitPartiallyIndexedSearch`.
+        let resolved = self.resolve(search);
+        if self.context.fast_search()
+            && matches!(resolved, VectorAccessPath::Flat)
+            && self.context.vector_index(&search.query().column).is_none()
+        {
+            return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                EmptyRelation {
+                    produce_one_row: false,
+                    schema: search.schema().clone(),
+                },
+            )));
+        }
+
+        let resolved = search.clone().with_resolution(resolved);
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(resolved),
         })))
@@ -332,4 +353,94 @@ fn restricts_candidates(plan: &LogicalPlan) -> bool {
         }
     });
     restricts
+}
+
+/// Put the exact re-rank above an indexed search that asked to refine.
+///
+/// `refine_factor` means "over-fetch `k * factor` approximate candidates, then re-score them
+/// exactly and keep the best `k`". The over-fetch is already a lowering detail of the indexed
+/// search; the re-scoring is structure, so it belongs here:
+///
+/// ```text
+/// VectorSearch{Flat, k}                       <- exact re-rank
+///   Projection [_rowid, vec]
+///     LanceTake [vec]
+///       VectorSearch{Index, k, refine_factor} <- over-fetches k * factor
+/// ```
+///
+/// That is the same subtree [`SplitPartiallyIndexedSearch`] builds, which is the point: "re-rank
+/// approximate candidates exactly" is one operation in the logical layer, and both the refine knob
+/// and partial index coverage are reasons to reach for it.
+#[derive(Debug)]
+pub struct ExpandVectorRefine {
+    context: Arc<ScanPlanningContext>,
+}
+
+impl ExpandVectorRefine {
+    pub fn new(context: Arc<ScanPlanningContext>) -> Self {
+        Self { context }
+    }
+}
+
+impl OptimizerRule for ExpandVectorRefine {
+    fn name(&self) -> &str {
+        "expand_vector_refine"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Extension(extension) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() else {
+            return Ok(Transformed::no(plan));
+        };
+        // Only an indexed search produces approximate distances worth refining, and only once.
+        if search.refine_expanded()
+            || search.query().refine_factor.is_none()
+            || !matches!(
+                search.access_path_resolution(),
+                Some(VectorAccessPath::Index { .. })
+            )
+        {
+            return Ok(Transformed::no(plan));
+        }
+
+        let column = &search.query().column;
+        let approximate = LogicalPlan::Extension(Extension {
+            node: Arc::new(search.clone().with_refine_expanded()),
+        });
+        let candidates = LogicalPlanBuilder::new(LogicalPlan::Extension(Extension {
+            node: Arc::new(LanceTakeNode::try_new(
+                approximate,
+                search.dataset().clone(),
+                search
+                    .dataset()
+                    .empty_projection()
+                    .union_column(column, OnMissing::Error)?,
+                self.context.take_settings().clone(),
+            )?),
+        }))
+        // Drop the approximate `_distance` so the re-rank does not produce a second one.
+        .project(vec![col(ROW_ID), col(column)])?
+        .build()?;
+
+        Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+            node: Arc::new(
+                search
+                    .clone()
+                    .with_input(candidates)
+                    .with_resolution(VectorAccessPath::Flat)
+                    .with_prefilter(PrefilterSourceKind::None)
+                    .with_refine_expanded(),
+            ),
+        })))
+    }
 }

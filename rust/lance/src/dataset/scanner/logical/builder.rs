@@ -11,9 +11,11 @@
 
 use std::sync::Arc;
 
+use datafusion::common::Column;
 use datafusion::datasource::provider_as_source;
+use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::{
-    Expr, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNodeCore,
+    Expr, Extension, LogicalPlan, LogicalPlanBuilder, SortExpr, UserDefinedLogicalNodeCore,
 };
 
 use datafusion::prelude::col;
@@ -26,8 +28,9 @@ use super::fts;
 use super::nodes::{LanceTakeNode, VectorAccessPath, VectorRerankNode, VectorSearchNode};
 use super::prepare::PreparedQueries;
 use super::source::{LanceScanSource, ScanSourceOptions};
-use crate::Result;
-use crate::dataset::Scanner;
+use crate::dataset::scanner::ColumnOrdering;
+use crate::dataset::{Dataset, Scanner};
+use crate::{Error, Result};
 
 /// Relation name for the scan leaf. Column references in filters and projections are
 /// unqualified, so this only ever shows up in `EXPLAIN` output.
@@ -53,7 +56,13 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     // final projection trims them back off. The imperative path splits this across two takes
     // (`pre_filter_projection` then the output projection); one take plus a projection is the same
     // set of reads.
-    let mut postfilter_columns: Vec<String> = Vec::new();
+    // A sort sits above any search, so its columns have to survive late materialization too.
+    let mut postfilter_columns: Vec<String> = scanner
+        .ordering
+        .iter()
+        .flatten()
+        .map(|column| column.column_name.clone())
+        .collect();
     if !prefilter {
         if let Some(filter) = &filter {
             postfilter_columns.extend(filter.column_refs().iter().map(|c| c.name.clone()));
@@ -122,11 +131,20 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
                 query.clone(),
             )?),
         };
-        with_take(
+        let taken = with_take(
             LogicalPlanBuilder::new(searched),
             scanner,
             &postfilter_columns,
-        )?
+        )?;
+        // A vector search promises rows in distance order, and the take between the search and
+        // here does not preserve it: `FilteredReadExec` reports no output ordering, so a
+        // multi-partition input gets a plain coalesce and the order is lost. Stating the ordering
+        // in the plan is the only way to hold the contract — inheriting it from whichever physical
+        // operator happened to sort is what made the imperative path's version of this fragile.
+        taken.sort([
+            col(DIST_COL).sort(true, false),
+            col(ROW_ID).sort(true, false),
+        ])?
     } else {
         LogicalPlanBuilder::new(source)
     };
@@ -152,6 +170,12 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
         if let Some(filter) = filter {
             builder = builder.filter(filter)?;
         }
+    }
+
+    // Sort below limit/offset, matching the imperative path: the limit takes the first rows of the
+    // ordering, not an arbitrary subset that is then ordered.
+    if let Some(ordering) = &scanner.ordering {
+        builder = builder.sort(ordering_exprs(ordering, &scanner.dataset)?)?;
     }
 
     if scanner.limit.unwrap_or(0) > 0 || scanner.offset.is_some() {
@@ -211,6 +235,32 @@ fn with_take(
         take_settings(scanner),
     )?;
     Ok(LogicalPlanBuilder::new(extension(take)))
+}
+
+/// The scanner's `order_by` as logical sort expressions.
+///
+/// A nested ordering column ("outer.inner") becomes a chain of `get_field` calls rather than a
+/// column reference, which is also what makes projection pushdown keep the outer struct.
+fn ordering_exprs(ordering: &[ColumnOrdering], dataset: &Dataset) -> Result<Vec<SortExpr>> {
+    ordering
+        .iter()
+        .map(|column| {
+            let path = dataset
+                .schema()
+                .resolve_case_insensitive(&column.column_name)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Field '{}' not found in schema",
+                        column.column_name
+                    ))
+                })?;
+            let mut expr = Expr::Column(Column::new_unqualified(&path[0].name));
+            for nested in &path[1..] {
+                expr = get_field(expr, nested.name.clone());
+            }
+            Ok(expr.sort(column.ascending, column.nulls_first))
+        })
+        .collect()
 }
 
 fn extension(node: impl UserDefinedLogicalNodeCore) -> LogicalPlan {
@@ -291,5 +341,6 @@ fn source_options(scanner: &Scanner) -> ScanSourceOptions {
         fragments: scanner.fragments.clone().map(Arc::new),
         index_expr_result_format: scanner.index_expr_result_format(),
         use_scalar_index: scanner.use_scalar_index,
+        fast_search: scanner.fast_search,
     }
 }

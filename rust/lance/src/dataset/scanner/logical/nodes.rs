@@ -160,6 +160,11 @@ pub struct VectorSearchNode {
     /// optimizer's next pass, and the branch's scan — already narrowed to `[_rowid]` — cannot
     /// supply the vectors the nested brute-force branch would ask for.
     input_fully_indexed: bool,
+    /// Whether [`ExpandVectorRefine`](super::rules::ExpandVectorRefine) has already put the exact
+    /// re-rank above this node. The third such marker in the module, and for the same reason as
+    /// `input_fully_indexed`: a rule that rewrites structure must recognize its own output, since
+    /// the optimizer runs the rule list to fixpoint.
+    refine_expanded: bool,
     schema: DFSchemaRef,
 }
 
@@ -189,6 +194,7 @@ impl VectorSearchNode {
             resolution: None,
             prefilter: PrefilterSourceKind::default(),
             input_fully_indexed: false,
+            refine_expanded: false,
             schema,
         })
     }
@@ -214,6 +220,15 @@ impl VectorSearchNode {
 
     pub fn input_fully_indexed(&self) -> bool {
         self.input_fully_indexed
+    }
+
+    pub fn with_refine_expanded(mut self) -> Self {
+        self.refine_expanded = true;
+        self
+    }
+
+    pub fn refine_expanded(&self) -> bool {
+        self.refine_expanded
     }
 
     pub fn input(&self) -> &LogicalPlan {
@@ -346,6 +361,7 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             resolution: self.resolution.clone(),
             prefilter: self.prefilter,
             input_fully_indexed: self.input_fully_indexed,
+            refine_expanded: self.refine_expanded,
             schema: self.schema.clone(),
         })
     }

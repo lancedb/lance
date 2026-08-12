@@ -20,7 +20,9 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use lance_arrow::SchemaExt as ArrowSchemaExt;
 use lance_core::datatypes::{OnMissing, Projection};
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{
+    ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD,
+};
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_select::result::IndexExprResultWireFormat;
@@ -49,16 +51,21 @@ pub struct ScanSourceOptions {
     pub fragments: Option<Arc<Vec<Fragment>>>,
     pub index_expr_result_format: IndexExprResultWireFormat,
     pub use_scalar_index: bool,
+    /// Answer from indices only: fragments a scalar index does not cover are skipped rather than
+    /// scanned. Only meaningful alongside an index query.
+    pub fast_search: bool,
 }
 
 pub struct LanceScanSource {
     dataset: Arc<Dataset>,
     options: ScanSourceOptions,
-    /// Dataset schema plus `_rowid` and `_rowaddr`. DataFusion's projection indices index into
-    /// this, so it must stay stable for the life of the provider.
+    /// Dataset schema plus the system columns the leaf can produce. DataFusion's projection
+    /// indices index into this, so it must stay stable for the life of the provider.
     full_schema: SchemaRef,
     row_id_idx: usize,
     row_addr_idx: usize,
+    created_version_idx: usize,
+    updated_version_idx: usize,
 }
 
 impl std::fmt::Debug for LanceScanSource {
@@ -75,8 +82,12 @@ impl LanceScanSource {
         let base = ArrowSchema::from(dataset.schema());
         let full_schema = base
             .try_with_column(ROW_ID_FIELD.clone())?
-            .try_with_column(ROW_ADDR_FIELD.clone())?;
-        let row_addr_idx = full_schema.fields.len() - 1;
+            .try_with_column(ROW_ADDR_FIELD.clone())?
+            .try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone())?
+            .try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())?;
+        let updated_version_idx = full_schema.fields.len() - 1;
+        let created_version_idx = updated_version_idx - 1;
+        let row_addr_idx = created_version_idx - 1;
         let row_id_idx = row_addr_idx - 1;
         Ok(Self {
             dataset,
@@ -84,6 +95,8 @@ impl LanceScanSource {
             full_schema: Arc::new(full_schema),
             row_id_idx,
             row_addr_idx,
+            created_version_idx,
+            updated_version_idx,
         })
     }
 
@@ -102,6 +115,8 @@ impl LanceScanSource {
             full_schema: self.full_schema.clone(),
             row_id_idx: self.row_id_idx,
             row_addr_idx: self.row_addr_idx,
+            created_version_idx: self.created_version_idx,
+            updated_version_idx: self.updated_version_idx,
         }
     }
 
@@ -119,6 +134,10 @@ impl LanceScanSource {
                 result = result.with_row_id();
             } else if *idx == self.row_addr_idx {
                 result = result.with_row_addr();
+            } else if *idx == self.created_version_idx {
+                result.with_row_created_at_version = true;
+            } else if *idx == self.updated_version_idx {
+                result.with_row_last_updated_at_version = true;
             } else {
                 columns.push(self.full_schema.field(*idx).name());
             }
@@ -191,6 +210,9 @@ impl LanceScanSource {
         }
         if let Some(io_buffer_size) = self.options.io_buffer_size {
             read_options = read_options.with_io_buffer_size(io_buffer_size);
+        }
+        if self.options.fast_search && filter_plan.has_index_query() {
+            read_options = read_options.with_only_indexed_fragments();
         }
         if let Some(limit) = limit
             && !filter_plan.has_any_filter()
