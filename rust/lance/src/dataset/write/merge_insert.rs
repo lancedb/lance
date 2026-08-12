@@ -2976,6 +2976,7 @@ impl Merger {
     fn extract_selections(
         &self,
         combined_batch: &RecordBatch,
+        right_offset: usize,
     ) -> Result<(BooleanArray, BooleanArray, BooleanArray)> {
         // The outer join distinguishes its three cases by which side's join
         // keys were NULL-padded: a present row always has non-null keys, while
@@ -2987,13 +2988,16 @@ impl Merger {
         // column as an absent join side, silently dropping every matched row
         // (https://github.com/lancedb/lancedb/issues/3515). The target half is
         // resolved independently because the indexed path keeps dataset-schema
-        // order even when the source fields are reordered.
+        // order even when the source fields are reordered. Restrict that lookup
+        // to the target half because a valid source field can have the same
+        // `target_`-prefixed name.
+        let combined_schema = combined_batch.schema();
         let source_key_cols = self
             .params
             .on
             .iter()
             .map(|key| {
-                combined_batch.schema().index_of(key).map_err(|_| {
+                combined_schema.index_of(key).map_err(|_| {
                     Error::internal(format!(
                         "merge insert key column '{}' not found in joined batch",
                         key
@@ -3007,12 +3011,18 @@ impl Merger {
             .iter()
             .map(|key| {
                 let target_key = format!("target_{key}");
-                combined_batch.schema().index_of(&target_key).map_err(|_| {
-                    Error::internal(format!(
-                        "merge insert target key column '{}' not found in joined batch",
-                        target_key
-                    ))
-                })
+                combined_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .skip(right_offset)
+                    .find_map(|(index, field)| (field.name() == &target_key).then_some(index))
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "merge insert target key column '{}' not found in joined batch",
+                            target_key
+                        ))
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -3054,7 +3064,7 @@ impl Merger {
         let right_cols_with_id = Vec::from_iter(right_offset..num_fields);
 
         let mut batches = Vec::with_capacity(2);
-        let (left_only, in_both, right_only) = self.extract_selections(&batch)?;
+        let (left_only, in_both, right_only) = self.extract_selections(&batch, right_offset)?;
 
         // There is no contention on this mutex.  We're only using it to bypass the rust
         // borrow checker (the stream needs to be `sync` since it crosses an await point)
@@ -4726,8 +4736,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_indexed_partial_merge_with_reordered_source() {
-        let target =
-            record_batch!(("id", UInt64, [1]), ("a", Int32, [None]), ("b", Int32, [7])).unwrap();
+        let target = record_batch!(
+            ("id", UInt64, [1]),
+            ("target_id", Int32, [9]),
+            ("b", Int32, [7])
+        )
+        .unwrap();
         let mut dataset = InsertBuilder::new("memory://")
             .execute(vec![target])
             .await
@@ -4743,7 +4757,7 @@ mod tests {
             .await
             .unwrap();
 
-        let source = record_batch!(("a", Int32, [42]), ("id", UInt64, [1])).unwrap();
+        let source = record_batch!(("target_id", Int32, [None]), ("id", UInt64, [1])).unwrap();
         let source_schema = source.schema();
         let (dataset, stats) =
             MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
@@ -4761,12 +4775,12 @@ mod tests {
         assert_eq!(stats.num_deleted_rows, 0);
         let result = dataset
             .scan()
-            .project(&["a"])
+            .project(&["target_id"])
             .unwrap()
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result["a"].as_primitive::<Int32Type>().value(0), 42);
+        assert!(result["target_id"].as_primitive::<Int32Type>().is_null(0));
     }
 
     #[tokio::test]
