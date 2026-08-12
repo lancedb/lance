@@ -261,6 +261,9 @@ impl ObjectStoreRegistry {
         self.misses.fetch_add(1, Ordering::Relaxed);
 
         let mut store = provider.new_store(base_path, params).await?;
+        // The active provider's cache identity is authoritative for the resolved store and
+        // every wrapper applied to it.
+        store.store_prefix.clone_from(&cache_path);
 
         store.inner = store.inner.traced();
 
@@ -378,6 +381,7 @@ impl ObjectStoreRegistry {
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     use super::*;
     use object_store::memory::InMemory;
@@ -426,6 +430,52 @@ mod tests {
             } else {
                 Ok(store)
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CustomPrefixProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for CustomPrefixProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            _params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            Ok(ObjectStore::new(
+                Arc::new(InMemory::new()),
+                base_path,
+                None,
+                None,
+                false,
+                true,
+                1,
+                0,
+                None,
+            ))
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            _url: &Url,
+            _storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            Ok("authoritative-prefix".to_string())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PrefixCapturingWrapper(Arc<Mutex<Option<String>>>);
+
+    impl crate::object_store::WrappingObjectStore for PrefixCapturingWrapper {
+        fn wrap(
+            &self,
+            store_prefix: &str,
+            original: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            *self.0.lock().unwrap() = Some(store_prefix.to_string());
+            original
         }
     }
 
@@ -506,6 +556,28 @@ mod tests {
             cached.native_directory_path(&path),
             Some(PathBuf::from("/native/table.lance"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_registry_wrapper_uses_provider_prefix() {
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert("custom-prefix", Arc::new(CustomPrefixProvider));
+        let captured = Arc::new(Mutex::new(None));
+        let params = ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(PrefixCapturingWrapper(captured.clone()))),
+            ..Default::default()
+        };
+
+        let store = registry
+            .get_store(Url::parse("custom-prefix://bucket").unwrap(), &params)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("authoritative-prefix")
+        );
+        assert_eq!(store.store_prefix, "authoritative-prefix");
     }
 
     #[test]
