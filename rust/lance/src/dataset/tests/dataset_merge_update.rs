@@ -1639,20 +1639,31 @@ async fn test_merge_insert_with_reordered_columns_and_index() {
     final_dataset.validate().await.unwrap();
 }
 
-/// A complete merge_insert source remains a full-schema update when its fields
-/// are ordered differently from the dataset schema.
+/// Reordered merge_insert sources invalidate LabelList coverage for both full-row
+/// and in-place column rewrites. Complete sources are also canonicalized before
+/// reaching both the current and frozen Legacy writers.
 ///
 /// Regression test for https://github.com/lance-format/lance/issues/8502.
+#[rstest]
+#[case::legacy_full(LanceFileVersion::Legacy, true, 2)]
+#[case::stable_full(LanceFileVersion::Stable, true, 2)]
+#[case::v2_1_partial(LanceFileVersion::V2_1, false, 1)]
 #[tokio::test]
-async fn test_merge_insert_reordered_full_schema_invalidates_label_list_index() {
+async fn test_merge_insert_reordered_schema_invalidates_label_list_index(
+    #[case] data_storage_version: LanceFileVersion,
+    #[case] is_full_schema: bool,
+    #[case] expected_fragments: usize,
+) {
     let list_field = ArrowField::new(
         "labels",
         DataType::LargeList(Arc::new(ArrowField::new("item", DataType::LargeUtf8, true))),
         true,
     );
+    let untouched_field = ArrowField::new("untouched", DataType::Utf8, true);
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::UInt64, false),
         list_field.clone(),
+        untouched_field.clone(),
     ]));
 
     let make_labels = |values: &[&str]| {
@@ -1670,11 +1681,21 @@ async fn test_merge_insert_reordered_full_schema_invalidates_label_list_index() 
         vec![
             Arc::new(UInt64Array::from(vec![1, 2])) as ArrayRef,
             make_labels(&["a", "b"]),
+            Arc::new(StringArray::from(vec!["u", "v"])) as ArrayRef,
         ],
     )
     .unwrap();
     let reader = RecordBatchIterator::new([Ok(initial)], schema.clone());
-    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
 
     dataset
         .create_index(
@@ -1697,18 +1718,17 @@ async fn test_merge_insert_reordered_full_schema_invalidates_label_list_index() 
         .await
         .unwrap();
 
-    let reordered_schema = Arc::new(ArrowSchema::new(vec![
-        list_field,
-        ArrowField::new("id", DataType::UInt64, false),
-    ]));
-    let update = RecordBatch::try_new(
-        reordered_schema.clone(),
-        vec![
-            make_labels(&["z"]),
-            Arc::new(UInt64Array::from(vec![2])) as ArrayRef,
-        ],
-    )
-    .unwrap();
+    let mut update_fields = vec![list_field, ArrowField::new("id", DataType::UInt64, false)];
+    let mut update_columns = vec![
+        make_labels(&["z"]),
+        Arc::new(UInt64Array::from(vec![2])) as ArrayRef,
+    ];
+    if is_full_schema {
+        update_fields.push(untouched_field);
+        update_columns.push(Arc::new(StringArray::from(vec!["v"])) as ArrayRef);
+    }
+    let reordered_schema = Arc::new(ArrowSchema::new(update_fields));
+    let update = RecordBatch::try_new(reordered_schema.clone(), update_columns).unwrap();
     let reader = RecordBatchIterator::new([Ok(update)], reordered_schema);
     let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_owned()])
         .unwrap()
@@ -1722,8 +1742,8 @@ async fn test_merge_insert_reordered_full_schema_invalidates_label_list_index() 
         .unwrap();
     assert_eq!(
         dataset.get_fragments().len(),
-        2,
-        "a reordered complete schema must use the full-row update path"
+        expected_fragments,
+        "the source width must select the expected rewrite path"
     );
 
     async fn matching_ids(dataset: &Dataset, use_scalar_index: bool) -> Vec<u64> {
@@ -1742,6 +1762,127 @@ async fn test_merge_insert_reordered_full_schema_invalidates_label_list_index() 
 
     assert_eq!(matching_ids(&dataset, false).await, vec![2]);
     assert_eq!(matching_ids(&dataset, true).await, vec![2]);
+
+    let row = dataset
+        .scan()
+        .filter("id = 2")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        row["untouched"].as_string::<i32>().value(0),
+        "v",
+        "a partial rewrite must preserve omitted columns"
+    );
+}
+
+/// A complete source is matched recursively by field name before it reaches
+/// either merge execution path, so reordered struct children keep their values.
+#[rstest]
+#[tokio::test]
+async fn test_merge_insert_nested_reorder_preserves_values(#[values(false, true)] use_index: bool) {
+    let target_struct_fields = Fields::from(vec![
+        ArrowField::new("a", DataType::Int32, false),
+        ArrowField::new("b", DataType::Int32, false),
+    ]);
+    let target_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("s", DataType::Struct(target_struct_fields.clone()), false),
+    ]));
+    let initial_struct = StructArray::new(
+        target_struct_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        ],
+        None,
+    );
+    let initial = RecordBatch::try_new(
+        target_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(initial_struct) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(initial)], target_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    if use_index {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_owned()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let source_struct_fields = Fields::from(vec![
+        ArrowField::new("b", DataType::Int32, false),
+        ArrowField::new("a", DataType::Int32, false),
+    ]);
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", DataType::Struct(source_struct_fields.clone()), false),
+        ArrowField::new("id", DataType::Int32, false),
+    ]));
+    let source_struct = StructArray::new(
+        source_struct_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![400])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![300])) as ArrayRef,
+        ],
+        None,
+    );
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(source_struct) as ArrayRef,
+            Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(source)], source_schema);
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_owned()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    let (dataset, _) = merge_job
+        .execute(reader_to_stream(Box::new(reader)))
+        .await
+        .unwrap();
+
+    let row = dataset
+        .scan()
+        .filter("id = 2")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(row.num_rows(), 1);
+    let values = row["s"].as_struct();
+    assert_eq!(
+        values
+            .column_by_name("a")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .value(0),
+        300
+    );
+    assert_eq!(
+        values
+            .column_by_name("b")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .value(0),
+        400
+    );
 }
 
 /// With stable row ids, updating a top-level struct column keeps a scalar index on a
@@ -2095,6 +2236,18 @@ async fn test_merge_insert_nested_index_stable_row_id() {
         )
         .await
         .unwrap();
+    // Force the indexed slow merge path whose rewrite metadata must include
+    // nested leaf ids as well as top-level fields.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
 
     // Sanity: index finds id=2 for s.x = 20.
     let pre = dataset
@@ -2106,17 +2259,32 @@ async fn test_merge_insert_nested_index_stable_row_id() {
         .unwrap();
     assert_eq!(pre.num_rows(), 1, "precondition: s.x=20 should match id=2");
 
-    // Full-row merge_insert update of id=2 changing s.x 20 -> 999 (pure rewrite-rows fragment).
+    // Full-row merge_insert update of id=2 changing s.x 20 -> 999. Supplying
+    // `(s, id)` also verifies reordered complete sources stay on RewriteRows.
     let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
         .unwrap()
         .when_matched(WhenMatched::UpdateAll)
         .when_not_matched(WhenNotMatched::DoNothing)
         .try_build()
         .unwrap();
-    let reader = Box::new(RecordBatchIterator::new(
-        vec![Ok(make_batch(vec![2], vec![999]))],
-        schema.clone(),
-    ));
+    let reordered_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", DataType::Struct(struct_fields.clone()), false),
+        ArrowField::new("id", DataType::Int32, false),
+    ]));
+    let updated_struct = StructArray::new(
+        struct_fields,
+        vec![Arc::new(Int32Array::from(vec![999])) as ArrayRef],
+        None,
+    );
+    let source = RecordBatch::try_new(
+        reordered_schema.clone(),
+        vec![
+            Arc::new(updated_struct) as ArrayRef,
+            Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(vec![Ok(source)], reordered_schema));
     let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
 
     // The rewritten fragment must NOT be covered by the nested `s.x` index, so

@@ -71,7 +71,7 @@ use arrow_array::{
     BooleanArray, RecordBatch, RecordBatchIterator, StructArray, UInt32Array, UInt64Array,
     cast::AsArray, types::UInt64Type,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
 use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -149,6 +149,67 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+/// Build a source schema in target field order while preserving the source's
+/// logical leaf types. The latter matters for extension columns such as Arrow
+/// JSON, whose write input is Utf8 while the dataset's physical type is binary.
+pub(crate) fn canonical_source_schema(
+    source: &Schema,
+    target: &Schema,
+) -> std::result::Result<Schema, ArrowError> {
+    fn canonical_field(source: &Field, target: &Field) -> std::result::Result<Field, ArrowError> {
+        let data_type = match (source.data_type(), target.data_type()) {
+            (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
+                let fields = target_fields
+                    .iter()
+                    .map(|target_field| {
+                        let source_field = source_fields
+                            .iter()
+                            .find(|field| field.name() == target_field.name())
+                            .ok_or_else(|| {
+                                ArrowError::SchemaError(format!(
+                                    "field {} does not exist in source struct {}",
+                                    target_field.name(),
+                                    source.name()
+                                ))
+                            })?;
+                        canonical_field(source_field, target_field).map(Arc::new)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                DataType::Struct(fields.into())
+            }
+            (DataType::List(source_item), DataType::List(target_item)) => {
+                DataType::List(Arc::new(canonical_field(source_item, target_item)?))
+            }
+            (DataType::LargeList(source_item), DataType::LargeList(target_item)) => {
+                DataType::LargeList(Arc::new(canonical_field(source_item, target_item)?))
+            }
+            (
+                DataType::FixedSizeList(source_item, size),
+                DataType::FixedSizeList(target_item, _),
+            ) => {
+                DataType::FixedSizeList(Arc::new(canonical_field(source_item, target_item)?), *size)
+            }
+            _ => source.data_type().clone(),
+        };
+        Ok(source.clone().with_data_type(data_type))
+    }
+
+    let fields = target
+        .fields()
+        .iter()
+        .map(|target_field| {
+            let source_field = source.field_with_name(target_field.name()).map_err(|_| {
+                ArrowError::SchemaError(format!(
+                    "field {} does not exist in source schema",
+                    target_field.name()
+                ))
+            })?;
+            canonical_field(source_field, target_field).map(Arc::new)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Schema::new_with_metadata(fields, source.metadata().clone()))
+}
 
 struct UpdatedRowAddrReconciler<I>
 where
@@ -1827,6 +1888,16 @@ impl MergeInsertJob {
             }
         }
 
+        // Data files record physical leaf fields, while an index can be attached to
+        // a logical parent such as a list. Include every affected ancestor so index
+        // coverage is pruned for the complete logical column that was rewritten.
+        let directly_updated_fields = all_fields_updated.iter().copied().collect::<Vec<_>>();
+        for field_id in directly_updated_fields {
+            if let Some(ancestry) = dataset.schema().field_ancestry_by_id(field_id as i32) {
+                all_fields_updated.extend(ancestry.into_iter().map(|field| field.id as u32));
+            }
+        }
+
         let new_fragments = Arc::try_unwrap(new_fragments)
             .unwrap()
             .into_inner()
@@ -2367,6 +2438,26 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
+        let source = if is_full_schema {
+            let target_schema = Schema::from(full_schema);
+            let canonical_schema = Arc::new(canonical_source_schema(
+                source_schema.as_ref(),
+                &target_schema,
+            )?);
+            let projection_schema = canonical_schema.clone();
+            let projected = source.map(move |batch| {
+                batch.and_then(|batch| {
+                    batch
+                        .project_by_schema(projection_schema.as_ref())
+                        .map_err(DataFusionError::from)
+                })
+            });
+            Box::pin(RecordBatchStreamAdapter::new(canonical_schema, projected))
+                as SendableRecordBatchStream
+        } else {
+            source
+        };
+        let source_schema = source.schema();
         let joined = self.create_joined_stream(source).await?;
         let merger = Merger::try_new(
             self.params.clone(),
@@ -2428,8 +2519,7 @@ impl MergeInsertJob {
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
@@ -2573,8 +2663,7 @@ impl MergeInsertJob {
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
