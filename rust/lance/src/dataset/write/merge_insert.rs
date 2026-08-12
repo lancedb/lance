@@ -4734,14 +4734,33 @@ mod tests {
         assert_eq!(n_indexed, UPD, "expected {UPD} rows flipped to 'indexed'");
     }
 
+    #[rstest::rstest]
+    #[case::reordered_null_payload(false, Some(42))]
+    #[case::target_name_collision(true, None)]
     #[tokio::test]
-    async fn test_indexed_partial_merge_with_reordered_source() {
-        let target = record_batch!(
-            ("id", UInt64, [1]),
-            ("target_id", Int32, [9]),
-            ("b", Int32, [7])
-        )
-        .unwrap();
+    async fn test_indexed_partial_merge_with_reordered_source(
+        #[case] has_target_name_collision: bool,
+        #[case] expected_payload: Option<i32>,
+    ) {
+        let (target, source, payload_column) = if has_target_name_collision {
+            (
+                record_batch!(
+                    ("id", UInt64, [1]),
+                    ("target_id", Int32, [9]),
+                    ("b", Int32, [7])
+                )
+                .unwrap(),
+                record_batch!(("target_id", Int32, [None]), ("id", UInt64, [1])).unwrap(),
+                "target_id",
+            )
+        } else {
+            (
+                record_batch!(("id", UInt64, [1]), ("a", Int32, [None]), ("b", Int32, [7]))
+                    .unwrap(),
+                record_batch!(("a", Int32, [42]), ("id", UInt64, [1])).unwrap(),
+                "a",
+            )
+        };
         let mut dataset = InsertBuilder::new("memory://")
             .execute(vec![target])
             .await
@@ -4757,7 +4776,6 @@ mod tests {
             .await
             .unwrap();
 
-        let source = record_batch!(("target_id", Int32, [None]), ("id", UInt64, [1])).unwrap();
         let source_schema = source.schema();
         let (dataset, stats) =
             MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
@@ -4775,12 +4793,14 @@ mod tests {
         assert_eq!(stats.num_deleted_rows, 0);
         let result = dataset
             .scan()
-            .project(&["target_id"])
+            .project(&[payload_column])
             .unwrap()
             .try_into_batch()
             .await
             .unwrap();
-        assert!(result["target_id"].as_primitive::<Int32Type>().is_null(0));
+        let payload = result[payload_column].as_primitive::<Int32Type>();
+        let actual_payload = (!payload.is_null(0)).then(|| payload.value(0));
+        assert_eq!(actual_payload, expected_payload);
     }
 
     #[tokio::test]
