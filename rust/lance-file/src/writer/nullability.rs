@@ -242,6 +242,21 @@ mod tests {
         assert!(verify_visible_nullability(&array.slice(2, 1), &field).is_err());
     }
 
+    /// Every slot masked: no null below is a value of the child, so a strict
+    /// child field is satisfied. `hidden` is `Some` on any path that masks,
+    /// so the `None` arm of `has_visible_null` never sees a hidden slot.
+    #[test]
+    fn test_fully_masked_parent_has_no_visible_null() {
+        let relaxed = Fields::from(vec![ArrowField::new("x", DataType::Int32, true)]);
+        let array = StructArray::new(
+            relaxed,
+            vec![Arc::new(Int32Array::from(vec![None, None, None])) as ArrayRef],
+            Some(NullBuffer::from(vec![false, false, false])),
+        );
+
+        assert!(verify_visible_nullability(&array, &strict_struct_field()).is_ok());
+    }
+
     /// A sliced list keeps its full values array; only nulls inside a
     /// referenced, visible window may reject.
     #[test]
