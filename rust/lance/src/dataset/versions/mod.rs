@@ -18,7 +18,7 @@ use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
-use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::chunker::{break_stream, chunk_stream, chunk_stream_with_sizes};
 use lance_file::{
     version::ConcreteFileVersion,
     versions as file_versions,
@@ -123,6 +123,7 @@ pub async fn write_fragments(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let version_name = format!("{version:?}");
     let schema = write::prepare_write_schema(
@@ -150,6 +151,7 @@ pub async fn write_fragments(
         params,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await?;
     Ok((fragments, schema))
@@ -166,17 +168,41 @@ pub async fn write_fragments_direct(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<Vec<Fragment>> {
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
-    let buffered_reader = match version {
-        ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
-            .map_ok(|batch| vec![batch])
-            .boxed(),
+    let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
+        if params.max_rows_per_group == 0 {
+            return Err(Error::invalid_input(
+                "max_rows_per_group must be greater than zero when file row counts are specified",
+            ));
+        }
+        let mut batch_row_counts = Vec::new();
+        for &file_rows in file_row_counts {
+            if file_rows == 0 {
+                return Err(Error::invalid_input(
+                    "File row counts must be greater than zero",
+                ));
+            }
+            let mut rows_remaining = file_rows;
+            while rows_remaining > 0 {
+                let batch_rows = rows_remaining.min(params.max_rows_per_group);
+                batch_row_counts.push(batch_rows);
+                rows_remaining -= batch_rows;
+            }
+        }
+        chunk_stream_with_sizes(data, batch_row_counts)
+    } else {
+        match version {
+            ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
+                .map_ok(|batch| vec![batch])
+                .boxed(),
+        }
     };
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -197,6 +223,7 @@ pub async fn write_fragments_direct(
         external_base_resolver,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await
 }

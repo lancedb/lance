@@ -31,7 +31,7 @@ use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::num::NonZero;
 use std::sync::Arc;
@@ -607,6 +607,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     mut seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<Vec<Fragment>>
 where
     OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
@@ -638,6 +639,9 @@ where
     let mut bytes_completed: u64 = 0;
     let mut rows_completed: u64 = 0;
     let mut files_written: u32 = 0;
+    let has_file_row_counts = file_row_counts.is_some();
+    let mut file_row_counts = file_row_counts.map(VecDeque::from);
+    let mut rows_remaining_in_planned_file = file_row_counts.as_mut().and_then(VecDeque::pop_front);
 
     // Wrap the loop in an async block so `?` returns into `loop_result` and we
     // can run cleanup before propagating the error.
@@ -661,9 +665,31 @@ where
                     }
                 }
             }
-            for batch in &batch_chunk {
-                num_rows_in_current_file += batch.num_rows() as u32;
-            }
+            let batch_chunk_rows = batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
+            num_rows_in_current_file += batch_chunk_rows as u32;
+
+            let reached_planned_file_boundary = if has_file_row_counts {
+                let rows_remaining = rows_remaining_in_planned_file.as_mut().ok_or_else(|| {
+                    Error::internal(
+                        "Writer received rows after all planned file boundaries were consumed",
+                    )
+                })?;
+                if batch_chunk_rows > *rows_remaining {
+                    return Err(Error::internal(format!(
+                        "Writer chunk of {batch_chunk_rows} rows crossed a planned file boundary with {rows_remaining} rows remaining"
+                    )));
+                }
+                *rows_remaining -= batch_chunk_rows;
+                let reached_boundary = *rows_remaining == 0;
+                if reached_boundary {
+                    rows_remaining_in_planned_file = file_row_counts
+                        .as_mut()
+                        .and_then(VecDeque::pop_front);
+                }
+                reached_boundary
+            } else {
+                false
+            };
 
             if let Some(cb) = &params.write_progress {
                 let current_bytes = writer.as_mut().unwrap().tell().await?;
@@ -674,7 +700,12 @@ where
                 });
             }
 
-            if num_rows_in_current_file >= params.max_rows_per_file as u32
+            let reached_row_limit = if has_file_row_counts {
+                reached_planned_file_boundary
+            } else {
+                num_rows_in_current_file >= params.max_rows_per_file as u32
+            };
+            if reached_row_limit
                 || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
             {
                 let mut w = writer.take().unwrap();
@@ -1290,6 +1321,33 @@ pub async fn write_fragments_internal(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    write_fragments_internal_with_file_row_counts(
+        storage_version,
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        target_bases_info,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all)]
+pub(crate) async fn write_fragments_internal_with_file_row_counts(
+    storage_version: ConcreteFileVersion,
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
+) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
     let adapter = SchemaAdapter::new(data.schema());
 
@@ -1318,6 +1376,7 @@ pub async fn write_fragments_internal(
         data,
         params,
         target_bases_info,
+        file_row_counts,
     )
     .await
 }
@@ -3910,6 +3969,7 @@ mod tests {
             WriteParams::default(),
             None,
             Vec::new(),
+            None,
         )
         .await;
 
@@ -3971,6 +4031,7 @@ mod tests {
             },
             None,
             Vec::new(),
+            None,
         )
         .await;
 
@@ -4199,6 +4260,7 @@ mod tests {
             },
             Some(target_bases),
             vec![],
+            None,
         )
         .await;
 

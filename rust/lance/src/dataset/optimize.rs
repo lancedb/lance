@@ -95,7 +95,10 @@ use super::transaction::{
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
-use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
+use super::{
+    WriteMode, WriteParams, cleanup_data_fragments,
+    write::write_fragments_internal_with_file_row_counts,
+};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
@@ -2109,9 +2112,31 @@ async fn rewrite_files(
         .checked_div(target_rows_per_fragment)
         .unwrap_or(1)
         .max(1);
-    let max_rows_per_file = usize::try_from(surviving_rows.div_ceil(output_fragment_count))
-        .unwrap_or(usize::MAX)
-        .max(1);
+    let output_fragment_count_usize = usize::try_from(output_fragment_count).map_err(|_| {
+        Error::internal(format!(
+            "Compaction output fragment count {output_fragment_count} does not fit in usize"
+        ))
+    })?;
+    let base_rows_per_file = surviving_rows / output_fragment_count;
+    let larger_file_count =
+        usize::try_from(surviving_rows % output_fragment_count).map_err(|_| {
+            Error::internal("Compaction larger output fragment count does not fit in usize")
+        })?;
+    let file_row_counts = if surviving_rows == 0 {
+        Vec::new()
+    } else {
+        (0..output_fragment_count_usize)
+            .map(|file_index| {
+                let file_rows = base_rows_per_file + u64::from(file_index < larger_file_count);
+                usize::try_from(file_rows).map_err(|_| {
+                    Error::internal(format!(
+                        "Compaction output row count {file_rows} does not fit in usize"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let max_rows_per_file = file_row_counts.first().copied().unwrap_or(1);
     let mut params = WriteParams {
         max_rows_per_file,
         max_rows_per_group: options.max_rows_per_group,
@@ -2166,7 +2191,7 @@ async fn rewrite_files(
             row_ids_rx = Some(rx);
         }
     } else {
-        let (frags, _) = write_fragments_internal(
+        let (frags, _) = write_fragments_internal_with_file_row_counts(
             dataset.manifest.data_storage_format.lance_file_format(),
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
@@ -2175,6 +2200,7 @@ async fn rewrite_files(
             reader.expect("reader must be prepared for non-binary-copy path"),
             params,
             None,
+            Some(file_row_counts),
         )
         .await?;
         new_fragments = frags;
@@ -3446,8 +3472,13 @@ mod tests {
         assert_eq!(second_metrics, CompactionMetrics::default());
     }
 
+    #[rstest]
+    #[case::legacy(LanceFileVersion::Legacy)]
+    #[case::stable(LanceFileVersion::Stable)]
     #[tokio::test]
-    async fn test_compaction_rebalances_oversized_task() {
+    async fn test_compaction_rebalances_oversized_task(
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
         let test_dir = TempStrDir::default();
         let data = sample_data().slice(0, 5_100);
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 5_000))], data.schema());
@@ -3456,7 +3487,7 @@ mod tests {
             &test_dir,
             Some(WriteParams {
                 max_rows_per_file: 5_000,
-                data_storage_version: Some(LanceFileVersion::Stable),
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -3487,6 +3518,50 @@ mod tests {
                 .map(|fragment| fragment.metadata.physical_rows.unwrap())
                 .collect::<Vec<_>>(),
             vec![1_025; 4]
+        );
+
+        let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(second_metrics, CompactionMetrics::default());
+    }
+
+    #[tokio::test]
+    async fn test_compaction_balances_non_divisible_stable_task() {
+        let test_dir = TempStrDir::default();
+        let data = sample_data().slice(0, 121);
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 121,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("a < 20").await.unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 10,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].fragments.len(), 1);
+
+        let metrics = compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 1);
+        assert_eq!(metrics.fragments_added, 10);
+        assert_eq!(
+            dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.metadata.physical_rows.unwrap())
+                .collect::<Vec<_>>(),
+            [vec![11], vec![10; 9]].concat()
         );
 
         let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();

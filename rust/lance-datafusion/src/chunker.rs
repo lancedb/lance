@@ -42,8 +42,8 @@ impl BatchReaderChunker {
         buffer_total - self.i
     }
 
-    async fn fill_buffer(&mut self) -> Result<()> {
-        while self.buffered_len() < self.output_size {
+    async fn fill_buffer(&mut self, output_size: usize) -> Result<()> {
+        while self.buffered_len() < output_size {
             match self.inner.next().await {
                 Some(Ok(batch)) => self.buffered.push_back(batch),
                 Some(Err(e)) => return Err(e.into()),
@@ -54,7 +54,11 @@ impl BatchReaderChunker {
     }
 
     async fn next(&mut self) -> Option<Result<Vec<RecordBatch>>> {
-        match self.fill_buffer().await {
+        self.next_sized(self.output_size).await
+    }
+
+    async fn next_sized(&mut self, output_size: usize) -> Option<Result<Vec<RecordBatch>>> {
+        match self.fill_buffer(output_size).await {
             Ok(_) => {}
             Err(e) => return Some(Err(e)),
         };
@@ -63,7 +67,7 @@ impl BatchReaderChunker {
 
         let mut rows_collected = 0;
 
-        while rows_collected < self.output_size {
+        while rows_collected < output_size {
             if let Some(batch) = self.buffered.pop_front() {
                 // Skip empty batch
                 if batch.num_rows() == 0 {
@@ -72,7 +76,7 @@ impl BatchReaderChunker {
 
                 let rows_remaining_in_batch = batch.num_rows() - self.i;
                 let rows_to_take =
-                    std::cmp::min(rows_remaining_in_batch, self.output_size - rows_collected);
+                    std::cmp::min(rows_remaining_in_batch, output_size - rows_collected);
 
                 if rows_to_take == rows_remaining_in_batch {
                     // We're taking the whole batch, so we can just move it
@@ -104,6 +108,12 @@ impl BatchReaderChunker {
             Some(Ok(batches))
         }
     }
+}
+
+struct VariableBatchReaderChunker {
+    chunker: BatchReaderChunker,
+    output_sizes: VecDeque<usize>,
+    is_done: bool,
 }
 
 struct BreakStreamState {
@@ -183,6 +193,97 @@ pub fn chunk_stream(
         }
     })
     .fuse()
+    .boxed()
+}
+
+/// Given a stream of record batches, yield chunks with the requested row counts.
+///
+/// The requested sizes must describe the complete input. An error is returned if
+/// the input ends early, contains additional rows, or a requested size is zero.
+///
+/// # Example
+///
+/// ```
+/// # use datafusion::physical_plan::SendableRecordBatchStream;
+/// # use lance_datafusion::chunker::chunk_stream_with_sizes;
+/// # fn split_stream(stream: SendableRecordBatchStream) {
+/// let chunks = chunk_stream_with_sizes(stream, vec![512, 512, 256]);
+/// # drop(chunks);
+/// # }
+/// ```
+pub fn chunk_stream_with_sizes(
+    stream: SendableRecordBatchStream,
+    output_sizes: Vec<usize>,
+) -> Pin<Box<dyn Stream<Item = Result<Vec<RecordBatch>>> + Send>> {
+    let state = VariableBatchReaderChunker {
+        chunker: BatchReaderChunker::new(stream, 1),
+        output_sizes: output_sizes.into(),
+        is_done: false,
+    };
+    futures::stream::unfold(state, |mut state| async move {
+        if state.is_done {
+            return None;
+        }
+
+        let Some(output_size) = state.output_sizes.pop_front() else {
+            return match state.chunker.next_sized(1).await {
+                None => None,
+                Some(Ok(_)) => {
+                    state.is_done = true;
+                    Some((
+                        Err(lance_core::Error::invalid_input(
+                            "Input contained more rows than the requested chunk sizes",
+                        )),
+                        state,
+                    ))
+                }
+                Some(Err(error)) => {
+                    state.is_done = true;
+                    Some((Err(error), state))
+                }
+            };
+        };
+
+        if output_size == 0 {
+            state.is_done = true;
+            return Some((
+                Err(lance_core::Error::invalid_input(
+                    "Requested chunk sizes must be greater than zero",
+                )),
+                state,
+            ));
+        }
+
+        match state.chunker.next_sized(output_size).await {
+            Some(Ok(batches)) => {
+                let actual_size = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                if actual_size == output_size {
+                    Some((Ok(batches), state))
+                } else {
+                    state.is_done = true;
+                    Some((
+                        Err(lance_core::Error::invalid_input(format!(
+                            "Input ended after {actual_size} rows while filling a requested {output_size}-row chunk"
+                        ))),
+                        state,
+                    ))
+                }
+            }
+            Some(Err(error)) => {
+                state.is_done = true;
+                Some((Err(error), state))
+            }
+            None => {
+                state.is_done = true;
+                Some((
+                    Err(lance_core::Error::invalid_input(format!(
+                        "Input ended before a requested {output_size}-row chunk could be filled"
+                    ))),
+                    state,
+                ))
+            }
+        }
+    })
     .boxed()
 }
 
@@ -359,6 +460,34 @@ mod tests {
         assert_eq!(chunked[1][1].num_rows(), 5);
         assert_eq!(chunked[2].len(), 1);
         assert_eq!(chunked[2][0].num_rows(), 8);
+
+        let chunked = super::chunk_stream_with_sizes(make_stream(), vec![9, 10, 9])
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            chunked
+                .iter()
+                .map(|batches| batches.iter().map(|batch| batch.num_rows()).sum::<usize>())
+                .collect::<Vec<_>>(),
+            vec![9, 10, 9]
+        );
+
+        let error = super::chunk_stream_with_sizes(make_stream(), vec![10, 17])
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("more rows than the requested chunk sizes")
+        );
+
+        let error = super::chunk_stream_with_sizes(make_stream(), vec![10, 19])
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ended after 18 rows"));
 
         let chunked = super::chunk_concat_stream(make_stream(), 10)
             .try_collect::<Vec<_>>()
