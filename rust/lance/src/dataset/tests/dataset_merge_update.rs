@@ -20,17 +20,18 @@ use lance_core::{ROW_ADDR, ROW_LAST_UPDATED_AT_VERSION};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use mock_instant::thread_local::MockClock;
 
 use crate::dataset::write::{InsertBuilder, WriteMode, WriteParams};
 use arrow::array::AsArray;
+use arrow::array::builder::{LargeListBuilder, LargeStringBuilder};
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::{Array, LargeBinaryArray, StructArray};
 use arrow_array::{
-    ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray,
+    ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray, UInt64Array,
     types::{Int32Type, UInt64Type},
 };
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -1525,15 +1526,16 @@ async fn test_issue_4429_nested_struct_encoding_v2_1_with_over_65k_structs() {
 
 /// Regression test for https://github.com/lancedb/lance/issues/5321
 ///
-/// merge_insert with reordered columns triggers the RewriteColumns path,
-/// which prunes the index bitmap. After compact + optimize_indices, the old
-/// stale B-tree data was being merged back in, causing "non-existent fragment"
-/// errors on subsequent queries.
+/// A partial merge_insert triggers the RewriteColumns path, which prunes the
+/// index bitmap. After compact + optimize_indices, the old stale B-tree data
+/// was being merged back in, causing "non-existent fragment" errors on
+/// subsequent queries.
 #[tokio::test]
 async fn test_merge_insert_with_reordered_columns_and_index() {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         ArrowField::new("value", DataType::Utf8, true),
+        ArrowField::new("untouched", DataType::Utf8, true),
     ]));
 
     // Step 1: Create dataset with one row {id: 1, value: "a"}
@@ -1542,6 +1544,7 @@ async fn test_merge_insert_with_reordered_columns_and_index() {
         vec![
             Arc::new(Int32Array::from(vec![0, 1])),
             Arc::new(StringArray::from(vec!["x", "a"])),
+            Arc::new(StringArray::from(vec!["u", "v"])),
         ],
     )
     .unwrap();
@@ -1569,8 +1572,9 @@ async fn test_merge_insert_with_reordered_columns_and_index() {
         .await
         .unwrap();
 
-    // Step 3: merge_insert with reversed column order (value, id)
-    // This triggers the RewriteColumns path, which prunes the index bitmap
+    // Step 3: merge_insert with a partial schema in reversed column order
+    // (value, id). Omitting `untouched` triggers the RewriteColumns path,
+    // which prunes the index bitmap.
     let reversed_schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("value", DataType::Utf8, true),
         ArrowField::new("id", DataType::Int32, false),
@@ -1615,6 +1619,7 @@ async fn test_merge_insert_with_reordered_columns_and_index() {
         vec![
             Arc::new(Int32Array::from(vec![1])),
             Arc::new(StringArray::from(vec!["d"])),
+            Arc::new(StringArray::from(vec!["v"])),
         ],
     )
     .unwrap();
@@ -1632,6 +1637,111 @@ async fn test_merge_insert_with_reordered_columns_and_index() {
     ));
     let (final_dataset, _) = merge_job2.execute(reader_to_stream(reader2)).await.unwrap();
     final_dataset.validate().await.unwrap();
+}
+
+/// A complete merge_insert source remains a full-schema update when its fields
+/// are ordered differently from the dataset schema.
+///
+/// Regression test for https://github.com/lance-format/lance/issues/8502.
+#[tokio::test]
+async fn test_merge_insert_reordered_full_schema_invalidates_label_list_index() {
+    let list_field = ArrowField::new(
+        "labels",
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::LargeUtf8, true))),
+        true,
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::UInt64, false),
+        list_field.clone(),
+    ]));
+
+    let make_labels = |values: &[&str]| {
+        let mut builder = LargeListBuilder::new(LargeStringBuilder::new())
+            .with_field(Arc::new(ArrowField::new("item", DataType::LargeUtf8, true)));
+        for value in values {
+            builder.values().append_value(value);
+            builder.append(true);
+        }
+        Arc::new(builder.finish()) as ArrayRef
+    };
+
+    let initial = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![1, 2])) as ArrayRef,
+            make_labels(&["a", "b"]),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(initial)], schema.clone());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Bitmap,
+            Some("id_idx".to_owned()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let reordered_schema = Arc::new(ArrowSchema::new(vec![
+        list_field,
+        ArrowField::new("id", DataType::UInt64, false),
+    ]));
+    let update = RecordBatch::try_new(
+        reordered_schema.clone(),
+        vec![
+            make_labels(&["z"]),
+            Arc::new(UInt64Array::from(vec![2])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(update)], reordered_schema);
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_owned()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+    let (dataset, _) = merge_job
+        .execute(reader_to_stream(Box::new(reader)))
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.get_fragments().len(),
+        2,
+        "a reordered complete schema must use the full-row update path"
+    );
+
+    async fn matching_ids(dataset: &Dataset, use_scalar_index: bool) -> Vec<u64> {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap();
+        scanner.filter("array_has(labels, 'z')").unwrap();
+        scanner.use_scalar_index(use_scalar_index);
+        let batch = scanner.try_into_batch().await.unwrap();
+        batch["id"]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    assert_eq!(matching_ids(&dataset, false).await, vec![2]);
+    assert_eq!(matching_ids(&dataset, true).await, vec![2]);
 }
 
 /// With stable row ids, updating a top-level struct column keeps a scalar index on a
@@ -2933,6 +3043,7 @@ async fn test_fts_index_stale_data_after_merge_insert_compact_optimize() {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         ArrowField::new("text", DataType::Utf8, true),
+        ArrowField::new("untouched", DataType::Utf8, true),
     ]));
 
     // Step 1: Create dataset with 2 rows in separate fragments
@@ -2944,6 +3055,7 @@ async fn test_fts_index_stale_data_after_merge_insert_compact_optimize() {
                 "the quick brown fox",
                 "the lazy dog",
             ])),
+            Arc::new(StringArray::from(vec!["u", "v"])),
         ],
     )
     .unwrap();
@@ -2976,9 +3088,9 @@ async fn test_fts_index_stale_data_after_merge_insert_compact_optimize() {
         .unwrap();
     assert_eq!(results.num_rows(), 1);
 
-    // Step 3: merge_insert with reversed column order (text, id)
-    // This triggers the RewriteColumns/DataReplacement path, which prunes the
-    // index fragment bitmap for the 'text' column.
+    // Step 3: merge_insert with a partial schema in reversed column order
+    // (text, id). Omitting `untouched` triggers the RewriteColumns/DataReplacement
+    // path, which prunes the index fragment bitmap for the 'text' column.
     let reversed_schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("text", DataType::Utf8, true),
         ArrowField::new("id", DataType::Int32, false),
@@ -3082,6 +3194,7 @@ async fn test_fts_index_stale_data_after_merge_insert_compact_optimize() {
         vec![
             Arc::new(Int32Array::from(vec![1])),
             Arc::new(StringArray::from(vec!["final text"])),
+            Arc::new(StringArray::from(vec!["v"])),
         ],
     )
     .unwrap();
@@ -3121,6 +3234,7 @@ async fn test_fts_index_incremental_reindex_after_in_place_update() {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         ArrowField::new("text", DataType::Utf8, true),
+        ArrowField::new("untouched", DataType::Utf8, true),
     ]));
 
     // Step 1: Create dataset with 2 rows in separate fragments
@@ -3132,6 +3246,7 @@ async fn test_fts_index_incremental_reindex_after_in_place_update() {
                 "the quick brown fox",
                 "the lazy dog",
             ])),
+            Arc::new(StringArray::from(vec!["u", "v"])),
         ],
     )
     .unwrap();
@@ -3172,9 +3287,9 @@ async fn test_fts_index_incremental_reindex_after_in_place_update() {
         .unwrap();
     assert_eq!(results.num_rows(), 1);
 
-    // Step 3: merge_insert with reversed column order to trigger
-    // RewriteColumns/DataReplacement path, which prunes the index
-    // fragment bitmap for the updated fragment.
+    // Step 3: merge_insert with a partial schema in reversed column order.
+    // Omitting `untouched` triggers the RewriteColumns/DataReplacement path,
+    // which prunes the index fragment bitmap for the updated fragment.
     // Update id=1 ("the lazy dog" -> "a speedy cat")
     let reversed_schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("text", DataType::Utf8, true),

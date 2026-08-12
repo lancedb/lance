@@ -974,6 +974,9 @@ impl MergeInsertJob {
             .lance_file_format();
         let mut options = versions::schema_compare_options(version);
         options.compare_nullability = NullabilityComparison::Ignore;
+        // Merge columns are matched by name, so a complete source remains a
+        // full-schema merge even when the caller orders its fields differently.
+        options.ignore_field_order = true;
 
         // Try full schema match first.
         if lance_schema
@@ -985,7 +988,6 @@ impl MergeInsertJob {
 
         // If full match fails, try subschema match.
         options.allow_subschema = true;
-        options.ignore_field_order = true; // Subschema matching should typically ignore order.
 
         lance_schema
             .check_compatible(target_schema, &options)
@@ -2359,6 +2361,9 @@ impl MergeInsertJob {
                 compare_metadata: false,
                 // Allow nullable source fields for non-nullable targets.
                 compare_nullability: NullabilityComparison::Ignore,
+                // Keep this classification consistent with `can_use_create_plan`
+                // and `check_compatible_schema`: merge columns match by name.
+                ignore_field_order: true,
                 ..Default::default()
             },
         );
