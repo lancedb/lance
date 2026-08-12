@@ -1025,7 +1025,13 @@ impl Planner {
                                 .parse::<ArrowDataType>()
                                 .ok()
                                 .filter(|data_type| matches!(data_type, ArrowDataType::Time32(_)))
-                                .and_then(|data_type| safe_coerce_scalar(value, &data_type))
+                                .and_then(|data_type| {
+                                    if matches!(value, ScalarValue::Null) {
+                                        ScalarValue::try_new_null(&data_type).ok()
+                                    } else {
+                                        safe_coerce_scalar(value, &data_type)
+                                    }
+                                })
                                 .map(|value| Expr::Literal(value, metadata.clone())),
                             _ => None,
                         }
@@ -1236,6 +1242,12 @@ mod tests {
             predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![false, true])
         );
+
+        let expr = planner
+            .parse_expr("arrow_cast(NULL, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        assert_eq!(expr, Expr::Literal(ScalarValue::Time32Second(None), None));
     }
 
     #[test]
