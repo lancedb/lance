@@ -855,6 +855,45 @@ impl ZoneMapIndex {
     }
 }
 
+fn remap_zone(zone: &ZoneMapStatistics, remapper: &dyn RowIdRemapper) -> Vec<ZoneMapStatistics> {
+    let zone_start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
+    let mut remapped = (0..zone.bound.length as u64)
+        .filter_map(|offset| remapper.remap_row_id(zone_start.saturating_add(offset)))
+        .collect::<Vec<_>>();
+    remapped.sort_unstable();
+    remapped.dedup();
+
+    let make_zone = |start: u64, end: u64| ZoneMapStatistics {
+        min: zone.min.clone(),
+        max: zone.max.clone(),
+        null_count: zone.null_count,
+        nan_count: zone.nan_count,
+        bound: ZoneBound {
+            fragment_id: start >> 32,
+            start: start & u64::from(u32::MAX),
+            length: (end - start + 1) as usize,
+        },
+    };
+    let mut zones = Vec::new();
+    let mut run_start = None;
+    let mut previous = 0u64;
+    for row_id in remapped {
+        if run_start.is_none() {
+            run_start = Some(row_id);
+        } else if row_id != previous.saturating_add(1) || row_id >> 32 != previous >> 32 {
+            if let Some(start) = run_start {
+                zones.push(make_zone(start, previous));
+            }
+            run_start = Some(row_id);
+        }
+        previous = row_id;
+    }
+    if let Some(start) = run_start {
+        zones.push(make_zone(start, previous));
+    }
+    zones
+}
+
 /// Merge caller-selected ZoneMap segments into one self-contained segment.
 pub async fn merge_zonemap_indices(
     source_indices: &[&ZoneMapIndex],
@@ -884,19 +923,22 @@ pub async fn merge_zonemap_indices(
                 data_type, source.data_type
             )));
         }
-        zones.extend(
+        let source_zones = source.zones.iter().flat_map(|zone| {
             source
-                .zones
-                .iter()
-                .filter(|zone| {
-                    u32::try_from(zone.bound.fragment_id)
-                        .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
-                })
-                .cloned(),
-        );
+                .fri
+                .as_deref()
+                .map_or_else(|| vec![zone.clone()], |remapper| remap_zone(zone, remapper))
+        });
+        zones.extend(source_zones.filter(|zone| {
+            u32::try_from(zone.bound.fragment_id)
+                .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
+        }));
         match &source.null_rows {
             Some(null_rows) => {
-                let mut filtered = null_rows.clone();
+                let mut filtered = source.fri.as_deref().map_or_else(
+                    || null_rows.clone(),
+                    |remapper| remapper.remap_row_addrs_tree_map(null_rows),
+                );
                 filtered.retain_fragments(fragment_filter.iter());
                 merged_null_rows |= &filtered;
             }
@@ -1791,11 +1833,11 @@ mod tests {
     use lance_select::RowAddrTreeMap;
 
     use crate::scalar::{
-        SargableQuery, ScalarIndex, SearchResult,
+        RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
         lance_format::LanceIndexStore,
         zonemap::{
             ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams,
-            merge_zonemap_indices,
+            merge_zonemap_indices, remap_zone,
         },
     };
 
@@ -1872,6 +1914,83 @@ mod tests {
         ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
             .await
             .expect("Failed to load ZoneMapIndex")
+    }
+
+    #[test]
+    fn test_remap_zone_splits_discontiguous_runs() {
+        #[derive(Debug)]
+        struct SplitRemapper {
+            old_start: u64,
+            new_start: u64,
+        }
+
+        impl RowIdRemapper for SplitRemapper {
+            fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+                match row_id.checked_sub(self.old_start)? {
+                    0 => Some(self.new_start + 1),
+                    1 => Some(self.new_start + 2),
+                    2 => Some(self.new_start + 7),
+                    3 => Some(self.new_start + 8),
+                    _ => None,
+                }
+            }
+
+            fn remap_row_addrs_tree_map(&self, _row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+                unreachable!()
+            }
+
+            fn remap_row_ids_roaring_tree_map(
+                &self,
+                _row_ids: &roaring::RoaringTreemap,
+            ) -> roaring::RoaringTreemap {
+                unreachable!()
+            }
+
+            fn remap_row_ids_record_batch(
+                &self,
+                _batch: RecordBatch,
+                _row_id_idx: usize,
+            ) -> lance_core::Result<RecordBatch> {
+                unreachable!()
+            }
+        }
+
+        let old_start = (2_u64 << 32) + 10;
+        let new_start = 3_u64 << 32;
+        let zone = ZoneMapStatistics {
+            min: ScalarValue::Int64(Some(10)),
+            max: ScalarValue::Int64(Some(40)),
+            null_count: 1,
+            nan_count: 0,
+            bound: ZoneBound {
+                fragment_id: 2,
+                start: 10,
+                length: 4,
+            },
+        };
+        let mut first_run = zone.clone();
+        first_run.bound = ZoneBound {
+            fragment_id: 3,
+            start: 1,
+            length: 2,
+        };
+        let mut second_run = zone.clone();
+        second_run.bound = ZoneBound {
+            fragment_id: 3,
+            start: 7,
+            length: 2,
+        };
+
+        assert_eq!(
+            remap_zone(
+                &zone,
+                &SplitRemapper {
+                    old_start,
+                    new_start,
+                }
+            ),
+            vec![first_run, second_run]
+        );
     }
 
     #[tokio::test]

@@ -5409,6 +5409,24 @@ mod tests {
             assert_eq!(scan_ids(&dataset, filter, true).await, expected);
         }
 
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("value_idx").await.unwrap())
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("value_idx", "value", vec![merged])
+            .await
+            .unwrap();
+
+        for (filter, expected) in [
+            ("value IS NULL", vec![1, 5, 9]),
+            ("value = 20", vec![2]),
+            ("value > 90", vec![10, 11]),
+        ] {
+            assert_eq!(scan_ids(&dataset, filter, false).await, expected);
+            assert_eq!(scan_ids(&dataset, filter, true).await, expected);
+        }
+
         let mut scanner = dataset.scan();
         scanner.filter("value IS NULL").unwrap();
         let plan = scanner.explain_plan(false).await.unwrap();
