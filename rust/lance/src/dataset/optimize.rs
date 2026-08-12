@@ -2088,8 +2088,20 @@ async fn rewrite_files(
         }
     }
 
+    // Multi-fragment tasks are already sized by CandidateBin::split_for_size.
+    // Let each such task produce one row-bounded fragment; applying the target
+    // again here would split it into a full fragment and a stranded remainder.
+    // Single-fragment rewrites can still use the target to repartition a large
+    // fragment selected for deletion or overlay materialization.
+    let max_rows_per_file = if fragments.len() > 1 {
+        usize::try_from(num_rows)
+            .unwrap_or(usize::MAX)
+            .max(options.target_rows_per_fragment)
+    } else {
+        options.target_rows_per_fragment
+    };
     let mut params = WriteParams {
-        max_rows_per_file: options.target_rows_per_fragment,
+        max_rows_per_file,
         max_rows_per_group: options.max_rows_per_group,
         mode: WriteMode::Append,
         // External blobs may reference URIs outside the dataset's base_paths
@@ -3289,49 +3301,44 @@ mod tests {
             .unwrap();
 
         let first_new_frag_idx = 7;
-        // Predicting the remap is difficult.  One task will remap to fragments 7/8 and the other
-        // will remap to fragments 9/10 but we don't know which is which and so we just allow ourselves
-        // to expect both possibilities.
+        // The tasks execute concurrently, so either one may reserve the first
+        // output fragment id.
         let remap_a = expect_remap(
             &[
                 vec![
-                    // 3 small fragments are rewritten to frags 7 & 8
+                    // 3 small fragments are rewritten to frag 7
                     (row_addrs(0, 0..400), true),
                     (row_addrs(1, 0..400), true),
-                    (row_addrs(2, 0..200), true),
+                    (row_addrs(2, 0..400), true),
                 ],
-                vec![(row_addrs(2, 200..400), true)],
                 // frag 3 is skipped since it does not have enough missing data
-                // Frags 4, 5, and 6 are rewritten to frags 9 & 10
+                // Frags 4, 5, and 6 are rewritten to frag 8
                 vec![
-                    // Only 800 of the 1000 rows taken from frag 4
                     (row_addrs(4, 0..200), true),
                     (row_addrs(4, 200..400), false),
                     (row_addrs(4, 400..1000), true),
-                    // frags 5 compacted with frag 4
-                    (row_addrs(5, 0..200), true),
+                    (row_addrs(5, 0..300), true),
+                    (row_addrs(6, 0..300), true),
                 ],
-                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
             ],
             first_new_frag_idx,
         );
         let remap_b = expect_remap(
             &[
-                // Frags 4, 5, and 6 are rewritten to frags 7 & 8
+                // Frags 4, 5, and 6 are rewritten to frag 7
                 vec![
                     (row_addrs(4, 0..200), true),
                     (row_addrs(4, 200..400), false),
                     (row_addrs(4, 400..1000), true),
-                    (row_addrs(5, 0..200), true),
+                    (row_addrs(5, 0..300), true),
+                    (row_addrs(6, 0..300), true),
                 ],
-                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
-                // 3 small fragments rewritten to frags 9 & 10
+                // 3 small fragments rewritten to frag 8
                 vec![
                     (row_addrs(0, 0..400), true),
                     (row_addrs(1, 0..400), true),
-                    (row_addrs(2, 0..200), true),
+                    (row_addrs(2, 0..400), true),
                 ],
-                vec![(row_addrs(2, 200..400), true)],
             ],
             first_new_frag_idx,
         );
@@ -3372,16 +3379,60 @@ mod tests {
 
         // Assert on metrics
         assert_eq!(metrics.fragments_removed, 6);
-        assert_eq!(metrics.fragments_added, 4);
+        assert_eq!(metrics.fragments_added, 2);
         assert_eq!(metrics.files_removed, 7); // 6 data files + 1 deletion file
-        assert_eq!(metrics.files_added, 4);
+        assert_eq!(metrics.files_added, 2);
 
         let fragment_ids = dataset
             .get_fragments()
             .iter()
             .map(|f| f.id())
             .collect::<Vec<_>>();
-        assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
+        assert_eq!(fragment_ids, vec![3, 7, 8]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_compaction_does_not_strand_small_remainders(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = TempStrDir::default();
+        let data = sample_data().slice(0, 2_000);
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 500,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(metrics.fragments_removed, 10);
+        assert_eq!(metrics.fragments_added, 3);
+        assert_eq!(
+            dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.metadata.physical_rows.unwrap())
+                .collect::<Vec<_>>(),
+            vec![600, 600, 800]
+        );
+
+        let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(second_metrics, CompactionMetrics::default());
     }
 
     #[rstest]
