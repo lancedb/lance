@@ -33,7 +33,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
-            native_directory_path_resolver: None,
+            native_directory_path_capability: None,
         }
         .with_native_directory_path_resolver(
             crate::object_store::NativeDirectoryPathResolver::new(|path| {

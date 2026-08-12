@@ -270,6 +270,7 @@ impl ObjectStoreRegistry {
         // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
         // `az$container@account`) so multiple stores on one cloud differ.
         crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, &cache_path);
+        store.rebind_native_directory_path();
 
         if let Some(wrapper) = &params.object_store_wrapper {
             store.apply_wrapper(wrapper.as_ref());

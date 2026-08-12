@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -164,6 +164,39 @@ impl std::fmt::Debug for NativeDirectoryPathResolver {
     }
 }
 
+#[derive(Clone)]
+struct NativeDirectoryPathCapability {
+    resolver: NativeDirectoryPathResolver,
+    inner: Weak<DynObjectStore>,
+}
+
+impl NativeDirectoryPathCapability {
+    fn new(resolver: NativeDirectoryPathResolver, inner: &Arc<DynObjectStore>) -> Self {
+        Self {
+            resolver,
+            inner: Arc::downgrade(inner),
+        }
+    }
+
+    fn is_valid_for(&self, inner: &Arc<DynObjectStore>) -> bool {
+        self.inner
+            .upgrade()
+            .is_some_and(|bound| Arc::ptr_eq(&bound, inner))
+    }
+
+    fn rebind(&mut self, inner: &Arc<DynObjectStore>) {
+        self.inner = Arc::downgrade(inner);
+    }
+}
+
+impl std::fmt::Debug for NativeDirectoryPathCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeDirectoryPathCapability")
+            .field("resolver", &self.resolver)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Debug, Clone)]
 pub struct ObjectStore {
@@ -189,7 +222,7 @@ pub struct ObjectStore {
     pub store_prefix: String,
     /// Maps object-store paths to exact native filesystem paths when this resolved store
     /// explicitly supports native directory metadata.
-    native_directory_path_resolver: Option<NativeDirectoryPathResolver>,
+    native_directory_path_capability: Option<NativeDirectoryPathCapability>,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -581,8 +614,11 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
-                native_directory_path_resolver: params.native_directory_path_resolver.clone(),
+                native_directory_path_capability: None,
             };
+            if let Some(resolver) = &params.native_directory_path_resolver {
+                store = store.with_native_directory_path_resolver(resolver.clone());
+            }
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 store.apply_wrapper(wrapper.as_ref());
             }
@@ -681,9 +717,10 @@ impl ObjectStore {
     /// This returns `None` unless the resolved provider explicitly opted into native directory
     /// semantics and every configured wrapper declared that it preserves those semantics.
     pub fn native_directory_path(&self, path: &Path) -> Option<PathBuf> {
-        self.native_directory_path_resolver
-            .as_ref()
-            .map(|resolver| resolver.resolve(path))
+        let capability = self.native_directory_path_capability.as_ref()?;
+        capability
+            .is_valid_for(&self.inner)
+            .then(|| capability.resolver.resolve(path))
     }
 
     /// Apply an object-store wrapper and update capabilities for the effective store.
@@ -692,8 +729,16 @@ impl ObjectStore {
     /// that it preserves their exact semantics.
     pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
         self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
-        if !wrapper.preserves_native_directory_path() {
-            self.native_directory_path_resolver = None;
+        if wrapper.preserves_native_directory_path() {
+            self.rebind_native_directory_path();
+        } else {
+            self.native_directory_path_capability = None;
+        }
+    }
+
+    fn rebind_native_directory_path(&mut self) {
+        if let Some(capability) = &mut self.native_directory_path_capability {
+            capability.rebind(&self.inner);
         }
     }
 
@@ -706,7 +751,8 @@ impl ObjectStore {
         mut self,
         resolver: NativeDirectoryPathResolver,
     ) -> Self {
-        self.native_directory_path_resolver = Some(resolver);
+        self.native_directory_path_capability =
+            Some(NativeDirectoryPathCapability::new(resolver, &self.inner));
         self
     }
 
@@ -1317,7 +1363,7 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
-            native_directory_path_resolver: None,
+            native_directory_path_capability: None,
         };
         if let Some(wrapper) = wrapper {
             object_store.apply_wrapper(wrapper.as_ref());
@@ -1780,6 +1826,17 @@ mod tests {
                 .native_directory_path(&Path::from("tmp/table.lance"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_replacing_inner_invalidates_native_directory_path() {
+        let mut store = ObjectStore::local();
+        let path = Path::from("tmp/table.lance");
+        assert!(store.native_directory_path(&path).is_some());
+
+        store.inner = Arc::new(InMemory::new());
+
+        assert!(store.native_directory_path(&path).is_none());
     }
 
     #[tokio::test]
