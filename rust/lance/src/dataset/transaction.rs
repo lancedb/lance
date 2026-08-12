@@ -2967,26 +2967,33 @@ impl Transaction {
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
                         new_frag.files.push(new_file.clone());
                     } else if !replaced_in_place
-                        && new_frag.files.iter().any(|file| {
-                            file.file_version()
-                                .is_ok_and(|version| version != ConcreteFileVersion::V1)
-                                && new_file
-                                    .fields
-                                    .iter()
-                                    .all(|field| file.fields.contains(field))
+                        && new_file.fields.iter().all(|field| {
+                            let mut covering = new_frag
+                                .files
+                                .iter()
+                                .filter(|file| file.fields.contains(field))
+                                .peekable();
+                            // Covered by something, and by nothing we cannot
+                            // tombstone. A field no file covers leaves the
+                            // mixed layout the error below reports.
+                            covering.peek().is_some()
+                                && covering.all(|file| {
+                                    file.file_version()
+                                        .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                                })
                         })
                     {
-                        // The replaced fields all live inside one wider file --
-                        // compaction folds a column into a shared base file, say.
-                        // Tombstone them there and append the new file to answer
-                        // for them, the idiom `update_columns` uses. A partial
-                        // overlap, or one spanning files, falls through to the
-                        // error below: it describes no layout we can resolve.
+                        // Tombstone the replaced fields where they live and
+                        // append the new file to answer for them, the idiom
+                        // `update_columns` uses. Compaction decides that layout,
+                        // so the fields may sit in one wider file or span
+                        // several.
                         //
                         // Legacy V1 is excluded: its reader derives the page table
                         // offset from the first field in the metadata, so
                         // tombstoning one field leaves its siblings decoding from
-                        // the wrong pages. V1 keeps exact-match replacement.
+                        // the wrong pages. A field a V1 file covers keeps
+                        // exact-match replacement.
                         for file in &mut new_frag.files {
                             // Same reason as the guard above.
                             if file.file_version()? == ConcreteFileVersion::V1 {
@@ -8126,8 +8133,8 @@ mod tests {
     }
 
     /// Replace `fields` in `fragment` at `read_version`, against a manifest
-    /// at `manifest_version` whose schema declares field ids 4 ("a") and
-    /// 5 ("v").
+    /// at `manifest_version` whose schema declares field ids 3 ("x"), 4 ("a"),
+    /// 5 ("v") and 6 ("y").
     fn replace_fields(
         fragment: Fragment,
         fields: Vec<i32>,
@@ -8135,12 +8142,16 @@ mod tests {
         read_version: u64,
     ) -> Result<Fragment> {
         let schema = ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int32, true),
             ArrowField::new("a", DataType::Int32, true),
             ArrowField::new("v", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
         ]);
         let mut lance_schema = LanceSchema::try_from(&schema).unwrap();
-        lance_schema.fields[0].id = 4;
-        lance_schema.fields[1].id = 5;
+        lance_schema.fields[0].id = 3;
+        lance_schema.fields[1].id = 4;
+        lance_schema.fields[2].id = 5;
+        lance_schema.fields[3].id = 6;
         let mut manifest = Manifest::new(
             lance_schema,
             Arc::new(vec![fragment]),
@@ -8208,11 +8219,10 @@ mod tests {
     }
 
     #[test]
-    fn test_data_replacement_rejects_fields_spanning_files() {
-        // The replaced fields live in two different wider files: no exact
-        // match, not uncovered, and no single file holds them all. That
-        // layout is unresolvable and must error rather than partially
-        // tombstone either file.
+    fn test_data_replacement_tombstones_fields_spanning_files() {
+        // The replaced fields sit in two different wider files. Each file is
+        // tombstoned for the field it holds and survives on its remaining
+        // live one, with the new file answering for both.
         let mut fragment = Fragment::new(0);
         fragment.files = vec![
             DataFile::new(
@@ -8233,10 +8243,41 @@ mod tests {
             ),
         ];
 
+        let fragment = replace_fields(fragment, vec![4, 5], 1, 1).unwrap();
+        let file = |path| {
+            fragment
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("{path} survives on its live field"))
+        };
+        assert_eq!(file("ab.lance").fields.as_ref(), &[3, TOMBSTONE_FIELD_ID]);
+        assert_eq!(file("cd.lance").fields.as_ref(), &[TOMBSTONE_FIELD_ID, 6]);
+        assert!(fragment.files.iter().any(|file| file.path == "v-new.lance"));
+    }
+
+    #[test]
+    fn test_data_replacement_rejects_fields_spanning_a_legacy_file() {
+        // Spanning is only resolvable while every covering file can be
+        // tombstoned. A V1 file holding one of the replaced fields cannot,
+        // so the replacement must be rejected rather than half applied.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new(
+                "ab.lance",
+                vec![3, 4],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            DataFile::new_legacy_from_fields("cd.lance", vec![5, 6], None),
+        ];
+
         let result = replace_fields(fragment, vec![4, 5], 1, 1);
         assert!(
             result.is_err(),
-            "spanning replacement must be rejected, got: {:?}",
+            "spanning a legacy file must be rejected, got: {:?}",
             result.map(|fragment| fragment.files)
         );
     }
