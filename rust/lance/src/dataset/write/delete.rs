@@ -166,7 +166,8 @@ impl DeleteBuilder {
     ///
     /// The patch is stored on the Delete [`Transaction`] and committed in the same
     /// version as the row deletions, so readers never observe deleted rows without
-    /// the metadata (or vice versa). Empty / no-op patches are rejected with
+    /// the metadata (or vice versa). If zero rows match the predicate, the patch
+    /// is not attached. Empty / no-op patches are rejected with
     /// [`Error::InvalidInput`].
     pub fn with_schema_metadata_updates(mut self, updates: SchemaMetadataUpdates) -> Result<Self> {
         updates.validate_non_empty()?;
@@ -233,6 +234,7 @@ impl DeleteBuilder {
             job.dataset.as_ref(),
             updated_fragments,
             deleted_fragment_ids,
+            num_deleted_rows,
         )?;
         Ok(UncommittedDelete {
             transaction,
@@ -265,6 +267,7 @@ impl DeleteJob {
         dataset: &Dataset,
         updated_fragments: Vec<Fragment>,
         deleted_fragment_ids: Vec<u64>,
+        num_deleted_rows: u64,
     ) -> Result<Transaction> {
         let predicate = match &self.filter {
             ExprFilter::Sql(s) => s.clone(),
@@ -279,9 +282,13 @@ impl DeleteJob {
             predicate,
         };
         let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        // Attach only when this attempt actually deleted rows; each retry uses
+        // its own authoritative count from execute_impl.
         match &self.schema_metadata_updates {
-            Some(updates) => transaction.with_schema_metadata_updates(updates.clone()),
-            None => Ok(transaction),
+            Some(updates) if num_deleted_rows > 0 => {
+                transaction.with_schema_metadata_updates(updates.clone())
+            }
+            _ => Ok(transaction),
         }
     }
 }
@@ -383,8 +390,12 @@ impl RetryExecutor for DeleteJob {
             affected_rows,
             num_deleted_rows,
         } = data;
-        let transaction =
-            self.build_transaction(dataset.as_ref(), updated_fragments, deleted_fragment_ids)?;
+        let transaction = self.build_transaction(
+            dataset.as_ref(),
+            updated_fragments,
+            deleted_fragment_ids,
+            num_deleted_rows,
+        )?;
 
         let mut builder = CommitBuilder::new(dataset);
 
@@ -1138,6 +1149,16 @@ mod tests {
             .expect("A4.4b fixture create must succeed")
     }
 
+    fn a44b_metadata_is_absent(dataset: &Dataset) -> bool {
+        let schema_absent = !dataset.schema().metadata.contains_key(A44B_SCHEMA_KEY);
+        let field_absent = dataset
+            .schema()
+            .field_by_id(0)
+            .map(|field0| !field0.metadata.contains_key(A44B_FIELD_KEY))
+            .unwrap_or(false);
+        schema_absent && field_absent
+    }
+
     fn a44b_assert_metadata_absent(dataset: &Dataset) {
         assert!(
             !dataset.schema().metadata.contains_key(A44B_SCHEMA_KEY),
@@ -1327,5 +1348,87 @@ mod tests {
         );
         a44b_assert_remaining_ids(&reopened, &(0..10).collect::<Vec<_>>()).await;
         a44b_assert_metadata_absent(&reopened);
+    }
+
+    // -------------------------------------------------------------------------
+    // A4d: zero-row Delete must not publish attached schema/field metadata
+    // -------------------------------------------------------------------------
+
+    /// A4d: a no-op Delete (predicate scans but matches zero rows) must not
+    /// publish attached schema/field metadata. Version advancement is
+    /// unconstrained.
+    #[tokio::test]
+    async fn test_a4d_noop_delete_does_not_publish_metadata() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let dataset = a44b_create_dataset(uri).await;
+        a44b_assert_metadata_absent(&dataset);
+        a44b_assert_remaining_ids(&dataset, &(0..10).collect::<Vec<_>>()).await;
+
+        let result = DeleteBuilder::new(Arc::new(dataset), "i > 100")
+            .with_schema_metadata_updates(a44b_metadata_updates())
+            .expect("Delete attachment must construct")
+            .execute()
+            .await
+            .expect("no-op attached Delete must complete");
+
+        assert_eq!(result.num_deleted_rows, 0, "predicate must match zero rows");
+        a44b_assert_remaining_ids(&result.new_dataset, &(0..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_absent(&result.new_dataset);
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        a44b_assert_remaining_ids(&reopened, &(0..10).collect::<Vec<_>>()).await;
+        a44b_assert_metadata_absent(&reopened);
+    }
+
+    /// A4d: execute_uncommitted on a zero-row attached Delete must not carry
+    /// schema_metadata_updates; CommitBuilder with affected_rows must leave
+    /// rows and metadata unchanged. Observations from staged txn, commit, and
+    /// reopen are aggregated so the real commit path always runs first.
+    #[tokio::test]
+    async fn test_a4d_noop_execute_uncommitted_does_not_attach_metadata() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let dataset = Arc::new(a44b_create_dataset(uri).await);
+        a44b_assert_metadata_absent(&dataset);
+        a44b_assert_remaining_ids(&dataset, &(0..10).collect::<Vec<_>>()).await;
+
+        let staged_delete = DeleteBuilder::new(dataset.clone(), "i > 100")
+            .with_schema_metadata_updates(a44b_metadata_updates())
+            .expect("Delete attachment must construct")
+            .execute_uncommitted()
+            .await
+            .expect("uncommitted no-op attached Delete must stage");
+
+        assert_eq!(
+            staged_delete.num_deleted_rows, 0,
+            "predicate must match zero rows"
+        );
+        let staged_attachment_absent = staged_delete.transaction.schema_metadata_updates.is_none();
+        let staged_attachment = format!("{:?}", staged_delete.transaction.schema_metadata_updates);
+
+        let mut commit_builder = CommitBuilder::new(dataset.clone());
+        if let Some(affected_rows) = staged_delete.affected_rows {
+            commit_builder = commit_builder.with_affected_rows(affected_rows);
+        }
+        let committed = commit_builder
+            .execute(staged_delete.transaction)
+            .await
+            .expect("committing no-op Delete must succeed");
+
+        a44b_assert_remaining_ids(&committed, &(0..10).collect::<Vec<_>>()).await;
+        let committed_metadata_absent = a44b_metadata_is_absent(&committed);
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        a44b_assert_remaining_ids(&reopened, &(0..10).collect::<Vec<_>>()).await;
+        let reopened_metadata_absent = a44b_metadata_is_absent(&reopened);
+
+        assert!(
+            staged_attachment_absent && committed_metadata_absent && reopened_metadata_absent,
+            "zero-row Delete must not attach or publish metadata; \
+             staged_attachment_absent={staged_attachment_absent} (updates={staged_attachment}), \
+             committed_metadata_absent={committed_metadata_absent}, \
+             reopened_metadata_absent={reopened_metadata_absent}"
+        );
     }
 }
