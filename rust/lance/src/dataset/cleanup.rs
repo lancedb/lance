@@ -310,8 +310,6 @@ struct CleanupInspection {
     verified_files: ReferencedFiles,
     /// Track tagged old versions in case we want to raise a `CleanupError`.
     tagged_old_versions: HashSet<u64>,
-    /// The earliest timestamp of all retained manifests.
-    earliest_retained_manifest_time: Option<DateTime<Utc>>,
 }
 
 /// If a file cannot be verified then it will only be deleted if it is at least
@@ -565,15 +563,6 @@ impl<'a> CleanupTask<'a> {
             inspection
                 .old_manifests
                 .insert(location.path.clone(), manifest.version);
-        } else {
-            let commit_ts = manifest.timestamp();
-            if let Some(ts) = inspection.earliest_retained_manifest_time {
-                if commit_ts < ts {
-                    inspection.earliest_retained_manifest_time = Some(commit_ts);
-                }
-            } else {
-                inspection.earliest_retained_manifest_time = Some(commit_ts);
-            }
         }
         Ok(())
     }
@@ -687,8 +676,9 @@ impl<'a> CleanupTask<'a> {
                 .boxed()
         };
 
-        // Restrict scanning to Lance-managed subtrees for safety and performance.
-        let unmodified_since = inspection.earliest_retained_manifest_time;
+        // Restrict scanning to Lance-managed subtrees and the policy's time boundary. A retained
+        // tag may predate files verified by manifests this cleanup is removing.
+        let unmodified_since = self.policy.before_timestamp;
         let streams = vec![
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
@@ -2427,6 +2417,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed.old_versions, 1);
+    }
+
+    #[tokio::test]
+    async fn tagged_old_version_does_not_limit_unreferenced_file_cleanup() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_seconds(1).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_seconds(2).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+
+        let dataset = fixture.open().await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+
+        let removed = fixture
+            .run_cleanup_with_override(utc_now(), None, Some(false))
+            .await
+            .unwrap();
+        let after_count = fixture.count_files().await.unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 1);
+        assert_eq!(after_count.num_data_files, 2);
+        assert_eq!(after_count.num_manifest_files, 2);
     }
 
     // Helper function to check that the number of files is correct.
