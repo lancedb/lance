@@ -2250,8 +2250,6 @@ impl FileFragment {
                     field.name
                 )));
             }
-            // The scanner injects these itself; a stored copy collides with it
-            // at projection time. Same boundary the ordinary insert path draws.
             if lance_core::is_system_column(&field.name) {
                 return Err(Error::invalid_input(format!(
                     "column data for fragment {} names reserved column '{}'",
