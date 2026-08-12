@@ -329,12 +329,21 @@ async fn fill_page(
         let page = lister
             .list_page(prefix.as_deref(), resume.as_ref(), remaining)
             .await?;
-        // The limit is the caller's, not the backend's: a page that came back holding more
-        // than it was asked for is held to what was asked for.
-        match remaining {
-            Some(remaining) => values.extend(page.entries.into_iter().take(remaining)),
-            None => values.extend(page.entries),
+        // A backend that returns more entries than asked for has already advanced its opaque
+        // cursor past the entire page. Truncating would silently discard the surplus entries,
+        // and there is no cursor this layer can synthesize for the retained prefix — the
+        // backend's cursor points past entries we would be dropping.
+        if let Some(remaining) = remaining {
+            if page.entries.len() > remaining {
+                return Err(Error::io(format!(
+                    "listing '{dir}': backend returned {} entries when at most {} were requested; \
+                     no cursor can represent the retained subset",
+                    page.entries.len(),
+                    remaining
+                )));
+            }
         }
+        values.extend(page.entries);
         match page.next {
             // A page that hands back the position it was given has not moved, and asking
             // again from it would repeat forever. The contract forbids it; a backend that
@@ -997,17 +1006,29 @@ mod tests {
         }
     }
 
-    /// The limit is what the caller asked for, not a hint the backend may round up. Holding a
-    /// page to it here is what makes the count [`DirListing::values`] documents true whatever
-    /// the backend does.
+    /// An overeager backend cannot be corrected locally: its cursor already points past
+    /// all the entries it returned, so truncating would silently drop the surplus.
     #[tokio::test]
-    async fn test_a_page_is_held_to_the_limit_asked_for() {
+    async fn test_a_page_exceeding_the_limit_is_rejected() {
         let mut store = test_store(KeyOrdered, TABLES).await;
         store.store.paginated_lister = Some(Arc::new(OvereagerLister));
 
-        let page = store.first_page("db", Some(2)).await;
+        let err = store
+            .store
+            .read_dir_page(
+                Path::from("db"),
+                ReadDirOptions {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
 
-        assert_eq!(page.values.len(), 2);
+        assert!(
+            err.to_string().contains("no cursor can represent"),
+            "{err:?}"
+        );
     }
 
     /// A recording [`PaginatedListStore`], so the translation `NativeDirLister` performs can be
