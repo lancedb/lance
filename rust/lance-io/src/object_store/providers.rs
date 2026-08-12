@@ -424,9 +424,11 @@ mod tests {
                 None,
             );
             if self.has_capability {
-                Ok(store.with_native_directory_path_resolver(|path| {
-                    PathBuf::from("/native").join(path.as_ref())
-                }))
+                Ok(store.with_native_directory_path_resolver(
+                    crate::object_store::NativeDirectoryPathResolver::new(|path| {
+                        PathBuf::from("/native").join(path.as_ref())
+                    }),
+                ))
             } else {
                 Ok(store)
             }

@@ -35,9 +35,11 @@ impl ObjectStoreProvider for FileStoreProvider {
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
             native_directory_path_resolver: None,
         }
-        .with_native_directory_path_resolver(|path| {
-            std::path::PathBuf::from(crate::local::to_local_path(path))
-        }))
+        .with_native_directory_path_resolver(
+            crate::object_store::NativeDirectoryPathResolver::new(|path| {
+                std::path::PathBuf::from(crate::local::to_local_path(path))
+            }),
+        ))
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {

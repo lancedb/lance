@@ -48,7 +48,8 @@ use futures::TryStreamExt;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
+    NativeDirectoryPathResolver, ObjectStore, ObjectStoreParams, StorageOptionsAccessor,
+    WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;
@@ -196,6 +197,33 @@ async fn test_with_object_store_wrappers_wraps_primary_store() {
     let _ = tracker.incremental_stats();
     drain_scan(&wrapped).await;
     assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+#[allow(deprecated)]
+async fn test_builder_carries_direct_store_native_directory_path() {
+    let uri = "file:///tmp/direct.lance";
+    let params = ObjectStoreParams {
+        object_store: Some((
+            Arc::new(object_store::memory::InMemory::new()),
+            url::Url::parse(uri).unwrap(),
+        )),
+        native_directory_path_resolver: Some(NativeDirectoryPathResolver::new(|path| {
+            std::path::PathBuf::from("/native").join(path.as_ref())
+        })),
+        ..Default::default()
+    };
+
+    let (store, path, _) = DatasetBuilder::from_uri(uri)
+        .with_store_params(params)
+        .build_object_store()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.native_directory_path(&path),
+        Some(std::path::PathBuf::from("/native/tmp/direct.lance"))
+    );
 }
 
 #[derive(Debug)]

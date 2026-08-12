@@ -704,9 +704,9 @@ impl ObjectStore {
     /// path served by the store.
     pub fn with_native_directory_path_resolver(
         mut self,
-        resolver: impl Fn(&Path) -> PathBuf + Send + Sync + 'static,
+        resolver: NativeDirectoryPathResolver,
     ) -> Self {
-        self.native_directory_path_resolver = Some(NativeDirectoryPathResolver::new(resolver));
+        self.native_directory_path_resolver = Some(resolver);
         self
     }
 

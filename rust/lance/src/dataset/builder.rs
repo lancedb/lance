@@ -553,8 +553,8 @@ impl DatasetBuilder {
 
         #[allow(deprecated)]
         let (object_store, base_path) = match &self.options.object_store {
-            Some(store) => (
-                Arc::new(ObjectStore::new(
+            Some(store) => {
+                let mut object_store = ObjectStore::new(
                     store.0.clone(),
                     store.1.clone(),
                     self.options.block_size,
@@ -566,9 +566,13 @@ impl DatasetBuilder {
                     DEFAULT_CLOUD_IO_PARALLELISM,
                     download_retry_count,
                     None, // No storage_options available here
-                )),
-                Path::from(store.1.path()),
-            ),
+                );
+                if let Some(resolver) = &self.options.native_directory_path_resolver {
+                    object_store =
+                        object_store.with_native_directory_path_resolver(resolver.clone());
+                }
+                (Arc::new(object_store), Path::from(store.1.path()))
+            }
             None => {
                 ObjectStore::from_uri_and_params(store_registry, &self.table_uri, &self.options)
                     .await?
