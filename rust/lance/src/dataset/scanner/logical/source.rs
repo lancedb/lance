@@ -16,9 +16,9 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DataFusionError;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use lance_arrow::SchemaExt as ArrowSchemaExt;
@@ -26,7 +26,6 @@ use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::{
     ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
-use lance_datafusion::exec::OneShotExec;
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::{PlannerIndexExt, ScalarIndexExpr};
 use lance_select::mask::{RowAddrMask, RowAddrTreeMap};
@@ -206,8 +205,11 @@ impl LanceScanSource {
 
     /// Present a row allow list in the shape the leaf's index-result slot expects.
     ///
-    /// Mirrors `Scanner::row_ids_as_take_input`. The one-shot stream is why a row-restricted scan
-    /// can only be executed once, which is also true of the imperative path's stale-row take.
+    /// `Scanner::row_ids_as_take_input` wraps the same batch in a `OneShotExec`. A memory source
+    /// says the same thing without the one-shot restriction, since the allow list is a materialized
+    /// mask. That does not by itself make the scan re-executable — `FilteredReadExec` drains one
+    /// shared task stream per instance, so every Lance scan plan is single-execution — but it keeps
+    /// the reason for that in one place instead of two.
     fn rows_as_index_input(&self, rows: &RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
         let result = IndexExprResult::exact(RowAddrMask::from_allowed(rows.clone()));
         let batch = result.serialize(
@@ -215,10 +217,11 @@ impl LanceScanSource {
             self.options.index_expr_result_format,
         )?;
         let schema = batch.schema();
-        let stream = futures::stream::once(async move { Ok(batch) });
-        Ok(Arc::new(OneShotExec::new(Box::pin(
-            RecordBatchStreamAdapter::new(schema, stream),
-        ))))
+        Ok(MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            schema,
+            None,
+        )?)
     }
 
     fn fragments(&self) -> &Arc<Vec<Fragment>> {
