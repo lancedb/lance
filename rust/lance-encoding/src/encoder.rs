@@ -173,6 +173,15 @@ pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
 /// tensor field) the tensor field is likely to emit encoded pages much more frequently
 /// than the boolean field.
 pub trait FieldEncoder: Send {
+    /// Validate and prepare an array before any encoder state is mutated.
+    ///
+    /// Batch-oriented callers invoke this for every root field before calling
+    /// [`Self::maybe_encode`], so a later validation failure cannot leave an
+    /// earlier field encoder partially advanced.
+    fn prepare_array(&mut self, array: ArrayRef) -> Result<ArrayRef> {
+        Ok(array)
+    }
+
     /// Buffer the data and, if there is enough data in the buffer to form a page, return
     /// an encoding task to encode the data.
     ///
@@ -287,16 +296,6 @@ pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Create an encoder for a root field exposed by [`BatchEncoder`].
-    fn create_root_field_encoder(
-        &self,
-        field: &Field,
-        column_index: &mut ColumnIndexSequence,
-        context: &FieldEncodingContext<'_>,
-    ) -> Result<Box<dyn FieldEncoder>> {
-        self.create_field_encoder(field, column_index, context)
-    }
-
     /// Choose and create an appropriate field encoder for the given
     /// field.
     ///
@@ -347,7 +346,7 @@ impl BatchEncoder {
                     root_field_metadata: &field.metadata,
                 };
                 let encoder =
-                    strategy.create_root_field_encoder(field, &mut col_idx_sequence, &context)?;
+                    strategy.create_field_encoder(field, &mut col_idx_sequence, &context)?;
                 col_idx += encoder.as_ref().num_columns();
                 Ok(encoder)
             })
@@ -423,20 +422,23 @@ pub async fn encode_batch(
         keep_original_array: true,
         ..*options
     };
-    for (array, field) in batch.columns().iter().zip(lance_schema.fields.iter()) {
-        encoding_strategy.validate_array(array.as_ref(), field)?;
-    }
-    let batch_encoder = BatchEncoder::try_new(&lance_schema, encoding_strategy, &options)?;
+    let mut batch_encoder = BatchEncoder::try_new(&lance_schema, encoding_strategy, &options)?;
+    let arrays = batch
+        .columns()
+        .iter()
+        .cloned()
+        .zip(batch_encoder.field_encoders.iter_mut())
+        .map(|(array, encoder)| encoder.prepare_array(array))
+        .collect::<Result<Vec<_>>>()?;
     let mut page_table = Vec::new();
     let mut col_idx_offset = 0;
-    for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
+    for (arr, mut encoder) in arrays.into_iter().zip(batch_encoder.field_encoders) {
         let mut external_buffers =
             OutOfLineBuffers::new(data_buffer.len() as u64, options.buffer_alignment);
         let repdef = RepDefBuilder::default();
         let encoder = encoder.as_mut();
         let num_rows = arr.len() as u64;
-        let mut tasks =
-            encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0, num_rows)?;
+        let mut tasks = encoder.maybe_encode(arr, &mut external_buffers, repdef, 0, num_rows)?;
         tasks.extend(encoder.flush(&mut external_buffers)?);
         for buffer in external_buffers.take_buffers() {
             data_buffer.extend_from_slice(&buffer);

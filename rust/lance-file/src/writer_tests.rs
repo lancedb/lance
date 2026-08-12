@@ -14,8 +14,8 @@ mod tests {
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::types::Float64Type;
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, RecordBatch, RecordBatchReader,
-        StringArray, StructArray, UInt64Array,
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
+        RecordBatchReader, StringArray, StructArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
@@ -28,7 +28,10 @@ mod tests {
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::constants::PACKED_STRUCT_META_KEY;
     use lance_encoding::decoder::DecoderPlugins;
-    use lance_encoding::encoder::{BatchEncoder, EncodingOptions, OutOfLineBuffers, encode_batch};
+    use lance_encoding::encoder::{
+        BatchEncoder, ColumnIndexSequence, EncodingOptions, FieldEncodingContext, OutOfLineBuffers,
+        encode_batch,
+    };
     use lance_encoding::repdef::RepDefBuilder;
     use lance_io::object_store::ObjectStore;
     use lance_io::traits::Writer;
@@ -745,22 +748,35 @@ mod tests {
     /// Fixed-size-list child slots under null parent rows are not logically
     /// encoded, while null structs under valid parent rows remain invalid.
     #[rstest]
-    #[case::masked_child_null(true, true)]
-    #[case::selected_child_null(false, false)]
+    #[case::masked_child_null(true, false, true)]
+    #[case::masked_non_nullable_child_null(true, true, true)]
+    #[case::selected_child_null(false, false, false)]
     #[tokio::test]
     async fn test_v2_0_writer_validates_logical_fixed_size_list_structs(
         #[case] mask_child_null: bool,
+        #[case] has_non_nullable_child_null: bool,
         #[case] should_succeed: bool,
     ) {
         let struct_fields: ArrowFields = vec![
-            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, !has_non_nullable_child_null),
             ArrowField::new("b", DataType::Int32, true),
         ]
         .into();
-        let struct_values = struct_array(
-            struct_fields.clone(),
-            Some(NullBuffer::from(vec![false, true, true])),
-        );
+        let struct_values = if has_non_nullable_child_null {
+            StructArray::new(
+                struct_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![None, Some(99), Some(30)])),
+                    Arc::new(Int32Array::from(vec![11, 98, 31])),
+                ],
+                Some(NullBuffer::from(vec![false, true, true])),
+            )
+        } else {
+            struct_array(
+                struct_fields.clone(),
+                Some(NullBuffer::from(vec![false, true, true])),
+            )
+        };
         let item_field = Arc::new(ArrowField::new(
             "item",
             DataType::Struct(struct_fields),
@@ -768,12 +784,15 @@ mod tests {
         ));
         let parent_nulls = mask_child_null.then(|| NullBuffer::from(vec![false, true, true]));
         let list = FixedSizeListArray::new(item_field, 1, Arc::new(struct_values), parent_nulls);
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "items",
-            list.data_type().clone(),
-            true,
-        )]));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(list)]).unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("items", list.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(list)],
+        )
+        .unwrap();
         let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
         let fs = FsFixture::default();
@@ -850,6 +869,33 @@ mod tests {
         ));
         assert!(direct_error.to_string().contains("struct validity"));
 
+        let options = EncodingOptions::default();
+        let field = &lance_schema.fields[0];
+        let context = FieldEncodingContext {
+            strategy: strategy.as_ref(),
+            options: &options,
+            root_field_metadata: &field.metadata,
+        };
+        let mut column_index = ColumnIndexSequence::default();
+        let mut factory_encoder = strategy
+            .create_field_encoder(field, &mut column_index, &context)
+            .unwrap();
+        let factory_result = factory_encoder.maybe_encode(
+            batch.column(0).clone(),
+            &mut OutOfLineBuffers::new(0, 64),
+            RepDefBuilder::default(),
+            0,
+            batch.num_rows() as u64,
+        );
+        let Err(factory_error) = factory_result else {
+            panic!("public create_field_encoder bypassed v2.0 validation");
+        };
+        assert!(matches!(
+            factory_error,
+            lance_core::Error::InvalidInput { .. }
+        ));
+        assert!(factory_error.to_string().contains("struct validity"));
+
         let error = encode_batch(
             &batch,
             lance_schema,
@@ -864,6 +910,39 @@ mod tests {
         assert!(message.contains("struct validity"), "{message}");
         assert!(message.contains("2.0"), "{message}");
         assert!(message.contains("1 null value"), "{message}");
+    }
+
+    #[test]
+    fn test_v2_0_primitive_fsl_preparation_reuses_array() {
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let array: ArrayRef = Arc::new(FixedSizeListArray::new(
+            item_field.clone(),
+            2,
+            Arc::new(Float32Array::from(vec![0.0; 6])),
+            Some(NullBuffer::from(vec![true, false, true])),
+        ));
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(item_field, 2),
+            true,
+        )]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        let strategy = versions::v2_0::encoding_strategy();
+        let options = EncodingOptions::default();
+        let field = &lance_schema.fields[0];
+        let context = FieldEncodingContext {
+            strategy: strategy.as_ref(),
+            options: &options,
+            root_field_metadata: &field.metadata,
+        };
+        let mut column_index = ColumnIndexSequence::default();
+        let mut encoder = strategy
+            .create_field_encoder(field, &mut column_index, &context)
+            .unwrap();
+
+        let prepared = encoder.prepare_array(array.clone()).unwrap();
+
+        assert!(Arc::ptr_eq(&prepared, &array));
     }
 
     /// The blocking read path applies the same projection-length validation as

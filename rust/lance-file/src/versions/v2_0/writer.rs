@@ -307,13 +307,17 @@ impl Writer {
         Ok(())
     }
 
-    fn verify_nullability_constraints(&self, field_arrays: &[(usize, ArrayRef)]) -> Result<()> {
-        let fields = &self.schema.as_ref().unwrap().fields;
-        for (field_idx, array) in field_arrays {
-            self.encoding_strategy
-                .validate_array(array.as_ref(), &fields[*field_idx])?;
-        }
-        Ok(())
+    fn prepare_field_arrays(
+        &mut self,
+        field_arrays: Vec<(usize, ArrayRef)>,
+    ) -> Result<Vec<(usize, ArrayRef)>> {
+        field_arrays
+            .into_iter()
+            .map(|(field_idx, array)| {
+                let array = self.column_writers[field_idx].prepare_array(array)?;
+                Ok((field_idx, array))
+            })
+            .collect()
     }
 
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
@@ -449,7 +453,7 @@ impl Writer {
         );
         self.ensure_initialized(batch)?;
         let field_arrays = self.field_arrays(batch)?;
-        self.verify_nullability_constraints(&field_arrays)?;
+        let field_arrays = self.prepare_field_arrays(field_arrays)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -525,23 +529,22 @@ impl Writer {
                 "write_column requires the writer to be created with an explicit schema".into(),
             )
         })?;
-        let field = schema.fields.get(column_index).ok_or_else(|| {
-            Error::invalid_input_source(
+        if column_index >= schema.fields.len() {
+            return Err(Error::invalid_input_source(
                 format!(
                     "write_column: field index {} is out of bounds (schema has {} fields)",
                     column_index,
                     schema.fields.len()
                 )
                 .into(),
-            )
-        })?;
+            ));
+        }
         if array.len() as u64 > u32::MAX as u64 {
             return Err(Error::invalid_input_source(
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
-        self.encoding_strategy
-            .validate_array(array.as_ref(), field)?;
+        let array = self.column_writers[column_index].prepare_array(array)?;
 
         // A never-advanced field simply remains a zero-length column, which the
         // encoders handle at `finish` time.

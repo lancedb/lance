@@ -4,14 +4,13 @@
 use std::{collections::HashMap, env, hash::RandomState, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, ListArray, UInt8Array, cast::AsArray, make_array,
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, UInt8Array, cast::AsArray, make_array,
 };
-use arrow_buffer::BooleanBufferBuilder;
+use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use arrow_select::filter::filter;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
-use lance_arrow::{BLOB_META_KEY, list::ListArrayExt};
+use lance_arrow::BLOB_META_KEY;
 
 use crate::{
     array_encoding::{
@@ -56,15 +55,27 @@ pub struct ArrayFieldEncodingStrategy {
 struct ValidatingFieldEncoder {
     inner: Box<dyn FieldEncoder>,
     field: Field,
+    prepared_array: Option<ArrayRef>,
 }
 
 impl ValidatingFieldEncoder {
     fn new(inner: Box<dyn FieldEncoder>, field: Field) -> Self {
-        Self { inner, field }
+        Self {
+            inner,
+            field,
+            prepared_array: None,
+        }
     }
 }
 
 impl FieldEncoder for ValidatingFieldEncoder {
+    fn prepare_array(&mut self, array: ArrayRef) -> Result<ArrayRef> {
+        ArrayFieldEncodingStrategy::validate_v2_0_array(array.as_ref(), &self.field, true)?;
+        let array = ArrayFieldEncodingStrategy::clear_unreachable_v2_0_fsl_struct_validity(array)?;
+        self.prepared_array = Some(array.clone());
+        Ok(array)
+    }
+
     fn maybe_encode(
         &mut self,
         array: ArrayRef,
@@ -73,10 +84,20 @@ impl FieldEncoder for ValidatingFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        // Batch-level entry points enforce declared field nullability before mutation. This
-        // wrapper makes only the v2.0 lossy-struct invariant unavoidable for direct encoders.
-        ArrayFieldEncodingStrategy::validate_v2_0_array(array.as_ref(), &self.field, false)?;
-        let array = ArrayFieldEncodingStrategy::clear_unreachable_v2_0_fsl_struct_validity(array)?;
+        let array = match self.prepared_array.take() {
+            Some(prepared) if Arc::ptr_eq(&prepared, &array) => prepared,
+            _ => {
+                // Direct field encoders have historically accepted arrays whose top-level
+                // nullability differs from the declared field. Keep that API behavior while
+                // still making the v2.0 struct-validity invariant unavoidable.
+                ArrayFieldEncodingStrategy::validate_v2_0_array(
+                    array.as_ref(),
+                    &self.field,
+                    false,
+                )?;
+                ArrayFieldEncodingStrategy::clear_unreachable_v2_0_fsl_struct_validity(array)?
+            }
+        };
         self.inner
             .maybe_encode(array, external_buffers, repdef, row_number, num_rows)
     }
@@ -150,89 +171,215 @@ impl ArrayFieldEncodingStrategy {
         field: &Field,
         enforce_field_nullability: bool,
     ) -> Result<()> {
-        if enforce_field_nullability && !field.nullable && array.null_count() > 0 {
+        Self::validate_v2_0_array_reachability(array, field, enforce_field_nullability, None)
+    }
+
+    fn field_requires_v2_0_validation(field: &Field, enforce_field_nullability: bool) -> bool {
+        field.logical_type.is_struct()
+            || (enforce_field_nullability && !field.nullable)
+            || field
+                .children
+                .iter()
+                .any(|child| Self::field_requires_v2_0_validation(child, enforce_field_nullability))
+    }
+
+    fn is_reachable(reachable: Option<&BooleanBuffer>, index: usize) -> bool {
+        reachable.map(|mask| mask.value(index)).unwrap_or(true)
+    }
+
+    fn positional_child_reachability(
+        array: &dyn Array,
+        reachable: Option<&BooleanBuffer>,
+    ) -> Option<BooleanBuffer> {
+        if reachable.is_none() && array.null_count() == 0 {
+            return None;
+        }
+        Some(BooleanBuffer::from_iter((0..array.len()).map(|index| {
+            Self::is_reachable(reachable, index) && array.is_valid(index)
+        })))
+    }
+
+    fn list_child_reachability<O: OffsetSizeTrait>(
+        array: &GenericListArray<O>,
+        reachable: Option<&BooleanBuffer>,
+    ) -> Option<BooleanBuffer> {
+        let values_len = array.values().len();
+        let offsets = array.offsets();
+        if reachable.is_none()
+            && array.null_count() == 0
+            && offsets.first().map(|offset| offset.as_usize()) == Some(0)
+            && offsets.last().map(|offset| offset.as_usize()) == Some(values_len)
+        {
+            return None;
+        }
+
+        let mut child_reachable = vec![false; values_len];
+        for index in 0..array.len() {
+            if Self::is_reachable(reachable, index) && array.is_valid(index) {
+                let start = offsets[index].as_usize();
+                let end = offsets[index + 1].as_usize();
+                for is_reachable in child_reachable.iter_mut().take(end).skip(start) {
+                    *is_reachable = true;
+                }
+            }
+        }
+        Some(BooleanBuffer::from_iter(child_reachable))
+    }
+
+    fn map_child_reachability(
+        array: &arrow_array::MapArray,
+        reachable: Option<&BooleanBuffer>,
+    ) -> Option<BooleanBuffer> {
+        let values_len = array.entries().len();
+        let offsets = array.offsets();
+        if reachable.is_none()
+            && array.null_count() == 0
+            && offsets.first().copied() == Some(0)
+            && offsets.last().copied() == Some(values_len as i32)
+        {
+            return None;
+        }
+
+        let mut child_reachable = vec![false; values_len];
+        for index in 0..array.len() {
+            if Self::is_reachable(reachable, index) && array.is_valid(index) {
+                let start = offsets[index] as usize;
+                let end = offsets[index + 1] as usize;
+                for is_reachable in child_reachable.iter_mut().take(end).skip(start) {
+                    *is_reachable = true;
+                }
+            }
+        }
+        Some(BooleanBuffer::from_iter(child_reachable))
+    }
+
+    fn fixed_size_list_child_reachability(
+        array: &arrow_array::FixedSizeListArray,
+        reachable: Option<&BooleanBuffer>,
+    ) -> Option<BooleanBuffer> {
+        let values_len = array.values().len();
+        let dimension = array.value_length() as usize;
+        let (first_value, final_value) = if array.is_empty() {
+            (0, 0)
+        } else {
+            (
+                array.value_offset(0) as usize,
+                array.value_offset(array.len() - 1) as usize + dimension,
+            )
+        };
+        if reachable.is_none()
+            && array.null_count() == 0
+            && first_value == 0
+            && final_value == values_len
+        {
+            return None;
+        }
+
+        let mut child_reachable = vec![false; values_len];
+        for index in 0..array.len() {
+            if Self::is_reachable(reachable, index) && array.is_valid(index) {
+                let start = array.value_offset(index) as usize;
+                for is_reachable in child_reachable.iter_mut().skip(start).take(dimension) {
+                    *is_reachable = true;
+                }
+            }
+        }
+        Some(BooleanBuffer::from_iter(child_reachable))
+    }
+
+    fn validate_v2_0_array_reachability(
+        array: &dyn Array,
+        field: &Field,
+        enforce_field_nullability: bool,
+        reachable: Option<&BooleanBuffer>,
+    ) -> Result<()> {
+        if !Self::field_requires_v2_0_validation(field, enforce_field_nullability) {
+            return Ok(());
+        }
+
+        let reachable_null_count = if array.null_count() == 0 {
+            0
+        } else if let Some(reachable) = reachable {
+            (0..array.len())
+                .filter(|index| reachable.value(*index) && array.is_null(*index))
+                .count()
+        } else {
+            array.null_count()
+        };
+
+        if enforce_field_nullability && !field.nullable && reachable_null_count > 0 {
             return Err(Error::invalid_input(format!(
                 "The field `{}` contained null values even though the field is marked non-null in the schema",
                 field.name
             )));
         }
-        if field.logical_type.is_struct() && array.null_count() > 0 {
+        if field.logical_type.is_struct() && reachable_null_count > 0 {
             return Err(Error::invalid_input(format!(
                 "The struct field `{}` contains {} null value(s), but Lance file version 2.0 does not encode struct validity; use file version 2.1 or later",
-                field.name,
-                array.null_count()
+                field.name, reachable_null_count
             )));
         }
 
         match array.data_type() {
             DataType::Struct(_) => {
+                let child_reachable = Self::positional_child_reachability(array, reachable);
                 for (child_field, child_array) in
                     field.children.iter().zip(array.as_struct().columns())
                 {
-                    Self::validate_v2_0_array(
+                    Self::validate_v2_0_array_reachability(
                         child_array.as_ref(),
                         child_field,
                         enforce_field_nullability,
+                        child_reachable.as_ref(),
                     )?;
                 }
             }
             DataType::List(_) => {
-                let child_array = array
-                    .as_list::<i32>()
-                    .filter_garbage_nulls()
-                    .trimmed_values();
+                let list_array = array.as_list::<i32>();
                 if let Some(child_field) = field.children.first() {
-                    Self::validate_v2_0_array(
-                        child_array.as_ref(),
+                    let child_reachable = Self::list_child_reachability(list_array, reachable);
+                    Self::validate_v2_0_array_reachability(
+                        list_array.values().as_ref(),
                         child_field,
                         enforce_field_nullability,
+                        child_reachable.as_ref(),
                     )?;
                 }
             }
             DataType::LargeList(_) => {
-                let child_array = array
-                    .as_list::<i64>()
-                    .filter_garbage_nulls()
-                    .trimmed_values();
+                let list_array = array.as_list::<i64>();
                 if let Some(child_field) = field.children.first() {
-                    Self::validate_v2_0_array(
-                        child_array.as_ref(),
+                    let child_reachable = Self::list_child_reachability(list_array, reachable);
+                    Self::validate_v2_0_array_reachability(
+                        list_array.values().as_ref(),
                         child_field,
                         enforce_field_nullability,
+                        child_reachable.as_ref(),
                     )?;
                 }
             }
             DataType::Map(_, _) => {
-                let list_array: ListArray = array.as_map().clone().into();
-                let child_array = list_array.filter_garbage_nulls().trimmed_values();
+                let map_array = array.as_map();
                 if let Some(child_field) = field.children.first() {
-                    Self::validate_v2_0_array(
-                        child_array.as_ref(),
+                    let child_reachable = Self::map_child_reachability(map_array, reachable);
+                    Self::validate_v2_0_array_reachability(
+                        map_array.entries(),
                         child_field,
                         enforce_field_nullability,
+                        child_reachable.as_ref(),
                     )?;
                 }
             }
             DataType::FixedSizeList(_, _) => {
                 let list_array = array.as_fixed_size_list();
-                let child_array = if let Some(nulls) =
-                    list_array.nulls().filter(|nulls| nulls.null_count() > 0)
-                {
-                    let dimension = list_array.value_length() as usize;
-                    let mut reachable = BooleanBufferBuilder::new(list_array.values().len());
-                    for is_valid in nulls.iter() {
-                        reachable.append_n(dimension, is_valid);
-                    }
-                    let reachable = BooleanArray::new(reachable.finish(), None);
-                    filter(list_array.values(), &reachable)?
-                } else {
-                    list_array.values().clone()
-                };
                 if let Some(child_field) = field.children.first() {
-                    Self::validate_v2_0_array(
-                        child_array.as_ref(),
+                    let child_reachable =
+                        Self::fixed_size_list_child_reachability(list_array, reachable);
+                    Self::validate_v2_0_array_reachability(
+                        list_array.values().as_ref(),
                         child_field,
                         enforce_field_nullability,
+                        child_reachable.as_ref(),
                     )?;
                 }
             }
@@ -241,10 +388,14 @@ impl ArrayFieldEncodingStrategy {
                 for (child_field, child_data) in field.children.iter().zip(array_data.child_data())
                 {
                     let child_array = make_array(child_data.clone());
-                    Self::validate_v2_0_array(
+                    let child_reachable = (child_array.len() == array.len())
+                        .then(|| Self::positional_child_reachability(array, reachable))
+                        .flatten();
+                    Self::validate_v2_0_array_reachability(
                         child_array.as_ref(),
                         child_field,
                         enforce_field_nullability,
+                        child_reachable.as_ref(),
                     )?;
                 }
             }
@@ -253,30 +404,62 @@ impl ArrayFieldEncodingStrategy {
     }
 
     fn clear_unreachable_v2_0_fsl_struct_validity(array: ArrayRef) -> Result<ArrayRef> {
-        // Validation above proves that any remaining null structs below a fixed-size-list
-        // belong only to null parent rows. The v2.0 physical FSL path still visits those
-        // child slots, so remove their unrepresentable validity without rebuilding arrays
-        // that do not contain such unreachable nulls (which preserves stable wire bytes).
+        fn force_valid_under_null_struct(
+            data: ArrayData,
+            struct_nulls: &NullBuffer,
+        ) -> Result<ArrayData> {
+            let Some(child_nulls) = data.nulls() else {
+                return Ok(data);
+            };
+            if !(0..data.len())
+                .any(|index| struct_nulls.is_null(index) && child_nulls.is_null(index))
+            {
+                return Ok(data);
+            }
+
+            let nulls =
+                NullBuffer::new(BooleanBuffer::from_iter((0..data.len()).map(|index| {
+                    struct_nulls.is_null(index) || child_nulls.is_valid(index)
+                })));
+            let nulls = (nulls.null_count() > 0).then_some(nulls);
+            Ok(data.into_builder().nulls(nulls).build()?)
+        }
+
         fn strip_struct_validity(data: ArrayData) -> Result<(ArrayData, bool)> {
-            let has_struct_nulls =
-                matches!(data.data_type(), DataType::Struct(_)) && data.null_count() > 0;
+            let struct_fields = match data.data_type() {
+                DataType::Struct(fields) => Some(fields.clone()),
+                _ => None,
+            };
+            let struct_nulls = struct_fields
+                .as_ref()
+                .and_then(|_| data.nulls())
+                .filter(|nulls| nulls.null_count() > 0)
+                .cloned();
             let mut children_changed = false;
             let children = data
                 .child_data()
                 .iter()
                 .cloned()
-                .map(|child| {
-                    let (child, changed) = strip_struct_validity(child)?;
+                .enumerate()
+                .map(|(index, child)| {
+                    let (mut child, changed) = strip_struct_validity(child)?;
                     children_changed |= changed;
+                    if let (Some(fields), Some(struct_nulls)) = (&struct_fields, &struct_nulls)
+                        && !fields[index].is_nullable()
+                    {
+                        let original_null_count = child.null_count();
+                        child = force_valid_under_null_struct(child, struct_nulls)?;
+                        children_changed |= child.null_count() != original_null_count;
+                    }
                     Ok(child)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if !has_struct_nulls && !children_changed {
+            if struct_nulls.is_none() && !children_changed {
                 return Ok((data, false));
             }
 
             let mut builder = data.into_builder().child_data(children);
-            if has_struct_nulls {
+            if struct_nulls.is_some() {
                 builder = builder.nulls(None);
             }
             Ok((builder.build()?, true))
@@ -312,20 +495,8 @@ impl ArrayFieldEncodingStrategy {
             Ok(array)
         }
     }
-}
 
-impl Default for ArrayFieldEncodingStrategy {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
-    fn validate_array(&self, array: &dyn Array, field: &Field) -> Result<()> {
-        Self::validate_v2_0_array(array, field, true)
-    }
-
-    fn create_field_encoder(
+    fn create_field_encoder_raw(
         &self,
         field: &Field,
         column_index: &mut ColumnIndexSequence,
@@ -359,11 +530,8 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
             match data_type {
                 DataType::List(_child) | DataType::LargeList(_child) => {
                     let list_idx = column_index.next_column_index(field.id as u32);
-                    let inner_encoding = context.strategy.create_field_encoder(
-                        &field.children[0],
-                        column_index,
-                        context,
-                    )?;
+                    let inner_encoding =
+                        self.create_field_encoder_raw(&field.children[0], column_index, context)?;
                     let offsets_encoder =
                         Arc::new(BasicEncoder::new(Box::new(ValueEncoder::default())));
                     Ok(Box::new(ListFieldEncoder::new(
@@ -393,9 +561,7 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                             .children
                             .iter()
                             .map(|field| {
-                                context
-                                    .strategy
-                                    .create_field_encoder(field, column_index, context)
+                                self.create_field_encoder_raw(field, column_index, context)
                             })
                             .collect::<Result<Vec<_>>>()?;
                         Ok(Box::new(StructFieldEncoder::new(
@@ -405,7 +571,6 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                     }
                 }
                 DataType::Dictionary(_, value_type) => {
-                    // A dictionary of primitive is, itself, primitive
                     if Self::is_primitive_type(&value_type) {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             options,
@@ -414,12 +579,10 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                             field.clone(),
                         )?))
                     } else {
-                        // A dictionary of logical is, itself, logical and we don't support that today
-                        // It could be possible (e.g. store indices in one column and values in remaining columns)
-                        // but would be a significant amount of work
-                        //
-                        // An easier fallback implementation would be to decode-on-write and encode-on-read
-                        Err(Error::not_supported_source(format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into()))
+                        Err(Error::not_supported_source(format!(
+                            "cannot encode a dictionary column whose value type is a logical type ({})",
+                            value_type
+                        ).into()))
                     }
                 }
                 _ => Err(Error::not_supported_source(
@@ -433,14 +596,26 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
             }
         }
     }
+}
 
-    fn create_root_field_encoder(
+impl Default for ArrayFieldEncodingStrategy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
+    fn validate_array(&self, array: &dyn Array, field: &Field) -> Result<()> {
+        Self::validate_v2_0_array(array, field, true)
+    }
+
+    fn create_field_encoder(
         &self,
         field: &Field,
         column_index: &mut ColumnIndexSequence,
         context: &FieldEncodingContext<'_>,
     ) -> Result<Box<dyn FieldEncoder>> {
-        let encoder = self.create_field_encoder(field, column_index, context)?;
+        let encoder = self.create_field_encoder_raw(field, column_index, context)?;
         Ok(Box::new(ValidatingFieldEncoder::new(
             encoder,
             field.clone(),
