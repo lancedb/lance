@@ -18,7 +18,9 @@ use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
-use lance_datafusion::chunker::{break_stream, chunk_stream, chunk_stream_with_sizes};
+use lance_datafusion::chunker::{
+    break_stream, break_stream_with_sizes, chunk_stream, chunk_stream_with_sizes,
+};
 use lance_file::{
     version::ConcreteFileVersion,
     versions as file_versions,
@@ -173,26 +175,35 @@ pub async fn write_fragments_direct(
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
-        if params.max_rows_per_group == 0 {
-            return Err(Error::invalid_input(
-                "max_rows_per_group must be greater than zero when file row counts are specified",
-            ));
-        }
         if file_row_counts.contains(&0) {
             return Err(Error::invalid_input(
                 "File row counts must be greater than zero",
             ));
         }
-        let max_rows_per_group = params.max_rows_per_group;
-        let batch_row_counts = file_row_counts
-            .clone()
-            .into_iter()
-            .flat_map(move |file_rows| {
-                (0..file_rows)
-                    .step_by(max_rows_per_group)
-                    .map(move |offset| (file_rows - offset).min(max_rows_per_group))
-            });
-        chunk_stream_with_sizes(data, batch_row_counts)
+        match version {
+            ConcreteFileVersion::V1 => {
+                if params.max_rows_per_group == 0 {
+                    return Err(Error::invalid_input(
+                        "max_rows_per_group must be greater than zero when file row counts are specified",
+                    ));
+                }
+                let max_rows_per_group = params.max_rows_per_group;
+                let batch_row_counts =
+                    file_row_counts
+                        .clone()
+                        .into_iter()
+                        .flat_map(move |file_rows| {
+                            (0..file_rows)
+                                .step_by(max_rows_per_group)
+                                .map(move |offset| (file_rows - offset).min(max_rows_per_group))
+                        });
+                chunk_stream_with_sizes(data, batch_row_counts)
+            }
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream_with_sizes(data, file_row_counts.clone()),
+        }
     } else {
         match version {
             ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
