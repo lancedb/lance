@@ -29,6 +29,8 @@ import java.util.Optional;
  * default values.
  */
 public class CompactionOptions implements Serializable {
+  // Pinned to the UID generated before maxSourceRows/maxSourceBytes were added, so that
+  // CompactionTask streams queued by older workers still deserialize during a rolling upgrade.
   private static final long serialVersionUID = 3114922060085417942L;
 
   // these fields are effectively final, but not marked as final for de/ser
