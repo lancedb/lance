@@ -25,6 +25,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -281,6 +282,29 @@ public class MergeInsertTest {
     return root;
   }
 
+  /**
+   * Build a key-only source (only the join key column) whose key {@code id=0} appears twice. A pure
+   * delete over such a source routes through the delete-only plan, exercising source dedupe there.
+   */
+  private VectorSchemaRoot buildDuplicateKeyOnlySource(Schema schema, RootAllocator allocator) {
+    Field idField = schema.findField("id");
+    Schema keyOnlySchema = new Schema(Collections.singletonList(idField));
+
+    List<Integer> sourceIds = Arrays.asList(0, 0);
+
+    VectorSchemaRoot root = VectorSchemaRoot.create(keyOnlySchema, allocator);
+    root.allocateNew();
+
+    IntVector idVector = (IntVector) root.getVector("id");
+    for (int i = 0; i < sourceIds.size(); i++) {
+      idVector.setSafe(i, sourceIds.get(i));
+    }
+
+    root.setRowCount(sourceIds.size());
+
+    return root;
+  }
+
   private ArrowArrayStream convertToStream(VectorSchemaRoot root, RootAllocator allocator)
       throws Exception {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -350,6 +374,122 @@ public class MergeInsertTest {
             originalDataset,
             readAll(dataset).toString(),
             "Dataset should remain unchanged after a failed mergeInsert");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeDeleteFullSchemaFirstSeen() throws Exception {
+    // Full-schema delete: source id=0 is duplicated ("First 0", then "Second 0").
+    // FirstSeen deletes the matched target row once and skips the duplicate; ids
+    // 3 and 4 are unique matches that are also deleted.
+
+    try (VectorSchemaRoot source = buildDuplicateKeySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedDelete()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            "{1=Person 1, 2=Person 2}",
+            readAll(result.dataset()).toString(),
+            "FirstSeen should delete each matched target row once, skipping the duplicate id=0");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeDeleteFullSchemaFailWithDuplicates() throws Exception {
+    // Full-schema delete with Fail must reject the ambiguous duplicate source key
+    // and leave the target unchanged.
+
+    try (VectorSchemaRoot source = buildDuplicateKeySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        String originalDataset = readAll(dataset).toString();
+
+        Exception ex =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.mergeInsert(
+                        new MergeInsertParams(Collections.singletonList("id"))
+                            .withMatchedDelete()
+                            .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                            .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
+                        sourceStream));
+
+        Assertions.assertNotNull(ex.getMessage(), "exception should carry a message");
+        Assertions.assertTrue(
+            ex.getMessage().contains("Ambiguous merge inserts are prohibited"),
+            "Fail should report the ambiguous-merge cause, got: " + ex.getMessage());
+
+        Assertions.assertEquals(
+            originalDataset,
+            readAll(dataset).toString(),
+            "Dataset should remain unchanged after a failed delete mergeInsert");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeDeleteOnlyKeyOnlyFirstSeen() throws Exception {
+    // Key-only delete-only plan: the source carries just the join key and id=0 is
+    // duplicated. FirstSeen deletes the matched target row once and skips the
+    // duplicate; no other rows are touched.
+
+    try (VectorSchemaRoot source =
+        buildDuplicateKeyOnlySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedDelete()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            "{1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4}",
+            readAll(result.dataset()).toString(),
+            "FirstSeen should delete the matched id=0 once and skip the duplicate");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeDeleteOnlyKeyOnlyFailWithDuplicates() throws Exception {
+    // Key-only delete-only plan with Fail must reject the ambiguous duplicate
+    // source key and leave the target unchanged.
+
+    try (VectorSchemaRoot source =
+        buildDuplicateKeyOnlySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        String originalDataset = readAll(dataset).toString();
+
+        Exception ex =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.mergeInsert(
+                        new MergeInsertParams(Collections.singletonList("id"))
+                            .withMatchedDelete()
+                            .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                            .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
+                        sourceStream));
+
+        Assertions.assertNotNull(ex.getMessage(), "exception should carry a message");
+        Assertions.assertTrue(
+            ex.getMessage().contains("Ambiguous merge inserts are prohibited"),
+            "Fail should report the ambiguous-merge cause, got: " + ex.getMessage());
+
+        Assertions.assertEquals(
+            originalDataset,
+            readAll(dataset).toString(),
+            "Dataset should remain unchanged after a failed delete-only mergeInsert");
       }
     }
   }
