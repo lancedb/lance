@@ -18,7 +18,11 @@ use lance_select::RowAddrTreeMap;
 use std::sync::Arc;
 
 /// Minimum amount of row-based zone work dispatched to the CPU pool at once.
-const TARGET_ROWS_PER_SPLIT: usize = 8192;
+///
+/// This is a floor, not a target: zones are never divided, so a split holding a
+/// single zone larger than this is dispatched as-is. Only zones smaller than the
+/// floor are grouped together, which is the point of batching.
+const MIN_ROWS_PER_SPLIT: usize = 8192;
 
 //
 // Example: Suppose we have two fragments, each with 4 rows.
@@ -145,7 +149,6 @@ type ZoneSplit = Vec<Zone>;
 struct ZoneSplitAssembler {
     stream: SendableRecordBatchStream,
     zone_size: usize,
-    target_rows: usize,
     input_batch: Option<RecordBatch>,
     input_offset: usize,
     /// Zero-copy slices of the zone currently being assembled.
@@ -162,7 +165,6 @@ impl ZoneSplitAssembler {
         Self {
             stream,
             zone_size,
-            target_rows: TARGET_ROWS_PER_SPLIT.max(zone_size),
             input_batch: None,
             input_offset: 0,
             current_zone: Vec::new(),
@@ -176,11 +178,11 @@ impl ZoneSplitAssembler {
     /// Produces the next bounded unit of zone work without eagerly draining the input.
     ///
     /// Each call advances `stream` only until enough *complete* zones have been
-    /// collected to reach `target_rows`. The target is intentionally a soft
-    /// boundary: a zone is never divided between splits, so the returned split
-    /// may contain slightly more rows than requested. Within a split, zones stay
-    /// in input order, contain at most `zone_size` physical rows, and never cross
-    /// a fragment boundary.
+    /// collected to reach `MIN_ROWS_PER_SPLIT`. That constant is a floor, not a
+    /// target: a zone is never divided between splits, so a single zone larger
+    /// than the floor is returned on its own and the split may hold far more rows
+    /// than the floor. Within a split, zones stay in input order, contain at most
+    /// `zone_size` physical rows, and never cross a fragment boundary.
     ///
     /// A large input batch may therefore be consumed over several calls. The
     /// unread suffix remains in `input_batch` and `input_offset`, which bounds
@@ -191,7 +193,7 @@ impl ZoneSplitAssembler {
     async fn next_split(&mut self) -> Result<Option<ZoneSplit>> {
         loop {
             // Return once the split contains enough complete zones.
-            if self.current_split_rows >= self.target_rows {
+            if self.current_split_rows >= MIN_ROWS_PER_SPLIT {
                 return Ok(Some(self.take_split()));
             }
 
@@ -606,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn batches_tiny_zones_incrementally_into_row_sized_splits() {
-        let num_rows = TARGET_ROWS_PER_SPLIT * 2 + 17;
+        let num_rows = MIN_ROWS_PER_SPLIT * 2 + 17;
         let input = batch(
             vec![1; num_rows],
             vec![0; num_rows],
@@ -621,13 +623,13 @@ mod tests {
                 .flatten()
                 .map(RecordBatch::num_rows)
                 .sum::<usize>(),
-            TARGET_ROWS_PER_SPLIT
+            MIN_ROWS_PER_SPLIT
         );
-        assert_eq!(first_split.len(), TARGET_ROWS_PER_SPLIT);
-        assert_eq!(assembler.input_offset, TARGET_ROWS_PER_SPLIT);
+        assert_eq!(first_split.len(), MIN_ROWS_PER_SPLIT);
+        assert_eq!(assembler.input_offset, MIN_ROWS_PER_SPLIT);
 
         let second_split = assembler.next_split().await.unwrap().unwrap();
-        assert_eq!(second_split.len(), TARGET_ROWS_PER_SPLIT);
+        assert_eq!(second_split.len(), MIN_ROWS_PER_SPLIT);
 
         let trailing_split = assembler.next_split().await.unwrap().unwrap();
         assert_eq!(trailing_split.len(), 17);
