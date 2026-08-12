@@ -188,10 +188,20 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
             .map(|fragment| fragment.id as u32)
             .collect::<RoaringBitmap>();
         // A bitmap cannot preserve duplicate fragments, and CountFromMaskExec
-        // can only resolve fragments from the scanner's dataset.
+        // resolves fragment IDs against the current manifest instead of using
+        // the descriptors supplied to FilteredReadExec.
         let has_duplicate_fragments = fragment_scope.len() != fragments.len() as u64;
-        let has_foreign_fragments = !(&fragment_scope - &dataset_fragments).is_empty();
-        if has_duplicate_fragments || has_foreign_fragments {
+        let descriptors_are_current = fragments.iter().all(|fragment| {
+            let Ok(fragment_id) = u32::try_from(fragment.id) else {
+                return false;
+            };
+            if !dataset.fragment_bitmap.contains(fragment_id) {
+                return false;
+            }
+            let fragment_index = dataset.fragment_bitmap.rank(fragment_id) as usize - 1;
+            dataset.fragments().get(fragment_index) == Some(fragment)
+        });
+        if has_duplicate_fragments || !descriptors_are_current {
             return Ok(None);
         }
         Some(fragment_scope)
@@ -617,6 +627,32 @@ mod tests {
         assert!(
             !plan_contains_union(&plan),
             "no union expected when the index covers the requested fragment, got: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn count_matches_scan_for_stale_fragment_descriptor() {
+        let fixture = make_fixture().await;
+        let mut dataset = fixture.dataset.as_ref().clone();
+        let stale_fragment = dataset.fragments()[0].clone();
+        dataset.delete("ordered = 0").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        let mut scan = dataset.scan();
+        scan.with_fragments(vec![stale_fragment.clone()]);
+        scan.filter("ordered < 10").unwrap();
+        let scanned_rows = scan.try_into_batch().await.unwrap().num_rows() as i64;
+
+        let mut count_scan = dataset.scan();
+        count_scan.with_fragments(vec![stale_fragment]);
+        count_scan.filter("ordered < 10").unwrap();
+        let (plan, count) = run_count(&mut count_scan).await;
+
+        assert_eq!(count, scanned_rows);
+        assert!(
+            !plan_contains_pushdown(&plan),
+            "a stale fragment descriptor must retain the original scan plan: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
