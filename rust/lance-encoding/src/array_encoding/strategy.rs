@@ -3,8 +3,13 @@
 
 use std::{collections::HashMap, env, hash::RandomState, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, ListArray, UInt8Array, cast::AsArray, make_array};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, ListArray, UInt8Array, cast::AsArray, make_array,
+};
+use arrow_buffer::BooleanBufferBuilder;
+use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use arrow_select::filter::filter;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use lance_arrow::{BLOB_META_KEY, list::ListArrayExt};
 
@@ -27,8 +32,8 @@ use crate::{
         PACKED_STRUCT_META_KEY,
     },
     encoder::{
-        ArrayEncoder, ArrayEncodingStrategy, ColumnIndexSequence, FieldEncoder,
-        FieldEncodingContext, FieldEncodingStrategy,
+        ArrayEncoder, ArrayEncodingStrategy, ColumnIndexSequence, EncodeTask, EncodedColumn,
+        FieldEncoder, FieldEncodingContext, FieldEncodingStrategy, OutOfLineBuffers,
     },
     encodings::{
         logical::r#struct::StructFieldEncoder,
@@ -46,6 +51,50 @@ use lance_core::{Error, Result};
 #[derive(Debug)]
 pub struct ArrayFieldEncodingStrategy {
     array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
+}
+
+struct ValidatingFieldEncoder {
+    inner: Box<dyn FieldEncoder>,
+    field: Field,
+}
+
+impl ValidatingFieldEncoder {
+    fn new(inner: Box<dyn FieldEncoder>, field: Field) -> Self {
+        Self { inner, field }
+    }
+}
+
+impl FieldEncoder for ValidatingFieldEncoder {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+        repdef: crate::repdef::RepDefBuilder,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Result<Vec<EncodeTask>> {
+        // Batch-level entry points enforce declared field nullability before mutation. This
+        // wrapper makes only the v2.0 lossy-struct invariant unavoidable for direct encoders.
+        ArrayFieldEncodingStrategy::validate_v2_0_array(array.as_ref(), &self.field, false)?;
+        let array = ArrayFieldEncodingStrategy::clear_unreachable_v2_0_fsl_struct_validity(array)?;
+        self.inner
+            .maybe_encode(array, external_buffers, repdef, row_number, num_rows)
+    }
+
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
+        self.inner.flush(external_buffers)
+    }
+
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        self.inner.finish(external_buffers)
+    }
+
+    fn num_columns(&self) -> u32 {
+        self.inner.num_columns()
+    }
 }
 
 impl ArrayFieldEncodingStrategy {
@@ -96,8 +145,12 @@ impl ArrayFieldEncodingStrategy {
         )
     }
 
-    fn validate_v2_0_array(array: &dyn Array, field: &Field) -> Result<()> {
-        if !field.nullable && array.null_count() > 0 {
+    fn validate_v2_0_array(
+        array: &dyn Array,
+        field: &Field,
+        enforce_field_nullability: bool,
+    ) -> Result<()> {
+        if enforce_field_nullability && !field.nullable && array.null_count() > 0 {
             return Err(Error::invalid_input(format!(
                 "The field `{}` contained null values even though the field is marked non-null in the schema",
                 field.name
@@ -116,7 +169,11 @@ impl ArrayFieldEncodingStrategy {
                 for (child_field, child_array) in
                     field.children.iter().zip(array.as_struct().columns())
                 {
-                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                    Self::validate_v2_0_array(
+                        child_array.as_ref(),
+                        child_field,
+                        enforce_field_nullability,
+                    )?;
                 }
             }
             DataType::List(_) => {
@@ -125,7 +182,11 @@ impl ArrayFieldEncodingStrategy {
                     .filter_garbage_nulls()
                     .trimmed_values();
                 if let Some(child_field) = field.children.first() {
-                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                    Self::validate_v2_0_array(
+                        child_array.as_ref(),
+                        child_field,
+                        enforce_field_nullability,
+                    )?;
                 }
             }
             DataType::LargeList(_) => {
@@ -134,14 +195,45 @@ impl ArrayFieldEncodingStrategy {
                     .filter_garbage_nulls()
                     .trimmed_values();
                 if let Some(child_field) = field.children.first() {
-                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                    Self::validate_v2_0_array(
+                        child_array.as_ref(),
+                        child_field,
+                        enforce_field_nullability,
+                    )?;
                 }
             }
             DataType::Map(_, _) => {
                 let list_array: ListArray = array.as_map().clone().into();
                 let child_array = list_array.filter_garbage_nulls().trimmed_values();
                 if let Some(child_field) = field.children.first() {
-                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                    Self::validate_v2_0_array(
+                        child_array.as_ref(),
+                        child_field,
+                        enforce_field_nullability,
+                    )?;
+                }
+            }
+            DataType::FixedSizeList(_, _) => {
+                let list_array = array.as_fixed_size_list();
+                let child_array = if let Some(nulls) =
+                    list_array.nulls().filter(|nulls| nulls.null_count() > 0)
+                {
+                    let dimension = list_array.value_length() as usize;
+                    let mut reachable = BooleanBufferBuilder::new(list_array.values().len());
+                    for is_valid in nulls.iter() {
+                        reachable.append_n(dimension, is_valid);
+                    }
+                    let reachable = BooleanArray::new(reachable.finish(), None);
+                    filter(list_array.values(), &reachable)?
+                } else {
+                    list_array.values().clone()
+                };
+                if let Some(child_field) = field.children.first() {
+                    Self::validate_v2_0_array(
+                        child_array.as_ref(),
+                        child_field,
+                        enforce_field_nullability,
+                    )?;
                 }
             }
             _ => {
@@ -149,11 +241,76 @@ impl ArrayFieldEncodingStrategy {
                 for (child_field, child_data) in field.children.iter().zip(array_data.child_data())
                 {
                     let child_array = make_array(child_data.clone());
-                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                    Self::validate_v2_0_array(
+                        child_array.as_ref(),
+                        child_field,
+                        enforce_field_nullability,
+                    )?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn clear_unreachable_v2_0_fsl_struct_validity(array: ArrayRef) -> Result<ArrayRef> {
+        // Validation above proves that any remaining null structs below a fixed-size-list
+        // belong only to null parent rows. The v2.0 physical FSL path still visits those
+        // child slots, so remove their unrepresentable validity without rebuilding arrays
+        // that do not contain such unreachable nulls (which preserves stable wire bytes).
+        fn strip_struct_validity(data: ArrayData) -> Result<(ArrayData, bool)> {
+            let has_struct_nulls =
+                matches!(data.data_type(), DataType::Struct(_)) && data.null_count() > 0;
+            let mut children_changed = false;
+            let children = data
+                .child_data()
+                .iter()
+                .cloned()
+                .map(|child| {
+                    let (child, changed) = strip_struct_validity(child)?;
+                    children_changed |= changed;
+                    Ok(child)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !has_struct_nulls && !children_changed {
+                return Ok((data, false));
+            }
+
+            let mut builder = data.into_builder().child_data(children);
+            if has_struct_nulls {
+                builder = builder.nulls(None);
+            }
+            Ok((builder.build()?, true))
+        }
+
+        fn normalize(data: ArrayData) -> Result<(ArrayData, bool)> {
+            let is_fixed_size_list = matches!(data.data_type(), DataType::FixedSizeList(_, _));
+            let mut children_changed = false;
+            let children = data
+                .child_data()
+                .iter()
+                .cloned()
+                .map(|child| {
+                    let (child, changed) = if is_fixed_size_list {
+                        strip_struct_validity(child)?
+                    } else {
+                        normalize(child)?
+                    };
+                    children_changed |= changed;
+                    Ok(child)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !children_changed {
+                return Ok((data, false));
+            }
+            Ok((data.into_builder().child_data(children).build()?, true))
+        }
+
+        let (data, changed) = normalize(array.to_data())?;
+        if changed {
+            Ok(make_array(data))
+        } else {
+            Ok(array)
+        }
     }
 }
 
@@ -165,7 +322,7 @@ impl Default for ArrayFieldEncodingStrategy {
 
 impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
     fn validate_array(&self, array: &dyn Array, field: &Field) -> Result<()> {
-        Self::validate_v2_0_array(array, field)
+        Self::validate_v2_0_array(array, field, true)
     }
 
     fn create_field_encoder(
@@ -275,6 +432,19 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                 )),
             }
         }
+    }
+
+    fn create_root_field_encoder(
+        &self,
+        field: &Field,
+        column_index: &mut ColumnIndexSequence,
+        context: &FieldEncodingContext<'_>,
+    ) -> Result<Box<dyn FieldEncoder>> {
+        let encoder = self.create_field_encoder(field, column_index, context)?;
+        Ok(Box::new(ValidatingFieldEncoder::new(
+            encoder,
+            field.clone(),
+        )))
     }
 }
 

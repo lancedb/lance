@@ -14,8 +14,8 @@ mod tests {
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::types::Float64Type;
     use arrow_array::{
-        Array, ArrayRef, Int32Array, ListArray, RecordBatch, RecordBatchReader, StringArray,
-        StructArray, UInt64Array,
+        Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, RecordBatch, RecordBatchReader,
+        StringArray, StructArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
@@ -28,7 +28,8 @@ mod tests {
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::constants::PACKED_STRUCT_META_KEY;
     use lance_encoding::decoder::DecoderPlugins;
-    use lance_encoding::encoder::{EncodingOptions, encode_batch};
+    use lance_encoding::encoder::{BatchEncoder, EncodingOptions, OutOfLineBuffers, encode_batch};
+    use lance_encoding::repdef::RepDefBuilder;
     use lance_io::object_store::ObjectStore;
     use lance_io::traits::Writer;
     use lance_io::utils::CachedFileSize;
@@ -741,6 +742,60 @@ mod tests {
         writer.finish().await.unwrap();
     }
 
+    /// Fixed-size-list child slots under null parent rows are not logically
+    /// encoded, while null structs under valid parent rows remain invalid.
+    #[rstest]
+    #[case::masked_child_null(true, true)]
+    #[case::selected_child_null(false, false)]
+    #[tokio::test]
+    async fn test_v2_0_writer_validates_logical_fixed_size_list_structs(
+        #[case] mask_child_null: bool,
+        #[case] should_succeed: bool,
+    ) {
+        let struct_fields: ArrowFields = vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]
+        .into();
+        let struct_values = struct_array(
+            struct_fields.clone(),
+            Some(NullBuffer::from(vec![false, true, true])),
+        );
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(struct_fields),
+            true,
+        ));
+        let parent_nulls = mask_child_null.then(|| NullBuffer::from(vec![false, true, true]));
+        let list = FixedSizeListArray::new(item_field, 1, Arc::new(struct_values), parent_nulls);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(list)]).unwrap();
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            ConcreteFileVersion::V2_0,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let result = writer.write_batch(&batch).await;
+        if !should_succeed {
+            let error = result.unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("struct validity"));
+            return;
+        }
+        result.unwrap();
+        writer.finish().await.unwrap();
+    }
+
     /// The public in-memory v2.0 encoder must enforce the invariant for both
     /// ordinary multi-column structs and packed structs.
     #[rstest]
@@ -771,6 +826,29 @@ mod tests {
         .unwrap();
         let lance_schema = Arc::new(LanceSchema::try_from(arrow_schema.as_ref()).unwrap());
         let strategy = versions::v2_0::encoding_strategy();
+
+        let mut batch_encoder = BatchEncoder::try_new(
+            lance_schema.as_ref(),
+            strategy.as_ref(),
+            &EncodingOptions::default(),
+        )
+        .unwrap();
+        let mut external_buffers = OutOfLineBuffers::new(0, 64);
+        let direct_result = batch_encoder.field_encoders[0].maybe_encode(
+            batch.column(0).clone(),
+            &mut external_buffers,
+            RepDefBuilder::default(),
+            0,
+            batch.num_rows() as u64,
+        );
+        let Err(direct_error) = direct_result else {
+            panic!("public BatchEncoder bypassed v2.0 validation");
+        };
+        assert!(matches!(
+            direct_error,
+            lance_core::Error::InvalidInput { .. }
+        ));
+        assert!(direct_error.to_string().contains("struct validity"));
 
         let error = encode_batch(
             &batch,

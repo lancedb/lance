@@ -287,6 +287,16 @@ pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Create an encoder for a root field exposed by [`BatchEncoder`].
+    fn create_root_field_encoder(
+        &self,
+        field: &Field,
+        column_index: &mut ColumnIndexSequence,
+        context: &FieldEncodingContext<'_>,
+    ) -> Result<Box<dyn FieldEncoder>> {
+        self.create_field_encoder(field, column_index, context)
+    }
+
     /// Choose and create an appropriate field encoder for the given
     /// field.
     ///
@@ -337,7 +347,7 @@ impl BatchEncoder {
                     root_field_metadata: &field.metadata,
                 };
                 let encoder =
-                    strategy.create_field_encoder(field, &mut col_idx_sequence, &context)?;
+                    strategy.create_root_field_encoder(field, &mut col_idx_sequence, &context)?;
                 col_idx += encoder.as_ref().num_columns();
                 Ok(encoder)
             })
