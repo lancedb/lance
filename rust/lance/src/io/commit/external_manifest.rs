@@ -191,8 +191,8 @@ mod test {
                 let final_meta = store.head(&Path::from(path)).await?;
                 assert_eq!(size, final_meta.size);
                 assert_eq!(
-                    e_tag, None,
-                    "the external index must not persist a physical object generation"
+                    e_tag, final_meta.e_tag,
+                    "the default policy must persist the finalized physical generation"
                 );
             }
             Ok(())
@@ -357,7 +357,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn external_manifest_store_put_skips_destination_head() {
+    async fn external_manifest_store_put_tracks_destination_etag() {
         let object_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
         let base_path = Path::from("repro");
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
@@ -403,13 +403,13 @@ mod test {
         );
         assert_eq!(location.size, Some(final_meta.size));
         assert_eq!(
-            location.e_tag, None,
-            "a successful copy must not incur a HEAD only to observe the destination ETag"
+            location.e_tag, final_meta.e_tag,
+            "the default policy must return the finalized physical generation"
         );
     }
 
     #[tokio::test]
-    async fn external_manifest_handler_finalize_skips_destination_head() {
+    async fn external_manifest_handler_finalize_tracks_destination_etag() {
         let object_store = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 1;
@@ -454,8 +454,8 @@ mod test {
         );
         assert_eq!(location.size, Some(final_meta.size));
         assert_eq!(
-            location.e_tag, None,
-            "a successful copy must not incur a HEAD only to observe the destination ETag"
+            location.e_tag, final_meta.e_tag,
+            "the default policy must return the finalized physical generation"
         );
     }
 

@@ -348,7 +348,7 @@ async fn test_ddb_open_iops() {
     //    * delete staged file
     // Commit: 1 read IOP to list versions before creating the dataset. A
     // successful manifest copy is sufficient proof of materialization, so the
-    // finalizer does not HEAD the destination for cache metadata.
+    // DynamoDB policy does not HEAD the destination for an ETag.
     let io_stats = committed_ds.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 4);
     assert_io_eq!(io_stats, read_iops, 1);
@@ -358,8 +358,9 @@ async fn test_ddb_open_iops() {
         !committed_row.contains_key("e_tag"),
         "DynamoDB must not persist a physical object generation"
     );
-    // Simulate a row written by an older Lance version. New readers must
-    // ignore this value and obtain their cache generation from S3.
+    // Simulate a row written by an older Lance version. New DynamoDB readers
+    // ignore this physical-generation token instead of treating it as logical
+    // manifest identity.
     ddb_table.set_legacy_etag(1, "legacy-stale-etag").await;
 
     let dataset = DatasetBuilder::from_uri(&uri)

@@ -712,10 +712,11 @@ The commit process follows a four-step protocol:
 
 4. **Update external store pointer**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
    - Update the external store to point to the finalized manifest path
-   - Record the path and size, but not the destination ETag. An ETag identifies a physical
-     object generation and can change when identical bytes are copied again. Because step 2
-     selected one immutable staging object, concurrent finalizers always materialize the same
-     bytes and publish the same path-and-size tuple.
+   - Custom external stores track the destination ETag by default, preserving exact physical-
+     generation validation. A store can explicitly omit it when step 2 selects one immutable
+     staging object and its protocol permits equivalent helpers to overwrite the canonical path.
+     DynamoDB uses this generation-independent policy: concurrent finalizers materialize the same
+     bytes and publish the same path-and-size tuple without an extra destination HEAD.
    - Completes the synchronization between external store and object storage
 
 **Fault Tolerance:**
@@ -726,13 +727,13 @@ If step 3 succeeds but step 4 fails, the canonical object remains committed; rea
 may repair the external index. Staging deletion is garbage collection and does not affect the
 commit outcome.
 
-**Rolling Upgrade:**
+**DynamoDB Rolling Upgrade:**
 
-Roll this behavior out normally across the fleet. New readers ignore legacy stored ETags, and
-legacy readers already accept finalized rows without an ETag, so mixed-version rows remain
-compatible. While both legacy finalizers and legacy readers remain, the pre-existing race can
-still republish a stale ETag that a legacy reader rejects. Full protection takes effect when the
-rolling upgrade converges; no row migration or quiesced cutover is required.
+Roll this behavior out normally across the fleet. New DynamoDB readers ignore legacy stored
+ETags, and legacy readers already accept finalized rows without an ETag, so mixed-version rows
+remain compatible. While both legacy finalizers and legacy readers remain, the pre-existing race
+can still republish a stale ETag that a legacy reader rejects. Full protection takes effect when
+the rolling upgrade converges; no row migration or quiesced cutover is required.
 
 ### Reader Process with External Store
 
@@ -742,8 +743,9 @@ The reader follows a validation and synchronization protocol:
 
 1. **Query external store**: `GET_EXTERNAL_STORE base_uri, version` → `path`
    - Retrieve the manifest path for the requested version
-   - If the path does not end with a UUID, validate the canonical object's size; any legacy stored
-     ETag is ignored because it is neither content identity nor dataset-incarnation identity
+   - If the path does not end with a UUID, validate the canonical object's size. Stores using
+     physical-generation tracking also require an exact destination ETag match. DynamoDB ignores
+     any legacy stored ETag because it is neither content identity nor dataset-incarnation identity
    - If the path ends with a UUID, synchronization is required
 
 2. **Synchronize to object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`
@@ -751,7 +753,8 @@ The reader follows a validation and synchronization protocol:
    - This operation is idempotent
 
 3. **Update external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
-   - Best-effort update the external store to reflect the finalized path and size, without an ETag
+   - Best-effort update the external store using its configured generation policy. DynamoDB records
+     the finalized path and size without an ETag
    - If this index repair fails, retain staging so a future reader can retry it
 
 4. **Return finalized path**: Return `{dataset}/_versions/{version}.manifest`
