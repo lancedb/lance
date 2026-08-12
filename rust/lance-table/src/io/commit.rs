@@ -239,9 +239,14 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
-    /// Optional e-tag, used for integrity checks. Manifests should be immutable, so
-    /// if we detect a change in the e-tag, it means the manifest was tampered with.
-    /// This might happen if the dataset was deleted and then re-created.
+    /// Optional opaque object generation token used to scope manifest caches.
+    ///
+    /// An ETag is not necessarily a content checksum and may change when an
+    /// object is rewritten with identical bytes. In particular, S3 Express
+    /// returns an object-specific opaque value. Callers must therefore not
+    /// diagnose manifest corruption from an ETag mismatch alone. The token is
+    /// still useful for avoiding a stale cache hit when a dataset is deleted
+    /// and recreated at the same URI and version.
     pub e_tag: Option<String>,
 }
 

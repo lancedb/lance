@@ -19,7 +19,7 @@ use log::warn;
 use object_store::ObjectMeta;
 use object_store::ObjectStoreExt;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{
     MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme, current_manifest_path,
@@ -30,14 +30,36 @@ use crate::io::commit::{CommitError, CommitHandler};
 
 /// External manifest store
 ///
-/// This trait abstracts an external storage for source of truth for manifests.
-/// The storage is expected to remember (uri, version) -> manifest_path
-/// and able to run transactions on the manifest_path.
+/// This trait abstracts a concurrency coordinator and lookup index for
+/// manifests. The store is expected to remember
+/// `(uri, version) -> manifest_path` and to atomically select one staging path
+/// for each version. The manifest bytes in object storage remain authoritative.
 ///
 /// This trait is called an **External** manifest store because the store is
 /// expected to work in tandem with the object store. We are only leveraging
 /// the external store for concurrent commit. Any manifest committed thru this
 /// trait should ultimately be materialized in the object store.
+///
+/// # Correctness model
+///
+/// 1. Writers first upload immutable manifests to unique staging paths.
+/// 2. `put_if_not_exists` linearizes `(dataset, version)` and records exactly
+///    one winning staging path. A writer that loses this operation must never
+///    materialize its own staging object at the final path.
+/// 3. The winner, or any helping reader, copies the recorded staging object to
+///    the deterministic final path. Successful final-path materialization is
+///    the durable commit point. Repeating this step is content-idempotent
+///    because every helper reads the same immutable source selected in step 2.
+/// 4. The external row is then compacted from staging to final path and staging
+///    is deleted. These are repair and garbage-collection operations: failures
+///    leave enough information for another helper and cannot undo step 3.
+///
+/// Object-store overwrites can assign a new ETag to identical bytes. Therefore
+/// the finalized external row contains stable logical metadata (path and size)
+/// but omits the destination ETag. Readers get the current opaque generation
+/// token from object storage for cache scoping. This protocol assumes one
+/// dataset incarnation owns the physical prefix; safe prefix reuse requires a
+/// separate incarnation identity rather than interpreting an ETag as one.
 /// For a visual explanation of the commit loop see
 /// <https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04>
 #[async_trait]
@@ -134,39 +156,90 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
         }
 
-        // A copy creates a new object whose metadata may differ from the source.
-        // Read the destination metadata before publishing the final path.
-        let final_meta = object_store.head(&final_path).await?;
-        let final_size = final_meta.size;
-        let final_e_tag = final_meta.e_tag;
+        // A successful copy materializes the selected bytes and therefore
+        // preserves their known size. We deliberately do not HEAD merely to
+        // obtain an ETag: that would add an S3 round trip and the token could
+        // become stale immediately after another identical overwrite anyway.
+        // If staging is already gone, confirm that another finalizer left a
+        // size-compatible canonical object before accepting its generation.
+        let (final_size, final_e_tag) = if copied {
+            (size, None)
+        } else {
+            let final_meta = object_store.head(&final_path).await?;
+            if final_meta.size != size {
+                return Err(Error::corrupt_file(
+                    final_path.clone(),
+                    format!(
+                        "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
+                        version, size, final_meta.size
+                    ),
+                ));
+            }
+            (final_meta.size, final_meta.e_tag)
+        };
 
         let location = ManifestLocation {
             version,
             path: final_path.clone(),
             size: Some(final_size),
             naming_scheme,
-            e_tag: final_e_tag.clone(),
+            e_tag: final_e_tag,
         };
 
-        if !copied {
+        // Step 3: Update the external index to the final path.
+        //
+        // Do not persist the destination ETag. The external store has already
+        // linearized the logical commit by selecting exactly one immutable
+        // staging path in step 1. Every correct finalizer therefore copies the
+        // same bytes to the deterministic final path. A repeated overwrite may
+        // still create a new physical object generation (and, for S3 Express,
+        // a new opaque random ETag), so publishing an ETag would let the DDB
+        // update race independently of the content it indexes:
+        //
+        //   A: COPY -> HEAD(E1)             -> publish E1
+        //   B:          COPY -> HEAD(E2) -> publish E2
+        //
+        // The final bytes are identical in either order, but DDB can retain E1
+        // while object storage exposes E2. Omitting the physical generation
+        // makes finalization idempotent: every finalizer publishes the same
+        // `(path, size, no-etag)` tuple. Readers obtain the current ETag from
+        // object storage and use it only to scope caches.
+        let published = self
+            .put_if_exists(
+                base_path.as_ref(),
+                version,
+                final_path.as_ref(),
+                final_size,
+                None,
+            )
+            .await;
+
+        if let Err(error) = published {
+            // The canonical object is already durable and is the commit point.
+            // Keep staging so an old or new reader that still observes the
+            // reservation can retry this cache/index update. A DDB failure must
+            // not turn an S3-committed transaction into a reported conflict.
+            warn!(
+                "Final manifest '{}' is committed, but the external manifest index could not be updated; retaining staging manifest '{}' for repair: {}",
+                final_path, staging_path, error
+            );
             return Ok(location);
         }
-
-        // Step 3: Update external store to final path
-        self.put_if_exists(
-            base_path.as_ref(),
-            version,
-            final_path.as_ref(),
-            final_size,
-            final_e_tag,
-        )
-        .await?;
 
         // Step 4: Delete staging manifest
         match object_store.delete(staging_path).await {
             Ok(_) => {}
             Err(ObjectStoreError::NotFound { .. }) => {}
-            Err(e) => return Err(e.into()),
+            Err(error) => {
+                // Staging is no longer authoritative after the canonical
+                // object and final index entry exist. Its deletion is garbage
+                // collection and cannot roll back the commit.
+                warn!(
+                    "Failed to delete finalized staging manifest '{}': {}",
+                    staging_path, error
+                );
+                return Ok(location);
+            }
         }
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
 
@@ -375,21 +448,32 @@ impl ExternalManifestCommitHandler {
                     None => Some(size),
                 };
 
-                let e_tag = match expected_e_tag {
-                    Some(expected_e_tag) => {
-                        if e_tag.as_ref() != Some(&expected_e_tag) {
-                            return Err(Error::corrupt_file(
-                                path,
-                                format!(
-                                    "Manifest e_tag mismatch for version {}: external store expected {:?}, object store returned {:?}",
-                                    version, expected_e_tag, e_tag
-                                ),
-                            ));
-                        }
-                        Some(expected_e_tag)
-                    }
-                    None => e_tag,
-                };
+                // `expected_e_tag` may come from a legacy external-store row.
+                // It describes the physical object generation observed by one
+                // finalizer, not the logical manifest selected by the external
+                // store. Multiple finalizers can safely overwrite the final
+                // key from that same immutable staging object while receiving
+                // different opaque ETags. Treating that race as corruption
+                // made a healthy manifest unreadable even though its bytes were
+                // unchanged.
+                //
+                // Always return the object store's current token so cache keys
+                // still change after a real replacement such as drop/recreate.
+                // Size remains a correctness check: all copies of the selected
+                // staging object must have the recorded size. Content integrity
+                // must be established by decoding the manifest or by an
+                // explicit content checksum, never by comparing opaque ETags.
+                if let Some(expected_e_tag) = expected_e_tag
+                    && e_tag.as_ref() != Some(&expected_e_tag)
+                {
+                    debug!(
+                        version,
+                        path = path.as_ref(),
+                        external_e_tag = ?expected_e_tag,
+                        object_store_e_tag = ?e_tag,
+                        "Ignoring stale external manifest ETag and using the object-store generation"
+                    );
+                }
 
                 Ok(ManifestLocation {
                     version,
@@ -408,15 +492,13 @@ impl ExternalManifestCommitHandler {
         }
     }
 
-    /// The manifest is considered committed once the staging manifest is written
-    /// to object store and that path is committed to the external store.
-    ///
-    /// However, to fully complete this, the staging manifest should be materialized
-    /// into the final path, the final path should be committed to the external store
-    /// and the staging manifest should be deleted. These steps may be completed
-    /// by any number of readers or writers, so care should be taken to ensure
-    /// that the manifest is not lost nor any errors occur due to duplicate
-    /// operations.
+    /// Recording the staging path in the external store reserves the version
+    /// for one immutable manifest. The commit becomes authoritative when those
+    /// bytes are materialized at the deterministic final object-store path.
+    /// Updating the external row to that final path and deleting staging are
+    /// repair and garbage-collection steps. They may be completed by any number
+    /// of readers or writers and must not roll back an already materialized
+    /// canonical manifest.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_manifest(
         &self,
@@ -440,11 +522,26 @@ impl ExternalManifestCommitHandler {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_manifest_path.as_ref());
         }
 
-        // A copy creates a new object whose metadata may differ from the source.
-        // Read the destination metadata before publishing the final path.
-        let final_meta = store.head(&final_manifest_path).await?;
-        let final_size = final_meta.size;
-        let final_e_tag = final_meta.e_tag;
+        // The successful-copy path already knows the authoritative size and
+        // intentionally avoids a HEAD for an unstable physical ETag. The
+        // source-missing path is different: another helper may have deleted
+        // staging, so confirm the canonical object exists with the selected
+        // staging size before treating its materialization as committed.
+        let (final_size, final_e_tag) = if copied {
+            (size, None)
+        } else {
+            let final_meta = store.head(&final_manifest_path).await?;
+            if final_meta.size != size {
+                return Err(Error::corrupt_file(
+                    final_manifest_path.clone(),
+                    format!(
+                        "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
+                        version, size, final_meta.size
+                    ),
+                ));
+            }
+            (final_meta.size, final_meta.e_tag)
+        };
 
         let location = ManifestLocation {
             version,
@@ -454,26 +551,45 @@ impl ExternalManifestCommitHandler {
             e_tag: final_e_tag,
         };
 
-        if !copied {
-            return Ok(location);
-        }
-
-        // step 2: flip the external store to point to the final location
-        self.external_manifest_store
+        // Step 2: point the external index at the final location. As in
+        // `ExternalManifestStore::put`, intentionally omit the destination
+        // ETag. DDB selected `staging_manifest_path` before any finalizer got
+        // here, so concurrent finalizers all copy the same immutable bytes.
+        // Path and size are stable logical metadata; an ETag belongs to one
+        // physical overwrite and is allowed to change independently.
+        let published = self
+            .external_manifest_store
             .put_if_exists(
                 base_path.as_ref(),
                 version,
                 location.path.as_ref(),
                 final_size,
-                location.e_tag.clone(),
+                None,
             )
-            .await?;
+            .await;
+
+        if let Err(error) = published {
+            // The canonical object is the data authority. Retaining staging
+            // lets another helper repair the external index without making
+            // this successfully materialized commit appear to have failed.
+            warn!(
+                "Final manifest '{}' is committed, but the external manifest index could not be updated; retaining staging manifest '{}' for repair: {}",
+                location.path, staging_manifest_path, error
+            );
+            return Ok(location);
+        }
 
         // step 3: delete the staging manifest
         match store.delete(staging_manifest_path).await {
             Ok(_) => {}
             Err(ObjectStoreError::NotFound { .. }) => {}
-            Err(e) => return Err(e.into()),
+            Err(error) => {
+                warn!(
+                    "Failed to delete finalized staging manifest '{}': {}",
+                    staging_manifest_path, error
+                );
+                return Ok(location);
+            }
         }
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_manifest_path.as_ref());
 
@@ -743,12 +859,13 @@ impl CommitHandler for ExternalManifestCommitHandler {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_file::version::LanceFileVersion;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::format::DataStorageFormat;
@@ -765,6 +882,11 @@ mod tests {
     struct TestExternalManifestStore {
         manifests: Mutex<HashMap<(String, u64), StoredManifest>>,
         fail_next_put_response: AtomicBool,
+        fail_next_final_publish: AtomicBool,
+        block_first_final_publish: bool,
+        final_publish_calls: AtomicUsize,
+        first_final_publish_started: Notify,
+        release_first_final_publish: Notify,
     }
 
     impl TestExternalManifestStore {
@@ -772,6 +894,25 @@ mod tests {
             Self {
                 manifests: Mutex::new(HashMap::new()),
                 fail_next_put_response: AtomicBool::new(fail_next_put_response),
+                fail_next_final_publish: AtomicBool::new(false),
+                block_first_final_publish: false,
+                final_publish_calls: AtomicUsize::new(0),
+                first_final_publish_started: Notify::new(),
+                release_first_final_publish: Notify::new(),
+            }
+        }
+
+        fn failing_final_publish_once() -> Self {
+            Self {
+                fail_next_final_publish: AtomicBool::new(true),
+                ..Self::new(false)
+            }
+        }
+
+        fn blocking_first_final_publish() -> Self {
+            Self {
+                block_first_final_publish: true,
+                ..Self::new(false)
             }
         }
     }
@@ -860,6 +1001,15 @@ mod tests {
             size: u64,
             e_tag: Option<String>,
         ) -> Result<()> {
+            if self.block_first_final_publish
+                && self.final_publish_calls.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                self.first_final_publish_started.notify_one();
+                self.release_first_final_publish.notified().await;
+            }
+            if self.fail_next_final_publish.swap(false, Ordering::SeqCst) {
+                return Err(Error::io("simulated final index update failure"));
+            }
             let key = (base_uri.to_string(), version);
             let mut manifests = self.manifests.lock().unwrap();
             let manifest = manifests
@@ -882,6 +1032,251 @@ mod tests {
             DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
             HashMap::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn test_finalized_manifest_uses_object_store_etag() {
+        let external_store = Arc::new(TestExternalManifestStore::new(false));
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
+
+        object_store
+            .inner
+            .put(
+                &final_path,
+                object_store::PutPayload::from_static(b"manifest"),
+            )
+            .await
+            .unwrap();
+        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+
+        // Rows written by older Lance versions can contain the ETag observed
+        // by a finalizer before a concurrent identical overwrite. The physical
+        // token may be stale even though DDB still identifies the right logical
+        // version and S3 contains the right manifest bytes.
+        external_store
+            .put_if_not_exists(
+                base_path.as_ref(),
+                1,
+                final_path.as_ref(),
+                final_meta.size,
+                Some("legacy-stale-etag".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let resolved = handler
+            .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
+            .await
+            .expect("an opaque ETag mismatch must not make valid manifest bytes unreadable");
+        assert_eq!(resolved.path, final_path);
+        assert_eq!(resolved.size, Some(final_meta.size));
+        assert_eq!(
+            resolved.e_tag, final_meta.e_tag,
+            "cache identity must use the current object-store generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalized_manifest_size_mismatch_remains_corruption() {
+        let external_store = Arc::new(TestExternalManifestStore::new(false));
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
+
+        object_store
+            .inner
+            .put(
+                &final_path,
+                object_store::PutPayload::from_static(b"manifest"),
+            )
+            .await
+            .unwrap();
+        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        external_store
+            .put_if_not_exists(
+                base_path.as_ref(),
+                1,
+                final_path.as_ref(),
+                final_meta.size + 1,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = handler
+            .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
+            .await
+            .expect_err("copies of the selected staging object must preserve its size");
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("Manifest size mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_canonical_manifest_commits_before_index_repair() {
+        let external_store = Arc::new(TestExternalManifestStore::failing_final_publish_once());
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let mut manifest = test_manifest();
+        let version = manifest.version;
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+
+        let committed = handler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .expect("a failed index update must not overturn a canonical S3 commit");
+        assert_eq!(committed.path, final_path);
+        object_store
+            .inner
+            .head(&final_path)
+            .await
+            .expect("the canonical manifest is the durable commit point");
+
+        let pending = external_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+            .unwrap();
+        assert_ne!(pending.path, final_path);
+        object_store
+            .inner
+            .head(&pending.path)
+            .await
+            .expect("staging must remain until the external index is repaired");
+
+        let repaired = handler
+            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .await
+            .expect("a reader must be able to repair the pending external index");
+        assert_eq!(repaired.path, final_path);
+        let indexed = external_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+            .unwrap();
+        assert_eq!(indexed.path, final_path);
+        assert_eq!(indexed.size, repaired.size);
+        assert_eq!(
+            indexed.e_tag, None,
+            "the repaired index must not retain a physical object generation"
+        );
+        let staging_error = object_store
+            .inner
+            .head(&pending.path)
+            .await
+            .expect_err("repair should garbage-collect the retained staging object");
+        assert!(matches!(staging_error, ObjectStoreError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_finalizers_publish_generation_independent_metadata() {
+        let external_store = Arc::new(TestExternalManifestStore::blocking_first_final_publish());
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let version = 1;
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+        let staging_path = make_staging_manifest_path(&final_path).unwrap();
+        let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
+
+        object_store
+            .inner
+            .put(&staging_path, manifest_bytes.clone().into())
+            .await
+            .unwrap();
+        let staging_meta = object_store.inner.head(&staging_path).await.unwrap();
+
+        let writer_store = object_store.inner.clone();
+        let writer_external_store = external_store.clone();
+        let writer_base_path = base_path.clone();
+        let writer_staging_path = staging_path.clone();
+        let writer_e_tag = staging_meta.e_tag.clone();
+        let writer = tokio::spawn(async move {
+            writer_external_store
+                .put(
+                    &writer_base_path,
+                    version,
+                    &writer_staging_path,
+                    staging_meta.size,
+                    writer_e_tag,
+                    writer_store.as_ref(),
+                    ManifestNamingScheme::V2,
+                )
+                .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            external_store.first_final_publish_started.notified(),
+        )
+        .await
+        .expect("the direct finalizer should pause after COPY");
+
+        let first_generation = object_store.inner.head(&final_path).await.unwrap();
+
+        // The writer created generation E1. While its final index update is
+        // paused, a reader observes the DDB-selected staging path and performs
+        // the same immutable copy, producing generation E2. Neither helper
+        // needs to publish or even fetch those tokens. Both copies have exactly
+        // the same bytes; only their physical object generations differ.
+        let reader_location = handler
+            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .await
+            .unwrap();
+
+        external_store.release_first_final_publish.notify_one();
+        let writer_location = writer.await.unwrap().unwrap();
+        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_bytes = object_store
+            .inner
+            .get(&final_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let indexed = external_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+            .unwrap();
+
+        assert_eq!(final_bytes, manifest_bytes);
+        assert_ne!(
+            first_generation.e_tag, final_meta.e_tag,
+            "the deterministic race must create a new physical generation"
+        );
+        assert_eq!(writer_location.e_tag, None);
+        assert_eq!(reader_location.e_tag, None);
+        assert_eq!(indexed.path, final_path);
+        assert_eq!(indexed.size, Some(final_meta.size));
+        assert_eq!(
+            indexed.e_tag, None,
+            "all finalizers must publish the same generation-independent tuple"
+        );
+
+        let resolved = handler
+            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .await
+            .expect("the finalized manifest must remain readable after the race");
+        assert_eq!(resolved.e_tag, final_meta.e_tag);
     }
 
     #[tokio::test]
