@@ -567,7 +567,13 @@ impl DatasetBuilder {
                     download_retry_count,
                     None, // No storage_options available here
                 );
-                if let Some(resolver) = &self.options.native_directory_path_resolver {
+                if self
+                    .options
+                    .object_store_wrapper
+                    .as_ref()
+                    .is_none_or(|wrapper| wrapper.preserves_native_directory_path())
+                    && let Some(resolver) = &self.options.native_directory_path_resolver
+                {
                     object_store =
                         object_store.with_native_directory_path_resolver(resolver.clone());
                 }

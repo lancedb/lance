@@ -203,27 +203,35 @@ async fn test_with_object_store_wrappers_wraps_primary_store() {
 #[allow(deprecated)]
 async fn test_builder_carries_direct_store_native_directory_path() {
     let uri = "file:///tmp/direct.lance";
-    let params = ObjectStoreParams {
-        object_store: Some((
-            Arc::new(object_store::memory::InMemory::new()),
-            url::Url::parse(uri).unwrap(),
-        )),
-        native_directory_path_resolver: Some(NativeDirectoryPathResolver::new(|path| {
-            std::path::PathBuf::from("/native").join(path.as_ref())
-        })),
-        ..Default::default()
-    };
+    let cases: [(Option<Arc<dyn WrappingObjectStore>>, bool); 3] = [
+        (None, true),
+        (Some(Arc::new(NonPreservingWrapper)), false),
+        (Some(Arc::new(NativeDirectoryPreservingWrapper)), true),
+    ];
 
-    let (store, path, _) = DatasetBuilder::from_uri(uri)
-        .with_store_params(params)
-        .build_object_store()
-        .await
-        .unwrap();
+    for (wrapper, should_preserve) in cases {
+        let params = ObjectStoreParams {
+            object_store: Some((
+                Arc::new(object_store::memory::InMemory::new()),
+                url::Url::parse(uri).unwrap(),
+            )),
+            native_directory_path_resolver: Some(NativeDirectoryPathResolver::new(|path| {
+                std::path::PathBuf::from("/native").join(path.as_ref())
+            })),
+            object_store_wrapper: wrapper,
+            ..Default::default()
+        };
 
-    assert_eq!(
-        store.native_directory_path(&path),
-        Some(std::path::PathBuf::from("/native/tmp/direct.lance"))
-    );
+        let (store, path, _) = DatasetBuilder::from_uri(uri)
+            .with_store_params(params)
+            .build_object_store()
+            .await
+            .unwrap();
+
+        let expected =
+            should_preserve.then(|| std::path::PathBuf::from("/native/tmp/direct.lance"));
+        assert_eq!(store.native_directory_path(&path), expected);
+    }
 }
 
 #[derive(Debug)]
