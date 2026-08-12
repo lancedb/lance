@@ -331,13 +331,10 @@ impl Writer {
         Ok(())
     }
 
-    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        for (col, field) in batch
-            .columns()
-            .iter()
-            .zip(self.schema.as_ref().unwrap().fields.iter())
-        {
-            Self::verify_field_nullability(&col.to_data(), field)?;
+    fn verify_nullability_constraints(&self, field_arrays: &[(usize, ArrayRef)]) -> Result<()> {
+        let fields = &self.schema.as_ref().unwrap().fields;
+        for (field_idx, array) in field_arrays {
+            Self::verify_field_nullability(&array.to_data(), &fields[*field_idx])?;
         }
         Ok(())
     }
@@ -394,14 +391,8 @@ impl Writer {
         Ok(self.schema.as_ref().unwrap())
     }
 
-    #[instrument(skip_all, level = "debug")]
-    fn encode_batch(
-        &mut self,
-        batch: &RecordBatch,
-        external_buffers: &mut OutOfLineBuffers,
-    ) -> Result<Vec<Vec<EncodeTask>>> {
-        let field_arrays = self
-            .schema
+    fn field_arrays(&self, batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
+        self.schema
             .as_ref()
             .unwrap()
             .fields
@@ -420,8 +411,7 @@ impl Writer {
                         ))?;
                 Ok((field_idx, array.clone()))
             })
-            .collect::<Result<Vec<_>>>()?;
-        self.encode_columns(&field_arrays, external_buffers)
+            .collect()
     }
 
     // Encode a set of `(field index, array)` pairs, each advancing only its own
@@ -481,7 +471,8 @@ impl Writer {
             batch.get_array_memory_size()
         );
         self.ensure_initialized(batch)?;
-        self.verify_nullability_constraints(batch)?;
+        let field_arrays = self.field_arrays(batch)?;
+        self.verify_nullability_constraints(&field_arrays)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -495,7 +486,7 @@ impl Writer {
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
-        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
         // Next, write external buffers
         for external_buffer in external_buffers.take_buffers() {
             Self::do_write_buffer(&mut self.writer, &external_buffer).await?;

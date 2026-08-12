@@ -547,8 +547,15 @@ impl FieldEncoder for StructFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
+        if struct_array.null_count() > 0 {
+            return Err(Error::invalid_input(format!(
+                "The struct column at physical index {} contains {} null value(s), but Lance file version 2.0 does not encode struct validity; use file version 2.1 or later",
+                self.column_index,
+                struct_array.null_count()
+            )));
+        }
+        self.num_rows_seen += array.len() as u64;
         let child_tasks = self
             .children
             .iter_mut()

@@ -5,6 +5,7 @@ use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
 use arrow_array::{Array, ArrayRef, cast::AsArray, make_array};
 use arrow_buffer::bit_util;
+use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use log::trace;
@@ -421,6 +422,20 @@ impl PrimitiveFieldEncoder {
         })
     }
 
+    fn verify_struct_nullability(array: &ArrayData, field: &Field) -> Result<()> {
+        if field.logical_type.is_struct() && array.null_count() > 0 {
+            return Err(Error::invalid_input(format!(
+                "The struct field `{}` contains {} null value(s), but Lance file version 2.0 does not encode struct validity; use file version 2.1 or later",
+                field.name,
+                array.null_count()
+            )));
+        }
+        for (child_field, child_array) in field.children.iter().zip(array.child_data()) {
+            Self::verify_struct_nullability(child_array, child_field)?;
+        }
+        Ok(())
+    }
+
     fn create_encode_task(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
         let encoder = self
             .array_encoding_strategy
@@ -504,6 +519,7 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        Self::verify_struct_nullability(&array.to_data(), &self.field)?;
         if let Some(arrays) = self.accumulation_queue.insert(array, row_number, num_rows) {
             Ok(self.do_flush(arrays.0)?)
         } else {
