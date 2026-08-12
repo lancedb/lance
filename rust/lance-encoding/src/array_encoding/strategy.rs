@@ -3,11 +3,10 @@
 
 use std::{collections::HashMap, env, hash::RandomState, sync::Arc};
 
-#[cfg(test)]
-use arrow_array::cast::AsArray;
-use arrow_array::{ArrayRef, UInt8Array};
+use arrow_array::{Array, ArrayRef, ListArray, UInt8Array, cast::AsArray, make_array};
 use arrow_schema::DataType;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
+use lance_arrow::{BLOB_META_KEY, list::ListArrayExt};
 
 use crate::{
     array_encoding::{
@@ -40,7 +39,6 @@ use crate::{
     },
 };
 
-use lance_arrow::BLOB_META_KEY;
 use lance_core::datatypes::{BLOB_DESC_FIELD, Field};
 use lance_core::{Error, Result};
 
@@ -97,6 +95,66 @@ impl ArrayFieldEncodingStrategy {
                 | DataType::LargeUtf8,
         )
     }
+
+    fn validate_v2_0_array(array: &dyn Array, field: &Field) -> Result<()> {
+        if !field.nullable && array.null_count() > 0 {
+            return Err(Error::invalid_input(format!(
+                "The field `{}` contained null values even though the field is marked non-null in the schema",
+                field.name
+            )));
+        }
+        if field.logical_type.is_struct() && array.null_count() > 0 {
+            return Err(Error::invalid_input(format!(
+                "The struct field `{}` contains {} null value(s), but Lance file version 2.0 does not encode struct validity; use file version 2.1 or later",
+                field.name,
+                array.null_count()
+            )));
+        }
+
+        match array.data_type() {
+            DataType::Struct(_) => {
+                for (child_field, child_array) in
+                    field.children.iter().zip(array.as_struct().columns())
+                {
+                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                }
+            }
+            DataType::List(_) => {
+                let child_array = array
+                    .as_list::<i32>()
+                    .filter_garbage_nulls()
+                    .trimmed_values();
+                if let Some(child_field) = field.children.first() {
+                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                }
+            }
+            DataType::LargeList(_) => {
+                let child_array = array
+                    .as_list::<i64>()
+                    .filter_garbage_nulls()
+                    .trimmed_values();
+                if let Some(child_field) = field.children.first() {
+                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                }
+            }
+            DataType::Map(_, _) => {
+                let list_array: ListArray = array.as_map().clone().into();
+                let child_array = list_array.filter_garbage_nulls().trimmed_values();
+                if let Some(child_field) = field.children.first() {
+                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                }
+            }
+            _ => {
+                let array_data = array.to_data();
+                for (child_field, child_data) in field.children.iter().zip(array_data.child_data())
+                {
+                    let child_array = make_array(child_data.clone());
+                    Self::validate_v2_0_array(child_array.as_ref(), child_field)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ArrayFieldEncodingStrategy {
@@ -106,6 +164,10 @@ impl Default for ArrayFieldEncodingStrategy {
 }
 
 impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
+    fn validate_array(&self, array: &dyn Array, field: &Field) -> Result<()> {
+        Self::validate_v2_0_array(array, field)
+    }
+
     fn create_field_encoder(
         &self,
         field: &Field,

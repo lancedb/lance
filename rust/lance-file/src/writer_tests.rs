@@ -14,10 +14,10 @@ mod tests {
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::types::Float64Type;
     use arrow_array::{
-        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchReader, StringArray, StructArray,
-        UInt64Array,
+        Array, ArrayRef, Int32Array, ListArray, RecordBatch, RecordBatchReader, StringArray,
+        StructArray, UInt64Array,
     };
-    use arrow_buffer::NullBuffer;
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
@@ -672,6 +672,73 @@ mod tests {
             .await,
             vec![Some(4), Some(5), Some(6)]
         );
+    }
+
+    /// V2.0 null-struct validation applies only to list values that are logically
+    /// encoded, excluding unselected backing values and values under null lists.
+    #[rstest]
+    #[case::non_empty_slice(1, 1, false, true)]
+    #[case::empty_slice(1, 0, false, true)]
+    #[case::garbage_under_null_list(0, 2, true, true)]
+    #[case::selected_null_struct(0, 1, false, false)]
+    #[tokio::test]
+    async fn test_v2_0_writer_validates_logical_list_structs(
+        #[case] offset: usize,
+        #[case] len: usize,
+        #[case] has_null_list: bool,
+        #[case] should_succeed: bool,
+    ) {
+        let struct_fields: ArrowFields = vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]
+        .into();
+        let struct_values = struct_array(
+            struct_fields.clone(),
+            Some(NullBuffer::from(vec![false, true, true])),
+        );
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(struct_fields),
+            true,
+        ));
+        let list_nulls = has_null_list.then(|| NullBuffer::from(vec![false, true, true]));
+        let list = ListArray::new(
+            item_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 2, 3])),
+            Arc::new(struct_values),
+            list_nulls,
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(list.slice(offset, len))],
+        )
+        .unwrap();
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            ConcreteFileVersion::V2_0,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let result = writer.write_batch(&batch).await;
+        if !should_succeed {
+            let error = result.unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("struct validity"));
+            return;
+        }
+        result.unwrap();
+        writer.finish().await.unwrap();
     }
 
     /// The public in-memory v2.0 encoder must enforce the invariant for both

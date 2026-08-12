@@ -282,6 +282,11 @@ impl Default for EncodingOptions {
 /// chosen before any data is generated and the same field encoder is
 /// used for all data in the field.
 pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
+    /// Validate one top-level array before any field encoder state is mutated.
+    fn validate_array(&self, _array: &dyn Array, _field: &Field) -> Result<()> {
+        Ok(())
+    }
+
     /// Choose and create an appropriate field encoder for the given
     /// field.
     ///
@@ -408,6 +413,9 @@ pub async fn encode_batch(
         keep_original_array: true,
         ..*options
     };
+    for (array, field) in batch.columns().iter().zip(lance_schema.fields.iter()) {
+        encoding_strategy.validate_array(array.as_ref(), field)?;
+    }
     let batch_encoder = BatchEncoder::try_new(&lance_schema, encoding_strategy, &options)?;
     let mut page_table = Vec::new();
     let mut col_idx_offset = 0;

@@ -6,12 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-
-use arrow_data::ArrayData;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
-use lance_core::datatypes::{Field, Schema as LanceSchema};
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
@@ -309,32 +307,11 @@ impl Writer {
         Ok(())
     }
 
-    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
-        if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!(
-                "The field `{}` contained null values even though the field is marked non-null in the schema",
-                field.name
-            )));
-        }
-        if field.logical_type.is_struct() && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!(
-                "The struct field `{}` contains {} null value(s), but Lance file version 2.0 does not encode struct validity; use file version 2.1 or later",
-                field.name,
-                arr.null_count()
-            )));
-        }
-
-        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
-            Self::verify_field_nullability(child_arr, child_field)?;
-        }
-
-        Ok(())
-    }
-
     fn verify_nullability_constraints(&self, field_arrays: &[(usize, ArrayRef)]) -> Result<()> {
         let fields = &self.schema.as_ref().unwrap().fields;
         for (field_idx, array) in field_arrays {
-            Self::verify_field_nullability(&array.to_data(), &fields[*field_idx])?;
+            self.encoding_strategy
+                .validate_array(array.as_ref(), &fields[*field_idx])?;
         }
         Ok(())
     }
@@ -563,7 +540,8 @@ impl Writer {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
-        Self::verify_field_nullability(&array.to_data(), field)?;
+        self.encoding_strategy
+            .validate_array(array.as_ref(), field)?;
 
         // A never-advanced field simply remains a zero-length column, which the
         // encoders handle at `finish` time.
