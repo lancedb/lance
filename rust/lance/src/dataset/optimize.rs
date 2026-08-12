@@ -2088,18 +2088,30 @@ async fn rewrite_files(
         }
     }
 
-    // Multi-fragment tasks are already sized by CandidateBin::split_for_size.
-    // Let each such task produce one row-bounded fragment; applying the target
-    // again here would split it into a full fragment and a stranded remainder.
-    // Single-fragment rewrites can still use the target to repartition a large
-    // fragment selected for deletion or overlay materialization.
-    let max_rows_per_file = if fragments.len() > 1 {
-        usize::try_from(num_rows)
-            .unwrap_or(usize::MAX)
-            .max(options.target_rows_per_fragment)
-    } else {
-        options.target_rows_per_fragment
-    };
+    let surviving_rows = fragments.iter().try_fold(0_u64, |total, fragment| {
+        let fragment_rows = fragment.num_rows().ok_or_else(|| {
+            Error::internal(format!(
+                "Fragment {} is missing row count metadata after migration",
+                fragment.id
+            ))
+        })?;
+        total.checked_add(fragment_rows as u64).ok_or_else(|| {
+            Error::internal("Compaction task surviving row count overflowed u64".to_string())
+        })
+    })?;
+
+    // Planner-sized tasks may exceed the target, but should remain one output
+    // instead of producing a target-sized fragment plus a stranded tail. For
+    // genuinely oversized tasks, choose a target-scale output count and spread
+    // the tail across those outputs.
+    let target_rows_per_fragment = options.target_rows_per_fragment as u64;
+    let output_fragment_count = surviving_rows
+        .checked_div(target_rows_per_fragment)
+        .unwrap_or(1)
+        .max(1);
+    let max_rows_per_file = usize::try_from(surviving_rows.div_ceil(output_fragment_count))
+        .unwrap_or(usize::MAX)
+        .max(1);
     let mut params = WriteParams {
         max_rows_per_file,
         max_rows_per_group: options.max_rows_per_group,
@@ -3422,13 +3434,59 @@ mod tests {
 
         assert_eq!(metrics.fragments_removed, 10);
         assert_eq!(metrics.fragments_added, 3);
+        let mut fragment_sizes = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata.physical_rows.unwrap())
+            .collect::<Vec<_>>();
+        fragment_sizes.sort_unstable();
+        assert_eq!(fragment_sizes, vec![600, 600, 800]);
+
+        let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(second_metrics, CompactionMetrics::default());
+    }
+
+    #[tokio::test]
+    async fn test_compaction_rebalances_oversized_task() {
+        let test_dir = TempStrDir::default();
+        let data = sample_data().slice(0, 5_100);
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 5_000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 5_000,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(5_000, 100))], data.schema());
+        dataset.append(reader, None).await.unwrap();
+
+        dataset.delete("a < 1000").await.unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].fragments.len(), 2);
+
+        let metrics = compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 4);
         assert_eq!(
             dataset
                 .get_fragments()
                 .iter()
                 .map(|fragment| fragment.metadata.physical_rows.unwrap())
                 .collect::<Vec<_>>(),
-            vec![600, 600, 800]
+            vec![1_025; 4]
         );
 
         let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();

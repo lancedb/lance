@@ -2832,7 +2832,7 @@ def test_zonemap_index_remapping(tmp_path: Path):
     # Run compaction to merge fragments
     compaction = dataset.optimize.compact_files(target_rows_per_fragment=2000)
     assert compaction.fragments_removed == 5
-    assert len(dataset.get_fragments()) == 3
+    assert len(dataset.get_fragments()) == 2
 
     # Check if the zone map index is no longer being used
     scanner = dataset.scanner(filter="values > 2500", prefilter=True)
