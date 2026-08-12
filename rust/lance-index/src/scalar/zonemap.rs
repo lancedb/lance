@@ -681,14 +681,26 @@ impl ScalarIndex for ZoneMapIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        if let SargableQuery::IsNull() = query
+        let result = if let SargableQuery::IsNull() = query
             && let Some(null_rows) = &self.null_rows
         {
-            return Ok(SearchResult::exact(null_rows.clone()));
-        }
+            SearchResult::exact(null_rows.clone())
+        } else {
+            search_zones(&self.zones, metrics, |zone| {
+                self.evaluate_zone_against_query(zone, query)
+            })?
+        };
 
-        search_zones(&self.zones, metrics, |zone| {
-            self.evaluate_zone_against_query(zone, query)
+        let Some(remapper) = &self.fri else {
+            return Ok(result);
+        };
+        let selected = remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows());
+        let nulls = remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows());
+
+        Ok(match result {
+            SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
+            SearchResult::AtMost(_) => SearchResult::at_most(selected).with_nulls(nulls),
+            SearchResult::AtLeast(_) => SearchResult::at_least(selected).with_nulls(nulls),
         })
     }
 

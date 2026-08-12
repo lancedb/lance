@@ -5326,6 +5326,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_zonemap_index_with_defer_index_remap() {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, (0..12).collect::<Vec<_>>()),
+            (
+                "value",
+                Int64,
+                [
+                    Some(0),
+                    None,
+                    Some(20),
+                    Some(30),
+                    Some(40),
+                    None,
+                    Some(60),
+                    Some(70),
+                    Some(80),
+                    None,
+                    Some(100),
+                    Some(110)
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                max_rows_per_group: 4,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::ZoneMap,
+                Some("value_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 3);
+        assert_eq!(metrics.fragments_added, 1);
+
+        async fn scan_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
+            let mut scanner = dataset.scan();
+            scanner.filter(filter).unwrap();
+            scanner.project(&["id"]).unwrap();
+            scanner.use_scalar_index(use_scalar_index);
+            scanner.try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec()
+        }
+
+        for (filter, expected) in [
+            ("value IS NULL", vec![1, 5, 9]),
+            ("value = 20", vec![2]),
+            ("value > 90", vec![10, 11]),
+        ] {
+            assert_eq!(scan_ids(&dataset, filter, false).await, expected);
+            assert_eq!(scan_ids(&dataset, filter, true).await, expected);
+        }
+
+        let mut scanner = dataset.scan();
+        scanner.filter("value IS NULL").unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery: query=[value IS NULL]@value_idx(ZoneMap)"),
+            "Expected ZoneMap index query in plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_btree_index_with_defer_index_remap() {
         // Create a dataset with an incremental ID column
         let mut dataset = lance_datagen::gen_batch()
