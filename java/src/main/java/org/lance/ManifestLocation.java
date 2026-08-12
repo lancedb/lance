@@ -16,15 +16,14 @@ package org.lance;
 import java.util.Optional;
 
 /** Metadata describing the location of a dataset manifest. */
-public final class ManifestLocationInfo {
+public final class ManifestLocation {
   private final long version;
   private final String path;
   private final long sizeBytes;
   private final ManifestNamingScheme namingScheme;
   private final String eTag;
 
-  ManifestLocationInfo(
-      long version, String path, long sizeBytes, String namingScheme, String eTag) {
+  ManifestLocation(long version, String path, long sizeBytes, String namingScheme, String eTag) {
     this.version = version;
     this.path = path;
     this.sizeBytes = sizeBytes;

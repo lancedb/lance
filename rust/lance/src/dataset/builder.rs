@@ -9,7 +9,7 @@ use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, W
 use crate::dataset::branch_location::BranchLocation;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use crate::{Dataset, Error, Result, session::Session};
-use futures::FutureExt;
+use futures::{FutureExt, TryStreamExt};
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
@@ -25,7 +25,7 @@ use lance_table::{
 };
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
-use object_store::{DynObjectStore, ObjectStoreExt, path::Path};
+use object_store::{DynObjectStore, path::Path};
 use prost::Message;
 use tracing::{info, instrument};
 use url::Url;
@@ -599,28 +599,23 @@ impl DatasetBuilder {
         Ok((object_store, base_path, commit_handler))
     }
 
-    /// Resolve metadata for the latest manifest without reading its contents.
+    /// List manifest locations without reading the manifest contents.
     ///
-    /// This locates the latest manifest and performs a metadata request only when the commit
-    /// handler did not already provide the object size. Explicit version, branch, and tag targets
-    /// are not supported by this lightweight operation.
-    pub async fn latest_manifest_location(mut self) -> Result<ManifestLocation> {
+    /// The returned locations are not guaranteed to be ordered. This operation may list and
+    /// materialize the full manifest history. Explicit version, branch, and tag targets are not
+    /// supported.
+    pub async fn list_manifest_locations(mut self) -> Result<Vec<ManifestLocation>> {
         if self.version.is_some() {
             return Err(Error::invalid_input(
-                "latest_manifest_location does not support an explicit version, branch, or tag",
+                "list_manifest_locations does not support an explicit version, branch, or tag",
             ));
         }
         self.apply_storage_options_override();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
-        let mut location = commit_handler
-            .resolve_latest_location(&base_path, object_store.as_ref())
-            .await?;
-        if location.size.is_none() {
-            let metadata = object_store.inner.head(&location.path).await?;
-            location.size = Some(metadata.size);
-            location.e_tag = metadata.e_tag;
-        }
-        Ok(location)
+        commit_handler
+            .list_manifest_locations(&base_path, object_store.as_ref(), false)
+            .try_collect()
+            .await
     }
 
     #[instrument(skip_all)]

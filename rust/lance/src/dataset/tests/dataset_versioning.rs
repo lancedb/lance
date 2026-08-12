@@ -49,7 +49,7 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
 }
 
 #[tokio::test]
-async fn test_latest_manifest_location_rejects_explicit_refs() {
+async fn test_list_manifest_locations_rejects_explicit_refs() {
     let test_dir = TempStdDir::default();
     let test_uri = test_dir.to_str().unwrap();
     let builders = [
@@ -59,7 +59,7 @@ async fn test_latest_manifest_location_rejects_explicit_refs() {
     ];
 
     for builder in builders {
-        let err = builder.latest_manifest_location().await.unwrap_err();
+        let err = builder.list_manifest_locations().await.unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains("does not support an explicit"));
     }

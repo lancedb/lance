@@ -128,10 +128,10 @@ impl BlockingDataset {
         })
     }
 
-    pub fn inspect_latest_manifest(
+    pub fn list_manifest_locations(
         uri: &str,
         storage_options: HashMap<String, String>,
-    ) -> Result<ManifestLocation> {
+    ) -> Result<Vec<ManifestLocation>> {
         let accessor = (!storage_options.is_empty()).then(|| {
             Arc::new(lance::io::StorageOptionsAccessor::with_static_options(
                 storage_options,
@@ -147,9 +147,10 @@ impl BlockingDataset {
         Ok(block_on(
             DatasetBuilder::from_uri(uri)
                 .with_read_params(params)
-                .latest_manifest_location(),
+                .list_manifest_locations(),
         )?)
     }
+
     pub fn write(
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
@@ -811,6 +812,9 @@ impl IntoJava for Version {
 
 impl IntoJava for ManifestLocation {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let size = self.size.ok_or_else(|| {
+            Error::runtime_error(format!("Manifest size is unavailable for {}", self.path))
+        })?;
         let path = env.new_string(self.path.to_string())?;
         let naming_scheme = env.new_string(match self.naming_scheme {
             ManifestNamingScheme::V1 => "V1",
@@ -821,12 +825,12 @@ impl IntoJava for ManifestLocation {
             None => JObject::null(),
         };
         Ok(env.new_object(
-            "org/lance/ManifestLocationInfo",
+            "org/lance/ManifestLocation",
             "(JLjava/lang/String;JLjava/lang/String;Ljava/lang/String;)V",
             &[
                 JValue::Long(self.version as i64),
                 JValue::Object(&path),
-                JValue::Long(self.size.unwrap_or(0) as i64),
+                JValue::Long(size as i64),
                 JValue::Object(&naming_scheme),
                 JValue::Object(&e_tag),
             ],
@@ -1428,7 +1432,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_inspectLatestManifestNative<'local>(
+pub extern "system" fn Java_org_lance_Dataset_listManifestLocationsNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
@@ -1436,11 +1440,11 @@ pub extern "system" fn Java_org_lance_Dataset_inspectLatestManifestNative<'local
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_inspect_latest_manifest(&mut env, path, storage_options_obj)
+        inner_list_manifest_locations(&mut env, path, storage_options_obj)
     )
 }
 
-fn inner_inspect_latest_manifest<'local>(
+fn inner_list_manifest_locations<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
     storage_options_obj: JObject,
@@ -1448,7 +1452,21 @@ fn inner_inspect_latest_manifest<'local>(
     let path: String = path.extract(env)?;
     let storage_options = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &storage_options)?;
-    BlockingDataset::inspect_latest_manifest(&path, storage_options)?.into_java(env)
+    let locations = BlockingDataset::list_manifest_locations(&path, storage_options)?;
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for location in locations {
+        env.with_local_frame(8, |env| {
+            let java_location = location.into_java(env)?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&java_location)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
 }
 
 #[allow(clippy::too_many_arguments)]

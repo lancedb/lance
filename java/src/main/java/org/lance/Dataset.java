@@ -484,39 +484,42 @@ public class Dataset implements Closeable {
       boolean namespaceClientManagedVersioning);
 
   /**
-   * Resolve metadata for the latest manifest without reading or deserializing its contents.
+   * List manifest locations without reading or deserializing the manifest contents.
+   *
+   * <p>The returned locations are not guaranteed to be ordered. This operation may list and
+   * materialize the full manifest history.
    *
    * <p>This method is for datasets whose commit handler can be resolved directly from the URI.
    * Namespace-managed tables and tables using a custom commit handler are not supported.
    *
    * @param uri dataset URI
-   * @return metadata for the latest manifest
+   * @return manifest locations
    */
-  public static ManifestLocationInfo inspectLatestManifest(String uri) {
-    return inspectLatestManifest(uri, new HashMap<>());
+  public static List<ManifestLocation> listManifestLocations(String uri) {
+    return listManifestLocations(uri, new HashMap<>());
   }
 
   /**
-   * Resolve metadata for the latest manifest without reading or deserializing its contents.
+   * List manifest locations without reading or deserializing the manifest contents.
+   *
+   * <p>The returned locations are not guaranteed to be ordered. This operation may list and
+   * materialize the full manifest history.
    *
    * <p>This method is for datasets whose commit handler can be resolved directly from the URI.
    * Namespace-managed tables and tables using a custom commit handler are not supported.
    *
-   * <p>The supplied storage options are used to construct the object store. A metadata request is
-   * made only when the commit handler did not already provide the manifest size.
-   *
    * @param uri dataset URI
    * @param storageOptions object-store credentials and connection options
-   * @return metadata for the latest manifest
+   * @return manifest locations
    */
-  public static ManifestLocationInfo inspectLatestManifest(
+  public static List<ManifestLocation> listManifestLocations(
       String uri, Map<String, String> storageOptions) {
     Preconditions.checkNotNull(uri, "uri must not be null");
     Preconditions.checkNotNull(storageOptions, "storageOptions must not be null");
-    return inspectLatestManifestNative(uri, storageOptions);
+    return listManifestLocationsNative(uri, storageOptions);
   }
 
-  private static native ManifestLocationInfo inspectLatestManifestNative(
+  private static native List<ManifestLocation> listManifestLocationsNative(
       String uri, Map<String, String> storageOptions);
 
   /**
