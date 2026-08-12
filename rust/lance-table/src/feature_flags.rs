@@ -76,6 +76,13 @@ pub fn apply_feature_flags(
         0
     };
 
+    // Capture before the reset below. The flag is not derivable from fragment
+    // content alone (see the migration path in `migrate_to_stable_row_ids`),
+    // so it must be carried across the reset explicitly, just like the MemWAL
+    // index-catchup bit above.
+    let had_stable_row_ids = manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+        && manifest.writer_feature_flags & FLAG_STABLE_ROW_IDS != 0;
+
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -90,12 +97,13 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DELETION_FILES;
     }
 
-    // If any fragment has row ids, they must all have row ids.
-    let has_row_ids = manifest
-        .fragments
-        .iter()
-        .any(|frag| frag.row_id_meta.is_some());
-    if has_row_ids || enable_stable_row_id {
+    // Set stable row IDs flag only when explicitly requested or when it was
+    // already set on the manifest before the reset above. Auto-detection from
+    // fragment content is intentionally removed: the migration path assigns
+    // row_id_meta to all fragments in a first commit *without* yet activating
+    // the flag, and a second commit activates it explicitly via
+    // `enable_stable_row_id`. Auto-detection would activate the flag too early.
+    if enable_stable_row_id || had_stable_row_ids {
         if !manifest
             .fragments
             .iter()

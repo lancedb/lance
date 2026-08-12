@@ -2228,6 +2228,7 @@ impl Transaction {
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
+            && config.migration_next_row_id.is_none()
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
@@ -2315,7 +2316,8 @@ impl Transaction {
         .then(|| Self::logical_index_segments(&final_indices));
 
         let mut next_row_id = {
-            // Only use row ids if the feature flag is set already or
+            // Only use row ids if the feature flag is set already, or this is
+            // a migration activation that explicitly provides the next_row_id.
             match (current_manifest, config.use_stable_row_ids) {
                 (Some(manifest), _) if manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0 => {
                     Some(manifest.next_row_id)
@@ -2323,9 +2325,14 @@ impl Transaction {
                 (None, true) => Some(0),
                 (_, false) => None,
                 (Some(_), true) => {
-                    return Err(Error::not_supported_source(
-                        "Cannot enable stable row ids on existing dataset".into(),
-                    ));
+                    // Migration activation: use the provided next_row_id.
+                    if let Some(migration_nri) = config.migration_next_row_id {
+                        Some(migration_nri)
+                    } else {
+                        return Err(Error::not_supported_source(
+                            "Cannot enable stable row ids on existing dataset".into(),
+                        ));
+                    }
                 }
             }
         };

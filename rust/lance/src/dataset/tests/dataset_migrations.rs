@@ -8,6 +8,7 @@ use crate::dataset::InsertBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
+use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use lance_table::format::IndexMetadata;
 
 use crate::dataset::write::{WriteMode, WriteParams};
@@ -15,7 +16,7 @@ use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::{Float32Array, Int64Array, RecordBatchIterator};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_file::version::LanceFileVersion;
 
 use futures::{StreamExt, TryStreamExt};
@@ -510,4 +511,165 @@ async fn test_list_struct_field_reorder_issue_5702() {
 
     // Verify schema has expected columns
     assert_eq!(batch.schema().fields().len(), 3); // id, data, extra
+}
+
+// Helper: create a simple dataset with one fragment of `n` rows at the given URI.
+async fn make_simple_dataset(uri: &str, n: i64) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..n))],
+    )
+    .unwrap();
+    Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_migrate_to_stable_row_ids_basic() {
+    // Create a dataset without stable row IDs (the default).
+    let mut dataset = make_simple_dataset("memory://migrate_basic", 10).await;
+    assert!(
+        !dataset.manifest.uses_stable_row_ids(),
+        "should not have stable row IDs yet"
+    );
+
+    // Append a second batch using InsertBuilder so we share the same object store.
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(10..20))],
+    )
+    .unwrap();
+    dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch2])
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    // Run the migration.
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    // FLAG_STABLE_ROW_IDS must be set in both reader and writer flags.
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS,
+        0,
+        "reader_feature_flags should have FLAG_STABLE_ROW_IDS"
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_STABLE_ROW_IDS,
+        0,
+        "writer_feature_flags should have FLAG_STABLE_ROW_IDS"
+    );
+    assert!(dataset.manifest.uses_stable_row_ids());
+
+    // All fragments must have row_id_meta set.
+    for frag in dataset.manifest.fragments.iter() {
+        assert!(
+            frag.row_id_meta.is_some(),
+            "fragment {} should have row_id_meta after migration",
+            frag.id
+        );
+    }
+
+    // next_row_id should equal the total number of physical rows (10 + 10 = 20).
+    assert_eq!(dataset.manifest.next_row_id, 20);
+
+    // Appending after migration should correctly assign row IDs from next_row_id.
+    let batch3 = RecordBatch::try_new(
+        Arc::new(ArrowSchema::from(dataset.schema())),
+        vec![Arc::new(Int64Array::from_iter_values(20..25))],
+    )
+    .unwrap();
+    let dataset_after_append = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch3])
+        .await
+        .unwrap();
+
+    // The new fragment should also have row_id_meta.
+    let new_frag = dataset_after_append.manifest.fragments.last().unwrap();
+    assert!(
+        new_frag.row_id_meta.is_some(),
+        "new fragment after migration should have row_id_meta"
+    );
+    // next_row_id should have advanced by the 5 newly appended rows.
+    assert_eq!(dataset_after_append.manifest.next_row_id, 25);
+}
+
+#[tokio::test]
+async fn test_migrate_to_stable_row_ids_already_migrated() {
+    // Create a dataset that already uses stable row IDs.
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..5))],
+    )
+    .unwrap();
+    let write_params = WriteParams {
+        enable_stable_row_ids: true,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://already_migrated",
+        Some(write_params),
+    )
+    .await
+    .unwrap();
+
+    assert!(dataset.manifest.uses_stable_row_ids());
+    let version_before = dataset.manifest.version;
+
+    // Calling migrate on an already-migrated dataset should be a no-op.
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    // Version must not have changed.
+    assert_eq!(
+        dataset.manifest.version, version_before,
+        "migrate should be a no-op when already migrated"
+    );
+    assert!(dataset.manifest.uses_stable_row_ids());
+}
+
+#[tokio::test]
+async fn test_migrate_to_stable_row_ids_empty() {
+    // Create an empty dataset (schema-only, no fragments).
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let empty_reader = RecordBatchIterator::new(
+        std::iter::empty::<std::result::Result<RecordBatch, arrow_schema::ArrowError>>(),
+        schema.clone(),
+    );
+    let mut dataset = Dataset::write(empty_reader, "memory://migrate_empty", None)
+        .await
+        .unwrap();
+
+    assert!(!dataset.manifest.uses_stable_row_ids());
+    assert_eq!(dataset.get_fragments().len(), 0);
+
+    // Migration on an empty dataset should succeed without error.
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    assert!(dataset.manifest.uses_stable_row_ids());
+    assert_eq!(dataset.manifest.next_row_id, 0);
 }
