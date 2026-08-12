@@ -305,6 +305,32 @@ public class MergeInsertTest {
     return root;
   }
 
+  /**
+   * Build a full-schema source from parallel {@code (id, name)} lists. A {@code null} id is written
+   * as a NULL join key, which merge insert never treats as a duplicate (SQL {@code NULL != NULL}).
+   */
+  private VectorSchemaRoot buildSourceFrom(
+      Schema schema, RootAllocator allocator, List<Integer> ids, List<String> names) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    root.allocateNew();
+
+    IntVector idVector = (IntVector) root.getVector("id");
+    VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+    for (int i = 0; i < ids.size(); i++) {
+      if (ids.get(i) == null) {
+        idVector.setNull(i);
+      } else {
+        idVector.setSafe(i, ids.get(i));
+      }
+      nameVector.setSafe(i, names.get(i).getBytes(StandardCharsets.UTF_8));
+    }
+
+    root.setRowCount(ids.size());
+
+    return root;
+  }
+
   private ArrowArrayStream convertToStream(VectorSchemaRoot root, RootAllocator allocator)
       throws Exception {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -490,6 +516,98 @@ public class MergeInsertTest {
             originalDataset,
             readAll(dataset).toString(),
             "Dataset should remain unchanged after a failed delete-only mergeInsert");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeFailAllowsUnmatchedDuplicateKeys() throws Exception {
+    // Boundary: Fail only rejects multiple source rows matching the SAME target row.
+    // Two unmatched source rows share id=10 (no target match), so Fail must NOT error
+    // and both rows are inserted.
+
+    try (VectorSchemaRoot source =
+        buildSourceFrom(
+            testDataset.getSchema(),
+            allocator,
+            Arrays.asList(10, 10),
+            Arrays.asList("First 10", "Second 10"))) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
+                sourceStream);
+
+        Assertions.assertEquals(
+            2,
+            result.stats().numInsertedRows(),
+            "Fail should insert both unmatched duplicate-key rows, not reject them");
+        Assertions.assertEquals(
+            7, result.dataset().countRows(), "Base 5 rows plus 2 unmatched inserts for id=10");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeFirstSeenDedupesUnmatchedKeys() throws Exception {
+    // Boundary: FirstSeen deduplicates unmatched rows that would otherwise insert the
+    // same non-null join key more than once. Two unmatched id=10 rows collapse to one.
+
+    try (VectorSchemaRoot source =
+        buildSourceFrom(
+            testDataset.getSchema(),
+            allocator,
+            Arrays.asList(10, 10),
+            Arrays.asList("First 10", "Second 10"))) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            1,
+            result.stats().numInsertedRows(),
+            "FirstSeen should insert only the first row for the duplicate key id=10");
+        Assertions.assertEquals(
+            6, result.dataset().countRows(), "Base 5 rows plus 1 deduplicated insert for id=10");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeNullKeysNeverDuplicate() throws Exception {
+    // Boundary: rows whose join key is NULL are never duplicates, because merge insert
+    // uses SQL equality where NULL does not equal NULL. Even under FirstSeen, two NULL-key
+    // rows are both inserted.
+
+    try (VectorSchemaRoot source =
+        buildSourceFrom(
+            testDataset.getSchema(),
+            allocator,
+            Arrays.asList((Integer) null, (Integer) null),
+            Arrays.asList("Null A", "Null B"))) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            2,
+            result.stats().numInsertedRows(),
+            "NULL join keys are never duplicates, so both rows insert even under FirstSeen");
+        Assertions.assertEquals(
+            7, result.dataset().countRows(), "Base 5 rows plus 2 NULL-key inserts");
       }
     }
   }

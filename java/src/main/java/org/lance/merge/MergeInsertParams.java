@@ -246,11 +246,17 @@ public class MergeInsertParams {
   }
 
   /**
-   * Control how duplicate source rows that match the same target row are handled.
+   * Control how duplicate source rows are handled.
    *
-   * <p>Default is {@link SourceDedupeBehavior#Fail}, which errors if the source contains duplicate
-   * join keys. Use {@link SourceDedupeBehavior#FirstSeen} to keep the first encountered row and
-   * skip subsequent duplicates.
+   * <p>Default is {@link SourceDedupeBehavior#Fail}, which errors only when multiple source rows
+   * match the <em>same target row</em> (an ambiguous update or delete). It does <b>not</b> reject
+   * duplicate join keys among unmatched rows — those are all inserted. Use {@link
+   * SourceDedupeBehavior#FirstSeen} to keep the first row for each join key and skip subsequent
+   * duplicates, including unmatched rows that would otherwise insert the same non-null key more
+   * than once.
+   *
+   * <p>Rows whose join keys contain NULL are never duplicates, because merge insert uses SQL
+   * equality where NULL does not equal NULL.
    *
    * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
    * sort the source data before passing it to the merge insert operation.
@@ -433,16 +439,23 @@ public class MergeInsertParams {
   }
 
   /**
-   * Describes how to handle duplicate source rows that match the same target row.
+   * Describes how to handle duplicate source rows.
    *
    * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
-   * sort the source data before passing it to the merge insert operation.
+   * sort the source data before passing it to the merge insert operation. Rows whose join keys
+   * contain NULL are not duplicates because merge insert uses SQL equality, where NULL does not
+   * equal NULL.
    */
   public enum SourceDedupeBehavior {
-    /** Fail the operation if duplicates are found (default). */
+    /** Fail if multiple source rows match the same target row (default). */
     Fail,
 
-    /** Keep the first seen value and skip subsequent duplicates. */
+    /**
+     * Keep the first row for each join key and skip subsequent rows.
+     *
+     * <p>This applies both to rows that match a target row and to unmatched rows that would
+     * otherwise insert the same non-null join key more than once.
+     */
     FirstSeen,
   }
 }
