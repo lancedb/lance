@@ -56,10 +56,10 @@ use crate::io::commit::{CommitError, CommitHandler};
 ///
 /// Object-store overwrites can assign a new ETag to identical bytes. Therefore
 /// the finalized external row contains stable logical metadata (path and size)
-/// but omits the destination ETag. Readers get the current opaque generation
-/// token from object storage for cache scoping. This protocol assumes one
-/// dataset incarnation owns the physical prefix; safe prefix reuse requires a
-/// separate incarnation identity rather than interpreting an ETag as one.
+/// but omits the destination ETag. An ETag is neither logical manifest identity
+/// nor dataset-incarnation identity, so cache correctness must not depend on it.
+/// This protocol assumes one dataset incarnation owns the physical prefix; safe
+/// prefix reuse requires a separate incarnation identity.
 /// For a visual explanation of the commit loop see
 /// <https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04>
 #[async_trait]
@@ -304,14 +304,14 @@ async fn copy_size_aware(
 /// that guarantee, cannot establish content integrity, and adds a read I/O to
 /// every commit. It would only provide an ETag that another identical helper
 /// can immediately invalidate, so the successful fast path deliberately
-/// returns no cache-generation token.
+/// returns no destination ETag.
 ///
 /// `NotFound` is different: the selected staging object may have disappeared
 /// because another helper finalized and deleted it, or because the commit is
 /// unrecoverable. Only in that ambiguous recovery path do we HEAD the canonical
 /// object and require its size to match the external-store-selected staging
-/// manifest. The ETag obtained by this required HEAD can be reused as a cache
-/// token.
+/// manifest. Any ETag returned by that required HEAD is merely the current
+/// object's opaque generation metadata.
 async fn copy_or_verify_final_manifest(
     object_store: &dyn OSObjectStore,
     staging_path: &Path,
@@ -434,10 +434,7 @@ impl ExternalManifestCommitHandler {
                     path,
                     size: expected_size,
                     naming_scheme,
-                    // An external-store ETag is deliberately ignored. It can
-                    // only describe a physical generation observed by an old
-                    // finalizer and has no bearing on the logical manifest.
-                    e_tag: _,
+                    e_tag: expected_e_tag,
                 } = location;
 
                 let size = match expected_size {
@@ -454,10 +451,28 @@ impl ExternalManifestCommitHandler {
                     None => Some(size),
                 };
 
-                // Always return the current object-store token solely for
-                // cache scoping. Size remains the stable cross-store check;
-                // content integrity comes from manifest decoding or an
-                // explicit checksum, never from an opaque ETag comparison.
+                // `None` explicitly opts out of generation validation. The
+                // DynamoDB implementation uses that policy because its legacy
+                // ETags can be stale after equivalent finalizers overwrite the
+                // canonical object. Other ExternalManifestStore implementations
+                // may intentionally publish a generation token, so preserve the
+                // public trait's existing comparison semantics for `Some`.
+                let e_tag = match expected_e_tag {
+                    Some(expected_e_tag) => {
+                        if e_tag.as_ref() != Some(&expected_e_tag) {
+                            return Err(Error::corrupt_file(
+                                path,
+                                format!(
+                                    "Manifest e_tag mismatch for version {}: external store expected {:?}, object store returned {:?}",
+                                    version, expected_e_tag, e_tag
+                                ),
+                            ));
+                        }
+                        Some(expected_e_tag)
+                    }
+                    None => e_tag,
+                };
+
                 Ok(ManifestLocation {
                     version,
                     path,
@@ -996,7 +1011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finalized_manifest_ignores_external_store_etag() {
+    async fn test_finalized_manifest_rejects_external_store_etag_mismatch() {
         let external_store = Arc::new(TestExternalManifestStore::new(false));
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
@@ -1015,17 +1030,51 @@ mod tests {
             .unwrap();
         let final_meta = object_store.inner.head(&final_path).await.unwrap();
 
-        // Rows written by older Lance versions can contain the ETag observed
-        // by a finalizer before a concurrent identical overwrite. The physical
-        // token may be stale even though DDB still identifies the right logical
-        // version and S3 contains the right manifest bytes.
         external_store
             .put_if_not_exists(
                 base_path.as_ref(),
                 1,
                 final_path.as_ref(),
                 final_meta.size,
-                Some("legacy-stale-etag".to_string()),
+                Some("expected-generation".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let error = handler
+            .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
+            .await
+            .expect_err("a custom external store's generation token must be honored");
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("Manifest e_tag mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_finalized_manifest_without_external_store_etag_uses_current_etag() {
+        let external_store = Arc::new(TestExternalManifestStore::new(false));
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
+
+        object_store
+            .inner
+            .put(
+                &final_path,
+                object_store::PutPayload::from_static(b"manifest"),
+            )
+            .await
+            .unwrap();
+        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        external_store
+            .put_if_not_exists(
+                base_path.as_ref(),
+                1,
+                final_path.as_ref(),
+                final_meta.size,
+                None,
             )
             .await
             .unwrap();
@@ -1033,13 +1082,10 @@ mod tests {
         let resolved = handler
             .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
             .await
-            .expect("an opaque ETag mismatch must not make valid manifest bytes unreadable");
+            .expect("an absent external-store ETag must opt out of comparison");
         assert_eq!(resolved.path, final_path);
         assert_eq!(resolved.size, Some(final_meta.size));
-        assert_eq!(
-            resolved.e_tag, final_meta.e_tag,
-            "cache identity must use the current object-store generation"
-        );
+        assert_eq!(resolved.e_tag, final_meta.e_tag);
     }
 
     #[tokio::test]
@@ -1327,7 +1373,7 @@ mod tests {
         assert_eq!(committed.path, final_path);
         assert_eq!(
             committed.e_tag, None,
-            "the caller must not perform a HEAD only to obtain a cache generation"
+            "the caller must not perform a HEAD only to observe the destination ETag"
         );
         assert!(
             fail_final_head.load(Ordering::SeqCst),

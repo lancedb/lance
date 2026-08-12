@@ -239,14 +239,17 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
-    /// Optional opaque object generation token used to scope manifest caches.
+    /// Optional opaque object generation token.
+    /// An [`ExternalManifestStore`](crate::io::commit::external_manifest::ExternalManifestStore)
+    /// may also use `Some` to require an exact-generation match; implementations
+    /// whose token can legitimately become stale after equivalent materialization
+    /// must return `None` instead.
     ///
     /// An ETag is not necessarily a content checksum and may change when an
     /// object is rewritten with identical bytes. In particular, S3 Express
-    /// returns an object-specific opaque value. Callers must therefore not
-    /// diagnose manifest corruption from an ETag mismatch alone. The token is
-    /// still useful for avoiding a stale cache hit when a dataset is deleted
-    /// and recreated at the same URI and version.
+    /// returns an object-specific opaque value. Callers must not treat it as a
+    /// content checksum, logical manifest identity, or dataset-incarnation
+    /// identity, and cache correctness must not depend on it.
     pub e_tag: Option<String>,
 }
 

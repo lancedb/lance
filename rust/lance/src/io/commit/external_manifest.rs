@@ -319,7 +319,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn finalized_external_manifest_location_ignores_stored_etag() {
+    async fn finalized_external_manifest_location_without_stored_etag_uses_current_etag() {
         let object_store = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 7;
@@ -338,7 +338,7 @@ mod test {
                     path: final_path,
                     size: Some(body.len() as u64),
                     naming_scheme: ManifestNamingScheme::V2,
-                    e_tag: Some("stale-etag".to_string()),
+                    e_tag: None,
                 },
                 verify_store: None,
             }),
@@ -347,7 +347,7 @@ mod test {
         let resolved = handler
             .resolve_latest_location(&base_path, &object_store)
             .await
-            .expect("an external-store ETag must not participate in manifest validation");
+            .expect("an absent external-store ETag must opt out of generation validation");
         let current_meta = object_store
             .inner
             .head(&resolved.path)
@@ -357,7 +357,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn external_manifest_store_put_skips_destination_cache_generation() {
+    async fn external_manifest_store_put_skips_destination_head() {
         let object_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
         let base_path = Path::from("repro");
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
@@ -404,12 +404,12 @@ mod test {
         assert_eq!(location.size, Some(final_meta.size));
         assert_eq!(
             location.e_tag, None,
-            "a successful copy must not incur a HEAD only to populate a cache token"
+            "a successful copy must not incur a HEAD only to observe the destination ETag"
         );
     }
 
     #[tokio::test]
-    async fn external_manifest_handler_finalize_skips_destination_cache_generation() {
+    async fn external_manifest_handler_finalize_skips_destination_head() {
         let object_store = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 1;
@@ -455,7 +455,7 @@ mod test {
         assert_eq!(location.size, Some(final_meta.size));
         assert_eq!(
             location.e_tag, None,
-            "a successful copy must not incur a HEAD only to populate a cache token"
+            "a successful copy must not incur a HEAD only to observe the destination ETag"
         );
     }
 
