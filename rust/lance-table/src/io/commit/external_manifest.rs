@@ -156,30 +156,15 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
         }
 
-        // HEAD serves two purposes that are local to this finalizer: it proves
-        // the canonical object has the selected staging size, and it supplies
-        // the physical generation used to scope this process's manifest cache.
-        // It is deliberately *not* used as durable commit identity. Another
-        // helper may overwrite the same immutable bytes immediately afterward,
-        // making this token stale without changing the logical manifest.
-        let final_meta = object_store.head(&final_path).await?;
-        if final_meta.size != size {
-            return Err(Error::corrupt_file(
-                final_path.clone(),
-                format!(
-                    "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
-                    version, size, final_meta.size
-                ),
-            ));
-        }
-        let final_size = final_meta.size;
+        let (final_size, final_e_tag) =
+            observe_final_manifest(object_store, &final_path, version, size, copied).await?;
 
         let location = ManifestLocation {
             version,
             path: final_path.clone(),
             size: Some(final_size),
             naming_scheme,
-            e_tag: final_meta.e_tag,
+            e_tag: final_e_tag,
         };
 
         // Step 3: Update the external index to the final path.
@@ -332,6 +317,47 @@ async fn copy_size_aware(
     }
 }
 
+/// Observe metadata for a canonical manifest after a finalization attempt.
+///
+/// A successful whole-object copy already proves that the selected immutable
+/// bytes were materialized at `final_path`. The following HEAD is useful for a
+/// defensive size check and for obtaining a cache-scoping generation, but a
+/// transient HEAD failure cannot undo that completed copy. In that case the
+/// caller continues with the selected size and no cache generation.
+///
+/// When `copied` is false, the source disappeared before this helper could copy
+/// it. Another helper is only *suspected* to have completed finalization, so a
+/// successful HEAD and exact size match are required before accepting the
+/// canonical object.
+async fn observe_final_manifest(
+    object_store: &dyn OSObjectStore,
+    final_path: &Path,
+    version: u64,
+    selected_size: u64,
+    copied: bool,
+) -> Result<(u64, Option<String>)> {
+    match object_store.head(final_path).await {
+        Ok(final_meta) if final_meta.size == selected_size => {
+            Ok((final_meta.size, final_meta.e_tag))
+        }
+        Ok(final_meta) => Err(Error::corrupt_file(
+            final_path.clone(),
+            format!(
+                "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
+                version, selected_size, final_meta.size
+            ),
+        )),
+        Err(error) if copied => {
+            warn!(
+                "Final manifest '{}' was copied successfully, but its metadata could not be read; continuing without a cache generation: {}",
+                final_path, error
+            );
+            Ok((selected_size, None))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 // NOTE: parts are uploaded sequentially. This could be parallelized (a
 // bounded JoinSet, like lance-io/src/object_writer.rs's
 // LANCE_UPLOAD_CONCURRENCY) or sidestepped entirely by switching to
@@ -459,6 +485,11 @@ impl ExternalManifestCommitHandler {
                 // staging object must have the recorded size. Content integrity
                 // must be established by decoding the manifest or by an
                 // explicit content checksum, never by comparing opaque ETags.
+                // This reader behavior is the safe first phase of a rolling
+                // deployment: it accepts legacy rows immediately. Writers can
+                // omit ETags after readers are upgraded; legacy readers already
+                // accept an absent ETag, while legacy finalizers may still
+                // republish a stale one during the mixed-version window.
                 if let Some(expected_e_tag) = expected_e_tag
                     && e_tag.as_ref() != Some(&expected_e_tag)
                 {
@@ -518,28 +549,15 @@ impl ExternalManifestCommitHandler {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_manifest_path.as_ref());
         }
 
-        // As in the direct writer path, HEAD verifies the selected size and
-        // gives this process a cache-scoping generation. The token is returned
-        // to the caller but is never published as logical metadata in the
-        // external index, where a later identical overwrite would stale it.
-        let final_meta = store.head(&final_manifest_path).await?;
-        if final_meta.size != size {
-            return Err(Error::corrupt_file(
-                final_manifest_path.clone(),
-                format!(
-                    "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
-                    version, size, final_meta.size
-                ),
-            ));
-        }
-        let final_size = final_meta.size;
+        let (final_size, final_e_tag) =
+            observe_final_manifest(store, &final_manifest_path, version, size, copied).await?;
 
         let location = ManifestLocation {
             version,
             path: final_manifest_path,
             size: Some(final_size),
             naming_scheme,
-            e_tag: final_meta.e_tag,
+            e_tag: final_e_tag,
         };
 
         // Step 2: point the external index at the final location. As in
@@ -1307,6 +1325,74 @@ mod tests {
             ManifestNamingScheme::V2.manifest_path(&base_path, 1)
         );
         object_store.inner.head(&resolved.path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_successful_copy_commits_when_cache_head_fails() {
+        let external_store = Arc::new(TestExternalManifestStore::new(false));
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: external_store.clone(),
+        };
+        let mut object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let mut manifest = test_manifest();
+        let version = manifest.version;
+        let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
+
+        let fail_final_head = Arc::new(AtomicBool::new(true));
+        let policy_fail_final_head = fail_final_head.clone();
+        let policy_final_path = final_path.clone();
+        let mut policy = ProxyObjectStorePolicy::new();
+        policy.set_obj_meta_policy(
+            "fail-final-head-once",
+            Arc::new(move |method, meta| {
+                if method == "head"
+                    && meta.location == policy_final_path
+                    && policy_fail_final_head.swap(false, Ordering::SeqCst)
+                {
+                    return Err(Error::io("simulated final HEAD failure"));
+                }
+                Ok(meta)
+            }),
+        );
+        object_store.inner = Arc::new(ProxyObjectStore::new(
+            object_store.inner.clone(),
+            Arc::new(Mutex::new(policy)),
+        ));
+
+        let committed = handler
+            .commit(
+                &mut manifest,
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .expect("a cache-metadata failure must not overturn a successful canonical copy");
+        assert_eq!(committed.path, final_path);
+        assert_eq!(
+            committed.e_tag, None,
+            "the caller must not invent a cache generation when HEAD failed"
+        );
+        assert!(
+            !fail_final_head.load(Ordering::SeqCst),
+            "the one-shot final HEAD failure must be consumed"
+        );
+
+        let indexed = external_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+            .expect("the external index must advance after the canonical copy");
+        assert_eq!(indexed.path, final_path);
+        assert_eq!(indexed.e_tag, None);
+        object_store
+            .inner
+            .head(&final_path)
+            .await
+            .expect("the canonical copy must remain readable");
     }
 
     #[tokio::test]

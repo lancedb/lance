@@ -700,7 +700,7 @@ The commit process follows a four-step protocol:
    - Write the new manifest to object storage under a unique path determined by a new UUID
    - This staged manifest is not yet visible to readers
 
-2. **Commit to external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest-{uuid}`
+2. **Reserve version in external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest-{uuid}`
    - Atomically reserve the version for this staged manifest using put-if-not-exists
    - The reservation selects one immutable staging object; it is not yet the canonical commit
    - If this operation fails due to conflict, another writer reserved this version
@@ -726,6 +726,15 @@ If step 3 succeeds but step 4 fails, the canonical object remains committed; rea
 may repair the external index. Staging deletion is garbage collection and does not affect the
 commit outcome.
 
+**Rolling Upgrade:**
+
+Deploy the reader behavior first: finalized rows are validated by path and size, while any
+stored ETag is treated only as a legacy cache-generation hint and never as content identity.
+After all readers have this behavior, deploy writers and finalizers that omit the destination
+ETag from finalized rows. Existing rows need no migration, and legacy readers already accept a
+missing ETag. Reader-first ordering matters because a legacy finalizer can still republish a
+stale ETag during a mixed-version race.
+
 ### Reader Process with External Store
 
 The reader follows a validation and synchronization protocol:
@@ -734,7 +743,8 @@ The reader follows a validation and synchronization protocol:
 
 1. **Query external store**: `GET_EXTERNAL_STORE base_uri, version` → `path`
    - Retrieve the manifest path for the requested version
-   - If the path does not end with a UUID, return it directly (synchronization complete)
+   - If the path does not end with a UUID, validate the canonical object's size and return its
+     current ETag only as a cache-generation token; a legacy stored ETag mismatch is not corruption
    - If the path ends with a UUID, synchronization is required
 
 2. **Synchronize to object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`
@@ -742,11 +752,11 @@ The reader follows a validation and synchronization protocol:
    - This operation is idempotent
 
 3. **Update external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
-   - Update the external store to reflect the finalized path
-   - Future readers will see the synchronized state
+   - Best-effort update the external store to reflect the finalized path and size, without an ETag
+   - If this index repair fails, retain staging so a future reader can retry it
 
 4. **Return finalized path**: Return `{dataset}/_versions/{version}.manifest`
-   - Always return the finalized path
-   - If synchronization fails, return an error to prevent reading inconsistent state
+   - Return once canonical materialization succeeds, even if index repair or staging cleanup fails
+   - If canonical materialization cannot be established, or an observed size differs, return an error
 
 This protocol ensures that datasets using external manifest stores remain portable: copying the dataset directory preserves all data without requiring the external store.
