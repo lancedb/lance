@@ -9,14 +9,16 @@
 
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use datafusion::execution::SendableRecordBatchStream;
-use futures::stream::FuturesOrdered;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{TryStreamExt, stream};
 use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{ROW_ADDR, Result};
 use lance_select::RowAddrTreeMap;
 use std::sync::Arc;
+
+/// Minimum amount of row-based zone work dispatched to the CPU pool at once.
+const TARGET_ROWS_PER_SPLIT: usize = 8192;
 
 //
 // Example: Suppose we have two fragments, each with 4 rows.
@@ -100,115 +102,185 @@ where
     /// explicit column index.
     pub async fn train(
         self,
-        mut stream: SendableRecordBatchStream,
+        stream: SendableRecordBatchStream,
     ) -> Result<(Vec<P::ZoneStatistics>, RowAddrTreeMap)> {
         let zone_size = usize::try_from(self.zone_capacity).map_err(|_| {
             Error::invalid_input("zone capacity does not fit into usize on this platform")
         })?;
 
-        let parallelism = get_num_compute_intensive_cpus();
-        let mut assembler = ZoneAssembler::new(zone_size);
-        let mut pending = FuturesOrdered::new();
+        let splits = stream::try_unfold(
+            ZoneSplitAssembler::new(stream, zone_size),
+            |mut assembler| async move {
+                Ok(assembler
+                    .next_split()
+                    .await?
+                    .map(|split| (split, assembler)))
+            },
+        );
+        let processor_factory = self.processor_factory;
+        let split_tasks = splits.map_ok(move |split| {
+            let processor_factory = processor_factory.clone();
+            spawn_cpu(move || process_zone_split(&*processor_factory, split))
+        });
+        let results = split_tasks.try_buffered(get_num_compute_intensive_cpus());
+        futures::pin_mut!(results);
+
         let mut zones = Vec::new();
         let mut null_rows = RowAddrTreeMap::new();
-
-        while let Some(batch) = stream.try_next().await? {
-            for zone in assembler.push_batch(batch)? {
-                let factory = self.processor_factory.clone();
-                pending.push_back(spawn_cpu(move || process_zone(&*factory, zone)).boxed());
-                if pending.len() >= parallelism
-                    && let Some(result) = pending.next().await
-                {
-                    let (stats, zone_nulls) = result?;
-                    zones.push(stats);
-                    null_rows |= &zone_nulls;
-                }
-            }
+        while let Some((mut split_zones, split_null_rows)) = results.try_next().await? {
+            zones.append(&mut split_zones);
+            null_rows |= &split_null_rows;
         }
-        if let Some(zone) = assembler.finish() {
-            let factory = self.processor_factory.clone();
-            pending.push_back(spawn_cpu(move || process_zone(&*factory, zone)).boxed());
-        }
-        while let Some(result) = pending.next().await {
-            let (stats, zone_nulls) = result?;
-            zones.push(stats);
-            null_rows |= &zone_nulls;
-        }
-
         Ok((zones, null_rows))
     }
 }
 
-/// Serial accumulator that splits the training stream into zones.
+type Zone = Vec<RecordBatch>;
+type ZoneSplit = Vec<Zone>;
+
+/// Serial accumulator that lazily groups the training stream into CPU-sized splits.
 ///
 /// Zones never span fragments and hold at most `zone_size` physical rows; a
 /// zone may span several input batches, collected as zero-copy slices.
-struct ZoneAssembler {
+struct ZoneSplitAssembler {
+    stream: SendableRecordBatchStream,
     zone_size: usize,
+    target_rows: usize,
+    input_batch: Option<RecordBatch>,
+    input_offset: usize,
     /// Zero-copy slices of the zone currently being assembled.
-    current: Vec<RecordBatch>,
+    current_zone: Zone,
     /// Physical rows accumulated so far in the current zone.
-    current_len: usize,
-    /// Fragment the current zone belongs to; meaningless when `current_len == 0`.
-    current_fragment: u64,
+    current_zone_rows: usize,
+    current_fragment: Option<u64>,
+    current_split: ZoneSplit,
+    current_split_rows: usize,
 }
 
-impl ZoneAssembler {
-    fn new(zone_size: usize) -> Self {
+impl ZoneSplitAssembler {
+    fn new(stream: SendableRecordBatchStream, zone_size: usize) -> Self {
         Self {
+            stream,
             zone_size,
-            current: Vec::new(),
-            current_len: 0,
-            current_fragment: 0,
+            target_rows: TARGET_ROWS_PER_SPLIT.max(zone_size),
+            input_batch: None,
+            input_offset: 0,
+            current_zone: Vec::new(),
+            current_zone_rows: 0,
+            current_fragment: None,
+            current_split: Vec::new(),
+            current_split_rows: 0,
         }
     }
 
-    /// Splits `batch` at fragment boundaries and zone capacity in a single
-    /// forward scan over `_rowaddr`, returning every zone completed by this
-    /// batch (possibly none or several). Each returned zone is the ordered
-    /// list of zero-copy slices holding its rows — all from one fragment,
-    /// possibly carried over from earlier batches.
-    fn push_batch(&mut self, batch: RecordBatch) -> Result<Vec<Vec<RecordBatch>>> {
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
-            return Ok(Vec::new());
-        }
-        let row_addrs = row_addr_column(&batch)?.values();
-
-        let mut completed = Vec::new();
-        let mut offset = 0;
-        while offset < num_rows {
-            let fragment_id = row_addrs[offset] >> 32;
-            // Zones cannot span fragments; cut the current zone (if non-empty)
-            // at the boundary.
-            if self.current_len > 0 && self.current_fragment != fragment_id {
-                completed.push(self.cut());
+    /// Produces the next bounded unit of zone work without eagerly draining the input.
+    ///
+    /// Each call advances `stream` only until enough *complete* zones have been
+    /// collected to reach `target_rows`. The target is intentionally a soft
+    /// boundary: a zone is never divided between splits, so the returned split
+    /// may contain slightly more rows than requested. Within a split, zones stay
+    /// in input order, contain at most `zone_size` physical rows, and never cross
+    /// a fragment boundary.
+    ///
+    /// A large input batch may therefore be consumed over several calls. The
+    /// unread suffix remains in `input_batch` and `input_offset`, which bounds
+    /// both queued CPU work and retained intermediate state. At end of stream,
+    /// the trailing partial zone is included in the final split. This method
+    /// returns `Some` only for non-empty splits and returns `None` once all input
+    /// has been consumed.
+    async fn next_split(&mut self) -> Result<Option<ZoneSplit>> {
+        loop {
+            // Return once the split contains enough complete zones.
+            if self.current_split_rows >= self.target_rows {
+                return Ok(Some(self.take_split()));
             }
-            self.current_fragment = fragment_id;
 
-            let limit = num_rows.min(offset + (self.zone_size - self.current_len));
-            let end = row_addrs[offset..limit]
+            // Read a batch only when the current one is exhausted.
+            if self.input_batch.is_none() {
+                let Some(batch) = self.stream.try_next().await? else {
+                    // Flush trailing work at EOF.
+                    self.finish_zone()?;
+                    return Ok((!self.current_split.is_empty()).then(|| self.take_split()));
+                };
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                row_addr_column(&batch)?;
+                self.input_batch = Some(batch);
+                self.input_offset = 0;
+            }
+
+            let input_rows = self
+                .input_batch
+                .as_ref()
+                .map(RecordBatch::num_rows)
+                .ok_or_else(|| Error::internal("zone split assembler lost its input batch"))?;
+            if self.input_offset == input_rows {
+                self.input_batch = None;
+                self.input_offset = 0;
+                continue;
+            }
+
+            let fragment_id = {
+                let batch = self
+                    .input_batch
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("zone split assembler lost its input batch"))?;
+                row_addr_column(batch)?.value(self.input_offset) >> 32
+            };
+            // A zone cannot cross a fragment boundary.
+            if self
+                .current_fragment
+                .is_some_and(|current| current != fragment_id)
+            {
+                self.finish_zone()?;
+                continue;
+            }
+            self.current_fragment = Some(fragment_id);
+
+            let batch = self
+                .input_batch
+                .as_ref()
+                .ok_or_else(|| Error::internal("zone split assembler lost its input batch"))?;
+            let row_addrs = row_addr_column(batch)?.values();
+            let remaining_rows = batch.num_rows() - self.input_offset;
+            let take = remaining_rows.min(self.zone_size - self.current_zone_rows);
+            let limit = self.input_offset + take;
+            // Stop at either the zone limit or the next fragment.
+            let end = row_addrs[self.input_offset..limit]
                 .iter()
                 .position(|addr| (addr >> 32) != fragment_id)
-                .map_or(limit, |run_len| offset + run_len);
-            self.current.push(batch.slice(offset, end - offset));
-            self.current_len += end - offset;
-            if self.current_len == self.zone_size {
-                completed.push(self.cut());
+                .map_or(limit, |run_len| self.input_offset + run_len);
+            let len = end - self.input_offset;
+            self.current_zone.push(batch.slice(self.input_offset, len));
+            self.current_zone_rows += len;
+            self.input_offset = end;
+            if self.current_zone_rows == self.zone_size {
+                self.finish_zone()?;
             }
-            offset = end;
         }
-        Ok(completed)
     }
 
-    /// Emits the trailing partial zone once the input stream is exhausted.
-    fn finish(&mut self) -> Option<Vec<RecordBatch>> {
-        (self.current_len > 0).then(|| self.cut())
+    fn finish_zone(&mut self) -> Result<()> {
+        if self.current_zone.is_empty() {
+            return Ok(());
+        }
+        self.current_split_rows = self
+            .current_split_rows
+            .checked_add(self.current_zone_rows)
+            .ok_or_else(|| {
+                Error::invalid_input("zone split row count exceeds usize on this platform")
+            })?;
+        self.current_split
+            .push(std::mem::take(&mut self.current_zone));
+        self.current_zone_rows = 0;
+        self.current_fragment = None;
+        Ok(())
     }
 
-    fn cut(&mut self) -> Vec<RecordBatch> {
-        self.current_len = 0;
-        std::mem::take(&mut self.current)
+    fn take_split(&mut self) -> ZoneSplit {
+        self.current_split_rows = 0;
+        std::mem::take(&mut self.current_split)
     }
 }
 
@@ -225,15 +297,15 @@ fn row_addr_column(batch: &RecordBatch) -> Result<&UInt64Array> {
 
 /// Pure-CPU statistics computation for one complete zone; runs via `spawn_cpu`.
 ///
-/// `batches` holds the zone's non-empty slices, all from one fragment. Returns
+/// `zone` holds the zone's non-empty slices, all from one fragment. Returns
 /// the zone statistics plus the exact addresses of the zone's null rows.
 fn process_zone<P: ZoneProcessor>(
     processor_factory: &dyn Fn() -> Result<P>,
-    batches: Vec<RecordBatch>,
-) -> Result<(P::ZoneStatistics, RowAddrTreeMap)> {
+    zone: Zone,
+    null_rows: &mut RowAddrTreeMap,
+) -> Result<P::ZoneStatistics> {
     let mut processor = processor_factory()?;
-    let mut null_rows = RowAddrTreeMap::new();
-    for batch in &batches {
+    for batch in &zone {
         let values = batch.column(0);
         processor.process_chunk(values)?;
 
@@ -255,7 +327,7 @@ fn process_zone<P: ZoneProcessor>(
     // Derive the zone bound from the first and last row addresses. Zone length
     // (offset span, last - first + 1) is not the row count: deletions may
     // leave gaps between consecutive offsets.
-    let (Some(first), Some(last)) = (batches.first(), batches.last()) else {
+    let (Some(first), Some(last)) = (zone.first(), zone.last()) else {
         return Err(Error::invalid_input(
             "zone task must contain at least one batch",
         ));
@@ -273,7 +345,20 @@ fn process_zone<P: ZoneProcessor>(
         length: (end - start + 1) as usize,
     };
     let stats = processor.finish_zone(bound)?;
-    Ok((stats, null_rows))
+    Ok(stats)
+}
+
+/// Computes all zones in one CPU-sized split, preserving their input order.
+fn process_zone_split<P: ZoneProcessor>(
+    processor_factory: &dyn Fn() -> Result<P>,
+    split: ZoneSplit,
+) -> Result<(Vec<P::ZoneStatistics>, RowAddrTreeMap)> {
+    let mut statistics = Vec::with_capacity(split.len());
+    let mut null_rows = RowAddrTreeMap::new();
+    for zone in split {
+        statistics.push(process_zone(processor_factory, zone, &mut null_rows)?);
+    }
+    Ok((statistics, null_rows))
 }
 
 /// Shared search helper that loops over zones, records metrics, and
@@ -517,6 +602,36 @@ mod tests {
             assert_eq!(stat.bound.length, 1); // Each zone contains exactly one row
             assert_eq!(stat.sum, values[i]);
         }
+    }
+
+    #[tokio::test]
+    async fn batches_tiny_zones_incrementally_into_row_sized_splits() {
+        let num_rows = TARGET_ROWS_PER_SPLIT * 2 + 17;
+        let input = batch(
+            vec![1; num_rows],
+            vec![0; num_rows],
+            (0..num_rows as u64).collect(),
+        );
+        let mut assembler = ZoneSplitAssembler::new(stream_from_batches(vec![input]), 1);
+
+        let first_split = assembler.next_split().await.unwrap().unwrap();
+        assert_eq!(
+            first_split
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            TARGET_ROWS_PER_SPLIT
+        );
+        assert_eq!(first_split.len(), TARGET_ROWS_PER_SPLIT);
+        assert_eq!(assembler.input_offset, TARGET_ROWS_PER_SPLIT);
+
+        let second_split = assembler.next_split().await.unwrap().unwrap();
+        assert_eq!(second_split.len(), TARGET_ROWS_PER_SPLIT);
+
+        let trailing_split = assembler.next_split().await.unwrap().unwrap();
+        assert_eq!(trailing_split.len(), 17);
+        assert!(assembler.next_split().await.unwrap().is_none());
     }
 
     #[tokio::test]
