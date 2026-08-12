@@ -136,8 +136,27 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 
 type NativeDirectoryPathFn = dyn Fn(&Path) -> PathBuf + Send + Sync;
 
+/// Maps an object-store path to the exact native filesystem path represented by a store.
+///
+/// Constructing this resolver is an explicit capability assertion: native filesystem metadata
+/// for the returned path must be authoritative for the corresponding object-store path.
 #[derive(Clone)]
-struct NativeDirectoryPathResolver(Arc<NativeDirectoryPathFn>);
+pub struct NativeDirectoryPathResolver(Arc<NativeDirectoryPathFn>);
+
+impl NativeDirectoryPathResolver {
+    /// Create a native-directory path resolver.
+    pub fn new(resolver: impl Fn(&Path) -> PathBuf + Send + Sync + 'static) -> Self {
+        Self(Arc::new(resolver))
+    }
+
+    fn resolve(&self, path: &Path) -> PathBuf {
+        self.0(path)
+    }
+
+    fn allocation_ptr(&self) -> *const () {
+        Arc::as_ptr(&self.0) as *const ()
+    }
+}
 
 impl std::fmt::Debug for NativeDirectoryPathResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -241,6 +260,11 @@ pub struct ObjectStoreParams {
     pub block_size: Option<usize>,
     #[deprecated(note = "Implement an ObjectStoreProvider instead")]
     pub object_store: Option<(Arc<DynObjectStore>, Url)>,
+    /// Native-directory capability for the store supplied through [`Self::object_store`].
+    ///
+    /// Leave this unset for direct stores whose object-store paths cannot be authoritatively
+    /// mapped to native filesystem paths.
+    pub native_directory_path_resolver: Option<NativeDirectoryPathResolver>,
     /// Refresh offset for AWS credentials when using the legacy AWS credentials path.
     /// For StorageOptionsAccessor, use `refresh_offset_millis` storage option instead.
     pub s3_credentials_refresh_offset: Duration,
@@ -266,6 +290,7 @@ impl Default for ObjectStoreParams {
         #[allow(deprecated)]
         Self {
             object_store: None,
+            native_directory_path_resolver: None,
             block_size: None,
             s3_credentials_refresh_offset: Duration::from_secs(60),
             #[cfg(feature = "aws")]
@@ -331,6 +356,9 @@ impl std::hash::Hash for ObjectStoreParams {
             Arc::as_ptr(store).hash(state);
             url.hash(state);
         }
+        if let Some(resolver) = &self.native_directory_path_resolver {
+            resolver.allocation_ptr().hash(state);
+        }
         self.s3_credentials_refresh_offset.hash(state);
         #[cfg(feature = "aws")]
         if let Some(aws_credentials) = &self.aws_credentials {
@@ -368,6 +396,14 @@ impl PartialEq for ObjectStoreParams {
                     .object_store
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
+            && self
+                .native_directory_path_resolver
+                .as_ref()
+                .map(NativeDirectoryPathResolver::allocation_ptr)
+                == other
+                    .native_directory_path_resolver
+                    .as_ref()
+                    .map(NativeDirectoryPathResolver::allocation_ptr)
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
             && self
                 .object_store_wrapper
@@ -545,7 +581,7 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
-                native_directory_path_resolver: None,
+                native_directory_path_resolver: params.native_directory_path_resolver.clone(),
             };
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 store.apply_wrapper(wrapper.as_ref());
@@ -647,7 +683,7 @@ impl ObjectStore {
     pub fn native_directory_path(&self, path: &Path) -> Option<PathBuf> {
         self.native_directory_path_resolver
             .as_ref()
-            .map(|resolver| resolver.0(path))
+            .map(|resolver| resolver.resolve(path))
     }
 
     /// Apply an object-store wrapper and update capabilities for the effective store.
@@ -670,7 +706,7 @@ impl ObjectStore {
         mut self,
         resolver: impl Fn(&Path) -> PathBuf + Send + Sync + 'static,
     ) -> Self {
-        self.native_directory_path_resolver = Some(NativeDirectoryPathResolver(Arc::new(resolver)));
+        self.native_directory_path_resolver = Some(NativeDirectoryPathResolver::new(resolver));
         self
     }
 
@@ -1743,6 +1779,32 @@ mod tests {
             store
                 .native_directory_path(&Path::from("tmp/table.lance"))
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_direct_store_carries_explicit_native_directory_path() {
+        let url = Url::parse("file:///tmp/table.lance").unwrap();
+        let params = ObjectStoreParams {
+            object_store: Some((Arc::new(InMemory::new()), url.clone())),
+            native_directory_path_resolver: Some(NativeDirectoryPathResolver::new(|path| {
+                PathBuf::from("/native").join(path.as_ref())
+            })),
+            ..Default::default()
+        };
+
+        let (store, path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            url.as_ref(),
+            &params,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.native_directory_path(&path),
+            Some(PathBuf::from("/native/tmp/table.lance"))
         );
     }
 
