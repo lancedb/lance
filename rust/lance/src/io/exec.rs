@@ -36,6 +36,7 @@ pub use optimizer::get_physical_optimizer;
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
 pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
+pub(crate) use scan::LanceStream;
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;

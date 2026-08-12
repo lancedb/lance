@@ -599,6 +599,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => self.check_compacted_sstables_conflict(
                     other_compacted_sstables,
                     self_compacted_sstables,
@@ -780,6 +781,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => {
                     // CreateIndex of MemWalIndex is compatible with UpdateMemWalState
                     // as they can be rebased on each other
@@ -1515,13 +1517,17 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        // Activation rebases like any other MemWAL state update; its preconditions
+        // are re-checked against the rebased index list when the commit applies.
         if let Operation::UpdateMemWalState {
             compacted_sstables: self_compacted_sstables,
+            ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => {
                     // Two UpdateMemWalState transactions conflict if they're updating
                     // the same shard's compacted SSTable
@@ -1926,6 +1932,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
+            ..
         } = &mut self.transaction.operation
         {
             // Handle FRAG_REUSE_INDEX rebasing
@@ -2194,7 +2201,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_file::version::LanceFileVersion;
     use lance_io::assert_io_eq;
     use uuid::Uuid;
 
@@ -2414,7 +2421,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2557,7 +2564,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -3339,6 +3346,7 @@ mod tests {
             (
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![],
+                    require_index_catchup: false,
                 },
                 NotCompatible,
             ),
@@ -3693,7 +3701,7 @@ mod tests {
                 "moved.lance",
                 vec![0],
                 vec![0],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(1);
@@ -4663,6 +4671,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4671,6 +4680,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4701,6 +4711,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4709,6 +4720,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4740,6 +4752,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4748,6 +4761,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4779,6 +4793,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4787,6 +4802,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4837,6 +4853,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4862,6 +4879,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4908,6 +4926,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );

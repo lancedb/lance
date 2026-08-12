@@ -3154,7 +3154,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -3213,7 +3213,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Include unverified files that cleanup would remove when this is set.
