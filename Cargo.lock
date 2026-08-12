@@ -5084,6 +5084,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "aws-config",
  "aws-credential-types",
  "aws-sdk-dynamodb",
  "blake3",

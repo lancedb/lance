@@ -47,6 +47,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+aws-config.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
 arrow-schema.workspace = true
@@ -74,6 +75,11 @@ harness = false
 [[bench]]
 name = "manifest_intern"
 harness = false
+
+[[bench]]
+name = "external_manifest_finalization"
+harness = false
+required-features = ["dynamodb"]
 
 [lints]
 workspace = true
