@@ -729,7 +729,8 @@ commit outcome.
 **Rolling Upgrade:**
 
 Deploy the reader behavior first: finalized rows are validated by path and size, while any
-stored ETag is treated only as a legacy cache-generation hint and never as content identity.
+stored ETag is ignored. The current object-store ETag is used only as a local cache-generation
+token and never as content identity.
 After all readers have this behavior, deploy writers and finalizers that omit the destination
 ETag from finalized rows. Existing rows need no migration, and legacy readers already accept a
 missing ETag. Reader-first ordering matters because a legacy finalizer can still republish a
@@ -744,7 +745,7 @@ The reader follows a validation and synchronization protocol:
 1. **Query external store**: `GET_EXTERNAL_STORE base_uri, version` → `path`
    - Retrieve the manifest path for the requested version
    - If the path does not end with a UUID, validate the canonical object's size and return its
-     current ETag only as a cache-generation token; a legacy stored ETag mismatch is not corruption
+     current ETag only as a cache-generation token; any legacy stored ETag is ignored without comparison
    - If the path ends with a UUID, synchronization is required
 
 2. **Synchronize to object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`

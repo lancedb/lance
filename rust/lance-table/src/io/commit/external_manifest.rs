@@ -19,7 +19,7 @@ use log::warn;
 use object_store::ObjectMeta;
 use object_store::ObjectStoreExt;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
-use tracing::{debug, info};
+use tracing::info;
 
 use super::{
     MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme, current_manifest_path,
@@ -453,7 +453,10 @@ impl ExternalManifestCommitHandler {
                     path,
                     size: expected_size,
                     naming_scheme,
-                    e_tag: expected_e_tag,
+                    // An external-store ETag is deliberately ignored. It can
+                    // only describe a physical generation observed by an old
+                    // finalizer and has no bearing on the logical manifest.
+                    e_tag: _,
                 } = location;
 
                 let size = match expected_size {
@@ -470,38 +473,10 @@ impl ExternalManifestCommitHandler {
                     None => Some(size),
                 };
 
-                // `expected_e_tag` may come from a legacy external-store row.
-                // It describes the physical object generation observed by one
-                // finalizer, not the logical manifest selected by the external
-                // store. Multiple finalizers can safely overwrite the final
-                // key from that same immutable staging object while receiving
-                // different opaque ETags. Treating that race as corruption
-                // made a healthy manifest unreadable even though its bytes were
-                // unchanged.
-                //
-                // Always return the object store's current token so cache keys
-                // still change after a real replacement such as drop/recreate.
-                // Size remains a correctness check: all copies of the selected
-                // staging object must have the recorded size. Content integrity
-                // must be established by decoding the manifest or by an
-                // explicit content checksum, never by comparing opaque ETags.
-                // This reader behavior is the safe first phase of a rolling
-                // deployment: it accepts legacy rows immediately. Writers can
-                // omit ETags after readers are upgraded; legacy readers already
-                // accept an absent ETag, while legacy finalizers may still
-                // republish a stale one during the mixed-version window.
-                if let Some(expected_e_tag) = expected_e_tag
-                    && e_tag.as_ref() != Some(&expected_e_tag)
-                {
-                    debug!(
-                        version,
-                        path = path.as_ref(),
-                        external_e_tag = ?expected_e_tag,
-                        object_store_e_tag = ?e_tag,
-                        "Ignoring stale external manifest ETag and using the object-store generation"
-                    );
-                }
-
+                // Always return the current object-store token solely for
+                // cache scoping. Size remains the stable cross-store check;
+                // content integrity comes from manifest decoding or an
+                // explicit checksum, never from an opaque ETag comparison.
                 Ok(ManifestLocation {
                     version,
                     path,
@@ -702,7 +677,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                                 version,
                                 path.as_ref(),
                                 size,
-                                e_tag.clone(),
+                                None,
                             )
                             .await;
                         if let Err(e) = res {
@@ -1044,7 +1019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finalized_manifest_uses_object_store_etag() {
+    async fn test_finalized_manifest_ignores_external_store_etag() {
         let external_store = Arc::new(TestExternalManifestStore::new(false));
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),

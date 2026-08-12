@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::datatypes::Int32Type;
 
@@ -11,6 +11,7 @@ use crate::{
     io::{ObjectStoreParams, StorageOptionsAccessor},
 };
 use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
+use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_s3::{Client as S3Client, config::Credentials};
 use futures::future::try_join_all;
 use lance_datagen::{RowCount, array, gen_batch};
@@ -147,6 +148,47 @@ impl DynamoDBCommitTable {
             .unwrap();
 
         Self(name.to_string())
+    }
+
+    async fn item_for_version(&self, expected_version: u64) -> HashMap<String, AttributeValue> {
+        let config = aws_config().await;
+        let client = aws_sdk_dynamodb::Client::new(&config);
+        let expected_version_string = expected_version.to_string();
+        client
+            .scan()
+            .table_name(&self.0)
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap()
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .find(|item| {
+                item.get("version").and_then(|value| value.as_n().ok())
+                    == Some(&expected_version_string)
+            })
+            .unwrap_or_else(|| panic!("DynamoDB row for version {expected_version} not found"))
+    }
+
+    async fn set_legacy_etag(&self, version: u64, e_tag: &str) {
+        let item = self.item_for_version(version).await;
+        let base_uri = item
+            .get("base_uri")
+            .and_then(|value| value.as_s().ok())
+            .expect("DynamoDB row must contain a string base_uri")
+            .clone();
+        let config = aws_config().await;
+        aws_sdk_dynamodb::Client::new(&config)
+            .update_item()
+            .table_name(&self.0)
+            .key("base_uri", AttributeValue::S(base_uri))
+            .key("version", AttributeValue::N(version.to_string()))
+            .update_expression("SET e_tag = :e_tag")
+            .expression_attribute_values(":e_tag", AttributeValue::S(e_tag.to_string()))
+            .send()
+            .await
+            .unwrap();
     }
 
     async fn delete_table(client: aws_sdk_dynamodb::Client, name: &str) {
@@ -311,6 +353,15 @@ async fn test_ddb_open_iops() {
     assert_io_eq!(io_stats, write_iops, 4);
     assert_io_eq!(io_stats, read_iops, 2);
 
+    let committed_row = ddb_table.item_for_version(1).await;
+    assert!(
+        !committed_row.contains_key("e_tag"),
+        "DynamoDB must not persist a physical object generation"
+    );
+    // Simulate a row written by an older Lance version. New readers must
+    // ignore this value and obtain their cache generation from S3.
+    ddb_table.set_legacy_etag(1, "legacy-stale-etag").await;
+
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_read_params(ReadParams {
             store_options: Some(store_params.clone()),
@@ -319,6 +370,10 @@ async fn test_ddb_open_iops() {
         .load()
         .await
         .unwrap();
+    assert_ne!(
+        dataset.manifest_location().e_tag.as_deref(),
+        Some("legacy-stale-etag")
+    );
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Open dataset can be read with 2 IOPs: HEAD verifies that the
     // finalized path returned by DynamoDB still exists, then the manifest
