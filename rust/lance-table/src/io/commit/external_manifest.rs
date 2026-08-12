@@ -147,22 +147,14 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
 
         // Step 2: Copy staging to final path
         let final_path = naming_scheme.manifest_path(base_path, version);
-        let copied = match copy_size_aware(object_store, staging_path, &final_path, size).await {
-            Ok(_) => true,
-            Err(ObjectStoreError::NotFound { .. }) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if copied {
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
-        }
-
-        let (final_size, final_e_tag) =
-            observe_final_manifest(object_store, &final_path, version, size, copied).await?;
+        let final_e_tag =
+            copy_or_verify_final_manifest(object_store, staging_path, &final_path, version, size)
+                .await?;
 
         let location = ManifestLocation {
             version,
             path: final_path.clone(),
-            size: Some(final_size),
+            size: Some(size),
             naming_scheme,
             e_tag: final_e_tag,
         };
@@ -173,26 +165,14 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         // linearized the logical commit by selecting exactly one immutable
         // staging path in step 1. Every correct finalizer therefore copies the
         // same bytes to the deterministic final path. A repeated overwrite may
-        // still create a new physical object generation (and, for S3 Express,
-        // a new opaque random ETag), so publishing an ETag would let the DDB
-        // update race independently of the content it indexes:
-        //
-        //   A: COPY -> HEAD(E1)             -> publish E1
-        //   B:          COPY -> HEAD(E2) -> publish E2
-        //
-        // The final bytes are identical in either order, but DDB can retain E1
-        // while object storage exposes E2. Omitting the physical generation
-        // makes finalization idempotent: every finalizer publishes the same
-        // `(path, size, no-etag)` tuple. Readers obtain the current ETag from
-        // object storage and use it only to scope caches.
+        // still create a new physical object generation, so observing and
+        // publishing a destination ETag would let that metadata race
+        // independently of the content it indexes. The successful copy path
+        // therefore performs no destination HEAD, and every finalizer publishes
+        // the same `(path, size, no-etag)` tuple. Readers obtain the current ETag
+        // from object storage only when they need it to scope caches.
         let published = self
-            .put_if_exists(
-                base_path.as_ref(),
-                version,
-                final_path.as_ref(),
-                final_size,
-                None,
-            )
+            .put_if_exists(base_path.as_ref(), version, final_path.as_ref(), size, None)
             .await;
 
         if let Err(error) = published {
@@ -317,43 +297,44 @@ async fn copy_size_aware(
     }
 }
 
-/// Observe metadata for a canonical manifest after a finalization attempt.
+/// Copy the selected staging manifest to its canonical path.
 ///
-/// A successful whole-object copy already proves that the selected immutable
-/// bytes were materialized at `final_path`. The following HEAD is useful for a
-/// defensive size check and for obtaining a cache-scoping generation, but a
-/// transient HEAD failure cannot undo that completed copy. In that case the
-/// caller continues with the selected size and no cache generation.
+/// A successful copy is the object store's acknowledgement that the known
+/// immutable bytes were materialized. A follow-up HEAD would not strengthen
+/// that guarantee, cannot establish content integrity, and adds a read I/O to
+/// every commit. It would only provide an ETag that another identical helper
+/// can immediately invalidate, so the successful fast path deliberately
+/// returns no cache-generation token.
 ///
-/// When `copied` is false, the source disappeared before this helper could copy
-/// it. Another helper is only *suspected* to have completed finalization, so a
-/// successful HEAD and exact size match are required before accepting the
-/// canonical object.
-async fn observe_final_manifest(
+/// `NotFound` is different: the selected staging object may have disappeared
+/// because another helper finalized and deleted it, or because the commit is
+/// unrecoverable. Only in that ambiguous recovery path do we HEAD the canonical
+/// object and require its size to match the external-store-selected staging
+/// manifest. The ETag obtained by this required HEAD can be reused as a cache
+/// token.
+async fn copy_or_verify_final_manifest(
     object_store: &dyn OSObjectStore,
+    staging_path: &Path,
     final_path: &Path,
     version: u64,
     selected_size: u64,
-    copied: bool,
-) -> Result<(u64, Option<String>)> {
-    match object_store.head(final_path).await {
-        Ok(final_meta) if final_meta.size == selected_size => {
-            Ok((final_meta.size, final_meta.e_tag))
+) -> Result<Option<String>> {
+    match copy_size_aware(object_store, staging_path, final_path, selected_size).await {
+        Ok(()) => {
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
+            Ok(None)
         }
-        Ok(final_meta) => Err(Error::corrupt_file(
-            final_path.clone(),
-            format!(
-                "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
-                version, selected_size, final_meta.size
-            ),
-        )),
-        Err(error) if copied => {
-            warn!(
-                "Final manifest '{}' was copied successfully, but its metadata could not be read; continuing without a cache generation: {}",
-                final_path, error
-            );
-            Ok((selected_size, None))
-        }
+        Err(ObjectStoreError::NotFound { .. }) => match object_store.head(final_path).await {
+            Ok(final_meta) if final_meta.size == selected_size => Ok(final_meta.e_tag),
+            Ok(final_meta) => Err(Error::corrupt_file(
+                final_path.clone(),
+                format!(
+                    "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
+                    version, selected_size, final_meta.size
+                ),
+            )),
+            Err(error) => Err(error.into()),
+        },
         Err(error) => Err(error.into()),
     }
 }
@@ -514,23 +495,19 @@ impl ExternalManifestCommitHandler {
         // step 1: copy the manifest to the final location
         let final_manifest_path = naming_scheme.manifest_path(base_path, version);
 
-        let copied =
-            match copy_size_aware(store, staging_manifest_path, &final_manifest_path, size).await {
-                Ok(_) => true,
-                Err(ObjectStoreError::NotFound { .. }) => false, // Another writer beat us to it.
-                Err(e) => return Err(e.into()),
-            };
-        if copied {
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_manifest_path.as_ref());
-        }
-
-        let (final_size, final_e_tag) =
-            observe_final_manifest(store, &final_manifest_path, version, size, copied).await?;
+        let final_e_tag = copy_or_verify_final_manifest(
+            store,
+            staging_manifest_path,
+            &final_manifest_path,
+            version,
+            size,
+        )
+        .await?;
 
         let location = ManifestLocation {
             version,
             path: final_manifest_path,
-            size: Some(final_size),
+            size: Some(size),
             naming_scheme,
             e_tag: final_e_tag,
         };
@@ -547,7 +524,7 @@ impl ExternalManifestCommitHandler {
                 base_path.as_ref(),
                 version,
                 location.path.as_ref(),
-                final_size,
+                size,
                 None,
             )
             .await;
@@ -1218,10 +1195,10 @@ mod tests {
 
         // The writer created generation E1. While its final index update is
         // paused, a reader observes the DDB-selected staging path and performs
-        // the same immutable copy, producing generation E2. Each helper returns
-        // the generation it observed for local cache scoping, but neither
-        // publishes that token. Both copies have exactly the same bytes; only
-        // their physical object generations differ.
+        // the same immutable copy, producing generation E2. Neither successful
+        // copy performs a destination HEAD or publishes a generation token.
+        // Both copies have exactly the same bytes; only their physical object
+        // generations differ.
         let reader_location = handler
             .resolve_version_location(&base_path, version, object_store.inner.as_ref())
             .await
@@ -1248,8 +1225,8 @@ mod tests {
             first_generation.e_tag, final_meta.e_tag,
             "the deterministic race must create a new physical generation"
         );
-        assert_eq!(writer_location.e_tag, first_generation.e_tag);
-        assert_eq!(reader_location.e_tag, final_meta.e_tag);
+        assert_eq!(writer_location.e_tag, None);
+        assert_eq!(reader_location.e_tag, None);
         assert_eq!(indexed.path, final_path);
         assert_eq!(indexed.size, Some(final_meta.size));
         assert_eq!(
@@ -1303,7 +1280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_successful_copy_commits_when_cache_head_fails() {
+    async fn test_successful_copy_skips_destination_head() {
         let external_store = Arc::new(TestExternalManifestStore::new(false));
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
@@ -1346,15 +1323,15 @@ mod tests {
                 None,
             )
             .await
-            .expect("a cache-metadata failure must not overturn a successful canonical copy");
+            .expect("a successful canonical copy must not require a destination HEAD");
         assert_eq!(committed.path, final_path);
         assert_eq!(
             committed.e_tag, None,
-            "the caller must not invent a cache generation when HEAD failed"
+            "the caller must not perform a HEAD only to obtain a cache generation"
         );
         assert!(
-            !fail_final_head.load(Ordering::SeqCst),
-            "the one-shot final HEAD failure must be consumed"
+            fail_final_head.load(Ordering::SeqCst),
+            "the destination HEAD trap must remain untouched after a successful copy"
         );
 
         let indexed = external_store
@@ -1363,11 +1340,86 @@ mod tests {
             .expect("the external index must advance after the canonical copy");
         assert_eq!(indexed.path, final_path);
         assert_eq!(indexed.e_tag, None);
+        fail_final_head.store(false, Ordering::SeqCst);
         object_store
             .inner
             .head(&final_path)
             .await
             .expect("the canonical copy must remain readable");
+    }
+
+    #[tokio::test]
+    async fn test_missing_staging_verifies_existing_final_manifest() {
+        let object_store = ObjectStore::memory();
+        let staging_path = Path::from("dataset/_versions/1.manifest-missing");
+        let final_path = Path::from("dataset/_versions/1.manifest");
+        let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
+        object_store
+            .inner
+            .put(&final_path, manifest_bytes.clone().into())
+            .await
+            .unwrap();
+        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+
+        let recovered_e_tag = copy_or_verify_final_manifest(
+            object_store.inner.as_ref(),
+            &staging_path,
+            &final_path,
+            1,
+            manifest_bytes.len() as u64,
+        )
+        .await
+        .expect("an existing canonical manifest should prove another helper finalized it");
+
+        assert_eq!(recovered_e_tag, final_meta.e_tag);
+    }
+
+    #[tokio::test]
+    async fn test_missing_staging_rejects_missing_final_manifest() {
+        let object_store = ObjectStore::memory();
+        let staging_path = Path::from("dataset/_versions/1.manifest-missing");
+        let final_path = Path::from("dataset/_versions/1.manifest");
+
+        let error = copy_or_verify_final_manifest(
+            object_store.inner.as_ref(),
+            &staging_path,
+            &final_path,
+            1,
+            42,
+        )
+        .await
+        .expect_err("missing staging and canonical objects cannot establish a commit");
+
+        assert!(matches!(error, Error::NotFound { .. }), "{error:?}");
+        assert!(error.to_string().contains(final_path.as_ref()), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_missing_staging_rejects_wrong_final_size() {
+        let object_store = ObjectStore::memory();
+        let staging_path = Path::from("dataset/_versions/1.manifest-missing");
+        let final_path = Path::from("dataset/_versions/1.manifest");
+        object_store
+            .inner
+            .put(&final_path, Bytes::from_static(b"wrong size").into())
+            .await
+            .unwrap();
+
+        let error = copy_or_verify_final_manifest(
+            object_store.inner.as_ref(),
+            &staging_path,
+            &final_path,
+            1,
+            42,
+        )
+        .await
+        .expect_err("a same-path object with the wrong size is not the selected manifest");
+
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("Manifest size mismatch"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

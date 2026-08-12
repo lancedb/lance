@@ -346,12 +346,12 @@ async fn test_ddb_open_iops() {
     //    * write staged file
     //    * copy to final file
     //    * delete staged file
-    // Commit: 2 read IOPs: list versions before creating the dataset, then
-    // HEAD the final manifest to verify its size and obtain a cache-scoping
-    // generation. That generation is not persisted as DDB commit identity.
+    // Commit: 1 read IOP to list versions before creating the dataset. A
+    // successful manifest copy is sufficient proof of materialization, so the
+    // finalizer does not HEAD the destination for cache metadata.
     let io_stats = committed_ds.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 4);
-    assert_io_eq!(io_stats, read_iops, 2);
+    assert_io_eq!(io_stats, read_iops, 1);
 
     let committed_row = ddb_table.item_for_version(1).await;
     assert!(
@@ -393,12 +393,11 @@ async fn test_ddb_open_iops() {
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);
-    // Append reads once to list versions and HEADs the final manifest once for
-    // size verification and a local cache-scoping generation. DDB stores only
-    // the stable final path and size.
+    // Append reads once to list versions. The successful copy reuses the known
+    // staging size, while DDB stores only the stable final path and size.
     // TODO: we can reduce this by implementing a specialized CommitHandler::list_manifest_locations()
     // for the DDB commit handler.
-    assert_io_eq!(io_stats, read_iops, 2);
+    assert_io_eq!(io_stats, read_iops, 1);
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();
