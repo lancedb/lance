@@ -316,6 +316,13 @@ impl Writer {
                 field.name
             )));
         }
+        if field.logical_type.is_struct() && arr.null_count() > 0 {
+            return Err(Error::invalid_input(format!(
+                "The struct field `{}` contains {} null value(s), but Lance file version 2.0 does not encode struct validity; use file version 2.1 or later",
+                field.name,
+                arr.null_count()
+            )));
+        }
 
         for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
             Self::verify_field_nullability(child_arr, child_field)?;

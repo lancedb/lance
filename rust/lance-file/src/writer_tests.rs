@@ -14,8 +14,10 @@ mod tests {
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::types::Float64Type;
     use arrow_array::{
-        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchReader, StringArray, UInt64Array,
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchReader, StringArray, StructArray,
+        UInt64Array,
     };
+    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
@@ -569,6 +571,48 @@ mod tests {
             err.contains("non-null"),
             "expected nullability error, got: {err}"
         );
+    }
+
+    /// V2.0 has no encoding for struct validity, so accepting a null struct
+    /// would silently turn it into a valid struct when the file is read.
+    #[tokio::test]
+    async fn test_v2_0_rejects_null_structs() {
+        let struct_fields: arrow_schema::Fields = vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]
+        .into();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(struct_fields.clone()),
+            true,
+        )]));
+        let structs = StructArray::new(
+            struct_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![10, 99, 30])),
+                Arc::new(Int32Array::from(vec![11, 98, 31])),
+            ],
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(structs)]).unwrap();
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            ConcreteFileVersion::V2_0,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let error = writer.write_batch(&batch).await.unwrap_err();
+
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("struct validity"), "{message}");
+        assert!(message.contains("2.0"), "{message}");
+        assert!(message.contains("1 null value"), "{message}");
     }
 
     /// The blocking read path applies the same projection-length validation as
