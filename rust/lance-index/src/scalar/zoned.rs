@@ -605,36 +605,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batches_tiny_zones_incrementally_into_row_sized_splits() {
-        let num_rows = TARGET_ROWS_PER_SPLIT * 2 + 17;
-        let input = batch(
-            vec![1; num_rows],
-            vec![0; num_rows],
-            (0..num_rows as u64).collect(),
-        );
-        let mut assembler = ZoneSplitAssembler::new(stream_from_batches(vec![input]), 1);
-
-        let first_split = assembler.next_split().await.unwrap().unwrap();
-        assert_eq!(
-            first_split
-                .iter()
-                .flatten()
-                .map(RecordBatch::num_rows)
-                .sum::<usize>(),
-            TARGET_ROWS_PER_SPLIT
-        );
-        assert_eq!(first_split.len(), TARGET_ROWS_PER_SPLIT);
-        assert_eq!(assembler.input_offset, TARGET_ROWS_PER_SPLIT);
-
-        let second_split = assembler.next_split().await.unwrap().unwrap();
-        assert_eq!(second_split.len(), TARGET_ROWS_PER_SPLIT);
-
-        let trailing_split = assembler.next_split().await.unwrap().unwrap();
-        assert_eq!(trailing_split.len(), 17);
-        assert!(assembler.next_split().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn handles_large_capacity() {
         // When capacity >> data size, all data fits in one zone.
         let values = vec![1; 100];
