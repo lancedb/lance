@@ -33,7 +33,11 @@ impl ObjectStoreProvider for FileStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
-        })
+            native_directory_path_resolver: None,
+        }
+        .with_native_directory_path_resolver(|path| {
+            std::path::PathBuf::from(crate::local::to_local_path(path))
+        }))
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
@@ -104,6 +108,33 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_native_directory_path_capability() {
+        let provider = FileStoreProvider;
+        let path = Path::from("tmp/table.lance");
+        let schemes = [
+            "file",
+            "file-object-store",
+            #[cfg(target_os = "linux")]
+            "file+uring",
+        ];
+
+        for scheme in schemes {
+            let store = provider
+                .new_store(
+                    Url::parse(&format!("{scheme}:///")).unwrap(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store.native_directory_path(&path),
+                Some(std::path::PathBuf::from(crate::local::to_local_path(&path))),
+                "scheme: {scheme}"
+            );
+        }
     }
 
     #[test]

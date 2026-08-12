@@ -271,6 +271,9 @@ impl ObjectStoreRegistry {
 
         if let Some(wrapper) = &params.object_store_wrapper {
             store.inner = wrapper.wrap(&cache_path, store.inner);
+            if !wrapper.preserves_native_directory_path() {
+                store.native_directory_path_resolver = None;
+            }
         }
 
         // Always wrap with IO tracking
@@ -377,8 +380,10 @@ impl ObjectStoreRegistry {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     use super::*;
+    use object_store::memory::InMemory;
 
     #[derive(Debug)]
     struct DummyProvider;
@@ -391,6 +396,39 @@ mod tests {
             _params: &ObjectStoreParams,
         ) -> Result<ObjectStore> {
             unreachable!("This test doesn't create stores")
+        }
+    }
+
+    #[derive(Debug)]
+    struct NativeDirectoryCapabilityProvider {
+        has_capability: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for NativeDirectoryCapabilityProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            _params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            let store = ObjectStore::new(
+                Arc::new(InMemory::new()),
+                base_path,
+                None,
+                None,
+                false,
+                true,
+                1,
+                0,
+                None,
+            );
+            if self.has_capability {
+                Ok(store.with_native_directory_path_resolver(|path| {
+                    PathBuf::from("/native").join(path.as_ref())
+                }))
+            } else {
+                Ok(store)
+            }
         }
     }
 
@@ -432,6 +470,45 @@ mod tests {
         let store_scoped = registry.get_store(url.clone(), &with_scoped).await.unwrap();
         let store_plain = registry.get_store(url, &without_scoped).await.unwrap();
         assert!(Arc::ptr_eq(&store_scoped, &store_plain));
+    }
+
+    #[tokio::test]
+    async fn test_cached_store_retains_native_directory_capability() {
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert(
+            "capability",
+            Arc::new(NativeDirectoryCapabilityProvider {
+                has_capability: true,
+            }),
+        );
+        let url = Url::parse("capability://test").unwrap();
+        let path = Path::from("table.lance");
+
+        let first = registry
+            .get_store(url.clone(), &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            first.native_directory_path(&path),
+            Some(PathBuf::from("/native/table.lance"))
+        );
+
+        registry.insert(
+            "capability",
+            Arc::new(NativeDirectoryCapabilityProvider {
+                has_capability: false,
+            }),
+        );
+        let cached = registry
+            .get_store(url, &ObjectStoreParams::default())
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &cached));
+        assert_eq!(
+            cached.native_directory_path(&path),
+            Some(PathBuf::from("/native/table.lance"))
+        );
     }
 
     #[test]

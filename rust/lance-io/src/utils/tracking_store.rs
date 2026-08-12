@@ -183,6 +183,10 @@ impl WrappingObjectStore for IOTracker {
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(IoTrackingStore::new(target, self.stats.clone()))
     }
+
+    fn preserves_native_directory_path(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Default, Clone)]

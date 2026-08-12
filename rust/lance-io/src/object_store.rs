@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -133,6 +134,17 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
     }
 }
 
+type NativeDirectoryPathFn = dyn Fn(&Path) -> PathBuf + Send + Sync;
+
+#[derive(Clone)]
+struct NativeDirectoryPathResolver(Arc<NativeDirectoryPathFn>);
+
+impl std::fmt::Debug for NativeDirectoryPathResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeDirectoryPathResolver")
+    }
+}
+
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Debug, Clone)]
 pub struct ObjectStore {
@@ -156,6 +168,9 @@ pub struct ObjectStore {
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
+    /// Maps object-store paths to exact native filesystem paths when this resolved store
+    /// explicitly supports native directory metadata.
+    native_directory_path_resolver: Option<NativeDirectoryPathResolver>,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -180,6 +195,14 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// The store_prefix is a string which uniquely identifies the object
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+
+    /// Whether this wrapper preserves the exact native filesystem path semantics of the
+    /// wrapped store.
+    ///
+    /// The default is `false` because a wrapper may hide, rewrite, or synthesize paths.
+    fn preserves_native_directory_path(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +225,12 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
         self.wrappers
             .iter()
             .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
+    }
+
+    fn preserves_native_directory_path(&self) -> bool {
+        self.wrappers
+            .iter()
+            .all(|wrapper| wrapper.preserves_native_directory_path())
     }
 }
 
@@ -522,6 +551,7 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
+                native_directory_path_resolver: None,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -610,6 +640,29 @@ impl ObjectStore {
 
     pub fn scheme(&self) -> &str {
         &self.scheme
+    }
+
+    /// Map an object-store path to the exact native filesystem path represented by this store.
+    ///
+    /// This returns `None` unless the resolved provider explicitly opted into native directory
+    /// semantics and every configured wrapper declared that it preserves those semantics.
+    pub fn native_directory_path(&self, path: &Path) -> Option<PathBuf> {
+        self.native_directory_path_resolver
+            .as_ref()
+            .map(|resolver| resolver.0(path))
+    }
+
+    /// Opt this resolved store into exact native filesystem directory inspection.
+    ///
+    /// The resolver must return a path whose native metadata is authoritative for the same
+    /// object-store path. Providers should only opt in when that equivalence holds for every
+    /// path served by the store.
+    pub fn with_native_directory_path_resolver(
+        mut self,
+        resolver: impl Fn(&Path) -> PathBuf + Send + Sync + 'static,
+    ) -> Self {
+        self.native_directory_path_resolver = Some(NativeDirectoryPathResolver(Arc::new(resolver)));
+        self
     }
 
     pub fn block_size(&self) -> usize {
@@ -1226,6 +1279,7 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            native_directory_path_resolver: None,
         }
     }
 }
@@ -1631,6 +1685,84 @@ mod tests {
     impl TestWrapper {
         fn called(&self) -> bool {
             self.called.load(Ordering::Relaxed)
+        }
+    }
+
+    #[derive(Debug)]
+    struct PassthroughWrapper;
+
+    impl WrappingObjectStore for PassthroughWrapper {
+        fn wrap(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn OSObjectStore>,
+        ) -> Arc<dyn OSObjectStore> {
+            original
+        }
+    }
+
+    #[derive(Debug)]
+    struct NativeDirectoryPreservingWrapper;
+
+    impl WrappingObjectStore for NativeDirectoryPreservingWrapper {
+        fn wrap(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn OSObjectStore>,
+        ) -> Arc<dyn OSObjectStore> {
+            original
+        }
+
+        fn preserves_native_directory_path(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_direct_store_does_not_infer_native_directory_path_from_scheme() {
+        let store = ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("file:///").unwrap(),
+            None,
+            None,
+            false,
+            false,
+            DEFAULT_LOCAL_IO_PARALLELISM,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        );
+
+        assert!(
+            store
+                .native_directory_path(&Path::from("tmp/table.lance"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wrapper_must_preserve_native_directory_path() {
+        let path = TempStdDir::default();
+        let uri = Url::from_directory_path(&path).unwrap();
+        let wrappers: [(Arc<dyn WrappingObjectStore>, bool); 2] = [
+            (Arc::new(PassthroughWrapper), false),
+            (Arc::new(NativeDirectoryPreservingWrapper), true),
+        ];
+
+        for (wrapper, should_preserve) in wrappers {
+            let params = ObjectStoreParams {
+                object_store_wrapper: Some(wrapper),
+                ..Default::default()
+            };
+            let (store, object_path) = ObjectStore::from_uri_and_params(
+                Arc::new(ObjectStoreRegistry::default()),
+                uri.as_ref(),
+                &params,
+            )
+            .await
+            .unwrap();
+
+            let expected = should_preserve.then(|| path.to_path_buf());
+            assert_eq!(store.native_directory_path(&object_path), expected);
         }
     }
 
