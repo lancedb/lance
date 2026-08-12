@@ -110,9 +110,9 @@ impl BatchReaderChunker {
     }
 }
 
-struct VariableBatchReaderChunker {
+struct VariableBatchReaderChunker<I> {
     chunker: BatchReaderChunker,
-    output_sizes: VecDeque<usize>,
+    output_sizes: I,
     is_done: bool,
 }
 
@@ -200,6 +200,7 @@ pub fn chunk_stream(
 ///
 /// The requested sizes must describe the complete input. An error is returned if
 /// the input ends early, contains additional rows, or a requested size is zero.
+/// Sizes are consumed lazily as chunks are requested.
 ///
 /// # Example
 ///
@@ -211,13 +212,17 @@ pub fn chunk_stream(
 /// # drop(chunks);
 /// # }
 /// ```
-pub fn chunk_stream_with_sizes(
+pub fn chunk_stream_with_sizes<I>(
     stream: SendableRecordBatchStream,
-    output_sizes: Vec<usize>,
-) -> Pin<Box<dyn Stream<Item = Result<Vec<RecordBatch>>> + Send>> {
+    output_sizes: I,
+) -> Pin<Box<dyn Stream<Item = Result<Vec<RecordBatch>>> + Send>>
+where
+    I: IntoIterator<Item = usize>,
+    I::IntoIter: Send + 'static,
+{
     let state = VariableBatchReaderChunker {
         chunker: BatchReaderChunker::new(stream, 1),
-        output_sizes: output_sizes.into(),
+        output_sizes: output_sizes.into_iter(),
         is_done: false,
     };
     futures::stream::unfold(state, |mut state| async move {
@@ -225,7 +230,7 @@ pub fn chunk_stream_with_sizes(
             return None;
         }
 
-        let Some(output_size) = state.output_sizes.pop_front() else {
+        let Some(output_size) = state.output_sizes.next() else {
             return match state.chunker.next_sized(1).await {
                 None => None,
                 Some(Ok(_)) => {
@@ -412,7 +417,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use arrow::datatypes::{Int32Type, Int64Type};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -461,10 +469,20 @@ mod tests {
         assert_eq!(chunked[2].len(), 1);
         assert_eq!(chunked[2][0].num_rows(), 8);
 
-        let chunked = super::chunk_stream_with_sizes(make_stream(), vec![9, 10, 9])
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let sizes_consumed = Arc::new(AtomicUsize::new(0));
+        let requested_sizes = [9, 10, 9].into_iter().inspect({
+            let sizes_consumed = sizes_consumed.clone();
+            move |_| {
+                sizes_consumed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let mut chunked = super::chunk_stream_with_sizes(make_stream(), requested_sizes);
+        assert_eq!(sizes_consumed.load(Ordering::SeqCst), 0);
+        let first_chunk = chunked.next().await.unwrap().unwrap();
+        assert_eq!(sizes_consumed.load(Ordering::SeqCst), 1);
+        let mut chunked = chunked.try_collect::<Vec<_>>().await.unwrap();
+        chunked.insert(0, first_chunk);
+        assert_eq!(sizes_consumed.load(Ordering::SeqCst), 3);
         assert_eq!(
             chunked
                 .iter()

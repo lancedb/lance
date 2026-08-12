@@ -178,20 +178,20 @@ pub async fn write_fragments_direct(
                 "max_rows_per_group must be greater than zero when file row counts are specified",
             ));
         }
-        let mut batch_row_counts = Vec::new();
-        for &file_rows in file_row_counts {
-            if file_rows == 0 {
-                return Err(Error::invalid_input(
-                    "File row counts must be greater than zero",
-                ));
-            }
-            let mut rows_remaining = file_rows;
-            while rows_remaining > 0 {
-                let batch_rows = rows_remaining.min(params.max_rows_per_group);
-                batch_row_counts.push(batch_rows);
-                rows_remaining -= batch_rows;
-            }
+        if file_row_counts.contains(&0) {
+            return Err(Error::invalid_input(
+                "File row counts must be greater than zero",
+            ));
         }
+        let max_rows_per_group = params.max_rows_per_group;
+        let batch_row_counts = file_row_counts
+            .clone()
+            .into_iter()
+            .flat_map(move |file_rows| {
+                (0..file_rows)
+                    .step_by(max_rows_per_group)
+                    .map(move |offset| (file_rows - offset).min(max_rows_per_group))
+            });
         chunk_stream_with_sizes(data, batch_row_counts)
     } else {
         match version {
