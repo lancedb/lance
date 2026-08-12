@@ -4628,9 +4628,12 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
 }
 
 fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
-    let exact = scores.map(f64::from).sum::<f64>();
-    let rounded = exact as f32;
-    if f64::from(rounded) < exact {
+    let (num_scores, exact) = scores.fold((0, 0.0_f64), |(count, sum), score| {
+        (count + 1, sum + f64::from(score))
+    });
+    let widened = exact * score_sum_upper_bound_factor(num_scores);
+    let rounded = widened as f32;
+    if f64::from(rounded) < widened {
         next_up_f32(rounded)
     } else {
         rounded
@@ -4688,6 +4691,35 @@ mod tests {
             },
         },
     };
+
+    #[test]
+    fn conservative_score_sum_covers_query_order_f32_rounding() {
+        let values = [
+            f32::from_bits(0x3e65_15bd),
+            f32::from_bits(0x34b4_3b11),
+            f32::from_bits(0x35e9_48ed),
+            f32::from_bits(0x3203_3773),
+        ];
+        let exact_score = values
+            .into_iter()
+            .fold(0.0_f32, |score, value| score + value);
+
+        assert_eq!(exact_score.to_bits(), 0x3e65_164a);
+        assert!(conservative_score_sum(values.into_iter()) >= exact_score);
+
+        let mut reordered = [
+            f32::from_bits(0x3c87_b63e),
+            f32::from_bits(0x3d28_d10b),
+            f32::from_bits(0x3cc4_29c0),
+        ];
+        let bound = conservative_score_sum(reordered.into_iter());
+        reordered.sort_by(|left, right| right.total_cmp(left));
+        let reordered_score = reordered
+            .into_iter()
+            .fold(0.0_f32, |score, value| score + value);
+        assert_eq!(reordered_score.to_bits(), 0x3da7_6086);
+        assert!(bound >= reordered_score);
+    }
 
     #[test]
     fn test_maxscore_prefix_bound_covers_f32_summation_rounding() {
