@@ -26,9 +26,12 @@ use lance_linalg::distance::DistanceType;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
-use super::nodes::VectorSearchNode;
+use lance_index::scalar::inverted::DocumentGranularity;
+
+use super::fts::{self, FtsIndexInfo};
+use super::nodes::{TakeSettings, VectorSearchNode};
 use crate::Result;
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, Scanner};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 /// Everything known about the vector index covering one column.
@@ -65,13 +68,21 @@ pub struct ScanPlanningContext {
     /// derivations below be honest about doing no I/O.
     fragments: Arc<Vec<Fragment>>,
     vector: HashMap<String, VectorIndexInfo>,
+    fts: HashMap<(String, DocumentGranularity), FtsIndexInfo>,
+    /// `Scanner::fast_search`: skip rows no index covers. A rule needs it to know whether to
+    /// build the flat branch at all, and it is not derivable from the plan.
+    fast_search: bool,
+    /// Read settings for any take a rule introduces, so a rewrite cannot lose the scanner's
+    /// fragment restriction.
+    take_settings: TakeSettings,
 }
 
 impl ScanPlanningContext {
     /// Walk the unoptimized plan for what it will need, then fetch all of it.
     ///
     /// This is the only `async fn` in stages 2 through 4 that is allowed to do I/O.
-    pub async fn collect(dataset: Arc<Dataset>, plan: &LogicalPlan) -> Result<Self> {
+    pub async fn collect(scanner: &Scanner, plan: &LogicalPlan) -> Result<Self> {
+        let dataset = scanner.dataset.clone();
         let mut searched_columns = Vec::new();
         plan.apply(|node| {
             if let LogicalPlan::Extension(extension) = node
@@ -95,14 +106,60 @@ impl ScanPlanningContext {
             }
         }
 
+        let fragments = scanner
+            .fragments
+            .clone()
+            .map(Arc::new)
+            .unwrap_or_else(|| dataset.fragments().clone());
+        let target_fragments =
+            RoaringBitmap::from_iter(fragments.iter().map(|fragment| fragment.id as u32));
+        let fts = fts::prefetch(&dataset, &fts::collect_requests(plan), &target_fragments).await?;
+
         Ok(Self {
-            fragments: dataset.fragments().clone(),
+            fragments,
             vector,
+            fts,
+            fast_search: scanner.fast_search,
+            take_settings: take_settings(scanner),
         })
     }
 
     pub fn vector_index(&self, column: &str) -> Option<&VectorIndexInfo> {
         self.vector.get(column)
+    }
+
+    pub fn fast_search(&self) -> bool {
+        self.fast_search
+    }
+
+    pub fn take_settings(&self) -> &TakeSettings {
+        &self.take_settings
+    }
+
+    pub fn fts_index(
+        &self,
+        column: &str,
+        granularity: DocumentGranularity,
+    ) -> Option<&FtsIndexInfo> {
+        self.fts.get(&(column.to_string(), granularity))
+    }
+
+    /// Fragments the FTS index on `column` does not cover — the same synchronous bitmap
+    /// arithmetic the vector path uses, over the same manifest fragment list.
+    pub fn fts_unindexed_fragments(
+        &self,
+        column: &str,
+        granularity: DocumentGranularity,
+    ) -> Option<Vec<Fragment>> {
+        fts::partition_fragments(self.fts_index(column, granularity)?, &self.fragments, false)
+    }
+
+    pub fn fts_indexed_fragments(
+        &self,
+        column: &str,
+        granularity: DocumentGranularity,
+    ) -> Option<Vec<Fragment>> {
+        fts::partition_fragments(self.fts_index(column, granularity)?, &self.fragments, true)
     }
 
     /// Fragments the given vector index does not cover — synchronous, because it is just the
@@ -158,4 +215,13 @@ async fn load_vector_index(
         segments: dataset.load_indices_by_name(&index.name).await?.to_vec(),
         metric,
     }))
+}
+
+/// Read settings a take must honor, lifted off the `Scanner`. `None` fragments means "all of
+/// them", which is a different plan from an explicit list of every fragment.
+pub fn take_settings(scanner: &Scanner) -> TakeSettings {
+    TakeSettings {
+        fragments: scanner.fragments.clone().map(Arc::new),
+        batch_size: scanner.batch_size.map(|size| size as u32),
+    }
 }

@@ -22,12 +22,15 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::{col, lit};
 use datafusion_physical_expr::PhysicalSortExpr;
-use lance_core::{ROW_ID, datatypes::Projection};
+use lance_core::ROW_ID;
 use lance_index::vector::DIST_COL;
+use lance_linalg::distance::DistanceType;
 
 use lance_table::format::IndexMetadata;
 
-use super::nodes::{LanceTakeNode, PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
+use super::nodes::{
+    LanceTakeNode, PrefilterSourceKind, VectorAccessPath, VectorRerankNode, VectorSearchNode,
+};
 use crate::Result;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::knn::{KnnBatchParams, new_knn_exec};
@@ -46,6 +49,11 @@ impl ExtensionPlanner for LanceExtensionPlanner {
         physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session_state: &SessionState,
     ) -> datafusion::common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        // FTS owns its own nodes, rules, and lowering; ask that module first.
+        if let Some(plan) = super::fts::plan_extension(node, physical_inputs) {
+            return Ok(Some(plan?));
+        }
+
         let input = physical_inputs.first().cloned().ok_or_else(|| {
             datafusion::common::DataFusionError::Internal(
                 "Lance logical nodes always have exactly one input".into(),
@@ -54,6 +62,13 @@ impl ExtensionPlanner for LanceExtensionPlanner {
 
         if let Some(search) = node.as_any().downcast_ref::<VectorSearchNode>() {
             return Ok(Some(plan_vector_search(search, input)?));
+        }
+        if let Some(rerank) = node.as_any().downcast_ref::<VectorRerankNode>() {
+            return Ok(Some(plan_flat_knn(
+                rerank.query(),
+                rerank.distance_type(),
+                input,
+            )?));
         }
         if let Some(take) = node.as_any().downcast_ref::<LanceTakeNode>() {
             return Ok(Some(plan_take(take, input)?));
@@ -84,7 +99,9 @@ fn plan_vector_search(
         }
         // An unresolved node means the rule did not run; brute force is the answer that is
         // always correct, so it is the safe default rather than an error.
-        Some(VectorAccessPath::Flat) | None => plan_flat_search(node, input)?,
+        Some(VectorAccessPath::Flat) | None => {
+            plan_flat_knn(node.query(), node.distance_type(), input)?
+        }
     };
     normalize_search_output(searched)
 }
@@ -112,13 +129,14 @@ fn plan_indexed_search(
     ))
 }
 
-fn plan_flat_search(
-    node: &VectorSearchNode,
+/// Brute-force top-`k` by distance over the input. Mirrors `Scanner::flat_knn`, and is shared by
+/// the flat access path and by [`VectorRerankNode`] — they are the same computation, differing only
+/// in what the caller does with the output schema.
+fn plan_flat_knn(
+    query: &lance_index::vector::Query,
+    distance_type: DistanceType,
     input: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let query = node.query();
-    let distance_type = node.distance_type();
-
     let distances = Arc::new(KNNVectorDistanceExec::try_new_batch(
         input,
         &query.column,
@@ -196,24 +214,30 @@ fn plan_take(
     node: &LanceTakeNode,
     input: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let options = take_options(node, input.schema().as_ref());
     Ok(Arc::new(FilteredReadExec::try_new(
         node.dataset().clone(),
-        take_options(node.projection().clone(), input.schema().as_ref()),
+        options,
         Some(input),
     )?))
 }
 
 /// Carry through whichever identity columns the input already has, so the take does not drop
 /// them. Mirrors `Scanner::take_current`.
-fn take_options(
-    mut projection: Projection,
-    input_schema: &arrow_schema::Schema,
-) -> FilteredReadOptions {
+fn take_options(node: &LanceTakeNode, input_schema: &arrow_schema::Schema) -> FilteredReadOptions {
+    let mut projection = node.projection().clone();
     projection.with_row_id |= input_schema.column_with_name(ROW_ID).is_some();
     projection.with_row_addr |= input_schema
         .column_with_name(lance_core::ROW_ADDR)
         .is_some();
-    FilteredReadOptions::new(projection)
+    let mut options = FilteredReadOptions::new(projection);
+    if let Some(batch_size) = node.settings().batch_size {
+        options = options.with_batch_size(batch_size);
+    }
+    if let Some(fragments) = &node.settings().fragments {
+        options = options.with_fragments(fragments.clone());
+    }
+    options
 }
 
 fn sort_asc(column: &str, plan: &dyn ExecutionPlan) -> Result<PhysicalSortExpr> {

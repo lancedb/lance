@@ -24,6 +24,7 @@ use lance_core::datatypes::OnMissing;
 use lance_table::format::Fragment;
 
 use super::context::ScanPlanningContext;
+use super::fts::{FtsAccessPath, FtsLeafNode};
 use super::nodes::{LanceTakeNode, PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
 use super::source::LanceScanSource;
 
@@ -126,28 +127,42 @@ impl OptimizerRule for ResolvePrefilterSource {
         let LogicalPlan::Extension(extension) = &plan else {
             return Ok(Transformed::no(plan));
         };
-        let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() else {
-            return Ok(Transformed::no(plan));
-        };
-        if !matches!(
-            search.access_path_resolution(),
-            Some(VectorAccessPath::Index { .. })
-        ) {
-            return Ok(Transformed::no(plan));
+        if let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() {
+            if !matches!(
+                search.access_path_resolution(),
+                Some(VectorAccessPath::Index { .. })
+            ) {
+                return Ok(Transformed::no(plan));
+            }
+            let kind = prefilter_kind(search.input());
+            if kind == search.prefilter() {
+                return Ok(Transformed::no(plan));
+            }
+            return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+                node: Arc::new(search.clone().with_prefilter(kind)),
+            })));
         }
-
-        let kind = if restricts_candidates(search.input()) {
-            PrefilterSourceKind::ChildRowIds
-        } else {
-            PrefilterSourceKind::None
-        };
-        if kind == search.prefilter() {
-            return Ok(Transformed::no(plan));
+        if let Some(leaf) = extension.node.as_any().downcast_ref::<FtsLeafNode>() {
+            if !matches!(leaf.resolution(), Some(FtsAccessPath::Index { .. })) {
+                return Ok(Transformed::no(plan));
+            }
+            let kind = prefilter_kind(leaf.input());
+            if kind == leaf.prefilter() {
+                return Ok(Transformed::no(plan));
+            }
+            return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+                node: Arc::new(leaf.clone().with_prefilter(kind)),
+            })));
         }
+        Ok(Transformed::no(plan))
+    }
+}
 
-        Ok(Transformed::yes(LogicalPlan::Extension(Extension {
-            node: Arc::new(search.clone().with_prefilter(kind)),
-        })))
+pub(super) fn prefilter_kind(input: &LogicalPlan) -> PrefilterSourceKind {
+    if restricts_candidates(input) {
+        PrefilterSourceKind::ChildRowIds
+    } else {
+        PrefilterSourceKind::None
     }
 }
 
@@ -250,6 +265,7 @@ impl OptimizerRule for SplitPartiallyIndexedSearch {
                     .dataset()
                     .empty_projection()
                     .union_column(column, OnMissing::Error)?,
+                self.context.take_settings().clone(),
             )?),
         });
         // The branches' `_distance` values are per-branch and, for the indexed one, approximate.
@@ -275,7 +291,7 @@ impl OptimizerRule for SplitPartiallyIndexedSearch {
 /// The recursion exists because the predicate may not have reached the leaf: before
 /// `PushDownFilter` runs there is a `Filter` in between, and that `Filter` has to be duplicated
 /// onto both branches along with the scan.
-fn restrict_scan(
+pub(super) fn restrict_scan(
     plan: &LogicalPlan,
     fragments: Vec<Fragment>,
 ) -> datafusion::common::Result<LogicalPlan> {

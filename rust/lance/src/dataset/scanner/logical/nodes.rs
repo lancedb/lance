@@ -16,11 +16,12 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+use lance_arrow::SchemaExt;
 use lance_core::datatypes::Projection;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{ApproxMode, DIST_COL, Query};
 use lance_linalg::distance::DistanceType;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{Fragment, IndexMetadata};
 use uuid::Uuid;
 
 use crate::Result;
@@ -370,6 +371,146 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
     }
 }
 
+/// Score the input's rows by distance to the query vector and keep the nearest `k`.
+///
+/// The difference from [`VectorSearchNode`] is what it does to the schema, and that follows from
+/// where it sits: a search *is* the source, so it may narrow its output to `[_rowid, _distance]`,
+/// while this sits above one and has to carry the columns already in flight. It also has no
+/// access path — a filter over rows someone else chose is brute force by definition.
+#[derive(Debug, Clone)]
+pub struct VectorRerankNode {
+    input: LogicalPlan,
+    query: Query,
+    distance_type: DistanceType,
+    schema: DFSchemaRef,
+}
+
+impl VectorRerankNode {
+    pub fn try_new(input: LogicalPlan, dataset: &Dataset, mut query: Query) -> Result<Self> {
+        let distance_type = match query.metric_type {
+            Some(metric) => metric,
+            None => {
+                let (_, element_type) = get_vector_type(dataset.schema(), &query.column)?;
+                default_distance_type_for(&element_type)
+            }
+        };
+        query.metric_type = Some(distance_type);
+
+        // Mirrors `KNNVectorDistanceExec::try_new_batch`: an existing `_distance` is dropped so the
+        // new one lands last.
+        let mut arrow = input.schema().as_arrow().clone();
+        if arrow.column_with_name(DIST_COL).is_some() {
+            arrow = arrow.without_column(DIST_COL);
+        }
+        let arrow = arrow.try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))?;
+        Ok(Self {
+            input,
+            query,
+            distance_type,
+            schema: Arc::new(DFSchema::try_from(arrow)?),
+        })
+    }
+
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
+    }
+}
+
+impl PartialEq for VectorRerankNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.input == other.input
+            && self.query.column == other.query.column
+            && self.query.k == other.query.k
+    }
+}
+
+impl Eq for VectorRerankNode {}
+
+impl Hash for VectorRerankNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.input.hash(state);
+        self.query.column.hash(state);
+        self.query.k.hash(state);
+    }
+}
+
+impl PartialOrd for VectorRerankNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.input.partial_cmp(&other.input)
+    }
+}
+
+impl UserDefinedLogicalNodeCore for VectorRerankNode {
+    fn name(&self) -> &str {
+        "VectorRerank"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![&self.input]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "VectorRerank: column={}, k={}, metric={}",
+            self.query.column, self.query.k, self.distance_type
+        )
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<Expr>,
+        mut inputs: Vec<LogicalPlan>,
+    ) -> datafusion::common::Result<Self> {
+        if !exprs.is_empty() {
+            return Err(datafusion::common::DataFusionError::Internal(
+                "VectorRerank takes no expressions".into(),
+            ));
+        }
+        if inputs.len() != 1 {
+            return Err(datafusion::common::DataFusionError::Internal(format!(
+                "VectorRerank takes exactly one input, got {}",
+                inputs.len()
+            )));
+        }
+        Ok(Self {
+            input: inputs.remove(0),
+            query: self.query.clone(),
+            distance_type: self.distance_type,
+            schema: self.schema.clone(),
+        })
+    }
+
+    /// The vector column has to survive down to here, and every other input column is part of the
+    /// output, so nothing below may be pruned.
+    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        Some(vec![(0..self.input.schema().fields().len()).collect()])
+    }
+}
+
+/// The read settings every take in a plan has to honor, carried down from the `Scanner`.
+///
+/// A take is a read, so a fragment restriction applies to it: rows the search found outside the
+/// target fragments are dropped here. That is how `with_fragments` reaches a search whose index
+/// covers more fragments than the scan asked for.
+#[derive(Debug, Clone, Default)]
+pub struct TakeSettings {
+    pub fragments: Option<Arc<Vec<Fragment>>>,
+    pub batch_size: Option<u32>,
+}
+
 /// Late materialization: fetch `projection`'s columns for rows the input has already identified,
 /// keyed by `_rowid`.
 ///
@@ -381,6 +522,7 @@ pub struct LanceTakeNode {
     input: LogicalPlan,
     dataset: Arc<Dataset>,
     projection: Projection,
+    settings: TakeSettings,
     schema: DFSchemaRef,
 }
 
@@ -389,12 +531,14 @@ impl LanceTakeNode {
         input: LogicalPlan,
         dataset: Arc<Dataset>,
         projection: Projection,
+        settings: TakeSettings,
     ) -> Result<Self> {
         let schema = Self::output_schema(&input, &dataset, &projection)?;
         Ok(Self {
             input,
             dataset,
             projection,
+            settings,
             schema,
         })
     }
@@ -415,6 +559,10 @@ impl LanceTakeNode {
 
     pub fn projection(&self) -> &Projection {
         &self.projection
+    }
+
+    pub fn settings(&self) -> &TakeSettings {
+        &self.settings
     }
 
     fn output_schema(
@@ -517,6 +665,7 @@ impl UserDefinedLogicalNodeCore for LanceTakeNode {
             inputs.remove(0),
             self.dataset.clone(),
             self.projection.clone(),
+            self.settings.clone(),
         )
         .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))
     }

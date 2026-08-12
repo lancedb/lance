@@ -22,8 +22,10 @@
 
 pub(super) mod builder;
 pub(super) mod context;
+pub(super) mod fts;
 pub(super) mod nodes;
 pub(super) mod planner;
+pub(super) mod prepare;
 pub(super) mod rules;
 pub(super) mod source;
 #[cfg(test)]
@@ -37,6 +39,8 @@ use datafusion::optimizer::optimize_projections::OptimizeProjections;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::push_down_limit::PushDownLimit;
 use datafusion::optimizer::simplify_expressions::SimplifyExpressions;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionConfig;
@@ -64,15 +68,15 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
     scanner.validate_options()?;
     ensure_supported(scanner)?;
 
-    let logical_plan = builder::build(scanner)?;
-    let context =
-        Arc::new(ScanPlanningContext::collect(scanner.dataset.clone(), &logical_plan).await?);
+    let prepared = prepare::PreparedQueries::resolve(scanner).await?;
+    let logical_plan = builder::build(scanner, &prepared)?;
+    let context = Arc::new(ScanPlanningContext::collect(scanner, &logical_plan).await?);
 
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(session_config(scanner))
         .with_optimizer_rules(optimizer_rules(&context))
-        .with_physical_optimizer_rules(get_physical_optimizer().rules)
+        .with_physical_optimizer_rules(physical_optimizer_rules())
         .build();
 
     let optimized = state.optimize(&logical_plan)?;
@@ -95,19 +99,40 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
 fn optimizer_rules(
     context: &Arc<ScanPlanningContext>,
 ) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-    vec![
-        Arc::new(rules::ResolveVectorAccessPath::new(context.clone())),
+    let mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![Arc::new(
+        rules::ResolveVectorAccessPath::new(context.clone()),
+    )];
+    // The FTS rules are contributed as a block by the module that owns the FTS nodes, which is
+    // the closest the spike gets to the doc's "each index plugin provides its own rules".
+    rules.extend(fts::rules(context));
+    rules.extend::<Vec<Arc<dyn OptimizerRule + Send + Sync>>>(vec![
         // Before PushDownFilter, so a prefilter predicate is still a `Filter` node that gets
         // duplicated onto both branches; each branch's scan then absorbs its own copy.
         Arc::new(rules::SplitPartiallyIndexedSearch::new(context.clone())),
         Arc::new(SimplifyExpressions::new()),
         Arc::new(PushDownFilter::new()),
         Arc::new(PushDownLimit::new()),
-        // After PushDownFilter, so the predicate has reached its final position, and after
-        // ResolveVectorAccessPath, whose choice decides what the child must produce.
+        // After PushDownFilter, so the predicate has reached its final position, and after the
+        // access-path rules, whose choice decides what each child must produce.
         Arc::new(rules::ResolvePrefilterSource),
         Arc::new(OptimizeProjections::new()),
-    ]
+    ]);
+    rules
+}
+
+/// The physical rule set: Lance's own rules, plus the stock DataFusion rules that hand-built
+/// physical plans never needed.
+///
+/// `get_physical_optimizer` is tuned for the imperative path, where every node is constructed with
+/// its final configuration already chosen. A plan lowered from stock logical nodes is not like
+/// that: `DefaultPhysicalPlanner` emits a `HashJoinExec` with `PartitionMode::Auto`, which panics
+/// at `execute()` unless `JoinSelection` resolves it. It runs first so the Lance rules see a
+/// fully-resolved plan, the same way they do today.
+fn physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
+        vec![Arc::new(JoinSelection::new())];
+    rules.extend(get_physical_optimizer().rules);
+    rules
 }
 
 fn session_config(scanner: &Scanner) -> SessionConfig {
@@ -142,9 +167,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
     }
     if scanner.is_batch_nearest {
         return unsupported("batch vector search");
-    }
-    if scanner.full_text_query.is_some() || scanner.filter.query_filter.is_some() {
-        return unsupported("full text search");
     }
     if scanner.aggregate.is_some() {
         return unsupported("aggregates");
