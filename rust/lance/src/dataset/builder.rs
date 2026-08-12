@@ -603,11 +603,22 @@ impl DatasetBuilder {
     ///
     /// The returned locations are not guaranteed to be ordered. This operation may list and
     /// materialize the full manifest history. Explicit version, branch, and tag targets are not
-    /// supported.
+    /// supported. Custom commit handlers and externally managed version stores are also not
+    /// supported because listing physical manifest objects may omit committed versions whose
+    /// authoritative locations are held outside the object store.
     pub async fn list_manifest_locations(mut self) -> Result<Vec<ManifestLocation>> {
         if self.version.is_some() {
             return Err(Error::invalid_input(
                 "list_manifest_locations does not support an explicit version, branch, or tag",
+            ));
+        }
+        let uses_external_or_custom_commit_handler = self.commit_handler.is_some()
+            || self.namespace_managed.is_some()
+            || Url::parse(&self.table_uri).is_ok_and(|url| url.scheme() == "s3+ddb");
+        if uses_external_or_custom_commit_handler {
+            return Err(Error::not_supported(
+                "list_manifest_locations does not support external or custom commit handlers; \
+                 object-store listing may omit committed manifest locations",
             ));
         }
         self.apply_storage_options_override();
@@ -927,11 +938,22 @@ impl DatasetBuilder {
 mod tests {
     use async_trait::async_trait;
     use lance_io::object_store::StorageOptionsProvider;
+    use lance_table::io::commit::UnsafeCommitHandler;
 
     use super::*;
 
     #[derive(Debug)]
     struct TestStorageOptionsProvider;
+
+    #[derive(Debug)]
+    struct TestNamespace;
+
+    #[async_trait]
+    impl LanceNamespace for TestNamespace {
+        fn namespace_id(&self) -> String {
+            "test-namespace".to_string()
+        }
+    }
 
     #[async_trait]
     impl StorageOptionsProvider for TestStorageOptionsProvider {
@@ -980,5 +1002,28 @@ mod tests {
             "test-storage-options-provider"
         );
         assert!(builder.storage_options_override.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_manifest_locations_rejects_external_and_custom_commit_handlers() {
+        let mut namespace_builder = DatasetBuilder::from_uri("memory://namespace-table");
+        namespace_builder.namespace_managed =
+            Some((Arc::new(TestNamespace), vec!["namespace-table".to_string()]));
+
+        let builders = [
+            DatasetBuilder::from_uri("memory://custom-handler-table")
+                .with_commit_handler(Arc::new(UnsafeCommitHandler)),
+            DatasetBuilder::from_uri("s3+ddb://bucket/table.lance?ddbTableName=manifest-table"),
+            namespace_builder,
+        ];
+
+        for builder in builders {
+            let err = builder.list_manifest_locations().await.unwrap_err();
+            assert!(matches!(err, Error::NotSupported { .. }));
+            assert!(
+                err.to_string()
+                    .contains("does not support external or custom commit handlers")
+            );
+        }
     }
 }

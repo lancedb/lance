@@ -489,8 +489,9 @@ public class Dataset implements Closeable {
    * <p>The returned locations are not guaranteed to be ordered. This operation may list and
    * materialize the full manifest history.
    *
-   * <p>This method is for datasets whose commit handler can be resolved directly from the URI.
-   * Namespace-managed tables and tables using a custom commit handler are not supported.
+   * <p>This method is for datasets whose committed manifests can be listed authoritatively from the
+   * object store. Namespace-managed tables, external version stores such as {@code s3+ddb}, and
+   * tables using a custom commit handler are not supported.
    *
    * @param uri dataset URI
    * @return manifest locations
@@ -505,8 +506,9 @@ public class Dataset implements Closeable {
    * <p>The returned locations are not guaranteed to be ordered. This operation may list and
    * materialize the full manifest history.
    *
-   * <p>This method is for datasets whose commit handler can be resolved directly from the URI.
-   * Namespace-managed tables and tables using a custom commit handler are not supported.
+   * <p>This method is for datasets whose committed manifests can be listed authoritatively from the
+   * object store. Namespace-managed tables, external version stores such as {@code s3+ddb}, and
+   * tables using a custom commit handler are not supported.
    *
    * @param uri dataset URI
    * @param storageOptions object-store credentials and connection options
