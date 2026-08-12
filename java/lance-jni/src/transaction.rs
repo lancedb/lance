@@ -19,7 +19,7 @@ use jni::sys::{jboolean, jint, jlong};
 use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
-    UpdateMap, UpdateMapEntry, UpdateMode,
+    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -411,6 +411,7 @@ fn convert_to_java_operation_inner<'local>(
         Operation::CreateIndex {
             new_indices,
             removed_indices,
+            ..
         } => {
             let java_new_indices = export_vec(env, &new_indices)?;
             let java_removed_indices = export_vec(env, &removed_indices)?;
@@ -433,7 +434,7 @@ fn convert_to_java_operation_inner<'local>(
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter: _,
-            updated_fragment_offsets: _,
+            updated_fragment_offsets,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -457,9 +458,48 @@ fn convert_to_java_operation_inner<'local>(
                     &[JValue::Object(&update_mode)],
                 )?
                 .l()?;
+            // Serialize updated_fragment_offsets to Java Map<Long, byte[]>.
+            // Values are portable RoaringBitmap bytes so the JNI boundary stays O(bitmap size)
+            // rather than O(n rows). Empty HashMap when None so the Java constructor always
+            // receives a non-null map.
+            let java_offsets_map = {
+                let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
+                if let Some(UpdatedFragmentOffsets(ref map)) = updated_fragment_offsets {
+                    for (frag_id, bitmap) in map {
+                        let mut buf: Vec<u8> = Vec::new();
+                        bitmap.serialize_into(&mut buf).map_err(|e| {
+                            Error::runtime_error(format!(
+                                "failed to serialize updatedFragmentOffsets for fragment \
+                                 {frag_id}: {e}"
+                            ))
+                        })?;
+                        // JNI byte arrays are signed i8; reinterpret without copying.
+                        let buf_i8: &[i8] = unsafe {
+                            std::slice::from_raw_parts(buf.as_ptr() as *const i8, buf.len())
+                        };
+                        env.with_local_frame(4, |env| {
+                            let java_key = env.new_object(
+                                "java/lang/Long",
+                                "(J)V",
+                                &[JValue::Long(*frag_id as i64)],
+                            )?;
+                            let java_arr = env.new_byte_array(buf_i8.len() as i32)?;
+                            env.set_byte_array_region(&java_arr, 0, buf_i8)?;
+                            env.call_method(
+                                &java_map,
+                                "put",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                                &[JValue::Object(&java_key), JValue::Object(&*java_arr)],
+                            )?;
+                            Ok::<JObject, Error>(JObject::null())
+                        })?;
+                    }
+                }
+                java_map
+            };
             Ok(env.new_object(
                 "org/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;)V",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
@@ -467,6 +507,7 @@ fn convert_to_java_operation_inner<'local>(
                     JValueGen::Object(&fields_modified),
                     JValueGen::Object(&fields_for_preserving_frag_bitmap),
                     JValue::Object(&update_mode_optional),
+                    JValue::Object(&java_offsets_map),
                 ],
             )?)
         }
@@ -1267,6 +1308,59 @@ fn convert_to_rust_operation(
                     update_mode.extract_object(env)
                 })?;
 
+            let updated_fragment_offsets = {
+                let offsets_obj = env
+                    .call_method(
+                        java_operation,
+                        "updatedFragmentOffsets",
+                        "()Ljava/util/Map;",
+                        &[],
+                    )?
+                    .l()?;
+                if offsets_obj.is_null() {
+                    None
+                } else {
+                    let jmap = JMap::from_env(env, &offsets_obj)?;
+                    let mut iter = jmap.iter(env)?;
+                    let mut offsets: HashMap<u64, RoaringBitmap> = HashMap::new();
+                    // Per-iteration local frame: iterator key/value JNI refs are released each
+                    // loop so large multi-fragment maps cannot exhaust the local reference table.
+                    loop {
+                        let entry = env.with_local_frame(
+                            8,
+                            |env| -> Result<Option<(u64, RoaringBitmap)>> {
+                                let Some((key, value)) = iter.next(env)? else {
+                                    return Ok(None);
+                                };
+                                let frag_id =
+                                    env.call_method(&key, "longValue", "()J", &[])?.j()? as u64;
+                                let buf: Vec<u8> =
+                                    env.convert_byte_array(JByteArray::from(value))?;
+                                let bitmap = RoaringBitmap::deserialize_from(buf.as_slice())
+                                    .map_err(|e| {
+                                        Error::input_error(format!(
+                                            "invalid updatedFragmentOffsets RoaringBitmap bytes \
+                                         for fragment {frag_id}: {e}"
+                                        ))
+                                    })?;
+                                Ok(Some((frag_id, bitmap)))
+                            },
+                        )?;
+                        match entry {
+                            None => break,
+                            Some((frag_id, bitmap)) => {
+                                offsets.insert(frag_id, bitmap);
+                            }
+                        }
+                    }
+                    if offsets.is_empty() {
+                        None
+                    } else {
+                        Some(UpdatedFragmentOffsets(offsets))
+                    }
+                }
+            };
+
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
@@ -1276,7 +1370,7 @@ fn convert_to_rust_operation(
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter: None,
-                updated_fragment_offsets: None,
+                updated_fragment_offsets,
             }
         }
         "DataReplacement" => {

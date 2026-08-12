@@ -3154,7 +3154,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -3213,7 +3213,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Include unverified files that cleanup would remove when this is set.
@@ -6012,6 +6012,11 @@ class LanceOperation:
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        updated_fragment_offsets: dict[int, bytes], optional
+            Physical row offsets that matched the update, keyed by fragment id,
+            each serialized in the portable RoaringBitmap format. Set on
+            ``rewrite_columns`` updates over stable row ids so the commit
+            refreshes row-level version metadata for the matched rows only.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6024,6 +6029,7 @@ class LanceOperation:
             default_factory=list
         )
         update_mode: str = ""
+        updated_fragment_offsets: Optional[Dict[int, bytes]] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
