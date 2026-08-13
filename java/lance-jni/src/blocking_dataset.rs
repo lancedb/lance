@@ -1146,10 +1146,7 @@ fn inner_create_index<'local>(
         if skip_commit {
             block_on(index_builder.execute_uncommitted())?
         } else {
-            // Keep the large index-build future off the JNI caller's native stack.
-            // The JVM defaults to a 1 MiB native stack on Linux, which is smaller
-            // than this future once it includes the dataset commit state machine.
-            block_on(Box::pin(index_builder.into_future()))?
+            block_on(index_builder.into_future())?
         }
     };
 

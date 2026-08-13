@@ -2807,6 +2807,45 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
+    fn references_field_assignment(&self) -> Result<bool> {
+        for output in &self.projection_plan.requested_output_expr {
+            if expression_references_field_assignment(&output.expr)? {
+                return Ok(true);
+            }
+        }
+
+        if let Some(filter) = &self.filter.expr_filter {
+            let references_assignment = match filter {
+                ExprFilter::Sql(sql) => sql.to_ascii_lowercase().contains("is_assigned"),
+                ExprFilter::Substrait(_) => true,
+                ExprFilter::Datafusion(expression) => {
+                    expression_references_field_assignment(expression)?
+                }
+            };
+            if references_assignment {
+                return Ok(true);
+            }
+        }
+
+        if let Some(ordering) = &self.ordering
+            && ordering
+                .iter()
+                .any(|ordering| self.dataset.schema().field(&ordering.column_name).is_none())
+        {
+            return Ok(true);
+        }
+
+        if let Some(aggregate) = &self.aggregate {
+            for expression in aggregate.group_by.iter().chain(&aggregate.aggregates) {
+                if expression_references_field_assignment(expression)? {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     async fn bind_field_assignment_expressions(&mut self) -> Result<()> {
         let filter_expression = self
             .filter
@@ -2890,7 +2929,7 @@ impl Scanner {
 
     #[instrument(level = "debug", skip_all)]
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.field_assignments_bound {
+        if !self.field_assignments_bound && self.references_field_assignment()? {
             let mut bound = self.clone();
             bound.field_assignments_bound = true;
             bound.bind_field_assignment_expressions().await?;
@@ -6861,6 +6900,7 @@ mod test {
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+    use lance_datafusion::udf::is_assigned;
     use lance_datagen::{
         ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount, array, gen_batch,
     };
@@ -6891,6 +6931,21 @@ mod test {
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
+
+    #[tokio::test]
+    async fn test_assignment_binding_fast_path_for_ordinary_scan() {
+        let test_dataset = TestVectorDataset::new(LanceFileVersion::V2_2, false)
+            .await
+            .unwrap();
+        let mut scanner = test_dataset.dataset.scan();
+
+        assert!(!scanner.references_field_assignment().unwrap());
+        scanner.filter("i > 10").unwrap();
+        assert!(!scanner.references_field_assignment().unwrap());
+
+        scanner.filter_expr(is_assigned(col("i")));
+        assert!(scanner.references_field_assignment().unwrap());
+    }
 
     #[test]
     fn test_fts_query_contract_rejects_invalid_values() {
