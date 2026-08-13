@@ -2070,7 +2070,7 @@ pub struct TransactionBuilder {
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
-    field_assignment_transaction: Option<FieldAssignmentTransaction>,
+    field_assignment_transaction: Option<Box<FieldAssignmentTransaction>>,
 }
 
 impl TransactionBuilder {
@@ -2115,7 +2115,11 @@ impl TransactionBuilder {
         if changes.is_empty() {
             return self;
         }
-        self.field_assignment_transaction = Some(changes);
+        // Keep the uncommon assignment payload off the builder's inline size.
+        // TransactionBuilder is retained across several write futures, and the
+        // four Vec headers in this payload otherwise push those futures over
+        // the workspace's large-future limit even when tracking is unused.
+        self.field_assignment_transaction = Some(Box::new(changes));
         self
     }
 
@@ -2131,7 +2135,7 @@ impl TransactionBuilder {
             transaction_properties: self.transaction_properties,
         };
         if let Some(changes) = self.field_assignment_transaction {
-            transaction.with_field_assignment_transaction(changes)
+            transaction.with_field_assignment_transaction(*changes)
         } else {
             transaction
         }

@@ -5301,7 +5301,8 @@ def _write_overlay_file(
     )
 
 
-def test_data_overlay_dense(tmp_path: Path):
+def test_data_overlay_dense(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5333,7 +5334,8 @@ def test_data_overlay_dense(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_newest_wins(tmp_path: Path):
+def test_data_overlay_newest_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5387,7 +5389,8 @@ def test_data_overlay_newest_wins(tmp_path: Path):
     assert val[4] == 444  # only the older overlay covers offset 4
 
 
-def test_data_overlay_sparse_per_field(tmp_path: Path):
+def test_data_overlay_sparse_per_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5427,7 +5430,10 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
-def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+def test_data_overlay_round_trips_through_fragment_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     import json
 
     base_dir = tmp_path / "test"

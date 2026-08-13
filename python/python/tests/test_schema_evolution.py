@@ -415,7 +415,9 @@ def test_alter_columns(tmp_path: Path):
 
     with pytest.raises(
         ValueError,
-        match="At least one of name, nullable, or data_type must be specified",
+        match=(
+            "At least one of name, nullable, data_type, or assignment must be specified"
+        ),
     ):
         dataset.alter_columns({"path": "x"})
 

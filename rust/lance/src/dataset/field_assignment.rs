@@ -2596,8 +2596,13 @@ mod tests {
         let mut assignment = dataset.scan();
         assignment.project_with_transform(&[("assigned", "is_assigned(embedding)")])?;
         let error = assignment.try_into_batch().await.unwrap_err();
+        let bitmap_file_name = bitmap
+            .path
+            .rsplit('/')
+            .next()
+            .expect("validated bitmap path must have a file name");
         assert!(
-            error.to_string().contains(&bitmap.path),
+            error.to_string().contains(bitmap_file_name),
             "unexpected assignment read error: {error}"
         );
 
