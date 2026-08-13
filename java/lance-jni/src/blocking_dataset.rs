@@ -35,7 +35,7 @@ use lance::dataset::cleanup::{
 };
 use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt, FragmentSummary};
+use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
@@ -785,22 +785,6 @@ impl IntoJava for Version {
     }
 }
 
-impl IntoJava for FragmentSummary {
-    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        Ok(env.new_object(
-            "org/lance/FragmentSummary",
-            "(JJJJJ)V",
-            &[
-                JValue::Long(self.fragment_count as i64),
-                JValue::Long(self.min_rows_per_fragment as i64),
-                JValue::Long(self.max_rows_per_fragment as i64),
-                JValue::Long(self.min_data_files_per_fragment as i64),
-                JValue::Long(self.max_data_files_per_fragment as i64),
-            ],
-        )?)
-    }
-}
-
 fn attach_native_dataset<'local>(
     env: &mut JNIEnv<'local>,
     dataset: BlockingDataset,
@@ -1547,27 +1531,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeGetFragmentStatistics<'a>(
     ok_or_throw!(env, inner_get_fragment_statistics(&mut env, jdataset))
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_nativeGetFragmentSummary<'a>(
-    mut env: JNIEnv<'a>,
-    jdataset: JObject,
-) -> JObject<'a> {
-    ok_or_throw!(env, inner_get_fragment_summary(&mut env, jdataset))
-}
-
-fn inner_get_fragment_summary<'local>(
-    env: &mut JNIEnv<'local>,
-    jdataset: JObject,
-) -> Result<JObject<'local>> {
-    let summary = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.inner.fragment_summary()?
-    };
-    summary.into_java(env)
-}
-
-/// Returns per-fragment statistics flattened as [id0, rowCount0, dataFileNum0, id1, ...].
+/// Returns per-fragment statistics in their final Java primitive arrays.
 ///
 /// Row count semantics match Java `FragmentMetadata.getNumRows()`:
 /// physical rows minus deleted rows, with absent values treated as 0.
@@ -1576,28 +1540,62 @@ fn inner_get_fragment_statistics<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
 ) -> Result<JObject<'local>> {
-    let stats: Vec<i64> = {
+    // Three 4096-entry typed buffers use 64 KiB while keeping JNI calls amortized.
+    const CHUNK_SIZE: usize = 4096;
+
+    let fragments = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        let fragments = dataset.inner.get_fragments();
-        let mut stats = Vec::with_capacity(fragments.len() * 3);
-        for f in fragments.iter() {
-            let meta = f.metadata();
-            let physical_rows = meta.physical_rows.unwrap_or(0) as i64;
-            let deleted_rows = meta
+        dataset.inner.fragments().clone()
+    };
+    let fragment_count = i32::try_from(fragments.len()).map_err(|_| {
+        Error::runtime_error(format!(
+            "Fragment statistics contain {} fragments, exceeding the Java array limit of {}",
+            fragments.len(),
+            i32::MAX
+        ))
+    })?;
+    let ids = env.new_int_array(fragment_count)?;
+    let row_counts = env.new_long_array(fragment_count)?;
+    let data_file_nums = env.new_int_array(fragment_count)?;
+
+    let chunk_capacity = fragments.len().min(CHUNK_SIZE);
+    let mut id_chunk = Vec::with_capacity(chunk_capacity);
+    let mut row_count_chunk = Vec::with_capacity(chunk_capacity);
+    let mut data_file_num_chunk = Vec::with_capacity(chunk_capacity);
+
+    for (chunk_index, fragment_chunk) in fragments.chunks(CHUNK_SIZE).enumerate() {
+        id_chunk.clear();
+        row_count_chunk.clear();
+        data_file_num_chunk.clear();
+
+        for fragment in fragment_chunk {
+            let physical_rows = fragment.physical_rows.unwrap_or(0) as i64;
+            let deleted_rows = fragment
                 .deletion_file
                 .as_ref()
-                .and_then(|d| d.num_deleted_rows)
+                .and_then(|deletion_file| deletion_file.num_deleted_rows)
                 .unwrap_or(0) as i64;
-            stats.push(f.id() as i64);
-            stats.push(physical_rows - deleted_rows);
-            stats.push(meta.files.len() as i64);
+            id_chunk.push(fragment.id as i32);
+            row_count_chunk.push(physical_rows - deleted_rows);
+            data_file_num_chunk.push(fragment.files.len() as i32);
         }
-        stats
-    };
-    let jarray = env.new_long_array(stats.len() as i32)?;
-    env.set_long_array_region(&jarray, 0, &stats)?;
-    Ok(jarray.into())
+
+        let offset = (chunk_index * CHUNK_SIZE) as i32;
+        env.set_int_array_region(&ids, offset, &id_chunk)?;
+        env.set_long_array_region(&row_counts, offset, &row_count_chunk)?;
+        env.set_int_array_region(&data_file_nums, offset, &data_file_num_chunk)?;
+    }
+
+    Ok(env.new_object(
+        "org/lance/FragmentStatistics",
+        "([I[J[I)V",
+        &[
+            JValue::Object(&ids),
+            JValue::Object(&row_counts),
+            JValue::Object(&data_file_nums),
+        ],
+    )?)
 }
 
 #[unsafe(no_mangle)]

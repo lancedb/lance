@@ -208,7 +208,7 @@ name = "count_pushdown"
 harness = false
 
 [[bench]]
-name = "fragment_summary"
+name = "fragment_statistics"
 harness = false
 
 [[bench]]

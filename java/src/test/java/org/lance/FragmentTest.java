@@ -442,12 +442,8 @@ public class FragmentTest {
 
         assertEquals(30, Arrays.stream(stats.getRowCounts()).sum());
 
-        FragmentSummary summary = dataset.getFragmentSummary();
-        assertEquals(2, summary.getFragmentCount());
-        assertEquals(9, summary.getMinRowsPerFragment());
-        assertEquals(21, summary.getMaxRowsPerFragment());
-        assertEquals(1, summary.getMinDataFilesPerFragment());
-        assertEquals(1, summary.getMaxDataFilesPerFragment());
+        dataset.delete("id < 5");
+        assertArrayEquals(new long[] {16, 4}, dataset.getFragmentStatistics().getRowCounts());
       }
     }
   }
@@ -460,18 +456,48 @@ public class FragmentTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(0, dataset.getFragmentStatistics().size());
-        FragmentSummary summary = dataset.getFragmentSummary();
-        assertEquals(0, summary.getFragmentCount());
-        assertEquals(0, summary.getMinRowsPerFragment());
-        assertEquals(0, summary.getMaxRowsPerFragment());
-        assertEquals(0, summary.getMinDataFilesPerFragment());
-        assertEquals(0, summary.getMaxDataFilesPerFragment());
       }
     }
   }
 
   @Test
-  void testFragmentSummaryRejectsUnknownRowsFromHistoricalManifest() {
+  void testFragmentStatisticsAcrossNativeChunks(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_statistics_chunks").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      FragmentMetadata template = testDataset.createNewFragment(1);
+      int fragmentCount = 4097;
+      List<FragmentMetadata> fragments = new ArrayList<>(fragmentCount);
+      for (int id = 0; id < fragmentCount; id++) {
+        fragments.add(
+            new FragmentMetadata(
+                id,
+                template.getFiles(),
+                template.getPhysicalRows(),
+                template.getDeletionFile(),
+                template.getRowIdMeta()));
+      }
+
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(fragments);
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        FragmentStatistics stats = dataset.getFragmentStatistics();
+        int lastIndex = fragmentCount - 1;
+        assertEquals(fragmentCount, stats.size());
+        assertEquals(0, stats.getIds()[0]);
+        assertEquals(lastIndex, stats.getIds()[lastIndex]);
+        assertEquals(1, stats.getRowCounts()[0]);
+        assertEquals(1, stats.getRowCounts()[lastIndex]);
+        assertEquals(1, stats.getDataFileNums()[0]);
+        assertEquals(1, stats.getDataFileNums()[lastIndex]);
+      }
+    }
+  }
+
+  @Test
+  void testFragmentStatisticsPreservesLegacyMissingRowCount() {
     String historicalPath =
         Path.of("..", "test_data", "v0.7.5", "with_deletions")
             .toAbsolutePath()
@@ -479,9 +505,10 @@ public class FragmentTest {
             .toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
         Dataset dataset = Dataset.open(historicalPath, allocator)) {
-      RuntimeException error = assertThrows(RuntimeException.class, dataset::getFragmentSummary);
-      assertTrue(error.getMessage().contains("Fragment summary requires"));
-      assertTrue(error.getMessage().contains("fragment"));
+      FragmentStatistics stats = dataset.getFragmentStatistics();
+      assertArrayEquals(new int[] {0}, stats.getIds());
+      assertArrayEquals(new long[] {0}, stats.getRowCounts());
+      assertArrayEquals(new int[] {1}, stats.getDataFileNums());
     }
   }
 }
