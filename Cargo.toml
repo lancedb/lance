@@ -73,7 +73,6 @@ lance-io = { version = "=11.0.0-beta.7", path = "./rust/lance-io", default-featu
 lance-linalg = { version = "=11.0.0-beta.7", path = "./rust/lance-linalg" }
 lance-namespace = { version = "=11.0.0-beta.7", path = "./rust/lance-namespace" }
 lance-namespace-impls = { version = "=11.0.0-beta.7", path = "./rust/lance-namespace-impls" }
-lance-namespace-datafusion = { version = "=7.0.0-beta.9", path = "./rust/lance-namespace-datafusion" }
 lance-namespace-reqwest-client = "0.8.6"
 lance-select = { version = "=11.0.0-beta.7", path = "./rust/lance-select" }
 lance-tokenizer = { version = "=11.0.0-beta.7", path = "./rust/lance-tokenizer" }
@@ -143,7 +142,6 @@ datafusion-common = "54.0.0"
 datafusion-functions = { version = "54.0.0", default-features = false, features = ["regex_expressions"] }
 datafusion-sql = "54.0.0"
 datafusion-expr = "54.0.0"
-datafusion-ffi = "54.0.0"
 datafusion-physical-expr = "54.0.0"
 datafusion-physical-plan = "54.0.0"
 datafusion-substrait = { version = "54.0.0", default-features = false }
