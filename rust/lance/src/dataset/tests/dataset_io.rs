@@ -638,13 +638,26 @@ async fn test_shallow_clone_reuses_base_object_store() {
         "reads on the wrapped clone must go through the wrapper"
     );
 
-    let fresh = DatasetBuilder::from_uri(&clone_uri).load().await.unwrap();
+    let fresh = DatasetBuilder::from_uri(&clone_uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let attempts = |stats: lance_io::object_store::providers::ObjectStoreRegistryStats| {
+        stats.hits + stats.misses
+    };
+    let attempts_before = attempts(fresh.session.store_registry().stats());
     let stores = futures::future::try_join_all((0..8).map(|_| fresh.object_store(Some(base_id))))
         .await
         .unwrap();
     assert!(
         stores.iter().all(|store| Arc::ptr_eq(store, &stores[0])),
         "concurrent resolutions must share one store"
+    );
+    assert_eq!(
+        attempts(fresh.session.store_registry().stats()) - attempts_before,
+        1,
+        "concurrent resolutions must resolve the store exactly once"
     );
 
     let read = cloned.scan().try_into_batch().await.unwrap();
