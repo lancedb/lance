@@ -728,6 +728,17 @@ fn segment_has_vector_details(segment: &IndexMetadata) -> bool {
     )
 }
 
+/// Whether this build has a reader for the index's declared type.
+///
+/// Segments without details predate type URLs and remain readable through the
+/// legacy file-based detection in the index open paths.
+pub(crate) fn index_type_is_known(index: &IndexMetadata) -> bool {
+    index
+        .index_details
+        .as_ref()
+        .is_none_or(|details| IndexDetails(details.clone()).index_version().is_ok())
+}
+
 /// Detect FTS / inverted segments from manifest details.
 ///
 /// Unlike vector, inverted segment support was added after index details were
@@ -2134,6 +2145,20 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
+            if let Some(index) = deltas.iter().find(|idx| !index_type_is_known(idx)) {
+                let type_url = index
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.as_str())
+                    .unwrap_or("<legacy>");
+                log::warn!(
+                    "Skipping optimization of index '{}' because this build does not recognize index type '{}'",
+                    index.name,
+                    type_url
+                );
+                continue;
+            }
+
             // Scalar indices have no rebalance concept, so skip them entirely
             // when every fragment is already covered and the caller hasn't
             // asked for retrain or an explicit delta merge. Vector indices
@@ -4109,6 +4134,76 @@ mod tests {
             serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_index_type_does_not_block_queries_or_optimization() {
+        let reader = gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .col("number", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["number"],
+                IndexType::BTree,
+                Some("number_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let appended = gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .col("number", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1));
+        dataset.append(appended, None).await.unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("number_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 32);
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut foreign_segment = write_vector_segment_metadata(
+            &dataset,
+            "foreign_idx",
+            field_id,
+            Uuid::new_v4(),
+            fragment_ids,
+            b"opaque external index",
+        )
+        .await;
+        foreign_segment.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/example.MyIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+        foreign_segment.index_version = 1;
+        dataset
+            .commit_existing_index_segments("foreign_idx", "vector", vec![foreign_segment])
+            .await
+            .unwrap();
+
+        let query = Float32Array::from(vec![0.5_f32; 8]);
+        let mut scanner = dataset.scan();
+        scanner.nearest("vector", &query, 5).unwrap();
+        assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 5);
+
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("number_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert!(
+            dataset
+                .load_index_by_name("foreign_idx")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
