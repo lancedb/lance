@@ -9,25 +9,48 @@
 //!   and lets Python code register additional `ObjectStoreProvider`s under new
 //!   URL schemes. A registry constructed here can be passed to `Session` so
 //!   `lance.dataset("myscheme://...")` dispatches through the new provider.
-//! - `PyObjectStoreProvider` is a bridge that adapts either a built-in Rust
-//!   provider (currently just `MemoryStoreProvider`) or a Python object that
-//!   implements the `new_store` protocol to `Arc<dyn ObjectStoreProvider>`.
+//! - `PyObjectStoreProvider` is a bridge that adapts a built-in Rust provider
+//!   (currently just `MemoryStoreProvider`), a Python object that implements
+//!   the `new_store` protocol, or an `Arc<dyn ObjectStoreProvider>` produced
+//!   by a *separate* wheel and handed across a `PyCapsule`, to
+//!   `Arc<dyn ObjectStoreProvider>`.
 //!
 //! The Python-callable path is intentionally stubbed for this first cut: the
 //! full Python-to-Rust `ObjectStore` bridge (i.e. wrapping a Python-returned
 //! object as an `object_store::ObjectStore`) is a follow-up. The smoke test
 //! against the built-in memory provider proves the registration + dispatch
 //! plumbing works end to end.
+//!
+//! # Out-of-tree providers via `PyCapsule`
+//!
+//! [`PyObjectStoreProvider::from_capsule`] lets an external wheel register a
+//! Rust `ObjectStoreProvider` it compiled itself. The external wheel builds an
+//! `Arc<dyn ObjectStoreProvider>`, wraps it in a `PyCapsule` named
+//! [`PROVIDER_CAPSULE_NAME`], and passes that capsule here. Because Rust has
+//! no stable ABI, this is sound **only when both wheels are built in lockstep**:
+//! identical `rustc`, identical `lance-io` / `object_store` source, and
+//! identical resolved dependency versions, so the trait object's vtable and the
+//! types in `new_store`'s signature have the same layout on both sides. In
+//! Phase I both wheels are built locally from the same branch and toolchain, so
+//! the constraint holds; distributing pre-built wheels that must interoperate
+//! is deferred (a packaging-phase concern).
 
+use std::ffi::CStr;
 use std::sync::Arc;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::{PyCapsule, PyCapsuleMethods};
 
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry,
 };
 use lance_io::object_store::providers::memory::MemoryStoreProvider;
+
+/// Name that every capsule passed to [`PyObjectStoreProvider::from_capsule`]
+/// must carry. External wheels create their capsule with this exact name so a
+/// capsule holding some unrelated pointer cannot be mistaken for a provider.
+pub const PROVIDER_CAPSULE_NAME: &CStr = c"lance_object_store_provider";
 
 /// Bridge between a Python object and the Rust `ObjectStoreProvider` trait.
 ///
@@ -68,13 +91,18 @@ impl ObjectStoreProvider for PyProviderBridge {
 
 /// Python-facing wrapper around `Arc<dyn ObjectStoreProvider>`.
 ///
-/// Two ways to construct one from Python:
+/// Three ways to construct one from Python:
 /// - `ObjectStoreProvider(py_obj)` — hold a Python object implementing
 ///   `new_store(base_path, storage_options)`. Registration succeeds; dispatch
 ///   currently raises because the full Python-to-Rust `ObjectStore` bridge
 ///   is a follow-up.
 /// - `ObjectStoreProvider.memory()` — wrap the built-in `MemoryStoreProvider`.
 ///   Registrable under any scheme and fully functional for read/write.
+/// - `ObjectStoreProvider.from_capsule(capsule)` — adopt an
+///   `Arc<dyn ObjectStoreProvider>` produced by a separate, ABI-compatible
+///   wheel (see the module docs on the `PyCapsule` handoff and its lockstep
+///   build requirement). This is how an out-of-tree Rust provider registers
+///   itself without living in the Lance source tree.
 #[pyclass(name = "_ObjectStoreProvider", module = "_lib")]
 #[derive(Clone)]
 pub struct PyObjectStoreProvider {
@@ -103,6 +131,37 @@ impl PyObjectStoreProvider {
         Self {
             inner: Arc::new(PyProviderBridge::Memory(MemoryStoreProvider)),
         }
+    }
+
+    /// Adopt an `Arc<dyn ObjectStoreProvider>` carried in a `PyCapsule` created
+    /// by a separate wheel. The capsule must be named [`PROVIDER_CAPSULE_NAME`]
+    /// and hold exactly an `Arc<dyn ObjectStoreProvider>`.
+    ///
+    /// See the module docstring for the ABI-lockstep requirement: the calling
+    /// wheel must be built against the identical `lance-io` / `object_store`
+    /// source and toolchain as this one.
+    #[staticmethod]
+    fn from_capsule(capsule: &Bound<'_, PyCapsule>) -> PyResult<Self> {
+        match capsule.name()? {
+            Some(name) if name == PROVIDER_CAPSULE_NAME => {}
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "expected a PyCapsule named {:?}, got {:?}",
+                    PROVIDER_CAPSULE_NAME.to_string_lossy(),
+                    other.map(|c| c.to_string_lossy().into_owned()),
+                )));
+            }
+        }
+
+        // SAFETY: by the capsule-name contract above, the capsule carries an
+        // `Arc<dyn ObjectStoreProvider>` built against the identical lance-io /
+        // object_store types (same source, rustc, and resolved dependency
+        // versions). Cloning the `Arc` bumps the strong count; the capsule
+        // retains its own reference and its destructor drops that on GC.
+        let provider = unsafe { capsule.reference::<Arc<dyn ObjectStoreProvider>>() };
+        Ok(Self {
+            inner: provider.clone(),
+        })
     }
 
     fn __repr__(&self) -> String {
