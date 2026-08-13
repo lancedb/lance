@@ -32,20 +32,20 @@ pub(super) mod source;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::optimizer::optimize_projections::OptimizeProjections;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::push_down_limit::PushDownLimit;
 use datafusion::optimizer::simplify_expressions::SimplifyExpressions;
-use datafusion::optimizer::{Analyzer, AnalyzerRule, OptimizerRule};
+use datafusion::optimizer::{Analyzer, AnalyzerRule, Optimizer, OptimizerRule};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use datafusion::prelude::SessionConfig;
 use lance_core::ROW_OFFSET;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::exec::get_session_context;
@@ -86,30 +86,93 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
 
     let context = Arc::new(ScanPlanningContext::collect(scanner, &logical_plan).await?);
 
-    // Built from the same session `execute_plan` will run this plan on, so that lowering sees the
-    // runtime it will actually execute against. `DefaultPhysicalPlanner` consults the config when
-    // it builds sorts and joins — `sort_spill_reservation_bytes` in particular — and a bare
-    // `SessionConfig::new()` here made the resulting plans hold more concurrently in the shared
-    // `FairSpillPool` than the imperative path's, which showed up as intermittent
-    // `ResourcesExhausted` under parallel test load.
-    let session = get_session_context(&scanner.execution_options());
-    let state = SessionStateBuilder::new()
-        .with_default_features()
-        .with_config(session_config(scanner, session.copied_config()))
-        .with_runtime_env(session.runtime_env())
-        .with_analyzer_rules(analyzer_rules(&context))
-        .with_optimizer_rules(optimizer_rules(&context))
-        .with_physical_optimizer_rules(physical_optimizer_rules())
-        .build();
+    let state = planning_state(scanner);
 
-    let optimized = state.optimize(&logical_plan)?;
+    // Run the two logical stages directly rather than through `SessionState::optimize`, because the
+    // rule lists are the one part of planning that genuinely varies per query — each Lance rule
+    // holds the `ScanPlanningContext` above — and registering them on a `SessionState` would drag
+    // the rest of the state into varying with them. See [`planning_state`].
+    let analyzed = Analyzer::with_rules(analyzer_rules(&context)).execute_and_check(
+        logical_plan,
+        state.config_options(),
+        |_, _| {},
+    )?;
+    let optimized = Optimizer::with_rules(optimizer_rules(&context)).optimize(
+        analyzed,
+        state.as_ref(),
+        |_, _| {},
+    )?;
 
     let plan = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
         planner::LanceExtensionPlanner,
     )])
-    .create_physical_plan(&optimized, &state)
+    .create_physical_plan(&optimized, state.as_ref())
     .await?;
     Ok(plan)
+}
+
+/// The query-independent half of planning state, built once and shared.
+///
+/// Built from the same session `execute_plan` will run this plan on, so that lowering sees the
+/// runtime it will actually execute against. `DefaultPhysicalPlanner` consults the config when it
+/// builds sorts and joins — `sort_spill_reservation_bytes` in particular — and a bare
+/// `SessionConfig::new()` here made the resulting plans hold more concurrently in the shared
+/// `FairSpillPool` than the imperative path's, which showed up as intermittent
+/// `ResourcesExhausted` under parallel test load.
+///
+/// Cached because building it is not cheap and nothing in it depends on the query:
+/// `with_default_features()` re-populates DataFusion's entire catalog of scalar, aggregate, window,
+/// and table functions, plus file formats and expression planners, none of which a scan consults.
+/// Measured at roughly 37 µs — against an imperative plan-build of 27 µs for the same query, so
+/// paying it per query doubled the cost of planning a trivial scan.
+///
+/// Only the *rule lists* vary per query, and they are a handful of `Arc`s; [`create_plan`] applies
+/// them with a standalone [`Analyzer`] and [`Optimizer`] instead of registering them here.
+fn planning_state(scanner: &Scanner) -> Arc<SessionState> {
+    /// Keyed by the session this state derives from and the parallelism it was built for.
+    type StateCache = Mutex<HashMap<(String, usize), Arc<SessionState>>>;
+
+    let session = get_session_context(&scanner.execution_options());
+    let target_partitions = scanner
+        .target_parallelism
+        .unwrap_or_else(get_num_compute_intensive_cpus);
+    // The session id identifies the cached `SessionContext` this state derives from, so it stands in
+    // for every execution option without this module having to know what they are.
+    let key = (session.session_id(), target_partitions);
+
+    static CACHE: OnceLock<StateCache> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(state) = cache.get(&key) {
+        return state.clone();
+    }
+
+    let state = Arc::new(
+        SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(
+                session
+                    .copied_config()
+                    .with_target_partitions(target_partitions),
+            )
+            .with_runtime_env(session.runtime_env())
+            .with_physical_optimizer_rules(physical_optimizer_rules())
+            .build(),
+    );
+
+    // The key space is (execution options) × (requested parallelism), both of which take a handful
+    // of distinct values in practice — `get_session_context` caps its own side at 4. Clearing on
+    // overflow rather than evicting an entry keeps this to one line; a workload that actually
+    // thrashed it would be better served by a real LRU.
+    const MAX_ENTRIES: usize = 8;
+    if cache.len() >= MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, state.clone());
+    state
 }
 
 /// The rewrites that must happen for the plan to be *correct*, in the stage that guarantees each
@@ -182,18 +245,6 @@ fn physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync
         vec![Arc::new(JoinSelection::new())];
     rules.extend(get_physical_optimizer().rules);
     rules
-}
-
-/// The shared session's config with the scanner's parallelism applied.
-///
-/// The override matches what the imperative path hands its physical rules, so the two paths agree
-/// on partition counts; everything else is inherited rather than reset.
-fn session_config(scanner: &Scanner, base: SessionConfig) -> SessionConfig {
-    base.with_target_partitions(
-        scanner
-            .target_parallelism
-            .unwrap_or_else(get_num_compute_intensive_cpus),
-    )
 }
 
 /// Reject every query shape the spike has not implemented yet.
