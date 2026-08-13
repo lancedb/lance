@@ -95,38 +95,329 @@ pub(super) fn address_read_concurrency(io_parallelism: usize, largest_read_bytes
     )
 }
 
+/// Merge one legacy candidate into the global top-k.
+///
+/// Legacy candidates already carry row addresses, so the heap evicts on the full
+/// `(score DESC, row_id ASC)` key and `into_sorted_vec` yields the final order
+/// directly. A score tie with a lower row_id wins, a higher one loses, whatever
+/// order candidates arrive in.
 pub(super) fn push_scored_key(
     candidates: &mut BinaryHeap<Reverse<ScoredDoc>>,
     limit: usize,
     key: u64,
     score: f32,
 ) {
+    // A NaN score is never competitive. It has to be rejected before the total
+    // order sees it, because `total_cmp` ranks NaN above every real score, which
+    // would put it at the top of the result. The WAND collector still admits one
+    // into an under-filled heap, so the two layers are not identical here.
+    if score.is_nan() {
+        return;
+    }
+    let candidate = ScoredDoc::new(key, score);
     if candidates.len() < limit {
-        candidates.push(Reverse(ScoredDoc::new(key, score)));
-    } else if candidates
-        .peek()
-        .is_some_and(|candidate| candidate.0.score.0 < score)
-    {
+        candidates.push(Reverse(candidate));
+    } else if candidates.peek().is_some_and(|worst| worst.0 < candidate) {
         candidates.pop();
-        candidates.push(Reverse(ScoredDoc::new(key, score)));
+        candidates.push(Reverse(candidate));
     }
 }
 
-pub(super) fn push_scored_partition_doc(
-    candidates: &mut BinaryHeap<Reverse<ScoredPartitionDoc>>,
-    limit: usize,
-    document: PartitionDocId,
-    score: f32,
-) {
-    if candidates.len() < limit {
-        candidates.push(Reverse(ScoredPartitionDoc::new(document, score)));
-    } else if candidates
-        .peek()
-        .is_some_and(|candidate| candidate.0.score.0 < score)
-    {
-        candidates.pop();
-        candidates.push(Reverse(ScoredPartitionDoc::new(document, score)));
+/// The global top-k of a modern search, as the merge can express it before row
+/// addresses are known.
+#[derive(Default)]
+pub(super) struct ModernCandidates {
+    /// The best `limit` candidates by score.
+    heap: BinaryHeap<Reverse<ScoredPartitionDoc>>,
+    /// Candidates tied at the current k-th score that the heap has no room for.
+    /// Cleared whenever the k-th score rises, so it holds just the current tie
+    /// band and stays empty for a query without ties.
+    tie_band: Vec<ScoredPartitionDoc>,
+}
+
+impl ModernCandidates {
+    /// Merge one candidate.
+    ///
+    /// Modern candidates carry dense DocIds whose row addresses are resolved only
+    /// after selection, so a k-th-score tie cannot be ordered here. Every tied
+    /// candidate is retained instead, and [`rank_resolved_documents`] picks the
+    /// exact top-k once the addresses are known.
+    fn push(&mut self, limit: usize, document: PartitionDocId, score: f32) {
+        if score.is_nan() {
+            return;
+        }
+        let candidate = ScoredPartitionDoc::new(document, score);
+        if self.heap.len() < limit {
+            self.heap.push(Reverse(candidate));
+            return;
+        }
+        let Some(Reverse(worst)) = self.heap.peek() else {
+            return;
+        };
+        let worst_score = worst.score;
+        match candidate.score.cmp(&worst_score) {
+            // Below the k-th score: never competitive.
+            std::cmp::Ordering::Less => {}
+            // Tied at the k-th score: a potential winner once addresses resolve.
+            std::cmp::Ordering::Equal => self.tie_band.push(candidate),
+            std::cmp::Ordering::Greater => {
+                let Some(Reverse(displaced)) = self.heap.pop() else {
+                    return;
+                };
+                self.heap.push(Reverse(candidate));
+                let kth = self.heap.peek().map(|Reverse(entry)| entry.score);
+                if kth.is_some_and(|kth| kth > worst_score) {
+                    // The k-th score rose past the band: none of its members can win.
+                    self.tie_band.clear();
+                } else {
+                    self.tie_band.push(displaced);
+                }
+            }
+        }
     }
+
+    /// Candidates held for the final selection: the top-k plus the tie band.
+    pub(super) fn buffered(&self) -> usize {
+        self.heap.len() + self.tie_band.len()
+    }
+
+    /// The candidates whose addresses have to be resolved: the top-k plus the tie
+    /// band. Returning more than `limit` is safe, the final ranking truncates.
+    pub(super) fn into_vec(self) -> Vec<ScoredPartitionDoc> {
+        let mut candidates = self
+            .heap
+            .into_vec()
+            .into_iter()
+            .map(|Reverse(candidate)| candidate)
+            .collect::<Vec<_>>();
+        candidates.extend(self.tie_band);
+        candidates
+    }
+
+    /// Rebuild from candidates already ordered best first, as the exact top-k with
+    /// an empty tie band.
+    pub(super) fn from_ranked(ordered: Vec<ScoredPartitionDoc>) -> Self {
+        Self {
+            heap: ordered.into_iter().map(Reverse).collect(),
+            tie_band: Vec::new(),
+        }
+    }
+}
+
+/// Order resolved FTS documents by `(score DESC, row_id ASC)` and keep the exact
+/// top-k.
+///
+/// This is where the deterministic tiebreak is finally settled for modern
+/// indexes: the merge above hands over the top-k plus its k-th-score tie group,
+/// and the row addresses resolved in between decide which tied documents win.
+pub(super) fn rank_resolved_documents(
+    mut documents: Vec<ScoredDoc>,
+    limit: usize,
+) -> Vec<ScoredDoc> {
+    documents.sort_unstable_by(|left, right| right.cmp(left));
+    documents.truncate(limit);
+    documents
+}
+
+/// One modern partition prepared for scoring.
+pub(super) struct LoadedModernPartition {
+    partition_ordinal: usize,
+    part: Arc<InvertedPartition>,
+    lengths: Arc<DocLengths>,
+    visibility: DocVisibility,
+    postings: Vec<PostingIterator>,
+    wand_scorer: Option<Arc<MemBM25Scorer>>,
+    threshold: Arc<AtomicU32>,
+    tokens_by_position: Vec<String>,
+    grouped_expansions: Vec<GroupedExpansionTerms>,
+    /// Set on the retry that follows a k-th-score tie overflow, so the walk orders
+    /// ties by row address instead of deferring them to the global merge.
+    pub(super) addresses: Option<ResidentAddressProjection>,
+}
+
+/// What one WAND search had to give up on its retained tie band.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct WandBandStatus {
+    /// See [`Wand::score_floor_overflow`]. When set, the candidates are missing
+    /// part of the partition's k-th-score tie band and must not be merged: the
+    /// partition is searched again with row addresses attached.
+    pub(super) score_floor_overflow: bool,
+    /// See [`Wand::band_truncated`]. A retry cannot improve on it, so it is only
+    /// reported.
+    pub(super) band_truncated: bool,
+}
+
+impl WandBandStatus {
+    pub(super) fn of<S: Scorer, D: WandDocuments>(wand: &Wand<'_, S, D>) -> Self {
+        Self {
+            score_floor_overflow: wand.score_floor_overflow(),
+            band_truncated: wand.band_truncated(),
+        }
+    }
+}
+
+/// Candidates one modern partition contributed to the global merge.
+pub(super) struct ScoredModernPartition {
+    pub(super) partition_ordinal: usize,
+    pub(super) part: Arc<InvertedPartition>,
+    pub(super) candidates: PartitionCandidates<DocId>,
+    pub(super) band: WandBandStatus,
+}
+
+/// Load everything the CPU scoring phase needs for one modern partition.
+///
+/// `Ok(None)` means the partition cannot contribute: no matching postings, or
+/// nothing visible under the prefilter.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn load_modern_partition(
+    partition_ordinal: usize,
+    part: Arc<InvertedPartition>,
+    tokens: Arc<Tokens>,
+    params: Arc<FtsSearchParams>,
+    operator: Operator,
+    mask: Arc<RowAddrMask>,
+    metrics: Arc<dyn MetricsCollector>,
+    impact_scorer: Arc<MemBM25Scorer>,
+    impact_shared_threshold: Arc<AtomicU32>,
+) -> Result<Option<LoadedModernPartition>> {
+    let LoadedPostings {
+        postings,
+        grouped_expansions,
+        impact_safe,
+        exact_scoring_required,
+    } = part
+        .load_posting_lists(
+            tokens.as_ref(),
+            params.as_ref(),
+            operator,
+            impact_scorer.as_ref(),
+            metrics.as_ref(),
+            false,
+        )
+        .await?;
+    if postings.is_empty() {
+        return Ok(None);
+    }
+    let documents = part
+        .docs
+        .modern()
+        .cloned()
+        .ok_or_else(|| Error::internal("modern index contains legacy partition documents"))?;
+    let materialize_selected = operator == Operator::Or
+        && mask.max_len().is_some_and(|selected| {
+            u128::from(selected).saturating_mul(100)
+                <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
+                    .saturating_mul(documents.len() as u128)
+        });
+    let visibility = match documents.immediate_visibility(mask.clone(), materialize_selected) {
+        Some(visibility) => visibility,
+        None => {
+            documents
+                .visibility(mask.clone(), materialize_selected)
+                .await?
+        }
+    };
+    if visibility.is_empty() {
+        return Ok(None);
+    }
+    let lengths = match documents.cached_lengths() {
+        Some(lengths) => lengths,
+        None => documents.lengths().await?,
+    };
+    let max_position = postings
+        .iter()
+        .map(|posting| posting.term_index() as usize)
+        .max()
+        .unwrap_or_default();
+    let mut tokens_by_position = vec![String::new(); max_position + 1];
+    for posting in &postings {
+        tokens_by_position[posting.term_index() as usize] = posting.token().to_owned();
+    }
+    let use_global_scorer = impact_safe || exact_scoring_required;
+    let threshold = if use_global_scorer {
+        impact_shared_threshold
+    } else {
+        Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+    };
+    let wand_scorer = use_global_scorer.then_some(impact_scorer);
+    Ok(Some(LoadedModernPartition {
+        partition_ordinal,
+        part,
+        lengths,
+        visibility,
+        postings,
+        wand_scorer,
+        threshold,
+        tokens_by_position,
+        grouped_expansions,
+        // A partition whose addresses are already in memory orders its k-th-score
+        // ties during the walk. The rest defer them, and an oversized tie band
+        // there is retried with the addresses loaded.
+        addresses: documents.resident_address_projection(),
+    }))
+}
+
+/// Run one modern partition's WAND search. Pure CPU work, so it can run on the
+/// compute pool.
+pub(super) fn score_modern_partition(
+    partition: LoadedModernPartition,
+    params: &FtsSearchParams,
+    operator: Operator,
+    metrics: &dyn MetricsCollector,
+) -> Result<ScoredModernPartition> {
+    let LoadedModernPartition {
+        partition_ordinal,
+        part,
+        lengths,
+        visibility,
+        postings,
+        wand_scorer,
+        threshold,
+        tokens_by_position,
+        grouped_expansions,
+        addresses,
+    } = partition;
+    let (candidates, band) = part.bm25_search_modern(
+        lengths.as_ref(),
+        &visibility,
+        addresses.as_ref(),
+        params,
+        operator,
+        postings,
+        wand_scorer,
+        metrics,
+        threshold,
+    )?;
+    Ok(ScoredModernPartition {
+        partition_ordinal,
+        part,
+        candidates: PartitionCandidates {
+            tokens_by_position,
+            grouped_expansions,
+            candidates,
+        },
+        band,
+    })
+}
+
+/// Rescore one partition's candidates with the corpus-wide statistics and merge
+/// them into the global top-k.
+pub(super) fn merge_modern_partition(
+    ranked: &mut ModernCandidates,
+    limit: usize,
+    partition_ordinal: usize,
+    candidates: PartitionCandidates<DocId>,
+    scorer: &MemBM25Scorer,
+    idf_cache: &mut HashMap<String, f32>,
+) -> Result<()> {
+    for (doc_id, score) in rescore_partition_candidates(candidates, scorer, idf_cache) {
+        ranked.push(
+            limit,
+            PartitionDocId::try_new(partition_ordinal, doc_id)?,
+            score,
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn rescore_partition_candidates<C>(

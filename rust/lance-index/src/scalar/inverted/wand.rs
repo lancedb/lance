@@ -18,10 +18,11 @@ use lance_core::{Error, Result};
 use lance_select::RowAddrMask;
 
 use crate::metrics::MetricsCollector;
+use crate::vector::graph::OrderedFloat;
 
 use super::{
     CompressedPositionStorage,
-    documents::{DocId, DocLengths, DocVisibility},
+    documents::{DocId, DocLengths, DocVisibility, ResidentAddressProjection},
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
     index::{PositionStreamCodec, dequantize_doc_length},
     query::Operator,
@@ -41,26 +42,139 @@ use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
-/// Top-k heap entry: (scored doc, doc length, posting doc id, frequency slot).
-/// The (term, freq) pairs live outside the heap so heap churn moves a compact
-/// tuple instead of a `Vec`.
-type TopKHeap = BinaryHeap<Reverse<(ScoredDoc, u32, u64, u32)>>;
+/// The maximum number of documents a deferred collector buffers beyond `limit`
+/// while it holds the k-th-score tie band. Matches the compound collector's
+/// bound (`compound::SCORE_FLOOR_RESOLUTION_BATCH_SIZE`) so both FTS paths cap
+/// their unresolved working set the same way.
+pub(super) const SCORE_FLOOR_BUFFER: usize = 128;
+
+/// As much of the FTS result order `(score DESC, row_id ASC)` as the WAND walk
+/// can see. Ordered "best is greatest".
+///
+/// `order_key` is the row address when the walk can resolve one and a constant
+/// otherwise (see [`WandDocuments::tie_order_key`]), so this is a partial picture
+/// of the result order: two candidates comparing equal are documents the walk
+/// cannot rank, and the collector retains both rather than choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopKRankKey {
+    score: OrderedFloat,
+    order_key: u64,
+}
+
+impl PartialOrd for TopKRankKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TopKRankKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| other.order_key.cmp(&self.order_key))
+    }
+}
+
+/// The rank key plus the posting DocId, which makes the heap order total.
+///
+/// The DocId is not part of the result order: it only keeps the heap
+/// deterministic and, once the retained band hits its cap, decides which
+/// candidates of an unrankable group to keep. Documents are appended in
+/// coordinate order, so for an index this writer produces the DocId ascends with
+/// `doc_index` inside a row; a rebuilt or merged index preserves that relative
+/// order too. It is a proxy, though, not a format guarantee, which is why it is
+/// consulted only past the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopKKey {
+    rank: TopKRankKey,
+    posting_doc_id: u64,
+}
+
+impl PartialOrd for TopKKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TopKKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank
+            .cmp(&other.rank)
+            .then_with(|| other.posting_doc_id.cmp(&self.posting_doc_id))
+    }
+}
+
+/// One live top-k candidate. The (term, freq) pairs live outside the heap in a
+/// [`FrequencySlots`] slot so heap churn moves a compact record instead of a `Vec`.
+#[derive(Debug, Clone)]
+struct TopKEntry {
+    doc: ScoredDoc,
+    order_key: u64,
+    doc_length: u32,
+    posting_doc_id: u64,
+    frequency_slot: u32,
+}
+
+impl TopKEntry {
+    fn rank_key(&self) -> TopKRankKey {
+        TopKRankKey {
+            score: self.doc.score,
+            order_key: self.order_key,
+        }
+    }
+
+    fn key(&self) -> TopKKey {
+        TopKKey {
+            rank: self.rank_key(),
+            posting_doc_id: self.posting_doc_id,
+        }
+    }
+}
+
+impl PartialEq for TopKEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for TopKEntry {}
+
+impl PartialOrd for TopKEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TopKEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+type TopKHeap = BinaryHeap<Reverse<TopKEntry>>;
 
 /// Reusable (term, freq) storage for live heap candidates. Replacing the k-th
 /// result reuses its slot and retained `Vec` capacity, so memory stays bounded
 /// by the live top-k rather than every historical heap admission.
 struct FrequencySlots {
     slots: Vec<Vec<(u32, u32)>>,
+    /// Slots whose entry left the heap without a replacement, ready for reuse.
+    free: Vec<u32>,
 }
 
 impl FrequencySlots {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             slots: Vec::with_capacity(capacity),
+            free: Vec::new(),
         }
     }
 
     fn push(&mut self, pairs: impl Iterator<Item = (u32, u32)>) -> Result<u32> {
+        if let Some(slot) = self.free.pop() {
+            self.replace(slot, pairs)?;
+            return Ok(slot);
+        }
         let slot = u32::try_from(self.slots.len()).map_err(|_| {
             Error::internal(format!(
                 "FTS top-k frequency slot count {} exceeds u32::MAX",
@@ -83,6 +197,13 @@ impl FrequencySlots {
         Ok(())
     }
 
+    /// Move a slot's pairs out and return the slot to the free list.
+    fn release(&mut self, slot: u32) -> Result<Vec<(u32, u32)>> {
+        let pairs = self.take(slot)?;
+        self.free.push(slot);
+        Ok(pairs)
+    }
+
     fn take(&mut self, slot: u32) -> Result<Vec<(u32, u32)>> {
         let num_slots = self.slots.len();
         self.slots
@@ -96,28 +217,99 @@ impl FrequencySlots {
     }
 }
 
+/// A document tied at the k-th score that the heap has no room for. It owns its
+/// frequencies because it never held a frequency slot.
+struct TieCandidate {
+    doc: ScoredDoc,
+    doc_length: u32,
+    posting_doc_id: u64,
+    freqs: Vec<(u32, u32)>,
+}
+
+/// What the WAND walk knows about the final result order, which decides whether a
+/// full retained band can be recovered from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TieHandling {
+    /// `order_key` is the row address. Candidates the walk cannot rank are then
+    /// documents of one row that also tie on score, differing only in the element
+    /// coordinate the walk cannot see. It stays empty for a row-granularity index,
+    /// where one row address maps to one document. A full band cannot be recovered
+    /// by rereading anything, so it degrades to the DocId proxy and reports
+    /// [`TopKCollector::band_truncated`].
+    ByRowAddress,
+    /// `order_key` is a constant, so the band is the whole k-th-score group. A full
+    /// band reports [`TopKCollector::score_floor_overflow`] and the caller retries
+    /// the partition with addresses attached.
+    DeferredAddresses,
+}
+
 /// Owns the top-k heap and the frequency slots referenced by its entries.
 struct TopKCollector {
     limit: usize,
     heap: TopKHeap,
     frequency_slots: FrequencySlots,
+    tie_handling: TieHandling,
+    /// Cap on `limit + tie_band.len()`. Both modes need one: a deferred walk can
+    /// tie the whole corpus at the k-th score, and nothing bounds how many elements
+    /// a single list row holds.
+    max_buffered: usize,
+    /// Candidates the walk cannot rank against the current k-th entry and the heap
+    /// has no room for. Cleared whenever the k-th key improves, so it holds just
+    /// the current tie band and stays empty for a query without ties.
+    tie_band: Vec<TieCandidate>,
+    score_floor_overflow: bool,
+    band_truncated: bool,
 }
 
 impl TopKCollector {
-    fn new(limit: usize, initial_capacity: usize) -> Self {
+    /// Collector for a walk whose document keys are row addresses.
+    fn by_row_address(limit: usize, initial_capacity: usize) -> Self {
+        Self::new(limit, initial_capacity, TieHandling::ByRowAddress)
+    }
+
+    /// Collector for a walk that resolves row addresses only afterwards.
+    fn deferring_addresses(limit: usize, initial_capacity: usize) -> Self {
+        Self::new(limit, initial_capacity, TieHandling::DeferredAddresses)
+    }
+
+    fn new(limit: usize, initial_capacity: usize, tie_handling: TieHandling) -> Self {
         let initial_capacity = initial_capacity.min(limit);
         Self {
             limit,
             heap: BinaryHeap::with_capacity(initial_capacity),
             frequency_slots: FrequencySlots::with_capacity(initial_capacity),
+            tie_handling,
+            max_buffered: limit.saturating_add(SCORE_FLOOR_BUFFER),
+            tie_band: Vec::new(),
+            score_floor_overflow: false,
+            band_truncated: false,
         }
     }
 
-    /// Insert a competitive result. When the heap is full, its evicted entry's
-    /// frequency slot is cleared and reused before the replacement is pushed.
+    /// True when the walk dropped part of its k-th-score tie band. The caller must
+    /// discard these candidates and retry the partition with resolved row
+    /// addresses, otherwise the final order is not the exact top-k.
+    fn score_floor_overflow(&self) -> bool {
+        self.score_floor_overflow
+    }
+
+    /// True when an address-ordered walk filled its band and fell back to the DocId
+    /// proxy. Rereading cannot recover it, so the caller reports it rather than
+    /// retrying: elements of that one row past the cap may order by DocId instead
+    /// of by `doc_index`.
+    fn band_truncated(&self) -> bool {
+        self.band_truncated
+    }
+
+    /// Insert a competitive result.
+    ///
+    /// Returns whether the document entered the heap. When the heap is full, the
+    /// evicted entry's frequency slot is cleared and reused before the replacement
+    /// is pushed.
     fn insert(
         &mut self,
         doc: ScoredDoc,
+        order_key: u64,
         doc_length: u32,
         posting_doc_id: u64,
         pairs: impl Iterator<Item = (u32, u32)>,
@@ -133,36 +325,197 @@ impl TopKCollector {
             )));
         }
 
-        let frequency_slot = if self.heap.len() == self.limit {
-            let Some(kth_score) = self.heap.peek().map(|entry| entry.0.0.score.0) else {
-                return Err(Error::internal(
-                    "FTS top-k heap is empty while its nonzero limit is reached",
-                ));
-            };
-            // Preserve the existing collector semantics for non-finite custom
-            // scorer output: only a strictly greater raw f32 replaces k-th.
-            if doc.score.0.partial_cmp(&kth_score) != Some(std::cmp::Ordering::Greater) {
+        if self.heap.len() < self.limit {
+            let frequency_slot = self.frequency_slots.push(pairs)?;
+            self.heap.push(Reverse(TopKEntry {
+                doc,
+                order_key,
+                doc_length,
+                posting_doc_id,
+                frequency_slot,
+            }));
+            return Ok(true);
+        }
+
+        // A NaN custom-scorer score is never competitive once the heap is full.
+        // Dropping it here keeps NaN out of the ordering key and preserves the
+        // pre-tiebreak semantics for non-finite scorer output.
+        //
+        // An under-filled heap still admits it, as it always has, and the merge then
+        // drops it: a partition can contribute one candidate fewer than `limit`.
+        // That predates the tiebreak and is left alone here.
+        if doc.score.0.is_nan() {
+            return Ok(false);
+        }
+        let candidate = TopKKey {
+            rank: TopKRankKey {
+                score: doc.score,
+                order_key,
+            },
+            posting_doc_id,
+        };
+        let Some(Reverse(worst)) = self.heap.peek() else {
+            return Err(Error::internal(
+                "FTS top-k heap is empty while its nonzero limit is reached",
+            ));
+        };
+        let worst_key = worst.key();
+
+        // Equal rank keys mean the walk cannot rank these two documents. The heap
+        // order still separates them through the DocId proxy, but that is not the
+        // result order, so the loser is retained instead of dropped.
+        if candidate.rank == worst_key.rank {
+            if self.band_is_full() {
+                self.record_band_full();
+            } else if candidate > worst_key {
+                // Wins the proxy, so it takes the heap slot and the displaced entry
+                // becomes the retained one.
+                let displaced = self.replace_worst_retaining(
+                    doc,
+                    order_key,
+                    doc_length,
+                    posting_doc_id,
+                    pairs,
+                )?;
+                self.tie_band.push(displaced);
+                return Ok(true);
+            } else {
+                self.tie_band.push(TieCandidate {
+                    doc,
+                    doc_length,
+                    posting_doc_id,
+                    freqs: pairs.collect(),
+                });
                 return Ok(false);
             }
-            let Some(Reverse((_, _, _, frequency_slot))) = self.heap.pop() else {
-                return Err(Error::internal(
-                    "FTS top-k heap entry disappeared during replacement",
-                ));
-            };
-            self.frequency_slots.replace(frequency_slot, pairs)?;
-            frequency_slot
-        } else {
-            self.frequency_slots.push(pairs)?
-        };
+        }
 
-        self.heap
-            .push(Reverse((doc, doc_length, posting_doc_id, frequency_slot)));
-        Ok(true)
+        match candidate.cmp(&worst_key) {
+            // Ranks below the k-th entry: never competitive.
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(false),
+            // Ranks above the k-th entry: it always enters the heap.
+            std::cmp::Ordering::Greater => {
+                // Checked before the pop, which would otherwise make the buffer look
+                // one candidate emptier than it is.
+                let band_full = self.band_is_full();
+                let Some(Reverse(displaced)) = self.heap.pop() else {
+                    return Err(Error::internal(
+                        "FTS top-k heap entry disappeared during replacement",
+                    ));
+                };
+                // The k-th key after the replacement is the smaller of what the pop
+                // exposed and the newcomer, both known without pushing first.
+                let kth = self
+                    .heap
+                    .peek()
+                    .map_or(candidate, |Reverse(entry)| entry.key().min(candidate));
+                let retain_displaced = if kth.rank > worst_key.rank {
+                    // The k-th rank rose past the band: none of its members can win.
+                    self.tie_band.clear();
+                    false
+                } else if band_full {
+                    self.record_band_full();
+                    false
+                } else {
+                    true
+                };
+
+                if retain_displaced {
+                    // The displaced entry keeps its frequencies, so the newcomer
+                    // takes another slot and the released one serves the next
+                    // replacement.
+                    let frequency_slot = self.frequency_slots.push(pairs)?;
+                    self.heap.push(Reverse(TopKEntry {
+                        doc,
+                        order_key,
+                        doc_length,
+                        posting_doc_id,
+                        frequency_slot,
+                    }));
+                    let freqs = self.frequency_slots.release(displaced.frequency_slot)?;
+                    self.tie_band.push(TieCandidate {
+                        doc: displaced.doc,
+                        doc_length: displaced.doc_length,
+                        posting_doc_id: displaced.posting_doc_id,
+                        freqs,
+                    });
+                } else {
+                    // Nothing keeps the displaced frequencies, so the slot and its
+                    // retained capacity are reused in place. This is the path every
+                    // improving candidate of a query without ties takes.
+                    let frequency_slot = displaced.frequency_slot;
+                    self.frequency_slots.replace(frequency_slot, pairs)?;
+                    self.heap.push(Reverse(TopKEntry {
+                        doc,
+                        order_key,
+                        doc_length,
+                        posting_doc_id,
+                        frequency_slot,
+                    }));
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Pop the worst entry, push `doc` in its place with a fresh slot, and return
+    /// the displaced entry owning its frequencies.
+    fn replace_worst_retaining(
+        &mut self,
+        doc: ScoredDoc,
+        order_key: u64,
+        doc_length: u32,
+        posting_doc_id: u64,
+        pairs: impl Iterator<Item = (u32, u32)>,
+    ) -> Result<TieCandidate> {
+        let Some(Reverse(displaced)) = self.heap.pop() else {
+            return Err(Error::internal(
+                "FTS top-k heap entry disappeared during replacement",
+            ));
+        };
+        let frequency_slot = self.frequency_slots.push(pairs)?;
+        self.heap.push(Reverse(TopKEntry {
+            doc,
+            order_key,
+            doc_length,
+            posting_doc_id,
+            frequency_slot,
+        }));
+        let freqs = self.frequency_slots.release(displaced.frequency_slot)?;
+        Ok(TieCandidate {
+            doc: displaced.doc,
+            doc_length: displaced.doc_length,
+            posting_doc_id: displaced.posting_doc_id,
+            freqs,
+        })
+    }
+
+    /// Record that the band could not take another candidate.
+    ///
+    /// A deferred walk can be retried with addresses. An address-ordered one has
+    /// nothing to reread, so it keeps ranking the heap on the DocId proxy: the
+    /// documents the result order would pick still reach the final selection, but
+    /// the rest of the unrankable group past the cap is dropped.
+    fn record_band_full(&mut self) {
+        match self.tie_handling {
+            TieHandling::ByRowAddress => self.band_truncated = true,
+            TieHandling::DeferredAddresses => self.score_floor_overflow = true,
+        }
+    }
+
+    /// Documents held for the final selection: the heap plus the retained band.
+    fn buffered(&self) -> usize {
+        self.heap.len() + self.tie_band.len()
+    }
+
+    /// Whether the retained band has reached its cap.
+    fn band_is_full(&self) -> bool {
+        self.buffered() >= self.max_buffered
     }
 
     fn kth_score_if_full(&self) -> Option<f32> {
         if self.heap.len() == self.limit {
-            self.heap.peek().map(|entry| entry.0.0.score.0)
+            self.heap.peek().map(|entry| entry.0.doc.score.0)
         } else {
             None
         }
@@ -175,25 +528,50 @@ impl TopKCollector {
         let Self {
             heap,
             mut frequency_slots,
+            tie_band,
             ..
         } = self;
-        heap.into_iter()
-            .map(
-                |Reverse((doc, doc_length, posting_doc_id, frequency_slot))| {
-                    Ok(DocCandidate {
-                        document: to_candidate(doc.row_id),
-                        posting_doc_id,
-                        freqs: frequency_slots.take(frequency_slot)?,
-                        doc_length,
-                    })
-                },
-            )
-            .collect()
+        let mut candidates = heap
+            .into_iter()
+            .map(|Reverse(entry)| {
+                Ok(DocCandidate {
+                    document: to_candidate(entry.doc.row_id),
+                    posting_doc_id: entry.posting_doc_id,
+                    freqs: frequency_slots.take(entry.frequency_slot)?,
+                    doc_length: entry.doc_length,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // The retained ties may beat a heap entry once addresses are resolved. The
+        // caller re-selects by `(score, row_id)`, so returning more than `limit`
+        // documents is safe.
+        candidates.reserve(tie_band.len());
+        for tie in tie_band {
+            candidates.push(DocCandidate {
+                document: to_candidate(tie.doc.row_id),
+                posting_doc_id: tie.posting_doc_id,
+                freqs: tie.freqs,
+                doc_length: tie.doc_length,
+            });
+        }
+        Ok(candidates)
     }
 
     #[cfg(test)]
     fn num_frequency_slots(&self) -> usize {
         self.frequency_slots.slots.len()
+    }
+
+    /// Smallest retained capacity across the live slots. A slot whose buffer was
+    /// handed to a retained tie comes back at zero.
+    #[cfg(test)]
+    fn min_frequency_slot_capacity(&self) -> usize {
+        self.frequency_slots
+            .slots
+            .iter()
+            .map(Vec::capacity)
+            .min()
+            .unwrap_or_default()
     }
 }
 const LINEAR_BLOCK_SKIP_LIMIT: usize = 8;
@@ -1559,6 +1937,27 @@ pub(super) trait WandDocuments {
     fn candidate_from_key(&self, key: u64) -> Self::Candidate;
     fn flat_documents(&self) -> Option<FlatDocuments<'_>>;
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
+
+    /// Whether [`WandDocuments::tie_order_key`] returns real row addresses.
+    ///
+    /// FTS results are ordered `(score DESC, row_id ASC)`. When this is true the
+    /// walk can rank score ties between rows itself; when it is false the ordering
+    /// key carries no information and the collector retains the whole k-th-score
+    /// band so the caller can re-select once addresses are resolved.
+    fn orders_ties_by_address(&self) -> bool;
+
+    /// Key used to rank score ties inside one partition's top-k.
+    ///
+    /// Implementations that report [`WandDocuments::orders_ties_by_address`] return
+    /// the row address here. A deferred walk returns a constant instead, which makes
+    /// every score tie compare equal and be retained. This default returns the
+    /// document key, which is what the legacy adapter wants (its key is the row
+    /// address); the test-only [`DocSet`] adapter inherits it too, so a wand unit
+    /// test over a DocSet without row_ids ranks by a DocId that production would
+    /// have deferred, and does not exercise the retained band.
+    fn tie_order_key(&self, document_key: u64) -> u64 {
+        document_key
+    }
 }
 
 pub(super) trait ModernVisibility {
@@ -1603,6 +2002,9 @@ impl ModernVisibility for &DocVisibility {
 pub(super) struct ModernWandDocuments<'a, V> {
     lengths: &'a DocLengths,
     visibility: V,
+    /// Attached only when the partition's row addresses are already in memory.
+    /// The walk then orders k-th-score ties exactly instead of deferring them.
+    addresses: Option<&'a ResidentAddressProjection>,
 }
 
 impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
@@ -1610,6 +2012,7 @@ impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
         Self {
             lengths,
             visibility: AllModernDocuments,
+            addresses: None,
         }
     }
 }
@@ -1619,7 +2022,20 @@ impl<'a> ModernWandDocuments<'a, &'a DocVisibility> {
         Self {
             lengths,
             visibility,
+            addresses: None,
         }
+    }
+}
+
+impl<'a, V> ModernWandDocuments<'a, V> {
+    /// Order k-th-score ties by row address instead of deferring them, using an
+    /// address projection the caller already holds in memory.
+    pub(crate) fn with_addresses(
+        mut self,
+        addresses: Option<&'a ResidentAddressProjection>,
+    ) -> Self {
+        self.addresses = addresses;
+        self
     }
 }
 
@@ -1678,6 +2094,24 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
 
     fn flat_doc_length(&self, doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
         self.scoring_num_tokens(doc_id as u32)
+    }
+
+    fn orders_ties_by_address(&self) -> bool {
+        self.addresses.is_some()
+    }
+
+    fn tie_order_key(&self, document_key: u64) -> u64 {
+        // Element documents of one row share its address, so this key ranks rows
+        // but not the elements within a row. The collector keeps every candidate it
+        // cannot rank, and the final sort settles them on `doc_index`.
+        //
+        // A dead slot has no current address. It is not visible to the walk, so
+        // ranking it last only guards against it winning a tie. Without a
+        // projection the key is that same constant for every document, which makes
+        // the collector retain the whole k-th-score band.
+        self.addresses
+            .and_then(|addresses| addresses.address(DocId::new(document_key as u32)))
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -1750,6 +2184,11 @@ impl WandDocuments for LegacyWandDocuments<'_> {
             self.docs.num_tokens_by_row_id(document_key)
         }
     }
+
+    // Legacy document keys are row addresses, so the walk orders ties exactly.
+    fn orders_ties_by_address(&self) -> bool {
+        true
+    }
 }
 
 // Most unit tests exercise WAND in isolation with an in-memory complete
@@ -1808,6 +2247,11 @@ impl WandDocuments for DocSet {
         } else {
             self.num_tokens_by_row_id(document_key)
         }
+    }
+
+    // `document_key` is a row address whenever this in-memory DocSet carries one.
+    fn orders_ties_by_address(&self) -> bool {
+        self.has_row_ids()
     }
 }
 
@@ -1973,6 +2417,12 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
     shared_threshold: Option<Arc<AtomicU32>>,
+    // Set when the last search dropped part of its k-th-score tie band because
+    // the walk could not order ties by row address (see `TieHandling`).
+    score_floor_overflow: bool,
+    // Set when an address-ordered search filled its band and fell back to the
+    // DocId proxy for the elements of one row.
+    band_truncated: bool,
 }
 
 /// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
@@ -1985,6 +2435,22 @@ fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
             Err(actual) => cur = actual,
         }
     }
+}
+
+/// Lower a competitive-score threshold by one ULP so the score-only WAND prune
+/// tests (`score <= threshold`) and their admit mirrors (`score > threshold`)
+/// keep, rather than drop, documents whose score equals the k-th best.
+///
+/// This is the admit-ties half of the deterministic tiebreak: the pruning kernels
+/// stay score-only and fast, and the equal-score band survives to be ordered by
+/// row_id in the collector and in the cross-partition merge. Documents strictly
+/// below the k-th score are still pruned, so non-tied queries keep their pruning
+/// power: a block max rarely bit-equals the running k-th score. For a zero or
+/// negative input `next_down` drops below zero, which the `threshold > 0.0` guards
+/// read as "no threshold yet".
+#[inline]
+fn admit_ties_floor(threshold: f32) -> f32 {
+    threshold.next_down()
 }
 
 // we were using row id as doc id in the past, which is u64,
@@ -2037,6 +2503,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             documents,
             scorer,
             shared_threshold: None,
+            score_floor_overflow: false,
+            band_truncated: false,
         }
     }
 
@@ -2046,6 +2514,33 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
         self
+    }
+
+    /// Build the top-k collector for one walk.
+    ///
+    /// The document adapter decides whether k-th-score ties can be settled during
+    /// the walk or must be deferred (see [`WandDocuments::orders_ties_by_address`]).
+    fn new_collector(&self, limit: usize, initial_capacity: usize) -> TopKCollector {
+        if self.documents.orders_ties_by_address() {
+            TopKCollector::by_row_address(limit, initial_capacity)
+        } else {
+            TopKCollector::deferring_addresses(limit, initial_capacity)
+        }
+    }
+
+    /// Whether the last search dropped part of its k-th-score tie band.
+    ///
+    /// The candidates it returned are then only the exact top-k up to that band,
+    /// so the caller must retry the partition with resolved row addresses.
+    pub(crate) fn score_floor_overflow(&self) -> bool {
+        self.score_floor_overflow
+    }
+
+    /// Whether the last search filled its band while already ordering by row
+    /// address. See [`TopKCollector::band_truncated`]: a retry cannot improve on
+    /// it, so the caller only reports it.
+    pub(crate) fn band_truncated(&self) -> bool {
+        self.band_truncated
     }
 
     /// Share one cross-partition top-k floor across a query's partitions.
@@ -2071,6 +2566,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
     /// Set the pruning threshold from this partition's k-th best, raised to the
     /// shared cross-partition floor when one is attached.
+    ///
+    /// The stored value sits one ULP below the k-th score ([`admit_ties_floor`]) so
+    /// documents tied at the k-th score are admitted rather than pruned; the
+    /// collector and the cross-partition merge then order them by row_id. The raw
+    /// k-th score is what gets published to the shared floor, so every partition
+    /// lowers from the same basis. The tiebreak holds for `wand_factor <= 1.0` (the
+    /// default); a larger factor lifts the floor above the k-th score and may prune
+    /// ties.
     fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
         let mut t = local_kth * wand_factor;
         if let Some(shared) = self.shared_threshold.as_ref() {
@@ -2080,14 +2583,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 t = g;
             }
         }
-        self.threshold = t;
+        self.threshold = admit_ties_floor(t);
     }
 
-    /// Raise the local threshold to the shared cross-partition floor, picking up
-    /// updates published by sibling partitions.
+    /// Raise the local threshold to the shared cross-partition floor published by
+    /// sibling partitions.
+    ///
+    /// Lowered one ULP like [`Wand::update_threshold`], so a tie at the shared k-th
+    /// score is not pruned by whichever partition published first. The merge
+    /// resolves it by row_id, which makes the result independent of partition
+    /// completion order.
     fn raise_to_shared_floor(&mut self, wand_factor: f32) {
         if let Some(shared) = self.shared_threshold.as_ref() {
-            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+            let g = admit_ties_floor(f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor);
             if g > self.threshold {
                 self.threshold = g;
             }
@@ -2151,7 +2659,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return self.and_bulk_search(params, metrics);
         }
 
-        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = self.new_collector(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         let mut and_search_stats = (self.operator == Operator::And).then_some(AndSearchStats {
             pruned_before_return_start: self.and_candidates_pruned_before_return,
@@ -2201,6 +2709,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
+                self.documents.tie_order_key(document_key),
                 doc_length,
                 posting_doc_id,
                 self.iter_term_freqs(),
@@ -2237,6 +2746,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             metrics.record_freqs_collected(and_stats.freqs_collected);
         }
 
+        self.score_floor_overflow = candidates.score_floor_overflow();
+        self.band_truncated = candidates.band_truncated();
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
@@ -2266,7 +2777,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .unwrap_or(false);
 
         let mut num_comparisons = 0;
-        let mut candidates = TopKCollector::new(limit, 0);
+        let mut candidates = self.new_collector(limit, 0);
         for (doc_id, document_key) in documents {
             num_comparisons += 1;
             self.move_head_before_target_to_tail(doc_id);
@@ -2314,6 +2825,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
+                self.documents.tie_order_key(document_key),
                 doc_length,
                 doc_id,
                 self.iter_term_freqs(),
@@ -2326,6 +2838,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         metrics.record_comparisons(num_comparisons);
 
+        self.score_floor_overflow = candidates.score_floor_overflow();
+        self.band_truncated = candidates.band_truncated();
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
@@ -2362,7 +2876,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let total_sum_upper_bound_factor = score_sum_upper_bound_factor(clauses.len());
 
         let mut acc = WindowAccumulator::new(clauses.len());
-        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = self.new_collector(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let norm_k = self.norm_k_cache();
         let norm_k_ref = norm_k
             .as_ref()
@@ -2588,6 +3102,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                     let doc_length = self.documents.scoring_num_tokens(doc as u32);
                                     if candidates.insert(
                                         ScoredDoc::new(document_key, total),
+                                        self.documents.tie_order_key(document_key),
                                         doc_length,
                                         doc,
                                         std::iter::once((essential_term, freq)).chain(
@@ -2781,6 +3296,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 .unwrap_or_else(|| self.documents.scoring_num_tokens(doc as u32));
                             if candidates.insert(
                                 ScoredDoc::new(document_key, score),
+                                self.documents.tie_order_key(document_key),
                                 doc_length,
                                 doc,
                                 clauses.iter().enumerate().filter_map(|(i, clause)| {
@@ -2817,6 +3333,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         metrics.record_comparisons(num_comparisons);
 
+        self.score_floor_overflow = candidates.score_floor_overflow();
+        self.band_truncated = candidates.band_truncated();
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
@@ -3226,7 +3744,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
 
-        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = self.new_collector(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
         let mut stats = AndSearchStats {
             pruned_before_return_start: self.and_candidates_pruned_before_return,
@@ -3530,6 +4048,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
                     if candidates.insert(
                         ScoredDoc::new(document_key, score),
+                        self.documents.tie_order_key(document_key),
                         doc_length,
                         u64::from(doc),
                         wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
@@ -3571,6 +4090,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         metrics.record_and_full_scores(stats.full_scores);
         metrics.record_freqs_collected(stats.freqs_collected);
 
+        self.score_floor_overflow = candidates.score_floor_overflow();
+        self.band_truncated = candidates.band_truncated();
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
@@ -4866,12 +5387,13 @@ mod tests {
     fn test_top_k_collector_reuses_frequency_slots() -> Result<()> {
         const LIMIT: usize = 8;
         const NUM_DOCS: usize = 10_000;
-        let mut collector = TopKCollector::new(LIMIT, LIMIT);
+        let mut collector = TopKCollector::by_row_address(LIMIT, LIMIT);
 
         for doc in 0..NUM_DOCS {
             let num_terms = doc % 4 + 1;
             let inserted = collector.insert(
                 ScoredDoc::new(doc as u64, doc as f32),
+                doc as u64,
                 num_terms as u32,
                 doc as u64,
                 (0..num_terms).map(|term| (term as u32, doc as u32)),
@@ -4892,6 +5414,306 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(candidate.freqs, expected_freqs);
         }
+        Ok(())
+    }
+
+    // Deterministic top-k tiebreak (score DESC, row_id ASC).
+    //
+    // A BM25 top-k that breaks ties arbitrarily is not a stable prefix across `k`:
+    // top-k1 is not a prefix of top-k2, so paginating a tied-score query (a broad
+    // term where many documents share `(tf, doc_len)`) duplicates and skips rows.
+    // The collector settles the tie when it knows row addresses and retains the
+    // whole k-th-score band when it does not, and `admit_ties_floor` keeps the
+    // WAND pruning kernels from dropping that band in the first place.
+
+    /// The ordering key a walk that defers row addresses hands the collector: one
+    /// constant for every document, so every score tie compares equal.
+    const DEFERRED_ORDER_KEY: u64 = u64::MAX;
+
+    /// Insert a document the walk can rank by row address. `document_key` doubles
+    /// as the address so the assertions can read the result back.
+    fn insert_addressed(
+        collector: &mut TopKCollector,
+        document_key: u64,
+        score: f32,
+    ) -> Result<bool> {
+        insert_at_address(collector, document_key, document_key, score)
+    }
+
+    /// Insert a document at an explicit address, so several documents can share
+    /// one address the way the elements of a list row do.
+    fn insert_at_address(
+        collector: &mut TopKCollector,
+        document_key: u64,
+        address: u64,
+        score: f32,
+    ) -> Result<bool> {
+        collector.insert(
+            ScoredDoc::new(document_key, score),
+            address,
+            1,
+            document_key,
+            std::iter::once((0u32, 1u32)),
+        )
+    }
+
+    /// Insert a document into a collector whose walk defers row addresses.
+    fn insert_deferred(
+        collector: &mut TopKCollector,
+        document_key: u64,
+        score: f32,
+    ) -> Result<bool> {
+        insert_at_address(collector, document_key, DEFERRED_ORDER_KEY, score)
+    }
+
+    fn collected_keys(collector: TopKCollector) -> Result<Vec<u64>> {
+        let mut keys = collector
+            .into_candidates(|key| key)?
+            .into_iter()
+            .map(|candidate| candidate.document)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        Ok(keys)
+    }
+
+    #[rstest]
+    #[case::one(1.0)]
+    #[case::small(f32::MIN_POSITIVE)]
+    #[case::large(1e30)]
+    fn test_admit_ties_floor_sits_just_below_kth(#[case] kth: f32) {
+        // A document tied at the k-th score must pass the `score > threshold` admit
+        // test, so the floor sits strictly below the k-th score, exactly one ULP down.
+        let floor = admit_ties_floor(kth);
+        assert!(floor < kth, "floor {floor} must be < kth {kth}");
+        assert_eq!(floor, kth.next_down());
+    }
+
+    #[test]
+    fn test_admit_ties_floor_zero_negative_and_nan() {
+        // Zero and negative inputs drop below zero, which the `threshold > 0.0`
+        // prune guards read as "no threshold yet" (pruning disabled).
+        assert!(admit_ties_floor(0.0) < 0.0);
+        assert!(admit_ties_floor(-1.0) < -1.0);
+        // NaN stays NaN; it is never a competitive score and is guarded at insert time.
+        assert!(admit_ties_floor(f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn test_top_k_collector_by_row_address_evicts_on_full_key() -> Result<()> {
+        // The ordering key is the row address, so a score tie is decided here: a
+        // lower address evicts the worst tied entry, a higher one loses.
+        let mut collector = TopKCollector::by_row_address(2, 2);
+        assert!(insert_addressed(&mut collector, 20, 1.0)?);
+        assert!(insert_addressed(&mut collector, 10, 1.0)?); // heap full {10, 20}
+        assert!(insert_addressed(&mut collector, 5, 1.0)?); // ties, lower address
+        assert!(!insert_addressed(&mut collector, 30, 1.0)?); // ties, higher address
+        assert!(!insert_addressed(&mut collector, 15, 0.5)?); // below the k-th score
+        assert!(!collector.score_floor_overflow());
+        // Distinct addresses leave nothing the walk cannot rank.
+        assert!(collector.tie_band.is_empty());
+        assert_eq!(
+            collected_keys(collector)?,
+            vec![5, 10],
+            "the two lowest addresses among the tie"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_k_collector_retains_element_documents_of_one_row() -> Result<()> {
+        // Element documents of one row share its address, so the address key cannot
+        // rank them and only `doc_index` can, which the walk never sees. Evicting
+        // one of them here would pick an arbitrary element, so both are retained and
+        // the resolved re-selection settles it.
+        const ROW: u64 = 100;
+        let mut collector = TopKCollector::by_row_address(2, 2);
+        assert!(insert_at_address(&mut collector, 11, ROW, 1.0)?);
+        assert!(insert_at_address(&mut collector, 12, ROW, 1.0)?);
+        // A lower address outranks the row whatever its elements' coordinates are,
+        // so it takes a heap slot and the element it displaced stays a candidate.
+        assert!(insert_at_address(&mut collector, 10, 50, 1.0)?);
+        assert!(!collector.score_floor_overflow());
+        assert_eq!(
+            collected_keys(collector)?,
+            vec![10, 11, 12],
+            "both elements of the tied row must reach the resolved re-selection"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_k_collector_ranks_rows_around_a_tied_element_row() -> Result<()> {
+        // The element band is still bounded by the row it belongs to: a strictly
+        // higher address loses outright, and a rising k-th key drops the band.
+        const ROW: u64 = 100;
+        let mut collector = TopKCollector::by_row_address(2, 2);
+        assert!(insert_at_address(&mut collector, 11, ROW, 1.0)?);
+        assert!(insert_at_address(&mut collector, 12, ROW, 1.0)?);
+        assert!(!insert_at_address(&mut collector, 13, 200, 1.0)?); // higher address
+        assert!(insert_at_address(&mut collector, 10, 50, 1.0)?); // lower address
+        assert!(insert_at_address(&mut collector, 9, 60, 2.0)?); // better score
+        assert_eq!(
+            collected_keys(collector)?,
+            vec![9, 10],
+            "a rising k-th key drops the element band"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_k_collector_retains_score_floor_band() -> Result<()> {
+        // A walk that defers row addresses has a constant ordering key, so every
+        // document tied at the k-th score shares one rank key and must survive for
+        // the address-resolved re-selection, whether it lands in the heap or beside
+        // it. The DocId proxy only decides which side of that split it lands on.
+        let mut collector = TopKCollector::deferring_addresses(2, 2);
+        assert!(insert_deferred(&mut collector, 10, 1.0)?);
+        assert!(insert_deferred(&mut collector, 11, 1.0)?);
+        assert!(insert_deferred(&mut collector, 5, 1.0)?); // wins the proxy, heap
+        assert!(!insert_deferred(&mut collector, 20, 1.0)?); // loses it, band
+        assert!(!collector.score_floor_overflow());
+        assert_eq!(
+            collected_keys(collector)?,
+            vec![5, 10, 11, 20],
+            "the whole tie band is kept, not just the first two seen"
+        );
+
+        // Once the k-th score rises past the band, none of its members can win.
+        let mut collector = TopKCollector::deferring_addresses(2, 2);
+        assert!(insert_deferred(&mut collector, 0, 1.0)?);
+        assert!(insert_deferred(&mut collector, 1, 1.0)?);
+        assert!(!insert_deferred(&mut collector, 2, 1.0)?);
+        assert!(insert_deferred(&mut collector, 3, 2.0)?); // k-th still 1.0
+        assert!(insert_deferred(&mut collector, 4, 2.0)?); // k-th rises to 2.0
+        assert_eq!(collected_keys(collector)?, vec![3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_k_collector_bounds_the_element_band() -> Result<()> {
+        // Nothing bounds how many elements a list row holds, so an address-ordered
+        // walk caps its band too. Past the cap the heap keeps ranking on the DocId
+        // proxy, so the documents the final order would pick survive even though
+        // the rest of the group is dropped.
+        const ROW: u64 = 100;
+        const LIMIT: usize = 2;
+        let max_buffered = LIMIT + SCORE_FLOOR_BUFFER;
+        let collect = || -> Result<(Vec<u64>, bool, usize)> {
+            let mut collector = TopKCollector::by_row_address(LIMIT, LIMIT);
+            // Descending DocIds, so the documents the result order wants arrive last
+            // and a collector that kept whatever it saw first would miss them.
+            for document_key in (0..(max_buffered as u64 + 50)).rev() {
+                insert_at_address(&mut collector, document_key, ROW, 1.0)?;
+            }
+            let truncated = collector.band_truncated();
+            let buffered = collector.buffered();
+            assert!(
+                !collector.score_floor_overflow(),
+                "an address-ordered walk has nothing to retry"
+            );
+            Ok((collected_keys(collector)?, truncated, buffered))
+        };
+
+        let (kept, truncated, buffered) = collect()?;
+        assert!(
+            truncated,
+            "an element band wider than the buffer must report a truncation"
+        );
+        assert!(
+            buffered <= max_buffered,
+            "buffered {buffered} must stay within {max_buffered}"
+        );
+        assert_eq!(
+            kept[..LIMIT],
+            [0, 1],
+            "the documents the result order picks must survive the truncation"
+        );
+
+        let (repeated, _, _) = collect()?;
+        assert_eq!(kept, repeated, "the truncation must be deterministic");
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_k_collector_score_floor_overflow_stays_bounded() -> Result<()> {
+        const LIMIT: usize = 3;
+        let max_buffered = LIMIT + SCORE_FLOOR_BUFFER;
+        let mut collector = TopKCollector::deferring_addresses(LIMIT, LIMIT);
+        for key in 0..(max_buffered as u64 + 50) {
+            insert_deferred(&mut collector, key, 1.0)?;
+        }
+        assert!(
+            collector.score_floor_overflow(),
+            "a tie band wider than the buffer must report an overflow"
+        );
+        let buffered = collector.buffered();
+        assert!(
+            buffered <= max_buffered,
+            "buffered {buffered} must stay within {max_buffered}"
+        );
+        // Only the heap takes frequency slots; retained ties own their frequencies.
+        assert!(collector.num_frequency_slots() <= LIMIT);
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_k_collector_reuses_slots_when_no_tie_is_retained() -> Result<()> {
+        // A deferred walk over strictly improving scores retains nothing, so every
+        // replacement must reuse the displaced entry's slot in place. Allocating a
+        // slot for the newcomer and releasing the displaced one instead would add a
+        // slot and hand its buffer away, which is exactly what `FrequencySlots`
+        // exists to avoid.
+        const LIMIT: usize = 4;
+        const NUM_PAIRS: u32 = 4;
+        let mut collector = TopKCollector::deferring_addresses(LIMIT, LIMIT);
+        for doc in 0..1_000u64 {
+            collector.insert(
+                ScoredDoc::new(doc, doc as f32),
+                DEFERRED_ORDER_KEY,
+                1,
+                doc,
+                (0..NUM_PAIRS).map(|term| (term, doc as u32)),
+            )?;
+        }
+        assert!(collector.tie_band.is_empty());
+        assert_eq!(
+            collector.num_frequency_slots(),
+            LIMIT,
+            "an improving candidate must not allocate a slot beyond the heap"
+        );
+        assert!(
+            collector.min_frequency_slot_capacity() >= NUM_PAIRS as usize,
+            "a reused slot must keep its retained capacity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_k_collector_rejects_nan_scores() -> Result<()> {
+        let mut collector = TopKCollector::by_row_address(1, 1);
+        assert!(insert_addressed(&mut collector, 1, 1.0)?);
+        assert!(!insert_addressed(&mut collector, 0, f32::NAN)?);
+        assert_eq!(collected_keys(collector)?, vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_k_collector_recycles_slots_while_retaining_ties() -> Result<()> {
+        // A retained band that the k-th score rises past is dropped wholesale, and
+        // the frequency slots of the documents that moved into it must come back.
+        const LIMIT: usize = 2;
+        let mut collector = TopKCollector::deferring_addresses(LIMIT, LIMIT);
+        for round in 0..50u64 {
+            for tie in 0..8u64 {
+                insert_deferred(&mut collector, round * 8 + tie, round as f32)?;
+            }
+        }
+        assert!(!collector.score_floor_overflow());
+        assert!(
+            collector.num_frequency_slots() <= LIMIT + 1,
+            "slot count {} grew with the number of dropped bands",
+            collector.num_frequency_slots()
+        );
         Ok(())
     }
 

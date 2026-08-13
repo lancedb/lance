@@ -465,10 +465,11 @@ async fn search_test_impact_partition(
     let documents = partition.docs.modern().unwrap();
     let lengths = documents.lengths().await.unwrap();
     let visibility = documents.visibility(NoFilter.mask(), false).await.unwrap();
-    partition
+    let (candidates, band) = partition
         .bm25_search_modern(
             lengths.as_ref(),
             &visibility,
+            None,
             params,
             Operator::Or,
             postings,
@@ -476,7 +477,9 @@ async fn search_test_impact_partition(
             &NoOpMetricsCollector,
             shared_threshold,
         )
-        .unwrap()
+        .unwrap();
+    assert!(!band.score_floor_overflow);
+    candidates
 }
 
 #[tokio::test]
