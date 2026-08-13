@@ -583,6 +583,31 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert plan.tasks[0].fragments == [frag.metadata for frag in fragments[0:2]]
     assert plan.tasks[1].fragments == [frag.metadata for frag in fragments[2:4]]
     assert repr(plan) == "CompactionPlan(read_version=1, tasks=<2 compaction tasks>)"
+
+    excluded_plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=400,
+            excluded_fragment_ids=[1, 1, 999],
+            num_threads=1,
+        ),
+    )
+    assert excluded_plan.num_tasks() == 1
+    assert excluded_plan.tasks[0].fragments == [
+        frag.metadata for frag in fragments[2:4]
+    ]
+    assert pickle.loads(pickle.dumps(excluded_plan)) == excluded_plan
+
+    none_plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=400,
+            excluded_fragment_ids=None,
+            num_threads=1,
+        ),
+    )
+    assert none_plan == plan
+
     # Plan can be pickled
     assert pickle.loads(pickle.dumps(plan)) == plan
 
