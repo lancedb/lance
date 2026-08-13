@@ -241,6 +241,9 @@ public class DatasetTest {
 
             List<Version> versions = dataset.listVersions();
             assertEquals(3, versions.size());
+            assertEquals(3, dataset.getVersionCount());
+            assertEquals(3, dataset2.getVersionCount());
+            assertEquals(3, dataset3.getVersionCount());
             assertEquals(1, versions.get(0).getId());
             assertEquals(2, versions.get(1).getId());
             assertEquals(3, versions.get(2).getId());
@@ -657,6 +660,40 @@ public class DatasetTest {
       nameColumnAlteration = new ColumnAlteration.Builder("new_name_2").build();
       dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
       assertNotNull(dataset.getSchema().findField("new_name_2"));
+    }
+  }
+
+  @Test
+  void testAlterColumnsCastType(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Widen "id" from Int32 to Int64. The cast target type is a parameterized ArrowType, which
+      // must survive the trip to the native side; regression test for a dropped cast that left the
+      // stored type unchanged.
+      ColumnAlteration widenId =
+          new ColumnAlteration.Builder("id").castTo(new ArrowType.Int(64, true)).build();
+      dataset.alterColumns(Collections.singletonList(widenId));
+
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id").getType());
+
+      // A cast combined with rename must apply both.
+      ColumnAlteration renameAndWiden =
+          new ColumnAlteration.Builder("id")
+              .rename("id_long")
+              .castTo(new ArrowType.Int(64, true))
+              .build();
+      dataset.alterColumns(Collections.singletonList(renameAndWiden));
+
+      List<String> fieldNames =
+          dataset.getSchema().getFields().stream().map(Field::getName).collect(Collectors.toList());
+      assertFalse(fieldNames.contains("id"));
+      assertTrue(fieldNames.contains("id_long"));
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id_long").getType());
     }
   }
 

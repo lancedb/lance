@@ -573,6 +573,28 @@ impl Branches<'_> {
             log::warn!("BranchContents of {} does not exist", branch);
         }
 
+        // Tags identify snapshots by (branch, version). Deleting a branch removes its entire version chain,
+        // so any tag whose branch matches the deletion target blocks the operation, regardless of the tagged
+        // version.
+        let referenced_tags = self
+            .refs
+            .tags()
+            .fetch_tags()
+            .await?
+            .into_iter()
+            .filter_map(|(name, contents)| {
+                (contents.branch.as_deref() == Some(branch)).then_some((name, contents.version))
+            })
+            .collect_vec();
+        if !referenced_tags.is_empty() {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Branch {} is referenced by tags {:?}, can not delete",
+                    branch, referenced_tags
+                ),
+            });
+        }
+
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {

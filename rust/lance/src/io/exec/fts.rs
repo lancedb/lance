@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{AsArray, BooleanBuilder, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt64Type};
@@ -66,6 +66,111 @@ use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenWithPosition {
+    text: String,
+    position: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenizedQuery(Vec<TokenWithPosition>);
+
+impl TokenizedQuery {
+    fn from_tokens(tokens: &Tokens) -> Self {
+        let mut token_positions = Vec::with_capacity(tokens.len());
+        for index in 0..tokens.len() {
+            token_positions.push(TokenWithPosition {
+                text: tokens.get_token(index).to_string(),
+                position: tokens.position(index),
+            });
+        }
+        Self(token_positions)
+    }
+}
+
+impl std::fmt::Display for TokenizedQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+        for (index, token) in self.0.iter().enumerate() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "({:?}, {})", token.text, token.position)?;
+        }
+        write!(f, "]")
+    }
+}
+
+fn record_tokenized_query(snapshot: &OnceLock<TokenizedQuery>, tokens: &Tokens) {
+    snapshot.get_or_init(|| TokenizedQuery::from_tokens(tokens));
+}
+
+fn fmt_tokenized_query(
+    snapshot: &OnceLock<TokenizedQuery>,
+    separator: &str,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    if let Some(tokens) = snapshot.get() {
+        write!(f, "{separator}tokenized_query={tokens}")?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenizedLeafKind {
+    Match,
+    Phrase,
+}
+
+impl std::fmt::Display for TokenizedLeafKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Match => write!(f, "Match"),
+            Self::Phrase => write!(f, "Phrase"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenizedQueryLeaf {
+    kind: TokenizedLeafKind,
+    column: Option<String>,
+    tokens: TokenizedQuery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenizedCompoundQuery(Vec<TokenizedQueryLeaf>);
+
+impl std::fmt::Display for TokenizedCompoundQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+        for (index, leaf) in self.0.iter().enumerate() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            write!(
+                f,
+                "{}(column={:?}, tokens={})",
+                leaf.kind,
+                leaf.column.as_deref().unwrap_or_default(),
+                leaf.tokens
+            )?;
+        }
+        write!(f, "]")
+    }
+}
+
+fn fmt_tokenized_compound_query(
+    snapshot: &OnceLock<TokenizedCompoundQuery>,
+    separator: &str,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    if let Some(tokens) = snapshot.get() {
+        write!(f, "{separator}tokenized_query={tokens}")?;
+    }
+    Ok(())
+}
 
 /// Expands a schema-derived nested FTS source into one canonical row per
 /// logical document before flat search or index building consumes it.
@@ -378,6 +483,7 @@ fn count_fts_leaves(query: &FtsQuery) -> usize {
 pub struct CompoundQueryExec {
     dataset: Arc<Dataset>,
     query: FtsQuery,
+    tokenized_query: Arc<OnceLock<TokenizedCompoundQuery>>,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
     /// When set, leaf scorers use this instead of building one from the
@@ -431,6 +537,7 @@ impl CompoundQueryExec {
         Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             prefilter_source,
             base_scorer: None,
@@ -484,9 +591,13 @@ impl DisplayAs for CompoundQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "CompoundFtsScorer: query={}", self.query)
+                write!(f, "CompoundFtsScorer: query={}", self.query)?;
+                fmt_tokenized_compound_query(&self.tokenized_query, ", ", f)
             }
-            DisplayFormatType::TreeRender => write!(f, "CompoundFtsScorer\nquery={}", self.query),
+            DisplayFormatType::TreeRender => {
+                write!(f, "CompoundFtsScorer\nquery={}", self.query)?;
+                fmt_tokenized_compound_query(&self.tokenized_query, "\n", f)
+            }
         }
     }
 }
@@ -545,6 +656,7 @@ impl ExecutionPlan for CompoundQueryExec {
         Ok(Arc::new(Self {
             dataset: self.dataset.clone(),
             query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
             params: self.params.clone(),
             prefilter_source,
             base_scorer: self.base_scorer.clone(),
@@ -562,6 +674,7 @@ impl ExecutionPlan for CompoundQueryExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let dataset = self.dataset.clone();
         let query = self.query.clone();
+        let tokenized_query = self.tokenized_query.clone();
         let params = self.params.clone();
         let prefilter_source = self.prefilter_source.clone();
         let base_scorer = self.base_scorer.clone();
@@ -592,6 +705,10 @@ impl ExecutionPlan for CompoundQueryExec {
             let _details = load_segment_details(&dataset, column, &segments).await?;
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
+            if let Some(first_index) = indices.first() {
+                tokenized_query
+                    .get_or_init(|| tokenize_compound_query(&query, first_index.as_ref()));
+            }
             let mut prefilter = build_prefilter(
                 context,
                 partition,
@@ -672,6 +789,75 @@ fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
     Box::new(TextTokenizer::new(
         TextAnalyzer::builder(SimpleTokenizer::default()).build(),
     ))
+}
+
+fn tokenizer_for_match_query(
+    index: &InvertedIndex,
+    fuzziness: Option<u32>,
+) -> Box<dyn LanceTokenizer> {
+    if !matches!(fuzziness, Some(distance) if distance != 0) {
+        return index.tokenizer();
+    }
+
+    let analyzer = TextAnalyzer::from(SimpleTokenizer::default());
+    match index.tokenizer().doc_type() {
+        DocType::Text => Box::new(TextTokenizer::new(analyzer)),
+        DocType::Json => Box::new(JsonTokenizer::new(analyzer)),
+    }
+}
+
+fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> TokenizedCompoundQuery {
+    fn visit(query: &FtsQuery, index: &InvertedIndex, leaves: &mut Vec<TokenizedQueryLeaf>) {
+        match query {
+            FtsQuery::Match(query) => {
+                let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
+                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                leaves.push(TokenizedQueryLeaf {
+                    kind: TokenizedLeafKind::Match,
+                    column: query.column.clone(),
+                    tokens: TokenizedQuery::from_tokens(&tokens),
+                });
+            }
+            FtsQuery::Phrase(query) => {
+                let mut tokenizer = index.tokenizer();
+                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                leaves.push(TokenizedQueryLeaf {
+                    kind: TokenizedLeafKind::Phrase,
+                    column: query.column.clone(),
+                    tokens: TokenizedQuery::from_tokens(&tokens),
+                });
+            }
+            FtsQuery::Boost(query) => {
+                visit(&query.positive, index, leaves);
+                visit(&query.negative, index, leaves);
+            }
+            FtsQuery::MultiMatch(query) => {
+                for query in &query.match_queries {
+                    let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
+                    let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                    leaves.push(TokenizedQueryLeaf {
+                        kind: TokenizedLeafKind::Match,
+                        column: query.column.clone(),
+                        tokens: TokenizedQuery::from_tokens(&tokens),
+                    });
+                }
+            }
+            FtsQuery::Boolean(query) => {
+                for query in query
+                    .should
+                    .iter()
+                    .chain(&query.must)
+                    .chain(&query.must_not)
+                {
+                    visit(query, index, leaves);
+                }
+            }
+        }
+    }
+
+    let mut leaves = Vec::with_capacity(count_fts_leaves(query));
+    visit(query, index, &mut leaves);
+    TokenizedCompoundQuery(leaves)
 }
 
 type SharedScorerResult = std::result::Result<Arc<MemBM25Scorer>, Arc<str>>;
@@ -980,6 +1166,7 @@ impl MetricsCollector for FtsIndexMetrics {
 pub struct MatchQueryExec {
     dataset: Arc<Dataset>,
     query: MatchQuery,
+    tokenized_query: Arc<OnceLock<TokenizedQuery>>,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
     /// When set, `execute()` skips `build_global_bm25_scorer` and threads this
@@ -1006,7 +1193,8 @@ impl DisplayAs for MatchQueryExec {
                     "MatchQuery: column={}, query=[{}]",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
-                )
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, ", ", f)
             }
             DisplayFormatType::TreeRender => {
                 write!(
@@ -1014,7 +1202,8 @@ impl DisplayAs for MatchQueryExec {
                     "MatchQuery\ncolumn={}\nquery={}",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
-                )
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, "\n", f)
             }
         }
     }
@@ -1066,6 +1255,7 @@ impl MatchQueryExec {
         Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             prefilter_source,
             base_scorer: None,
@@ -1127,6 +1317,7 @@ impl MatchQueryExec {
         Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             prefilter_source,
             base_scorer: None,
@@ -1168,6 +1359,7 @@ impl MatchQueryExec {
         Ok(Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             prefilter_source,
             base_scorer: None,
@@ -1279,6 +1471,7 @@ impl ExecutionPlan for MatchQueryExec {
                 Self {
                     dataset: self.dataset.clone(),
                     query: self.query.clone(),
+                    tokenized_query: self.tokenized_query.clone(),
                     params: self.params.clone(),
                     prefilter_source: PreFilterSource::None,
                     base_scorer: self.base_scorer.clone(),
@@ -1310,6 +1503,7 @@ impl ExecutionPlan for MatchQueryExec {
                 Self {
                     dataset: self.dataset.clone(),
                     query: self.query.clone(),
+                    tokenized_query: self.tokenized_query.clone(),
                     params: self.params.clone(),
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
@@ -1338,6 +1532,7 @@ impl ExecutionPlan for MatchQueryExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
+        let tokenized_query = self.tokenized_query.clone();
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
@@ -1388,26 +1583,13 @@ impl ExecutionPlan for MatchQueryExec {
             metrics
                 .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
 
-            let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
             let first_index = indices.first().ok_or(DataFusionError::Execution(format!(
                 "FTS index for column {} has no segments",
                 column
             )))?;
-            let mut tokenizer = match is_fuzzy {
-                false => first_index.tokenizer(),
-                true => {
-                    let tokenizer = TextAnalyzer::from(SimpleTokenizer::default());
-                    match first_index.tokenizer().doc_type() {
-                        DocType::Text => {
-                            Box::new(TextTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
-                        }
-                        DocType::Json => {
-                            Box::new(JsonTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
-                        }
-                    }
-                }
-            };
+            let mut tokenizer = tokenizer_for_match_query(first_index, query.fuzziness);
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            record_tokenized_query(&tokenized_query, &tokens);
             let base_scorer = match (preset_base_scorer, shared_scorer) {
                 (Some(scorer), _) => scorer,
                 (None, Some(shared_scorer)) => shared_scorer.wait().await?,
@@ -1475,6 +1657,7 @@ pub struct FlatMatchFilterExec {
     dataset: Arc<Dataset>,
     input: Arc<dyn ExecutionPlan>,
     query: MatchQuery,
+    tokenized_query: Arc<OnceLock<TokenizedQuery>>,
     params: FtsSearchParams,
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`]. `FlatMatchFilterExec` only
@@ -1490,6 +1673,7 @@ pub struct FlatMatchFilterExec {
 struct FlatMatchFilterStreamOptions {
     dataset: Arc<Dataset>,
     query: MatchQuery,
+    tokenized_query: Arc<OnceLock<TokenizedQuery>>,
     document_column: String,
     preset_segments: Option<Vec<IndexMetadata>>,
     resolved_field: Option<ResolvedFtsField>,
@@ -1536,7 +1720,8 @@ impl DisplayAs for FlatMatchFilterExec {
                     "FlatMatchFilter: column={}, query={}",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
-                )
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, ", ", f)
             }
             DisplayFormatType::TreeRender => {
                 write!(
@@ -1544,7 +1729,8 @@ impl DisplayAs for FlatMatchFilterExec {
                     "FlatMatchFilter\ncolumn={}\nquery={}",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
-                )
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, "\n", f)
             }
         }
     }
@@ -1606,6 +1792,7 @@ impl FlatMatchFilterExec {
             dataset,
             input,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             preset_segments: None,
             document_column,
@@ -1625,6 +1812,7 @@ impl FlatMatchFilterExec {
             dataset,
             input,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             preset_segments: None,
             document_column: resolved_field.root_column.clone(),
@@ -1648,6 +1836,7 @@ impl FlatMatchFilterExec {
             dataset,
             input,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             preset_segments: Some(segments),
             document_column,
@@ -1703,6 +1892,7 @@ impl FlatMatchFilterExec {
         let FlatMatchFilterStreamOptions {
             dataset,
             query,
+            tokenized_query,
             document_column,
             preset_segments,
             resolved_field,
@@ -1752,6 +1942,7 @@ impl FlatMatchFilterExec {
             }
         };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
+        record_tokenized_query(&tokenized_query, &query_tokens);
 
         let baseline = BaselineMetrics::new(&metrics_set, partition);
         let elapsed_compute = baseline.elapsed_compute().clone();
@@ -1850,6 +2041,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
             dataset: self.dataset.clone(),
             input,
             query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
             params: self.params.clone(),
             preset_segments: self.preset_segments.clone(),
             document_column: self.document_column.clone(),
@@ -1873,6 +2065,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
             FlatMatchFilterStreamOptions {
                 dataset: self.dataset.clone(),
                 query: self.query.clone(),
+                tokenized_query: self.tokenized_query.clone(),
                 document_column: self.document_column.clone(),
                 preset_segments: self.preset_segments.clone(),
                 resolved_field: self.resolved_field.clone(),
@@ -1908,6 +2101,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
 pub struct FlatMatchQueryExec {
     dataset: Arc<Dataset>,
     query: MatchQuery,
+    tokenized_query: Arc<OnceLock<TokenizedQuery>>,
     params: FtsSearchParams,
     unindexed_input: Arc<dyn ExecutionPlan>,
     /// Optional override for the BM25 scorer normally built locally inside
@@ -1935,7 +2129,8 @@ impl DisplayAs for FlatMatchQueryExec {
                     "FlatMatchQuery: column={}, query={}",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
-                )
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, ", ", f)
             }
             DisplayFormatType::TreeRender => {
                 write!(
@@ -1943,7 +2138,8 @@ impl DisplayAs for FlatMatchQueryExec {
                     "FlatMatchQuery\ncolumn={}\nquery={}",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
-                )
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, "\n", f)
             }
         }
     }
@@ -1988,6 +2184,7 @@ impl FlatMatchQueryExec {
         Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             unindexed_input,
             base_scorer: None,
@@ -2043,6 +2240,7 @@ impl FlatMatchQueryExec {
         Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             unindexed_input,
             base_scorer: None,
@@ -2118,6 +2316,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         Ok(Arc::new(Self {
             dataset: self.dataset.clone(),
             query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
             params: self.params.clone(),
             unindexed_input,
             base_scorer: self.base_scorer.clone(),
@@ -2138,6 +2337,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
+        let tokenized_query = self.tokenized_query.clone();
         let ds = self.dataset.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer_producer = self.shared_scorer.clone().map(SharedFtsScorerProducer::new);
@@ -2185,11 +2385,11 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             format!("FTS index for column {} has no segments", column),
                         ))?;
                         let mut tokenizer = first_index.tokenizer();
+                        let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                        record_tokenized_query(&tokenized_query, &query_tokens);
                         let base_scorer = match preset_base_scorer {
                             Some(scorer) => (*scorer).clone(),
                             None => {
-                                let query_tokens =
-                                    collect_query_tokens(&query.terms, &mut tokenizer);
                                 let scorer_start = std::time::Instant::now();
                                 let scorer = build_global_bm25_scorer(
                                     &indices,
@@ -2205,10 +2405,12 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         };
                         (tokenizer, Some(base_scorer))
                     }
-                    None => (
-                        default_text_tokenizer(),
-                        preset_base_scorer.map(|s| (*s).clone()),
-                    ),
+                    None => {
+                        let mut tokenizer = default_text_tokenizer();
+                        let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                        record_tokenized_query(&tokenized_query, &query_tokens);
+                        (tokenizer, preset_base_scorer.map(|s| (*s).clone()))
+                    }
                 };
 
                 flat_bm25_search_stream_with_options_and_scorer(
@@ -2281,6 +2483,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
 pub struct PhraseQueryExec {
     dataset: Arc<Dataset>,
     query: PhraseQuery,
+    tokenized_query: Arc<OnceLock<TokenizedQuery>>,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
     /// Optional override for the BM25 scorer normally built locally inside
@@ -2306,7 +2509,8 @@ impl DisplayAs for PhraseQueryExec {
                     "PhraseQuery: column={}, query={}",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
-                )
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, ", ", f)
             }
             DisplayFormatType::TreeRender => {
                 write!(
@@ -2314,7 +2518,8 @@ impl DisplayAs for PhraseQueryExec {
                     "PhraseQuery\ncolumn={}\nquery={}",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
-                )
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, "\n", f)
             }
         }
     }
@@ -2358,6 +2563,7 @@ impl PhraseQueryExec {
         Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             prefilter_source,
             base_scorer: None,
@@ -2412,6 +2618,7 @@ impl PhraseQueryExec {
         Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             prefilter_source,
             base_scorer: None,
@@ -2454,6 +2661,7 @@ impl PhraseQueryExec {
         Ok(Self {
             dataset,
             query,
+            tokenized_query: Arc::new(OnceLock::new()),
             params,
             prefilter_source,
             base_scorer: None,
@@ -2547,6 +2755,7 @@ impl ExecutionPlan for PhraseQueryExec {
             0 => Self {
                 dataset: self.dataset.clone(),
                 query: self.query.clone(),
+                tokenized_query: self.tokenized_query.clone(),
                 params: self.params.clone(),
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
@@ -2576,6 +2785,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 Self {
                     dataset: self.dataset.clone(),
                     query: self.query.clone(),
+                    tokenized_query: self.tokenized_query.clone(),
                     params: self.params.clone(),
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
@@ -2604,6 +2814,7 @@ impl ExecutionPlan for PhraseQueryExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
+        let tokenized_query = self.tokenized_query.clone();
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
@@ -2660,6 +2871,7 @@ impl ExecutionPlan for PhraseQueryExec {
             )))?;
             let mut tokenizer = first_index.tokenizer();
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            record_tokenized_query(&tokenized_query, &tokens);
             let base_scorer = match (preset_base_scorer, shared_scorer) {
                 (Some(scorer), _) => scorer,
                 (None, Some(shared_scorer)) => shared_scorer.wait().await?,
@@ -3347,6 +3559,54 @@ mod tests {
         (Arc::new(dataset), committed, fragment_ids)
     }
 
+    fn tokenized_query_index_params() -> InvertedIndexParams {
+        InvertedIndexParams::new("simple".to_string(), Language::English)
+            .with_position(true)
+            .lower_case(true)
+            .stem(false)
+            .remove_stop_words(true)
+            .ascii_folding(false)
+    }
+
+    async fn create_tokenized_query_fixture(with_unindexed_append: bool) -> Dataset {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["first and second"]),
+            )
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &tokenized_query_index_params(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        if with_unindexed_append {
+            let appended = lance_datagen::gen_batch()
+                .col(
+                    "text",
+                    lance_datagen::array::cycle_utf8_literals(&["first and second"]),
+                )
+                .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+            dataset.append(appended, None).await.unwrap();
+        }
+        dataset
+    }
+
+    fn find_plan_line<'a>(analysis: &'a str, node: &str) -> &'a str {
+        analysis
+            .lines()
+            .find(|line| line.trim_start().starts_with(node))
+            .unwrap_or_else(|| panic!("{node} missing from plan:\n{analysis}"))
+    }
+
     fn segment_uuid_for_fragment(segments: &[IndexMetadata], fragment_id: u32) -> Uuid {
         segments
             .iter()
@@ -3723,6 +3983,92 @@ mod tests {
             .unwrap();
         let analysis = analyze_scanner.analyze_plan().await.unwrap();
         assert!(analysis.contains(PARTITIONS_SEARCHED_METRIC));
+    }
+
+    #[tokio::test]
+    async fn test_analyze_plan_shows_indexed_and_flat_match_tokens() {
+        let dataset = create_tokenized_query_fixture(true).await;
+        let query = MatchQuery::new("FIRST and SECOND".to_string())
+            .with_column(Some("text".to_string()))
+            .with_operator(Operator::And);
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap();
+
+        let explained = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            !explained.contains("tokenized_query="),
+            "explain_plan should not claim runtime tokenization: {explained}"
+        );
+
+        let analysis = scanner.analyze_plan().await.unwrap();
+        let expected = r#"tokenized_query=[("first", 0), ("second", 2)]"#;
+        assert!(
+            find_plan_line(&analysis, "MatchQuery:").contains(expected),
+            "indexed MatchQuery is missing token positions:\n{analysis}"
+        );
+        assert!(
+            find_plan_line(&analysis, "FlatMatchQuery:").contains(expected),
+            "flat MatchQuery is missing token positions:\n{analysis}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analyze_plan_shows_indexed_and_flat_phrase_tokens() {
+        let dataset = create_tokenized_query_fixture(true).await;
+        let query =
+            PhraseQuery::new("FIRST and SECOND".to_string()).with_column(Some("text".to_string()));
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap();
+
+        let analysis = scanner.analyze_plan().await.unwrap();
+        let expected = r#"tokenized_query=[("first", 0), ("second", 2)]"#;
+        assert!(
+            find_plan_line(&analysis, "PhraseQuery:").contains(expected),
+            "indexed PhraseQuery is missing token positions:\n{analysis}"
+        );
+        assert!(
+            find_plan_line(&analysis, "FlatMatchQuery:").contains(expected),
+            "flat phrase path is missing token positions:\n{analysis}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analyze_plan_shows_compound_leaf_tokens() {
+        let dataset = create_tokenized_query_fixture(false).await;
+        let query = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("FIRST and SECOND".to_string())
+                    .with_column(Some("text".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                PhraseQuery::new("SECOND FIRST".to_string())
+                    .with_column(Some("text".to_string()))
+                    .with_slop(2)
+                    .into(),
+            ),
+        ]);
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap();
+
+        let analysis = scanner.analyze_plan().await.unwrap();
+        let compound = find_plan_line(&analysis, "CompoundFtsScorer:");
+        assert!(
+            compound.contains(r#"Match(column="text", tokens=[("first", 0), ("second", 2)])"#),
+            "compound Match leaf is missing token positions: {compound}"
+        );
+        assert!(
+            compound.contains(r#"Phrase(column="text", tokens=[("second", 0), ("first", 1)])"#),
+            "compound Phrase leaf is missing token positions: {compound}"
+        );
     }
 
     #[tokio::test]

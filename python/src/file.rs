@@ -299,8 +299,7 @@ impl LanceFileWriter {
             .transpose()
             .infer_error()?
             .unwrap_or_default()
-            .resolve()
-            .into();
+            .resolve();
         let options = FileWriterOptions {
             data_cache_bytes,
             keep_original_array,

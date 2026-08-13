@@ -617,6 +617,139 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
     assert result["name"][2] == "Chase"  # id=3 should have name Chase
 
 
+def test_fragment_update_columns_with_blob_v2(tmp_path):
+    data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4]),
+            "payload": lance.blob_array([b"one", b"two", b"", None]),
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_blob_v2"
+    dataset = lance.write_dataset(
+        data,
+        dataset_uri,
+        data_storage_version="2.2",
+    )
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "payload": lance.blob_array([b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+
+    operation = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        operation,
+        read_version=dataset.version,
+    )
+
+    result = updated_dataset.to_table(blob_handling="all_binary")
+    assert result["id"].to_pylist() == [1, 2, 3, 4]
+    assert result["payload"].to_pylist() == [b"one", b"NEW", b"", None]
+
+
+def test_fragment_update_columns_with_nested_blob_v2(tmp_path):
+    def info_array(names, payloads):
+        fields = [pa.field("name", pa.string()), lance.blob_field("blob")]
+        return pa.StructArray.from_arrays(
+            [pa.array(names), lance.blob_array(payloads)], fields=fields
+        )
+
+    dataset_uri = tmp_path / "test_dataset_update_columns_nested_blob_v2"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([1, 2]),
+                "info": info_array(["a", "b"], [b"one", b"two"]),
+            }
+        ),
+        dataset_uri,
+        data_storage_version="2.2",
+    )
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "info": info_array(["B"], [b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+        ),
+        read_version=dataset.version,
+    )
+
+    info = updated_dataset.to_table(blob_handling="all_binary")["info"].combine_chunks()
+    assert info.field("name").to_pylist() == ["a", "B"]
+    assert info.field("blob").to_pylist() == [b"one", b"NEW"]
+
+
+def test_fragment_update_columns_preserves_external_blob_v2(tmp_path):
+    dataset_uri = tmp_path / "test_dataset_update_columns_external_blob_v2"
+    external = tmp_path / "existing-payload.bin"
+    external.write_bytes(b"outside")
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([1, 2]),
+                "payload": lance.blob_array([external.as_uri(), b"two"]),
+            }
+        ),
+        dataset_uri,
+        data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
+    )
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "payload": lance.blob_array([b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+        ),
+        read_version=dataset.version,
+    )
+
+    result = updated_dataset.to_table(blob_handling="all_binary")
+    assert result["payload"].to_pylist() == [b"outside", b"NEW"]
+
+    new_external = tmp_path / "new-payload.bin"
+    new_external.write_bytes(b"new outside")
+    with pytest.raises(ValueError, match="outside registered external bases"):
+        updated_dataset.get_fragment(0).update_columns(
+            pa.table(
+                {
+                    "id": pa.array([2]),
+                    "payload": lance.blob_array([new_external.as_uri()]),
+                }
+            ),
+            left_on="id",
+        )
+
+
 def test_fragment_update_columns_with_nulls(tmp_path):
     """Test fragment update columns with null values."""
     # Create initial dataset
@@ -1155,3 +1288,32 @@ def test_row_id_sequence_reads_back_fragment_metadata(tmp_path: Path):
         [0, 1, 2, 3, 4],
         [5, 6, 7, 8, 9],
     ]
+
+
+def test_fragment_validate(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(100), "b": range(100)}),
+        tmp_path,
+        max_rows_per_file=50,
+    )
+    # A valid fragment validates without raising.
+    for fragment in dataset.get_fragments():
+        assert fragment.validate() is None
+
+
+def test_fragment_validate_across_data_files(tmp_path: Path):
+    # add_columns writes a second data file per fragment; validate must still
+    # pass (field ids increasing and unique across a fragment's data files).
+    dataset = write_dataset(pa.table({"a": range(100)}), tmp_path, max_rows_per_file=50)
+    dataset.add_columns({"b": "a + 1"})
+    for fragment in dataset.get_fragments():
+        assert len(fragment.data_files()) > 1
+        fragment.validate()
+
+
+def test_fragment_validate_after_delete(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(100)}), tmp_path, max_rows_per_file=50)
+    dataset.delete("a < 10")
+    # A fragment carrying a deletion vector still validates.
+    for fragment in dataset.get_fragments():
+        fragment.validate()

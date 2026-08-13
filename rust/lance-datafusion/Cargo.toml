@@ -41,7 +41,6 @@ prost-build.workspace = true
 protobuf-src = {version = "2.1", optional = true}
 
 [dev-dependencies]
-lance-datagen.workspace = true
 rstest.workspace = true
 
 [features]
