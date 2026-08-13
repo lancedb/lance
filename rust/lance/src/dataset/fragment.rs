@@ -1169,8 +1169,7 @@ impl FileFragment {
             .data_file_dir(data_file)?
             .join(data_file.path.as_str());
         let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
-            // TODO: make object stores for non-default bases reuse the same scan scheduler
-            //  currently we always create a new one
+            // TODO: reuse the same scan scheduler for non-default bases
             let object_store = self.dataset.object_store(Some(base_id)).await?;
             let config = SchedulerConfig::max_bandwidth(&object_store);
             (
