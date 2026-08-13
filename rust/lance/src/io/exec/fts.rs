@@ -46,7 +46,9 @@ use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
+    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
+    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -1058,6 +1060,10 @@ pub struct FtsIndexMetrics {
     compound_peak_address_resolution_batch_size: Gauge,
     compound_score_floor_overflows: Count,
     compound_peak_buffered_candidates: Gauge,
+    compound_should_skipped_windows: Count,
+    compound_should_bound_recomputations: Count,
+    compound_should_essential_evaluations: Count,
+    compound_should_non_essential_evaluations: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -1087,6 +1093,14 @@ impl FtsIndexMetrics {
                 .new_count(COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, partition),
             compound_peak_buffered_candidates: metrics
                 .new_gauge(COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC, partition),
+            compound_should_skipped_windows: metrics
+                .new_count(COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC, partition),
+            compound_should_bound_recomputations: metrics
+                .new_count(COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC, partition),
+            compound_should_essential_evaluations: metrics
+                .new_count(COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, partition),
+            compound_should_non_essential_evaluations: metrics
+                .new_count(COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -1159,6 +1173,25 @@ impl MetricsCollector for FtsIndexMetrics {
     fn record_compound_peak_buffered_candidates(&self, num_candidates: usize) {
         self.compound_peak_buffered_candidates
             .set_max(num_candidates);
+    }
+
+    fn record_compound_should_skipped_windows(&self, num_windows: usize) {
+        self.compound_should_skipped_windows.add(num_windows);
+    }
+
+    fn record_compound_should_bound_recomputations(&self, num_recomputations: usize) {
+        self.compound_should_bound_recomputations
+            .add(num_recomputations);
+    }
+
+    fn record_compound_should_essential_evaluations(&self, num_evaluations: usize) {
+        self.compound_should_essential_evaluations
+            .add(num_evaluations);
+    }
+
+    fn record_compound_should_non_essential_evaluations(&self, num_evaluations: usize) {
+        self.compound_should_non_essential_evaluations
+            .add(num_evaluations);
     }
 }
 
@@ -3461,7 +3494,7 @@ mod tests {
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_datagen::{BatchCount, ByteCount, RowCount};
-    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
         PhraseQuery, collect_query_tokens, has_query_token,
@@ -3511,6 +3544,22 @@ mod tests {
         fn consume(self) -> ExecutionSummaryCounts {
             self.collected_stats.lock().unwrap().take().unwrap()
         }
+    }
+
+    #[test]
+    fn test_compound_should_metrics_are_counted_independently() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = super::FtsIndexMetrics::new(&metrics_set, 0);
+
+        metrics.record_compound_should_skipped_windows(2);
+        metrics.record_compound_should_bound_recomputations(3);
+        metrics.record_compound_should_essential_evaluations(5);
+        metrics.record_compound_should_non_essential_evaluations(7);
+
+        assert_eq!(metrics.compound_should_skipped_windows.value(), 2);
+        assert_eq!(metrics.compound_should_bound_recomputations.value(), 3);
+        assert_eq!(metrics.compound_should_essential_evaluations.value(), 5);
+        assert_eq!(metrics.compound_should_non_essential_evaluations.value(), 7);
     }
 
     async fn create_segment_selection_fixture() -> (Arc<Dataset>, Vec<IndexMetadata>, Vec<u32>) {
@@ -3888,7 +3937,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![legacy_index_meta],
                 removed_indices: vec![index_meta],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
         )
         .build();

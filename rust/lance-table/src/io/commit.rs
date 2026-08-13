@@ -239,9 +239,23 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
-    /// Optional e-tag, used for integrity checks. Manifests should be immutable, so
-    /// if we detect a change in the e-tag, it means the manifest was tampered with.
-    /// This might happen if the dataset was deleted and then re-created.
+    /// Optional opaque object generation token observed at `path`.
+    ///
+    /// An ETag is not necessarily a content checksum and may change when an
+    /// object is rewritten with identical bytes. In particular, S3 Express
+    /// returns an object-specific opaque value. Callers must not treat it as a
+    /// content checksum, logical manifest identity, or dataset-incarnation
+    /// identity. The generic
+    /// [`ExternalManifestStore`](crate::io::commit::external_manifest::ExternalManifestStore)
+    /// workflow therefore neither persists nor validates it: COPY and external
+    /// index publication are not atomic, so an otherwise correct equivalent
+    /// materialization can make a stored token stale before it is published.
+    ///
+    /// When present, the token still distinguishes the physical object
+    /// generation observed by this caller and can prevent reuse of an older
+    /// cached Dataset at the same URI and version. Conversely, `None` must not
+    /// be interpreted as proof that two observations belong to the same dataset
+    /// incarnation.
     pub e_tag: Option<String>,
 }
 
@@ -2182,7 +2196,7 @@ mod tests {
 
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+        use lance_file::version::LanceFileVersion;
 
         use crate::format::DataStorageFormat;
 
@@ -2190,7 +2204,7 @@ mod tests {
         Manifest::new(
             Schema::try_from(&arrow_schema).unwrap(),
             Arc::new(vec![]),
-            DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable)),
+            DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
             HashMap::new(),
         )
     }

@@ -34,7 +34,6 @@ use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
@@ -408,7 +407,7 @@ pub struct IvfShuffler {
 
     shuffle_output_root_filename: String,
 
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 }
 
 /// Represents a range of batches in a file that should be shuffled
@@ -448,11 +447,11 @@ impl IvfShuffler {
             unsorted_buffers: vec![],
             is_legacy,
             shuffle_output_root_filename,
-            format_version: LanceFileVersion::V2_0,
+            format_version: ConcreteFileVersion::V2_0,
         })
     }
 
-    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+    pub fn with_format_version(mut self, format_version: ConcreteFileVersion) -> Self {
         self.format_version = format_version;
         self
     }
@@ -808,7 +807,7 @@ impl IvfShuffler {
                     )]));
                     let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
                     let mut file_writer = versions::create_writer(
-                        ConcreteFileVersion::from(this.format_version),
+                        this.format_version,
                         writer,
                         lance_schema,
                         FileWriterOptions::default(),

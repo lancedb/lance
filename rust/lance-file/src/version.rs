@@ -29,7 +29,7 @@ pub const fn next_file_version() -> ConcreteFileVersion {
 ///
 /// `Stable` and `Next` are release selectors. They resolve to an exact
 /// [`ConcreteFileVersion`] before file or dataset dispatch and are never persisted.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LanceFileVersion {
     /// The legacy v1 format.
     Legacy,
@@ -244,18 +244,6 @@ impl ConcreteFileVersion {
 impl Display for ConcreteFileVersion {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.to_manifest_string())
-    }
-}
-
-impl From<LanceFileVersion> for ConcreteFileVersion {
-    fn from(value: LanceFileVersion) -> Self {
-        value.resolve()
-    }
-}
-
-impl From<ConcreteFileVersion> for LanceFileVersion {
-    fn from(value: ConcreteFileVersion) -> Self {
-        value.to_selector()
     }
 }
 

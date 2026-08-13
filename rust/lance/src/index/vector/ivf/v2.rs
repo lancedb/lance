@@ -5541,7 +5541,8 @@ mod tests {
         let batches = batches.try_collect::<Vec<_>>().await?;
         let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
         let new_aux_path = new_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut writer = lance_file::versions::v2_1::create_writer(
+        let mut writer = lance_file::versions::create_writer(
+            reader.metadata().version(),
             obj_store.create(&new_aux_path).await?,
             batch.schema_ref().as_ref().try_into()?,
             Default::default(),
@@ -5577,7 +5578,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![new_meta],
                 removed_indices: vec![old_meta.clone()],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );

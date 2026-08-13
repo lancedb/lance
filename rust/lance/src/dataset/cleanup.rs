@@ -1348,7 +1348,16 @@ impl CleanupPolicyBuilder {
     }
 
     /// Cleanup all versions except the last `n` versions of the dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `n` is zero.
     pub async fn retain_n_versions(mut self, dataset: &Dataset, n: usize) -> Result<Self> {
+        if n == 0 {
+            return Err(Error::invalid_input(format!(
+                "retain_versions must be greater than 0, got {n}"
+            )));
+        }
         let versions = dataset.versions().await?;
         self.policy.before_version = if versions.len() <= n {
             Some(versions[0].version)
@@ -2943,7 +2952,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![referenced_index],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3051,7 +3059,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index_a.clone(), index_b.clone()],
                 removed_indices: vec![],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3070,7 +3077,6 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index_c.clone()],
                 removed_indices: vec![index_a.clone()],
-                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3149,7 +3155,6 @@ mod tests {
                     Operation::CreateIndex {
                         new_indices: vec![old_index.clone()],
                         removed_indices: vec![],
-                        mem_wal_index_catchup_advances: Vec::new(),
                     },
                     None,
                 ),
@@ -3168,7 +3173,6 @@ mod tests {
                     Operation::CreateIndex {
                         new_indices: vec![current_index],
                         removed_indices: vec![old_index],
-                        mem_wal_index_catchup_advances: Vec::new(),
                     },
                     None,
                 ),
@@ -3402,6 +3406,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_rejects_retain_zero_versions() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let error = CleanupPolicyBuilder::default()
+            .retain_n_versions(&fixture.open().await.unwrap(), 0)
+            .await
+            .err()
+            .expect("retaining zero versions should return an error");
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("retain_versions must be greater than 0, got 0"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_and_retain_3_recent_versions() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -3433,6 +3457,19 @@ mod tests {
 
         assert_eq!(after_count.num_data_files, 3);
         assert_eq!(after_count.num_manifest_files, 3);
+        assert_eq!(
+            fixture
+                .open()
+                .await
+                .unwrap()
+                .version_refs()
+                .await
+                .unwrap()
+                .iter()
+                .map(|version| version.version)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 
     #[tokio::test]
