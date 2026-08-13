@@ -21,6 +21,7 @@ use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use mock_instant::thread_local::MockClock;
+use tokio::sync::Barrier;
 
 use crate::dataset::refs::branch_contents_path;
 use crate::utils::test::copy_test_data_to_tmp;
@@ -506,6 +507,61 @@ async fn test_tag(
     assert!(tag1_after_second_update.updated_at > tag1_before_second_update.updated_at);
     dataset = dataset.checkout_version("tag1").await.unwrap();
     assert_eq!(dataset.manifest.version, 1);
+}
+
+#[tokio::test]
+async fn test_concurrent_tag_creation_conflict() {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data)], schema),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.delete("i >= 5").await.unwrap();
+
+    let dataset = Arc::new(dataset);
+    let concurrency = 32;
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let handles = (0..concurrency)
+        .map(|attempt| {
+            let dataset = dataset.clone();
+            let barrier = barrier.clone();
+            let version = (attempt % 2 + 1) as u64;
+            tokio::spawn(async move {
+                barrier.wait().await;
+                (version, dataset.tags().create("race", version).await)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut successful_version = None;
+    let mut conflicts = 0;
+    for handle in handles {
+        let (version, result) = handle.await.unwrap();
+        match result {
+            Ok(()) => successful_version = Some(version),
+            Err(Error::RefConflict { .. }) => conflicts += 1,
+            Err(error) => panic!("unexpected tag creation error: {error}"),
+        }
+    }
+
+    assert_eq!(conflicts, concurrency - 1);
+    assert_eq!(
+        dataset.tags().get_version("race").await.unwrap(),
+        successful_version.unwrap()
+    );
 }
 
 #[rstest]

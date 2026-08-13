@@ -4938,6 +4938,7 @@ dependencies = [
  "tracing",
  "tracing-mock",
  "url",
+ "uuid",
 ]
 
 [[package]]
