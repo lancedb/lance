@@ -132,7 +132,8 @@ use lance_table::feature_flags::{
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
-    BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, StagedAddColumns, UDFCheckpointStore,
+    BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, StagedAddColumns,
+    StagedReplaceColumn, UDFCheckpointStore,
 };
 pub use take::TakeBuilder;
 use uuid::Uuid;
@@ -3439,6 +3440,9 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
 /// - [Self::add_columns()]: Add new columns to the dataset, similar to `ALTER TABLE ADD COLUMN`.
 /// - [Self::stage_add_columns()]: Stage new columns without publishing them until
 ///   [`StagedAddColumns::commit`].
+/// - [Self::stage_replace_column()]: Stage a complete replacement for one existing
+///   top-level field without publishing it until
+///   [`StagedReplaceColumn::commit_exact`].
 /// - [Self::drop_columns()]: Drop columns from the dataset, similar to `ALTER TABLE DROP COLUMN`.
 /// - [Self::alter_columns()]: Modify columns in the dataset, changing their name, type, or nullability.
 ///   Similar to `ALTER TABLE ALTER COLUMN`.
@@ -3467,6 +3471,29 @@ impl Dataset {
         batch_size: Option<u32>,
     ) -> Result<StagedAddColumns> {
         schema_evolution::stage_add_columns(self, transforms, read_columns, batch_size).await
+    }
+
+    /// Stage a complete replacement for one existing top-level field.
+    ///
+    /// `field_id` must be a stable top-level field ID from this dataset
+    /// snapshot. `stream` must contain exactly one top-level field whose
+    /// case-sensitive name matches that source field. The stream is not polled
+    /// until those checks succeed.
+    ///
+    /// The target's top-level field ID is preserved. Candidate values and
+    /// schema stay invisible until [`StagedReplaceColumn::commit_exact`]
+    /// succeeds. Dropping the returned handle does not publish; unreferenced
+    /// candidate files may remain for dataset GC.
+    ///
+    /// See [`StagedReplaceColumn`] for snapshot ownership and ExactMerge
+    /// fencing. The handle, not the caller, supplies the output field ID.
+    pub async fn stage_replace_column(
+        &self,
+        field_id: i32,
+        stream: datafusion::execution::SendableRecordBatchStream,
+        batch_size: Option<u32>,
+    ) -> Result<StagedReplaceColumn> {
+        schema_evolution::stage_replace_column(self, field_id, stream, batch_size).await
     }
 
     /// Append new columns to the dataset.

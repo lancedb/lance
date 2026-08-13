@@ -28,6 +28,7 @@ use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_MET
 #[cfg(test)]
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::Fragment;
+use lance_table::format::overlay::tombstone_overlay_fields;
 
 pub mod optimize;
 
@@ -653,6 +654,263 @@ pub(super) async fn add_columns(
     let staged = stage_add_columns(dataset, transforms, read_columns, batch_size).await?;
     *dataset = staged.commit().await?;
     Ok(())
+}
+
+/// In-process handle for a staged [`Dataset::stage_replace_column`] operation.
+///
+/// Candidate values and schema stay invisible until [`Self::commit_exact`]
+/// succeeds. Dropping this handle does not publish; unreferenced candidate
+/// data files may remain for dataset GC.
+///
+/// The handle privately owns a clone of the [`Dataset`] snapshot that created
+/// it, the full candidate fragments/schema, and the exact output field ID.
+/// [`Self::commit_exact`] builds one [`Operation::ExactMerge`] that pins that
+/// source snapshot and the handle-owned output ID. The handle is not
+/// serializable and has no persistent staging ID.
+///
+/// This type intentionally does not implement [`Clone`]: commit consumes the
+/// handle so the safe API publishes at most once.
+#[must_use = "staged replacement is not published until commit_exact(); drop abandons without publishing"]
+#[derive(Debug)]
+pub struct StagedReplaceColumn {
+    dataset: Dataset,
+    fragments: Vec<Fragment>,
+    schema: Schema,
+    output_field_id: i32,
+}
+
+impl StagedReplaceColumn {
+    /// Unpublished candidate schema for this staged replacement.
+    ///
+    /// The candidate remains invisible to table readers until
+    /// [`Self::commit_exact`] succeeds.
+    pub fn candidate_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Consume this handle and publish with exact source-basis fencing.
+    ///
+    /// Captures the owned snapshot's schema and fragments as
+    /// [`crate::dataset::transaction::ExactMergeBasis`], validates
+    /// `input_field_ids` plus the handle-owned output field ID before any
+    /// manifest commit, and commits a single [`Operation::ExactMerge`].
+    /// Empty `input_field_ids` is allowed for literal-only computation.
+    /// Duplicates and IDs missing from the source schema return
+    /// [`Error::InvalidInput`].
+    ///
+    /// On any commit error after the commit attempt begins, candidate files are
+    /// left in place because the outcome may be ambiguous.
+    pub async fn commit_exact(self, input_field_ids: &[i32]) -> Result<Dataset> {
+        let Self {
+            mut dataset,
+            fragments,
+            schema,
+            output_field_id,
+        } = self;
+        let source_schema = dataset.schema().clone();
+        let source_fragments = dataset.manifest.fragments.as_ref().to_vec();
+        let output_field_ids = [output_field_id];
+        validate_exact_merge_field_ids(
+            &source_schema,
+            &schema,
+            input_field_ids,
+            &output_field_ids,
+        )?;
+        let operation = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema,
+                source_fragments,
+                input_field_ids: input_field_ids.to_vec(),
+                output_field_ids: output_field_ids.to_vec(),
+            },
+            fragments,
+            schema,
+        };
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+        Ok(dataset)
+    }
+}
+
+/// Stage a complete replacement for one existing top-level field.
+///
+/// Validates the target ID and stream schema before polling or writing the
+/// stream. Candidate fragments and schema stay unpublished until
+/// [`StagedReplaceColumn::commit_exact`] succeeds.
+pub(super) async fn stage_replace_column(
+    dataset: &Dataset,
+    field_id: i32,
+    stream: SendableRecordBatchStream,
+    batch_size: Option<u32>,
+) -> Result<StagedReplaceColumn> {
+    let source_field = replace_target_field(dataset, field_id)?;
+    validate_replace_stream_schema(source_field, stream.schema().as_ref())?;
+
+    let mut old_subtree_ids = Vec::new();
+    collect_subtree_field_ids(source_field, &mut old_subtree_ids);
+    let original_files = dataset
+        .manifest
+        .fragments
+        .iter()
+        .flat_map(|fragment| {
+            fragment
+                .files
+                .iter()
+                .map(|file| (fragment.id, file.base_id, file.path.clone()))
+        })
+        .collect::<HashSet<_>>();
+
+    let replacement = replacement_field(
+        source_field,
+        stream.schema().field(0),
+        dataset.manifest.max_field_id() + 1,
+    )?;
+    let mut schema = dataset.schema().clone();
+    let top_level_index = schema
+        .fields
+        .iter()
+        .position(|field| field.id == field_id)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Field ID {field_id} is nested; only a top-level field can be replaced"
+            ))
+        })?;
+    schema.fields[top_level_index] = replacement;
+    schema.validate()?;
+    let write_schema = schema.project_by_ids(&[field_id], true);
+
+    let fragments = add_columns_from_stream(
+        &dataset.get_fragments(),
+        stream,
+        Some((write_schema, schema.clone())),
+        batch_size,
+    )
+    .await?;
+    let fragments =
+        supersede_replaced_field_locations(fragments, &original_files, &old_subtree_ids);
+
+    Ok(StagedReplaceColumn {
+        dataset: dataset.clone(),
+        fragments,
+        schema,
+        output_field_id: field_id,
+    })
+}
+
+fn replace_target_field(dataset: &Dataset, field_id: i32) -> Result<&Field> {
+    let Some(field) = dataset.schema().field_by_id(field_id) else {
+        return Err(Error::invalid_input(format!(
+            "Field ID {field_id} does not exist in the source schema"
+        )));
+    };
+    if !dataset
+        .schema()
+        .fields
+        .iter()
+        .any(|field| field.id == field_id)
+    {
+        return Err(Error::invalid_input(format!(
+            "Field ID {field_id} is nested; only a top-level field can be replaced"
+        )));
+    }
+    Ok(field)
+}
+
+fn validate_replace_stream_schema(source_field: &Field, stream_schema: &ArrowSchema) -> Result<()> {
+    if stream_schema.fields.len() != 1 {
+        return Err(Error::invalid_input(format!(
+            "Replacement stream schema must contain exactly one top-level field, got {}",
+            stream_schema.fields.len()
+        )));
+    }
+    let stream_field = stream_schema.field(0);
+    if stream_field.name() != source_field.name.as_str() {
+        return Err(Error::invalid_input(format!(
+            "Replacement stream field name '{}' does not match source field name '{}' for field id {}",
+            stream_field.name(),
+            source_field.name,
+            source_field.id
+        )));
+    }
+    Ok(())
+}
+
+fn replacement_field(
+    source_field: &Field,
+    stream_field: &ArrowField,
+    next_field_id: i32,
+) -> Result<Field> {
+    if source_field.data_type() == *stream_field.data_type() {
+        let mut field = source_field.clone();
+        field.nullable = stream_field.is_nullable();
+        let mut metadata = stream_field.metadata().clone();
+        metadata.remove("lance:field_id");
+        field.metadata = metadata;
+        return Ok(field);
+    }
+
+    let mut field = Field::try_from(stream_field)?;
+    clear_assigned_ids(&mut field);
+    field.id = source_field.id;
+    field.parent_id = source_field.parent_id;
+    field.unenforced_primary_key_position = source_field.unenforced_primary_key_position;
+    field.unenforced_clustering_key_position = source_field.unenforced_clustering_key_position;
+    let mut next_id = next_field_id;
+    for child in &mut field.children {
+        child.set_id(field.id, &mut next_id);
+    }
+    Ok(field)
+}
+
+fn clear_assigned_ids(field: &mut Field) {
+    field.id = -1;
+    for child in &mut field.children {
+        clear_assigned_ids(child);
+    }
+}
+
+fn collect_subtree_field_ids(field: &Field, ids: &mut Vec<i32>) {
+    ids.push(field.id);
+    for child in &field.children {
+        collect_subtree_field_ids(child, ids);
+    }
+}
+
+fn supersede_replaced_field_locations(
+    mut fragments: Vec<Fragment>,
+    original_files: &HashSet<(u64, Option<u32>, String)>,
+    old_subtree_ids: &[i32],
+) -> Vec<Fragment> {
+    let old_subtree_u32 = old_subtree_ids
+        .iter()
+        .filter_map(|id| u32::try_from(*id).ok())
+        .collect::<Vec<_>>();
+    for fragment in &mut fragments {
+        for file in &mut fragment.files {
+            if !original_files.contains(&(fragment.id, file.base_id, file.path.clone())) {
+                continue;
+            }
+            let fields = file
+                .fields
+                .iter()
+                .map(|field| {
+                    if old_subtree_ids.contains(field) {
+                        -2
+                    } else {
+                        *field
+                    }
+                })
+                .collect::<Vec<_>>();
+            file.fields = fields.into();
+        }
+        fragment
+            .files
+            .retain(|file| file.fields.iter().any(|field| *field != -2));
+        tombstone_overlay_fields(&mut fragment.overlays, &old_subtree_u32);
+    }
+    fragments
 }
 
 async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
@@ -5391,5 +5649,889 @@ mod test {
         .with_metadata(packed_meta);
         let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
         assert!(check_field_conflict(&field1, &field4, &ConcreteFileVersion::V2_2).is_err());
+    }
+
+    const REPLACE_SCHEMA_META_KEY: &str = "replace_schema_meta";
+    const REPLACE_SCHEMA_META_VALUE: &str = "schema-meta-v1";
+    const REPLACE_FIELD_META_KEY: &str = "replace_field_meta";
+    const REPLACE_OLD_FIELD_META: &str = "old-field-meta";
+    const REPLACE_NEW_FIELD_META: &str = "new-field-meta";
+
+    fn replace_column_stream(
+        field: ArrowField,
+        column: ArrayRef,
+    ) -> datafusion::execution::SendableRecordBatchStream {
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(std::iter::once(Ok(batch))),
+        ))
+    }
+
+    fn never_poll_stream(
+        fields: Vec<ArrowField>,
+    ) -> datafusion::execution::SendableRecordBatchStream {
+        let schema = Arc::new(ArrowSchema::new(fields));
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async { panic!("replacement stream must not be polled") }),
+        ))
+    }
+
+    async fn write_replace_three_fragment_dataset(test_uri: &str) -> Result<Dataset> {
+        let value_field = ArrowField::new("value", DataType::Int32, true).with_metadata(
+            [(
+                REPLACE_FIELD_META_KEY.to_string(),
+                REPLACE_OLD_FIELD_META.to_string(),
+            )]
+            .into(),
+        );
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![ArrowField::new("id", DataType::Int32, false), value_field],
+            [(
+                REPLACE_SCHEMA_META_KEY.to_string(),
+                REPLACE_SCHEMA_META_VALUE.to_string(),
+            )]
+            .into(),
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..6)),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50, 60])),
+            ],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.get_fragments().len(), 3);
+        Ok(dataset)
+    }
+
+    fn assert_replace_source_unchanged(dataset: &Dataset, version_before: u64) {
+        assert_eq!(dataset.version().version, version_before);
+        assert_eq!(
+            dataset.schema().metadata.get(REPLACE_SCHEMA_META_KEY),
+            Some(&REPLACE_SCHEMA_META_VALUE.to_string())
+        );
+        let value = dataset
+            .schema()
+            .field("value")
+            .expect("source value field must remain visible");
+        assert_eq!(
+            value.metadata.get(REPLACE_FIELD_META_KEY),
+            Some(&REPLACE_OLD_FIELD_META.to_string())
+        );
+    }
+
+    /// Multi-fragment same-type replacement keeps the target root ID and
+    /// non-target values. Source and newly opened readers keep old values
+    /// until exact commit.
+    #[tokio::test]
+    async fn test_stage_replace_column_same_type_multi_fragment_until_exact_commit() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_replace_three_fragment_dataset(test_uri).await?;
+        let version_before = dataset.version().version;
+        let value_id = dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+        let id_field_id = dataset.schema().field("id").expect("fixture has id").id;
+
+        let staged = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![11, 21, 31, 41, 51, 61])),
+                ),
+                None,
+            )
+            .await?;
+
+        assert_eq!(
+            staged
+                .candidate_schema()
+                .field("value")
+                .expect("candidate must keep value")
+                .id,
+            value_id
+        );
+        assert_replace_source_unchanged(&dataset, version_before);
+        let before_commit = Dataset::open(test_uri).await?;
+        assert_replace_source_unchanged(&before_commit, version_before);
+        let before_data = before_commit.scan().try_into_batch().await?;
+        let old_values = before_data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(old_values, &Int32Array::from(vec![10, 20, 30, 40, 50, 60]));
+
+        let committed = staged.commit_exact(&[id_field_id]).await?;
+        assert_eq!(committed.version().version, version_before + 1);
+        assert_replace_source_unchanged(&dataset, version_before);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before + 1);
+        assert_eq!(
+            reopened.schema().field("value").expect("value remains").id,
+            value_id
+        );
+        assert_eq!(
+            reopened.schema().metadata.get(REPLACE_SCHEMA_META_KEY),
+            Some(&REPLACE_SCHEMA_META_VALUE.to_string())
+        );
+        let data = reopened.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 6);
+        let ids = data
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids, &Int32Array::from_iter_values(0..6));
+        let values = data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values, &Int32Array::from(vec![11, 21, 31, 41, 51, 61]));
+        Ok(())
+    }
+
+    /// Target field metadata and values become visible in exactly one new version.
+    #[tokio::test]
+    async fn test_stage_replace_column_metadata_visible_in_one_version() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_replace_three_fragment_dataset(test_uri).await?;
+        let version_before = dataset.version().version;
+        let value_id = dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+        let id_field_id = dataset.schema().field("id").expect("fixture has id").id;
+
+        let replacement = ArrowField::new("value", DataType::Int32, false).with_metadata(
+            [(
+                REPLACE_FIELD_META_KEY.to_string(),
+                REPLACE_NEW_FIELD_META.to_string(),
+            )]
+            .into(),
+        );
+        let staged = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    replacement,
+                    Arc::new(Int32Array::from(vec![7, 8, 9, 10, 11, 12])),
+                ),
+                None,
+            )
+            .await?;
+        assert_replace_source_unchanged(&dataset, version_before);
+
+        let committed = staged.commit_exact(&[id_field_id]).await?;
+        assert_eq!(committed.version().version, version_before + 1);
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before + 1);
+        let value = reopened.schema().field("value").expect("value remains");
+        assert_eq!(value.id, value_id);
+        assert!(!value.nullable);
+        assert_eq!(
+            value.metadata.get(REPLACE_FIELD_META_KEY),
+            Some(&REPLACE_NEW_FIELD_META.to_string())
+        );
+        let data = reopened.scan().try_into_batch().await?;
+        let values = data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values, &Int32Array::from(vec![7, 8, 9, 10, 11, 12]));
+        Ok(())
+    }
+
+    /// A new Arrow type keeps the target root ID. Nested descendants are
+    /// allocated strictly above the persistent field-ID high-water.
+    #[tokio::test]
+    async fn test_stage_replace_column_new_type_preserves_root_id_above_high_water() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let payload = ArrowField::new(
+            "payload",
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("a", DataType::Int32, true),
+                ArrowField::new("b", DataType::Int32, true),
+            ])),
+            false,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            payload,
+            ArrowField::new("extra", DataType::Int32, true),
+        ]));
+        let payload_array = StructArray::new(
+            ArrowFields::from(vec![
+                ArrowField::new("a", DataType::Int32, true),
+                ArrowField::new("b", DataType::Int32, true),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                Arc::new(payload_array),
+                Arc::new(Int32Array::from(vec![9, 8])),
+            ],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            test_uri,
+            None,
+        )
+        .await?;
+        let payload_id = dataset
+            .schema()
+            .field("payload")
+            .expect("fixture has payload")
+            .id;
+        let extra_id = dataset
+            .schema()
+            .field("extra")
+            .expect("fixture has extra")
+            .id;
+        dataset.drop_columns(&["extra"]).await?;
+        let high_water = dataset.manifest.max_field_id();
+        assert!(
+            high_water >= extra_id,
+            "dropped extra must remain in the persistent high-water"
+        );
+        assert!(
+            dataset.schema().field_by_id(extra_id).is_none(),
+            "dropped extra must not stay in the visible schema"
+        );
+
+        let new_payload = ArrowField::new(
+            "payload",
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("p", DataType::Utf8, true),
+                ArrowField::new("q", DataType::Int32, true),
+                ArrowField::new("r", DataType::Int32, true),
+            ])),
+            true,
+        );
+        let new_payload_array = StructArray::new(
+            ArrowFields::from(vec![
+                ArrowField::new("p", DataType::Utf8, true),
+                ArrowField::new("q", DataType::Int32, true),
+                ArrowField::new("r", DataType::Int32, true),
+            ]),
+            vec![
+                Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![5, 6])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef,
+            ],
+            None,
+        );
+        let staged = dataset
+            .stage_replace_column(
+                payload_id,
+                replace_column_stream(new_payload, Arc::new(new_payload_array)),
+                None,
+            )
+            .await?;
+        let candidate_payload = staged
+            .candidate_schema()
+            .field("payload")
+            .expect("candidate keeps payload");
+        assert_eq!(candidate_payload.id, payload_id);
+        assert!(candidate_payload.nullable);
+        let descendant_ids: Vec<i32> = candidate_payload
+            .children
+            .iter()
+            .map(|child| child.id)
+            .collect();
+        assert_eq!(descendant_ids.len(), 3);
+        assert!(
+            descendant_ids.iter().all(|id| *id > high_water),
+            "new descendants {descendant_ids:?} must be strictly above high-water {high_water}"
+        );
+        assert!(
+            !descendant_ids.contains(&extra_id),
+            "must not reuse the dropped extra field id {extra_id}"
+        );
+
+        let committed = staged.commit_exact(&[]).await?;
+        let published = committed
+            .schema()
+            .field("payload")
+            .expect("published payload");
+        assert_eq!(published.id, payload_id);
+        assert!(published.children.iter().all(|child| child.id > high_water));
+        Ok(())
+    }
+
+    /// Mixed physical files keep non-target fields, old target locations are
+    /// tombstoned or removed, and a target index cannot serve stale values.
+    #[tokio::test]
+    async fn test_stage_replace_column_mixed_files_tombstone_and_prunes_index() -> Result<()> {
+        use crate::index::DatasetIndexExt;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+            ],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            test_uri,
+            None,
+        )
+        .await?;
+        assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 1);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await?;
+        let value_id = dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+        let id_field_id = dataset.schema().field("id").expect("fixture has id").id;
+        let source_file_path = dataset.get_fragments()[0].metadata.files[0].path.clone();
+
+        let staged = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![91, 92, 93, 94])),
+                ),
+                None,
+            )
+            .await?;
+        let committed = staged.commit_exact(&[id_field_id]).await?;
+        committed.validate().await?;
+
+        let frag = &committed.get_fragments()[0].metadata;
+        let mixed = frag
+            .files
+            .iter()
+            .find(|file| file.path == source_file_path)
+            .expect("mixed source file must be retained");
+        assert!(
+            mixed.fields.contains(&id_field_id),
+            "mixed file must retain the non-target field"
+        );
+        assert!(
+            !mixed.fields.contains(&value_id),
+            "old target location must be tombstoned or removed from the mixed file"
+        );
+        assert!(
+            frag.files
+                .iter()
+                .any(|file| file.fields.contains(&value_id) && file.path != source_file_path),
+            "replacement must append a new target file"
+        );
+
+        let indices = committed.load_indices().await?;
+        let value_index = indices
+            .iter()
+            .find(|idx| idx.fields.contains(&value_id))
+            .expect("target index declaration remains");
+        let effective = value_index
+            .effective_fragment_bitmap(&committed.fragment_bitmap)
+            .unwrap_or_default();
+        assert!(
+            !effective.contains(0),
+            "rewritten fragment must not stay in target index coverage"
+        );
+
+        let data = committed.scan().try_into_batch().await?;
+        let values = data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values, &Int32Array::from(vec![91, 92, 93, 94]));
+        let ids = data
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids, &Int32Array::from(vec![1, 2, 3, 4]));
+        Ok(())
+    }
+
+    /// Missing, nested, empty, multi-field, and name-mismatch inputs fail
+    /// before the stream is polled and leave the visible dataset unchanged.
+    #[tokio::test]
+    async fn test_stage_replace_column_rejects_invalid_id_and_schema_before_poll() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let payload = ArrowField::new(
+            "payload",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "inner",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            payload,
+        ]));
+        let payload_array = StructArray::new(
+            ArrowFields::from(vec![ArrowField::new("inner", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![0])), Arc::new(payload_array)],
+        )?;
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            test_uri,
+            None,
+        )
+        .await?;
+        let version_before = dataset.version().version;
+        let payload_id = dataset
+            .schema()
+            .field("payload")
+            .expect("fixture has payload")
+            .id;
+        let inner_id = dataset
+            .schema()
+            .field("payload")
+            .and_then(|field| field.children.first())
+            .expect("payload has inner")
+            .id;
+
+        let missing = dataset
+            .stage_replace_column(
+                9_999,
+                never_poll_stream(vec![ArrowField::new("id", DataType::Int32, false)]),
+                None,
+            )
+            .await
+            .expect_err("missing field id must fail");
+        assert!(
+            matches!(missing, Error::InvalidInput { .. }),
+            "expected InvalidInput for missing id, got: {missing:?}"
+        );
+
+        let nested = dataset
+            .stage_replace_column(
+                inner_id,
+                never_poll_stream(vec![ArrowField::new("inner", DataType::Int32, true)]),
+                None,
+            )
+            .await
+            .expect_err("nested field id must fail");
+        assert!(
+            matches!(nested, Error::InvalidInput { .. }),
+            "expected InvalidInput for nested id, got: {nested:?}"
+        );
+
+        let empty = dataset
+            .stage_replace_column(payload_id, never_poll_stream(vec![]), None)
+            .await
+            .expect_err("empty stream schema must fail");
+        assert!(
+            matches!(empty, Error::InvalidInput { .. }),
+            "expected InvalidInput for empty schema, got: {empty:?}"
+        );
+
+        let multi = dataset
+            .stage_replace_column(
+                payload_id,
+                never_poll_stream(vec![
+                    ArrowField::new("payload", DataType::Int32, true),
+                    ArrowField::new("extra", DataType::Int32, true),
+                ]),
+                None,
+            )
+            .await
+            .expect_err("multi-field stream schema must fail");
+        assert!(
+            matches!(multi, Error::InvalidInput { .. }),
+            "expected InvalidInput for multi-field schema, got: {multi:?}"
+        );
+
+        let name_mismatch = dataset
+            .stage_replace_column(
+                payload_id,
+                never_poll_stream(vec![ArrowField::new("Payload", DataType::Int32, true)]),
+                None,
+            )
+            .await
+            .expect_err("case-sensitive name mismatch must fail");
+        assert!(
+            matches!(name_mismatch, Error::InvalidInput { .. }),
+            "expected InvalidInput for name mismatch, got: {name_mismatch:?}"
+        );
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before);
+        assert_eq!(reopened.schema().fields.len(), 2);
+        Ok(())
+    }
+
+    /// Short, long, and failing streams must not publish a candidate.
+    #[tokio::test]
+    async fn test_stage_replace_column_short_long_failing_stream_publishes_nothing() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_replace_three_fragment_dataset(test_uri).await?;
+        let version_before = dataset.version().version;
+        let value_id = dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+        let schema_before = ArrowSchema::from(dataset.schema());
+
+        let short = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                ),
+                None,
+            )
+            .await
+            .expect_err("short stream must fail staging");
+        assert!(
+            short
+                .to_string()
+                .contains("Stream ended before producing values for all rows in dataset"),
+            "expected short-stream error, got: {short:?}"
+        );
+
+        let long = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7])),
+                ),
+                None,
+            )
+            .await
+            .expect_err("long stream must fail staging");
+        assert!(
+            long.to_string()
+                .contains("Stream produced more values than expected for dataset"),
+            "expected long-stream error, got: {long:?}"
+        );
+
+        let failing_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]));
+        let failing = dataset
+            .stage_replace_column(
+                value_id,
+                Box::pin(RecordBatchStreamAdapter::new(
+                    failing_schema,
+                    futures::stream::once(async {
+                        Err(datafusion::error::DataFusionError::Execution(
+                            "replacement stream failed".into(),
+                        ))
+                    }),
+                )),
+                None,
+            )
+            .await
+            .expect_err("failing stream must fail staging");
+        assert!(
+            failing.to_string().contains("replacement stream failed"),
+            "expected failing-stream error, got: {failing:?}"
+        );
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_replace_source_unchanged(&reopened, version_before);
+        assert_eq!(ArrowSchema::from(reopened.schema()), schema_before);
+        let data = reopened.scan().try_into_batch().await?;
+        let values = data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values, &Int32Array::from(vec![10, 20, 30, 40, 50, 60]));
+        Ok(())
+    }
+
+    /// Dropping a staged handle must not publish the candidate.
+    #[tokio::test]
+    async fn test_stage_replace_column_drop_does_not_publish() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_replace_three_fragment_dataset(test_uri).await?;
+        let version_before = dataset.version().version;
+        let value_id = dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+
+        let staged = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                ),
+                None,
+            )
+            .await?;
+        drop(staged);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_replace_source_unchanged(&reopened, version_before);
+        let data = reopened.scan().try_into_batch().await?;
+        let values = data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values, &Int32Array::from(vec![10, 20, 30, 40, 50, 60]));
+        Ok(())
+    }
+
+    /// An intervening input mutation and an intervening target/schema mutation
+    /// each make commit_exact fail with the existing typed conflict.
+    #[tokio::test]
+    async fn test_stage_replace_column_commit_exact_rejects_intervening_mutations() -> Result<()> {
+        use crate::dataset::UpdateBuilder;
+
+        let test_dir = TempStrDir::default();
+        let input_uri = format!("{}/input", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
+
+        let input_dataset = write_replace_three_fragment_dataset(&input_uri).await?;
+        let input_version = input_dataset.version().version;
+        let input_value_id = input_dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+        let input_id = input_dataset
+            .schema()
+            .field("id")
+            .expect("fixture has id")
+            .id;
+        let input_staged = input_dataset
+            .stage_replace_column(
+                input_value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![11, 21, 31, 41, 51, 61])),
+                ),
+                None,
+            )
+            .await?;
+        let _ = UpdateBuilder::new(Arc::new(Dataset::open(&input_uri).await?))
+            .update_where("id >= 0")?
+            .set("id", "id + 1")?
+            .build()?
+            .execute()
+            .await?;
+        let input_err = input_staged
+            .commit_exact(&[input_id])
+            .await
+            .expect_err("exact publish must reject intervening input mutation");
+        assert!(
+            matches!(
+                input_err,
+                Error::RetryableCommitConflict { .. } | Error::IncompatibleTransaction { .. }
+            ),
+            "expected typed conflict for input mutation, got: {input_err:?}"
+        );
+        let input_reopened = Dataset::open(&input_uri).await?;
+        assert!(input_reopened.version().version > input_version);
+        let input_values = input_reopened
+            .scan()
+            .try_into_batch()
+            .await?
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            &input_values,
+            &Int32Array::from(vec![10, 20, 30, 40, 50, 60])
+        );
+
+        let target_dataset = write_replace_three_fragment_dataset(&target_uri).await?;
+        let target_version = target_dataset.version().version;
+        let target_value_id = target_dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+        let target_id = target_dataset
+            .schema()
+            .field("id")
+            .expect("fixture has id")
+            .id;
+        let target_staged = target_dataset
+            .stage_replace_column(
+                target_value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![11, 21, 31, 41, 51, 61])),
+                ),
+                None,
+            )
+            .await?;
+        let _ = UpdateBuilder::new(Arc::new(Dataset::open(&target_uri).await?))
+            .update_where("id >= 0")?
+            .set("value", "value + 1")?
+            .build()?
+            .execute()
+            .await?;
+        let target_err = target_staged
+            .commit_exact(&[target_id])
+            .await
+            .expect_err("exact publish must reject intervening target mutation");
+        assert!(
+            matches!(
+                target_err,
+                Error::RetryableCommitConflict { .. } | Error::IncompatibleTransaction { .. }
+            ),
+            "expected typed conflict for target mutation, got: {target_err:?}"
+        );
+        let target_reopened = Dataset::open(&target_uri).await?;
+        assert!(target_reopened.version().version > target_version);
+        let target_values = target_reopened
+            .scan()
+            .try_into_batch()
+            .await?
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            &target_values,
+            &Int32Array::from(vec![11, 21, 31, 41, 51, 61])
+        );
+        Ok(())
+    }
+
+    /// Deletion-vector / fully deleted batch row alignment stays correct.
+    #[tokio::test]
+    async fn test_stage_replace_column_deletion_vector_row_alignment() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..105)),
+                Arc::new(Int32Array::from_iter_values(0..105)),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.delete("i >= 100").await?;
+        assert_eq!(dataset.count_rows(None).await?, 100);
+        let value_id = dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+        let id_field_id = dataset.schema().field("i").expect("fixture has i").id;
+
+        let staged = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from_iter_values((0..100).map(|i| i + 1_000))),
+                ),
+                Some(50),
+            )
+            .await?;
+        let committed = staged.commit_exact(&[id_field_id]).await?;
+        let data = committed.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 100);
+        let values = data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            values,
+            &Int32Array::from_iter_values((0..100).map(|i| i + 1_000))
+        );
+        let ids = data
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids, &Int32Array::from_iter_values(0..100));
+        Ok(())
     }
 }
