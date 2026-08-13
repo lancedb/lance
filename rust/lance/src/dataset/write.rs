@@ -1571,10 +1571,12 @@ impl WriterOptions {
     pub(super) fn update(
         source_store_registry: Arc<ObjectStoreRegistry>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+        allow_external_blob_outside_bases: bool,
     ) -> Self {
         Self {
             add_data_dir: true,
             external_base_resolver,
+            allow_external_blob_outside_bases,
             source_store_registry,
             ..Default::default()
         }
@@ -2253,7 +2255,7 @@ mod tests {
 
             let object_store = Arc::new(ObjectStore::memory());
             let (fragments, _) = write_fragments_internal(
-                ConcreteFileVersion::from(version),
+                version.resolve(),
                 None,
                 object_store,
                 &Path::from("test"),

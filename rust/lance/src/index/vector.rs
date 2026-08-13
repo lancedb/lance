@@ -591,7 +591,7 @@ async fn prepare_vector_segment_build(
     let shuffler = create_ivf_shuffler(
         temp_dir_path,
         num_partitions,
-        format_version.to_selector(),
+        format_version,
         Some(progress),
     );
 
@@ -1345,7 +1345,7 @@ pub(crate) async fn build_vector_index_incremental(
     let shuffler = create_ivf_shuffler(
         temp_dir_path,
         ivf_model.num_partitions(),
-        format_version.to_selector(),
+        format_version,
         Some(progress.clone()),
     );
 
@@ -1961,7 +1961,6 @@ pub async fn initialize_vector_index(
         Operation::CreateIndex {
             new_indices: vec![new_idx],
             removed_indices: vec![],
-            mem_wal_index_catchup_advances: Vec::new(),
         },
         None,
     );
@@ -2932,7 +2931,8 @@ mod tests {
             .await
             .unwrap();
         let arrow_schema = ArrowSchema::new(vec![Field::new("dummy", ArrowDataType::Int32, true)]);
-        let mut v2w = lance_file::versions::v2_1::create_writer(
+        let mut v2w = lance_file::versions::create_writer(
+            dataset_format_version(&dataset),
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap(),
             FileWriterOptions::default(),

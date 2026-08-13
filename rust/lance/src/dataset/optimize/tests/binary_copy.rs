@@ -790,11 +790,27 @@ async fn test_can_use_binary_copy_reject_deletions() {
     assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 }
 
+#[rstest::rstest]
+#[case(LanceFileVersion::V2_0)]
+#[case(LanceFileVersion::V2_1)]
+#[case(LanceFileVersion::V2_2)]
+#[case(LanceFileVersion::V2_3)]
 #[tokio::test]
-async fn test_binary_copy_compaction_with_complex_schema() {
-    for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_compaction_with_complex_schema(version).await;
-    }
+async fn test_binary_copy_compaction_with_complex_schema(#[case] version: LanceFileVersion) {
+    do_test_binary_copy_compaction_with_complex_schema(version).await;
+}
+
+#[test]
+fn test_binary_copy_complex_schema_covers_every_non_legacy_version() {
+    assert_eq!(
+        [
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        ],
+        NON_LEGACY_VERSIONS
+    );
 }
 
 async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVersion) {
@@ -802,7 +818,10 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 
-    let row_num = 1_000;
+    let row_num: u64 = 1_000;
+    let batches: u32 = 10;
+    const NUM_FRAGMENTS: usize = 100;
+    let rows_per_file = (row_num as usize * batches as usize) / NUM_FRAGMENTS;
 
     let inner_fields = Fields::from(vec![
         Field::new("x", DataType::UInt32, true),
@@ -863,7 +882,7 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
             "events",
             array::rand_list_any(array::rand_struct(event_fields.clone()), true),
         )
-        .into_reader_rows(RowCount::from(row_num), BatchCount::from(10));
+        .into_reader_rows(RowCount::from(row_num), BatchCount::from(batches));
 
     let full_dir = TempStrDir::default();
     let mut dataset = Dataset::write(
@@ -872,12 +891,18 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
         Some(WriteParams {
             enable_stable_row_ids: true,
             data_storage_version: Some(version),
-            max_rows_per_file: (row_num / 100) as usize,
+            max_rows_per_file: rows_per_file,
             ..Default::default()
         }),
     )
     .await
     .unwrap();
+
+    assert_eq!(
+        dataset.get_fragments().len(),
+        NUM_FRAGMENTS,
+        "compaction must have many input fragments to merge"
+    );
 
     let opt_full = CompactionOptions {
         compaction_mode: Some(CompactionMode::Reencode),

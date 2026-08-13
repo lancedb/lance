@@ -21,6 +21,7 @@ use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use mock_instant::thread_local::MockClock;
+use tokio::sync::Barrier;
 
 use crate::dataset::refs::branch_contents_path;
 use crate::utils::test::copy_test_data_to_tmp;
@@ -508,6 +509,61 @@ async fn test_tag(
     assert_eq!(dataset.manifest.version, 1);
 }
 
+#[tokio::test]
+async fn test_concurrent_tag_creation_conflict() {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data)], schema),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.delete("i >= 5").await.unwrap();
+
+    let dataset = Arc::new(dataset);
+    let concurrency = 32;
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let handles = (0..concurrency)
+        .map(|attempt| {
+            let dataset = dataset.clone();
+            let barrier = barrier.clone();
+            let version = (attempt % 2 + 1) as u64;
+            tokio::spawn(async move {
+                barrier.wait().await;
+                (version, dataset.tags().create("race", version).await)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut successful_version = None;
+    let mut conflicts = 0;
+    for handle in handles {
+        let (version, result) = handle.await.unwrap();
+        match result {
+            Ok(()) => successful_version = Some(version),
+            Err(Error::RefConflict { .. }) => conflicts += 1,
+            Err(error) => panic!("unexpected tag creation error: {error}"),
+        }
+    }
+
+    assert_eq!(conflicts, concurrency - 1);
+    assert_eq!(
+        dataset.tags().get_version("race").await.unwrap(),
+        successful_version.unwrap()
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_fragment_id_zero_not_reused() {
@@ -993,12 +1049,39 @@ async fn test_branch() {
     let (main_rows, _) = collect_rows(&main_dataset).await;
     assert_eq!(main_rows, 50); // only batch1
     assert_eq!(main_dataset.version().version, 1);
+    let main_versions = main_dataset.version_refs().await.unwrap();
+    assert_eq!(
+        main_versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        main_dataset.latest_version_id().await.unwrap(),
+        main_versions.last().unwrap().version
+    );
 
     // branch1 has data 1 + 2 (80 rows)
     let updated_branch1 = Dataset::open(branch1_dataset.uri()).await.unwrap();
     let (branch1_rows, _) = collect_rows(&updated_branch1).await;
     assert_eq!(branch1_rows, 80); // batch1+batch2
     assert_eq!(updated_branch1.version().version, 2);
+    let _ = updated_branch1.object_store.as_ref().io_stats_incremental();
+    let branch1_versions = updated_branch1.version_refs().await.unwrap();
+    let io_stats = updated_branch1.object_store.as_ref().io_stats_incremental();
+    assert_eq!(io_stats.read_bytes, 0);
+    assert_eq!(
+        branch1_versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        updated_branch1.latest_version_id().await.unwrap(),
+        branch1_versions.last().unwrap().version
+    );
 
     // branch2 has data 1 + 2 + 3 (100 rows)
     let updated_branch2 = Dataset::open(branch2_dataset.uri()).await.unwrap();

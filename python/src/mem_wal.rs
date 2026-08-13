@@ -1034,6 +1034,14 @@ fn shard_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -
 }
 
 fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
+    // Close awaits every frozen memtable's flush, so nothing is owed afterwards
+    // regardless of whether the active memtable had buffered batches.
+    let stats_before_close = MemTableStats {
+        frozen_count: 0,
+        frozen_bytes: 0,
+        ..stats_before_close
+    };
+
     if stats_before_close.batch_count == 0 {
         return stats_before_close;
     }
@@ -1055,5 +1063,7 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
         pending_wal_batch_count: 0,
         pending_wal_row_count: 0,
         pending_wal_estimated_bytes: 0,
+        frozen_count: 0,
+        frozen_bytes: 0,
     }
 }
