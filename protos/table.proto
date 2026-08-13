@@ -236,6 +236,10 @@ message FieldAssignmentFile {
   string path = 1;
   uint64 size_bytes = 2;
   optional uint32 base_id = 3;
+  // Optional exact byte copy for small immutable roots. The referenced object
+  // remains authoritative for reachability, clone, and cleanup; readers may
+  // use this copy to avoid a separate metadata request.
+  optional bytes inline_bytes = 4;
 }
 
 // Manifest descriptor for one tracked field. The field_id is the stable Lance
@@ -252,8 +256,10 @@ message FieldAssignmentRoot {
 }
 
 // Assignment state for one physical fragment. all_assigned=true means every
-// physical row is assigned. Partial states are stored as serialized Roaring
-// bitmaps of physical row offsets. all_assigned=false is invalid.
+// physical row is assigned. Partial states are portable serialized Roaring
+// bitmaps of physical row offsets. Small bitmaps may be embedded in the root;
+// larger bitmaps are referenced as immutable files. all_assigned=false is
+// invalid.
 message FieldAssignmentFragment {
   uint64 fragment_id = 1;
   uint64 physical_rows = 2;
@@ -261,6 +267,7 @@ message FieldAssignmentFragment {
   oneof state {
     bool all_assigned = 3;
     FieldAssignmentFile partial = 4;
+    bytes inline_partial = 5;
   }
 }
 

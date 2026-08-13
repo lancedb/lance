@@ -110,12 +110,22 @@ pub enum AssignmentFragment {
     Partial(Arc<RoaringBitmap>),
 }
 
+/// Snapshot state and complete fragment domain carried by a bound assignment UDF.
+#[doc(hidden)]
+pub type BoundAssignmentSnapshot = (i32, Arc<HashMap<u32, AssignmentFragment>>, RoaringBitmap);
+
 #[derive(Debug, Clone)]
 struct BoundIsAssignedUdf {
     binding_id: u64,
     field_id: i32,
-    fragments: Arc<HashMap<u32, AssignmentFragment>>,
+    snapshot: Arc<AssignmentSnapshot>,
     signature: Signature,
+}
+
+#[derive(Debug)]
+struct AssignmentSnapshot {
+    fragments: Arc<HashMap<u32, AssignmentFragment>>,
+    covered_fragments: RoaringBitmap,
 }
 
 impl PartialEq for BoundIsAssignedUdf {
@@ -137,7 +147,7 @@ impl BoundIsAssignedUdf {
     fn value(&self, row_address: u64) -> bool {
         let fragment_id = (row_address >> 32) as u32;
         let row_offset = row_address as u32;
-        match self.fragments.get(&fragment_id) {
+        match self.snapshot.fragments.get(&fragment_id) {
             Some(AssignmentFragment::All) => true,
             Some(AssignmentFragment::Partial(bitmap)) => bitmap.contains(row_offset),
             None => false,
@@ -148,7 +158,7 @@ impl BoundIsAssignedUdf {
 #[derive(Debug)]
 struct DeferredAssignmentState {
     binding_id: u64,
-    fragments: OnceLock<Arc<HashMap<u32, AssignmentFragment>>>,
+    snapshot: OnceLock<Arc<AssignmentSnapshot>>,
 }
 
 /// A shared snapshot binding initialized by a Lance table provider while its
@@ -173,15 +183,33 @@ impl DeferredAssignmentBinding {
 
     /// Initialize this binding with the referenced snapshot state.
     pub fn initialize(&self, fragments: HashMap<u32, AssignmentFragment>) -> DFResult<()> {
-        if self.state.fragments.get().is_some() {
+        let covered_fragments = fragments.keys().copied().collect();
+        self.initialize_with_coverage(fragments, covered_fragments)
+    }
+
+    /// Initialize this binding and record the complete fragment domain for
+    /// which absent entries mean unassigned.
+    #[doc(hidden)]
+    pub fn initialize_with_coverage(
+        &self,
+        fragments: HashMap<u32, AssignmentFragment>,
+        covered_fragments: RoaringBitmap,
+    ) -> DFResult<()> {
+        if self.state.snapshot.get().is_some() {
             return Ok(());
         }
-        self.state.fragments.set(Arc::new(fragments)).map_err(|_| {
-            datafusion::error::DataFusionError::Internal(format!(
-                "is_assigned binding {} for field ID {} was initialized concurrently",
-                self.state.binding_id, self.field_id
-            ))
-        })
+        self.state
+            .snapshot
+            .set(Arc::new(AssignmentSnapshot {
+                fragments: Arc::new(fragments),
+                covered_fragments,
+            }))
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "is_assigned binding {} for field ID {} was initialized concurrently",
+                    self.state.binding_id, self.field_id
+                ))
+            })
     }
 }
 
@@ -209,7 +237,7 @@ impl Hash for DeferredBoundIsAssignedUdf {
 
 impl DeferredBoundIsAssignedUdf {
     fn value(&self, row_address: u64) -> DFResult<bool> {
-        let fragments = self.binding.state.fragments.get().ok_or_else(|| {
+        let snapshot = self.binding.state.snapshot.get().ok_or_else(|| {
             datafusion::error::DataFusionError::Execution(format!(
                 "is_assigned binding {} for field ID {} was not initialized by its Lance table provider",
                 self.binding.state.binding_id, self.binding.field_id
@@ -217,7 +245,7 @@ impl DeferredBoundIsAssignedUdf {
         })?;
         let fragment_id = (row_address >> 32) as u32;
         let row_offset = row_address as u32;
-        Ok(match fragments.get(&fragment_id) {
+        Ok(match snapshot.fragments.get(&fragment_id) {
             Some(AssignmentFragment::All) => true,
             Some(AssignmentFragment::Partial(bitmap)) => bitmap.contains(row_offset),
             None => false,
@@ -359,10 +387,28 @@ pub fn bound_is_assigned_udf(
     field_id: i32,
     fragments: HashMap<u32, AssignmentFragment>,
 ) -> ScalarUDF {
+    let covered_fragments = fragments.keys().copied().collect();
+    bound_is_assigned_udf_with_coverage(field_id, fragments, covered_fragments)
+}
+
+/// Create a snapshot-bound `is_assigned` UDF with an explicit fragment domain.
+///
+/// The fragment domain is required by exact row-selection pushdown because a
+/// fragment missing from `fragments` is known to be entirely unassigned, while
+/// a fragment outside `covered_fragments` is unknown to this binding.
+#[doc(hidden)]
+pub fn bound_is_assigned_udf_with_coverage(
+    field_id: i32,
+    fragments: HashMap<u32, AssignmentFragment>,
+    covered_fragments: RoaringBitmap,
+) -> ScalarUDF {
     ScalarUDF::new_from_impl(BoundIsAssignedUdf {
         binding_id: NEXT_ASSIGNMENT_BINDING_ID.fetch_add(1, Ordering::Relaxed),
         field_id,
-        fragments: Arc::new(fragments),
+        snapshot: Arc::new(AssignmentSnapshot {
+            fragments: Arc::new(fragments),
+            covered_fragments,
+        }),
         signature: Signature::exact(vec![DataType::UInt64], Volatility::Immutable),
     })
 }
@@ -375,7 +421,7 @@ pub fn deferred_bound_is_assigned_udf(field_id: i32) -> (ScalarUDF, DeferredAssi
         field_id,
         state: Arc::new(DeferredAssignmentState {
             binding_id: NEXT_ASSIGNMENT_BINDING_ID.fetch_add(1, Ordering::Relaxed),
-            fragments: OnceLock::new(),
+            snapshot: OnceLock::new(),
         }),
     };
     let udf = ScalarUDF::new_from_impl(DeferredBoundIsAssignedUdf {
@@ -402,6 +448,25 @@ pub fn bound_is_assigned_field_id(udf: &ScalarUDF) -> Option<i32> {
                 .downcast_ref::<DeferredBoundIsAssignedUdf>()
                 .map(|bound| bound.binding.field_id)
         })
+}
+
+/// Return the immutable state carried by an initialized bound assignment UDF.
+#[doc(hidden)]
+pub fn bound_is_assigned_snapshot(udf: &ScalarUDF) -> Option<BoundAssignmentSnapshot> {
+    if let Some(bound) = udf.inner().downcast_ref::<BoundIsAssignedUdf>() {
+        return Some((
+            bound.field_id,
+            bound.snapshot.fragments.clone(),
+            bound.snapshot.covered_fragments.clone(),
+        ));
+    }
+    let bound = udf.inner().downcast_ref::<DeferredBoundIsAssignedUdf>()?;
+    let snapshot = bound.binding.state.snapshot.get()?;
+    Some((
+        bound.binding.field_id,
+        snapshot.fragments.clone(),
+        snapshot.covered_fragments.clone(),
+    ))
 }
 
 /// Build the native DataFusion logical expression for

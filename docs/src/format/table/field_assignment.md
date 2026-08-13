@@ -9,6 +9,7 @@ message FieldAssignmentFile {
   string path = 1;
   uint64 size_bytes = 2;
   optional uint32 base_id = 3;
+  optional bytes inline_bytes = 4;
 }
 
 message FieldAssignmentState {
@@ -17,7 +18,7 @@ message FieldAssignmentState {
 }
 ```
 
-`FieldAssignmentFile.path` is relative to the owning dataset root. `base_id`, when present, resolves through the manifest base-path map and allows shallow clones to reuse immutable assignment objects.
+`FieldAssignmentFile.path` is relative to the owning dataset root. `base_id`, when present, resolves through the manifest base-path map and allows shallow clones to reuse immutable assignment objects. A root descriptor may also carry `inline_bytes`, an exact size-checked copy of a small root. The manifest copy is authoritative for normal reads and avoids a separate object-store request. The immutable object remains reachable at `path` for cleanup, clone, and readers that ignore the copy; explicit dataset validation requires both copies to match. Bitmap-file descriptors cannot carry `inline_bytes`.
 
 ## Root and bitmap objects
 
@@ -35,11 +36,12 @@ message FieldAssignmentFragment {
   oneof state {
     bool all_assigned = 3;
     FieldAssignmentFile partial = 4;
+    bytes inline_partial = 5;
   }
 }
 ```
 
-An absent fragment entry means no physical rows are assigned. `all_assigned=true` means every physical row is assigned; `all_assigned=false` is invalid. A partial entry references a portable serialized 32-bit Roaring bitmap under `_field_assignments/bitmaps/<field-id>/<fragment-id>/`. Bitmap values are physical row offsets, must be within `physical_rows`, and must represent a non-empty, non-full set.
+An absent fragment entry means no physical rows are assigned. `all_assigned=true` means every physical row is assigned; `all_assigned=false` is invalid. Both partial variants contain the same portable serialized 32-bit Roaring bitmap: `partial` references an immutable object under `_field_assignments/bitmaps/<field-id>/<fragment-id>/`, while `inline_partial` embeds the bytes in the root. Bitmap values are physical row offsets, must be within `physical_rows`, and must represent a non-empty, non-full set. Writers embed small sparse states and retain external objects for dense, large, or aggregate-root-budget-exceeding states; readers treat both representations identically.
 
 Roots and bitmap pages are immutable. A new snapshot reuses every unchanged object and writes only the roots and pages needed for changed fragment states. Cleanup retains objects referenced by any retained manifest or descendant branch and removes objects that are no longer reachable.
 
@@ -56,7 +58,9 @@ Roots and bitmap pages are immutable. A new snapshot reuses every unchanged obje
 
 `is_assigned(field)` resolves its single direct field reference to a stable field ID while planning. It returns a non-null Boolean value for every output row. Unknown fields, untracked fields, and non-field arguments are planning errors.
 
-A fallback execution reads the field root and required partial pages, combines physical row address fragment IDs and offsets with the assignment state, and emits an Arrow BooleanArray. Ordinary projection continues to return stored Arrow values even for unassigned rows. A plan that does not contain `is_assigned` must not read assignment roots or bitmaps.
+For filters, the assignment bitmap is an exact snapshot-native row selection. It participates in the same `NOT`, `AND`, and `OR` row-mask algebra, stable-row-ID translation, deletion masking, scalar-index composition, and distributed row-selection serialization as an exact scalar index. An unsupported mixed expression falls back to evaluating the complete expression after the scan rather than applying an inexact partial pushdown.
+
+Projection, ordering, aggregation, and fallback filtering combine physical row address fragment IDs and offsets with the assignment state to emit an Arrow BooleanArray. Ordinary projection continues to return stored Arrow values even for unassigned rows. A plan that does not contain `is_assigned` must not read assignment roots or bitmaps.
 
 The logical function is encoded in Substrait with extension URN `urn:lance:extension:functions`. Consumers must register the Lance `is_assigned` extension before accepting such a plan.
 

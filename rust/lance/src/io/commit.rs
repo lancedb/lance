@@ -394,6 +394,22 @@ async fn localize_deep_clone_field_assignments(
         };
         assignment.root.base_id = None;
         assignment.root.size_bytes = size_bytes;
+        if assignment.root.inline_bytes.is_some() {
+            let relative = Path::parse(assignment.root.path.as_str())?;
+            let path = Path::from_iter(base_path.parts().chain(relative.parts()));
+            let known_size = usize::try_from(size_bytes).map_err(|_| {
+                Error::invalid_input(format!(
+                    "Deep-cloned field assignment root '{}' size {} does not fit on this platform",
+                    assignment.root.path, size_bytes
+                ))
+            })?;
+            let bytes = object_store
+                .open_with_size(&path, known_size)
+                .await?
+                .get_all()
+                .await?;
+            assignment.root.inline_bytes = Some(bytes.to_vec());
+        }
     }
     Ok(())
 }

@@ -377,6 +377,7 @@ mod tests {
                 ),
                 size_bytes: 0,
                 base_id: None,
+                inline_bytes: None,
             },
         }];
         apply_feature_flags(&mut manifest, false, false).unwrap();

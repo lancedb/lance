@@ -2994,6 +2994,8 @@ impl Dataset {
         // but an explicit dataset validation must verify the complete snapshot
         // contract, including fragment cardinalities and bitmap bounds.
         for assignment in &self.manifest.field_assignment_states {
+            self.validate_field_assignment_root_object(assignment.field_id)
+                .await?;
             let root = self
                 .load_field_assignment_root(assignment.field_id)
                 .await?
@@ -3004,7 +3006,11 @@ impl Dataset {
                     ))
                 })?;
             for fragment in root.fragments {
-                if matches!(fragment.state, FieldAssignmentFragmentState::Partial(_)) {
+                if matches!(
+                    fragment.state,
+                    FieldAssignmentFragmentState::Partial(_)
+                        | FieldAssignmentFragmentState::InlinePartial(_)
+                ) {
                     self.load_field_assignment_bitmap(assignment.field_id, &fragment)
                         .await?;
                 }

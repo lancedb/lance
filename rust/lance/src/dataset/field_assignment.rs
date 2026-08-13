@@ -14,7 +14,8 @@ use datafusion::logical_expr::{Expr, ScalarUDF, col};
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
 use lance_datafusion::udf::{
-    AssignmentFragment, IS_ASSIGNED_NAME, bound_is_assigned_udf, is_unbound_is_assigned_udf,
+    AssignmentFragment, IS_ASSIGNED_NAME, bound_is_assigned_udf_with_coverage,
+    is_unbound_is_assigned_udf,
 };
 #[cfg(feature = "substrait")]
 use lance_datafusion::udf::{bound_is_assigned_field_id, is_assigned};
@@ -41,12 +42,51 @@ pub const FIELD_ASSIGNMENTS_DIR: &str = "_field_assignments";
 const FIELD_ASSIGNMENT_ROOTS_DIR: &str = "roots";
 const FIELD_ASSIGNMENT_BITMAPS_DIR: &str = "bitmaps";
 const MAX_FIELD_ASSIGNMENT_FILE_BYTES: u64 = 512 * 1024 * 1024;
+/// Individual portable Roaring bitmaps at or below this size are embedded in
+/// the root when they are also sparse, avoiding one metadata request per
+/// fragment without turning dense mutation state into monolithic metadata.
+const MAX_INLINE_FIELD_ASSIGNMENT_BITMAP_BYTES: usize = 64 * 1024;
+/// Inline only states at or below 25% density; denser states benefit from
+/// independent immutable objects during repeated sparse mutations.
+const MAX_INLINE_FIELD_ASSIGNMENT_DENSITY_DENOMINATOR: u64 = 4;
+/// Cap total embedded bitmap bytes so large/high-fragment-count roots retain
+/// incremental immutable bitmap objects instead of becoming monolithic.
+const MAX_INLINE_FIELD_ASSIGNMENT_ROOT_BYTES: usize = 4 * 1024 * 1024;
+/// Small roots are copied into their manifest descriptor so cold planning does
+/// not require a separate object-store request.
+const MAX_INLINE_FIELD_ASSIGNMENT_ROOT_COPY_BYTES: usize = 64 * 1024;
+/// Bound total root copies retained in one manifest across all tracked fields.
+const MAX_INLINE_FIELD_ASSIGNMENT_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
+fn inline_field_assignment_bytes(file: &FieldAssignmentFile) -> Result<Option<Bytes>> {
+    let Some(bytes) = file.inline_bytes.as_ref() else {
+        return Ok(None);
+    };
+    if bytes.len() as u64 != file.size_bytes {
+        return Err(Error::invalid_input(format!(
+            "Inline field assignment file '{}' has size {}, expected {}",
+            file.path,
+            bytes.len(),
+            file.size_bytes
+        )));
+    }
+    if file.size_bytes > MAX_FIELD_ASSIGNMENT_FILE_BYTES {
+        return Err(Error::invalid_input(format!(
+            "Field assignment file '{}' has invalid declared size {}; maximum is {}",
+            file.path, file.size_bytes, MAX_FIELD_ASSIGNMENT_FILE_BYTES
+        )));
+    }
+    Ok(Some(Bytes::copy_from_slice(bytes)))
+}
 
 pub async fn read_field_assignment_bytes(
     store: &ObjectStore,
     path: &Path,
     file: &FieldAssignmentFile,
 ) -> Result<Bytes> {
+    if let Some(bytes) = inline_field_assignment_bytes(file)? {
+        return Ok(bytes);
+    }
     if file.size_bytes > MAX_FIELD_ASSIGNMENT_FILE_BYTES {
         return Err(Error::invalid_input(format!(
             "Field assignment file '{}' has invalid declared size {}; maximum is {}",
@@ -70,6 +110,36 @@ pub async fn read_field_assignment_bytes(
         )));
     }
     Ok(bytes)
+}
+
+fn decode_field_assignment_bitmap(
+    bytes: &[u8],
+    source: &str,
+    field_id: i32,
+    fragment: &FieldAssignmentFragment,
+) -> Result<RoaringBitmap> {
+    let bitmap = RoaringBitmap::deserialize_from(&mut Cursor::new(bytes)).map_err(|error| {
+        Error::invalid_input(format!(
+            "Failed to decode assignment bitmap '{}' for field ID {}, fragment {}: {}",
+            source, field_id, fragment.fragment_id, error
+        ))
+    })?;
+    if bitmap.is_empty() || bitmap.len() == fragment.physical_rows {
+        return Err(Error::invalid_input(format!(
+            "Partial assignment bitmap '{}' for field ID {}, fragment {} must be non-empty and non-full",
+            source, field_id, fragment.fragment_id
+        )));
+    }
+    if bitmap
+        .max()
+        .is_some_and(|offset| offset as u64 >= fragment.physical_rows)
+    {
+        return Err(Error::invalid_input(format!(
+            "Assignment bitmap '{}' for field ID {}, fragment {} contains an out-of-bounds row offset",
+            source, field_id, fragment.fragment_id
+        )));
+    }
+    Ok(bitmap)
 }
 
 impl Dataset {
@@ -129,6 +199,9 @@ impl Dataset {
     }
 
     async fn read_field_assignment_file(&self, file: &FieldAssignmentFile) -> Result<Arc<Bytes>> {
+        if let Some(bytes) = inline_field_assignment_bytes(file)? {
+            return Ok(Arc::new(bytes));
+        }
         let path = self.field_assignment_path(file)?;
         let source_uri = self.field_assignment_source_uri(file)?;
         let key = FieldAssignmentFileKey {
@@ -201,42 +274,57 @@ impl Dataset {
         Ok(Some(root))
     }
 
+    /// Verify that an inline root copy exactly matches its referenced immutable
+    /// object. Normal queries trust the manifest copy; explicit validation
+    /// checks both representations and object reachability.
+    pub(crate) async fn validate_field_assignment_root_object(&self, field_id: i32) -> Result<()> {
+        let Some(descriptor) = self.field_assignment_state(field_id) else {
+            return Ok(());
+        };
+        let Some(inline_bytes) = descriptor.root.inline_bytes.as_ref() else {
+            return Ok(());
+        };
+        let mut object_file = descriptor.root.clone();
+        object_file.inline_bytes = None;
+        let path = self.field_assignment_path(&object_file)?;
+        let store = self.object_store(object_file.base_id).await?;
+        let object_bytes = read_field_assignment_bytes(&store, &path, &object_file).await?;
+        if object_bytes.as_ref() != inline_bytes.as_slice() {
+            return Err(Error::invalid_input(format!(
+                "Inline field assignment root '{}' for field ID {} does not match its immutable object",
+                descriptor.root.path, field_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Load and validate a partial assignment bitmap.
     pub(crate) async fn load_field_assignment_bitmap(
         &self,
         field_id: i32,
         fragment: &FieldAssignmentFragment,
     ) -> Result<RoaringBitmap> {
-        let FieldAssignmentFragmentState::Partial(file) = &fragment.state else {
-            return Err(Error::internal(format!(
-                "Field assignment bitmap requested for non-partial fragment {}",
-                fragment.fragment_id
-            )));
+        let bitmap = match &fragment.state {
+            FieldAssignmentFragmentState::Partial(file) => {
+                file.validate_bitmap_path_for_fragment(field_id, fragment.fragment_id)?;
+                let bytes = self.read_field_assignment_file(file).await?;
+                decode_field_assignment_bitmap(
+                    bytes.as_ref().as_ref(),
+                    &file.path,
+                    field_id,
+                    fragment,
+                )?
+            }
+            FieldAssignmentFragmentState::InlinePartial(bytes) => {
+                decode_field_assignment_bitmap(bytes, "inline root entry", field_id, fragment)?
+            }
+            FieldAssignmentFragmentState::All => {
+                return Err(Error::internal(format!(
+                    "Field assignment bitmap requested for all-assigned fragment {}",
+                    fragment.fragment_id
+                )));
+            }
         };
-        file.validate_bitmap_path_for_fragment(field_id, fragment.fragment_id)?;
-        let bytes = self.read_field_assignment_file(file).await?;
-        let bitmap = RoaringBitmap::deserialize_from(&mut Cursor::new(bytes.as_ref().as_ref()))
-            .map_err(|error| {
-                Error::invalid_input(format!(
-                    "Failed to decode assignment bitmap '{}' for field ID {}, fragment {}: {}",
-                    file.path, field_id, fragment.fragment_id, error
-                ))
-            })?;
-        if bitmap.is_empty() || bitmap.len() == fragment.physical_rows {
-            return Err(Error::invalid_input(format!(
-                "Partial assignment bitmap '{}' for field ID {}, fragment {} must be non-empty and non-full",
-                file.path, field_id, fragment.fragment_id
-            )));
-        }
-        if bitmap
-            .max()
-            .is_some_and(|offset| offset as u64 >= fragment.physical_rows)
-        {
-            return Err(Error::invalid_input(format!(
-                "Assignment bitmap '{}' for field ID {}, fragment {} contains an out-of-bounds row offset",
-                file.path, field_id, fragment.fragment_id
-            )));
-        }
         Ok(bitmap)
     }
 
@@ -247,7 +335,7 @@ impl Dataset {
         fragment_id: u64,
         physical_rows: u64,
         bitmap: &RoaringBitmap,
-    ) -> Result<FieldAssignmentFile> {
+    ) -> Result<FieldAssignmentFragmentState> {
         if bitmap.is_empty() || bitmap.len() == physical_rows {
             return Err(Error::internal(format!(
                 "Only partial assignment bitmaps may be written for field ID {}, fragment {}",
@@ -265,17 +353,36 @@ impl Dataset {
         }
         let mut bytes = Vec::with_capacity(bitmap.serialized_size());
         bitmap.serialize_into(&mut bytes)?;
+        let is_sparse =
+            bitmap.len() <= physical_rows / MAX_INLINE_FIELD_ASSIGNMENT_DENSITY_DENOMINATOR;
+        if is_sparse && bytes.len() <= MAX_INLINE_FIELD_ASSIGNMENT_BITMAP_BYTES {
+            return Ok(FieldAssignmentFragmentState::InlinePartial(bytes));
+        }
+        Ok(FieldAssignmentFragmentState::Partial(
+            self.write_field_assignment_bitmap_file(write_store, field_id, fragment_id, &bytes)
+                .await?,
+        ))
+    }
+
+    async fn write_field_assignment_bitmap_file(
+        &self,
+        write_store: &ObjectStore,
+        field_id: i32,
+        fragment_id: u64,
+        bytes: &[u8],
+    ) -> Result<FieldAssignmentFile> {
         let relative = Path::from(FIELD_ASSIGNMENTS_DIR)
             .join(FIELD_ASSIGNMENT_BITMAPS_DIR)
             .join(field_id.to_string())
             .join(fragment_id.to_string())
             .join(format!("{}.rbm", Uuid::new_v4()));
         let full_path = Path::from_iter(self.base.parts().chain(relative.parts()));
-        write_store.put(&full_path, &bytes).await?;
+        write_store.put(&full_path, bytes).await?;
         Ok(FieldAssignmentFile {
             path: relative.to_string(),
             size_bytes: bytes.len() as u64,
             base_id: None,
+            inline_bytes: None,
         })
     }
 
@@ -296,7 +403,47 @@ impl Dataset {
                 field_id
             )));
         }
+        let mut inline_bytes = 0usize;
+        for entry in &mut root.fragments {
+            let spill = match &entry.state {
+                FieldAssignmentFragmentState::InlinePartial(bytes) => {
+                    let next_inline_bytes =
+                        inline_bytes.checked_add(bytes.len()).ok_or_else(|| {
+                            Error::internal(format!(
+                                "Inline assignment bitmap size overflow for field ID {}",
+                                field_id
+                            ))
+                        })?;
+                    if next_inline_bytes <= MAX_INLINE_FIELD_ASSIGNMENT_ROOT_BYTES {
+                        inline_bytes = next_inline_bytes;
+                        None
+                    } else {
+                        Some(bytes.clone())
+                    }
+                }
+                _ => None,
+            };
+            if let Some(bytes) = spill {
+                let file = self
+                    .write_field_assignment_bitmap_file(
+                        write_store,
+                        field_id,
+                        entry.fragment_id,
+                        &bytes,
+                    )
+                    .await?;
+                entry.state = FieldAssignmentFragmentState::Partial(file);
+            }
+        }
         let bytes = pb::FieldAssignmentRoot::from(&root).encode_to_vec();
+        if bytes.len() as u64 > MAX_FIELD_ASSIGNMENT_FILE_BYTES {
+            return Err(Error::internal(format!(
+                "Field assignment root for field ID {} has encoded size {}, maximum is {}",
+                field_id,
+                bytes.len(),
+                MAX_FIELD_ASSIGNMENT_FILE_BYTES
+            )));
+        }
         let relative = Path::from(FIELD_ASSIGNMENTS_DIR)
             .join(FIELD_ASSIGNMENT_ROOTS_DIR)
             .join(field_id.to_string())
@@ -309,6 +456,8 @@ impl Dataset {
                 path: relative.to_string(),
                 size_bytes: bytes.len() as u64,
                 base_id: None,
+                inline_bytes: (bytes.len() <= MAX_INLINE_FIELD_ASSIGNMENT_ROOT_COPY_BYTES)
+                    .then(|| bytes.to_vec()),
             },
         })
     }
@@ -406,7 +555,8 @@ impl Dataset {
             {
                 let state = match &fragment.state {
                     FieldAssignmentFragmentState::All => None,
-                    FieldAssignmentFragmentState::Partial(_) => Some(
+                    FieldAssignmentFragmentState::Partial(_)
+                    | FieldAssignmentFragmentState::InlinePartial(_) => Some(
                         self.load_field_assignment_bitmap(field_id, &fragment)
                             .await?,
                     ),
@@ -623,7 +773,8 @@ pub async fn load_field_assignment_fragments(
                 }
                 let state = match fragment.state {
                     FieldAssignmentFragmentState::All => AssignmentFragment::All,
-                    FieldAssignmentFragmentState::Partial(_) => {
+                    FieldAssignmentFragmentState::Partial(_)
+                    | FieldAssignmentFragmentState::InlinePartial(_) => {
                         let bitmap = dataset
                             .load_field_assignment_bitmap(field_id, &fragment)
                             .await?;
@@ -753,17 +904,27 @@ impl FieldAssignmentExprBindings {
                     .collect::<HashSet<_>>(),
             )
         });
+        let covered_fragments = selected_fragments
+            .unwrap_or(dataset.fragments())
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<RoaringBitmap>();
         let io_parallelism = dataset.object_store.io_parallelism().max(1);
         let functions = futures::stream::iter(field_ids)
             .map(|field_id| {
                 let selected_fragment_ids = selected_fragment_ids.clone();
+                let covered_fragments = covered_fragments.clone();
                 async move {
                     let fragments =
                         load_field_assignment_fragments(dataset, field_id, selected_fragment_ids)
                             .await?;
                     Ok::<(i32, Arc<ScalarUDF>), Error>((
                         field_id,
-                        Arc::new(bound_is_assigned_udf(field_id, fragments)),
+                        Arc::new(bound_is_assigned_udf_with_coverage(
+                            field_id,
+                            fragments,
+                            covered_fragments,
+                        )),
                     ))
                 }
             })
@@ -868,7 +1029,8 @@ async fn materialize_fragment_bitmap(
             );
             Ok(bitmap)
         }
-        FieldAssignmentFragmentState::Partial(_) => {
+        FieldAssignmentFragmentState::Partial(_)
+        | FieldAssignmentFragmentState::InlinePartial(_) => {
             current.load_field_assignment_bitmap(field_id, entry).await
         }
     }
@@ -1221,7 +1383,7 @@ pub async fn apply_field_assignment_transaction(
                     let bitmap = current
                         .load_field_assignment_bitmap(source_field_id, fragment)
                         .await?;
-                    let file = current
+                    let state = current
                         .write_field_assignment_bitmap(
                             write_store,
                             field_id,
@@ -1230,7 +1392,7 @@ pub async fn apply_field_assignment_transaction(
                             &bitmap,
                         )
                         .await?;
-                    fragment.state = FieldAssignmentFragmentState::Partial(file);
+                    fragment.state = state;
                 }
             }
             descriptors.push(
@@ -1410,7 +1572,7 @@ pub async fn apply_field_assignment_transaction(
                     );
                 }
                 FieldAssignmentFragmentValue::Partial(bitmap) => {
-                    let file = current
+                    let state = current
                         .write_field_assignment_bitmap(
                             write_store,
                             field_id,
@@ -1424,7 +1586,7 @@ pub async fn apply_field_assignment_transaction(
                         FieldAssignmentFragment {
                             fragment_id: *fragment_id,
                             physical_rows,
-                            state: FieldAssignmentFragmentState::Partial(file),
+                            state,
                         },
                     );
                 }
@@ -1475,7 +1637,7 @@ pub async fn apply_field_assignment_transaction(
                     },
                 );
             } else {
-                let file = current
+                let state = current
                     .write_field_assignment_bitmap(
                         write_store,
                         field_id,
@@ -1489,7 +1651,7 @@ pub async fn apply_field_assignment_transaction(
                     FieldAssignmentFragment {
                         fragment_id: *fragment_id,
                         physical_rows,
-                        state: FieldAssignmentFragmentState::Partial(file),
+                        state,
                     },
                 );
             }
@@ -1508,6 +1670,20 @@ pub async fn apply_field_assignment_transaction(
         );
     }
     descriptors.sort_by_key(|state| state.field_id);
+    let mut inline_manifest_bytes = 0usize;
+    for descriptor in &mut descriptors {
+        let Some(bytes) = descriptor.root.inline_bytes.as_ref() else {
+            continue;
+        };
+        let next_inline_manifest_bytes = inline_manifest_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| Error::internal("Inline assignment manifest size overflow"))?;
+        if next_inline_manifest_bytes <= MAX_INLINE_FIELD_ASSIGNMENT_MANIFEST_BYTES {
+            inline_manifest_bytes = next_inline_manifest_bytes;
+        } else {
+            descriptor.root.inline_bytes = None;
+        }
+    }
     manifest.field_assignment_states = descriptors;
     Ok(())
 }
@@ -1527,6 +1703,7 @@ mod tests {
     use lance_datafusion::udf::is_assigned;
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::FileWriterOptions;
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::utils::CachedFileSize;
     use lance_table::feature_flags::{FLAG_FIELD_ASSIGNMENT, FLAG_UNKNOWN};
     use lance_table::format::DataFile;
@@ -1542,8 +1719,17 @@ mod tests {
         ColumnAlteration, FieldAssignment, FieldAssignmentAlteration, NewColumnTransform,
         UpdateBuilder, WriteDestination, WriteMode, WriteParams,
     };
+    use crate::index::DatasetIndexExt;
 
     async fn tracked_dataset(directory: &TempStrDir, rows_per_file: usize) -> Result<Dataset> {
+        tracked_dataset_with_stable_row_ids(directory, rows_per_file, false).await
+    }
+
+    async fn tracked_dataset_with_stable_row_ids(
+        directory: &TempStrDir,
+        rows_per_file: usize,
+        enable_stable_row_ids: bool,
+    ) -> Result<Dataset> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             DataType::Int32,
@@ -1558,6 +1744,7 @@ mod tests {
             directory,
             Some(WriteParams {
                 max_rows_per_file: rows_per_file,
+                enable_stable_row_ids,
                 ..Default::default()
             }),
         )
@@ -1575,6 +1762,59 @@ mod tests {
             )
             .await?;
         Ok(dataset)
+    }
+
+    async fn assigned_tracked_dataset(
+        directory: &TempStrDir,
+        rows_per_file: usize,
+    ) -> Result<Dataset> {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("embedding", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..8)),
+                Arc::new(Int32Array::from_iter_values(10..18)),
+            ],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            directory,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_file,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset
+            .alter_columns_with_assignment(
+                &[],
+                &[FieldAssignmentAlteration::new(
+                    "embedding",
+                    FieldAssignment::Assigned,
+                )],
+            )
+            .await?;
+        Ok(dataset)
+    }
+
+    async fn filtered_ids(dataset: &Dataset, filter: &str) -> Result<(Vec<i32>, String)> {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"])?;
+        scanner.filter(filter)?;
+        let plan = scanner.explain_plan(false).await?;
+        let batch = scanner.try_into_batch().await?;
+        let ids = batch
+            .column_by_name("id")
+            .expect("id projection must exist")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id must remain Int32");
+        let mut ids = ids.values().to_vec();
+        ids.sort_unstable();
+        Ok((ids, plan))
     }
 
     async fn assignment_rows(dataset: &Dataset, field: &str) -> Result<Vec<(i32, bool)>> {
@@ -1724,6 +1964,83 @@ mod tests {
         let mut scanner = dataset.scan();
         scanner.filter("NOT is_assigned(embedding)")?;
         assert_eq!(scanner.count_rows().await?, 6);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_assignment_filter_uses_exact_row_selection_pushdown() -> Result<()> {
+        for enable_stable_row_ids in [false, true] {
+            let directory = TempStrDir::default();
+            let dataset =
+                tracked_dataset_with_stable_row_ids(&directory, 2, enable_stable_row_ids).await?;
+            let result = UpdateBuilder::new(Arc::new(dataset))
+                .update_where("id IN (1, 3, 5, 7)")?
+                .set("embedding", "id * 10")?
+                .build()?
+                .execute()
+                .await?;
+            let mut dataset = result.new_dataset.as_ref().clone();
+            dataset.delete("id = 3").await?;
+
+            let (ids, plan) = filtered_ids(&dataset, "is_assigned(embedding)").await?;
+            assert_eq!(ids, vec![1, 5, 7]);
+            assert!(
+                plan.contains("ScalarIndexQuery")
+                    && plan.contains("FieldAssignment")
+                    && plan.contains("exact"),
+                "assignment filter did not use exact row selection:\n{plan}"
+            );
+
+            let (ids, plan) = filtered_ids(&dataset, "NOT is_assigned(embedding)").await?;
+            assert_eq!(ids, vec![0, 2, 4, 6]);
+            assert!(
+                plan.contains("ScalarIndexQuery"),
+                "unexpected plan:\n{plan}"
+            );
+
+            let (ids, plan) = filtered_ids(&dataset, "is_assigned(embedding) AND id >= 5").await?;
+            assert_eq!(ids, vec![5, 7]);
+            assert!(
+                plan.contains("ScalarIndexQuery"),
+                "unexpected plan:\n{plan}"
+            );
+
+            // OR with an unindexed predicate must retain the correctness
+            // fallback because the other side may select any physical row.
+            let (ids, plan) = filtered_ids(&dataset, "is_assigned(embedding) OR id = 0").await?;
+            assert_eq!(ids, vec![0, 1, 5, 7]);
+            assert!(
+                !plan.contains("ScalarIndexQuery"),
+                "partial OR was incorrectly pushed down:\n{plan}"
+            );
+
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Bitmap,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await?;
+            let (ids, plan) = filtered_ids(&dataset, "is_assigned(embedding) OR id = 0").await?;
+            assert_eq!(ids, vec![0, 1, 5, 7]);
+            assert!(
+                plan.contains("ScalarIndexQuery")
+                    && plan.contains("FieldAssignment")
+                    && plan.contains("Bitmap"),
+                "assignment and scalar index were not combined:\n{plan}"
+            );
+
+            compact_files(&mut dataset, CompactionOptions::default(), None).await?;
+            let (ids, plan) = filtered_ids(&dataset, "is_assigned(embedding)").await?;
+            assert_eq!(ids, vec![1, 5, 7]);
+            assert!(
+                plan.contains("ScalarIndexQuery"),
+                "unexpected plan:\n{plan}"
+            );
+        }
 
         Ok(())
     }
@@ -2246,15 +2563,31 @@ mod tests {
     #[tokio::test]
     async fn test_assignment_state_is_loaded_only_when_referenced() -> Result<()> {
         let directory = TempStrDir::default();
-        let dataset = tracked_dataset(&directory, 2).await?;
+        let dataset = assigned_tracked_dataset(&directory, 2).await?;
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id IN (1, 3, 5, 7)")?
+            .invalidate_fields(["embedding"])?
+            .build()?
+            .execute()
+            .await?;
+        let dataset = result.new_dataset.as_ref();
         let field_id = dataset.schema().field("embedding").unwrap().id;
         let root = dataset
-            .field_assignment_state(field_id)
-            .unwrap()
-            .root
-            .clone();
-        let store = dataset.object_store(root.base_id).await?;
-        store.delete(&dataset.field_assignment_path(&root)?).await?;
+            .load_field_assignment_root(field_id)
+            .await?
+            .expect("tracked field must have a root");
+        let bitmap = root
+            .fragments
+            .iter()
+            .find_map(|fragment| match &fragment.state {
+                FieldAssignmentFragmentState::Partial(bitmap) => Some(bitmap.clone()),
+                _ => None,
+            })
+            .expect("dense partial assignment must use an external bitmap");
+        let store = dataset.object_store(bitmap.base_id).await?;
+        store
+            .delete(&dataset.field_assignment_path(&bitmap)?)
+            .await?;
 
         let mut ordinary = dataset.scan();
         ordinary.project(&["id"])?;
@@ -2264,7 +2597,7 @@ mod tests {
         assignment.project_with_transform(&[("assigned", "is_assigned(embedding)")])?;
         let error = assignment.try_into_batch().await.unwrap_err();
         assert!(
-            error.to_string().contains(&root.path),
+            error.to_string().contains(&bitmap.path),
             "unexpected assignment read error: {error}"
         );
 
@@ -2272,58 +2605,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_assignment_planning_reuses_session_metadata_cache() -> Result<()> {
+    async fn test_assignment_planning_inlines_sparse_root_and_caches_external_fallback()
+    -> Result<()> {
         use lance_io::{assert_io_eq, assert_io_gt};
 
         let directory = TempStrDir::default();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("embedding", DataType::Int32, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..8)),
-                Arc::new(Int32Array::from_iter_values(0..8)),
-            ],
-        )?;
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new([Ok(batch)], schema),
-            &directory,
-            Some(WriteParams {
-                max_rows_per_file: 4,
-                ..Default::default()
-            }),
-        )
-        .await?;
-        dataset
-            .alter_columns_with_assignment(
-                &[],
-                &[FieldAssignmentAlteration::new(
-                    "embedding",
-                    FieldAssignment::Assigned,
-                )],
-            )
-            .await?;
+        let dataset = assigned_tracked_dataset(&directory, 4).await?;
         let result = UpdateBuilder::new(Arc::new(dataset))
-            .update_where("id = 1 OR id = 5")?
+            .update_where("id % 4 != 0")?
             .invalidate_fields(["embedding"])?
             .build()?
             .execute()
             .await?;
         let dataset = result.new_dataset.as_ref();
+        let field_id = dataset.schema().field("embedding").unwrap().id;
+        assert!(
+            dataset
+                .field_assignment_state(field_id)
+                .unwrap()
+                .root
+                .inline_bytes
+                .is_some()
+        );
+        let root = dataset.load_field_assignment_root(field_id).await?.unwrap();
+        assert!(root.fragments.iter().all(|fragment| matches!(
+            fragment.state,
+            FieldAssignmentFragmentState::InlinePartial(_)
+        )));
 
         let _ = dataset.object_store.io_stats_incremental();
         let mut first = dataset.scan();
         first.project_with_transform(&[("assigned", "is_assigned(embedding)")])?;
         first.explain_plan(false).await?;
         let first_io = dataset.object_store.io_stats_incremental();
-        assert_io_gt!(first_io, read_iops, 0);
+        assert_io_eq!(first_io, read_iops, 0);
+        assert_io_eq!(first_io, read_bytes, 0);
 
-        let mut second = dataset.scan();
+        let mut external_root = dataset.clone();
+        Arc::make_mut(&mut external_root.manifest)
+            .field_assignment_states
+            .iter_mut()
+            .find(|state| state.field_id == field_id)
+            .unwrap()
+            .root
+            .inline_bytes = None;
+        let _ = external_root.object_store.io_stats_incremental();
+        let mut second = external_root.scan();
         second.project_with_transform(&[("assigned", "is_assigned(embedding)")])?;
         second.explain_plan(false).await?;
-        let warm_io = dataset.object_store.io_stats_incremental();
+        let cold_external_io = external_root.object_store.io_stats_incremental();
+        assert_io_gt!(cold_external_io, read_iops, 0);
+
+        let mut third = external_root.scan();
+        third.project_with_transform(&[("assigned", "is_assigned(embedding)")])?;
+        third.explain_plan(false).await?;
+        let warm_io = external_root.object_store.io_stats_incremental();
         assert_io_eq!(warm_io, read_iops, 0);
         assert_io_eq!(warm_io, read_bytes, 0);
 
@@ -2623,6 +2959,17 @@ mod tests {
             Arc::new(Int32Array::from(vec![None, Some(40)])),
         )
         .await?;
+        let root = dataset
+            .load_field_assignment_root(field_id)
+            .await?
+            .expect("tracked field must have a root");
+        assert!(matches!(
+            root.fragments.as_slice(),
+            [FieldAssignmentFragment {
+                state: FieldAssignmentFragmentState::InlinePartial(_),
+                ..
+            }]
+        ));
 
         assert_eq!(
             assignment_rows(&dataset, "embedding").await?,
@@ -2740,7 +3087,24 @@ mod tests {
                 .all(|fragment| match &fragment.state {
                     FieldAssignmentFragmentState::All => true,
                     FieldAssignmentFragmentState::Partial(bitmap) => bitmap.base_id.is_none(),
+                    FieldAssignmentFragmentState::InlinePartial(_) => true,
                 })
+        );
+        deep.validate().await?;
+        let mut corrupted_inline_root = deep.clone();
+        let inline_bytes = Arc::make_mut(&mut corrupted_inline_root.manifest)
+            .field_assignment_states
+            .iter_mut()
+            .find(|state| state.field_id == field_id)
+            .and_then(|state| state.root.inline_bytes.as_mut())
+            .expect("small deep-cloned root must retain an inline copy");
+        inline_bytes[0] ^= 0xff;
+        let error = corrupted_inline_root.validate().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its immutable object"),
+            "unexpected inline root validation error: {error}"
         );
 
         // Prove the deep clone owns its assignment objects instead of falling

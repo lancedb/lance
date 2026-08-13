@@ -159,7 +159,13 @@ impl LanceTableProvider {
                     load_field_assignment_fragments(&self.dataset, binding.field_id(), None)
                         .await
                         .map_err(DataFusionError::from)?;
-                binding.initialize(fragments)
+                let covered_fragments = self
+                    .dataset
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect();
+                binding.initialize_with_coverage(fragments, covered_fragments)
             })
             .buffer_unordered(io_parallelism)
             .try_collect::<Vec<_>>()

@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 use super::pb;
 
+const MAX_INLINE_FIELD_ASSIGNMENT_ROOT_BYTES: usize = 64 * 1024;
+
 /// Reference to an immutable field-assignment object under a dataset root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct FieldAssignmentFile {
@@ -20,6 +22,9 @@ pub struct FieldAssignmentFile {
     pub size_bytes: u64,
     /// Optional external dataset base ID.
     pub base_id: Option<u32>,
+    /// Optional exact inline copy of a small immutable root object.
+    #[serde(default)]
+    pub inline_bytes: Option<Vec<u8>>,
 }
 
 impl From<&FieldAssignmentFile> for pb::FieldAssignmentFile {
@@ -28,6 +33,7 @@ impl From<&FieldAssignmentFile> for pb::FieldAssignmentFile {
             path: value.path.clone(),
             size_bytes: value.size_bytes,
             base_id: value.base_id,
+            inline_bytes: value.inline_bytes.clone(),
         }
     }
 }
@@ -40,13 +46,39 @@ impl TryFrom<pb::FieldAssignmentFile> for FieldAssignmentFile {
             path: value.path,
             size_bytes: value.size_bytes,
             base_id: value.base_id,
+            inline_bytes: value.inline_bytes,
         };
+        file.validate_inline_copy()?;
         file.validate_namespace()?;
         Ok(file)
     }
 }
 
 impl FieldAssignmentFile {
+    fn validate_inline_copy(&self) -> Result<()> {
+        if let Some(bytes) = self.inline_bytes.as_ref()
+            && bytes.len() as u64 != self.size_bytes
+        {
+            return Err(Error::invalid_input(format!(
+                "Inline field assignment file '{}' has size {}, expected {}",
+                self.path,
+                bytes.len(),
+                self.size_bytes
+            )));
+        }
+        if self
+            .inline_bytes
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > MAX_INLINE_FIELD_ASSIGNMENT_ROOT_BYTES)
+        {
+            return Err(Error::invalid_input(format!(
+                "Inline field assignment file '{}' has size {}, maximum is {}",
+                self.path, self.size_bytes, MAX_INLINE_FIELD_ASSIGNMENT_ROOT_BYTES
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_namespace(&self) -> Result<()> {
         let path = Path::parse(&self.path).map_err(|error| {
             Error::invalid_input(format!(
@@ -112,6 +144,7 @@ impl FieldAssignmentFile {
 
     /// Validate that this file is an immutable assignment root.
     pub fn validate_root_path(&self) -> Result<()> {
+        self.validate_inline_copy()?;
         self.validate_kind("roots", 4, ".root")
     }
 
@@ -136,7 +169,15 @@ impl FieldAssignmentFile {
 
     /// Validate that this file is an immutable partial-assignment bitmap.
     pub fn validate_bitmap_path(&self) -> Result<()> {
-        self.validate_kind("bitmaps", 5, ".rbm")
+        self.validate_inline_copy()?;
+        self.validate_kind("bitmaps", 5, ".rbm")?;
+        if self.inline_bytes.is_some() {
+            return Err(Error::invalid_input(format!(
+                "Field assignment bitmap file '{}' cannot contain inline root bytes",
+                self.path
+            )));
+        }
+        Ok(())
     }
 
     /// Validate this bitmap's namespace against its root entry.
@@ -224,6 +265,8 @@ pub enum FieldAssignmentFragmentState {
     All,
     /// A non-empty, non-full Roaring bitmap of physical row offsets.
     Partial(FieldAssignmentFile),
+    /// A small non-empty, non-full portable Roaring bitmap embedded in the root.
+    InlinePartial(Vec<u8>),
 }
 
 impl From<&FieldAssignmentRoot> for pb::FieldAssignmentRoot {
@@ -262,6 +305,9 @@ impl From<&FieldAssignmentFragment> for pb::FieldAssignmentFragment {
             }
             FieldAssignmentFragmentState::Partial(file) => {
                 pb::field_assignment_fragment::State::Partial(file.into())
+            }
+            FieldAssignmentFragmentState::InlinePartial(bytes) => {
+                pb::field_assignment_fragment::State::InlinePartial(bytes.clone())
             }
         };
         Self {
@@ -308,6 +354,15 @@ impl TryFrom<pb::FieldAssignmentFragment> for FieldAssignmentFragment {
                 }
                 FieldAssignmentFragmentState::Partial(file)
             }
+            pb::field_assignment_fragment::State::InlinePartial(bytes) => {
+                if bytes.is_empty() {
+                    return Err(Error::invalid_input(format!(
+                        "Inline partial field assignment for fragment {} must be non-empty",
+                        value.fragment_id
+                    )));
+                }
+                FieldAssignmentFragmentState::InlinePartial(bytes)
+            }
         };
         Ok(Self {
             fragment_id: value.fragment_id,
@@ -338,7 +393,13 @@ mod tests {
                             .to_string(),
                         size_bytes: 12,
                         base_id: Some(4),
+                        inline_bytes: None,
                     }),
+                },
+                FieldAssignmentFragment {
+                    fragment_id: 5,
+                    physical_rows: 10,
+                    state: FieldAssignmentFragmentState::InlinePartial(vec![1, 2, 3]),
                 },
             ],
         };
@@ -352,6 +413,17 @@ mod tests {
             ],
         };
         assert!(FieldAssignmentRoot::try_from(duplicate).is_err());
+
+        let empty_inline = pb::FieldAssignmentRoot {
+            fragments: vec![pb::FieldAssignmentFragment {
+                fragment_id: 1,
+                physical_rows: 5,
+                state: Some(pb::field_assignment_fragment::State::InlinePartial(
+                    Vec::new(),
+                )),
+            }],
+        };
+        assert!(FieldAssignmentRoot::try_from(empty_inline).is_err());
     }
 
     #[test]
@@ -361,6 +433,7 @@ mod tests {
                 .to_string(),
             size_bytes: 12,
             base_id: None,
+            inline_bytes: Some(vec![0; 12]),
         };
         assert!(root.validate_root_path().is_ok());
         assert!(root.validate_bitmap_path().is_err());
@@ -370,6 +443,7 @@ mod tests {
                 .to_string(),
             size_bytes: 12,
             base_id: None,
+            inline_bytes: None,
         };
         assert!(bitmap.validate_bitmap_path().is_ok());
         assert!(bitmap.validate_root_path().is_err());
@@ -386,6 +460,7 @@ mod tests {
                 path: invalid_path.to_string(),
                 size_bytes: 12,
                 base_id: None,
+                inline_bytes: None,
             };
             assert!(
                 file.validate_root_path().is_err() && file.validate_bitmap_path().is_err(),

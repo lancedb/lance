@@ -5256,6 +5256,7 @@ impl Scanner {
                     search.index_name
                 ))
             }),
+            ScalarIndexExpr::Exact(selection) => Ok(selection.fragment_bitmap().clone()),
         }
     }
 
@@ -5321,6 +5322,7 @@ impl Scanner {
                     stack.push(rhs);
                 }
                 ScalarIndexExpr::Query(search) => searches.push(search),
+                ScalarIndexExpr::Exact(_) => {}
             }
         }
 

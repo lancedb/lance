@@ -28,6 +28,8 @@ use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
 
+const MAX_INLINE_FIELD_ASSIGNMENT_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
 /// Manifest of a dataset
 ///
 ///  * Schema
@@ -983,6 +985,19 @@ impl TryFrom<pb::Manifest> for Manifest {
                     state.field_id
                 )));
             }
+        }
+        let inline_assignment_bytes = field_assignment_states
+            .iter()
+            .filter_map(|state| state.root.inline_bytes.as_ref())
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
+            .ok_or_else(|| {
+                Error::invalid_input("Inline field assignment manifest size overflow")
+            })?;
+        if inline_assignment_bytes > MAX_INLINE_FIELD_ASSIGNMENT_MANIFEST_BYTES {
+            return Err(Error::invalid_input(format!(
+                "Manifest contains {} inline field assignment bytes, maximum is {}",
+                inline_assignment_bytes, MAX_INLINE_FIELD_ASSIGNMENT_MANIFEST_BYTES
+            )));
         }
 
         Ok(Self {
