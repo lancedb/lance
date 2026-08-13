@@ -343,6 +343,55 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 20 * 1024 * 1024;
 #[cfg(test)]
 pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 
+async fn localize_deep_clone_field_assignments(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    manifest: &mut Manifest,
+) -> Result<()> {
+    let mut normalized_roots = HashMap::new();
+    for assignment in &mut manifest.field_assignment_states {
+        let size_bytes = if let Some(size_bytes) = normalized_roots.get(&assignment.root.path) {
+            *size_bytes
+        } else {
+            let relative = Path::parse(assignment.root.path.as_str())?;
+            let path = Path::from_iter(base_path.parts().chain(relative.parts()));
+            let bytes = object_store.read_one_all(&path).await?;
+            if bytes.len() as u64 != assignment.root.size_bytes {
+                return Err(Error::invalid_input(format!(
+                    "Deep-cloned field assignment root '{}' has size {}, expected {}",
+                    assignment.root.path,
+                    bytes.len(),
+                    assignment.root.size_bytes
+                )));
+            }
+            let mut root = pb::FieldAssignmentRoot::decode(bytes.as_ref()).map_err(|error| {
+                Error::invalid_input(format!(
+                    "Failed to decode deep-cloned field assignment root '{}': {}",
+                    assignment.root.path, error
+                ))
+            })?;
+            for fragment in &mut root.fragments {
+                if let Some(pb::field_assignment_fragment::State::Partial(bitmap)) =
+                    &mut fragment.state
+                {
+                    // collect_paths copied every referenced page under the same
+                    // dataset-relative path, so the cloned root must no longer
+                    // retain the source manifest's base-ID namespace.
+                    bitmap.base_id = None;
+                }
+            }
+            let normalized = root.encode_to_vec();
+            object_store.put(&path, &normalized).await?;
+            let size_bytes = normalized.len() as u64;
+            normalized_roots.insert(assignment.root.path.clone(), size_bytes);
+            size_bytes
+        };
+        assignment.root.base_id = None;
+        assignment.root.size_bytes = size_bytes;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
@@ -441,6 +490,8 @@ async fn do_commit_new_dataset(
                 }
             }
             new_manifest.fragments = Arc::new(new_frags);
+            localize_deep_clone_field_assignments(object_store, base_path, &mut new_manifest)
+                .await?;
 
             // Indices: keep metadata but normalize base to local
             let mut updated_indices = Vec::new();
@@ -1029,6 +1080,16 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
+    if !lance_table::feature_flags::can_write_dataset(dataset.manifest.writer_feature_flags) {
+        return Err(Error::not_supported_source(
+            format!(
+                "This dataset cannot be written by this version of Lance. Please upgrade Lance to write to this dataset.\n Flags: {}",
+                dataset.manifest.writer_feature_flags
+            )
+            .into(),
+        ));
+    }
+
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
@@ -1074,6 +1135,14 @@ pub(crate) async fn do_commit_detached_transaction(
         };
 
         manifest.version = random_version;
+
+        crate::dataset::field_assignment::apply_field_assignment_transaction(
+            dataset,
+            object_store,
+            &mut manifest,
+            transaction,
+        )
+        .await?;
 
         // recompute_stats is always false so far because detached manifests are newer than
         // the old stats bug.
@@ -1304,6 +1373,16 @@ pub(crate) async fn commit_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
+    if !lance_table::feature_flags::can_write_dataset(dataset.manifest.writer_feature_flags) {
+        return Err(Error::not_supported_source(
+            format!(
+                "This dataset cannot be written by this version of Lance. Please upgrade Lance to write to this dataset.\n Flags: {}",
+                dataset.manifest.writer_feature_flags
+            )
+            .into(),
+        ));
+    }
+
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
@@ -1387,6 +1466,20 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
+        // A compatible rebase may have advanced to a snapshot that requires a
+        // writer feature absent from the snapshot originally read. Recheck the
+        // actual head on every attempt so an older writer cannot cross the
+        // feature boundary through a concurrent commit.
+        if !lance_table::feature_flags::can_write_dataset(dataset.manifest.writer_feature_flags) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "This dataset cannot be written by this version of Lance. Please upgrade Lance to write to this dataset.\n Flags: {}",
+                    dataset.manifest.writer_feature_flags
+                )
+                .into(),
+            ));
+        }
+
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
         let pb_transaction = pb::Transaction::from(&transaction);
@@ -1429,6 +1522,14 @@ pub(crate) async fn commit_transaction(
         };
 
         manifest.version = target_version;
+
+        crate::dataset::field_assignment::apply_field_assignment_transaction(
+            &dataset,
+            object_store,
+            &mut manifest,
+            &transaction,
+        )
+        .await?;
 
         let previous_writer_version = &dataset.manifest.writer_version;
         // The versions of Lance prior to when we started writing the writer version

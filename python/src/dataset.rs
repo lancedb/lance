@@ -45,8 +45,8 @@ use lance::dataset::scanner::{
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
-    BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
-    WriteDestination,
+    BatchInfo, BatchUDF, CommitBuilder, FieldAssignment, FieldAssignmentAlteration, MergeStats,
+    NewColumnTransform, UDFCheckpointStore, WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
@@ -128,6 +128,19 @@ const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
 type PyBlobBytes = Option<Py<PyBytes>>;
+
+fn parse_field_assignment(value: Option<String>) -> PyResult<Option<FieldAssignment>> {
+    value
+        .map(|value| match value.as_str() {
+            "assigned" => Ok(FieldAssignment::Assigned),
+            "unassigned" => Ok(FieldAssignment::Unassigned),
+            _ => Err(PyValueError::new_err(format!(
+                "assignment must be 'assigned' or 'unassigned', got '{}'",
+                value
+            ))),
+        })
+        .transpose()
+}
 type PyReadBlob = (u64, PyBlobBytes);
 type PyReadBlobRange = (usize, u64, PyBlobBytes);
 
@@ -388,6 +401,17 @@ impl MergeInsertBuilder {
 
     pub fn when_not_matched_insert_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
         slf.builder.when_not_matched(WhenNotMatched::InsertAll);
+        Ok(slf)
+    }
+
+    /// Clear assignment for tracked fields on rows updated by the merge.
+    pub fn invalidate_fields(
+        mut slf: PyRefMut<Self>,
+        fields: Vec<String>,
+    ) -> PyResult<PyRefMut<Self>> {
+        slf.builder
+            .invalidate_fields(fields)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(slf)
     }
 
@@ -1854,23 +1878,38 @@ impl Dataset {
                     .get_item("data_type")?
                     .map(|n| n.extract())
                     .transpose()?;
+                let assignment: Option<String> = obj
+                    .get_item("assignment")?
+                    .map(|value| value.extract())
+                    .transpose()?;
 
                 for key in obj.keys().iter().map(|k| k.extract::<String>()) {
                     let k = key?;
-                    if k != "path" && k != "name" && k != "nullable" && k != "data_type" {
+                    if k != "path"
+                        && k != "name"
+                        && k != "nullable"
+                        && k != "data_type"
+                        && k != "assignment"
+                    {
                         return Err(PyValueError::new_err(format!(
-                            "Unknown key: {}. Valid keys are name, nullable, and data_type.",
+                            "Unknown key: {}. Valid keys are name, nullable, data_type, and assignment.",
                             k
                         )));
                     }
                 }
 
-                if name.is_none() && nullable.is_none() && data_type.is_none() {
+                if name.is_none()
+                    && nullable.is_none()
+                    && data_type.is_none()
+                    && assignment.is_none()
+                {
                     return Err(PyValueError::new_err(
-                        "At least one of name, nullable, or data_type must be specified",
+                        "At least one of name, nullable, data_type, or assignment must be specified",
                     ));
                 }
 
+                let assignment = parse_field_assignment(assignment)?
+                    .map(|assignment| FieldAssignmentAlteration::new(path.clone(), assignment));
                 let mut alteration = ColumnAlteration::new(path);
                 if let Some(name) = name {
                     alteration = alteration.rename(name);
@@ -1881,14 +1920,24 @@ impl Dataset {
                 if let Some(data_type) = data_type {
                     alteration = alteration.cast_to(data_type.0);
                 }
-                Ok(alteration)
+                Ok((alteration, assignment))
             })
             .collect::<PyResult<Vec<_>>>()?;
+
+        let (alterations, assignment_alterations): (Vec<_>, Vec<_>) =
+            alterations.into_iter().unzip();
+        let assignment_alterations = assignment_alterations
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         let mut new_self = self.ds.as_ref().clone();
         new_self = rt()
             .spawn(None, async move {
-                new_self.alter_columns(&alterations).await.map(|_| new_self)
+                new_self
+                    .alter_columns_with_assignment(&alterations, &assignment_alterations)
+                    .await
+                    .map(|_| new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
@@ -1941,13 +1990,15 @@ impl Dataset {
         Ok(dict.into())
     }
 
-    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
+    #[pyo3(signature=(updates=None, predicate=None, conflict_retries=None, retry_timeout=None, invalidate_fields=None))]
     fn update(
         &mut self,
-        updates: &Bound<'_, PyDict>,
+        py: Python<'_>,
+        updates: Option<&Bound<'_, PyDict>>,
         predicate: Option<&str>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
+        invalidate_fields: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
@@ -1964,13 +2015,21 @@ impl Dataset {
             builder = builder.retry_timeout(timeout);
         }
 
-        for (key, value) in updates {
-            let column: PyBackedStr = key.cast::<PyString>()?.clone().try_into()?;
-            let expr: PyBackedStr = value.cast::<PyString>()?.clone().try_into()?;
-
+        if let Some(invalidate_fields) = invalidate_fields {
             builder = builder
-                .set(column, &expr)
+                .invalidate_fields(invalidate_fields)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        if let Some(updates) = updates {
+            for (key, value) in updates {
+                let column: PyBackedStr = key.cast::<PyString>()?.clone().try_into()?;
+                let expr: PyBackedStr = value.cast::<PyString>()?.clone().try_into()?;
+
+                builder = builder
+                    .set(column, &expr)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
         }
 
         let operation = builder
@@ -1982,7 +2041,7 @@ impl Dataset {
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         self.ds = new_self.new_dataset;
-        let update_dict = PyDict::new(updates.py());
+        let update_dict = PyDict::new(py);
         let num_rows_updated = new_self.rows_updated;
         update_dict.set_item("num_rows_updated", num_rows_updated)?;
         Ok(update_dict.into())
@@ -3149,20 +3208,24 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (reader, batch_size = None))]
+    #[pyo3(signature = (reader, batch_size = None, assignment = None))]
     fn add_columns_from_reader(
         &mut self,
         reader: &Bound<'_, PyAny>,
         batch_size: Option<u32>,
+        assignment: Option<String>,
     ) -> PyResult<()> {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
 
         let transforms = NewColumnTransform::Reader(Box::new(batches));
+        let assignment = parse_field_assignment(assignment)?;
 
         let mut new_self = self.ds.as_ref().clone();
         let new_self = rt()
             .spawn(None, async move {
-                new_self.add_columns(transforms, None, batch_size).await?;
+                new_self
+                    .add_columns_with_assignment(transforms, None, batch_size, assignment)
+                    .await?;
                 Ok(new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
@@ -3171,21 +3234,23 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (transforms, read_columns = None, batch_size = None))]
+    #[pyo3(signature = (transforms, read_columns = None, batch_size = None, assignment = None))]
     fn add_columns(
         &mut self,
         py: Python<'_>,
         transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
+        assignment: Option<String>,
     ) -> PyResult<()> {
         let transforms = transforms_from_python(py, transforms)?;
+        let assignment = parse_field_assignment(assignment)?;
 
         let mut new_self = self.ds.as_ref().clone();
         let new_self = rt()
             .spawn(None, async move {
                 new_self
-                    .add_columns(transforms, read_columns, batch_size)
+                    .add_columns_with_assignment(transforms, read_columns, batch_size, assignment)
                     .await?;
                 Ok(new_self)
             })?
@@ -3196,15 +3261,22 @@ impl Dataset {
     }
 
     /// Add NULL columns with only ArrowSchema.
-    #[pyo3(signature = (schema))]
-    fn add_columns_with_schema(&mut self, schema: PyArrowType<ArrowSchema>) -> PyResult<()> {
+    #[pyo3(signature = (schema, assignment = None))]
+    fn add_columns_with_schema(
+        &mut self,
+        schema: PyArrowType<ArrowSchema>,
+        assignment: Option<String>,
+    ) -> PyResult<()> {
         let arrow_schema: &ArrowSchema = &schema.0;
         let transform = NewColumnTransform::AllNulls(Arc::new(arrow_schema.clone()));
+        let assignment = parse_field_assignment(assignment)?;
 
         let mut new_self = self.ds.as_ref().clone();
         let new_self = rt()
             .spawn(None, async move {
-                new_self.add_columns(transform, None, None).await?;
+                new_self
+                    .add_columns_with_assignment(transform, None, None, assignment)
+                    .await?;
                 Ok(new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;

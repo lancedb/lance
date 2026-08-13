@@ -50,6 +50,7 @@ use lance_table::{
     rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
 };
 use object_store::path::Path;
+use prost::Message;
 use roaring::RoaringBitmap;
 use std::cmp::Ordering;
 use std::{
@@ -262,6 +263,292 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+}
+
+const FIELD_ASSIGNMENT_TRANSACTION_PROPERTY: &str = "__lance_field_assignment_transaction";
+
+/// Assignment tracking initialization for a stable field ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FieldAssignmentInitialization {
+    pub field_id: i32,
+    pub assigned: bool,
+}
+
+/// Assignment transition for existing physical row addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FieldAssignmentRowChange {
+    pub field_id: i32,
+    pub assigned: bool,
+    pub row_addresses: roaring::RoaringTreemap,
+}
+
+/// Exact assignment state for a newly written fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FieldAssignmentFragmentState {
+    pub fragment_path: String,
+    pub field_id: i32,
+    pub state: FieldAssignmentFragmentValue,
+}
+
+/// Preserve assignment state when schema evolution replaces a stable field ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FieldAssignmentTransfer {
+    pub source_field_id: i32,
+    pub target_field_id: i32,
+}
+
+/// Compact state supplied for a newly written fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FieldAssignmentFragmentValue {
+    None,
+    All,
+    Partial(RoaringBitmap),
+}
+
+/// Assignment transitions carried atomically by a transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FieldAssignmentTransaction {
+    pub initializations: Vec<FieldAssignmentInitialization>,
+    pub row_changes: Vec<FieldAssignmentRowChange>,
+    pub fragment_states: Vec<FieldAssignmentFragmentState>,
+    pub transfers: Vec<FieldAssignmentTransfer>,
+}
+
+impl FieldAssignmentTransaction {
+    pub fn is_empty(&self) -> bool {
+        self.initializations.is_empty()
+            && self.row_changes.is_empty()
+            && self.fragment_states.is_empty()
+            && self.transfers.is_empty()
+    }
+}
+
+fn encode_field_assignment_transaction(value: &FieldAssignmentTransaction) -> String {
+    let bytes = pb::transaction::FieldAssignmentTransaction::from(value).encode_to_vec();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_field_assignment_transaction(value: &str) -> Result<FieldAssignmentTransaction> {
+    if !value.len().is_multiple_of(2) {
+        return Err(Error::invalid_input(
+            "Internal field assignment transaction has an odd-length encoding",
+        ));
+    }
+    let nibble = |byte: u8| -> Result<u8> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            b'A'..=b'F' => Ok(byte - b'A' + 10),
+            _ => Err(Error::invalid_input(
+                "Internal field assignment transaction is not hexadecimal",
+            )),
+        }
+    };
+    let bytes = value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect::<Result<Vec<_>>>()?;
+    let proto =
+        pb::transaction::FieldAssignmentTransaction::decode(bytes.as_slice()).map_err(|error| {
+            Error::invalid_input(format!(
+                "Failed to decode internal field assignment transaction: {}",
+                error
+            ))
+        })?;
+    proto.try_into()
+}
+
+impl From<&FieldAssignmentTransaction> for pb::transaction::FieldAssignmentTransaction {
+    fn from(value: &FieldAssignmentTransaction) -> Self {
+        use pb::transaction::field_assignment_transaction as assignment_pb;
+
+        Self {
+            initializations: value
+                .initializations
+                .iter()
+                .map(|initialization| assignment_pb::Initialization {
+                    field_id: initialization.field_id,
+                    initial_state: if initialization.assigned {
+                        assignment_pb::InitialState::Assigned as i32
+                    } else {
+                        assignment_pb::InitialState::Unassigned as i32
+                    },
+                })
+                .collect(),
+            row_changes: value
+                .row_changes
+                .iter()
+                .map(|change| {
+                    let mut row_addresses = Vec::new();
+                    change
+                        .row_addresses
+                        .serialize_into(&mut row_addresses)
+                        .expect("RoaringTreemap serialization to Vec cannot fail");
+                    assignment_pb::RowChange {
+                        field_id: change.field_id,
+                        assigned: change.assigned,
+                        row_addresses,
+                    }
+                })
+                .collect(),
+            fragment_states: value
+                .fragment_states
+                .iter()
+                .map(|fragment| {
+                    let state = match &fragment.state {
+                        FieldAssignmentFragmentValue::None => {
+                            assignment_pb::fragment_state::State::NoneAssigned(true)
+                        }
+                        FieldAssignmentFragmentValue::All => {
+                            assignment_pb::fragment_state::State::AllAssigned(true)
+                        }
+                        FieldAssignmentFragmentValue::Partial(bitmap) => {
+                            let mut bytes = Vec::new();
+                            bitmap
+                                .serialize_into(&mut bytes)
+                                .expect("RoaringBitmap serialization to Vec cannot fail");
+                            assignment_pb::fragment_state::State::Partial(bytes)
+                        }
+                    };
+                    assignment_pb::FragmentState {
+                        fragment_path: fragment.fragment_path.clone(),
+                        field_id: fragment.field_id,
+                        state: Some(state),
+                    }
+                })
+                .collect(),
+            transfers: value
+                .transfers
+                .iter()
+                .map(|transfer| assignment_pb::Transfer {
+                    source_field_id: transfer.source_field_id,
+                    target_field_id: transfer.target_field_id,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<pb::transaction::FieldAssignmentTransaction> for FieldAssignmentTransaction {
+    type Error = Error;
+
+    fn try_from(value: pb::transaction::FieldAssignmentTransaction) -> Result<Self> {
+        use pb::transaction::field_assignment_transaction as assignment_pb;
+
+        let initializations = value
+            .initializations
+            .into_iter()
+            .map(|initialization| {
+                let initial_state = assignment_pb::InitialState::try_from(
+                    initialization.initial_state,
+                )
+                .map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Unknown field assignment initial state {} for field ID {}",
+                        initialization.initial_state, initialization.field_id
+                    ))
+                })?;
+                Ok(FieldAssignmentInitialization {
+                    field_id: initialization.field_id,
+                    assigned: initial_state == assignment_pb::InitialState::Assigned,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let row_changes = value
+            .row_changes
+            .into_iter()
+            .map(|change| {
+                let row_addresses =
+                    roaring::RoaringTreemap::deserialize_from(change.row_addresses.as_slice())
+                        .map_err(|error| {
+                            Error::invalid_input(format!(
+                                "Invalid field assignment row addresses for field ID {}: {}",
+                                change.field_id, error
+                            ))
+                        })?;
+                if row_addresses.is_empty() {
+                    return Err(Error::invalid_input(format!(
+                        "Field assignment row change for field ID {} has no rows",
+                        change.field_id
+                    )));
+                }
+                Ok(FieldAssignmentRowChange {
+                    field_id: change.field_id,
+                    assigned: change.assigned,
+                    row_addresses,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fragment_states = value
+            .fragment_states
+            .into_iter()
+            .map(|fragment| {
+                if fragment.fragment_path.is_empty() {
+                    return Err(Error::invalid_input(
+                        "Field assignment fragment state has an empty fragment path",
+                    ));
+                }
+                let state = match fragment.state.ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Field assignment fragment '{}' for field ID {} has no state",
+                        fragment.fragment_path, fragment.field_id
+                    ))
+                })? {
+                    assignment_pb::fragment_state::State::AllAssigned(true) => {
+                        FieldAssignmentFragmentValue::All
+                    }
+                    assignment_pb::fragment_state::State::NoneAssigned(true) => {
+                        FieldAssignmentFragmentValue::None
+                    }
+                    assignment_pb::fragment_state::State::AllAssigned(false)
+                    | assignment_pb::fragment_state::State::NoneAssigned(false) => {
+                        return Err(Error::invalid_input(format!(
+                            "Field assignment fragment '{}' for field ID {} encodes a false state marker",
+                            fragment.fragment_path, fragment.field_id
+                        )));
+                    }
+                    assignment_pb::fragment_state::State::Partial(bytes) => {
+                        let bitmap = RoaringBitmap::deserialize_from(bytes.as_slice()).map_err(
+                            |error| {
+                                Error::invalid_input(format!(
+                                    "Invalid field assignment bitmap for fragment '{}', field ID {}: {}",
+                                    fragment.fragment_path, fragment.field_id, error
+                                ))
+                            },
+                        )?;
+                        FieldAssignmentFragmentValue::Partial(bitmap)
+                    }
+                };
+                Ok(FieldAssignmentFragmentState {
+                    fragment_path: fragment.fragment_path,
+                    field_id: fragment.field_id,
+                    state,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let transfers = value
+            .transfers
+            .into_iter()
+            .map(|transfer| FieldAssignmentTransfer {
+                source_field_id: transfer.source_field_id,
+                target_field_id: transfer.target_field_id,
+            })
+            .collect();
+
+        Ok(Self {
+            initializations,
+            row_changes,
+            fragment_states,
+            transfers,
+        })
+    }
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -1786,7 +2073,28 @@ impl TransactionBuilder {
         mut self,
         transaction_properties: Option<Arc<HashMap<String, String>>>,
     ) -> Self {
-        self.transaction_properties = transaction_properties;
+        self.transaction_properties = transaction_properties.map(|properties| {
+            let mut properties = properties.as_ref().clone();
+            properties.remove(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY);
+            Arc::new(properties)
+        });
+        self
+    }
+
+    pub(crate) fn field_assignment_transaction(
+        mut self,
+        changes: FieldAssignmentTransaction,
+    ) -> Self {
+        if changes.is_empty() {
+            return self;
+        }
+        let properties = self
+            .transaction_properties
+            .get_or_insert_with(|| Arc::new(HashMap::new()));
+        Arc::make_mut(properties).insert(
+            FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
+            encode_field_assignment_transaction(&changes),
+        );
         self
     }
 
@@ -1805,6 +2113,33 @@ impl TransactionBuilder {
 }
 
 impl Transaction {
+    pub(crate) fn with_field_assignment_transaction(
+        mut self,
+        changes: FieldAssignmentTransaction,
+    ) -> Self {
+        if changes.is_empty() {
+            return self;
+        }
+        let properties = self
+            .transaction_properties
+            .get_or_insert_with(|| Arc::new(HashMap::new()));
+        Arc::make_mut(properties).insert(
+            FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
+            encode_field_assignment_transaction(&changes),
+        );
+        self
+    }
+
+    pub(crate) fn field_assignment_transaction(
+        &self,
+    ) -> Result<Option<FieldAssignmentTransaction>> {
+        self.transaction_properties
+            .as_ref()
+            .and_then(|properties| properties.get(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY))
+            .map(|encoded| decode_field_assignment_transaction(encoded))
+            .transpose()
+    }
+
     pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
         TransactionBuilder::new(read_version, operation).build()
     }
@@ -4221,6 +4556,18 @@ impl TryFrom<pb::Transaction> for Transaction {
                 ));
             }
         };
+        let mut transaction_properties = message.transaction_properties;
+        transaction_properties.remove(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY);
+        if let Some(field_assignment_transaction) = message.field_assignment_transaction {
+            let changes = FieldAssignmentTransaction::try_from(field_assignment_transaction)?;
+            if !changes.is_empty() {
+                transaction_properties.insert(
+                    FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
+                    encode_field_assignment_transaction(&changes),
+                );
+            }
+        }
+
         Ok(Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
@@ -4230,10 +4577,10 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(message.tag.clone())
             },
-            transaction_properties: if message.transaction_properties.is_empty() {
+            transaction_properties: if transaction_properties.is_empty() {
                 None
             } else {
-                Some(Arc::new(message.transaction_properties))
+                Some(Arc::new(transaction_properties))
             },
         })
     }
@@ -4305,6 +4652,11 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
 
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
+        let field_assignment_transaction = value
+            .field_assignment_transaction()
+            .expect("internal field assignment transaction must be valid")
+            .as_ref()
+            .map(Into::into);
         let operation = match &value.operation {
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
@@ -4528,17 +4880,19 @@ impl From<&Transaction> for pb::Transaction {
             }
         };
 
-        let transaction_properties = value
+        let mut transaction_properties = value
             .transaction_properties
             .as_ref()
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
+        transaction_properties.remove(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY);
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
+            field_assignment_transaction,
         }
     }
 }
@@ -6273,6 +6627,79 @@ mod tests {
     }
 
     #[test]
+    fn test_field_assignment_transaction_round_trip_is_not_a_user_property() {
+        let changes = FieldAssignmentTransaction {
+            initializations: vec![FieldAssignmentInitialization {
+                field_id: 7,
+                assigned: false,
+            }],
+            row_changes: vec![FieldAssignmentRowChange {
+                field_id: 7,
+                assigned: true,
+                row_addresses: roaring::RoaringTreemap::from_iter([3_u64, (2_u64 << 32) | 4]),
+            }],
+            fragment_states: vec![FieldAssignmentFragmentState {
+                fragment_path: "data/new.lance".to_string(),
+                field_id: 7,
+                state: FieldAssignmentFragmentValue::Partial(RoaringBitmap::from_iter([1, 3])),
+            }],
+            transfers: vec![FieldAssignmentTransfer {
+                source_field_id: 7,
+                target_field_id: 9,
+            }],
+        };
+        let tx = Transaction::new_from_version(1, Operation::ReserveFragments { num_fragments: 1 })
+            .with_field_assignment_transaction(changes.clone());
+        let proto = pb::Transaction::from(&tx);
+        assert!(proto.field_assignment_transaction.is_some());
+        assert!(
+            !proto
+                .transaction_properties
+                .contains_key(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY)
+        );
+
+        let decoded = Transaction::try_from(proto).unwrap();
+        assert_eq!(
+            decoded.field_assignment_transaction().unwrap(),
+            Some(changes.clone())
+        );
+        assert!(
+            decoded
+                .transaction_properties
+                .as_ref()
+                .unwrap()
+                .contains_key(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY)
+        );
+
+        let encoded = encode_field_assignment_transaction(&changes);
+        let properties = Arc::new(HashMap::from([(
+            FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
+            encoded.clone(),
+        )]));
+        let user_transaction =
+            TransactionBuilder::new(1, Operation::ReserveFragments { num_fragments: 1 })
+                .transaction_properties(Some(properties))
+                .build();
+        assert_eq!(
+            user_transaction.field_assignment_transaction().unwrap(),
+            None
+        );
+
+        let mut user_proto = pb::Transaction::from(&user_transaction);
+        user_proto
+            .transaction_properties
+            .insert(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(), encoded);
+        let decoded_user_transaction = Transaction::try_from(user_proto).unwrap();
+        assert_eq!(
+            decoded_user_transaction
+                .field_assignment_transaction()
+                .unwrap(),
+            None
+        );
+        assert!(decoded_user_transaction.transaction_properties.is_none());
+    }
+
+    #[test]
     fn test_proto_legacy_field_9_read() {
         // Simulate a manifest written by old Lance: only field 9, no field 10.
         let pb_tx = pb::Transaction {
@@ -6280,6 +6707,7 @@ mod tests {
             uuid: "test".to_string(),
             tag: String::new(),
             transaction_properties: HashMap::new(),
+            field_assignment_transaction: None,
             operation: Some(pb::transaction::Operation::Update(
                 pb::transaction::Update {
                     removed_fragment_ids: vec![],
@@ -6329,6 +6757,7 @@ mod tests {
             uuid: "test".to_string(),
             tag: String::new(),
             transaction_properties: HashMap::new(),
+            field_assignment_transaction: None,
             operation: Some(pb::transaction::Operation::Update(
                 pb::transaction::Update {
                     removed_fragment_ids: vec![],

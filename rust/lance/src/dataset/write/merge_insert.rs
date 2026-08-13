@@ -56,7 +56,10 @@ use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
         fragment::FileFragment,
-        transaction::{Operation, Transaction},
+        transaction::{
+            FieldAssignmentRowChange, FieldAssignmentTransaction, Operation, Transaction,
+            UpdatedFragmentOffsets,
+        },
         versions,
         write::merge_insert::logical_plan::MergeInsertPlanner,
     },
@@ -135,7 +138,7 @@ use roaring::RoaringTreemap;
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     iter::Peekable,
     sync::{
         Arc, Mutex,
@@ -149,6 +152,63 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+fn collect_supplied_field_ids(
+    target: &lance_core::datatypes::Field,
+    source: &lance_core::datatypes::Field,
+    supplied: &mut HashSet<i32>,
+) {
+    supplied.insert(target.id);
+    for source_child in &source.children {
+        if let Some(target_child) = target.child(&source_child.name) {
+            collect_supplied_field_ids(target_child, source_child, supplied);
+        }
+    }
+}
+
+fn supplied_field_ids(
+    target: &lance_core::datatypes::Schema,
+    source: &lance_core::datatypes::Schema,
+) -> HashSet<i32> {
+    let mut supplied = HashSet::new();
+    for source_field in &source.fields {
+        if let Some(target_field) = target.field(&source_field.name) {
+            collect_supplied_field_ids(target_field, source_field, &mut supplied);
+        }
+    }
+    supplied
+}
+
+async fn resolve_row_ids(dataset: &Dataset, row_ids: Vec<u64>) -> Result<Vec<u64>> {
+    let Some(index) = get_row_id_index(dataset).await? else {
+        return Ok(row_ids);
+    };
+    row_ids
+        .into_iter()
+        .map(|row_id| {
+            index.get(row_id).map(Into::into).ok_or_else(|| {
+                Error::internal(format!("Row ID {} is missing from the index", row_id))
+            })
+        })
+        .collect()
+}
+
+fn invalidation_row_changes(
+    invalidated_field_ids: &BTreeSet<i32>,
+    row_addresses: &RoaringTreemap,
+) -> Vec<FieldAssignmentRowChange> {
+    if row_addresses.is_empty() {
+        return Vec::new();
+    }
+    invalidated_field_ids
+        .iter()
+        .map(|field_id| FieldAssignmentRowChange {
+            field_id: *field_id,
+            assigned: false,
+            row_addresses: row_addresses.clone(),
+        })
+        .collect()
+}
 
 struct UpdatedRowAddrReconciler<I>
 where
@@ -477,6 +537,8 @@ struct MergeInsertParams {
     // Target all registered bases, mirroring WriteParams::target_all_bases.
     // Some(include_primary); resolved at execution time.
     target_all_bases: Option<bool>,
+    // Tracked fields to invalidate on rows updated by the merge.
+    invalidated_field_ids: BTreeSet<i32>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -569,6 +631,9 @@ impl MergeInsertBuilder {
             // lowercased column names from SQL parsing or user input
             on.iter()
                 .map(|col| {
+                    if col == ROW_ID {
+                        return Ok(ROW_ID.to_string());
+                    }
                     dataset
                         .schema()
                         .field_case_insensitive(col)
@@ -601,6 +666,7 @@ impl MergeInsertBuilder {
                 target_bases: None,
                 target_base_names_or_paths: None,
                 target_all_bases: None,
+                invalidated_field_ids: BTreeSet::new(),
             },
         })
     }
@@ -628,6 +694,46 @@ impl MergeInsertBuilder {
     pub fn when_not_matched_by_source(&mut self, behavior: WhenNotMatchedBySource) -> &mut Self {
         self.params.delete_not_matched_by_source = behavior;
         self
+    }
+
+    /// Clear logical assignment for tracked fields on rows updated by this
+    /// merge insert.
+    ///
+    /// The source must not also supply an invalidated field. Invalidation is
+    /// committed atomically with the matched-row update.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    /// # fn build(dataset: Arc<Dataset>) -> Result<()> {
+    /// let mut merge = MergeInsertBuilder::try_new(dataset, vec!["_rowid".to_string()])?;
+    /// merge
+    ///     .when_matched(WhenMatched::UpdateAll)
+    ///     .when_not_matched(WhenNotMatched::DoNothing)
+    ///     .invalidate_fields(["embedding"])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn invalidate_fields<I, S>(&mut self, fields: I) -> Result<&mut Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for path in fields {
+            let path = path.as_ref();
+            let field = self.dataset.schema().field(path).ok_or_else(|| {
+                Error::invalid_input(format!("Cannot invalidate unknown field '{}'", path))
+            })?;
+            if self.dataset.field_assignment_state(field.id).is_none() {
+                return Err(Error::invalid_input(format!(
+                    "Cannot invalidate untracked field '{}' (stable field ID {})",
+                    path, field.id
+                )));
+            }
+            self.params.invalidated_field_ids.insert(field.id);
+        }
+        Ok(self)
     }
 
     /// Set number of times to retry the operation if there is contention.
@@ -774,6 +880,31 @@ impl MergeInsertBuilder {
 
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
+        if !self.params.invalidated_field_ids.is_empty()
+            && !matches!(
+                self.params.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            )
+        {
+            return Err(Error::invalid_input(
+                "Field invalidation requires a matched-row update action",
+            ));
+        }
+        if self.params.on.iter().any(|column| column == ROW_ID)
+            && (self.params.on.len() != 1
+                || self.params.insert_not_matched
+                || self.params.delete_not_matched_by_source != WhenNotMatchedBySource::Keep
+                || !matches!(
+                    self.params.when_matched,
+                    WhenMatched::UpdateAll
+                        | WhenMatched::UpdateIf(_)
+                        | WhenMatched::UpdateIfExpr(_)
+                ))
+        {
+            return Err(Error::invalid_input(
+                "_rowid is supported only as the sole key of an update-only merge insert",
+            ));
+        }
         if !self.params.insert_not_matched
             && self.params.when_matched == WhenMatched::DoNothing
             && self.params.delete_not_matched_by_source == WhenNotMatchedBySource::Keep
@@ -964,7 +1095,8 @@ impl MergeInsertJob {
     }
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<SchemaComparison> {
-        let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
+        let user_schema = schema.without_column(ROW_ID).without_column(ROW_ADDR);
+        let lance_schema: lance_core::datatypes::Schema = (&user_schema).try_into()?;
         let target_schema = self.dataset.schema();
 
         let version = self
@@ -1278,12 +1410,25 @@ impl MergeInsertJob {
             }
             SchemaComparison::Subschema => {
                 let existing = session_ctx.read_lance(self.dataset.clone(), true, true)?;
-                let columns = schema
+                let row_id_is_join_key = self.params.on.len() == 1 && self.params.on[0] == ROW_ID;
+                let mut column_names = schema
                     .field_names()
-                    .iter()
-                    .map(|s| s.as_str())
-                    .chain([ROW_ID, ROW_ADDR])
+                    .into_iter()
+                    .filter(|name| name.as_str() != ROW_ID && name.as_str() != ROW_ADDR)
+                    .cloned()
                     .collect::<Vec<_>>();
+                if row_id_is_join_key {
+                    column_names.insert(
+                        schema
+                            .index_of(ROW_ID)
+                            .expect("_rowid join key is in source schema"),
+                        ROW_ID.to_string(),
+                    );
+                    column_names.push(ROW_ADDR.to_string());
+                } else {
+                    column_names.extend([ROW_ID.to_string(), ROW_ADDR.to_string()]);
+                }
+                let columns = column_names.iter().map(String::as_str).collect::<Vec<_>>();
                 let projected = existing.select_columns(&columns)?;
                 // We need to rename the columns from the target table so that they don't conflict with the source table
                 let projected = Self::prefix_columns(projected, "target_");
@@ -2223,6 +2368,14 @@ impl MergeInsertJob {
     /// `InvalidInput` error, because inserted rows would otherwise attempt to
     /// write a non-nullable NULL downstream.
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
+        if !self.dataset.manifest.field_assignment_states.is_empty()
+            || !self.params.invalidated_field_ids.is_empty()
+            || self.params.on.iter().any(|column| column == ROW_ID)
+        {
+            // Assignment-aware merge commits currently use the canonical path,
+            // which records exact matched offsets and new-fragment state.
+            return Ok(false);
+        }
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
         let full_schema = self.dataset.schema();
@@ -2351,8 +2504,28 @@ impl MergeInsertJob {
         // The slow path consumes a single stream; adapt the provider back into one.
         let source = provider_to_stream(provider).await?;
         let source_schema = source.schema();
-        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
+        let assignment_source_schema = source_schema
+            .as_ref()
+            .without_column(ROW_ID)
+            .without_column(ROW_ADDR);
+        let lance_schema = lance_core::datatypes::Schema::try_from(&assignment_source_schema)?;
         let full_schema = self.dataset.schema();
+        let source_supplied_field_ids = supplied_field_ids(full_schema, &lance_schema);
+        if let Some(field_id) = self
+            .params
+            .invalidated_field_ids
+            .iter()
+            .find(|field_id| source_supplied_field_ids.contains(field_id))
+        {
+            let field_name = full_schema
+                .field_by_id(*field_id)
+                .map(|field| field.name.as_str())
+                .unwrap_or("<unknown>");
+            return Err(Error::invalid_input(format!(
+                "Field '{}' cannot be both written and invalidated by merge insert",
+                field_name
+            )));
+        }
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
             &SchemaCompareOptions {
@@ -2395,22 +2568,14 @@ impl MergeInsertJob {
         let is_delete_only = matches!(self.params.when_matched, WhenMatched::Delete)
             && !self.params.insert_not_matched;
 
-        let (operation, affected_rows) = if is_delete_only {
+        let (operation, affected_rows, assignment_changes) = if is_delete_only {
             // Consume the stream so the merger records the matched row ids in
             // `deleted_rows`; it produces no batches.
             let drained: Vec<RecordBatch> = Box::pin(stream).try_collect().await?;
             debug_assert!(drained.is_empty(), "delete-only merge must not emit rows");
 
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
-            let removed_row_addr_vec =
-                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    removed_row_ids
-                        .iter()
-                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                        .collect::<Vec<_>>()
-                } else {
-                    removed_row_ids
-                };
+            let removed_row_addr_vec = resolve_row_ids(&self.dataset, removed_row_ids).await?;
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec);
 
             let (updated_fragments, removed_fragment_ids) =
@@ -2433,7 +2598,11 @@ impl MergeInsertJob {
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (
+                operation,
+                affected_rows,
+                FieldAssignmentTransaction::default(),
+            )
         } else if !is_full_schema {
             // Non-delete partial-schema merge: patch the provided columns into
             // existing fragments in place. (Delete is handled above; a wider
@@ -2455,6 +2624,30 @@ impl MergeInsertJob {
             )
             .await?;
 
+            let matched_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
+            let matched_row_addrs =
+                RoaringTreemap::from_iter(resolve_row_ids(&self.dataset, matched_row_ids).await?);
+            let mut offsets = HashMap::new();
+            for raw_address in &matched_row_addrs {
+                let address = RowAddress::from(raw_address);
+                offsets
+                    .entry(address.fragment_id() as u64)
+                    .or_insert_with(roaring::RoaringBitmap::new)
+                    .insert(address.row_offset());
+            }
+            let fragment_states = self.dataset.field_assignment_states_for_new_fragments(
+                &new_fragments,
+                &source_supplied_field_ids,
+            )?;
+            let assignment_changes = FieldAssignmentTransaction {
+                row_changes: invalidation_row_changes(
+                    &self.params.invalidated_field_ids,
+                    &matched_row_addrs,
+                ),
+                fragment_states,
+                ..Default::default()
+            };
+
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
@@ -2464,11 +2657,11 @@ impl MergeInsertJob {
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
-                updated_fragment_offsets: None,
+                updated_fragment_offsets: (!offsets.is_empty())
+                    .then_some(UpdatedFragmentOffsets(offsets)),
             };
-            // We have rewritten the fragments, not just the deletion files, so
-            // we can't use affected rows here.
-            (operation, None)
+            let affected_rows = Some(RowAddrTreeMap::from(matched_row_addrs));
+            (operation, affected_rows, assignment_changes)
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
@@ -2515,16 +2708,7 @@ impl MergeInsertJob {
                 // Apply deletions
                 let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
 
-                let removed_row_addr_vec =
-                    if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                        let addresses: Vec<u64> = removed_row_ids
-                            .iter()
-                            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                            .collect::<Vec<_>>();
-                        addresses
-                    } else {
-                        removed_row_ids
-                    };
+                let removed_row_addr_vec = resolve_row_ids(&self.dataset, removed_row_ids).await?;
 
                 Ok(RoaringTreemap::from_iter(removed_row_addr_vec))
             }
@@ -2558,6 +2742,19 @@ impl MergeInsertJob {
                 }
             };
 
+            let fragment_states = self.dataset.field_assignment_states_for_new_fragments(
+                &new_fragments,
+                &source_supplied_field_ids,
+            )?;
+            let assignment_changes = FieldAssignmentTransaction {
+                row_changes: invalidation_row_changes(
+                    &self.params.invalidated_field_ids,
+                    &removed_row_addrs,
+                ),
+                fragment_states,
+                ..Default::default()
+            };
+
             // Commit updated and new fragments
             let operation = Operation::Update {
                 removed_fragment_ids,
@@ -2578,7 +2775,7 @@ impl MergeInsertJob {
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (operation, affected_rows, assignment_changes)
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -2586,7 +2783,8 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
+        let transaction = Transaction::new(self.dataset.manifest.version, operation, None)
+            .with_field_assignment_transaction(assignment_changes);
 
         Ok(UncommittedMergeInsert {
             transaction,
@@ -3032,7 +3230,18 @@ impl Merger {
         // The schema of the combined batches will be:
         // source_keys, source_payload, target_keys, target_payload, row_id, row_addr?
         // The keys and non_keys on both sides will be equal
-        let (row_id_col, row_addr_col, right_offset) = if num_fields % 2 == 1 {
+        let row_id_is_join_key = self.params.on.len() == 1 && self.params.on[0] == ROW_ID;
+        let (row_id_col, row_addr_col, right_offset) = if row_id_is_join_key {
+            let right_offset = self.schema.fields().len();
+            assert!(self.with_row_addr);
+            assert_eq!(num_fields, right_offset * 2 + 1);
+            let row_id_col = right_offset
+                + self
+                    .schema
+                    .index_of(ROW_ID)
+                    .expect("_rowid join key is in merger schema");
+            (row_id_col, Some(num_fields - 1), right_offset)
+        } else if num_fields % 2 == 1 {
             // No rowaddr
             assert!(!self.with_row_addr);
             (num_fields - 1, None, num_fields / 2)

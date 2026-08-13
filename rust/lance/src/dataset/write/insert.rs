@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -23,7 +23,10 @@ use crate::Dataset;
 use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{
+    FieldAssignmentFragmentState, FieldAssignmentFragmentValue, FieldAssignmentTransaction,
+    Operation, Transaction, TransactionBuilder,
+};
 use crate::dataset::write::{
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
@@ -56,6 +59,31 @@ pub struct InsertBuilder<'a> {
 }
 
 impl<'a> InsertBuilder<'a> {
+    fn supplied_assignment_fields(
+        context: &WriteContext<'_>,
+        input_schema: &Schema,
+    ) -> HashSet<i32> {
+        let Some(dataset) = context.dest.dataset() else {
+            return HashSet::new();
+        };
+        dataset
+            .manifest
+            .field_assignment_states
+            .iter()
+            .filter_map(|state| {
+                let ancestry = dataset.schema().field_ancestry_by_id(state.field_id)?;
+                let mut input_field = input_schema
+                    .fields
+                    .iter()
+                    .find(|field| field.name == ancestry[0].name)?;
+                for field in &ancestry[1..] {
+                    input_field = input_field.child(&field.name)?;
+                }
+                Some(state.field_id)
+            })
+            .collect()
+    }
+
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
@@ -203,6 +231,7 @@ impl<'a> InsertBuilder<'a> {
         );
 
         self.validate_write(&mut context, &schema)?;
+        let supplied_assignment_fields = Self::supplied_assignment_fields(&context, &schema);
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
         let target_base_info = validate_and_resolve_target_bases_with_primary(
@@ -226,7 +255,12 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
+        let transaction = Self::build_transaction(
+            written_schema,
+            written_fragments,
+            &context,
+            &supplied_assignment_fields,
+        )?;
 
         Ok((transaction, context))
     }
@@ -235,6 +269,7 @@ impl<'a> InsertBuilder<'a> {
         schema: Schema,
         fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
+        supplied_assignment_fields: &HashSet<i32>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
@@ -276,7 +311,7 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments },
         };
 
-        let transaction = TransactionBuilder::new(
+        let mut transaction = TransactionBuilder::new(
             context
                 .dest
                 .dataset()
@@ -286,6 +321,43 @@ impl<'a> InsertBuilder<'a> {
         )
         .transaction_properties(context.params.transaction_properties.clone())
         .build();
+
+        if let Some(dataset) = context.dest.dataset()
+            && !dataset.manifest.field_assignment_states.is_empty()
+        {
+            let (Operation::Append { fragments } | Operation::Overwrite { fragments, .. }) =
+                &transaction.operation
+            else {
+                unreachable!("insert only creates append or overwrite operations");
+            };
+            let mut fragment_states = Vec::with_capacity(
+                fragments.len() * dataset.manifest.field_assignment_states.len(),
+            );
+            for fragment in fragments {
+                let fragment_path = fragment
+                    .files
+                    .first()
+                    .ok_or_else(|| Error::internal("Written fragment has no data files"))?
+                    .path
+                    .clone();
+                for assignment in &dataset.manifest.field_assignment_states {
+                    fragment_states.push(FieldAssignmentFragmentState {
+                        fragment_path: fragment_path.clone(),
+                        field_id: assignment.field_id,
+                        state: if supplied_assignment_fields.contains(&assignment.field_id) {
+                            FieldAssignmentFragmentValue::All
+                        } else {
+                            FieldAssignmentFragmentValue::None
+                        },
+                    });
+                }
+            }
+            transaction =
+                transaction.with_field_assignment_transaction(FieldAssignmentTransaction {
+                    fragment_states,
+                    ..Default::default()
+                });
+        }
 
         Ok(transaction)
     }

@@ -33,6 +33,56 @@ message Transaction {
   // __lance_commit_message is a reserved key
   map<string, string> transaction_properties = 4;
 
+  // Snapshot-level field assignment transitions committed atomically with the
+  // operation. This is intentionally independent of Data Overlay FieldCoverage.
+  FieldAssignmentTransaction field_assignment_transaction = 5;
+
+  message FieldAssignmentTransaction {
+    enum InitialState {
+      UNASSIGNED = 0;
+      ASSIGNED = 1;
+    }
+
+    message Initialization {
+      int32 field_id = 1;
+      InitialState initial_state = 2;
+    }
+
+    // Changes existing rows addressed in the transaction's read snapshot.
+    message RowChange {
+      int32 field_id = 1;
+      bool assigned = 2;
+      // Portable serialized RoaringTreemap of physical row addresses.
+      bytes row_addresses = 3;
+    }
+
+    message FragmentState {
+      // Path of the first data file in the uncommitted fragment. Paths remain
+      // stable when the commit assigns or rebases fragment IDs.
+      string fragment_path = 1;
+      int32 field_id = 2;
+
+      oneof state {
+        bool all_assigned = 3;
+        bool none_assigned = 4;
+        // Portable serialized RoaringBitmap of local physical row offsets.
+        bytes partial = 5;
+      }
+    }
+
+    // Preserve a tracked logical field across schema evolution that replaces
+    // its stable field ID (for example, a type cast).
+    message Transfer {
+      int32 source_field_id = 1;
+      int32 target_field_id = 2;
+    }
+
+    repeated Initialization initializations = 1;
+    repeated RowChange row_changes = 2;
+    repeated FragmentState fragment_states = 3;
+    repeated Transfer transfers = 4;
+  }
+
   // Add new rows to the dataset.
   message Append {
     // The new fragments to append.

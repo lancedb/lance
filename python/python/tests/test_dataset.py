@@ -6529,3 +6529,79 @@ def test_all_files(tmp_path):
     assert result.schema.field("size_bytes").type == pa.int64()
     assert result.num_rows >= 2  # at least manifest + data file
     assert all(s > 0 for s in result.column("size_bytes").to_pylist())
+
+
+def _assignment_rows(dataset: lance.LanceDataset) -> list[tuple[int, bool]]:
+    table = dataset.to_table(
+        columns={"id": "id", "assigned": "is_assigned(embedding)"}
+    ).sort_by("id")
+    assert table["assigned"].null_count == 0
+    return list(zip(table["id"].to_pylist(), table["assigned"].to_pylist()))
+
+
+def test_field_assignment_public_api(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"id": range(4)}), tmp_path)
+    dataset.add_columns(pa.field("embedding", pa.int32()), assignment="unassigned")
+    assert _assignment_rows(dataset) == [
+        (0, False),
+        (1, False),
+        (2, False),
+        (3, False),
+    ]
+
+    # The new invalidation option is trailing so existing positional retry
+    # arguments keep their meaning.
+    result = dataset.update({"id": "id"}, "id < 0", 1, timedelta(seconds=1))
+    assert result["num_rows_updated"] == 0
+
+    result = dataset.update({"embedding": "CAST(NULL AS INT)"}, where="id = 0")
+    assert result["num_rows_updated"] == 1
+    assert _assignment_rows(dataset)[0] == (0, True)
+
+    fragments_before = [fragment.metadata for fragment in dataset.get_fragments()]
+    result = dataset.update(where="id = 0", invalidate_fields=["embedding"])
+    assert result["num_rows_updated"] == 1
+    assert [
+        fragment.metadata for fragment in dataset.get_fragments()
+    ] == fragments_before
+    assert _assignment_rows(dataset)[0] == (0, False)
+
+    dataset = lance.write_dataset(
+        pa.table({"id": [4], "embedding": pa.array([None], pa.int32())}),
+        dataset,
+        mode="append",
+    )
+    dataset = lance.write_dataset(pa.table({"id": [5]}), dataset, mode="append")
+    assert _assignment_rows(dataset)[-2:] == [(4, True), (5, False)]
+
+    with pytest.raises(ValueError, match="assigned.*unassigned"):
+        dataset.add_columns(pa.field("bad", pa.int32()), assignment="unknown")
+    with pytest.raises(ValueError, match="untracked field"):
+        dataset.to_table(columns={"assigned": "is_assigned(id)"})
+
+
+def test_field_assignment_alter_and_rowid_merge(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(6), "embedding": pa.array(range(10, 16), pa.int32())}),
+        tmp_path,
+    )
+    dataset.alter_columns({"path": "embedding", "assignment": "assigned"})
+    assert all(assigned for _, assigned in _assignment_rows(dataset))
+
+    dataset.update(where="id IN (1, 4)", invalidate_fields=["embedding"])
+    pending = dataset.to_table(
+        columns=["_rowid", "id"], filter="NOT is_assigned(embedding)"
+    ).sort_by("id")
+    source = pa.table(
+        {
+            "_rowid": pending["_rowid"],
+            "embedding": pa.array([None, 400], pa.int32()),
+        }
+    )
+    stats = dataset.merge_insert(on="_rowid").when_matched_update_all().execute(source)
+    assert stats == {
+        "num_inserted_rows": 0,
+        "num_updated_rows": 2,
+        "num_deleted_rows": 0,
+    }
+    assert all(assigned for _, assigned in _assignment_rows(dataset))

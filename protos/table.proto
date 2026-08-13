@@ -125,6 +125,9 @@ message Manifest {
   //   MemWAL SSTables still hold. Writers must refuse it too: one that does not
   //   maintain index_catchup can change an index without withdrawing the
   //   position recorded for it. Setting it is one-way.
+  // * 1 << 8: snapshot-level field assignment state is present. This is a
+  //   writer-only requirement: older readers may still perform ordinary Arrow
+  //   projection, but writers must preserve the state across every mutation.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -217,7 +220,49 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // Snapshot-level logical assignment state for tracked fields. Each entry is
+  // bound to a stable field ID and points to an immutable assignment root.
+  // Readers may ignore this section for ordinary Arrow projection, but writers
+  // must preserve it and readers must understand it before evaluating
+  // is_assigned(field).
+  repeated FieldAssignmentState field_assignment_states = 22;
 } // Manifest
+
+// A reference to a file under the dataset root. When base_id is present, the
+// referenced file belongs to that base dataset (for example after a shallow
+// clone).
+message FieldAssignmentFile {
+  string path = 1;
+  uint64 size_bytes = 2;
+  optional uint32 base_id = 3;
+}
+
+// Manifest descriptor for one tracked field. The field_id is the stable Lance
+// schema field ID, not a name or ordinal.
+message FieldAssignmentState {
+  int32 field_id = 1;
+  FieldAssignmentFile root = 2;
+}
+
+// Immutable root for one field's assignment state in one snapshot. A fragment
+// absent from this list has no assigned rows. Entries are sorted by fragment ID.
+message FieldAssignmentRoot {
+  repeated FieldAssignmentFragment fragments = 1;
+}
+
+// Assignment state for one physical fragment. all_assigned=true means every
+// physical row is assigned. Partial states are stored as serialized Roaring
+// bitmaps of physical row offsets. all_assigned=false is invalid.
+message FieldAssignmentFragment {
+  uint64 fragment_id = 1;
+  uint64 physical_rows = 2;
+
+  oneof state {
+    bool all_assigned = 3;
+    FieldAssignmentFile partial = 4;
+  }
+}
 
 // external dataset base path
 message BasePath {

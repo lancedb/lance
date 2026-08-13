@@ -9,7 +9,10 @@ use std::{
 use super::fragment::FileFragment;
 use super::{
     Dataset,
-    transaction::{Operation, Transaction},
+    transaction::{
+        FieldAssignmentInitialization, FieldAssignmentTransaction, FieldAssignmentTransfer,
+        Operation, Transaction, TransactionBuilder,
+    },
     write::cleanup_data_fragments,
 };
 use crate::index::DatasetIndexExt;
@@ -107,6 +110,107 @@ pub enum NewColumnTransform {
     Reader(Box<dyn RecordBatchReader + Send>),
     /// Add new columns that are initially all null
     AllNulls(Arc<ArrowSchema>),
+}
+
+/// Initial logical assignment state for a field when tracking is enabled.
+///
+/// Assignment is independent of Arrow validity. In particular, an explicitly
+/// assigned NULL is [`Assigned`](Self::Assigned), while an omitted or
+/// invalidated value is [`Unassigned`](Self::Unassigned).
+///
+/// ```
+/// use lance::dataset::FieldAssignment;
+///
+/// let initial = FieldAssignment::Unassigned;
+/// assert!(!initial.is_assigned());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldAssignment {
+    /// Every live row starts with a logical assignment.
+    Assigned,
+    /// Every live row starts without a logical assignment.
+    Unassigned,
+}
+
+impl FieldAssignment {
+    /// Return the boolean state represented by this initialization.
+    pub fn is_assigned(self) -> bool {
+        matches!(self, Self::Assigned)
+    }
+}
+
+/// Assignment tracking initialization applied with schema alterations.
+///
+/// This is separate from [`ColumnAlteration`] so adding the opt-in assignment
+/// contract does not change the existing public struct layout.
+///
+/// ```
+/// use lance::dataset::{FieldAssignment, FieldAssignmentAlteration};
+///
+/// let alteration =
+///     FieldAssignmentAlteration::new("embedding", FieldAssignment::Unassigned);
+/// assert_eq!(alteration.path(), "embedding");
+/// assert_eq!(alteration.assignment(), FieldAssignment::Unassigned);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldAssignmentAlteration {
+    path: String,
+    assignment: FieldAssignment,
+}
+
+impl FieldAssignmentAlteration {
+    /// Create assignment tracking initialization for a field path.
+    pub fn new(path: impl Into<String>, assignment: FieldAssignment) -> Self {
+        Self {
+            path: path.into(),
+            assignment,
+        }
+    }
+
+    /// Field path resolved against the input snapshot.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Explicit initial assignment state for every live row.
+    pub fn assignment(&self) -> FieldAssignment {
+        self.assignment
+    }
+}
+
+fn collect_assignment_transfers(
+    dataset: &Dataset,
+    source: &Field,
+    target: &Field,
+    transfers: &mut Vec<FieldAssignmentTransfer>,
+) -> Result<()> {
+    if dataset.field_assignment_state(source.id).is_some() {
+        transfers.push(FieldAssignmentTransfer {
+            source_field_id: source.id,
+            target_field_id: target.id,
+        });
+    }
+    for source_child in &source.children {
+        fn has_tracked_field(dataset: &Dataset, field: &Field) -> bool {
+            dataset.field_assignment_state(field.id).is_some()
+                || field
+                    .children
+                    .iter()
+                    .any(|child| has_tracked_field(dataset, child))
+        }
+        let has_tracked_descendant = has_tracked_field(dataset, source_child);
+        if !has_tracked_descendant {
+            continue;
+        }
+        let target_child = target.child(&source_child.name).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Cannot cast field '{}' because tracked nested field '{}' has no corresponding target field",
+                source.name, source_child.name
+            ))
+        })?;
+        collect_assignment_transfers(dataset, source_child, target_child, transfers)?;
+    }
+    Ok(())
 }
 
 /// Definition of a change to a column in a dataset
@@ -444,7 +548,9 @@ pub(super) async fn add_columns(
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
+    assignment: Option<FieldAssignment>,
 ) -> Result<()> {
+    let previous_field_ids: HashSet<i32> = dataset.schema().field_ids().into_iter().collect();
     let (fragments, schema, _fragments_to_cleanup, preserves_nullability) =
         add_columns_to_fragments(
             dataset,
@@ -455,12 +561,37 @@ pub(super) async fn add_columns(
         )
         .await?;
 
+    let initializations = assignment.map(|assignment| {
+        schema
+            .fields
+            .iter()
+            .filter(|field| !previous_field_ids.contains(&field.id))
+            .map(|field| FieldAssignmentInitialization {
+                field_id: field.id,
+                assigned: assignment.is_assigned(),
+            })
+            .collect::<Vec<_>>()
+    });
+    if initializations.as_ref().is_some_and(Vec::is_empty) {
+        return Err(Error::invalid_input(
+            "Assignment tracking can only be initialized for newly added fields",
+        ));
+    }
+
     let operation = Operation::Merge {
         fragments,
         schema,
         preserves_nullability,
     };
-    let transaction = Transaction::new(dataset.manifest.version, operation, None);
+    let mut transaction_builder = TransactionBuilder::new(dataset.manifest.version, operation);
+    if let Some(initializations) = initializations {
+        transaction_builder =
+            transaction_builder.field_assignment_transaction(FieldAssignmentTransaction {
+                initializations,
+                ..Default::default()
+            });
+    }
+    let transaction = transaction_builder.build();
     // Once the manifest commit has been attempted, an error does not prove
     // that the new files are unreferenced: the commit may have landed and only
     // its response (or a post-commit callback) may have failed. Leave files
@@ -727,6 +858,7 @@ async fn add_columns_from_stream(
 pub(super) async fn alter_columns(
     dataset: &mut Dataset,
     alterations: &[ColumnAlteration],
+    assignment_alterations: &[FieldAssignmentAlteration],
 ) -> Result<()> {
     // Validate referenced columns exist and enforce NOT NULL when tightening
     // a column from nullable to non-nullable.
@@ -734,10 +866,50 @@ pub(super) async fn alter_columns(
 
     // Mapping of old to new fields that need to be casted.
     let mut cast_fields: Vec<(Field, Field)> = Vec::new();
+    let mut assignment_initializations = Vec::new();
+    let mut assignment_transfers = Vec::new();
     let mut tightens_nullability = false;
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
     let version = dataset.manifest.data_storage_format.lance_file_format();
+
+    let mut assignment_field_ids = HashSet::new();
+    for alteration in assignment_alterations {
+        let field_src = dataset.schema().field(alteration.path()).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Column \"{}\" does not exist in the dataset",
+                alteration.path()
+            ))
+        })?;
+        if !assignment_field_ids.insert(field_src.id) {
+            return Err(Error::invalid_input(format!(
+                "Column '{}' initializes assignment tracking more than once",
+                alteration.path()
+            )));
+        }
+        if dataset.field_assignment_state(field_src.id).is_some() {
+            return Err(Error::invalid_input(format!(
+                "Column '{}' already has assignment tracking",
+                alteration.path()
+            )));
+        }
+        if alterations.iter().any(|schema_alteration| {
+            schema_alteration.data_type.is_some()
+                && dataset
+                    .schema()
+                    .field(&schema_alteration.path)
+                    .is_some_and(|field| field.id == field_src.id)
+        }) {
+            return Err(Error::invalid_input(format!(
+                "Column '{}' cannot initialize assignment tracking and change type in the same alteration",
+                alteration.path()
+            )));
+        }
+        assignment_initializations.push(FieldAssignmentInitialization {
+            field_id: field_src.id,
+            assigned: alteration.assignment().is_assigned(),
+        });
+    }
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
@@ -784,6 +956,13 @@ pub(super) async fn alter_columns(
             );
             *field_dest = Field::try_from(&arrow_field)?;
             field_dest.set_id(field_src.parent_id, &mut next_field_id);
+
+            collect_assignment_transfers(
+                dataset,
+                field_src,
+                field_dest,
+                &mut assignment_transfers,
+            )?;
 
             cast_fields.push((field_src.clone(), field_dest.clone()));
         }
@@ -925,6 +1104,16 @@ pub(super) async fn alter_columns(
             },
             /*blob_op= */ None,
         )
+    };
+
+    let transaction = if assignment_initializations.is_empty() && assignment_transfers.is_empty() {
+        transaction
+    } else {
+        transaction.with_field_assignment_transaction(FieldAssignmentTransaction {
+            initializations: assignment_initializations,
+            transfers: assignment_transfers,
+            ..Default::default()
+        })
     };
 
     // TODO: adjust the indices here for the new schema

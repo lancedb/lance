@@ -33,6 +33,7 @@ chrono.workspace = true
 log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
+roaring.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

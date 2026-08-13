@@ -48,6 +48,94 @@ assert dataset.schema == pa.schema([
 
 This operation is very fast, as it only updates the metadata of the dataset.
 
+### Tracking logical assignment
+
+Assignment tracking distinguishes an omitted or invalidated value from an
+explicitly written NULL. It is opt-in and must be initialized explicitly; Lance
+does not infer assignment from Arrow validity.
+
+```python
+tracked_dataset = lance.write_dataset(
+    pa.table({
+        "id": [1, 2, 3],
+        "text": ["one", "two", "three"],
+        "priority": [1, 20, 3],
+    }),
+    "assignment_tracking",
+)
+tracked_dataset.add_columns(
+    pa.field("embedding", pa.list_(pa.float32(), 128)),
+    assignment="unassigned",
+)
+
+pending = tracked_dataset.to_table(
+    columns=["_rowid", "text"],
+    filter="NOT is_assigned(embedding)",
+)
+```
+
+`is_assigned(field)` is a non-null boolean expression and can be used anywhere
+other Lance SQL expressions are accepted, including projections, filters,
+boolean combinations, aggregation, and ordering:
+
+```python
+scanner = tracked_dataset.scanner(
+    columns={
+        "id": "id",
+        "embedding": "embedding",
+        "embedding_assigned": "is_assigned(embedding)",
+    },
+    filter="is_assigned(embedding) OR priority > 10",
+    order_by=["is_assigned(embedding)"],
+)
+```
+
+Ordinary projection always returns the stored Arrow value, even when the row is
+unassigned. A successful field write creates assignment for the affected rows,
+including explicit NULL. Appending a row that omits the tracked field leaves it
+unassigned.
+
+Use `invalidate_fields` to clear assignment atomically with a mutation. A field
+cannot be written and invalidated by the same mutation, and an invalidation-only
+update does not rewrite data files.
+
+```python
+tracked_dataset.update(
+    updates={"text": "'replacement text'"},
+    where="id = 42",
+    invalidate_fields=["embedding"],
+)
+
+tracked_dataset.update(
+    where="id = 43",
+    invalidate_fields=["embedding"],
+)
+```
+
+Precomputed results can be written back by physical row ID with an update-only merge. The source must omit fields that are not being logically written.
+
+```python
+source = pa.table({
+    "_rowid": pending["_rowid"],
+    "embedding": embed(pending["text"]),
+})
+
+stats = (
+    tracked_dataset.merge_insert(on="_rowid")
+    .when_matched_update_all()
+    .execute(source)
+)
+```
+
+Tracking can also be initialized on an existing field. Initializing it as assigned is an explicit migration assertion about every live row; initializing an already tracked field is an error.
+
+```python
+existing_dataset.alter_columns({
+    "path": "thumbnail",
+    "assignment": "assigned",
+})
+```
+
 For Lance file format `<= 2.1`, adding sub-columns under an existing `struct` is not supported.
 Starting with Lance file format `2.2`, schema-only add can also extend nested `struct` fields
 (including `struct` fields nested inside list types), for example by adding

@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
+use super::{FieldAssignmentState, Fragment};
 use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
@@ -104,6 +104,12 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Snapshot-level assignment descriptors keyed by stable field ID.
+    ///
+    /// The descriptors are sorted by field ID. Their immutable roots are loaded
+    /// only when a query or mutation needs assignment state.
+    pub field_assignment_states: Vec<FieldAssignmentState>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -199,6 +205,7 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            field_assignment_states: Vec::new(),
         }
     }
 
@@ -230,6 +237,7 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            field_assignment_states: previous.field_assignment_states.clone(),
         }
     }
 
@@ -266,6 +274,18 @@ impl Manifest {
             })
             .collect::<Vec<_>>();
 
+        let field_assignment_states = self
+            .field_assignment_states
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                if state.root.base_id.is_none() {
+                    state.root.base_id = Some(ref_base_id);
+                }
+                state
+            })
+            .collect();
+
         Self {
             schema: self.schema.clone(),
             version: self.version,
@@ -295,6 +315,7 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            field_assignment_states,
         }
     }
 
@@ -941,6 +962,29 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let schema = Schema::try_from(fields_with_meta)?;
 
+        let mut field_assignment_states = p
+            .field_assignment_states
+            .into_iter()
+            .map(FieldAssignmentState::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        field_assignment_states.sort_by_key(|state| state.field_id);
+        for states in field_assignment_states.windows(2) {
+            if states[0].field_id == states[1].field_id {
+                return Err(Error::invalid_input(format!(
+                    "Manifest contains duplicate field assignment state for field ID {}",
+                    states[0].field_id
+                )));
+            }
+        }
+        for state in &field_assignment_states {
+            if schema.field_by_id(state.field_id).is_none() {
+                return Err(Error::invalid_input(format!(
+                    "Manifest field assignment state references unknown field ID {}",
+                    state.field_id
+                )));
+            }
+        }
+
         Ok(Self {
             schema,
             version: p.version,
@@ -970,6 +1014,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            field_assignment_states,
         })
     }
 }
@@ -1037,6 +1082,7 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            field_assignment_states: m.field_assignment_states.iter().map(Into::into).collect(),
         }
     }
 }

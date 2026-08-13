@@ -41,8 +41,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb, populate_manifest_schema_dictionaries,
+    DataFile, DataStorageFormat, DeletionFile, FieldAssignmentFragmentState, Fragment,
+    IndexMetadata, MAGIC, Manifest, RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -72,6 +72,7 @@ pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
 pub mod delta;
+pub(crate) mod field_assignment;
 pub mod files;
 pub mod fragment;
 mod hash_joiner;
@@ -132,7 +133,8 @@ use lance_table::feature_flags::{
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
-    BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
+    BatchInfo, BatchUDF, ColumnAlteration, FieldAssignment, FieldAssignmentAlteration,
+    NewColumnTransform, UDFCheckpointStore,
 };
 pub use take::TakeBuilder;
 use uuid::Uuid;
@@ -2988,6 +2990,22 @@ impl Dataset {
 
         rowids::validate_stable_row_ids(self).await?;
 
+        // Assignment roots and partial pages are lazy during ordinary scans,
+        // but an explicit dataset validation must verify the complete snapshot
+        // contract, including fragment cardinalities and bitmap bounds.
+        for assignment in &self.manifest.field_assignment_states {
+            let root = self
+                .load_field_assignment_root(assignment.field_id)
+                .await?
+                .expect("manifest assignment descriptor has a root");
+            for fragment in root.fragments {
+                if matches!(fragment.state, FieldAssignmentFragmentState::Partial(_)) {
+                    self.load_field_assignment_bitmap(assignment.field_id, &fragment)
+                        .await?;
+                }
+            }
+        }
+
         // Validate indices
         let indices = self.load_indices().await?;
         self.validate_indices(&indices)?;
@@ -3320,6 +3338,46 @@ impl Dataset {
                 }
             }
         }
+
+        for assignment in &self.manifest.field_assignment_states {
+            let root_base = if let Some(base_id) = assignment.root.base_id {
+                let base_path = self
+                    .manifest
+                    .base_paths
+                    .get(&base_id)
+                    .ok_or_else(|| Error::internal(format!("base_id {} not found", base_id)))?;
+                Path::parse(base_path.path.as_str())?
+            } else {
+                self.base.clone()
+            };
+            file_paths.push((assignment.root.path.clone(), root_base));
+
+            let root = self
+                .load_field_assignment_root(assignment.field_id)
+                .await?
+                .expect("assignment descriptor has an immutable root");
+            for fragment in root.fragments {
+                let FieldAssignmentFragmentState::Partial(bitmap) = fragment.state else {
+                    continue;
+                };
+                let bitmap_base = if let Some(base_id) = bitmap.base_id {
+                    let base_path =
+                        self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                            Error::internal(format!("base_id {} not found", base_id))
+                        })?;
+                    Path::parse(base_path.path.as_str())?
+                } else {
+                    self.base.clone()
+                };
+                file_paths.push((bitmap.path, bitmap_base));
+            }
+        }
+
+        // Casts may transfer a tracked field to a new stable ID while reusing
+        // the same immutable root. Deep clone must not race two copies to the
+        // same destination object.
+        let mut seen = HashSet::new();
+        file_paths.retain(|path| seen.insert(path.clone()));
         Ok(file_paths)
     }
 
@@ -3466,7 +3524,45 @@ impl Dataset {
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> Result<()> {
-        schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
+        self.add_columns_with_assignment(transforms, read_columns, batch_size, None)
+            .await
+    }
+
+    /// Append new columns and optionally initialize logical assignment tracking.
+    ///
+    /// Tracking requires an explicit [`FieldAssignment`] state and is bound to
+    /// each newly added field's stable ID. Arrow NULL values are not inspected.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{FieldAssignment, NewColumnTransform};
+    /// # async fn add_embedding(dataset: &mut Dataset) -> Result<()> {
+    /// let schema = Arc::new(Schema::new(vec![Field::new(
+    ///     "embedding",
+    ///     DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+    ///     true,
+    /// )]));
+    /// dataset
+    ///     .add_columns_with_assignment(
+    ///         NewColumnTransform::AllNulls(schema),
+    ///         None,
+    ///         None,
+    ///         Some(FieldAssignment::Unassigned),
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn add_columns_with_assignment(
+        &mut self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+        assignment: Option<FieldAssignment>,
+    ) -> Result<()> {
+        schema_evolution::add_columns(self, transforms, read_columns, batch_size, assignment).await
     }
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
@@ -3478,7 +3574,37 @@ impl Dataset {
     /// it, call [optimize::compact_files()] and then
     /// [cleanup::cleanup_old_versions()] on the dataset.
     pub async fn alter_columns(&mut self, alterations: &[ColumnAlteration]) -> Result<()> {
-        schema_evolution::alter_columns(self, alterations).await
+        schema_evolution::alter_columns(self, alterations, &[]).await
+    }
+
+    /// Modify columns and atomically initialize assignment tracking.
+    ///
+    /// Existing [`ColumnAlteration`] callers remain source-compatible; the
+    /// assignment-specific alterations are supplied separately and resolve
+    /// paths against the input snapshot.
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{FieldAssignment, FieldAssignmentAlteration};
+    /// # async fn enable_tracking(dataset: &mut Dataset) -> Result<()> {
+    /// dataset
+    ///     .alter_columns_with_assignment(
+    ///         &[],
+    ///         &[FieldAssignmentAlteration::new(
+    ///             "embedding",
+    ///             FieldAssignment::Assigned,
+    ///         )],
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn alter_columns_with_assignment(
+        &mut self,
+        alterations: &[ColumnAlteration],
+        assignment_alterations: &[FieldAssignmentAlteration],
+    ) -> Result<()> {
+        schema_evolution::alter_columns(self, alterations, assignment_alterations).await
     }
 
     /// Remove columns from the dataset.

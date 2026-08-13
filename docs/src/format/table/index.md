@@ -189,6 +189,10 @@ For the full specification — coverage and resolution rules, dense vs. sparse l
 versioning, index integration, compaction, and a worked example — see the
 [Data Overlay Files Specification](data_overlay_file.md).
 
+## Field Assignment
+
+Field assignment is optional, stable-field-ID-bound snapshot state that distinguishes an explicitly assigned value, including NULL, from an omitted or invalidated value. The `is_assigned(field)` expression reads this state without changing ordinary Arrow projection semantics. See the [Field Assignment Specification](field_assignment.md) for storage, mutation, query, clone, cleanup, and compatibility rules.
+
 
 
 ## Related Specifications

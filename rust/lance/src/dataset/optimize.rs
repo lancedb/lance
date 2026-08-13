@@ -82,7 +82,7 @@
 //! they can be committed in any order.
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
@@ -91,7 +91,8 @@ use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
-    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+    FieldAssignmentTransaction, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
@@ -1937,6 +1938,46 @@ pub struct RewriteResult {
     pub row_addrs: Option<Vec<u8>>,
 }
 
+async fn compaction_source_row_addresses(
+    dataset: &Dataset,
+    task: &RewriteResult,
+) -> Result<Vec<u64>> {
+    if let Some(serialized) = &task.row_addrs {
+        return Ok(
+            RoaringTreemap::deserialize_from(&mut Cursor::new(serialized))?
+                .iter()
+                .collect(),
+        );
+    }
+
+    let dataset = Arc::new(dataset.clone());
+    let mut addresses = Vec::new();
+    for fragment in &task.original_fragments {
+        let physical_rows = fragment.physical_rows.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Compacted fragment {} is missing physical_rows",
+                fragment.id
+            ))
+        })?;
+        let deletion_vector = FileFragment::new(dataset.clone(), fragment.clone())
+            .get_deletion_vector()
+            .await?;
+        for offset in 0..physical_rows as u32 {
+            if deletion_vector
+                .as_ref()
+                .is_some_and(|deleted| deleted.contains(offset))
+            {
+                continue;
+            }
+            addresses.push(
+                lance_core::utils::address::RowAddress::new_from_parts(fragment.id as u32, offset)
+                    .into(),
+            );
+        }
+    }
+    Ok(addresses)
+}
+
 async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
@@ -2456,6 +2497,7 @@ pub async fn commit_compaction(
     let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
+    let mut assignment_changes = FieldAssignmentTransaction::default();
 
     // Write an FRI only when the compaction touches data an index must later
     // remap: a rewrite group covered by a data index, or by the existing FRI's new
@@ -2483,6 +2525,19 @@ pub async fn commit_compaction(
     let mut any_group_indexed = false;
 
     for task in completed_tasks {
+        if !dataset.manifest.field_assignment_states.is_empty() {
+            let source_row_addresses = compaction_source_row_addresses(dataset, &task).await?;
+            assignment_changes.fragment_states.extend(
+                dataset
+                    .field_assignment_states_for_rewritten_rows(
+                        &task.new_fragments,
+                        &source_row_addresses,
+                        &HashSet::new(),
+                        &HashSet::new(),
+                    )
+                    .await?,
+            );
+        }
         metrics += task.metrics;
         let rewrite_group = RewriteGroup {
             old_fragments: task.original_fragments.clone(),
@@ -2622,6 +2677,7 @@ pub async fn commit_compaction(
         },
     )
     .transaction_properties(options.transaction_properties.clone())
+    .field_assignment_transaction(assignment_changes)
     .build();
 
     if let Err(e) = dataset

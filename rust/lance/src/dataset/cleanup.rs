@@ -60,6 +60,7 @@ use lance_table::{
 };
 use object_store::ObjectMeta;
 use object_store::path::Path;
+use prost::Message;
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
@@ -77,6 +78,7 @@ struct ReferencedFiles {
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
+    field_assignment_paths: HashSet<Path>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -546,6 +548,7 @@ impl<'a> CleanupTask<'a> {
             }
             Err(error) => return Err(error),
         };
+        let field_assignment_paths = self.primary_field_assignment_paths(&manifest).await?;
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
@@ -560,7 +563,13 @@ impl<'a> CleanupTask<'a> {
             inspection.tagged_old_versions.insert(manifest.version);
         }
 
-        self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
+        self.process_manifest(
+            &manifest,
+            &indexes,
+            &field_assignment_paths,
+            in_working_set,
+            &mut inspection,
+        )?;
         if !in_working_set {
             inspection
                 .old_manifests
@@ -582,6 +591,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         manifest: &Manifest,
         indexes: &Vec<IndexMetadata>,
+        field_assignment_paths: &HashSet<Path>,
         in_working_set: bool,
         inspection: &mut MutexGuard<CleanupInspection>,
     ) -> Result<()> {
@@ -618,7 +628,117 @@ impl<'a> CleanupTask<'a> {
             let uuid_str = index.uuid.to_string();
             referenced_files.index_uuids.insert(uuid_str);
         }
+        referenced_files
+            .field_assignment_paths
+            .extend(field_assignment_paths.iter().cloned());
         Ok(())
+    }
+
+    async fn primary_field_assignment_paths(&self, manifest: &Manifest) -> Result<HashSet<Path>> {
+        let mut paths = HashSet::new();
+        for state in &manifest.field_assignment_states {
+            // Cleanup scans only this dataset's object store. Files owned by an
+            // external base are managed by that dataset's cleanup lifecycle.
+            if state.root.base_id.is_some() {
+                continue;
+            }
+            let root_path = Path::parse(&state.root.path)?;
+            paths.insert(root_path.clone());
+            let full_root_path =
+                Path::from_iter(self.dataset.base.parts().chain(root_path.parts()));
+            let root_bytes = self
+                .dataset
+                .object_store
+                .read_one_all(&full_root_path)
+                .await?;
+            if root_bytes.len() as u64 != state.root.size_bytes {
+                return Err(Error::invalid_input(format!(
+                    "Field assignment root '{}' has size {}, expected {}",
+                    state.root.path,
+                    root_bytes.len(),
+                    state.root.size_bytes
+                )));
+            }
+            let root = lance_table::format::pb::FieldAssignmentRoot::decode(root_bytes.as_ref())
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "Failed to decode field assignment root '{}': {}",
+                        state.root.path, error
+                    ))
+                })?;
+            for fragment in root.fragments {
+                if let Some(lance_table::format::pb::field_assignment_fragment::State::Partial(
+                    file,
+                )) = fragment.state
+                    && file.base_id.is_none()
+                {
+                    paths.insert(Path::parse(file.path)?);
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    async fn branch_field_assignment_paths(&self, manifest: &Manifest) -> Result<HashSet<Path>> {
+        let mut paths = HashSet::new();
+        for state in &manifest.field_assignment_states {
+            let Some(root_base_id) = state.root.base_id else {
+                continue;
+            };
+            let Some(root_base) = manifest.base_paths.get(&root_base_id) else {
+                return Err(Error::invalid_input(format!(
+                    "Branch field assignment root '{}' references unknown base ID {}",
+                    state.root.path, root_base_id
+                )));
+            };
+            if root_base.path != self.dataset.uri {
+                continue;
+            }
+
+            let root_path = Path::parse(&state.root.path)?;
+            paths.insert(root_path.clone());
+            let full_root_path =
+                Path::from_iter(self.dataset.base.parts().chain(root_path.parts()));
+            let root_bytes = self
+                .dataset
+                .object_store
+                .read_one_all(&full_root_path)
+                .await?;
+            if root_bytes.len() as u64 != state.root.size_bytes {
+                return Err(Error::invalid_input(format!(
+                    "Branch field assignment root '{}' has size {}, expected {}",
+                    state.root.path,
+                    root_bytes.len(),
+                    state.root.size_bytes
+                )));
+            }
+            let root = lance_table::format::pb::FieldAssignmentRoot::decode(root_bytes.as_ref())
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "Failed to decode branch field assignment root '{}': {}",
+                        state.root.path, error
+                    ))
+                })?;
+            for fragment in root.fragments {
+                let Some(lance_table::format::pb::field_assignment_fragment::State::Partial(
+                    bitmap,
+                )) = fragment.state
+                else {
+                    continue;
+                };
+                let bitmap_is_local = match bitmap.base_id {
+                    None => true,
+                    Some(base_id) => manifest
+                        .base_paths
+                        .get(&base_id)
+                        .is_some_and(|base| base.path == self.dataset.uri),
+                };
+                if bitmap_is_local {
+                    paths.insert(Path::parse(bitmap.path)?);
+                }
+            }
+        }
+        Ok(paths)
     }
 
     #[instrument(
@@ -699,6 +819,17 @@ impl<'a> CleanupTask<'a> {
             // the proof when the old manifests are removed by this cleanup pass.
             build_listing_stream(self.dataset.indices_dir(), None),
             build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
+            // Assignment roots and pages from manifests being removed are
+            // verified objects. Scan the complete managed subtree while that
+            // proof is available; a retained-manifest timestamp can otherwise
+            // skip an object written in the same commit and strand it forever.
+            build_listing_stream(
+                self.dataset
+                    .base
+                    .clone()
+                    .join(super::field_assignment::FIELD_ASSIGNMENTS_DIR),
+                None,
+            ),
         ];
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
@@ -854,6 +985,26 @@ impl<'a> CleanupTask<'a> {
                     size_bytes,
                 ));
             }
+        }
+        if relative_path.as_ref().starts_with("_field_assignments") {
+            if inspection
+                .referenced_files
+                .field_assignment_paths
+                .contains(&relative_path)
+            {
+                return Ok(None);
+            }
+            if !maybe_in_progress {
+                return Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes));
+            }
+            if inspection
+                .verified_files
+                .field_assignment_paths
+                .contains(&relative_path)
+            {
+                return Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes));
+            }
+            return Ok(None);
         }
         if relative_path.as_ref().starts_with("_indices") {
             // Indices are referenced by UUID so we need to examine the UUID
@@ -1190,6 +1341,7 @@ impl<'a> CleanupTask<'a> {
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+        let field_assignment_paths = self.branch_field_assignment_paths(&manifest).await?;
         let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
 
@@ -1253,6 +1405,19 @@ impl<'a> CleanupTask<'a> {
                     is_referenced = true;
                 }
             }
+        }
+        if !field_assignment_paths.is_empty() {
+            for path in field_assignment_paths {
+                inspection
+                    .verified_files
+                    .field_assignment_paths
+                    .remove(&path);
+                inspection
+                    .referenced_files
+                    .field_assignment_paths
+                    .insert(path);
+            }
+            is_referenced = true;
         }
         if is_referenced {
             inspection

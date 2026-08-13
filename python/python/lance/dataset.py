@@ -453,6 +453,40 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
+    def invalidate_fields(self, fields: Iterable[str]) -> "MergeInsertBuilder":
+        """Clear logical assignment for tracked fields on matched updates.
+
+        The invalidation is atomic with the merge. A source field cannot be
+        both written and invalidated, and ``_rowid`` merges must remain
+        update-only.
+
+        Parameters
+        ----------
+        fields : iterable of str
+            Tracked field paths to invalidate on rows updated by the merge.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"id": [1], "value": [10]}), "merge_assignment_invalidation"
+        ... )
+        >>> dataset.alter_columns({"path": "value", "assignment": "assigned"})
+        >>> source = dataset.to_table(columns=["_rowid", "id"])
+        >>> _ = (
+        ...     dataset.merge_insert(on="_rowid")
+        ...     .when_matched_update_all()
+        ...     .invalidate_fields(["value"])
+        ...     .execute(source)
+        ... )
+        >>> dataset.to_table(
+        ...     columns={"assigned": "is_assigned(value)"}
+        ... )["assigned"].to_pylist()
+        [False]
+        """
+        return super(MergeInsertBuilder, self).invalidate_fields(list(fields))
+
     def when_matched_delete(self) -> "MergeInsertBuilder":
         """
         Configure the operation to delete matched rows in the target table.
@@ -2507,6 +2541,9 @@ class LanceDataset(pa.dataset.Dataset):
             - "data_type": pyarrow.DataType, optional
                 The new data type to cast the column to. If not specified, the column
                 data type is not changed.
+            - "assignment": {"assigned", "unassigned"}, optional
+                Enable assignment tracking for the stable field ID and initialize
+                every live row explicitly. Arrow NULL values are not inspected.
 
         Examples
         --------
@@ -2524,6 +2561,11 @@ class LanceDataset(pa.dataset.Dataset):
         1  2  b
         2  3  c
         >>> dataset.alter_columns({"path": "x", "data_type": pa.int32()})
+        >>> dataset.alter_columns({"path": "x", "assignment": "unassigned"})
+        >>> dataset.to_table(
+        ...     columns={"assigned": "is_assigned(x)"}
+        ... )["assigned"].to_pylist()
+        [False, False, False]
         >>> dataset.schema
         x: int32
         b: string
@@ -2602,6 +2644,7 @@ class LanceDataset(pa.dataset.Dataset):
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
         batch_size: Optional[int] = None,
+        assignment: Optional[Literal["assigned", "unassigned"]] = None,
     ):
         """
         Add new columns with defined values.
@@ -2641,11 +2684,24 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: int, optional
             The number of rows to read at a time from the source dataset when applying
             the transform.  This is ignored if the dataset is a v1 dataset.
+        assignment: {"assigned", "unassigned"}, optional
+            Enable assignment tracking for each newly added field and explicitly
+            initialize the current snapshot. This state is independent of Arrow
+            validity, so an assigned NULL remains assigned.
 
         Examples
         --------
         >>> import lance
         >>> import pyarrow as pa
+        >>> tracked = lance.write_dataset(pa.table({"id": [1, 2]}), "tracked")
+        >>> tracked.add_columns(
+        ...     pa.field("embedding", pa.int32()), assignment="unassigned"
+        ... )
+        >>> tracked.to_table(
+        ...     columns={"assigned": "is_assigned(embedding)"}
+        ... )["assigned"].to_pylist()
+        [False, False]
+
         >>> table = pa.table({"a": [1, 2, 3]})
         >>> dataset = lance.write_dataset(table, "my_dataset")
         >>> @lance.batch_udf()
@@ -2680,15 +2736,15 @@ class LanceDataset(pa.dataset.Dataset):
             transforms = pa.schema(transforms)
 
         if isinstance(transforms, pa.Schema):
-            self._ds.add_columns_with_schema(transforms)
+            self._ds.add_columns_with_schema(transforms, assignment)
             return
 
         transforms = normalize_transform(transforms, self, read_columns, reader_schema)
         if isinstance(transforms, pa.RecordBatchReader):
-            self._ds.add_columns_from_reader(transforms, batch_size)
+            self._ds.add_columns_from_reader(transforms, batch_size, assignment)
             return
         else:
-            self._ds.add_columns(transforms, read_columns, batch_size)
+            self._ds.add_columns(transforms, read_columns, batch_size, assignment)
 
             if isinstance(transforms, BatchUDF):
                 if transforms.cache is not None:
@@ -2925,18 +2981,20 @@ class LanceDataset(pa.dataset.Dataset):
 
     def update(
         self,
-        updates: Dict[str, str],
+        updates: Optional[Dict[str, str]] = None,
         where: Optional[str] = None,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
+        invalidate_fields: Optional[Iterable[str]] = None,
     ) -> UpdateResult:
         """
         Update column values for rows matching where.
 
         Parameters
         ----------
-        updates : dict of str to str
-            A mapping of column names to a SQL expression.
+        updates : dict of str to str, optional
+            A mapping of column names to a SQL expression. This may be omitted
+            for an invalidation-only mutation.
         where : str, optional
             A SQL predicate indicating which rows should be updated.
         conflict_retries : int, optional
@@ -2947,6 +3005,9 @@ class LanceDataset(pa.dataset.Dataset):
             the operation before giving up. At least one attempt will be made,
             regardless of how long it takes to complete. Subsequent attempts will be
             cancelled once this timeout is reached. Default is 30 seconds.
+        invalidate_fields : iterable of str, optional
+            Tracked fields whose logical assignment should be cleared for the
+            matching rows. A field cannot also appear in ``updates``.
 
         Returns
         -------
@@ -2966,10 +3027,23 @@ class LanceDataset(pa.dataset.Dataset):
         0  1  a
         1  4  b
         2  5  c
+
+        An invalidation-only update clears assignment without rewriting data files.
+
+        >>> field = pa.field("embedding", pa.int32())
+        >>> dataset.add_columns(field, assignment="assigned")
+        >>> dataset.update(where="a = 1", invalidate_fields=["embedding"])
+        {'num_rows_updated': 1}
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        return self._ds.update(updates, where, conflict_retries, retry_timeout)
+        return self._ds.update(
+            updates,
+            where,
+            conflict_retries,
+            retry_timeout,
+            None if invalidate_fields is None else list(invalidate_fields),
+        )
 
     def versions(self):
         """
@@ -5737,6 +5811,7 @@ class AlterColumn(TypedDict):
     name: Optional[str]
     nullable: Optional[bool]
     data_type: Optional[pa.DataType]
+    assignment: Optional[Literal["assigned", "unassigned"]]
 
 
 class ExecuteResult(TypedDict):

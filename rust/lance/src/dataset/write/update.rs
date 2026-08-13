@@ -9,8 +9,10 @@ use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
-use crate::dataset::transaction::UpdateMode::RewriteRows;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+use crate::dataset::transaction::{
+    FieldAssignmentRowChange, FieldAssignmentTransaction, Operation, Transaction,
+};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
@@ -75,6 +77,8 @@ pub struct UpdateBuilder {
     condition: Option<Expr>,
     /// The updates to apply to matching rows.
     updates: HashMap<String, Expr>,
+    /// Tracked fields to invalidate for the matching rows.
+    invalidated_field_ids: HashSet<i32>,
     /// Number of times to retry on commit conflicts.
     conflict_retries: u32,
     /// Total timeout for retries.
@@ -87,6 +91,7 @@ impl UpdateBuilder {
             dataset,
             condition: None,
             updates: HashMap::new(),
+            invalidated_field_ids: HashSet::new(),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
         }
@@ -206,6 +211,46 @@ impl UpdateBuilder {
         Ok(self)
     }
 
+    /// Clear logical assignment for tracked fields on every matching row.
+    ///
+    /// Invalidation is committed atomically with value updates. An
+    /// invalidation-only update is valid, but a field cannot be both written
+    /// and invalidated by the same operation.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::UpdateBuilder;
+    /// # fn build(dataset: Arc<Dataset>) -> Result<()> {
+    /// let job = UpdateBuilder::new(dataset)
+    ///     .update_where("id = 42")?
+    ///     .invalidate_fields(["embedding"])?
+    ///     .build()?;
+    /// # let _ = job;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn invalidate_fields<I, S>(mut self, fields: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for path in fields {
+            let path = path.as_ref();
+            let field = self.dataset.schema().field(path).ok_or_else(|| {
+                Error::invalid_input(format!("Cannot invalidate unknown field '{}'", path))
+            })?;
+            if self.dataset.field_assignment_state(field.id).is_none() {
+                return Err(Error::invalid_input(format!(
+                    "Cannot invalidate untracked field '{}' (stable field ID {})",
+                    path, field.id
+                )));
+            }
+            self.invalidated_field_ids.insert(field.id);
+        }
+        Ok(self)
+    }
+
     /// Set the number of times to retry on commit conflicts.
     ///
     /// Default is 10.
@@ -235,8 +280,35 @@ impl UpdateBuilder {
             updates.insert(column, physical_expr);
         }
 
-        if updates.is_empty() {
-            return Err(Error::invalid_input("No updates provided"));
+        if updates.is_empty() && self.invalidated_field_ids.is_empty() {
+            return Err(Error::invalid_input(
+                "No value updates or field invalidations provided",
+            ));
+        }
+        let mut written_field_ids = Vec::new();
+        for column in updates.keys() {
+            let field = self
+                .dataset
+                .schema()
+                .field(column)
+                .expect("set validates update fields");
+            collect_subtree_field_ids(field, &mut written_field_ids);
+        }
+        if let Some(field_id) = written_field_ids
+            .iter()
+            .map(|field_id| *field_id as i32)
+            .find(|field_id| self.invalidated_field_ids.contains(field_id))
+        {
+            let field_name = self
+                .dataset
+                .schema()
+                .field_by_id(field_id)
+                .map(|field| field.name.as_str())
+                .unwrap_or("<unknown>");
+            return Err(Error::invalid_input(format!(
+                "Field '{}' cannot be both written and invalidated",
+                field_name
+            )));
         }
 
         let updates = Arc::new(updates);
@@ -245,6 +317,7 @@ impl UpdateBuilder {
             dataset: self.dataset,
             condition: self.condition,
             updates,
+            invalidated_field_ids: Arc::new(self.invalidated_field_ids),
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
         })
@@ -265,6 +338,7 @@ pub struct UpdateData {
     old_fragments: Vec<Fragment>,
     new_fragments: Vec<Fragment>,
     affected_rows: RowAddrTreeMap,
+    source_row_addresses: Vec<u64>,
     num_updated_rows: u64,
 }
 
@@ -273,6 +347,7 @@ pub struct UpdateJob {
     dataset: Arc<Dataset>,
     condition: Option<Expr>,
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
+    invalidated_field_ids: Arc<HashSet<i32>>,
     conflict_retries: u32,
     retry_timeout: Duration,
 }
@@ -289,6 +364,10 @@ impl UpdateJob {
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
+        if self.updates.is_empty() {
+            return self.execute_invalidation_only_impl().await;
+        }
+
         let mut scanner = self.dataset.scan();
         let legacy_blob_ids = self
             .dataset
@@ -469,6 +548,7 @@ impl UpdateJob {
 
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
+        let source_row_addresses = removed_row_ids.ordered_row_addrs(row_id_index.as_deref());
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
         let deletions_result = self.apply_deletions(&row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
@@ -496,6 +576,41 @@ impl UpdateJob {
             old_fragments,
             new_fragments,
             affected_rows,
+            source_row_addresses,
+            num_updated_rows,
+        })
+    }
+
+    async fn execute_invalidation_only_impl(&self) -> Result<UpdateData> {
+        let mut scanner = self.dataset.scan();
+        scanner.project::<&str>(&[])?;
+        scanner.with_row_id();
+        if let Some(expr) = &self.condition {
+            scanner.filter_expr(expr.clone());
+        }
+
+        let stream = scanner
+            .try_into_dfstream(scanner.execution_options())
+            .await?;
+        let (mut stream, row_id_rx) =
+            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+        while let Some(batch) = stream.next().await {
+            batch?;
+        }
+        let row_ids = row_id_rx
+            .try_recv()
+            .map_err(|error| Error::internal(format!("Failed to receive row ids: {}", error)))?;
+        let row_id_index = get_row_id_index(&self.dataset).await?;
+        let source_row_addresses = row_ids.ordered_row_addrs(row_id_index.as_deref());
+        let row_addrs = row_ids.row_addrs(row_id_index.as_deref());
+        let num_updated_rows = row_addrs.len();
+
+        Ok(UpdateData {
+            removed_fragment_ids: Vec::new(),
+            old_fragments: Vec::new(),
+            new_fragments: Vec::new(),
+            affected_rows: RowAddrTreeMap::from(row_addrs.as_ref().clone()),
+            source_row_addresses,
             num_updated_rows,
         })
     }
@@ -505,6 +620,46 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        if self.updates.is_empty() {
+            let row_addresses = RoaringTreemap::from_iter(update_data.source_row_addresses);
+            let row_changes = if row_addresses.is_empty() {
+                Vec::new()
+            } else {
+                self.invalidated_field_ids
+                    .iter()
+                    .map(|field_id| FieldAssignmentRowChange {
+                        field_id: *field_id,
+                        assigned: false,
+                        row_addresses: row_addresses.clone(),
+                    })
+                    .collect()
+            };
+            let operation = Operation::Update {
+                removed_fragment_ids: Vec::new(),
+                updated_fragments: Vec::new(),
+                new_fragments: Vec::new(),
+                fields_modified: Vec::new(),
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: Vec::new(),
+                update_mode: Some(RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            };
+            let transaction = Transaction::new(dataset.manifest.version, operation, None)
+                .with_field_assignment_transaction(FieldAssignmentTransaction {
+                    row_changes,
+                    ..Default::default()
+                });
+            let new_dataset = CommitBuilder::new(dataset)
+                .with_affected_rows(update_data.affected_rows)
+                .execute(transaction)
+                .await?;
+            return Ok(UpdateResult {
+                new_dataset: Arc::new(new_dataset),
+                rows_updated: update_data.num_updated_rows,
+            });
+        }
+
         // Updated columns are top-level (nested references are rejected by `set`), but a
         // struct-column update rewrites all of its descendants. Collect the full field
         // subtree so an index on a nested child field is recognized as modified and not
@@ -515,6 +670,19 @@ impl UpdateJob {
                 collect_subtree_field_ids(field, &mut fields_for_preserving_frag_bitmap);
             }
         }
+
+        let assigned_field_ids = fields_for_preserving_frag_bitmap
+            .iter()
+            .map(|field_id| *field_id as i32)
+            .collect::<HashSet<_>>();
+        let fragment_states = dataset
+            .field_assignment_states_for_rewritten_rows(
+                &update_data.new_fragments,
+                &update_data.source_row_addresses,
+                &assigned_field_ids,
+                self.invalidated_field_ids.as_ref(),
+            )
+            .await?;
 
         // Commit updated and new fragments
         let operation = Operation::Update {
@@ -532,7 +700,11 @@ impl UpdateJob {
             updated_fragment_offsets: None,
         };
 
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = Transaction::new(dataset.manifest.version, operation, None)
+            .with_field_assignment_transaction(FieldAssignmentTransaction {
+                fragment_states,
+                ..Default::default()
+            });
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)

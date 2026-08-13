@@ -4200,6 +4200,7 @@ dependencies = [
  "pin-project",
  "prost",
  "prost-build",
+ "roaring",
  "tokio",
  "tracing",
 ]

@@ -27,6 +27,14 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Substrait extension URN for Lance-native scalar functions.
+///
+/// ```
+/// use lance_datafusion::substrait::LANCE_FUNCTIONS_EXTENSION_URN;
+/// assert_eq!(LANCE_FUNCTIONS_EXTENSION_URN, "urn:lance:extension:functions");
+/// ```
+pub const LANCE_FUNCTIONS_EXTENSION_URN: &str = "urn:lance:extension:functions";
+
 /// FixedSizeList has no Substrait producer support in datafusion-substrait.
 /// Other unsupported types (Null, Float16) are encoded as UserDefined and
 /// handled by `remove_extension_types` on the decode side.
@@ -76,11 +84,43 @@ pub fn encode_substrait(
     let output_type = expr.get_type(&df_schema)?;
     // Nullability doesn't matter
     let output_field = Field::new("output", output_type, /*nullable=*/ true);
-    let extended_expr = datafusion_substrait::logical_plan::producer::to_substrait_extended_expr(
-        &[(&expr, &output_field)],
-        &df_schema,
-        state,
-    )?;
+    let mut extended_expr =
+        datafusion_substrait::logical_plan::producer::to_substrait_extended_expr(
+            &[(&expr, &output_field)],
+            &df_schema,
+            state,
+        )?;
+
+    use datafusion_substrait::substrait::proto::extensions::{
+        SimpleExtensionUrn, simple_extension_declaration::MappingType,
+    };
+    let has_lance_function = extended_expr.extensions.iter().any(|extension| {
+        matches!(
+            &extension.mapping_type,
+            Some(MappingType::ExtensionFunction(function))
+                if function.name == crate::udf::IS_ASSIGNED_NAME
+        )
+    });
+    if has_lance_function {
+        let anchor = extended_expr
+            .extension_urns
+            .iter()
+            .map(|extension| extension.extension_urn_anchor)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        extended_expr.extension_urns.push(SimpleExtensionUrn {
+            extension_urn_anchor: anchor,
+            urn: LANCE_FUNCTIONS_EXTENSION_URN.to_string(),
+        });
+        for extension in &mut extended_expr.extensions {
+            if let Some(MappingType::ExtensionFunction(function)) = &mut extension.mapping_type
+                && function.name == crate::udf::IS_ASSIGNED_NAME
+            {
+                function.extension_urn_reference = anchor;
+            }
+        }
+    }
 
     Ok(extended_expr.encode_to_vec())
 }
@@ -540,7 +580,7 @@ mod tests {
     use datafusion::{
         execution::SessionState,
         logical_expr::{BinaryExpr, Operator},
-        prelude::{Expr, SessionContext},
+        prelude::{Expr, SessionContext, col},
     };
     use datafusion_common::{Column, ScalarValue};
     use datafusion_substrait::substrait::proto::{
@@ -562,10 +602,11 @@ mod tests {
     };
     use prost::Message;
 
-    use crate::substrait::{encode_substrait, parse_substrait};
+    use crate::substrait::{LANCE_FUNCTIONS_EXTENSION_URN, encode_substrait, parse_substrait};
 
     fn session_state() -> SessionState {
         let ctx = SessionContext::new();
+        crate::udf::register_functions(&ctx);
         ctx.state()
     }
 
@@ -677,6 +718,36 @@ mod tests {
             encode_substrait(expr.clone(), Arc::new(schema.clone()), &session_state()).unwrap();
 
         let decoded = parse_substrait(bytes.as_slice(), Arc::new(schema.clone()), &session_state())
+            .await
+            .unwrap();
+        assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
+    async fn test_is_assigned_uses_lance_substrait_extension() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::Int32,
+            true,
+        )]));
+        let expr = crate::udf::is_assigned(col("embedding"));
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let encoded = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        let urn = encoded
+            .extension_urns
+            .iter()
+            .find(|extension| extension.urn == LANCE_FUNCTIONS_EXTENSION_URN)
+            .unwrap();
+        assert!(encoded.extensions.iter().any(|extension| {
+            matches!(
+                &extension.mapping_type,
+                Some(MappingType::ExtensionFunction(function))
+                    if function.name == crate::udf::IS_ASSIGNED_NAME
+                        && function.extension_urn_reference == urn.extension_urn_anchor
+            )
+        }));
+
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
             .await
             .unwrap();
         assert_eq!(decoded, expr);

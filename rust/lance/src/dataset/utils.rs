@@ -132,6 +132,23 @@ impl CapturedRowIds {
             }
         }
     }
+
+    /// Resolve captured row IDs to physical row addresses without changing
+    /// their scan order.
+    pub(crate) fn ordered_row_addrs(&self, index: Option<&RowIdIndex>) -> Vec<u64> {
+        match self {
+            Self::AddressStyle(addrs) => addrs.iter().collect(),
+            Self::SequenceStyle(sequence) => {
+                let Some(index) = index else {
+                    panic!("RowIdIndex required for sequence style row ids")
+                };
+                sequence
+                    .iter()
+                    .map(|row_id| index.get(row_id).expect("row id missing from index").into())
+                    .collect()
+            }
+        }
+    }
 }
 
 impl Default for CapturedRowIds {
