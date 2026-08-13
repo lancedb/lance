@@ -510,6 +510,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
+                    base_object_stores: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 })
             }
         }

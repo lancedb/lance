@@ -578,6 +578,57 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     assert!(tracker.incremental_stats().read_iops > 0);
 }
 
+#[tokio::test]
+async fn test_shallow_clone_reuses_base_object_store() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let batch = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(64))
+        .unwrap();
+    let mut source = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    source
+        .tags()
+        .create("to_clone", source.version().version)
+        .await
+        .unwrap();
+
+    let cloned = source
+        .shallow_clone(&clone_uri, "to_clone", None)
+        .await
+        .unwrap();
+    let base_id = cloned.get_fragments()[0].metadata().files[0]
+        .base_id
+        .expect("shallow clone data files must reference the source base");
+
+    let first = cloned.object_store(Some(base_id)).await.unwrap();
+    let second = cloned.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "repeated lookups must reuse the cached base object store"
+    );
+
+    // Clones of the dataset share the same cache.
+    let third = cloned.clone().object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &third),
+        "dataset clones must share the base object store cache"
+    );
+
+    // Reads through the cached store still work.
+    let read = cloned.scan().try_into_batch().await.unwrap();
+    assert_eq!(read.num_rows(), 64);
+}
+
 #[cfg(feature = "azure")]
 #[tokio::test]
 async fn test_object_store_uses_runtime_base_store_params() {

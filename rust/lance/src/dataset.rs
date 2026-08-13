@@ -197,6 +197,9 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
+    /// Object stores for additional base paths, resolved on first use and
+    /// shared across clones of this dataset.
+    pub(crate) base_object_stores: Arc<std::sync::Mutex<HashMap<u32, Arc<ObjectStore>>>>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -865,6 +868,7 @@ impl Dataset {
             file_reader_options,
             store_params: store_params.map(Box::new),
             base_store_params,
+            base_object_stores: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -2411,6 +2415,10 @@ impl Dataset {
     }
 
     async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
+        if let Some(store) = self.base_object_stores.lock().unwrap().get(&base_id) {
+            return Ok(store.clone());
+        }
+
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
@@ -2423,7 +2431,13 @@ impl Dataset {
         )
         .await?;
 
-        Ok(store)
+        Ok(self
+            .base_object_stores
+            .lock()
+            .unwrap()
+            .entry(base_id)
+            .or_insert(store)
+            .clone())
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
