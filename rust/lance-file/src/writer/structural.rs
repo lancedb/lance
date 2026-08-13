@@ -5,9 +5,14 @@ use core::panic;
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_data::ArrayData;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{StreamExt, stream::FuturesOrdered};
-use lance_core::{Error, Result, datatypes::Schema, utils::bit::pad_bytes};
+use lance_core::{
+    Error, Result,
+    datatypes::{Field, Schema},
+    utils::bit::pad_bytes,
+};
 use lance_encoding::{
     decoder::PageEncoding,
     encoder::{
@@ -441,13 +446,26 @@ impl EncodingPipeline {
         self.schema.is_some()
     }
 
+    fn verify_field_nullability(array: &ArrayData, field: &Field) -> Result<()> {
+        if !field.nullable && array.null_count() > 0 {
+            return Err(Error::invalid_input(format!(
+                "The field `{}` contained null values even though the field is marked non-null in the schema",
+                field.name
+            )));
+        }
+        for (child_field, child_array) in field.children.iter().zip(array.child_data()) {
+            Self::verify_field_nullability(child_array, child_field)?;
+        }
+        Ok(())
+    }
+
     fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
         for (column, field) in batch
             .columns()
             .iter()
             .zip(self.schema.as_ref().unwrap().fields.iter())
         {
-            crate::writer::nullability::verify_visible_nullability(column.as_ref(), field)?;
+            Self::verify_field_nullability(&column.to_data(), field)?;
         }
         Ok(())
     }
@@ -577,7 +595,7 @@ impl EncodingPipeline {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
-        crate::writer::nullability::verify_visible_nullability(array.as_ref(), field)?;
+        Self::verify_field_nullability(&array.to_data(), field)?;
         if array.is_empty() {
             return Ok(());
         }

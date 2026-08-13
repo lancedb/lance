@@ -14,7 +14,6 @@ use prost_types::Any;
 
 use crate::{format::pbfile, versions};
 
-pub(crate) mod nullability;
 pub(crate) mod structural;
 
 /// Page buffers in current Lance files are aligned to 64 bytes.
