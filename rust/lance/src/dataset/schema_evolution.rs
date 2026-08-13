@@ -454,6 +454,10 @@ pub(super) fn merge_introduces_required_field(old: &Schema, merged: &Schema) -> 
 /// field IDs and rejects concurrent data/schema changes in both commit orders.
 /// The handle is not serializable and has no persistent staging ID.
 ///
+/// Use [`Self::set_field_metadata_entry`] to insert or replace one metadata
+/// entry on a newly staged top-level field before commit. The mutation stays
+/// on this in-process candidate until a successful commit.
+///
 /// This type intentionally does not implement [`Clone`]: commit consumes the
 /// handle so the safe API publishes at most once.
 #[must_use = "staged columns are not published until commit()/commit_exact(); drop abandons without publishing"]
@@ -474,6 +478,60 @@ impl StagedAddColumns {
     /// [`Self::commit`] or [`Self::commit_exact`] succeeds.
     pub fn candidate_schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Insert or replace one metadata entry on a newly staged top-level field.
+    ///
+    /// `field_id` must be a Lance-assigned ID from [`Self::candidate_schema`]
+    /// for a top-level field this handle staged. The change applies only to
+    /// this in-process candidate and stays invisible to the source
+    /// [`Dataset`] and table readers until [`Self::commit`] or
+    /// [`Self::commit_exact`] succeeds.
+    ///
+    /// Source/pre-existing, unknown, and nested field IDs return
+    /// [`Error::InvalidInput`] and leave the candidate unchanged. Other
+    /// candidate schema and field metadata entries are preserved.
+    ///
+    /// ```
+    /// # use lance::dataset::StagedAddColumns;
+    /// # use lance::Result;
+    /// # fn example(staged: &mut StagedAddColumns, field_id: i32) -> Result<()> {
+    /// staged.set_field_metadata_entry(field_id, "unit", "meters")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_field_metadata_entry(
+        &mut self,
+        field_id: i32,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
+        let top_level_index = self
+            .schema
+            .fields
+            .iter()
+            .position(|field| field.id == field_id);
+        match top_level_index {
+            None if self.schema.field_by_id(field_id).is_some() => {
+                Err(Error::invalid_input(format!(
+                    "Field ID {field_id} is nested; metadata can only be set on newly staged top-level fields"
+                )))
+            }
+            None => Err(Error::invalid_input(format!(
+                "Field ID {field_id} is not present in the candidate schema"
+            ))),
+            Some(_) if self.dataset.schema().field_by_id(field_id).is_some() => {
+                Err(Error::invalid_input(format!(
+                    "Field ID {field_id} belongs to the source dataset; metadata can only be set on newly staged top-level fields"
+                )))
+            }
+            Some(index) => {
+                self.schema.fields[index]
+                    .metadata
+                    .insert(key.into(), value.into());
+                Ok(())
+            }
+        }
     }
 
     /// Consume this handle and publish the staged columns with ordinary Merge
@@ -1435,6 +1493,8 @@ mod test {
     const A2_FIELD_META_KEY: &str = "a2_stage_field_meta";
     const A2_FIELD_META_VALUE: &str = "field-meta-v1";
     const A2_NEW_COLUMN: &str = "staged_col";
+    const STAGED_EXTRA_META_KEY: &str = "staged_extra_meta";
+    const STAGED_EXTRA_META_VALUE: &str = "extra-v1";
 
     async fn write_a2_three_fragment_dataset(
         test_uri: &str,
@@ -1880,6 +1940,261 @@ mod test {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(staged_col, &Int32Array::from(vec![0, 10, 20, 30, 40, 50]));
+
+        Ok(())
+    }
+
+    fn assert_candidate_schema_unchanged(staged: &StagedAddColumns, before: &Schema) {
+        assert_eq!(staged.candidate_schema(), before);
+        assert_eq!(&staged.candidate_schema().metadata, &before.metadata);
+    }
+
+    fn staged_struct_column_reader(num_rows: i32) -> Box<dyn RecordBatchReader + Send> {
+        let inner_field = ArrowField::new("inner", DataType::Int32, false);
+        let struct_field = ArrowField::new(
+            "staged_struct",
+            DataType::Struct(ArrowFields::from(vec![inner_field.clone()])),
+            false,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![struct_field]));
+        let struct_array = StructArray::new(
+            ArrowFields::from(vec![inner_field]),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows)) as ArrayRef],
+            None,
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array)]).unwrap();
+        Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))
+    }
+
+    /// Stage a column that already carries ordinary field metadata, add one
+    /// extra entry on the Lance-assigned top-level ID, and publish both
+    /// entries with the values in a single ExactMerge.
+    #[tokio::test]
+    async fn test_stage_add_columns_set_field_metadata_entry_commit_exact() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+        let schema_before = ArrowSchema::from(dataset.schema());
+        let input_field_id = dataset.schema().field("id").expect("fixture has id").id;
+
+        let mut staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                Some(vec!["id".into()]),
+                None,
+            )
+            .await?;
+
+        let output_field_id = staged
+            .candidate_schema()
+            .field(A2_NEW_COLUMN)
+            .expect("staged candidate schema must expose the new output field by name")
+            .id;
+
+        staged.set_field_metadata_entry(
+            output_field_id,
+            STAGED_EXTRA_META_KEY,
+            STAGED_EXTRA_META_VALUE,
+        )?;
+
+        let candidate_field = staged
+            .candidate_schema()
+            .field_by_id(output_field_id)
+            .expect("candidate must still expose the staged field");
+        assert_eq!(
+            candidate_field.metadata.get(A2_FIELD_META_KEY),
+            Some(&A2_FIELD_META_VALUE.to_string()),
+            "existing ordinary field metadata must be preserved"
+        );
+        assert_eq!(
+            candidate_field.metadata.get(STAGED_EXTRA_META_KEY),
+            Some(&STAGED_EXTRA_META_VALUE.to_string()),
+            "new field metadata entry must be visible on the in-process candidate"
+        );
+
+        assert_a2_base_schema_unchanged(&dataset, version_before);
+        assert_eq!(ArrowSchema::from(dataset.schema()), schema_before);
+        assert!(
+            dataset.schema().field(A2_NEW_COLUMN).is_none(),
+            "source Dataset must not observe staged field metadata before commit"
+        );
+
+        let before_commit = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&before_commit, version_before);
+        assert_eq!(ArrowSchema::from(before_commit.schema()), schema_before);
+        let before_data = before_commit.scan().try_into_batch().await?;
+        assert!(before_data.column_by_name(A2_NEW_COLUMN).is_none());
+
+        let committed = staged
+            .commit_exact(&[input_field_id], &[output_field_id])
+            .await?;
+
+        assert_eq!(committed.version().version, version_before + 1);
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before + 1);
+        assert_eq!(
+            reopened.schema().metadata.get(A2_SCHEMA_META_KEY),
+            Some(&A2_SCHEMA_META_VALUE.to_string())
+        );
+        let published_field = reopened
+            .schema()
+            .field(A2_NEW_COLUMN)
+            .expect("committed schema must include staged column");
+        assert_eq!(published_field.id, output_field_id);
+        assert_eq!(
+            published_field.metadata.get(A2_FIELD_META_KEY),
+            Some(&A2_FIELD_META_VALUE.to_string())
+        );
+        assert_eq!(
+            published_field.metadata.get(STAGED_EXTRA_META_KEY),
+            Some(&STAGED_EXTRA_META_VALUE.to_string())
+        );
+
+        let data = reopened.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 6);
+        let staged_col = data
+            .column_by_name(A2_NEW_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(staged_col, &Int32Array::from(vec![0, 10, 20, 30, 40, 50]));
+
+        Ok(())
+    }
+
+    /// Source, unknown, and nested field IDs must fail without mutating the
+    /// unpublished candidate.
+    #[tokio::test]
+    async fn test_stage_add_columns_set_field_metadata_entry_rejects_invalid_ids() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let source_field_id = dataset.schema().field("id").expect("fixture has id").id;
+
+        let mut staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(staged_struct_column_reader(6)),
+                None,
+                None,
+            )
+            .await?;
+
+        let nested_field_id = staged
+            .candidate_schema()
+            .field("staged_struct.inner")
+            .expect("candidate schema must expose the nested field by path")
+            .id;
+        assert!(
+            !staged
+                .candidate_schema()
+                .top_level_field_ids()
+                .contains(&nested_field_id),
+            "nested field ID must not be a top-level candidate field"
+        );
+
+        let unknown_field_id = 1_000_000;
+        assert!(
+            staged
+                .candidate_schema()
+                .field_by_id(unknown_field_id)
+                .is_none(),
+            "unknown field ID must be absent from the candidate schema"
+        );
+
+        let candidate_before = staged.candidate_schema().clone();
+
+        let source_err = staged
+            .set_field_metadata_entry(
+                source_field_id,
+                STAGED_EXTRA_META_KEY,
+                STAGED_EXTRA_META_VALUE,
+            )
+            .expect_err("source/pre-existing field ID must be rejected");
+        assert!(
+            matches!(source_err, Error::InvalidInput { .. }),
+            "expected InvalidInput for source field ID, got: {source_err:?}"
+        );
+        assert!(
+            source_err.to_string().contains("source"),
+            "source field ID error must mention source, got: {source_err}"
+        );
+        assert_candidate_schema_unchanged(&staged, &candidate_before);
+
+        let unknown_err = staged
+            .set_field_metadata_entry(
+                unknown_field_id,
+                STAGED_EXTRA_META_KEY,
+                STAGED_EXTRA_META_VALUE,
+            )
+            .expect_err("unknown field ID must be rejected");
+        assert!(
+            matches!(unknown_err, Error::InvalidInput { .. }),
+            "expected InvalidInput for unknown field ID, got: {unknown_err:?}"
+        );
+        assert!(
+            unknown_err.to_string().contains("not present"),
+            "unknown field ID error must mention absence, got: {unknown_err}"
+        );
+        assert_candidate_schema_unchanged(&staged, &candidate_before);
+
+        let nested_err = staged
+            .set_field_metadata_entry(
+                nested_field_id,
+                STAGED_EXTRA_META_KEY,
+                STAGED_EXTRA_META_VALUE,
+            )
+            .expect_err("nested field ID must be rejected");
+        assert!(
+            matches!(nested_err, Error::InvalidInput { .. }),
+            "expected InvalidInput for nested field ID, got: {nested_err:?}"
+        );
+        assert!(
+            nested_err.to_string().contains("nested"),
+            "nested field ID error must mention nested, got: {nested_err}"
+        );
+        assert_candidate_schema_unchanged(&staged, &candidate_before);
+
+        Ok(())
+    }
+
+    /// Mutating candidate field metadata and then dropping the handle must not
+    /// publish values or metadata.
+    #[tokio::test]
+    async fn test_stage_add_columns_set_field_metadata_entry_drop_does_not_publish() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+        let schema_before = ArrowSchema::from(dataset.schema());
+
+        let mut staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                None,
+                None,
+            )
+            .await?;
+        let output_field_id = staged
+            .candidate_schema()
+            .field(A2_NEW_COLUMN)
+            .expect("staged candidate schema must expose the new output field by name")
+            .id;
+        staged.set_field_metadata_entry(
+            output_field_id,
+            STAGED_EXTRA_META_KEY,
+            STAGED_EXTRA_META_VALUE,
+        )?;
+        drop(staged);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&reopened, version_before);
+        assert_eq!(ArrowSchema::from(reopened.schema()), schema_before);
+        assert!(!reopened.schema().metadata.contains_key(A2_SCHEMA_META_KEY));
+        assert!(reopened.schema().field(A2_NEW_COLUMN).is_none());
+        let data = reopened.scan().try_into_batch().await?;
+        assert!(data.column_by_name(A2_NEW_COLUMN).is_none());
 
         Ok(())
     }
