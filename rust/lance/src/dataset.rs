@@ -197,13 +197,11 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
-    /// Object stores for additional base paths, resolved on first use and
-    /// shared across clones of this dataset.
+    /// Object stores for additional base paths, shared across clones.
     pub(crate) base_object_stores: BaseObjectStores,
 }
 
-/// The `OnceCell` coalesces concurrent first resolutions of a base into a
-/// single store build.
+/// The `OnceCell` coalesces concurrent first resolutions into one build.
 pub(crate) type BaseObjectStores =
     Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<Arc<ObjectStore>>>>>>;
 
@@ -2055,7 +2053,6 @@ impl Dataset {
         }
 
         let mut cloned = self.clone();
-        cloned.base_object_stores = Default::default();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
             object_store.inner =
@@ -2427,23 +2424,35 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
+        // Cores are cached without wrappers; each resolution decorates the
+        // shared core with the caller's wrapper.
+        let mut core_params = self.store_params_for_base(Some(base_path));
+        let wrapper = core_params.object_store_wrapper.take();
+
         let cell = {
             let mut stores = self.base_object_stores.lock().unwrap();
             stores.entry(base_id).or_default().clone()
         };
-        let store = cell
+        let core = cell
             .get_or_try_init(|| async {
-                let store_params = self.store_params_for_base(Some(base_path));
                 let (store, _) = ObjectStore::from_uri_and_params(
                     self.session.store_registry(),
                     &base_path.path,
-                    &store_params,
+                    &core_params,
                 )
                 .await?;
                 Ok::<_, Error>(store)
             })
             .await?;
-        Ok(store.clone())
+
+        match wrapper {
+            Some(wrapper) => {
+                let mut store = core.as_ref().clone();
+                store.inner = wrapper.wrap(&store.store_prefix, store.inner.clone());
+                Ok(Arc::new(store))
+            }
+            None => Ok(core.clone()),
+        }
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
