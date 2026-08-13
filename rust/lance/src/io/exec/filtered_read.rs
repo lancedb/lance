@@ -1396,8 +1396,9 @@ impl FilteredReadStream {
         filter: Option<Arc<dyn PhysicalExpr>>,
         output_schema: SchemaRef,
     ) -> Result<ReadBatchFut> {
-        if let Some(filter) = filter {
-            Ok(batch_fut
+        let batch_fut = if let Some(filter) = filter {
+            let filter_output_schema = output_schema.clone();
+            batch_fut
                 .map(move |batch| {
                     let batch = batch?;
                     let batch = datafusion_physical_plan::filter::batch_filter(&batch, &filter)
@@ -1407,12 +1408,25 @@ impl FilteredReadStream {
                             ))
                         })?;
                     // Drop any fields loaded purely for the purpose of applying the filter
-                    Ok(batch.project_by_schema(output_schema.as_ref())?)
+                    Ok(batch.project_by_schema(filter_output_schema.as_ref())?)
                 })
-                .boxed())
+                .boxed()
         } else {
-            Ok(batch_fut)
-        }
+            batch_fut
+        };
+
+        // File readers can return equivalent fields without the projection's
+        // schema metadata. ExecutionPlan requires every batch to match schema().
+        Ok(batch_fut
+            .map(move |batch| {
+                let batch = batch?;
+                if batch.schema_ref() == &output_schema {
+                    Ok(batch)
+                } else {
+                    Ok(batch.with_schema(output_schema)?)
+                }
+            })
+            .boxed())
     }
 
     fn apply_soft_limit<S>(stream: S, limit: u64) -> impl Stream<Item = Result<ReadBatchFut>>
@@ -3107,7 +3121,7 @@ impl ExecutionPlan for FilteredReadExec {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use crate::index::DatasetIndexExt;
     use arrow::{
@@ -3130,6 +3144,7 @@ mod tests {
     };
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use rstest::rstest;
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -3348,6 +3363,70 @@ mod tests {
             .await
             .unwrap();
         (tmp_path, Arc::new(dataset))
+    }
+
+    #[rstest]
+    #[case::unfiltered(None)]
+    #[case::filtered(Some("value > 2"))]
+    #[tokio::test]
+    async fn test_output_batches_preserve_schema_metadata(#[case] filter: Option<&str>) {
+        let tmp_path = TempStrDir::default();
+        let metadata = HashMap::from([(
+            "embedding_functions".to_string(),
+            "[{\"name\":\"test\"}]".to_string(),
+        )]);
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![arrow_schema::Field::new(
+                "value",
+                arrow_schema::DataType::Int32,
+                true,
+            )],
+            metadata.clone(),
+        ));
+        let batch = arrow_array::record_batch!(("value", Int32, [1, 2, 3, 4]))
+            .unwrap()
+            .with_schema(schema.clone())
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut options = FilteredReadOptions::basic_full_read(&dataset);
+        if let Some(filter) = filter {
+            let arrow_schema = Arc::new(ArrowSchema::from(dataset.schema()));
+            let planner = Planner::new(arrow_schema);
+            let expr = planner.parse_filter(filter).unwrap();
+            options = options.with_filter(Some(expr.clone()), Some(expr)).unwrap();
+        }
+
+        let plan = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        let expected_schema = plan.schema();
+        assert_eq!(expected_schema.metadata(), &metadata);
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert!(!batches.is_empty());
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.schema() == expected_schema),
+            "output schema metadata was not preserved with filter {filter:?}"
+        );
     }
 
     fn u32s(ranges: Vec<Range<u32>>) -> Arc<dyn Array> {
