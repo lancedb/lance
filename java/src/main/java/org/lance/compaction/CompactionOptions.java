@@ -18,6 +18,7 @@ import com.google.common.base.MoreObjects;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.OptionalDataException;
 import java.io.Serializable;
 import java.util.Optional;
 
@@ -28,6 +29,10 @@ import java.util.Optional;
  * default values.
  */
 public class CompactionOptions implements Serializable {
+  // Pinned to the UID generated before maxSourceRows/maxSourceBytes were added, so that
+  // CompactionTask streams queued by older workers still deserialize during a rolling upgrade.
+  private static final long serialVersionUID = 3114922060085417942L;
+
   // these fields are effectively final, but not marked as final for de/ser
   private Optional<Long> targetRowsPerFragment;
   private Optional<Long> maxRowsPerGroup;
@@ -40,6 +45,8 @@ public class CompactionOptions implements Serializable {
   private Optional<CompactionMode> compactionMode;
   private Optional<Long> binaryCopyReadBatchBytes;
   private Optional<Long> maxSourceFragments;
+  private Optional<Long> maxSourceRows;
+  private Optional<Long> maxSourceBytes;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -52,7 +59,9 @@ public class CompactionOptions implements Serializable {
       Optional<Boolean> deferIndexRemap,
       Optional<CompactionMode> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
-      Optional<Long> maxSourceFragments) {
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceRows,
+      Optional<Long> maxSourceBytes) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -64,6 +73,8 @@ public class CompactionOptions implements Serializable {
     this.compactionMode = compactionMode;
     this.binaryCopyReadBatchBytes = binaryCopyReadBatchBytes;
     this.maxSourceFragments = maxSourceFragments;
+    this.maxSourceRows = maxSourceRows;
+    this.maxSourceBytes = maxSourceBytes;
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -81,6 +92,14 @@ public class CompactionOptions implements Serializable {
 
   public Optional<Long> getMaxSourceFragments() {
     return maxSourceFragments;
+  }
+
+  public Optional<Long> getMaxSourceRows() {
+    return maxSourceRows;
+  }
+
+  public Optional<Long> getMaxSourceBytes() {
+    return maxSourceBytes;
   }
 
   public Optional<Boolean> getMaterializeDeletions() {
@@ -129,6 +148,8 @@ public class CompactionOptions implements Serializable {
         .add("compactionMode", compactionMode.orElse(null))
         .add("binaryCopyReadBatchBytes", binaryCopyReadBatchBytes.orElse(null))
         .add("maxSourceFragments", maxSourceFragments.orElse(null))
+        .add("maxSourceRows", maxSourceRows.orElse(null))
+        .add("maxSourceBytes", maxSourceBytes.orElse(null))
         .toString();
   }
 
@@ -144,6 +165,8 @@ public class CompactionOptions implements Serializable {
     output.writeObject(compactionMode.map(CompactionMode::getValue).orElse(null));
     output.writeObject(binaryCopyReadBatchBytes.orElse(null));
     output.writeObject(maxSourceFragments.orElse(null));
+    output.writeObject(maxSourceRows.orElse(null));
+    output.writeObject(maxSourceBytes.orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -167,6 +190,25 @@ public class CompactionOptions implements Serializable {
     }
     this.binaryCopyReadBatchBytes = Optional.ofNullable((Long) input.readObject());
     this.maxSourceFragments = Optional.ofNullable((Long) input.readObject());
+    this.maxSourceRows = readTrailingLong(input);
+    this.maxSourceBytes = readTrailingLong(input);
+  }
+
+  /**
+   * Reads a trailing Long field that older writers did not emit. Streams written before the field
+   * was added end here, which surfaces as an {@link OptionalDataException} with {@code eof} set; in
+   * that case the field is treated as unset.
+   */
+  private static Optional<Long> readTrailingLong(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      return Optional.ofNullable((Long) input.readObject());
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Optional.empty();
+    }
   }
 
   /** Builder for CompactionOptions. */
@@ -182,6 +224,8 @@ public class CompactionOptions implements Serializable {
     private Optional<CompactionMode> compactionMode = Optional.empty();
     private Optional<Long> binaryCopyReadBatchBytes = Optional.empty();
     private Optional<Long> maxSourceFragments = Optional.empty();
+    private Optional<Long> maxSourceRows = Optional.empty();
+    private Optional<Long> maxSourceBytes = Optional.empty();
 
     private Builder() {}
 
@@ -239,10 +283,51 @@ public class CompactionOptions implements Serializable {
      * Maximum number of source fragments to compact in a single run. Tasks are included until
      * adding the next task would exceed this limit, allowing for incremental compaction. Fragments
      * are processed oldest first.
+     *
+     * @throws IllegalArgumentException if {@code maxSourceFragments} is not positive
      */
     public Builder withMaxSourceFragments(long maxSourceFragments) {
-      this.maxSourceFragments = Optional.of(maxSourceFragments);
+      this.maxSourceFragments =
+          Optional.of(positiveBudget("maxSourceFragments", maxSourceFragments));
       return this;
+    }
+
+    /**
+     * Maximum number of source rows to compact in a single run. Rows are counted as live rows
+     * (physical rows minus soft-deleted rows). Tasks are included until adding the next task would
+     * exceed this limit.
+     *
+     * @throws IllegalArgumentException if {@code maxSourceRows} is not positive
+     */
+    public Builder withMaxSourceRows(long maxSourceRows) {
+      this.maxSourceRows = Optional.of(positiveBudget("maxSourceRows", maxSourceRows));
+      return this;
+    }
+
+    /**
+     * Maximum number of source bytes to compact in a single run, measured as the total size of the
+     * source fragments' data and overlay files. Tasks are included until adding the next task would
+     * exceed this limit. Blob v2 payloads live in separate blob files and are not counted, so this
+     * is not a cap on total compaction I/O for datasets with blob columns.
+     *
+     * @throws IllegalArgumentException if {@code maxSourceBytes} is not positive
+     */
+    public Builder withMaxSourceBytes(long maxSourceBytes) {
+      this.maxSourceBytes = Optional.of(positiveBudget("maxSourceBytes", maxSourceBytes));
+      return this;
+    }
+
+    /**
+     * A max source budget of zero admits no work and a negative value would wrap around to an
+     * effectively unlimited budget on the Rust side, so both are rejected here. Leave the option
+     * unset for no limit.
+     */
+    private static long positiveBudget(String name, long value) {
+      if (value <= 0) {
+        throw new IllegalArgumentException(
+            name + " must be greater than 0, got " + value + " (leave unset for no limit)");
+      }
+      return value;
     }
 
     public CompactionOptions build() {
@@ -257,7 +342,9 @@ public class CompactionOptions implements Serializable {
           deferIndexRemap,
           compactionMode,
           binaryCopyReadBatchBytes,
-          maxSourceFragments);
+          maxSourceFragments,
+          maxSourceRows,
+          maxSourceBytes);
     }
   }
 }
