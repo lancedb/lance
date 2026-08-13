@@ -119,8 +119,8 @@ use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
-    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+    BlobFile, BlobLeafRequest, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange,
+    ReadBlobRangesBuilder, ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -1815,6 +1815,18 @@ impl Dataset {
         let fragments = self.get_fragments();
         let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
+    }
+
+    /// Select Blob v2 handles from a nested list column by row address.
+    ///
+    /// Each request's index path traverses list levels. Results preserve request
+    /// order and return `None` for nulls.
+    pub async fn take_blob_leaves_by_addresses(
+        self: &Arc<Self>,
+        requests: &[BlobLeafRequest],
+        column: impl AsRef<str>,
+    ) -> Result<Vec<Option<BlobFile>>> {
+        blob::take_blob_leaves_by_addresses(self, requests, column.as_ref()).await
     }
 
     /// Create a planned blob reader for a blob column.
