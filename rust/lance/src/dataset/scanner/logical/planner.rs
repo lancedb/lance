@@ -14,6 +14,7 @@ use std::sync::Arc;
 use arrow_schema::SortOptions;
 use async_trait::async_trait;
 use datafusion::execution::session_state::SessionState;
+use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::expressions;
@@ -156,25 +157,13 @@ fn plan_flat_knn(
         },
     )?);
 
-    let bounded = match (query.lower_bound, query.upper_bound) {
-        (None, None) => distances as Arc<dyn ExecutionPlan>,
-        (lower, upper) => {
-            let mut predicate = None;
-            if let Some(lower) = lower {
-                predicate = Some(col(DIST_COL).gt_eq(lit(lower)));
-            }
-            if let Some(upper) = upper {
-                let clause = col(DIST_COL).lt(lit(upper));
-                predicate = Some(match predicate {
-                    Some(existing) => existing.and(clause),
-                    None => clause,
-                });
-            }
-            Arc::new(LanceFilterExec::try_new(
-                predicate.expect("at least one bound is set"),
-                distances,
-            )?)
-        }
+    let lower = query
+        .lower_bound
+        .map(|bound| col(DIST_COL).gt_eq(lit(bound)));
+    let upper = query.upper_bound.map(|bound| col(DIST_COL).lt(lit(bound)));
+    let bounded = match conjunction([lower, upper].into_iter().flatten()) {
+        None => distances as Arc<dyn ExecutionPlan>,
+        Some(predicate) => Arc::new(LanceFilterExec::try_new(predicate, distances)?),
     };
 
     let sorted = Arc::new(

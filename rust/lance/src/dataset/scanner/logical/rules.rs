@@ -18,9 +18,12 @@
 //! analyzer also runs each rule exactly once, where the optimizer re-runs rules until the plan
 //! stops changing — which is why none of these rules needs to recognize its own output.
 //!
-//! [`ResolvePrefilterSource`] is the exception, and an instructive one: it is equally mandatory but
-//! has to observe the plan *after* `PushDownFilter` has moved the predicate, so it cannot run in a
-//! stage that precedes the optimizer.
+//! Three of them are exceptions, and instructively so: [`ResolvePrefilterSource`],
+//! [`ResolveScalarIndexQuery`], and the scan-leaf half of [`SplitOnIndexCoverage`] are equally
+//! mandatory but each has to observe the plan *after* `PushDownFilter` has moved the predicate —
+//! the first asks "is there a predicate below the search?", the other two ask "which predicates
+//! reached the leaf?". DataFusion's phase order is mandatory-then-optional; these are
+//! optional-then-mandatory, so they run in the optimizer and carry their own idempotence guards.
 
 use std::any::Any;
 use std::sync::Arc;

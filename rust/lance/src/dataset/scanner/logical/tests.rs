@@ -33,9 +33,6 @@ trait ScanConfig: Fn(&mut Scanner) -> Result<&mut Scanner> {}
 impl<F: Fn(&mut Scanner) -> Result<&mut Scanner>> ScanConfig for F {}
 
 /// Sort a result batch by `_rowid` so two plans can be compared as sets.
-///
-/// FTS results are not contractually ordered — neither path applies a final sort — so score ties
-/// may surface in different orders. Row-set equality is the honest oracle there.
 fn sorted_by_row_id(batch: &RecordBatch) -> Result<RecordBatch> {
     use arrow::compute::{SortColumn, lexsort_to_indices, take};
 
@@ -98,7 +95,12 @@ async fn run(plan: Arc<dyn ExecutionPlan>) -> Result<RecordBatch> {
     Ok(concat_batches(&schema, &batches)?)
 }
 
-/// Execute both planning paths and assert they produce the same rows.
+/// Execute both planning paths and assert they produce the same rows, in the same order.
+///
+/// This is the default, and deliberately so: row order is observable, so a path that returns the
+/// right rows in a different order has still changed what a caller sees. Reach for
+/// [`assert_paths_agree_unordered`] only where the order is genuinely not part of the contract,
+/// and say why at the call site.
 async fn assert_paths_agree(dataset: &Dataset, config: impl ScanConfig) -> Result<()> {
     let expected = run(imperative_plan_for(dataset, &config).await?).await?;
     let actual = run(logical_plan_for(dataset, &config).await?).await?;
@@ -118,6 +120,10 @@ async fn assert_paths_agree(dataset: &Dataset, config: impl ScanConfig) -> Resul
 }
 
 /// As [`assert_paths_agree`], but comparing row *sets* rather than row sequences.
+///
+/// Only two shapes need this, and both are cases where nothing in either path establishes an
+/// order: an all-ties FTS score sort, and a union of coverage branches. Each call site states
+/// which. A new use is a claim that order does not matter — check that before making it.
 async fn assert_paths_agree_unordered(dataset: &Dataset, config: impl ScanConfig) -> Result<()> {
     let expected = sorted_by_row_id(&run(imperative_plan_for(dataset, &config).await?).await?)?;
     let actual = sorted_by_row_id(&run(logical_plan_for(dataset, &config).await?).await?)?;
@@ -138,16 +144,48 @@ async fn assert_paths_agree_unordered(dataset: &Dataset, config: impl ScanConfig
 
 const DIM: u32 = 32;
 
+/// Tag a reader's schema with dataset-level metadata.
+///
+/// The imperative suite's own fixtures do this deliberately — `scanner.rs:6489` says "so it tests
+/// all paths that re-construct the schema along the way". The oracle needs it for the same reason:
+/// a lowering step that rebuilds an output schema and drops its metadata is invisible against a
+/// fixture that has none.
+fn tagged(reader: impl arrow_array::RecordBatchReader) -> impl arrow_array::RecordBatchReader {
+    use arrow::datatypes::Schema as ArrowSchema;
+    use arrow_array::{RecordBatch, RecordBatchIterator};
+
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        reader.schema().fields().clone(),
+        [("dataset".to_string(), "logical".to_string())].into(),
+    ));
+    let batches = reader
+        .map(|batch| {
+            let batch = batch?;
+            RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    RecordBatchIterator::new(batches.into_iter().map(Ok), schema)
+}
+
 async fn test_dataset() -> Dataset {
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::dataset::WriteParams;
     use arrow::datatypes::Int32Type;
 
-    gen_batch()
+    let data = gen_batch()
         .col("i", array::step::<Int32Type>())
         .col("s", array::rand_utf8(ByteCount::from(8), false))
-        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(100))
-        .await
-        .unwrap()
+        .into_reader_rows(RowCount::from(100), BatchCount::from(2));
+    Dataset::write(
+        tagged(data),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
 }
 
 /// Written through a real (in-memory) object store rather than `into_ram_dataset`, so index
@@ -164,7 +202,7 @@ async fn vector_dataset() -> Dataset {
         .col("vec", array::rand_vec::<Float32Type>(Dimension::from(DIM)))
         .into_reader_rows(RowCount::from(256), BatchCount::from(4));
     Dataset::write(
-        data,
+        tagged(data),
         "memory://",
         Some(WriteParams {
             max_rows_per_file: 512,
@@ -616,6 +654,8 @@ async fn partially_indexed_fts_dataset() -> Dataset {
 #[tokio::test]
 async fn test_paths_agree_on_fts_with_a_fragment_restriction() {
     let dataset = fts_dataset().await;
+    // Unordered: every document in this fixture scores identically on `hello`, and neither path
+    // breaks the tie deterministically. Row-set equality is the strongest honest bar here.
     assert_paths_agree_unordered(&dataset, |scan| {
         let first = vec![dataset_fragments(scan)[0].clone()];
         scan.project(&["s"])?
@@ -705,7 +745,7 @@ fn list_element_match_query(terms: &str) -> lance_index::scalar::FullTextSearchQ
 #[tokio::test]
 async fn test_paths_agree_on_list_element_fts() {
     let dataset = list_element_fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["i"])?
             .with_row_id()
             .full_text_search(list_element_match_query("hello"))
@@ -717,7 +757,7 @@ async fn test_paths_agree_on_list_element_fts() {
 #[tokio::test]
 async fn test_paths_agree_on_list_element_fts_prefilter() {
     let dataset = list_element_fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["i"])?
             .with_row_id()
             .prefilter(true)
@@ -735,7 +775,7 @@ async fn test_paths_agree_on_list_element_fts_phrase() {
     use lance_index::scalar::inverted::query::PhraseQuery;
 
     let dataset = list_element_fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["i"])?
             .with_row_id()
             .full_text_search(FullTextSearchQuery::new_query(
@@ -814,7 +854,7 @@ async fn test_fts_match_uses_the_index() {
 #[tokio::test]
 async fn test_paths_agree_on_fts_match() {
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .full_text_search(match_query("hello"))
@@ -829,7 +869,7 @@ async fn test_paths_agree_on_fts_phrase() {
     use lance_index::scalar::inverted::query::PhraseQuery;
 
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .full_text_search(FullTextSearchQuery::new_query(
@@ -848,7 +888,7 @@ async fn test_paths_agree_on_fts_boost() {
     use lance_index::scalar::inverted::query::{BoostQuery, MatchQuery};
 
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         let positive = MatchQuery::new("hello".to_owned()).with_column(Some("s".to_owned()));
         let negative = MatchQuery::new("world".to_owned()).with_column(Some("s".to_owned()));
         scan.project(&["s"])?
@@ -867,7 +907,7 @@ async fn test_paths_agree_on_fts_boolean() {
     use lance_index::scalar::inverted::query::{BooleanQuery, MatchQuery, Occur};
 
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         let must = MatchQuery::new("hello".to_owned()).with_column(Some("s".to_owned()));
         let should = MatchQuery::new("lance".to_owned()).with_column(Some("s".to_owned()));
         let excluded = MatchQuery::new("search".to_owned()).with_column(Some("s".to_owned()));
@@ -890,7 +930,7 @@ async fn test_paths_agree_on_fts_multi_match() {
     use lance_index::scalar::inverted::query::MultiMatchQuery;
 
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .full_text_search(FullTextSearchQuery::new_query(
@@ -956,7 +996,7 @@ async fn test_fts_prefilter_feeds_the_index() {
 #[tokio::test]
 async fn test_paths_agree_on_fts_prefilter() {
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .prefilter(true)
@@ -970,7 +1010,7 @@ async fn test_paths_agree_on_fts_prefilter() {
 #[tokio::test]
 async fn test_paths_agree_on_fts_postfilter() {
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .prefilter(false)
@@ -984,7 +1024,7 @@ async fn test_paths_agree_on_fts_postfilter() {
 #[tokio::test]
 async fn test_paths_agree_on_fts_limit() {
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .full_text_search(match_query("doc7"))?
@@ -1017,6 +1057,9 @@ async fn test_partially_indexed_fts_splits() {
 #[tokio::test]
 async fn test_paths_agree_on_partially_indexed_fts() {
     let dataset = partially_indexed_fts_dataset().await;
+    // Unordered: the coverage split unions an index search over the indexed fragments with a
+    // brute-force search over the rest, and a union imposes no order between its branches. Which
+    // branch's rows land first varies run to run.
     assert_paths_agree_unordered(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
@@ -1029,6 +1072,9 @@ async fn test_paths_agree_on_partially_indexed_fts() {
 #[tokio::test]
 async fn test_paths_agree_on_partially_indexed_fts_prefilter() {
     let dataset = partially_indexed_fts_dataset().await;
+    // Unordered: the coverage split unions an index search over the indexed fragments with a
+    // brute-force search over the rest, and a union imposes no order between its branches. Which
+    // branch's rows land first varies run to run.
     assert_paths_agree_unordered(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
@@ -1075,7 +1121,7 @@ async fn test_paths_agree_on_fts_without_an_index() {
     .await
     .unwrap();
 
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .full_text_search(match_query("hello"))
@@ -1092,7 +1138,7 @@ async fn test_paths_agree_on_fts_filter_postfiltering_a_vector_search() {
     use crate::dataset::scanner::QueryFilter;
 
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .prefilter(false)
@@ -1108,7 +1154,7 @@ async fn test_paths_agree_on_fts_filter_prefiltering_a_vector_search() {
     use crate::dataset::scanner::QueryFilter;
 
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .prefilter(true)
@@ -1124,7 +1170,7 @@ async fn test_paths_agree_on_vector_filter_postfiltering_an_fts_search() {
     use crate::dataset::scanner::QueryFilter;
 
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .prefilter(false)
@@ -1140,7 +1186,7 @@ async fn test_paths_agree_on_vector_filter_prefiltering_an_fts_search() {
     use crate::dataset::scanner::QueryFilter;
 
     let dataset = fts_dataset().await;
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .prefilter(true)
@@ -1301,7 +1347,7 @@ async fn test_paths_agree_on_a_vector_search_over_an_overlay() {
     for stable_row_ids in [false, true] {
         let dataset = overlay_fixtures::create_vector_overlay_dataset(stable_row_ids).await;
         let query = arrow_array::Float32Array::from(overlay_fixtures::vec_query());
-        assert_paths_agree_unordered(&dataset, |scan| {
+        assert_paths_agree(&dataset, |scan| {
             scan.nearest("vec", &query, 3)?
                 .minimum_nprobes(1)
                 .with_row_id()
@@ -1318,7 +1364,7 @@ async fn test_paths_agree_on_a_vector_search_over_an_overlay() {
 async fn test_paths_agree_on_a_fast_search_over_an_overlay() {
     let dataset = overlay_fixtures::create_vector_overlay_dataset(false).await;
     let query = arrow_array::Float32Array::from(overlay_fixtures::vec_query());
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.nearest("vec", &query, 3)?
             .minimum_nprobes(1)
             .fast_search()
@@ -1347,7 +1393,7 @@ async fn test_paths_agree_on_an_fts_search_over_an_overlay() {
     )
     .await;
 
-    assert_paths_agree_unordered(&dataset, |scan| {
+    assert_paths_agree(&dataset, |scan| {
         scan.project(&["id"])?
             .with_row_id()
             .full_text_search(text_match_query("apple"))
@@ -1378,6 +1424,10 @@ async fn test_paths_agree_on_a_scalar_index_over_an_overlay() {
         // `age = 50` now matches the overlaid row (whose index entry says 10) and the untouched
         // row that always said 50, so both the block and the re-read have to be right.
         for filter in ["age = 50", "age = 10", "age = 20"] {
+            // Unordered: the coverage split makes this a union of an index lookup and a re-read of
+            // the overlaid rows, and a union imposes no order between its branches. The two paths
+            // build that union in different places — `scan_impl` versus `SplitOnIndexCoverage` —
+            // so they interleave the branches differently while selecting the same rows.
             assert_paths_agree_unordered(&dataset, |scan| {
                 scan.filter(filter)?.with_row_id().project(&["id"])
             })
@@ -1385,6 +1435,46 @@ async fn test_paths_agree_on_a_scalar_index_over_an_overlay() {
             .unwrap();
         }
     }
+}
+
+/// The oracle compares the two paths to each other, so a schema fact both of them lose is
+/// invisible to it. This asserts the fact against the dataset instead.
+#[tokio::test]
+async fn test_output_schema_keeps_dataset_metadata() -> Result<()> {
+    let dataset = test_dataset().await;
+    let expected = dataset.schema().metadata.clone();
+    assert!(
+        !expected.is_empty(),
+        "fixture must carry schema metadata for this test to mean anything"
+    );
+
+    for (path, plan) in [
+        (
+            "imperative",
+            imperative_plan_for(&dataset, |scan| scan.filter("i > 50")?.project(&["s"])).await?,
+        ),
+        (
+            "logical",
+            logical_plan_for(&dataset, |scan| scan.filter("i > 50")?.project(&["s"])).await?,
+        ),
+    ] {
+        assert_eq!(
+            plan.schema().metadata(),
+            &expected,
+            "{path} path's plan schema dropped the dataset's schema metadata"
+        );
+        // Checked separately from the plan schema because they can disagree, and it is the batch
+        // the caller actually receives.
+        let batches = execute_plan(plan, LanceExecutionOptions::default())?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(
+            batches[0].schema().metadata(),
+            &expected,
+            "{path} path's output batches dropped the dataset's schema metadata"
+        );
+    }
+    Ok(())
 }
 
 /// The check that replaced the deleted idempotence markers: a search whose access path was never
