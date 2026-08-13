@@ -2986,6 +2986,15 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return versions
 
+    def version_refs(self) -> List[VersionRef]:
+        """
+        Return lightweight references to all attached versions in the current branch.
+
+        Unlike :meth:`versions`, this does not read or deserialize every manifest.
+        Use :attr:`latest_version` instead when only the latest version is needed.
+        """
+        return self._ds.version_refs()
+
     @property
     def version(self) -> int:
         """
@@ -5722,6 +5731,10 @@ class Version(TypedDict):
     version: int
     timestamp: int | datetime
     metadata: Dict[str, str]
+
+
+class VersionRef(TypedDict):
+    version: int
 
 
 class UpdateResult(TypedDict):

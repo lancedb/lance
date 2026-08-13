@@ -993,12 +993,39 @@ async fn test_branch() {
     let (main_rows, _) = collect_rows(&main_dataset).await;
     assert_eq!(main_rows, 50); // only batch1
     assert_eq!(main_dataset.version().version, 1);
+    let main_versions = main_dataset.version_refs().await.unwrap();
+    assert_eq!(
+        main_versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        main_dataset.latest_version_id().await.unwrap(),
+        main_versions.last().unwrap().version
+    );
 
     // branch1 has data 1 + 2 (80 rows)
     let updated_branch1 = Dataset::open(branch1_dataset.uri()).await.unwrap();
     let (branch1_rows, _) = collect_rows(&updated_branch1).await;
     assert_eq!(branch1_rows, 80); // batch1+batch2
     assert_eq!(updated_branch1.version().version, 2);
+    let _ = updated_branch1.object_store.as_ref().io_stats_incremental();
+    let branch1_versions = updated_branch1.version_refs().await.unwrap();
+    let io_stats = updated_branch1.object_store.as_ref().io_stats_incremental();
+    assert_eq!(io_stats.read_bytes, 0);
+    assert_eq!(
+        branch1_versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        updated_branch1.latest_version_id().await.unwrap(),
+        branch1_versions.last().unwrap().version
+    );
 
     // branch2 has data 1 + 2 + 3 (100 rows)
     let updated_branch2 = Dataset::open(branch2_dataset.uri()).await.unwrap();
