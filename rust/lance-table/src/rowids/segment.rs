@@ -381,8 +381,7 @@ impl U64Segment {
         }
     }
 
-    /// Reads values at non-decreasing indices in one pass. Use instead of
-    /// repeated [`Self::get`], which rescans a bitmap segment every call.
+    /// Reads values at non-decreasing indices in one pass.
     pub fn cursor(&self) -> SegmentCursor<'_> {
         SegmentCursor {
             segment: self,
@@ -648,8 +647,7 @@ impl U64Segment {
     }
 }
 
-/// Segment reader that keeps its scan position across calls, from
-/// [`U64Segment::cursor`]. Only bitmap segments carry state.
+/// Segment reader that keeps its scan position across calls.
 pub struct SegmentCursor<'a> {
     segment: &'a U64Segment,
     /// Byte the next select1 scan resumes at.
@@ -659,8 +657,7 @@ pub struct SegmentCursor<'a> {
 }
 
 impl SegmentCursor<'_> {
-    /// The value at index `i`. Indices may repeat but a decrease rewinds the
-    /// scan.
+    /// The value at index `i`. A decreasing index rewinds the scan.
     pub fn get(&mut self, i: usize) -> Option<u64> {
         let U64Segment::RangeWithBitmap { range, bitmap } = self.segment else {
             return self.segment.get(i);

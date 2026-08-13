@@ -762,10 +762,8 @@ pub fn select_row_ids<'a>(
     match offsets {
         ReadBatchParams::Indices(indices) => {
             let indices = indices.values();
-            // Sorted indices are the common case and let one cursor walk the
-            // sequence; `select` needs them in bounds because it drops the
-            // rest silently.
             if indices.windows(2).all(|pair| pair[0] <= pair[1]) {
+                // `select` drops out-of-bounds indices instead of erroring.
                 if let Some(&last) = indices.last()
                     && last as u64 >= sequence.len()
                 {
