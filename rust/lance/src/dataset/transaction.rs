@@ -35,6 +35,7 @@ use lance_table::feature_flags::{
     FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
 };
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
@@ -2810,6 +2811,9 @@ impl Transaction {
                     // TODO(rmeng): check new file and fragment are the same length
 
                     let mut columns_covered = HashSet::new();
+                    // Set when an existing file covers exactly the replaced
+                    // fields, so the whole file swaps rather than part of it.
+                    let mut replaced_in_place = false;
                     for file in &mut new_frag.files {
                         if file.fields == new_file.fields
                             && file.file_major_version == new_file.file_major_version
@@ -2819,16 +2823,78 @@ impl Transaction {
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
                             file.base_id = new_file.base_id;
+                            replaced_in_place = true;
                         }
                         columns_covered.extend(file.fields.iter());
                     }
+                    // Reject a file whose version does not decode before any
+                    // arm publishes it.
+                    new_file.file_version()?;
+
                     // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
                     // Then it means it's a all-NULL column that is being replaced with real data
                     // just add it to the final fragments. Push the DataFile as
                     // given so every field (including base_id) is preserved.
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
-                        new_file.file_version()?;
-
+                        new_frag.files.push(new_file.clone());
+                    } else if !replaced_in_place
+                        && new_file.fields.iter().all(|field| {
+                            let mut covering = new_frag
+                                .files
+                                .iter()
+                                .filter(|file| file.fields.contains(field))
+                                .peekable();
+                            // Covered by something, and by nothing we cannot
+                            // tombstone. A field no file covers leaves the
+                            // mixed layout the error below reports.
+                            covering.peek().is_some()
+                                && covering.all(|file| {
+                                    file.file_version()
+                                        .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                                })
+                        })
+                    {
+                        // Tombstone the replaced fields where they live and
+                        // append the new file to answer for them, the idiom
+                        // `update_columns` uses. Compaction decides that layout,
+                        // so the fields may sit in one wider file or span
+                        // several.
+                        //
+                        // Legacy V1 is excluded: its reader derives the page table
+                        // offset from the first field in the metadata, so
+                        // tombstoning one field leaves its siblings decoding from
+                        // the wrong pages. A field a V1 file covers keeps
+                        // exact-match replacement.
+                        for file in &mut new_frag.files {
+                            // Same reason as the guard above.
+                            if file.file_version()? == ConcreteFileVersion::V1 {
+                                continue;
+                            }
+                            file.fields = file
+                                .fields
+                                .iter()
+                                .map(|field| {
+                                    if new_file.fields.contains(field) {
+                                        TOMBSTONE_FIELD_ID
+                                    } else {
+                                        *field
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .into();
+                        }
+                        // Every data file must share at least one field with
+                        // the dataset schema: a file kept alive only by
+                        // tombstones or by ids the schema no longer defines is
+                        // unreachable to readers, uncollectable by cleanup,
+                        // and reported corrupt by validate().
+                        let live_ids = schema
+                            .fields_pre_order()
+                            .map(|field| field.id)
+                            .collect::<HashSet<i32>>();
+                        new_frag
+                            .files
+                            .retain(|file| file.fields.iter().any(|f| live_ids.contains(f)));
                         new_frag.files.push(new_file.clone());
                     }
 
@@ -2839,13 +2905,22 @@ impl Transaction {
                         ));
                     }
 
-                    // New base values for these fields supersede any overlay
-                    // still shadowing them; tombstone the overlaid fields so the
-                    // replacement is not silently masked.
+                    // New base values supersede any overlay still shadowing
+                    // them, so tombstone the overlaid fields. An overlay
+                    // committed after this transaction's snapshot is the newer
+                    // value though -- the conflict resolver rebases these two
+                    // precisely because the overlay wins -- so it stays, and
+                    // being newer it stays last, preserving the ordering.
+                    let (mut superseded, newer): (Vec<_>, Vec<_>) = new_frag
+                        .overlays
+                        .drain(..)
+                        .partition(|overlay| overlay.committed_version <= self.read_version);
                     lance_table::format::overlay::tombstone_overlay_fields(
-                        &mut new_frag.overlays,
+                        &mut superseded,
                         &replaced_fields,
                     );
+                    superseded.extend(newer);
+                    new_frag.overlays = superseded;
 
                     final_fragments.push(new_frag);
                 }
@@ -7845,9 +7920,10 @@ mod tests {
     #[test]
     fn test_data_replacement_tombstones_overlaid_fields() {
         // A DataReplacement writing new base values for field 5 must stop any
-        // overlay from shadowing those cells: field 5 is tombstoned in place
+        // overlay already shadowing those cells: field 5 is tombstoned in place
         // (preserving the overlay's field 3), and an overlay covering only field
-        // 5 is dropped entirely.
+        // 5 is dropped entirely. Both overlays predate the transaction's read
+        // version, which is what makes the replacement the newer value.
         let mut fragment = Fragment::new(0);
         fragment.files = vec![
             DataFile::new_legacy_from_fields("f3.lance", vec![3], None),
@@ -7860,12 +7936,12 @@ mod tests {
                     roaring::RoaringBitmap::from_iter([0u32]),
                     roaring::RoaringBitmap::from_iter([0u32]),
                 ]),
-                committed_version: 3,
+                committed_version: 1,
             },
             DataOverlayFile {
                 data_file: DataFile::new_legacy_from_fields("o5.lance", vec![5], None),
                 coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
-                committed_version: 3,
+                committed_version: 1,
             },
         ];
 
@@ -7904,6 +7980,224 @@ mod tests {
         // overlay is dropped.
         assert_eq!(frag.overlays.len(), 1);
         assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
+    }
+
+    /// Replace `fields` in `fragment` at `read_version`, against a manifest
+    /// at `manifest_version` whose schema declares field ids 3 ("x"), 4 ("a"),
+    /// 5 ("v") and 6 ("y").
+    fn replace_fields(
+        fragment: Fragment,
+        fields: Vec<i32>,
+        manifest_version: u64,
+        read_version: u64,
+    ) -> Result<Fragment> {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("v", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let mut lance_schema = LanceSchema::try_from(&schema).unwrap();
+        lance_schema.fields[0].id = 3;
+        lance_schema.fields[1].id = 4;
+        lance_schema.fields[2].id = 5;
+        lance_schema.fields[3].id = 6;
+        let mut manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![fragment]),
+            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.version = manifest_version;
+
+        let column_indices = (0..fields.len() as i32).collect();
+        let txn = Transaction::new(
+            read_version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new(
+                        "v-new.lance",
+                        fields,
+                        column_indices,
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    ),
+                )],
+            },
+            None,
+        );
+        txn.build_manifest(
+            Some(&manifest),
+            vec![],
+            "txn",
+            &ManifestWriteConfig::default(),
+        )
+        .map(|(manifest, _)| manifest.fragments[0].clone())
+    }
+
+    /// Replace field 5 in `fragment` at `read_version`, against a manifest at
+    /// `manifest_version`.
+    fn replace_field_5(
+        fragment: Fragment,
+        manifest_version: u64,
+        read_version: u64,
+    ) -> Result<Fragment> {
+        replace_fields(fragment, vec![5], manifest_version, read_version)
+    }
+
+    #[test]
+    fn test_data_replacement_rejects_subset_of_legacy_file() {
+        // The V1 reader derives its page table offset from the first field in
+        // the file metadata, so turning `[4, 5]` into `[-2, 5]` would leave
+        // field 4 decoding from field 5's pages. With no exact match to swap,
+        // the replacement must be rejected rather than corrupting the sibling.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new_legacy_from_fields(
+            "wide.lance",
+            vec![4, 5],
+            None,
+        )];
+
+        let result = replace_field_5(fragment, 1, 1);
+        assert!(
+            result.is_err(),
+            "legacy subset replacement must be rejected, got: {:?}",
+            result.map(|fragment| fragment.files)
+        );
+    }
+
+    #[test]
+    fn test_data_replacement_tombstones_fields_spanning_files() {
+        // The replaced fields sit in two different wider files. Each file is
+        // tombstoned for the field it holds and survives on its remaining
+        // live one, with the new file answering for both.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new(
+                "ab.lance",
+                vec![3, 4],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            DataFile::new(
+                "cd.lance",
+                vec![5, 6],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+        ];
+
+        let fragment = replace_fields(fragment, vec![4, 5], 1, 1).unwrap();
+        let file = |path| {
+            fragment
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("{path} survives on its live field"))
+        };
+        assert_eq!(file("ab.lance").fields.as_ref(), &[3, TOMBSTONE_FIELD_ID]);
+        assert_eq!(file("cd.lance").fields.as_ref(), &[TOMBSTONE_FIELD_ID, 6]);
+        assert!(fragment.files.iter().any(|file| file.path == "v-new.lance"));
+    }
+
+    #[test]
+    fn test_data_replacement_rejects_fields_spanning_a_legacy_file() {
+        // Spanning is only resolvable while every covering file can be
+        // tombstoned. A V1 file holding one of the replaced fields cannot,
+        // so the replacement must be rejected rather than half applied.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new(
+                "ab.lance",
+                vec![3, 4],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            DataFile::new_legacy_from_fields("cd.lance", vec![5, 6], None),
+        ];
+
+        let result = replace_fields(fragment, vec![4, 5], 1, 1);
+        assert!(
+            result.is_err(),
+            "spanning a legacy file must be rejected, got: {:?}",
+            result.map(|fragment| fragment.files)
+        );
+    }
+
+    #[test]
+    fn test_data_replacement_retombstones_wider_file() {
+        // A wider file carrying a tombstone from an earlier round is
+        // tombstoned again for the newly replaced field and survives on its
+        // remaining live field.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new(
+            "wide.lance",
+            vec![4, TOMBSTONE_FIELD_ID, 5],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+
+        let fragment = replace_fields(fragment, vec![5], 1, 1).unwrap();
+        let wide = fragment
+            .files
+            .iter()
+            .find(|file| file.path == "wide.lance")
+            .expect("wider file survives on its live field");
+        assert_eq!(
+            wide.fields.as_ref(),
+            &[4, TOMBSTONE_FIELD_ID, TOMBSTONE_FIELD_ID]
+        );
+        assert!(fragment.files.iter().any(|file| file.path == "v-new.lance"));
+    }
+
+    #[test]
+    fn test_data_replacement_preserves_overlay_newer_than_snapshot() {
+        // An overlay committed after this transaction read its snapshot holds
+        // the newer value; the conflict resolver rebases the two precisely
+        // because the overlay wins. Tombstoning it would discard a committed
+        // write, so only overlays the transaction could have seen are superseded.
+        let mut fragment = Fragment::new(0);
+        // One wider file, so the replacement takes the tombstone-and-append path.
+        fragment.files = vec![DataFile::new(
+            "wide.lance",
+            vec![4, 5],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new(
+                "newer.lance",
+                vec![5],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+            committed_version: 7,
+        }];
+
+        // Staged against version 6, i.e. before the overlay landed.
+        let fragment = replace_field_5(fragment, 7, 6).unwrap();
+        assert!(fragment.files.iter().any(|f| f.path == "v-new.lance"));
+        assert_eq!(
+            fragment.overlays.len(),
+            1,
+            "overlay committed after the snapshot must survive"
+        );
+        assert_eq!(fragment.overlays[0].data_file.fields.as_ref(), &[5]);
     }
 
     #[test]

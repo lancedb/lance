@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{
-    cell::{RefCell, UnsafeCell},
+    cell::{OnceCell, RefCell, UnsafeCell},
     collections::{BinaryHeap, VecDeque},
 };
 use std::{cmp::Reverse, fmt::Debug};
@@ -1473,7 +1473,7 @@ const MAXSCORE_INNER_WINDOW: usize = 1 << 12;
 /// accumulation. Prefix bounds are summed in `f64`, then widened enough to
 /// cover any recursive `f32` summation order of the same non-negative values.
 #[inline]
-fn score_sum_upper_bound_factor(num_values: usize) -> f64 {
+pub(super) fn score_sum_upper_bound_factor(num_values: usize) -> f64 {
     if num_values <= 2 {
         1.0
     } else {
@@ -4371,6 +4371,7 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     phrase_slop: Option<u32>,
     wand_factor: f32,
     cost: usize,
+    global_score_upper_bound: OnceCell<Option<f32>>,
     current_doc: Option<DocInfo>,
     current_document_key: Option<u64>,
     current_score: f32,
@@ -4405,6 +4406,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
             cost,
+            global_score_upper_bound: OnceCell::new(),
             current_doc: None,
             current_document_key: None,
             current_score: 0.0,
@@ -4494,6 +4496,12 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.cost
     }
 
+    pub(super) fn global_score_upper_bound(&self) -> Option<f32> {
+        *self
+            .global_score_upper_bound
+            .get_or_init(|| self.wand.compound_global_score_upper_bound())
+    }
+
     pub(super) fn current_score(&self) -> Result<f32> {
         self.current_doc
             .map(|_| self.current_score)
@@ -4558,6 +4566,43 @@ impl<D: WandDocuments> Drop for WandCursor<'_, D> {
 }
 
 impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
+    fn compound_global_score_upper_bound(&self) -> Option<f32> {
+        if self.lead.len() + self.head.len() + self.tail.len() != self.num_terms {
+            return None;
+        }
+        // Grouped expansions score their terms separately, while their union
+        // posting stores one aggregate bound whose f32 rounding is not proven
+        // conservative for that exact sum.
+        if self.lead.iter().any(|posting| posting.has_grouped_terms())
+            || self
+                .head
+                .iter()
+                .any(|posting| posting.posting.has_grouped_terms())
+            || self
+                .tail
+                .iter()
+                .any(|posting| posting.posting.has_grouped_terms())
+        {
+            return None;
+        }
+        let upper = conservative_score_sum(
+            self.lead
+                .iter()
+                .map(|posting| posting.global_upper_bound(&self.scorer))
+                .chain(
+                    self.head
+                        .iter()
+                        .map(|posting| posting.posting.global_upper_bound(&self.scorer)),
+                )
+                .chain(
+                    self.tail
+                        .iter()
+                        .map(|posting| posting.posting.global_upper_bound(&self.scorer)),
+                ),
+        );
+        (upper.is_finite() && upper >= 0.0).then_some(upper)
+    }
+
     fn seek(&mut self, target: u64) {
         self.up_to = None;
         self.and_max_score = f32::INFINITY;
@@ -4719,6 +4764,39 @@ mod tests {
             .fold(0.0_f32, |score, value| score + value);
         assert_eq!(reordered_score.to_bits(), 0x3da7_6086);
         assert!(bound >= reordered_score);
+    }
+
+    #[test]
+    fn compound_global_bound_rejects_grouped_term_scoring() {
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let list = generate_posting_list(vec![0], 1.0, None, false);
+        let grouped_terms = Arc::<[GroupedTermScorer]>::from([GroupedTermScorer::new(1.0, &list)]);
+        let posting =
+            PostingIterator::with_query_weight(String::from("term"), 0, 0, 1.0, list, docs.len())
+                .with_grouped_terms(grouped_terms);
+        let wand = Wand::new(Operator::Or, std::iter::once(posting), &docs, UnitScorer);
+
+        assert_eq!(wand.compound_global_score_upper_bound(), None);
+    }
+
+    #[test]
+    fn compound_global_bound_rejects_late_partial_posting_state() {
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let posting = PostingIterator::with_query_weight(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(vec![0], 1.0, None, false),
+            docs.len(),
+        );
+        let mut wand = Wand::new(Operator::Or, std::iter::once(posting), &docs, UnitScorer);
+
+        assert!(wand.next().unwrap().is_some());
+        wand.push_back_leads(1);
+        assert_eq!(wand.compound_global_score_upper_bound(), None);
     }
 
     #[test]
