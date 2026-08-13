@@ -3698,6 +3698,7 @@ dependencies = [
  "async-trait",
  "async_cell",
  "aws-credential-types",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",

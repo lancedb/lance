@@ -14,8 +14,14 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance import LanceDataset
+from lance.dataset import AlterColumn
 from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import write_fragments
+
+
+def test_alter_column_typed_dict_only_requires_path():
+    assert AlterColumn.__required_keys__ == frozenset({"path"})
+    assert "assignment" in AlterColumn.__optional_keys__
 
 
 def test_drop_columns(tmp_path: Path):

@@ -570,6 +570,61 @@ def test_fragment_update_columns_basic(tmp_path):
     assert result["id"] == [1, 2, 3, 4]  # id column should remain unchanged
 
 
+def test_fragment_update_columns_preserves_exact_field_assignment(tmp_path):
+    dataset_uri = tmp_path / "test_update_columns_assignment"
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": pa.array([10, 20], pa.int32())}),
+        dataset_uri,
+    )
+    dataset.alter_columns({"path": "value", "assignment": "unassigned"})
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table({"id": [1], "value": pa.array([None], pa.int32())}),
+        left_on="id",
+        right_on="id",
+    )
+    operation = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    assert operation.update_mode == "rewrite_columns"
+    assert operation.updated_fragment_offsets is not None
+
+    dataset = lance.LanceDataset.commit(
+        str(dataset_uri), operation, read_version=dataset.version
+    )
+    result = dataset.to_table(
+        columns={"id": "id", "value": "value", "assigned": "is_assigned(value)"}
+    ).sort_by("id")
+    assert result["value"].to_pylist() == [None, 20]
+    assert result["assigned"].to_pylist() == [True, False]
+
+
+def test_fragment_update_columns_rejects_missing_assignment_offsets(tmp_path):
+    dataset_uri = tmp_path / "test_update_columns_assignment_missing_offsets"
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": pa.array([10, 20], pa.int32())}),
+        dataset_uri,
+    )
+    dataset.alter_columns({"path": "value", "assignment": "unassigned"})
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table({"id": [1], "value": pa.array([99], pa.int32())}),
+        left_on="id",
+        right_on="id",
+    )
+    updated_fragment._updated_fragment_offsets = None
+    operation = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+    )
+    with pytest.raises(OSError, match="missing exact updated_fragment_offsets"):
+        lance.LanceDataset.commit(
+            str(dataset_uri), operation, read_version=dataset.version
+        )
+
+
 def test_fragment_update_columns_with_custom_join_key(tmp_path):
     """Test fragment update columns with custom join key."""
     # Create initial dataset

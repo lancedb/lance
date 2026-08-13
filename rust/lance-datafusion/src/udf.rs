@@ -17,7 +17,7 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 pub mod json;
 
@@ -145,6 +145,147 @@ impl BoundIsAssignedUdf {
     }
 }
 
+#[derive(Debug)]
+struct DeferredAssignmentState {
+    binding_id: u64,
+    fragments: OnceLock<Arc<HashMap<u32, AssignmentFragment>>>,
+}
+
+/// A shared snapshot binding initialized by a Lance table provider while its
+/// physical scan is planned.
+///
+/// This allows a logical DataFusion expression above the table scan to retain
+/// ordinary synchronous scalar-expression semantics. The provider performs
+/// assignment I/O asynchronously before DataFusion constructs or executes the
+/// parent projection, filter, aggregate, or sort.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct DeferredAssignmentBinding {
+    field_id: i32,
+    state: Arc<DeferredAssignmentState>,
+}
+
+impl DeferredAssignmentBinding {
+    /// Stable field ID resolved from the logical field reference.
+    pub fn field_id(&self) -> i32 {
+        self.field_id
+    }
+
+    /// Initialize this binding with the referenced snapshot state.
+    pub fn initialize(&self, fragments: HashMap<u32, AssignmentFragment>) -> DFResult<()> {
+        if self.state.fragments.get().is_some() {
+            return Ok(());
+        }
+        self.state.fragments.set(Arc::new(fragments)).map_err(|_| {
+            datafusion::error::DataFusionError::Internal(format!(
+                "is_assigned binding {} for field ID {} was initialized concurrently",
+                self.state.binding_id, self.field_id
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeferredBoundIsAssignedUdf {
+    binding: DeferredAssignmentBinding,
+    signature: Signature,
+}
+
+impl PartialEq for DeferredBoundIsAssignedUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding.state.binding_id == other.binding.state.binding_id
+            && self.binding.field_id == other.binding.field_id
+    }
+}
+
+impl Eq for DeferredBoundIsAssignedUdf {}
+
+impl Hash for DeferredBoundIsAssignedUdf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.binding.state.binding_id.hash(state);
+        self.binding.field_id.hash(state);
+    }
+}
+
+impl DeferredBoundIsAssignedUdf {
+    fn value(&self, row_address: u64) -> DFResult<bool> {
+        let fragments = self.binding.state.fragments.get().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "is_assigned binding {} for field ID {} was not initialized by its Lance table provider",
+                self.binding.state.binding_id, self.binding.field_id
+            ))
+        })?;
+        let fragment_id = (row_address >> 32) as u32;
+        let row_offset = row_address as u32;
+        Ok(match fragments.get(&fragment_id) {
+            Some(AssignmentFragment::All) => true,
+            Some(AssignmentFragment::Partial(bitmap)) => bitmap.contains(row_offset),
+            None => false,
+        })
+    }
+}
+
+impl ScalarUDFImpl for DeferredBoundIsAssignedUdf {
+    fn name(&self) -> &str {
+        IS_ASSIGNED_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(Arc::new(Field::new(
+            IS_ASSIGNED_NAME,
+            DataType::Boolean,
+            false,
+        )))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        match &args.args[0] {
+            ColumnarValue::Array(array) => {
+                let row_addresses =
+                    array
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            datafusion::error::DataFusionError::Execution(format!(
+                                "bound is_assigned expected UInt64 row addresses, got {}",
+                                array.data_type()
+                            ))
+                        })?;
+                let values = (0..row_addresses.len())
+                    .map(|index| {
+                        if row_addresses.is_valid(index) {
+                            self.value(row_addresses.value(index))
+                        } else {
+                            Ok(false)
+                        }
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+                Ok(ColumnarValue::Array(Arc::new(BooleanArray::from_iter(
+                    values.into_iter().map(Some),
+                ))))
+            }
+            ColumnarValue::Scalar(ScalarValue::UInt64(row_address)) => Ok(ColumnarValue::Scalar(
+                ScalarValue::Boolean(Some(match row_address {
+                    Some(value) => self.value(*value)?,
+                    None => false,
+                })),
+            )),
+            value => Err(datafusion::error::DataFusionError::Execution(format!(
+                "bound is_assigned expected UInt64 row addresses, got {}",
+                value.data_type()
+            ))),
+        }
+    }
+}
+
 impl ScalarUDFImpl for BoundIsAssignedUdf {
     fn name(&self) -> &str {
         IS_ASSIGNED_NAME
@@ -224,6 +365,43 @@ pub fn bound_is_assigned_udf(
         fragments: Arc::new(fragments),
         signature: Signature::exact(vec![DataType::UInt64], Volatility::Immutable),
     })
+}
+
+/// Create an `is_assigned` UDF and a shared binding that a Lance table
+/// provider initializes before execution.
+#[doc(hidden)]
+pub fn deferred_bound_is_assigned_udf(field_id: i32) -> (ScalarUDF, DeferredAssignmentBinding) {
+    let binding = DeferredAssignmentBinding {
+        field_id,
+        state: Arc::new(DeferredAssignmentState {
+            binding_id: NEXT_ASSIGNMENT_BINDING_ID.fetch_add(1, Ordering::Relaxed),
+            fragments: OnceLock::new(),
+        }),
+    };
+    let udf = ScalarUDF::new_from_impl(DeferredBoundIsAssignedUdf {
+        binding: binding.clone(),
+        signature: Signature::exact(vec![DataType::UInt64], Volatility::Immutable),
+    });
+    (udf, binding)
+}
+
+/// Return true only for the public, unbound logical `is_assigned` UDF.
+#[doc(hidden)]
+pub fn is_unbound_is_assigned_udf(udf: &ScalarUDF) -> bool {
+    udf.inner().downcast_ref::<IsAssignedUdf>().is_some()
+}
+
+/// Return the stable field ID carried by an eager or deferred bound UDF.
+#[doc(hidden)]
+pub fn bound_is_assigned_field_id(udf: &ScalarUDF) -> Option<i32> {
+    udf.inner()
+        .downcast_ref::<BoundIsAssignedUdf>()
+        .map(|bound| bound.field_id)
+        .or_else(|| {
+            udf.inner()
+                .downcast_ref::<DeferredBoundIsAssignedUdf>()
+                .map(|bound| bound.binding.field_id)
+        })
 }
 
 /// Build the native DataFusion logical expression for

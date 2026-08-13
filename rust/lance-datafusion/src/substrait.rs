@@ -35,6 +35,36 @@ use std::sync::Arc;
 /// ```
 pub const LANCE_FUNCTIONS_EXTENSION_URN: &str = "urn:lance:extension:functions";
 
+fn validate_lance_function_extensions(
+    extension_urns: &[datafusion_substrait::substrait::proto::extensions::SimpleExtensionUrn],
+    extensions: &[datafusion_substrait::substrait::proto::extensions::SimpleExtensionDeclaration],
+) -> Result<()> {
+    use datafusion_substrait::substrait::proto::extensions::simple_extension_declaration::MappingType;
+
+    let urns = extension_urns
+        .iter()
+        .map(|extension| (extension.extension_urn_anchor, extension.urn.as_str()))
+        .collect::<HashMap<_, _>>();
+    for extension in extensions {
+        let Some(MappingType::ExtensionFunction(function)) = &extension.mapping_type else {
+            continue;
+        };
+        if function.name != crate::udf::IS_ASSIGNED_NAME {
+            continue;
+        }
+        let actual = urns.get(&function.extension_urn_reference).copied();
+        if actual != Some(LANCE_FUNCTIONS_EXTENSION_URN) {
+            return Err(Error::invalid_input(format!(
+                "Substrait function '{}' must reference Lance extension URN '{}', found {:?}",
+                crate::udf::IS_ASSIGNED_NAME,
+                LANCE_FUNCTIONS_EXTENSION_URN,
+                actual
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// FixedSizeList has no Substrait producer support in datafusion-substrait.
 /// Other unsupported types (Null, Float16) are encoded as UserDefined and
 /// handled by `remove_extension_types` on the decode side.
@@ -310,6 +340,7 @@ pub async fn parse_substrait(
     state: &SessionState,
 ) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
+    validate_lance_function_extensions(&envelope.extension_urns, &envelope.extensions)?;
     if envelope.referred_expr.is_empty() {
         return Err(Error::invalid_input_source(
             "the provided substrait expression is empty (contains no expressions)".into(),
@@ -398,6 +429,7 @@ pub async fn parse_substrait_aggregate(
     state: &SessionState,
 ) -> Result<Aggregate> {
     let plan = Plan::decode(bytes)?;
+    validate_lance_function_extensions(&plan.extension_urns, &plan.extensions)?;
     let (aggregate_rel, output_names) = extract_aggregate_from_plan(&plan)?;
     let extensions = Extensions::try_from(&plan.extensions)?;
 
@@ -751,6 +783,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
+    async fn test_is_assigned_rejects_wrong_substrait_extension_urn() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::Int32,
+            true,
+        )]));
+        let expr = crate::udf::is_assigned(col("embedding"));
+        let bytes = encode_substrait(expr, schema.clone(), &session_state()).unwrap();
+        let mut encoded = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        let lance_urn = encoded
+            .extension_urns
+            .iter_mut()
+            .find(|extension| extension.urn == LANCE_FUNCTIONS_EXTENSION_URN)
+            .unwrap();
+        lance_urn.urn = "urn:example:not-lance".to_string();
+
+        let error = parse_substrait(encoded.encode_to_vec().as_slice(), schema, &session_state())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must reference Lance extension URN")
+        );
     }
 
     /// Helper to create a simple equality filter on the "id" field

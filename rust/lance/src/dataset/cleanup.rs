@@ -33,6 +33,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
+use super::field_assignment::read_field_assignment_bytes;
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
@@ -642,36 +643,33 @@ impl<'a> CleanupTask<'a> {
             if state.root.base_id.is_some() {
                 continue;
             }
+            state.root.validate_root_path_for_field(state.field_id)?;
             let root_path = Path::parse(&state.root.path)?;
             paths.insert(root_path.clone());
             let full_root_path =
                 Path::from_iter(self.dataset.base.parts().chain(root_path.parts()));
-            let root_bytes = self
-                .dataset
-                .object_store
-                .read_one_all(&full_root_path)
-                .await?;
-            if root_bytes.len() as u64 != state.root.size_bytes {
-                return Err(Error::invalid_input(format!(
-                    "Field assignment root '{}' has size {}, expected {}",
-                    state.root.path,
-                    root_bytes.len(),
-                    state.root.size_bytes
-                )));
-            }
-            let root = lance_table::format::pb::FieldAssignmentRoot::decode(root_bytes.as_ref())
-                .map_err(|error| {
-                    Error::invalid_input(format!(
-                        "Failed to decode field assignment root '{}': {}",
-                        state.root.path, error
-                    ))
-                })?;
+            let root_bytes = read_field_assignment_bytes(
+                &self.dataset.object_store,
+                &full_root_path,
+                &state.root,
+            )
+            .await?;
+            let root_proto = lance_table::format::pb::FieldAssignmentRoot::decode(
+                root_bytes.as_ref(),
+            )
+            .map_err(|error| {
+                Error::invalid_input(format!(
+                    "Failed to decode field assignment root '{}': {}",
+                    state.root.path, error
+                ))
+            })?;
+            let root = lance_table::format::FieldAssignmentRoot::try_from(root_proto)?;
             for fragment in root.fragments {
-                if let Some(lance_table::format::pb::field_assignment_fragment::State::Partial(
-                    file,
-                )) = fragment.state
+                if let lance_table::format::FieldAssignmentFragmentState::Partial(file) =
+                    fragment.state
                     && file.base_id.is_none()
                 {
+                    file.validate_bitmap_path_for_fragment(state.field_id, fragment.fragment_id)?;
                     paths.insert(Path::parse(file.path)?);
                 }
             }
@@ -679,55 +677,62 @@ impl<'a> CleanupTask<'a> {
         Ok(paths)
     }
 
-    async fn branch_field_assignment_paths(&self, manifest: &Manifest) -> Result<HashSet<Path>> {
+    async fn branch_field_assignment_paths(
+        &self,
+        manifest: &Manifest,
+        branch_base: &Path,
+    ) -> Result<HashSet<Path>> {
         let mut paths = HashSet::new();
         for state in &manifest.field_assignment_states {
-            let Some(root_base_id) = state.root.base_id else {
-                continue;
-            };
-            let Some(root_base) = manifest.base_paths.get(&root_base_id) else {
-                return Err(Error::invalid_input(format!(
-                    "Branch field assignment root '{}' references unknown base ID {}",
-                    state.root.path, root_base_id
-                )));
-            };
-            if root_base.path != self.dataset.uri {
-                continue;
-            }
-
+            state.root.validate_root_path_for_field(state.field_id)?;
             let root_path = Path::parse(&state.root.path)?;
-            paths.insert(root_path.clone());
-            let full_root_path =
-                Path::from_iter(self.dataset.base.parts().chain(root_path.parts()));
-            let root_bytes = self
-                .dataset
-                .object_store
-                .read_one_all(&full_root_path)
-                .await?;
-            if root_bytes.len() as u64 != state.root.size_bytes {
-                return Err(Error::invalid_input(format!(
-                    "Branch field assignment root '{}' has size {}, expected {}",
-                    state.root.path,
-                    root_bytes.len(),
-                    state.root.size_bytes
-                )));
+            let (root_base, root_is_parent_owned) = match state.root.base_id {
+                None => (branch_base.clone(), false),
+                Some(root_base_id) => {
+                    let root_base = manifest.base_paths.get(&root_base_id).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Branch field assignment root '{}' references unknown base ID {}",
+                            state.root.path, root_base_id
+                        ))
+                    })?;
+                    if root_base.path != self.dataset.uri {
+                        // This cleanup owns only the parent dataset's object store.
+                        // Assignment objects in any other external base are
+                        // protected by that base's own cleanup lifecycle.
+                        continue;
+                    }
+                    (self.dataset.base.clone(), true)
+                }
+            };
+            if root_is_parent_owned {
+                paths.insert(root_path.clone());
             }
-            let root = lance_table::format::pb::FieldAssignmentRoot::decode(root_bytes.as_ref())
-                .map_err(|error| {
-                    Error::invalid_input(format!(
-                        "Failed to decode branch field assignment root '{}': {}",
-                        state.root.path, error
-                    ))
-                })?;
+            let full_root_path = Path::from_iter(root_base.parts().chain(root_path.parts()));
+            let root_bytes = read_field_assignment_bytes(
+                &self.dataset.object_store,
+                &full_root_path,
+                &state.root,
+            )
+            .await?;
+            let root_proto = lance_table::format::pb::FieldAssignmentRoot::decode(
+                root_bytes.as_ref(),
+            )
+            .map_err(|error| {
+                Error::invalid_input(format!(
+                    "Failed to decode branch field assignment root '{}': {}",
+                    state.root.path, error
+                ))
+            })?;
+            let root = lance_table::format::FieldAssignmentRoot::try_from(root_proto)?;
             for fragment in root.fragments {
-                let Some(lance_table::format::pb::field_assignment_fragment::State::Partial(
-                    bitmap,
-                )) = fragment.state
+                let lance_table::format::FieldAssignmentFragmentState::Partial(bitmap) =
+                    fragment.state
                 else {
                     continue;
                 };
+                bitmap.validate_bitmap_path_for_fragment(state.field_id, fragment.fragment_id)?;
                 let bitmap_is_local = match bitmap.base_id {
-                    None => true,
+                    None => root_is_parent_owned,
                     Some(base_id) => manifest
                         .base_paths
                         .get(&base_id)
@@ -1313,6 +1318,7 @@ impl<'a> CleanupTask<'a> {
             // This avoids creating a dataset instance and prevents manifest deletion
             // during the retain operation.
             let branch_location = self.dataset.branch_location().find_branch(Some(branch))?;
+            let branch_base = branch_location.path.clone();
             self.dataset
                 .commit_handler
                 .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
@@ -1324,6 +1330,7 @@ impl<'a> CleanupTask<'a> {
                         location,
                         *root_version_number,
                         &inspection,
+                        &branch_base,
                     )
                 })
                 .await?;
@@ -1336,12 +1343,15 @@ impl<'a> CleanupTask<'a> {
         location: ManifestLocation,
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
+        branch_base: &Path,
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-        let field_assignment_paths = self.branch_field_assignment_paths(&manifest).await?;
+        let field_assignment_paths = self
+            .branch_field_assignment_paths(&manifest, branch_base)
+            .await?;
         let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
 

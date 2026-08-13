@@ -33,7 +33,7 @@ use lance_table::format::{
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyBytes, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
@@ -358,20 +358,29 @@ impl FileFragment {
         Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
-    fn update_columns(
+    fn update_columns<'py>(
         &mut self,
+        py: Python<'py>,
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-    ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+    ) -> PyResult<(PyLance<Fragment>, Vec<u32>, Bound<'py, PyBytes>)> {
         let mut fragment = self.fragment.clone();
-        let (updated_fragment, fields_modified) = rt()
+        let result = rt()
             .spawn(None, async move {
-                fragment.update_columns(reader.0, &left_on, &right_on).await
+                fragment
+                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .await
             })?
             .infer_error()?;
+        let mut offsets = Vec::with_capacity(result.matched_offsets.serialized_size());
+        result.matched_offsets.serialize_into(&mut offsets)?;
 
-        Ok((PyLance(updated_fragment), fields_modified))
+        Ok((
+            PyLance(result.fragment),
+            result.fields_modified,
+            PyBytes::new(py, &offsets),
+        ))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {

@@ -353,17 +353,17 @@ async fn localize_deep_clone_field_assignments(
         let size_bytes = if let Some(size_bytes) = normalized_roots.get(&assignment.root.path) {
             *size_bytes
         } else {
+            assignment
+                .root
+                .validate_root_path_for_field(assignment.field_id)?;
             let relative = Path::parse(assignment.root.path.as_str())?;
             let path = Path::from_iter(base_path.parts().chain(relative.parts()));
-            let bytes = object_store.read_one_all(&path).await?;
-            if bytes.len() as u64 != assignment.root.size_bytes {
-                return Err(Error::invalid_input(format!(
-                    "Deep-cloned field assignment root '{}' has size {}, expected {}",
-                    assignment.root.path,
-                    bytes.len(),
-                    assignment.root.size_bytes
-                )));
-            }
+            let bytes = crate::dataset::field_assignment::read_field_assignment_bytes(
+                object_store,
+                &path,
+                &assignment.root,
+            )
+            .await?;
             let mut root = pb::FieldAssignmentRoot::decode(bytes.as_ref()).map_err(|error| {
                 Error::invalid_input(format!(
                     "Failed to decode deep-cloned field assignment root '{}': {}",
@@ -374,6 +374,12 @@ async fn localize_deep_clone_field_assignments(
                 if let Some(pb::field_assignment_fragment::State::Partial(bitmap)) =
                     &mut fragment.state
                 {
+                    let typed_bitmap =
+                        lance_table::format::FieldAssignmentFile::try_from(bitmap.clone())?;
+                    typed_bitmap.validate_bitmap_path_for_fragment(
+                        assignment.field_id,
+                        fragment.fragment_id,
+                    )?;
                     // collect_paths copied every referenced page under the same
                     // dataset-relative path, so the cloned root must no longer
                     // retain the source manifest's base-ID namespace.
@@ -404,6 +410,7 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    transaction.validate_internal_extensions()?;
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
@@ -1090,6 +1097,7 @@ pub(crate) async fn do_commit_detached_transaction(
         ));
     }
 
+    transaction.validate_internal_extensions()?;
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
@@ -1482,6 +1490,7 @@ pub(crate) async fn commit_transaction(
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
+        transaction.validate_internal_extensions()?;
         let pb_transaction = pb::Transaction::from(&transaction);
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 

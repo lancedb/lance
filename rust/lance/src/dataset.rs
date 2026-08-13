@@ -2997,7 +2997,12 @@ impl Dataset {
             let root = self
                 .load_field_assignment_root(assignment.field_id)
                 .await?
-                .expect("manifest assignment descriptor has a root");
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "Missing assignment root for tracked field ID {}",
+                        assignment.field_id
+                    ))
+                })?;
             for fragment in root.fragments {
                 if matches!(fragment.state, FieldAssignmentFragmentState::Partial(_)) {
                     self.load_field_assignment_bitmap(assignment.field_id, &fragment)
@@ -3340,6 +3345,9 @@ impl Dataset {
         }
 
         for assignment in &self.manifest.field_assignment_states {
+            assignment
+                .root
+                .validate_root_path_for_field(assignment.field_id)?;
             let root_base = if let Some(base_id) = assignment.root.base_id {
                 let base_path = self
                     .manifest
@@ -3355,11 +3363,18 @@ impl Dataset {
             let root = self
                 .load_field_assignment_root(assignment.field_id)
                 .await?
-                .expect("assignment descriptor has an immutable root");
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "Missing assignment root for tracked field ID {}",
+                        assignment.field_id
+                    ))
+                })?;
             for fragment in root.fragments {
                 let FieldAssignmentFragmentState::Partial(bitmap) = fragment.state else {
                     continue;
                 };
+                bitmap
+                    .validate_bitmap_path_for_fragment(assignment.field_id, fragment.fragment_id)?;
                 let bitmap_base = if let Some(base_id) = bitmap.base_id {
                     let base_path =
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {

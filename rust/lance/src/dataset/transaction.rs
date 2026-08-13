@@ -55,7 +55,7 @@ use roaring::RoaringBitmap;
 use std::cmp::Ordering;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 use uuid::Uuid;
 
@@ -266,6 +266,10 @@ pub struct Transaction {
 }
 
 const FIELD_ASSIGNMENT_TRANSACTION_PROPERTY: &str = "__lance_field_assignment_transaction";
+const FIELD_ASSIGNMENT_TRANSACTION_AUTH_PROPERTY: &str =
+    "__lance_field_assignment_transaction_auth";
+static FIELD_ASSIGNMENT_TRANSACTION_AUTH_KEY: LazyLock<[u8; 32]> =
+    LazyLock::new(|| *blake3::hash(Uuid::new_v4().as_bytes()).as_bytes());
 
 /// Assignment tracking initialization for a stable field ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +327,12 @@ impl FieldAssignmentTransaction {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct FieldAssignmentConflictScope {
+    pub row_fragment_ids: HashSet<u64>,
+    pub changes_tracking_schema: bool,
+}
+
 fn encode_field_assignment_transaction(value: &FieldAssignmentTransaction) -> String {
     let bytes = pb::transaction::FieldAssignmentTransaction::from(value).encode_to_vec();
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -363,6 +373,19 @@ fn decode_field_assignment_transaction(value: &str) -> Result<FieldAssignmentTra
             ))
         })?;
     proto.try_into()
+}
+
+fn field_assignment_transaction_auth(transaction: &Transaction, encoded: &str) -> String {
+    let mut hasher = blake3::Hasher::new_keyed(&FIELD_ASSIGNMENT_TRANSACTION_AUTH_KEY);
+    hasher.update(&transaction.read_version.to_le_bytes());
+    hasher.update(&(transaction.uuid.len() as u64).to_le_bytes());
+    hasher.update(transaction.uuid.as_bytes());
+    let operation = format!("{:?}", transaction.operation);
+    hasher.update(&(operation.len() as u64).to_le_bytes());
+    hasher.update(operation.as_bytes());
+    hasher.update(&(encoded.len() as u64).to_le_bytes());
+    hasher.update(encoded.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 impl From<&FieldAssignmentTransaction> for pb::transaction::FieldAssignmentTransaction {
@@ -2046,6 +2069,7 @@ pub struct TransactionBuilder {
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    field_assignment_transaction: Option<FieldAssignmentTransaction>,
 }
 
 impl TransactionBuilder {
@@ -2056,6 +2080,7 @@ impl TransactionBuilder {
             operation,
             tag: None,
             transaction_properties: None,
+            field_assignment_transaction: None,
         }
     }
 
@@ -2076,6 +2101,7 @@ impl TransactionBuilder {
         self.transaction_properties = transaction_properties.map(|properties| {
             let mut properties = properties.as_ref().clone();
             properties.remove(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY);
+            properties.remove(FIELD_ASSIGNMENT_TRANSACTION_AUTH_PROPERTY);
             Arc::new(properties)
         });
         self
@@ -2088,13 +2114,7 @@ impl TransactionBuilder {
         if changes.is_empty() {
             return self;
         }
-        let properties = self
-            .transaction_properties
-            .get_or_insert_with(|| Arc::new(HashMap::new()));
-        Arc::make_mut(properties).insert(
-            FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
-            encode_field_assignment_transaction(&changes),
-        );
+        self.field_assignment_transaction = Some(changes);
         self
     }
 
@@ -2102,12 +2122,17 @@ impl TransactionBuilder {
         let uuid = self
             .uuid
             .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string());
-        Transaction {
+        let transaction = Transaction {
             read_version: self.read_version,
             uuid,
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+        };
+        if let Some(changes) = self.field_assignment_transaction {
+            transaction.with_field_assignment_transaction(changes)
+        } else {
+            transaction
         }
     }
 }
@@ -2120,24 +2145,61 @@ impl Transaction {
         if changes.is_empty() {
             return self;
         }
+        let encoded = encode_field_assignment_transaction(&changes);
+        let auth = field_assignment_transaction_auth(&self, &encoded);
         let properties = self
             .transaction_properties
             .get_or_insert_with(|| Arc::new(HashMap::new()));
-        Arc::make_mut(properties).insert(
-            FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
-            encode_field_assignment_transaction(&changes),
-        );
+        let properties = Arc::make_mut(properties);
+        properties.insert(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(), encoded);
+        properties.insert(FIELD_ASSIGNMENT_TRANSACTION_AUTH_PROPERTY.to_string(), auth);
         self
     }
 
     pub(crate) fn field_assignment_transaction(
         &self,
     ) -> Result<Option<FieldAssignmentTransaction>> {
-        self.transaction_properties
-            .as_ref()
-            .and_then(|properties| properties.get(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY))
-            .map(|encoded| decode_field_assignment_transaction(encoded))
-            .transpose()
+        let Some(properties) = self.transaction_properties.as_ref() else {
+            return Ok(None);
+        };
+        let encoded = properties.get(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY);
+        let auth = properties.get(FIELD_ASSIGNMENT_TRANSACTION_AUTH_PROPERTY);
+        match (encoded, auth) {
+            (None, None) => Ok(None),
+            (Some(encoded), Some(auth)) => {
+                let expected = field_assignment_transaction_auth(self, encoded);
+                if auth != &expected {
+                    return Err(Error::invalid_input(
+                        "Internal field assignment transaction authentication failed",
+                    ));
+                }
+                decode_field_assignment_transaction(encoded).map(Some)
+            }
+            _ => Err(Error::invalid_input(
+                "Internal field assignment transaction payload and authentication must both be present",
+            )),
+        }
+    }
+
+    pub(crate) fn field_assignment_conflict_scope(&self) -> Result<FieldAssignmentConflictScope> {
+        let Some(changes) = self.field_assignment_transaction()? else {
+            return Ok(FieldAssignmentConflictScope::default());
+        };
+        let row_fragment_ids = changes
+            .row_changes
+            .iter()
+            .flat_map(|change| change.row_addresses.iter())
+            .map(|address| address >> 32)
+            .collect();
+        Ok(FieldAssignmentConflictScope {
+            row_fragment_ids,
+            changes_tracking_schema: !changes.initializations.is_empty()
+                || !changes.transfers.is_empty(),
+        })
+    }
+
+    pub(crate) fn validate_internal_extensions(&self) -> Result<()> {
+        self.field_assignment_transaction().map(|_| ())
     }
 
     pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
@@ -4558,17 +4620,14 @@ impl TryFrom<pb::Transaction> for Transaction {
         };
         let mut transaction_properties = message.transaction_properties;
         transaction_properties.remove(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY);
-        if let Some(field_assignment_transaction) = message.field_assignment_transaction {
-            let changes = FieldAssignmentTransaction::try_from(field_assignment_transaction)?;
-            if !changes.is_empty() {
-                transaction_properties.insert(
-                    FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
-                    encode_field_assignment_transaction(&changes),
-                );
-            }
-        }
+        transaction_properties.remove(FIELD_ASSIGNMENT_TRANSACTION_AUTH_PROPERTY);
+        let field_assignment_transaction = message
+            .field_assignment_transaction
+            .map(FieldAssignmentTransaction::try_from)
+            .transpose()?
+            .filter(|changes| !changes.is_empty());
 
-        Ok(Self {
+        let transaction = Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
             operation,
@@ -4582,6 +4641,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(transaction_properties))
             },
+        };
+        Ok(if let Some(changes) = field_assignment_transaction {
+            transaction.with_field_assignment_transaction(changes)
+        } else {
+            transaction
         })
     }
 }
@@ -4654,7 +4718,10 @@ impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
         let field_assignment_transaction = value
             .field_assignment_transaction()
-            .expect("internal field assignment transaction must be valid")
+            // Commit entry points validate this reserved extension. Keep the
+            // legacy infallible conversion panic-free for direct callers.
+            .ok()
+            .flatten()
             .as_ref()
             .map(Into::into);
         let operation = match &value.operation {
@@ -4886,6 +4953,7 @@ impl From<&Transaction> for pb::Transaction {
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
         transaction_properties.remove(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY);
+        transaction_properties.remove(FIELD_ASSIGNMENT_TRANSACTION_AUTH_PROPERTY);
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
@@ -6697,6 +6765,61 @@ mod tests {
             None
         );
         assert!(decoded_user_transaction.transaction_properties.is_none());
+    }
+
+    #[test]
+    fn malformed_reserved_transaction_property_is_rejected_without_panicking() {
+        let transaction = Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Operation::ReserveFragments { num_fragments: 1 },
+            tag: None,
+            transaction_properties: Some(Arc::new(HashMap::from([(
+                FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
+                "not-hex".to_string(),
+            )]))),
+        };
+        assert!(transaction.validate_internal_extensions().is_err());
+
+        let proto = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pb::Transaction::from(&transaction)
+        }))
+        .expect("infallible protobuf conversion must not panic");
+        assert!(proto.field_assignment_transaction.is_none());
+        assert!(
+            !proto
+                .transaction_properties
+                .contains_key(FIELD_ASSIGNMENT_TRANSACTION_PROPERTY)
+        );
+    }
+
+    #[test]
+    fn user_cannot_inject_or_retarget_field_assignment_transaction() {
+        let changes = FieldAssignmentTransaction {
+            initializations: vec![FieldAssignmentInitialization {
+                field_id: 7,
+                assigned: false,
+            }],
+            ..Default::default()
+        };
+        let encoded = encode_field_assignment_transaction(&changes);
+        let forged = Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Operation::ReserveFragments { num_fragments: 1 },
+            tag: None,
+            transaction_properties: Some(Arc::new(HashMap::from([(
+                FIELD_ASSIGNMENT_TRANSACTION_PROPERTY.to_string(),
+                encoded,
+            )]))),
+        };
+        assert!(forged.validate_internal_extensions().is_err());
+
+        let mut retargeted =
+            Transaction::new_from_version(1, Operation::ReserveFragments { num_fragments: 1 })
+                .with_field_assignment_transaction(changes);
+        retargeted.operation = Operation::ReserveFragments { num_fragments: 2 };
+        assert!(retargeted.validate_internal_extensions().is_err());
     }
 
     #[test]

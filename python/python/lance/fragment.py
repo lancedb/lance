@@ -108,6 +108,9 @@ class FragmentMetadata:
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
     overlays: List["LanceOperation.DataOverlayFile"] = field(default_factory=list)
+    _updated_fragment_offsets: Optional[bytes] = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def num_deletions(self) -> int:
@@ -915,15 +918,18 @@ class LanceFragment(pa.dataset.Fragment):
         - The columns to update must already exist in the fragment
         - The join column (left_on/right_on) will not be updated
         - Metadata columns (_rowid, _rowaddr) cannot be updated
+        - The returned metadata carries the exact matched row offsets so
+          ``LanceOperation.Update`` can preserve field-assignment state
         - This is a low-level API; for most use cases, use Dataset.update() instead
         """
         if right_on is None:
             right_on = left_on
 
         reader = _coerce_reader(data_obj, schema)
-        metadata, fields_modified = self._fragment.update_columns(
+        metadata, fields_modified, matched_offsets = self._fragment.update_columns(
             reader, left_on, right_on
         )
+        metadata._updated_fragment_offsets = matched_offsets
         return metadata, fields_modified
 
     def merge_columns(

@@ -5,7 +5,9 @@
 
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
+use object_store::path::Path;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::pb;
 
@@ -34,16 +36,129 @@ impl TryFrom<pb::FieldAssignmentFile> for FieldAssignmentFile {
     type Error = Error;
 
     fn try_from(value: pb::FieldAssignmentFile) -> Result<Self> {
-        if value.path.is_empty() {
-            return Err(Error::invalid_input(
-                "Field assignment file path must not be empty",
-            ));
-        }
-        Ok(Self {
+        let file = Self {
             path: value.path,
             size_bytes: value.size_bytes,
             base_id: value.base_id,
-        })
+        };
+        file.validate_namespace()?;
+        Ok(file)
+    }
+}
+
+impl FieldAssignmentFile {
+    fn validate_namespace(&self) -> Result<()> {
+        let path = Path::parse(&self.path).map_err(|error| {
+            Error::invalid_input(format!(
+                "Invalid field assignment file path '{}': {}",
+                self.path, error
+            ))
+        })?;
+        let mut parts = path.parts();
+        if !parts
+            .next()
+            .is_some_and(|part| part.as_ref() == "_field_assignments")
+        {
+            return Err(Error::invalid_input(format!(
+                "Field assignment file '{}' must be under '_field_assignments'",
+                self.path
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_kind(&self, kind: &str, expected_parts: usize, suffix: &str) -> Result<()> {
+        self.validate_namespace()?;
+        let path = Path::parse(&self.path)?;
+        let parts = path
+            .parts()
+            .map(|part| part.as_ref().to_string())
+            .collect::<Vec<_>>();
+        if parts.len() != expected_parts || parts.get(1).map(String::as_str) != Some(kind) {
+            return Err(Error::invalid_input(format!(
+                "Field assignment {} file '{}' has an invalid path layout",
+                kind, self.path
+            )));
+        }
+        parts[2].parse::<i32>().map_err(|_| {
+            Error::invalid_input(format!(
+                "Field assignment {} file '{}' has an invalid field ID segment",
+                kind, self.path
+            ))
+        })?;
+        if kind == "bitmaps" {
+            parts[3].parse::<u64>().map_err(|_| {
+                Error::invalid_input(format!(
+                    "Field assignment bitmap file '{}' has an invalid fragment ID segment",
+                    self.path
+                ))
+            })?;
+        }
+        let file_name = parts.last().expect("validated non-empty path");
+        let uuid = file_name.strip_suffix(suffix).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Field assignment {} file '{}' must end in '{}'",
+                kind, self.path, suffix
+            ))
+        })?;
+        Uuid::parse_str(uuid).map_err(|_| {
+            Error::invalid_input(format!(
+                "Field assignment {} file '{}' has an invalid immutable object ID",
+                kind, self.path
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Validate that this file is an immutable assignment root.
+    pub fn validate_root_path(&self) -> Result<()> {
+        self.validate_kind("roots", 4, ".root")
+    }
+
+    /// Validate this root's namespace against its manifest field ID.
+    pub fn validate_root_path_for_field(&self, field_id: i32) -> Result<()> {
+        self.validate_root_path()?;
+        let path_field_id = Path::parse(&self.path)?
+            .parts()
+            .nth(2)
+            .expect("validated root field ID segment")
+            .as_ref()
+            .parse::<i32>()
+            .expect("validated root field ID");
+        if path_field_id != field_id {
+            return Err(Error::invalid_input(format!(
+                "Field assignment root '{}' is under field ID {}, expected {}",
+                self.path, path_field_id, field_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate that this file is an immutable partial-assignment bitmap.
+    pub fn validate_bitmap_path(&self) -> Result<()> {
+        self.validate_kind("bitmaps", 5, ".rbm")
+    }
+
+    /// Validate this bitmap's namespace against its root entry.
+    pub fn validate_bitmap_path_for_fragment(&self, field_id: i32, fragment_id: u64) -> Result<()> {
+        self.validate_bitmap_path()?;
+        let path = Path::parse(&self.path)?;
+        let parts = path.parts().collect::<Vec<_>>();
+        let path_field_id = parts[2]
+            .as_ref()
+            .parse::<i32>()
+            .expect("validated bitmap field ID");
+        let path_fragment_id = parts[3]
+            .as_ref()
+            .parse::<u64>()
+            .expect("validated bitmap fragment ID");
+        if path_field_id != field_id || path_fragment_id != fragment_id {
+            return Err(Error::invalid_input(format!(
+                "Field assignment bitmap '{}' is under field ID {} and fragment {}, expected field ID {} and fragment {}",
+                self.path, path_field_id, path_fragment_id, field_id, fragment_id
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -75,22 +190,24 @@ impl TryFrom<pb::FieldAssignmentState> for FieldAssignmentState {
                 value.field_id
             ))
         })?;
+        let root: FieldAssignmentFile = root.try_into()?;
+        root.validate_root_path_for_field(value.field_id)?;
         Ok(Self {
             field_id: value.field_id,
-            root: root.try_into()?,
+            root,
         })
     }
 }
 
 /// Materialized immutable root for one tracked field.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub struct FieldAssignmentRoot {
     /// Non-empty fragment states, sorted by fragment ID.
     pub fragments: Vec<FieldAssignmentFragment>,
 }
 
 /// Materialized assignment state for one physical fragment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub struct FieldAssignmentFragment {
     /// Fragment ID in the snapshot.
     pub fragment_id: u64,
@@ -101,7 +218,7 @@ pub struct FieldAssignmentFragment {
 }
 
 /// Compact assignment representation for a fragment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub enum FieldAssignmentFragmentState {
     /// Every physical row is assigned.
     All,
@@ -182,6 +299,7 @@ impl TryFrom<pb::FieldAssignmentFragment> for FieldAssignmentFragment {
             }
             pb::field_assignment_fragment::State::Partial(file) => {
                 let file: FieldAssignmentFile = file.try_into()?;
+                file.validate_bitmap_path()?;
                 if file.size_bytes == 0 {
                     return Err(Error::invalid_input(format!(
                         "Partial field assignment file '{}' must have a non-zero size",
@@ -216,7 +334,8 @@ mod tests {
                     fragment_id: 3,
                     physical_rows: 8,
                     state: FieldAssignmentFragmentState::Partial(FieldAssignmentFile {
-                        path: "_field_assignments/bitmaps/part.rbm".to_string(),
+                        path: "_field_assignments/bitmaps/7/3/00000000-0000-0000-0000-000000000001.rbm"
+                            .to_string(),
                         size_bytes: 12,
                         base_id: Some(4),
                     }),
@@ -233,5 +352,45 @@ mod tests {
             ],
         };
         assert!(FieldAssignmentRoot::try_from(duplicate).is_err());
+    }
+
+    #[test]
+    fn field_assignment_files_reject_wrong_roles_and_layouts() {
+        let root = FieldAssignmentFile {
+            path: "_field_assignments/roots/7/00000000-0000-0000-0000-000000000001.root"
+                .to_string(),
+            size_bytes: 12,
+            base_id: None,
+        };
+        assert!(root.validate_root_path().is_ok());
+        assert!(root.validate_bitmap_path().is_err());
+
+        let bitmap = FieldAssignmentFile {
+            path: "_field_assignments/bitmaps/7/3/00000000-0000-0000-0000-000000000001.rbm"
+                .to_string(),
+            size_bytes: 12,
+            base_id: None,
+        };
+        assert!(bitmap.validate_bitmap_path().is_ok());
+        assert!(bitmap.validate_root_path().is_err());
+
+        for invalid_path in [
+            "outside/roots/7/00000000-0000-0000-0000-000000000001.root",
+            "_field_assignments/roots/not-a-field/00000000-0000-0000-0000-000000000001.root",
+            "_field_assignments/roots/7/not-a-uuid.root",
+            "_field_assignments/bitmaps/7/not-a-fragment/00000000-0000-0000-0000-000000000001.rbm",
+            "_field_assignments/bitmaps/7/3/00000000-0000-0000-0000-000000000001.root",
+            "_field_assignments/bitmaps/7/3/00000000-0000-0000-0000-000000000001.rbm/extra",
+        ] {
+            let file = FieldAssignmentFile {
+                path: invalid_path.to_string(),
+                size_bytes: 12,
+                base_id: None,
+            };
+            assert!(
+                file.validate_root_path().is_err() && file.validate_bitmap_path().is_err(),
+                "invalid path was accepted: {invalid_path}"
+            );
+        }
     }
 }

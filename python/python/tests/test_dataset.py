@@ -6565,6 +6565,23 @@ def test_field_assignment_public_api(tmp_path: Path):
         fragment.metadata for fragment in dataset.get_fragments()
     ] == fragments_before
     assert _assignment_rows(dataset)[0] == (0, False)
+    transaction = dataset.read_transaction(dataset.version)
+    assert not any(
+        key.startswith("__lance_field_assignment_transaction")
+        for key in transaction.transaction_properties
+    )
+
+    for reserved_key in (
+        "__lance_field_assignment_transaction",
+        "__lance_field_assignment_transaction_auth",
+    ):
+        forged = lance.Transaction(
+            dataset.version,
+            lance.LanceOperation.Update(),
+            transaction_properties={reserved_key: "00"},
+        )
+        with pytest.raises(ValueError, match="properties are reserved"):
+            lance.LanceDataset.commit(dataset, forged)
 
     dataset = lance.write_dataset(
         pa.table({"id": [4], "embedding": pa.array([None], pa.int32())}),

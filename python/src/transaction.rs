@@ -818,6 +818,14 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .map(Arc::new);
+        if transaction_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("__lance_field_assignment_transaction")
+                || properties.contains_key("__lance_field_assignment_transaction_auth")
+        }) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "field assignment transaction properties are reserved",
+            ));
+        }
         Ok(Self(Transaction {
             read_version,
             uuid,
@@ -849,8 +857,13 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         let py_transaction = cls.call1((read_version, operation, uuid))?;
 
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
-            let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;
-            py_transaction.setattr("transaction_properties", py_dict)?;
+            let mut transaction_properties = transaction_properties_arc.as_ref().clone();
+            transaction_properties.remove("__lance_field_assignment_transaction");
+            transaction_properties.remove("__lance_field_assignment_transaction_auth");
+            if !transaction_properties.is_empty() {
+                let py_dict = transaction_properties.into_pyobject(py)?;
+                py_transaction.setattr("transaction_properties", py_dict)?;
+            }
         }
         // Unwrap due to infallible
         Ok(py_transaction.into_pyobject(py).unwrap())

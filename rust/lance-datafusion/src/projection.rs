@@ -233,6 +233,7 @@ impl ProjectionPlan {
     /// from reading the field's stored values and keeps ordinary queries
     /// unchanged.
     pub fn rebuild_physical_projection(&mut self, base: Arc<dyn Projectable>) -> Result<()> {
+        let blob_handling = self.physical_projection.blob_handling.clone();
         let mut physical_columns = Vec::new();
         let mut with_row_id = false;
         let mut with_row_addr = self.must_add_row_offset;
@@ -261,6 +262,7 @@ impl ProjectionPlan {
         physical_projection.with_row_addr = with_row_addr;
         physical_projection.with_row_last_updated_at_version = with_row_last_updated_at_version;
         physical_projection.with_row_created_at_version = with_row_created_at_version;
+        physical_projection.blob_handling = blob_handling;
         self.physical_projection = physical_projection;
         Ok(())
     }
@@ -559,6 +561,7 @@ mod tests {
 
     use arrow_array::{ArrayRef, Float32Array, Int64Array};
     use lance_arrow::json::{is_json_field, json_field};
+    use lance_core::datatypes::BlobHandling;
 
     #[test]
     fn test_scoring_column_expression() {
@@ -770,5 +773,26 @@ mod tests {
         let output = plan.output_schema().unwrap();
         let output_field = output.field_with_name("meta").unwrap();
         assert!(is_json_field(output_field));
+    }
+
+    #[test]
+    fn test_rebuild_physical_projection_preserves_blob_handling() {
+        let base = Arc::new(
+            Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                "blob",
+                DataType::Binary,
+                true,
+            )]))
+            .unwrap(),
+        );
+        let mut plan = ProjectionPlan::from_expressions(base.clone(), &[("blob", "blob")]).unwrap();
+        plan.physical_projection.blob_handling = BlobHandling::AllBinary;
+
+        plan.rebuild_physical_projection(base).unwrap();
+
+        assert_eq!(
+            plan.physical_projection.blob_handling,
+            BlobHandling::AllBinary
+        );
     }
 }

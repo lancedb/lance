@@ -4025,6 +4025,7 @@ dependencies = [
  "async_cell",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",

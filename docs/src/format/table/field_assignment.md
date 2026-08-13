@@ -62,4 +62,4 @@ The logical function is encoded in Substrait with extension URN `urn:lance:exten
 
 ## Compatibility
 
-Manifest writer feature bit `1 << 8` indicates that field assignment state is present. The bit is writer-only: older readers may ignore the descriptors and perform ordinary Arrow projection, but a writer that does not understand the bit must refuse every mutation because it cannot preserve assignment state.
+Manifest reader and writer feature bit `1 << 8` indicates that field assignment state is present. A Lance version that does not understand the bit must refuse to open or mutate the dataset. This fail-closed reader gate is required because previously released writers did not enforce writer-only feature bits on every mutation and clone path; allowing them to open a tracked snapshot could silently discard assignment descriptors. Readers that understand the bit still perform ordinary Arrow projection without loading assignment objects unless a query references `is_assigned`.

@@ -39,8 +39,9 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// invalidating the catch-up position recorded for that index, leaving a stale
 /// position behind. Both must refuse the table.
 pub const FLAG_MEM_WAL_INDEX_CATCHUP: u64 = 128;
-/// Snapshot-level logical field assignment state is present. Ordinary readers
-/// may ignore this state, but every writer must preserve it across mutations.
+/// Snapshot-level logical field assignment state is present. Both older
+/// readers and older writers must refuse the dataset: released writers do not
+/// consistently enforce writer-only feature bits on every mutation path.
 pub const FLAG_FIELD_ASSIGNMENT: u64 = 256;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 512;
@@ -134,6 +135,7 @@ pub fn apply_feature_flags(
     }
 
     if !manifest.field_assignment_states.is_empty() {
+        manifest.reader_feature_flags |= FLAG_FIELD_ASSIGNMENT;
         manifest.writer_feature_flags |= FLAG_FIELD_ASSIGNMENT;
     }
 
@@ -251,8 +253,6 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        // Field assignment changes only writer obligations; ordinary readers
-        // never see the bit in reader_feature_flags.
         assert!(can_read_dataset(super::FLAG_FIELD_ASSIGNMENT));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_feature_flags_sets_writer_only_assignment_flag() {
+    fn test_apply_feature_flags_sets_assignment_reader_and_writer_flags() {
         use crate::format::{DataStorageFormat, FieldAssignmentFile, FieldAssignmentState};
         use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
@@ -372,13 +372,15 @@ mod tests {
         manifest.field_assignment_states = vec![FieldAssignmentState {
             field_id,
             root: FieldAssignmentFile {
-                path: "_field_assignments/roots/empty.root".to_string(),
+                path: format!(
+                    "_field_assignments/roots/{field_id}/00000000-0000-0000-0000-000000000001.root"
+                ),
                 size_bytes: 0,
                 base_id: None,
             },
         }];
         apply_feature_flags(&mut manifest, false, false).unwrap();
-        assert_eq!(manifest.reader_feature_flags & FLAG_FIELD_ASSIGNMENT, 0);
+        assert_ne!(manifest.reader_feature_flags & FLAG_FIELD_ASSIGNMENT, 0);
         assert_ne!(manifest.writer_feature_flags & FLAG_FIELD_ASSIGNMENT, 0);
     }
 

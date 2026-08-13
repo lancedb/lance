@@ -2503,7 +2503,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
-    def alter_columns(self, *alterations: Iterable[AlterColumn]):
+    def alter_columns(self, *alterations: AlterColumn):
         """Alter column name, data type, and nullability.
 
         Columns that are renamed can keep any indices that are on them. If a
@@ -5806,8 +5806,11 @@ class DeleteResult(TypedDict):
     num_deleted_rows: int
 
 
-class AlterColumn(TypedDict):
+class _AlterColumnRequired(TypedDict):
     path: str
+
+
+class AlterColumn(_AlterColumnRequired, total=False):
     name: Optional[str]
     nullable: Optional[bool]
     data_type: Optional[pa.DataType]
@@ -6092,6 +6095,8 @@ class LanceOperation:
             each serialized in the portable RoaringBitmap format. Set on
             ``rewrite_columns`` updates over stable row ids so the commit
             refreshes row-level version metadata for the matched rows only.
+            :meth:`LanceFragment.update_columns` records these offsets on its
+            returned metadata, and this operation imports them automatically.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6109,6 +6114,31 @@ class LanceOperation:
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
             LanceOperation._validate_fragments(self.new_fragments)
+            inferred_offsets = {
+                fragment.id: fragment._updated_fragment_offsets
+                for fragment in self.updated_fragments
+                if fragment._updated_fragment_offsets is not None
+            }
+            if inferred_offsets:
+                if self.updated_fragment_offsets is not None:
+                    conflicting = {
+                        fragment_id
+                        for fragment_id, offsets in inferred_offsets.items()
+                        if self.updated_fragment_offsets.get(fragment_id) != offsets
+                    }
+                    if conflicting:
+                        raise ValueError(
+                            "updated_fragment_offsets conflicts with offsets "
+                            "returned by LanceFragment.update_columns for fragments "
+                            f"{sorted(conflicting)}"
+                        )
+                    merged_offsets = dict(inferred_offsets)
+                    merged_offsets.update(self.updated_fragment_offsets)
+                    self.updated_fragment_offsets = merged_offsets
+                else:
+                    self.updated_fragment_offsets = inferred_offsets
+                if not self.update_mode:
+                    self.update_mode = "rewrite_columns"
 
     @dataclass
     class Merge(BaseOperation):
