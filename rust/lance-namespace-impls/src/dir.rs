@@ -3742,8 +3742,8 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
         self.record_op("rename_table");
-        if let Some(ref manifest_ns) = self.manifest_ns {
-            return manifest_ns.rename_table(request).await;
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
+            return LanceNamespace::rename_table(manifest_ns.as_ref(), request).await;
         }
 
         if request.new_table_name.trim().is_empty() {
@@ -3770,7 +3770,7 @@ impl LanceNamespace for DirectoryNamespace {
         let source_name = Self::table_name_from_id(&request.id)?;
         let new_table_name = request.new_table_name.clone();
 
-        let source_status = self.check_table_status(&source_name).await;
+        let source_status = self.check_table_status(&source_name).await?;
         if !source_status.exists || source_status.is_deregistered {
             return Err(NamespaceError::TableNotFound {
                 message: Self::format_table_id_from_request(&request.id),
@@ -3778,7 +3778,7 @@ impl LanceNamespace for DirectoryNamespace {
             .into());
         }
 
-        let destination_status = self.check_table_status(&new_table_name).await;
+        let destination_status = self.check_table_status(&new_table_name).await?;
         if destination_status.exists && !destination_status.is_deregistered {
             return Err(NamespaceError::TableAlreadyExists {
                 message: new_table_name,
