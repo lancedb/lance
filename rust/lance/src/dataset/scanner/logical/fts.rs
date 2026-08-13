@@ -1344,7 +1344,7 @@ impl SplittableSearch for FtsLeafNode {
             gaps.push(ScanRestriction::Rows(rows.clone()));
         }
         IndexCoverage::Partial {
-            indexed,
+            indexed: Some(indexed),
             gaps,
             block: stale,
         }

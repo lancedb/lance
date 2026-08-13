@@ -343,5 +343,7 @@ fn source_options(scanner: &Scanner) -> ScanSourceOptions {
         use_scalar_index: scanner.use_scalar_index,
         fast_search: scanner.fast_search,
         rows: None,
+        filter_plan: None,
+        overlay_block: None,
     }
 }

@@ -26,8 +26,10 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::{DFSchemaRef, TableReference};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{provider_as_source, source_as_provider};
+use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::logical_expr::{
     EmptyRelation, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNodeCore,
 };
@@ -238,8 +240,12 @@ pub(super) enum IndexCoverage {
     Unusable,
     /// The indexed branch reads `indexed` and must not emit `block`; the brute-force branch reads
     /// the rows described by `gaps`.
+    ///
+    /// `indexed: None` means the indexed branch reads everything the node already reads — the
+    /// scan-leaf case, where the hole is entirely at row level and there are no fragments to
+    /// exclude.
     Partial {
-        indexed: Vec<Fragment>,
+        indexed: Option<Vec<Fragment>>,
         gaps: Vec<ScanRestriction>,
         block: Option<Arc<RowAddrTreeMap>>,
     },
@@ -277,6 +283,14 @@ pub(super) trait SplittableSearch {
     fn is_splittable(&self) -> bool;
     fn coverage(&self, context: &ScanPlanningContext) -> IndexCoverage;
     fn input(&self) -> &LogicalPlan;
+    /// Whether `fast_search` may drop this node's brute-force branch.
+    ///
+    /// True for a search, where `fast_search` is the user trading recall for latency. False for a
+    /// scan's predicate: there the brute-force branch re-reads rows whose index entry an overlay
+    /// invalidated, which repairs the index result rather than extending it past the index.
+    fn honors_fast_search(&self) -> bool {
+        true
+    }
     /// This node reading only indexed rows, with `block` withheld from the index result.
     fn indexed_branch(&self, input: LogicalPlan, block: Option<Arc<RowAddrTreeMap>>)
     -> LogicalPlan;
@@ -333,11 +347,115 @@ fn splittable(plan: &LogicalPlan) -> Option<&dyn SplittableSearch> {
 #[derive(Debug)]
 pub struct SplitOnIndexCoverage {
     context: Arc<ScanPlanningContext>,
+    scope: SplitScope,
+}
+
+/// Which node kind a [`SplitOnIndexCoverage`] instance is responsible for.
+///
+/// The rule is registered twice, in two different stages, because the two kinds of coverage become
+/// knowable at different times. A search node carries its index from the builder, so its coverage
+/// is settled before any optimization. A scan's index query does not exist until `PushDownFilter`
+/// has decided which predicates reach the leaf — so that half cannot run in the analyzer, however
+/// mandatory it is. Same rewrite, same trait, different stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitScope {
+    /// Vector and full-text search nodes. Runs in the analyzer.
+    Searches,
+    /// Scan leaves whose scalar index query has been resolved. Runs in the optimizer.
+    Scans,
 }
 
 impl SplitOnIndexCoverage {
-    pub fn new(context: Arc<ScanPlanningContext>) -> Self {
-        Self { context }
+    pub fn searches(context: Arc<ScanPlanningContext>) -> Self {
+        Self {
+            context,
+            scope: SplitScope::Searches,
+        }
+    }
+
+    pub fn scans(context: Arc<ScanPlanningContext>) -> Self {
+        Self {
+            context,
+            scope: SplitScope::Scans,
+        }
+    }
+
+    fn rewrite_node(
+        &self,
+        plan: LogicalPlan,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let split = match self.scope {
+            SplitScope::Searches => match splittable(&plan) {
+                Some(node) => self.split(node, plan.schema())?,
+                None => None,
+            },
+            SplitScope::Scans => match ScanCoverage::of(&plan, &self.context) {
+                Some(node) => self.split(&node, plan.schema())?,
+                None => None,
+            },
+        };
+        Ok(match split {
+            Some(split) => Transformed::yes(split),
+            None => Transformed::no(plan),
+        })
+    }
+
+    /// The split itself, shared by every index kind. `None` means the node was left alone.
+    fn split(
+        &self,
+        node: &dyn SplittableSearch,
+        schema: &DFSchemaRef,
+    ) -> datafusion::common::Result<Option<LogicalPlan>> {
+        if !node.is_splittable() {
+            return Ok(None);
+        }
+
+        let fast_search = self.context.fast_search() && node.honors_fast_search();
+        let coverage = match fast_search {
+            true => node.coverage(&self.context).indexed_only(),
+            false => node.coverage(&self.context),
+        };
+        match coverage {
+            IndexCoverage::Complete => Ok(None),
+            IndexCoverage::Unusable if fast_search => {
+                Ok(Some(LogicalPlan::EmptyRelation(EmptyRelation {
+                    produce_one_row: false,
+                    schema: schema.clone(),
+                })))
+            }
+            IndexCoverage::Unusable => Ok(Some(node.flat_branch(node.input().clone()))),
+            IndexCoverage::Partial {
+                indexed,
+                gaps,
+                block,
+            } => {
+                let indexed_input = match indexed {
+                    Some(fragments) => restrict_scan(
+                        node.input(),
+                        &ScanRestriction::Fragments(Arc::new(fragments)),
+                    )?,
+                    None => node.input().clone(),
+                };
+                let indexed_branch = node.indexed_branch(indexed_input, block);
+                if gaps.is_empty() {
+                    return Ok(Some(indexed_branch));
+                }
+                let mut sources = Vec::with_capacity(gaps.len());
+                for gap in &gaps {
+                    sources.push(restrict_scan(node.input(), gap)?);
+                }
+                let mut builder = LogicalPlanBuilder::new(sources.remove(0));
+                for source in sources {
+                    builder = builder.union(source)?;
+                }
+                let flat_branch = node.flat_branch(builder.build()?);
+                Ok(Some(node.merge(
+                    indexed_branch,
+                    flat_branch,
+                    &self.context,
+                )?))
+            }
+        }
     }
 }
 
@@ -355,59 +473,21 @@ impl AnalyzerRule for SplitOnIndexCoverage {
     }
 }
 
-impl SplitOnIndexCoverage {
-    fn rewrite_node(
+impl OptimizerRule for SplitOnIndexCoverage {
+    fn name(&self) -> &str {
+        "split_on_index_coverage"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(
         &self,
         plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
     ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
-        let Some(node) = splittable(&plan) else {
-            return Ok(Transformed::no(plan));
-        };
-        if !node.is_splittable() {
-            return Ok(Transformed::no(plan));
-        }
-
-        let coverage = match self.context.fast_search() {
-            true => node.coverage(&self.context).indexed_only(),
-            false => node.coverage(&self.context),
-        };
-        match coverage {
-            IndexCoverage::Complete => Ok(Transformed::no(plan)),
-            IndexCoverage::Unusable if self.context.fast_search() => Ok(Transformed::yes(
-                LogicalPlan::EmptyRelation(EmptyRelation {
-                    produce_one_row: false,
-                    schema: plan.schema().clone(),
-                }),
-            )),
-            IndexCoverage::Unusable => Ok(Transformed::yes(node.flat_branch(node.input().clone()))),
-            IndexCoverage::Partial {
-                indexed,
-                gaps,
-                block,
-            } => {
-                let indexed_branch = node.indexed_branch(
-                    restrict_scan(node.input(), &ScanRestriction::Fragments(Arc::new(indexed)))?,
-                    block,
-                );
-                if gaps.is_empty() {
-                    return Ok(Transformed::yes(indexed_branch));
-                }
-                let mut sources = Vec::with_capacity(gaps.len());
-                for gap in &gaps {
-                    sources.push(restrict_scan(node.input(), gap)?);
-                }
-                let mut builder = LogicalPlanBuilder::new(sources.remove(0));
-                for source in sources {
-                    builder = builder.union(source)?;
-                }
-                let flat_branch = node.flat_branch(builder.build()?);
-                Ok(Transformed::yes(node.merge(
-                    indexed_branch,
-                    flat_branch,
-                    &self.context,
-                )?))
-            }
-        }
+        self.rewrite_node(plan)
     }
 }
 
@@ -454,7 +534,7 @@ impl SplittableSearch for VectorSearchNode {
             gaps.push(ScanRestriction::Rows(rows.clone()));
         }
         IndexCoverage::Partial {
-            indexed,
+            indexed: Some(indexed),
             gaps,
             block: stale,
         }
@@ -518,6 +598,193 @@ impl SplittableSearch for VectorSearchNode {
             ),
         }))
     }
+}
+
+/// A Lance scan leaf whose scalar index query a data overlay has partly invalidated.
+///
+/// The third instance of the coverage split, and the one that needed a plan node to reach. Its
+/// coverage hole is purely at row level — the index covers every fragment, it just describes some
+/// rows as they were before an overlay changed them — which is why `indexed` is `None` and the
+/// only gap is a row set.
+struct ScanCoverage {
+    scan: LogicalPlan,
+    table_name: TableReference,
+    stale: Arc<RowAddrTreeMap>,
+}
+
+impl ScanCoverage {
+    /// Recognize a scan whose resolved index query has stale rows.
+    ///
+    /// Returns `None` for every scan on the common path: no index query, no overlays, or an index
+    /// query no overlay touched.
+    fn of(plan: &LogicalPlan, context: &ScanPlanningContext) -> Option<Self> {
+        if !context.has_overlays() {
+            return None;
+        }
+        let LogicalPlan::TableScan(scan) = plan else {
+            return None;
+        };
+        // Idempotence: this rule runs in the optimizer, which loops to a fixed point, and the
+        // indexed branch it produces is still a scan with an index query. The block it carries is
+        // what says the split already happened here.
+        let index_query = with_lance_source(plan, |source| match source.overlay_block() {
+            Some(_) => None,
+            None => source.filter_plan()?.index_query.clone(),
+        })??;
+        match context.index_query_staleness(&index_query) {
+            OverlayStaleness::Rows(stale) => Some(Self {
+                scan: plan.clone(),
+                table_name: scan.table_name.clone(),
+                stale,
+            }),
+            // A scalar index answers by row address whatever segment produced the entry, so there
+            // is no case where blocking cannot express the hole.
+            OverlayStaleness::None | OverlayStaleness::Unknown => None,
+        }
+    }
+}
+
+impl SplittableSearch for ScanCoverage {
+    fn is_splittable(&self) -> bool {
+        true
+    }
+
+    fn honors_fast_search(&self) -> bool {
+        false
+    }
+
+    fn coverage(&self, _context: &ScanPlanningContext) -> IndexCoverage {
+        IndexCoverage::Partial {
+            indexed: None,
+            gaps: vec![ScanRestriction::Rows(self.stale.clone())],
+            block: Some(self.stale.clone()),
+        }
+    }
+
+    fn input(&self) -> &LogicalPlan {
+        &self.scan
+    }
+
+    fn indexed_branch(
+        &self,
+        input: LogicalPlan,
+        block: Option<Arc<RowAddrTreeMap>>,
+    ) -> LogicalPlan {
+        let Some(block) = block else {
+            return input;
+        };
+        map_lance_scan(&input, |source| source.blocking(block.clone())).unwrap_or(input)
+    }
+
+    /// The gap branch is already a scan of exactly the stale rows with its index turned off, so
+    /// re-reading them from current values needs nothing further.
+    fn flat_branch(&self, input: LogicalPlan) -> LogicalPlan {
+        input
+    }
+
+    fn merge(
+        &self,
+        indexed: LogicalPlan,
+        flat: LogicalPlan,
+        _context: &ScanPlanningContext,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        // Aliased back to the table's own name: a union derives its output schema from its inputs
+        // and drops their relation qualifiers, which would strand every parent expression that
+        // still names the table. Both branches read the same table, so the name is still true.
+        LogicalPlanBuilder::new(indexed)
+            .union(flat)?
+            .alias(self.table_name.clone())?
+            .build()
+    }
+}
+
+/// Derive each Lance scan's scalar index query and record it on the scan's source.
+///
+/// This is what gives the index decision a place in the plan. Until it runs, the decision exists
+/// only inside `TableProvider::scan`, where no rule can see it — which is why the scan leaf was the
+/// one coverage split that had to be written out by hand.
+///
+/// It runs after `PushDownFilter` for the same reason
+/// [`ResolvePrefilterSource`] does: the predicate has to have reached its final position first.
+#[derive(Debug)]
+pub struct ResolveScalarIndexQuery {
+    context: Arc<ScanPlanningContext>,
+}
+
+impl ResolveScalarIndexQuery {
+    pub fn new(context: Arc<ScanPlanningContext>) -> Self {
+        Self { context }
+    }
+}
+
+impl OptimizerRule for ResolveScalarIndexQuery {
+    fn name(&self) -> &str {
+        "resolve_scalar_index_query"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::TableScan(scan) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        // The physical planner unqualifies a `TableScan`'s filters before handing them to
+        // `TableProvider::scan`, and the Lance expression planner expects the same bare columns.
+        let filters = unnormalize_cols(scan.filters.iter().cloned());
+        let resolved = with_lance_source(&plan, |source| {
+            match source.filter_plan().is_some() || filters.is_empty() {
+                true => None,
+                false => Some(source.resolve_filter_plan(&filters, self.context.scalar_indices())),
+            }
+        });
+        let Some(Some(filter_plan)) = resolved else {
+            return Ok(Transformed::no(plan));
+        };
+        let filter_plan = filter_plan.map_err(datafusion::common::DataFusionError::from)?;
+        Ok(Transformed::yes(map_lance_scan(&plan, |source| {
+            source.with_filter_plan(filter_plan.clone())
+        })?))
+    }
+}
+
+/// Run `f` against the [`LanceScanSource`] behind a `TableScan`, if that is what this node is.
+///
+/// Closure-shaped rather than returning a reference because `source_as_provider` hands back an
+/// owned `Arc`, so the borrow cannot outlive this call.
+fn with_lance_source<R>(plan: &LogicalPlan, f: impl FnOnce(&LanceScanSource) -> R) -> Option<R> {
+    let LogicalPlan::TableScan(scan) = plan else {
+        return None;
+    };
+    let provider = source_as_provider(&scan.source).ok()?;
+    let source = (provider.as_ref() as &dyn Any).downcast_ref::<LanceScanSource>()?;
+    Some(f(source))
+}
+
+/// Rebuild `plan`, replacing every Lance scan leaf's source with `f` applied to it.
+fn map_lance_scan(
+    plan: &LogicalPlan,
+    f: impl Fn(&LanceScanSource) -> LanceScanSource,
+) -> datafusion::common::Result<LogicalPlan> {
+    Ok(plan
+        .clone()
+        .transform_down(|node| {
+            let Some(source) = with_lance_source(&node, &f) else {
+                return Ok(Transformed::no(node));
+            };
+            let LogicalPlan::TableScan(scan) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            let mut scan = scan.clone();
+            scan.source = provider_as_source(Arc::new(source));
+            Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+        })?
+        .data)
 }
 
 /// Rebuild `plan`, pointing every scan leaf at the same source narrowed by `restriction`.

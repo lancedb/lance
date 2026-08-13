@@ -18,30 +18,26 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DataFusionError;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::ExecutionPlan;
 use lance_arrow::SchemaExt as ArrowSchemaExt;
 use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::{
     ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{PlannerIndexExt, ScalarIndexExpr};
+use lance_index::scalar::expression::PlannerIndexExt;
 use lance_select::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_select::result::{IndexExprResult, IndexExprResultWireFormat};
 use lance_table::format::Fragment;
 
-use super::context::{OpaqueSegments, OverlayStaleness, overlay_staleness};
+use crate::Result;
 use crate::dataset::Dataset;
-use crate::index::DatasetIndexInternalExt;
-use crate::index::scalar::load_named_scalar_segments;
+use crate::index::{DatasetIndexInternalExt, ScalarIndexInfo};
 use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::scalar_index::ScalarIndexExec;
-use crate::io::exec::{FilterPlan as ExprFilterPlan, LanceFilterExec, Planner, project};
-use crate::{Error, Result};
+use crate::io::exec::{FilterPlan as ExprFilterPlan, Planner};
 
 /// How a branch's scan is narrowed to the rows that branch is responsible for.
 ///
@@ -81,6 +77,16 @@ pub struct ScanSourceOptions {
     /// case that produces one: these rows were singled out *because* their index entries are no
     /// longer trustworthy.
     pub rows: Option<Arc<RowAddrTreeMap>>,
+    /// How this scan's predicate splits into a scalar index query and a refine filter.
+    ///
+    /// `None` means nothing has resolved it yet and the leaf will do so itself. Filling this in is
+    /// what makes the index decision part of the plan rather than a private detail of
+    /// [`TableProvider::scan`] — see [`ResolveScalarIndexQuery`](super::rules::ResolveScalarIndexQuery).
+    pub filter_plan: Option<ExprFilterPlan>,
+    /// Rows the scalar index result must not emit, because a data overlay invalidated its entries
+    /// for them. The same rows are re-read on a sibling branch, restricted by
+    /// [`ScanRestriction::Rows`].
+    pub overlay_block: Option<Arc<RowAddrTreeMap>>,
 }
 
 pub struct LanceScanSource {
@@ -138,12 +144,49 @@ impl LanceScanSource {
                 fragments: Some(fragments.clone()),
                 ..self.options.clone()
             },
+            // The resolved filter plan goes with it: it was resolved *using* the index whose
+            // entries for these rows are the reason this branch exists.
             ScanRestriction::Rows(rows) => ScanSourceOptions {
                 rows: Some(rows.clone()),
                 use_scalar_index: false,
+                filter_plan: None,
+                overlay_block: None,
                 ..self.options.clone()
             },
         };
+        self.with_options(options)
+    }
+
+    /// How this scan's predicate splits into a scalar index query and a refine filter, once a rule
+    /// has resolved it.
+    ///
+    /// This is the accessor that makes the index decision inspectable from the plan. Without it the
+    /// decision exists only inside [`TableProvider::scan`], where no rule can reach it.
+    pub fn filter_plan(&self) -> Option<&ExprFilterPlan> {
+        self.options.filter_plan.as_ref()
+    }
+
+    pub fn with_filter_plan(&self, filter_plan: ExprFilterPlan) -> Self {
+        self.with_options(ScanSourceOptions {
+            filter_plan: Some(filter_plan),
+            ..self.options.clone()
+        })
+    }
+
+    /// The rows withheld from this source's index result, if a split has already happened here.
+    pub fn overlay_block(&self) -> Option<&Arc<RowAddrTreeMap>> {
+        self.options.overlay_block.as_ref()
+    }
+
+    /// The same source, with `rows` withheld from whatever its index query returns.
+    pub fn blocking(&self, rows: Arc<RowAddrTreeMap>) -> Self {
+        self.with_options(ScanSourceOptions {
+            overlay_block: Some(rows),
+            ..self.options.clone()
+        })
+    }
+
+    fn with_options(&self, options: ScanSourceOptions) -> Self {
         Self {
             dataset: self.dataset.clone(),
             options,
@@ -183,24 +226,35 @@ impl LanceScanSource {
     /// Split the pushed-down predicates into a scalar-index query plus a refine expression.
     ///
     /// This mirrors [`Scanner::create_filter_plan`](crate::dataset::Scanner), including its
-    /// guard that scalar indices are unusable when any fragment is missing a row count.
-    async fn build_filter_plan(&self, filters: &[Expr]) -> Result<ExprFilterPlan> {
+    /// guard that scalar indices are unusable when any fragment is missing a row count. It is
+    /// synchronous because [`ScanPlanningContext`](super::context::ScanPlanningContext) already
+    /// holds the `ScalarIndexInfo`, which is what lets a rule call it.
+    pub fn resolve_filter_plan(
+        &self,
+        filters: &[Expr],
+        index_info: &ScalarIndexInfo,
+    ) -> Result<ExprFilterPlan> {
         let Some(expr) = conjunction(filters) else {
             return Ok(ExprFilterPlan::default());
         };
 
         let planner = Planner::new(self.full_schema.clone());
-        let index_info = self.dataset.scalar_index_info().await?;
         let plan =
-            planner.create_filter_plan(expr.clone(), &index_info, self.options.use_scalar_index)?;
+            planner.create_filter_plan(expr.clone(), index_info, self.options.use_scalar_index)?;
 
         if plan.index_query.is_some() && self.fragments().iter().any(|f| f.physical_rows.is_none())
         {
             // Scalar index results are expressed in row addresses, which need fragment row
             // counts to interpret. Without them, fall back to a pure refine filter.
-            return planner.create_filter_plan(expr, &index_info, false);
+            return planner.create_filter_plan(expr, index_info, false);
         }
         Ok(plan)
+    }
+
+    /// [`Self::resolve_filter_plan`] for the case where no rule got there first.
+    async fn build_filter_plan(&self, filters: &[Expr]) -> Result<ExprFilterPlan> {
+        let index_info = self.dataset.scalar_index_info().await?;
+        self.resolve_filter_plan(filters, &index_info)
     }
 
     /// Present a row allow list in the shape the leaf's index-result slot expects.
@@ -231,79 +285,6 @@ impl LanceScanSource {
             .unwrap_or_else(|| self.dataset.fragments())
     }
 
-    /// The rows a scalar-index query cannot be trusted for, because a data overlay changed a value
-    /// one of its indices covers.
-    ///
-    /// Mirrors `Scanner::overlay_stale_index_rows`. The segment metadata is cached, so on the
-    /// common path — no fragment carries an overlay — the caller skips this entirely.
-    async fn index_query_staleness(
-        &self,
-        index_query: &ScalarIndexExpr,
-    ) -> Result<OverlayStaleness> {
-        let mut segments = Vec::new();
-        let mut stack = vec![index_query];
-        while let Some(expr) = stack.pop() {
-            match expr {
-                ScalarIndexExpr::Not(inner) => stack.push(inner),
-                ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
-                    stack.push(lhs);
-                    stack.push(rhs);
-                }
-                ScalarIndexExpr::Query(search) => segments.extend(
-                    load_named_scalar_segments(
-                        self.dataset.as_ref(),
-                        &search.column,
-                        &search.index_name,
-                    )
-                    .await?,
-                ),
-            }
-        }
-        overlay_staleness(
-            &self.dataset,
-            &segments,
-            self.fragments(),
-            OpaqueSegments::Covering,
-        )
-        .await
-    }
-
-    /// Re-read the stale rows from their current values and re-apply the whole predicate.
-    ///
-    /// These rows were withheld from the index result, so this is the only path that can surface
-    /// them.
-    ///
-    /// This is the third instance of the coverage split — and the one
-    /// [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage) cannot reach, because a scalar
-    /// index query is not a node in the logical plan: it is derived here, from predicates
-    /// DataFusion pushed into the leaf. Unifying it would mean giving the index query a logical
-    /// node of its own, which is a much larger change than this spike.
-    async fn stale_rows_branch(
-        &self,
-        rows: &RowAddrTreeMap,
-        filter: &Expr,
-        projection: Projection,
-        schema: &ArrowSchema,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let filter_columns = Planner::column_names_in_expr(filter);
-        let projection = projection.union_columns(filter_columns, OnMissing::Error)?;
-        let mut options = FilteredReadOptions::new(projection);
-        if let Some(fragments) = self.options.fragments.clone() {
-            options = options.with_fragments(fragments);
-        }
-        let read = Arc::new(FilteredReadExec::try_new(
-            self.dataset.clone(),
-            options,
-            Some(self.rows_as_index_input(rows)?),
-        )?);
-        let planner = Planner::new(read.schema());
-        let filtered = Arc::new(LanceFilterExec::try_new(
-            planner.optimize_expr(filter.clone())?,
-            read,
-        )?);
-        Ok(Arc::new(project(filtered, schema)?))
-    }
-
     async fn scan_impl(
         &self,
         projection: Option<&Vec<usize>>,
@@ -316,8 +297,10 @@ impl LanceScanSource {
             // stand-in. Matches `Scanner::filtered_read_source`.
             projection.with_row_addr = true;
         }
-        let user_projection = projection.clone();
-        let filter_plan = self.build_filter_plan(filters).await?;
+        let filter_plan = match self.options.filter_plan.clone() {
+            Some(filter_plan) => filter_plan,
+            None => self.build_filter_plan(filters).await?,
+        };
 
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
@@ -350,25 +333,16 @@ impl LanceScanSource {
             read_options = read_options.with_scan_range_before_filter(0..limit as u64)?;
         }
 
-        // Row-level index coverage: block the rows a data overlay has invalidated from the index
-        // result, and re-read them below. Row coverage, unlike the fragment coverage the rules
-        // handle, has to be resolved here — the scalar index query is derived in this method, not
-        // carried by a node.
-        let mut stale_rows = None;
-        if let Some(index_query) = filter_plan.index_query.as_ref()
-            && self.fragments().iter().any(|f| !f.overlays.is_empty())
-            && let OverlayStaleness::Rows(rows) = self.index_query_staleness(index_query).await?
-        {
+        if let Some(rows) = &self.options.overlay_block {
             read_options =
                 read_options.with_overlay_block(RowAddrMask::from_block(rows.as_ref().clone()));
-            stale_rows = Some(rows);
         }
 
         // A row restriction and a scalar-index query compete for the same slot, and
         // `restricted_to` has already turned the index off in that case.
         let index_input = match &self.options.rows {
             Some(rows) => Some(self.rows_as_index_input(rows)?),
-            None => filter_plan.index_query.clone().map(|index_query| {
+            None => filter_plan.index_query.map(|index_query| {
                 Arc::new(ScalarIndexExec::new(
                     self.dataset.clone(),
                     index_query,
@@ -377,25 +351,10 @@ impl LanceScanSource {
             }),
         };
 
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
+        Ok(Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
             read_options,
             index_input,
-        )?);
-
-        let Some(rows) = stale_rows else {
-            return Ok(plan);
-        };
-        let filter = filter_plan.full_expr.as_ref().ok_or_else(|| {
-            Error::internal("a scalar index query without a predicate to re-apply".to_string())
-        })?;
-        let stale_branch = self
-            .stale_rows_branch(&rows, filter, user_projection, plan.schema().as_ref())
-            .await?;
-        let unioned = UnionExec::try_new(vec![plan, stale_branch])?;
-        Ok(Arc::new(RepartitionExec::try_new(
-            unioned,
-            Partitioning::RoundRobinBatch(1),
         )?))
     }
 }

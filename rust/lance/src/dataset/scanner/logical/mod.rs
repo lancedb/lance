@@ -109,7 +109,7 @@ fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRul
     // the closest the spike gets to the doc's "each index plugin provides its own rules".
     rules.extend(fts::analyzer_rules(context));
     rules.extend::<Vec<Arc<dyn AnalyzerRule + Send + Sync>>>(vec![
-        Arc::new(rules::SplitOnIndexCoverage::new(context.clone())),
+        Arc::new(rules::SplitOnIndexCoverage::searches(context.clone())),
         // After the split, so the refine lands on the *indexed branch* of a partially-covered
         // search rather than above the union — the nesting the imperative path produces.
         Arc::new(rules::ExpandVectorRefine::new(context.clone())),
@@ -124,10 +124,18 @@ fn optimizer_rules(
     rules.extend::<Vec<Arc<dyn OptimizerRule + Send + Sync>>>(vec![
         Arc::new(SimplifyExpressions::new()),
         Arc::new(PushDownFilter::new()),
+        // The rest of this list is mandatory work that could not run in the analyzer, because each
+        // rule reads something `PushDownFilter` is what settles.
+        //
+        // Which predicates reached the leaf decides the scalar index query, and the index query
+        // decides the scan's coverage — so the split runs here for scans and in the analyzer for
+        // searches. Before `PushDownLimit`, so a limit is pushed into a union of branches rather
+        // than duplicated onto each of them.
+        Arc::new(rules::ResolveScalarIndexQuery::new(context.clone())),
+        Arc::new(rules::SplitOnIndexCoverage::scans(context.clone())),
         Arc::new(PushDownLimit::new()),
-        // After PushDownFilter, so the predicate has reached its final position. This rule is as
-        // mandatory as the analyzer ones, but it reads a *structural* fact — is there a predicate
-        // below the search — that pushdown is what settles, so it cannot run before the optimizer.
+        // Whether a predicate sits below the search is what makes it a prefilter, and pushdown is
+        // what moves it there.
         Arc::new(rules::ResolvePrefilterSource),
         Arc::new(OptimizeProjections::new()),
     ]);

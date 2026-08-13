@@ -27,6 +27,7 @@ use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
+use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DocumentGranularity;
 
 use super::fts::{self, FtsIndexInfo};
@@ -35,7 +36,7 @@ use crate::Result;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::translate_addr_treemap_to_row_ids;
 use crate::dataset::{Dataset, Scanner};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, ScalarIndexInfo};
 
 /// What a data overlay did to an index's entries.
 ///
@@ -160,6 +161,15 @@ pub struct ScanPlanningContext {
     /// Read settings for any take a rule introduces, so a rewrite cannot lose the scanner's
     /// fragment restriction.
     take_settings: TakeSettings,
+    /// What the filter parser needs to turn a predicate into a scalar index query. Already the
+    /// canonical instance of this whole pattern — see the module docs.
+    scalar_indices: Arc<ScalarIndexInfo>,
+    /// Row-level coverage for every index in the dataset, keyed by index name.
+    ///
+    /// Keyed by name rather than by column because that is how a scalar index query names what it
+    /// consulted. Empty unless some fragment carries an overlay, which is what keeps this off the
+    /// common path.
+    index_staleness: HashMap<String, OverlayStaleness>,
 }
 
 impl ScanPlanningContext {
@@ -209,13 +219,64 @@ impl ScanPlanningContext {
         )
         .await?;
 
+        let scalar_indices = Arc::new(dataset.scalar_index_info().await?);
+        let index_staleness = prefetch_index_staleness(&dataset, &fragments).await?;
+
         Ok(Self {
             fragments,
             vector,
             fts,
             fast_search: scanner.fast_search,
             take_settings: take_settings(scanner),
+            scalar_indices,
+            index_staleness,
         })
+    }
+
+    pub fn scalar_indices(&self) -> &ScalarIndexInfo {
+        &self.scalar_indices
+    }
+
+    /// Whether any fragment this scan will read carries a data overlay.
+    ///
+    /// The one check that keeps overlay handling off the common path, and the reason
+    /// [`Self::index_query_staleness`] can answer `None` without consulting anything.
+    pub fn has_overlays(&self) -> bool {
+        !self.index_staleness.is_empty()
+    }
+
+    /// The rows a scalar index query's results cannot be trusted for.
+    ///
+    /// A query may consult several indices, so this is the union of what each one lost. One
+    /// untrustworthy index poisons the whole query, since the results are combined before anything
+    /// can tell them apart.
+    pub fn index_query_staleness(&self, query: &ScalarIndexExpr) -> OverlayStaleness {
+        let mut stale = RowAddrTreeMap::new();
+        let mut found = false;
+        let mut queue = vec![query];
+        while let Some(expr) = queue.pop() {
+            match expr {
+                ScalarIndexExpr::Not(inner) => queue.push(inner),
+                ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
+                    queue.push(lhs);
+                    queue.push(rhs);
+                }
+                ScalarIndexExpr::Query(search) => {
+                    match self.index_staleness.get(&search.index_name) {
+                        Some(OverlayStaleness::Rows(rows)) => {
+                            stale |= rows.as_ref().clone();
+                            found = true;
+                        }
+                        Some(OverlayStaleness::Unknown) => return OverlayStaleness::Unknown,
+                        Some(OverlayStaleness::None) | None => {}
+                    }
+                }
+            }
+        }
+        match found {
+            true => OverlayStaleness::Rows(Arc::new(stale)),
+            false => OverlayStaleness::None,
+        }
     }
 
     pub fn vector_index(&self, column: &str) -> Option<&VectorIndexInfo> {
@@ -298,6 +359,38 @@ impl ScanPlanningContext {
                 .collect(),
         )
     }
+}
+
+/// Row-level coverage for every index in the dataset, keyed by index name.
+///
+/// Which indices a scan consults is not known until filter pushdown has settled, which is after
+/// every stage that is allowed to do I/O. Since the index list is short and this whole map is
+/// skipped unless an overlay exists, computing all of them up front is cheaper than an async hop
+/// later — and it is what lets the coverage split be one synchronous rule.
+async fn prefetch_index_staleness(
+    dataset: &Arc<Dataset>,
+    fragments: &[Fragment],
+) -> Result<HashMap<String, OverlayStaleness>> {
+    if overlaid_fragments(fragments).is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut segments: HashMap<String, Vec<IndexMetadata>> = HashMap::new();
+    for index in dataset.load_indices().await?.iter() {
+        segments
+            .entry(index.name.clone())
+            .or_default()
+            .push(index.clone());
+    }
+
+    let mut staleness = HashMap::with_capacity(segments.len());
+    for (name, segments) in segments {
+        staleness.insert(
+            name,
+            overlay_staleness(dataset, &segments, fragments, OpaqueSegments::Covering).await?,
+        );
+    }
+    Ok(staleness)
 }
 
 async fn load_vector_index(
