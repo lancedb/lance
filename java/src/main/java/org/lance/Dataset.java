@@ -484,6 +484,47 @@ public class Dataset implements Closeable {
       boolean namespaceClientManagedVersioning);
 
   /**
+   * List manifest locations without reading or deserializing the manifest contents.
+   *
+   * <p>The returned locations are not guaranteed to be ordered. This operation may list and
+   * materialize the full manifest history.
+   *
+   * <p>This method is for datasets whose committed manifests can be listed authoritatively from the
+   * object store. Namespace-managed tables, external version stores such as {@code s3+ddb}, and
+   * tables using a custom commit handler are not supported.
+   *
+   * @param uri dataset URI
+   * @return manifest locations
+   */
+  public static List<ManifestLocation> listManifestLocations(String uri) {
+    return listManifestLocations(uri, new HashMap<>());
+  }
+
+  /**
+   * List manifest locations without reading or deserializing the manifest contents.
+   *
+   * <p>The returned locations are not guaranteed to be ordered. This operation may list and
+   * materialize the full manifest history.
+   *
+   * <p>This method is for datasets whose committed manifests can be listed authoritatively from the
+   * object store. Namespace-managed tables, external version stores such as {@code s3+ddb}, and
+   * tables using a custom commit handler are not supported.
+   *
+   * @param uri dataset URI
+   * @param storageOptions object-store credentials and connection options
+   * @return manifest locations
+   */
+  public static List<ManifestLocation> listManifestLocations(
+      String uri, Map<String, String> storageOptions) {
+    Preconditions.checkNotNull(uri, "uri must not be null");
+    Preconditions.checkNotNull(storageOptions, "storageOptions must not be null");
+    return listManifestLocationsNative(uri, storageOptions);
+  }
+
+  private static native List<ManifestLocation> listManifestLocationsNative(
+      String uri, Map<String, String> storageOptions);
+
+  /**
    * Creates a builder for opening a dataset.
    *
    * <p>This builder supports opening datasets either directly from a URI or from a LanceNamespace.

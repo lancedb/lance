@@ -70,8 +70,6 @@ tracing.workspace = true
 tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
-chrono.workspace = true
-uuid.workspace = true
 async-channel = "2.3.1"
 rand_distr.workspace = true
 rangemap.workspace = true
@@ -87,6 +85,7 @@ lance-testing.workspace = true
 test-log.workspace = true
 rstest.workspace = true
 chrono.workspace = true
+uuid.workspace = true
 
 [features]
 geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-schema", "dep:geo-types"]
