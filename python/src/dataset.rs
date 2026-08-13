@@ -1661,6 +1661,29 @@ impl Dataset {
             .collect())
     }
 
+    fn take_blob_leaves_by_addresses(
+        self_: PyRef<'_, Self>,
+        requests: Vec<(u64, Vec<usize>)>,
+        blob_column: &str,
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
+        let requests = requests
+            .into_iter()
+            .map(|(row, index_path)| lance::dataset::BlobLeafRequest::new(row, index_path))
+            .collect::<Vec<_>>();
+        let blobs = rt()
+            .block_on(
+                Some(self_.py()),
+                self_
+                    .ds
+                    .take_blob_leaves_by_addresses(&requests, blob_column),
+            )?
+            .infer_error()?;
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
+    }
+
     fn take_blobs_by_indices(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,

@@ -2286,6 +2286,37 @@ class LanceDataset(pa.dataset.Dataset):
             for lance_blob_file in lance_blob_files
         ]
 
+    def take_blob_leaves_by_addresses(
+        self,
+        blob_column: str,
+        requests: Sequence[Tuple[int, Sequence[int]]],
+    ) -> List[Optional[BlobFile]]:
+        """
+        Select blobs within nested list values by row address and index path.
+
+        Parameters
+        ----------
+        blob_column : str
+            A ``List`` or ``LargeList`` column with Blob v2 leaf values.
+        requests : Sequence[Tuple[int, Sequence[int]]]
+            ``(row_address, index_path)`` pairs. Each index path contains one
+            zero-based index per nested list level.
+
+        Returns
+        -------
+        blob_files : List[Optional[BlobFile]]
+            One result per request, in request order. Null values return
+            ``None``.
+        """
+        lance_blob_files = self._ds.take_blob_leaves_by_addresses(
+            [(row, list(index_path)) for row, index_path in requests],
+            blob_column,
+        )
+        return [
+            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            for lance_blob_file in lance_blob_files
+        ]
+
     def read_blobs(
         self,
         blob_column: str,

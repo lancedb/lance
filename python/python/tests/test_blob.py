@@ -2369,6 +2369,34 @@ def test_write_list_struct_nested_blob_v2(tmp_path):
     assert blobs.to_pylist() == [b"first", b"second", None]
 
 
+def test_take_blob_leaves_by_addresses(tmp_path):
+    blob_values = lance.blob_array([b"first", b"second", None])
+    blobs = pa.ListArray.from_arrays(pa.array([0, 2, 3]), blob_values)
+    dataset = lance.write_dataset(
+        pa.table({"blobs": blobs}),
+        tmp_path / "list_blob_v2",
+        data_storage_version="2.2",
+    )
+    addresses = (
+        dataset.to_table(columns=[], with_row_address=True)
+        .column("_rowaddr")
+        .to_pylist()
+    )
+
+    leaves = dataset.take_blob_leaves_by_addresses(
+        "blobs",
+        [
+            (addresses[0], [1]),
+            (addresses[0], [0]),
+            (addresses[1], [0]),
+        ],
+    )
+
+    assert leaves[0].read() == b"second"
+    assert leaves[1].read() == b"first"
+    assert leaves[2] is None
+
+
 def test_to_pandas_returns_blob_files_for_projected_nested_fields(
     dataset_with_nested_blobs,
 ):

@@ -436,6 +436,11 @@ class _Dataset:
         row_addresses: List[int],
         blob_column: str,
     ) -> List[Optional[LanceBlobFile]]: ...
+    def take_blob_leaves_by_addresses(
+        self,
+        requests: List[Tuple[int, List[int]]],
+        blob_column: str,
+    ) -> List[Optional[LanceBlobFile]]: ...
     def take_blobs_by_indices(
         self,
         row_indices: List[int],
