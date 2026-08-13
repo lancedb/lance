@@ -624,6 +624,26 @@ async fn test_shallow_clone_reuses_base_object_store() {
         "dataset clones must share the base object store cache"
     );
 
+    // Rebinding wrappers must not reuse the pre-wrap base store.
+    let tracker = Arc::new(IOTracker::default());
+    let wrapped =
+        cloned.with_object_store_wrappers(vec![tracker.clone() as Arc<dyn WrappingObjectStore>]);
+    let wrapped_store = wrapped.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&first, &wrapped_store),
+        "wrapper rebinding must start from a fresh base store cache"
+    );
+
+    // Concurrent first resolutions coalesce onto a single store.
+    let fresh = DatasetBuilder::from_uri(&clone_uri).load().await.unwrap();
+    let stores = futures::future::try_join_all((0..8).map(|_| fresh.object_store(Some(base_id))))
+        .await
+        .unwrap();
+    assert!(
+        stores.iter().all(|store| Arc::ptr_eq(store, &stores[0])),
+        "concurrent resolutions must share one store"
+    );
+
     // Reads through the cached store still work.
     let read = cloned.scan().try_into_batch().await.unwrap();
     assert_eq!(read.num_rows(), 64);

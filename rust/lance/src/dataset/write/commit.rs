@@ -482,6 +482,7 @@ impl<'a> CommitBuilder<'a> {
                 manifest_location,
                 session,
                 fragment_bitmap,
+                base_object_stores: Default::default(),
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => {
@@ -510,7 +511,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
-                    base_object_stores: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    base_object_stores: Default::default(),
                 })
             }
         }

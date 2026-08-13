@@ -199,8 +199,13 @@ pub struct Dataset {
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     /// Object stores for additional base paths, resolved on first use and
     /// shared across clones of this dataset.
-    pub(crate) base_object_stores: Arc<std::sync::Mutex<HashMap<u32, Arc<ObjectStore>>>>,
+    pub(crate) base_object_stores: BaseObjectStores,
 }
+
+/// The `OnceCell` coalesces concurrent first resolutions of a base into a
+/// single store build.
+pub(crate) type BaseObjectStores =
+    Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<Arc<ObjectStore>>>>>>;
 
 impl std::fmt::Debug for Dataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -504,6 +509,7 @@ impl Dataset {
         let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = manifest;
         self.manifest_location = manifest_location;
+        self.base_object_stores = Default::default();
         self.fragment_bitmap = Arc::new(
             self.manifest
                 .fragments
@@ -868,7 +874,7 @@ impl Dataset {
             file_reader_options,
             store_params: store_params.map(Box::new),
             base_store_params,
-            base_object_stores: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            base_object_stores: Default::default(),
         })
     }
 
@@ -1634,6 +1640,7 @@ impl Dataset {
 
         self.manifest = Arc::new(manifest);
         self.manifest_location = manifest_location;
+        self.base_object_stores = Default::default();
         self.fragment_bitmap = Arc::new(
             self.manifest
                 .fragments
@@ -2026,6 +2033,7 @@ impl Dataset {
     ) -> Self {
         let mut cloned = self.clone();
         cloned.object_store = object_store;
+        cloned.base_object_stores = Default::default();
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
         }
@@ -2047,6 +2055,7 @@ impl Dataset {
         }
 
         let mut cloned = self.clone();
+        cloned.base_object_stores = Default::default();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
             object_store.inner =
@@ -2415,29 +2424,26 @@ impl Dataset {
     }
 
     async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
-        if let Some(store) = self.base_object_stores.lock().unwrap().get(&base_id) {
-            return Ok(store.clone());
-        }
-
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
-        let store_params = self.store_params_for_base(Some(base_path));
-
-        let (store, _) = ObjectStore::from_uri_and_params(
-            self.session.store_registry(),
-            &base_path.path,
-            &store_params,
-        )
-        .await?;
-
-        Ok(self
-            .base_object_stores
-            .lock()
-            .unwrap()
-            .entry(base_id)
-            .or_insert(store)
-            .clone())
+        let cell = {
+            let mut stores = self.base_object_stores.lock().unwrap();
+            stores.entry(base_id).or_default().clone()
+        };
+        let store = cell
+            .get_or_try_init(|| async {
+                let store_params = self.store_params_for_base(Some(base_path));
+                let (store, _) = ObjectStore::from_uri_and_params(
+                    self.session.store_registry(),
+                    &base_path.path,
+                    &store_params,
+                )
+                .await?;
+                Ok::<_, Error>(store)
+            })
+            .await?;
+        Ok(store.clone())
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
