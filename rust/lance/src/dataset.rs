@@ -224,6 +224,14 @@ pub struct Version {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// A lightweight reference to an attached dataset version, which could be used to uniquely identify a version.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct VersionRef {
+    /// Version number within the current branch's history.
+    pub version: u64,
+}
+
 /// Convert Manifest to Data Version.
 impl From<&Manifest> for Version {
     fn from(m: &Manifest) -> Self {
@@ -2553,6 +2561,37 @@ impl Dataset {
         // TODO: this API should support pagination
         versions.sort_by_key(|v| v.version);
 
+        Ok(versions)
+    }
+
+    /// Get the number of versions in the current version history.
+    ///
+    /// Unlike [`Self::versions`], this only enumerates manifest locations and does not read or
+    /// deserialize every manifest.
+    pub async fn count_versions(&self) -> Result<u64> {
+        self.commit_handler
+            .list_manifest_locations(&self.base, &self.object_store, false)
+            .try_fold(0_u64, |count, _| async move { Ok(count + 1) })
+            .await
+    }
+
+    /// List lightweight references to all attached versions in the current branch's history.
+    ///
+    /// Unlike [`Self::versions`], this only enumerates manifest locations and does not read or
+    /// deserialize every manifest. The references are sorted by version in ascending order.
+    /// Detached manifests are excluded; see [`Self::list_detached_manifests`].
+    ///
+    /// Use [`Self::latest_version_id`] instead when only the latest version is needed.
+    pub async fn version_refs(&self) -> Result<Vec<VersionRef>> {
+        let mut versions: Vec<_> = self
+            .commit_handler
+            .list_manifest_locations(&self.base, &self.object_store, false)
+            .map_ok(|location| VersionRef {
+                version: location.version,
+            })
+            .try_collect()
+            .await?;
+        versions.sort_unstable_by_key(|version| version.version);
         Ok(versions)
     }
 

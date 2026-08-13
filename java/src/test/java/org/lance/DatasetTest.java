@@ -188,6 +188,30 @@ public class DatasetTest {
   }
 
   @Test
+  void testListManifestLocations(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("manifest_locations").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 1).close();
+
+      List<ManifestLocation> manifests = Dataset.listManifestLocations(datasetPath);
+      assertEquals(2, manifests.size());
+      assertEquals(
+          Set.of(1L, 2L),
+          manifests.stream().map(ManifestLocation::getVersion).collect(Collectors.toSet()));
+      for (ManifestLocation manifest : manifests) {
+        assertTrue(manifest.getPath().contains("manifest_locations/_versions/"));
+        assertFalse(manifest.getPath().startsWith("_versions/"));
+        assertTrue(manifest.getPath().endsWith(".manifest"));
+        assertTrue(manifest.getSizeBytes() > 0);
+        assertNotNull(manifest.getNamingScheme());
+      }
+    }
+  }
+
+  @Test
   void testCreateDirNotExist(@TempDir Path tempDir) throws IOException, URISyntaxException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -281,6 +305,9 @@ public class DatasetTest {
 
             List<Version> versions = dataset.listVersions();
             assertEquals(3, versions.size());
+            assertEquals(3, dataset.getVersionCount());
+            assertEquals(3, dataset2.getVersionCount());
+            assertEquals(3, dataset3.getVersionCount());
             assertEquals(1, versions.get(0).getId());
             assertEquals(2, versions.get(1).getId());
             assertEquals(3, versions.get(2).getId());
