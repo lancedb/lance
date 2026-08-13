@@ -3867,7 +3867,6 @@ dependencies = [
  "jsonb",
  "lance-arrow",
  "lance-core",
- "lance-datagen",
  "lance-geo",
  "log",
  "pin-project",
@@ -3875,23 +3874,6 @@ dependencies = [
  "prost-build",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "lance-datagen"
-version = "11.0.0-beta.6"
-dependencies = [
- "arrow",
- "arrow-array",
- "arrow-cast",
- "arrow-schema",
- "chrono",
- "futures",
- "half",
- "hex",
- "rand 0.9.5",
- "rand_distr",
- "rand_xoshiro",
 ]
 
 [[package]]
@@ -4019,7 +4001,6 @@ dependencies = [
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
- "lance-datagen",
  "lance-encoding",
  "lance-file",
  "lance-geo",
