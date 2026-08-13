@@ -58,6 +58,7 @@ use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOption
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::iter::empty;
@@ -126,6 +127,30 @@ impl BlockingDataset {
                 .map_err(|e| Error::io_error(e.to_string()))
         })
     }
+
+    pub fn list_manifest_locations(
+        uri: &str,
+        storage_options: HashMap<String, String>,
+    ) -> Result<Vec<ManifestLocation>> {
+        let accessor = (!storage_options.is_empty()).then(|| {
+            Arc::new(lance::io::StorageOptionsAccessor::with_static_options(
+                storage_options,
+            ))
+        });
+        let params = ReadParams {
+            store_options: Some(ObjectStoreParams {
+                storage_options_accessor: accessor,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(block_on(
+            DatasetBuilder::from_uri(uri)
+                .with_read_params(params)
+                .list_manifest_locations(),
+        )?)
+    }
+
     pub fn write(
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
@@ -789,6 +814,34 @@ impl IntoJava for Version {
     }
 }
 
+impl IntoJava for ManifestLocation {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let size = self.size.ok_or_else(|| {
+            Error::runtime_error(format!("Manifest size is unavailable for {}", self.path))
+        })?;
+        let path = env.new_string(self.path.to_string())?;
+        let naming_scheme = env.new_string(match self.naming_scheme {
+            ManifestNamingScheme::V1 => "V1",
+            ManifestNamingScheme::V2 => "V2",
+        })?;
+        let e_tag = match self.e_tag {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+        Ok(env.new_object(
+            "org/lance/ManifestLocation",
+            "(JLjava/lang/String;JLjava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Long(self.version as i64),
+                JValue::Object(&path),
+                JValue::Long(size as i64),
+                JValue::Object(&naming_scheme),
+                JValue::Object(&e_tag),
+            ],
+        )?)
+    }
+}
+
 fn attach_native_dataset<'local>(
     env: &mut JNIEnv<'local>,
     dataset: BlockingDataset,
@@ -1380,6 +1433,44 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             namespace_client_managed_versioning != 0,
         )
     )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_listManifestLocationsNative<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString,
+    storage_options_obj: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_list_manifest_locations(&mut env, path, storage_options_obj)
+    )
+}
+
+fn inner_list_manifest_locations<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString,
+    storage_options_obj: JObject,
+) -> Result<JObject<'local>> {
+    let path: String = path.extract(env)?;
+    let storage_options = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options = to_rust_map(env, &storage_options)?;
+    let locations = BlockingDataset::list_manifest_locations(&path, storage_options)?;
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for location in locations {
+        env.with_local_frame(8, |env| {
+            let java_location = location.into_java(env)?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&java_location)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3176,6 +3267,22 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let max_source_rows = env
+        .call_method(
+            &java_options,
+            "getMaxSourceRows",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_source_bytes = env
+        .call_method(
+            &java_options,
+            "getMaxSourceBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3190,6 +3297,8 @@ fn convert_java_compaction_options_to_rust(
         &compaction_mode,
         &binary_copy_read_batch_bytes,
         &max_source_fragments,
+        &max_source_rows,
+        &max_source_bytes,
         config,
     )
 }
