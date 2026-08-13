@@ -44,7 +44,8 @@ use lance_table::{
     format::{
         BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
         RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-        overlay::DataOverlayFile, pb,
+        overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID},
+        pb,
     },
     io::{
         commit::CommitHandler,
@@ -5509,11 +5510,42 @@ fn exact_merge_data_file_persistently_eq(left: &DataFile, right: &DataFile) -> b
         && left.base_id == right.base_id
 }
 
+/// Candidate-shape comparison for one protected (non-output or mixed) data file.
+///
+/// Path, column indices, file version, base_id, and field-vector length/order
+/// stay exact. `file_size_bytes` is ignored. A source slot covered by the
+/// expanded output subtree may keep its original field ID or become
+/// [`TOMBSTONE_FIELD_ID`]; every other slot, including existing tombstones,
+/// must stay equal. Used only after source-basis matching; that equality
+/// remains byte-for-byte / persistent-identity strict.
+fn exact_merge_candidate_data_file_shape_eq(
+    source: &DataFile,
+    candidate: &DataFile,
+    output_coverage: &HashSet<i32>,
+) -> bool {
+    source.path == candidate.path
+        && source.column_indices == candidate.column_indices
+        && source.file_major_version == candidate.file_major_version
+        && source.file_minor_version == candidate.file_minor_version
+        && source.base_id == candidate.base_id
+        && source.fields.len() == candidate.fields.len()
+        && source.fields.iter().zip(candidate.fields.iter()).all(
+            |(source_field, candidate_field)| {
+                if output_coverage.contains(source_field) {
+                    *candidate_field == *source_field || *candidate_field == TOMBSTONE_FIELD_ID
+                } else {
+                    candidate_field == source_field
+                }
+            },
+        )
+}
+
 /// Validate that an ExactMerge candidate preserves source fragment/row
 /// membership and order, and only mutates schema/data under declared output
 /// roots. Non-output schema skeleton, fragment ID sequence, and non-output /
-/// mixed base-file and overlay sequences must match by ordered persistent
-/// identity; output-only entries may change freely.
+/// mixed base-file and overlay sequences stay at the same ordered identity;
+/// mixed files may tombstone covered output slots in place. Output-only
+/// entries may change freely.
 fn validate_exact_merge_candidate_shape(
     source_schema: &Schema,
     source_fragments: &[Fragment],
@@ -5664,8 +5696,8 @@ fn validate_exact_merge_candidate_files_shape(
     fragment_id: u64,
 ) -> Result<()> {
     // Output-only entries may be inserted, replaced, removed, or reordered.
-    // Everything else (non-output and mixed) forms an ordered persistent-identity
-    // sequence that must match exactly.
+    // Non-output and mixed files keep ordered identity; mixed files may
+    // tombstone covered output slots in place.
     let source_protected: Vec<&DataFile> = source_files
         .iter()
         .filter(|file| !data_file_only_output(file, output_coverage))
@@ -5685,7 +5717,7 @@ fn validate_exact_merge_candidate_files_shape(
     }
 
     for (source_file, candidate_file) in source_protected.iter().zip(candidate_protected.iter()) {
-        if !exact_merge_data_file_persistently_eq(source_file, candidate_file) {
+        if !exact_merge_candidate_data_file_shape_eq(source_file, candidate_file, output_coverage) {
             return Err(Error::invalid_input(format!(
                 "ExactMerge candidate changed or reordered protected data file {:?} \
                  in fragment {fragment_id}",
@@ -5703,8 +5735,9 @@ fn validate_exact_merge_candidate_overlays_shape(
     fragment_id: u64,
 ) -> Result<()> {
     // Overlay list position is significant (committed_version tie-break).
-    // Output-only overlays may change freely; protected overlays must keep
-    // exact ordered persistent identity.
+    // Output-only overlays may change freely; protected overlays keep ordered
+    // identity, coverage, and committed_version. Mixed overlays may tombstone
+    // covered nested-file slots in place.
     let source_protected: Vec<&DataOverlayFile> = source_overlays
         .iter()
         .filter(|overlay| !data_file_only_output(&overlay.data_file, output_coverage))
@@ -5726,7 +5759,13 @@ fn validate_exact_merge_candidate_overlays_shape(
     for (source_overlay, candidate_overlay) in
         source_protected.iter().zip(candidate_protected.iter())
     {
-        if !exact_merge_overlay_persistently_eq(source_overlay, candidate_overlay) {
+        if !exact_merge_candidate_data_file_shape_eq(
+            &source_overlay.data_file,
+            &candidate_overlay.data_file,
+            output_coverage,
+        ) || source_overlay.coverage != candidate_overlay.coverage
+            || source_overlay.committed_version != candidate_overlay.committed_version
+        {
             return Err(Error::invalid_input(format!(
                 "ExactMerge candidate changed or reordered protected overlay {:?} \
                  in fragment {fragment_id}",
@@ -5807,7 +5846,7 @@ mod tests {
     use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
-    use lance_table::format::overlay::OverlayCoverage;
+    use lance_table::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
     use lance_table::format::{
         RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
     };
@@ -9564,6 +9603,303 @@ mod tests {
                 .map(String::as_str),
             Some("stale"),
             "input Manifest must not be mutated by a successful apply"
+        );
+    }
+
+    fn exact_merge_two_field_schema() -> Schema {
+        Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, true),
+        ]))
+        .unwrap()
+    }
+
+    fn exact_merge_fragment(files: Vec<DataFile>, overlays: Vec<DataOverlayFile>) -> Fragment {
+        Fragment {
+            id: 0,
+            files,
+            overlays,
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(4),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }
+    }
+
+    fn exact_merge_tip(schema: Schema, fragment: Fragment) -> Manifest {
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.version = 7;
+        manifest
+    }
+
+    fn exact_merge_replace_name(
+        source_fragment: Fragment,
+        candidate_fragment: Fragment,
+    ) -> Operation {
+        let schema = exact_merge_two_field_schema();
+        Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: schema.clone(),
+                source_fragments: vec![source_fragment],
+                input_field_ids: vec![0],
+                output_field_ids: vec![1],
+            },
+            fragments: vec![candidate_fragment],
+            schema,
+        }
+    }
+
+    /// Existing-column replacement may keep a mixed base file at the same
+    /// protected identity while tombstoning only declared output slots and
+    /// appending an output-only file.
+    #[test]
+    fn test_exact_merge_candidate_allows_tombstoned_output_slots_in_mixed_data_file() {
+        let mut mixed = DataFile::new_legacy_from_fields("mixed.lance", vec![0, 1], None);
+        mixed.file_size_bytes = CachedFileSize::new(4096);
+        let source = exact_merge_fragment(vec![mixed.clone()], vec![]);
+
+        let mut tombstoned = mixed;
+        tombstoned.fields = Arc::from([0, TOMBSTONE_FIELD_ID]);
+        tombstoned.file_size_bytes = CachedFileSize::new(8192);
+        let candidate = exact_merge_fragment(
+            vec![
+                tombstoned,
+                DataFile::new_legacy_from_fields("out.lance", vec![1], None),
+            ],
+            vec![],
+        );
+
+        validate_operation(
+            Some(&exact_merge_tip(
+                exact_merge_two_field_schema(),
+                source.clone(),
+            )),
+            &exact_merge_replace_name(source, candidate),
+        )
+        .expect(
+            "mixed base file may tombstone covered output slots and append an output-only file",
+        );
+    }
+
+    /// The same directional slot rule applies to a mixed overlay: covered
+    /// nested-file slots may become the tombstone sentinel while coverage and
+    /// committed_version stay exact.
+    #[test]
+    fn test_exact_merge_candidate_allows_tombstoned_output_slots_in_mixed_overlay() {
+        let base = DataFile::new_legacy_from_fields("id.lance", vec![0], None);
+        let mixed_overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("ov-mixed.lance", vec![0, 1], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32, 1, 2, 3])),
+            committed_version: 5,
+        };
+        let source = exact_merge_fragment(vec![base.clone()], vec![mixed_overlay.clone()]);
+
+        let mut tombstoned_overlay = mixed_overlay;
+        tombstoned_overlay.data_file.fields = Arc::from([0, TOMBSTONE_FIELD_ID]);
+        let candidate = exact_merge_fragment(
+            vec![
+                base,
+                DataFile::new_legacy_from_fields("out.lance", vec![1], None),
+            ],
+            vec![tombstoned_overlay],
+        );
+
+        validate_operation(
+            Some(&exact_merge_tip(
+                exact_merge_two_field_schema(),
+                source.clone(),
+            )),
+            &exact_merge_replace_name(source, candidate),
+        )
+        .expect(
+            "mixed overlay may tombstone covered output slots while coverage and version stay exact",
+        );
+    }
+
+    /// Covered mixed-file/overlay slots may only stay equal or become `-2`.
+    /// Identity, length/order, protected slots, overlay coverage/version, and
+    /// protected sequence membership remain exact.
+    #[test]
+    fn test_exact_merge_candidate_rejects_mixed_file_and_overlay_slot_mutations() {
+        let mixed = DataFile::new_legacy_from_fields("mixed.lance", vec![0, 1], None);
+        let source_file = exact_merge_fragment(vec![mixed.clone()], vec![]);
+        let mut tombstoned_mixed = mixed.clone();
+        tombstoned_mixed.fields = Arc::from([0, TOMBSTONE_FIELD_ID]);
+        let out = DataFile::new_legacy_from_fields("out.lance", vec![1], None);
+        let valid_file = exact_merge_fragment(vec![tombstoned_mixed.clone(), out.clone()], vec![]);
+        let file_tip = exact_merge_tip(exact_merge_two_field_schema(), source_file.clone());
+
+        let base = DataFile::new_legacy_from_fields("id.lance", vec![0], None);
+        let mixed_overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("ov-mixed.lance", vec![0, 1], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32, 1, 2, 3])),
+            committed_version: 5,
+        };
+        let source_overlay = exact_merge_fragment(vec![base.clone()], vec![mixed_overlay.clone()]);
+        let mut tombstoned_overlay = mixed_overlay;
+        tombstoned_overlay.data_file.fields = Arc::from([0, TOMBSTONE_FIELD_ID]);
+        let valid_overlay = exact_merge_fragment(vec![base, out.clone()], vec![tombstoned_overlay]);
+        let overlay_tip = exact_merge_tip(exact_merge_two_field_schema(), source_overlay.clone());
+
+        let file_op =
+            |candidate: Fragment| exact_merge_replace_name(source_file.clone(), candidate);
+        let overlay_op =
+            |candidate: Fragment| exact_merge_replace_name(source_overlay.clone(), candidate);
+
+        let mutate_file = |mutate: fn(&mut DataFile)| {
+            let mut candidate = valid_file.clone();
+            mutate(&mut candidate.files[0]);
+            file_op(candidate)
+        };
+        let mutate_overlay_file = |mutate: fn(&mut DataFile)| {
+            let mut candidate = valid_overlay.clone();
+            mutate(&mut candidate.overlays[0].data_file);
+            overlay_op(candidate)
+        };
+
+        let three_field = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, true),
+            ArrowField::new("score", DataType::Float32, true),
+        ]))
+        .unwrap();
+        let mut relabeled = valid_file.clone();
+        relabeled.files[0].fields = Arc::from([0, 2]);
+        let relabel_op = Operation::ExactMerge {
+            basis: ExactMergeBasis {
+                source_schema: exact_merge_two_field_schema(),
+                source_fragments: vec![source_file.clone()],
+                input_field_ids: vec![0],
+                output_field_ids: vec![1, 2],
+            },
+            fragments: vec![relabeled],
+            schema: three_field,
+        };
+
+        let mut inserted_mixed = valid_file.clone();
+        inserted_mixed.files.insert(
+            1,
+            DataFile::new_legacy_from_fields("new-mixed.lance", vec![0, 1], None),
+        );
+
+        let other = DataFile::new_legacy_from_fields("id.lance", vec![0], None);
+        let source_two = exact_merge_fragment(vec![mixed, other.clone()], vec![]);
+        let swapped = exact_merge_fragment(vec![other, tombstoned_mixed, out], vec![]);
+        let swap_tip = exact_merge_tip(exact_merge_two_field_schema(), source_two.clone());
+
+        let mut overlay_coverage = valid_overlay.clone();
+        overlay_coverage.overlays[0].coverage =
+            OverlayCoverage::dense(RoaringBitmap::from_iter([0u32]));
+        let mut overlay_version = valid_overlay.clone();
+        overlay_version.overlays[0].committed_version = 6;
+
+        let cases: Vec<(&str, Manifest, Operation)> = vec![
+            (
+                "tombstoned_non_output_slot",
+                file_tip.clone(),
+                mutate_file(|file| {
+                    file.fields = Arc::from([TOMBSTONE_FIELD_ID, 1]);
+                }),
+            ),
+            (
+                "covered_slot_relabeled_to_other_output_id",
+                file_tip.clone(),
+                relabel_op,
+            ),
+            (
+                "field_removal",
+                file_tip.clone(),
+                mutate_file(|file| {
+                    file.fields = Arc::from([0]);
+                }),
+            ),
+            (
+                "field_insertion",
+                file_tip.clone(),
+                mutate_file(|file| {
+                    file.fields = Arc::from([0, TOMBSTONE_FIELD_ID, 1]);
+                }),
+            ),
+            (
+                "field_reorder",
+                file_tip.clone(),
+                mutate_file(|file| {
+                    file.fields = Arc::from([TOMBSTONE_FIELD_ID, 0]);
+                }),
+            ),
+            (
+                "path_change",
+                file_tip.clone(),
+                mutate_file(|file| {
+                    file.path = "mixed-renamed.lance".to_string();
+                }),
+            ),
+            (
+                "column_indices_change",
+                file_tip.clone(),
+                mutate_file(|file| {
+                    file.column_indices = Arc::from([0, 1]);
+                }),
+            ),
+            (
+                "file_version_change",
+                file_tip.clone(),
+                mutate_file(|file| {
+                    file.file_minor_version = file.file_minor_version.saturating_add(1);
+                }),
+            ),
+            (
+                "base_id_change",
+                file_tip.clone(),
+                mutate_file(|file| {
+                    file.base_id = Some(1);
+                }),
+            ),
+            ("new_mixed_file", file_tip, file_op(inserted_mixed)),
+            (
+                "protected_sequence_mutation",
+                swap_tip,
+                exact_merge_replace_name(source_two, swapped),
+            ),
+            (
+                "mixed_overlay_non_output_slot_tombstoned",
+                overlay_tip.clone(),
+                mutate_overlay_file(|file| {
+                    file.fields = Arc::from([TOMBSTONE_FIELD_ID, TOMBSTONE_FIELD_ID]);
+                }),
+            ),
+            (
+                "mixed_overlay_coverage_change",
+                overlay_tip.clone(),
+                overlay_op(overlay_coverage),
+            ),
+            (
+                "mixed_overlay_committed_version_change",
+                overlay_tip,
+                overlay_op(overlay_version),
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (name, tip, operation) in cases {
+            match validate_operation(Some(&tip), &operation) {
+                Ok(()) => failures.push(format!("{name}: expected InvalidInput, got Ok(())")),
+                Err(err) if !matches!(err, Error::InvalidInput { .. }) => {
+                    failures.push(format!("{name}: expected InvalidInput, got {err:?}"))
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "ExactMerge mixed candidate-shape gaps:\n{}",
+            failures.join("\n")
         );
     }
 
