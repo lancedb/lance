@@ -9,7 +9,9 @@ use std::{
 use super::fragment::FileFragment;
 use super::{
     Dataset,
-    transaction::{ExactMergeBasis, Operation, Transaction, validate_exact_merge_field_ids},
+    transaction::{
+        ExactMergeBasis, Operation, Transaction, TransactionBuilder, validate_exact_merge_field_ids,
+    },
     write::cleanup_data_fragments,
 };
 use crate::index::DatasetIndexExt;
@@ -459,6 +461,12 @@ pub(super) fn merge_introduces_required_field(old: &Schema, merged: &Schema) -> 
 /// entry on a newly staged top-level field before commit. The mutation stays
 /// on this in-process candidate until a successful commit.
 ///
+/// Use [`Self::with_transaction_properties`] to attach generic key-value
+/// metadata to the transaction created by commit. Lance does not interpret
+/// the keys or values. Properties are persisted with that transaction and
+/// should not contain secrets. The builder call does not publish; dropping
+/// a configured handle remains invisible.
+///
 /// This type intentionally does not implement [`Clone`]: commit consumes the
 /// handle so the safe API publishes at most once.
 #[must_use = "staged columns are not published until commit()/commit_exact(); drop abandons without publishing"]
@@ -468,6 +476,7 @@ pub struct StagedAddColumns {
     fragments: Vec<Fragment>,
     schema: Schema,
     preserves_nullability: bool,
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl StagedAddColumns {
@@ -535,6 +544,32 @@ impl StagedAddColumns {
         }
     }
 
+    /// Attach generic key-value metadata to the transaction created by commit.
+    ///
+    /// Lance does not interpret the keys or values. The map is persisted with
+    /// the transaction and becomes visible only after a successful
+    /// [`Self::commit`] or [`Self::commit_exact`]. Calling this method does not
+    /// publish the candidate or change the source [`Dataset`]. Dropping the
+    /// configured handle remains invisible.
+    ///
+    /// Properties should not contain secrets.
+    ///
+    /// ```
+    /// # use std::collections::HashMap;
+    /// # use lance::dataset::StagedAddColumns;
+    /// # fn example(staged: StagedAddColumns) -> StagedAddColumns {
+    /// let mut properties = HashMap::new();
+    /// properties.insert("logical_op".into(), "add_columns".into());
+    /// staged.with_transaction_properties(properties)
+    /// # }
+    /// ```
+    pub fn with_transaction_properties(self, properties: HashMap<String, String>) -> Self {
+        Self {
+            transaction_properties: Some(Arc::new(properties)),
+            ..self
+        }
+    }
+
     /// Consume this handle and publish the staged columns with ordinary Merge
     /// concurrency semantics.
     ///
@@ -552,13 +587,16 @@ impl StagedAddColumns {
             fragments,
             schema,
             preserves_nullability,
+            transaction_properties,
         } = self;
         let operation = Operation::Merge {
             fragments,
             schema,
             preserves_nullability,
         };
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+            .transaction_properties(transaction_properties)
+            .build();
         // Once the manifest commit has been attempted, an error does not prove
         // that the new files are unreferenced: the commit may have landed and
         // only its response (or a post-commit callback) may have failed. Leave
@@ -592,6 +630,7 @@ impl StagedAddColumns {
             fragments,
             schema,
             preserves_nullability: _,
+            transaction_properties,
         } = self;
         let source_schema = dataset.schema().clone();
         let source_fragments = dataset.manifest.fragments.as_ref().to_vec();
@@ -606,7 +645,9 @@ impl StagedAddColumns {
             fragments,
             schema,
         };
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+            .transaction_properties(transaction_properties)
+            .build();
         // Same ambiguous-outcome policy as [`Self::commit`]: never delete
         // candidate files after a commit attempt.
         dataset
@@ -642,6 +683,7 @@ pub(super) async fn stage_add_columns(
         fragments,
         schema,
         preserves_nullability,
+        transaction_properties: None,
     })
 }
 
@@ -668,6 +710,12 @@ pub(super) async fn add_columns(
 /// source snapshot and the handle-owned output ID. The handle is not
 /// serializable and has no persistent staging ID.
 ///
+/// Use [`Self::with_transaction_properties`] to attach generic key-value
+/// metadata to the transaction created by commit. Lance does not interpret
+/// the keys or values. Properties are persisted with that transaction and
+/// should not contain secrets. The builder call does not publish; dropping
+/// a configured handle remains invisible.
+///
 /// This type intentionally does not implement [`Clone`]: commit consumes the
 /// handle so the safe API publishes at most once.
 #[must_use = "staged replacement is not published until commit_exact(); drop abandons without publishing"]
@@ -677,6 +725,7 @@ pub struct StagedReplaceColumn {
     fragments: Vec<Fragment>,
     schema: Schema,
     output_field_id: i32,
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl StagedReplaceColumn {
@@ -686,6 +735,32 @@ impl StagedReplaceColumn {
     /// [`Self::commit_exact`] succeeds.
     pub fn candidate_schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Attach generic key-value metadata to the transaction created by commit.
+    ///
+    /// Lance does not interpret the keys or values. The map is persisted with
+    /// the transaction and becomes visible only after a successful
+    /// [`Self::commit_exact`]. Calling this method does not publish the
+    /// candidate or change the source [`Dataset`]. Dropping the configured
+    /// handle remains invisible.
+    ///
+    /// Properties should not contain secrets.
+    ///
+    /// ```
+    /// # use std::collections::HashMap;
+    /// # use lance::dataset::StagedReplaceColumn;
+    /// # fn example(staged: StagedReplaceColumn) -> StagedReplaceColumn {
+    /// let mut properties = HashMap::new();
+    /// properties.insert("logical_op".into(), "replace_column".into());
+    /// staged.with_transaction_properties(properties)
+    /// # }
+    /// ```
+    pub fn with_transaction_properties(self, properties: HashMap<String, String>) -> Self {
+        Self {
+            transaction_properties: Some(Arc::new(properties)),
+            ..self
+        }
     }
 
     /// Consume this handle and publish with exact source-basis fencing.
@@ -706,6 +781,7 @@ impl StagedReplaceColumn {
             fragments,
             schema,
             output_field_id,
+            transaction_properties,
         } = self;
         let source_schema = dataset.schema().clone();
         let source_fragments = dataset.manifest.fragments.as_ref().to_vec();
@@ -726,7 +802,9 @@ impl StagedReplaceColumn {
             fragments,
             schema,
         };
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+            .transaction_properties(transaction_properties)
+            .build();
         dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
@@ -796,6 +874,7 @@ pub(super) async fn stage_replace_column(
         fragments,
         schema,
         output_field_id: field_id,
+        transaction_properties: None,
     })
 }
 
@@ -2177,6 +2256,9 @@ mod test {
             .expect("staged candidate schema must expose the new output field by name")
             .id;
 
+        let properties = staged_transaction_properties();
+        let staged = staged.with_transaction_properties(properties.clone());
+
         handler.fail_next(AmbiguousFailure::LandAndConflict);
         let committed = staged
             .commit_exact(&[input_field_id], &[output_field_id])
@@ -2198,6 +2280,205 @@ mod test {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(staged_col, &Int32Array::from(vec![0, 10, 20, 30, 40, 50]));
+
+        let tx = reopened
+            .read_transaction_by_version(committed.version().version)
+            .await?
+            .expect("converged ExactMerge must persist a transaction");
+        assert!(
+            matches!(tx.operation, Operation::ExactMerge { .. }),
+            "land-and-conflict success must remain ExactMerge, got: {:?}",
+            tx.operation
+        );
+        assert_eq!(
+            tx.transaction_properties,
+            Some(Arc::new(properties)),
+            "landed-but-conflict ExactMerge must retain the exact properties"
+        );
+
+        Ok(())
+    }
+
+    fn staged_transaction_properties() -> HashMap<String, String> {
+        HashMap::from([
+            ("logical_op".to_string(), "staged_columns".to_string()),
+            ("orchestrator_marker".to_string(), "marker-v1".to_string()),
+        ])
+    }
+
+    /// ExactMerge commit persists a nonempty two-entry property map on the
+    /// same version that publishes the candidate. The builder call itself
+    /// must not make the candidate or the properties visible.
+    #[tokio::test]
+    async fn test_stage_add_columns_transaction_properties_commit_exact() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+        let input_field_id = dataset.schema().field("id").expect("fixture has id").id;
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                Some(vec!["id".into()]),
+                None,
+            )
+            .await?;
+        let output_field_id = staged
+            .candidate_schema()
+            .field(A2_NEW_COLUMN)
+            .expect("staged candidate schema must expose the new output field by name")
+            .id;
+
+        let properties = staged_transaction_properties();
+        let staged = staged.with_transaction_properties(properties.clone());
+
+        assert_a2_base_schema_unchanged(&dataset, version_before);
+        let before_commit = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&before_commit, version_before);
+        assert!(
+            before_commit.schema().field(A2_NEW_COLUMN).is_none(),
+            "candidate remains invisible to table readers before commit_exact"
+        );
+        let before_tx = before_commit
+            .read_transaction_by_version(version_before)
+            .await?
+            .expect("base version has a transaction");
+        assert_eq!(
+            before_tx.transaction_properties, None,
+            "properties must be absent before the staged commit"
+        );
+
+        let committed = staged
+            .commit_exact(&[input_field_id], &[output_field_id])
+            .await?;
+        assert_eq!(committed.version().version, version_before + 1);
+        assert_a2_base_schema_unchanged(&dataset, version_before);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before + 1);
+        let tx = reopened
+            .read_transaction_by_version(committed.version().version)
+            .await?
+            .expect("committed version must have a transaction");
+        assert!(
+            matches!(tx.operation, Operation::ExactMerge { .. }),
+            "commit_exact must persist ExactMerge, got: {:?}",
+            tx.operation
+        );
+        assert_eq!(tx.transaction_properties, Some(Arc::new(properties)));
+        let original_tx = reopened
+            .read_transaction_by_version(version_before)
+            .await?
+            .expect("base version has a transaction");
+        assert_eq!(original_tx.transaction_properties, None);
+
+        Ok(())
+    }
+
+    /// Ordinary Merge commit also carries handle-owned transaction properties.
+    #[tokio::test]
+    async fn test_stage_add_columns_transaction_properties_commit() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                None,
+                None,
+            )
+            .await?;
+        let properties = staged_transaction_properties();
+        let staged = staged.with_transaction_properties(properties.clone());
+
+        let before_commit = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&before_commit, version_before);
+        let before_tx = before_commit
+            .read_transaction_by_version(version_before)
+            .await?
+            .expect("base version has a transaction");
+        assert_eq!(before_tx.transaction_properties, None);
+
+        let committed = staged.commit().await?;
+        assert_eq!(committed.version().version, version_before + 1);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before + 1);
+        let tx = reopened
+            .read_transaction_by_version(committed.version().version)
+            .await?
+            .expect("committed version must have a transaction");
+        assert!(
+            matches!(tx.operation, Operation::Merge { .. }),
+            "ordinary commit must persist Merge, got: {:?}",
+            tx.operation
+        );
+        assert_eq!(tx.transaction_properties, Some(Arc::new(properties)));
+
+        Ok(())
+    }
+
+    /// A handle that never calls the builder still reads back no properties.
+    #[tokio::test]
+    async fn test_stage_add_columns_transaction_properties_without_builder() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                None,
+                None,
+            )
+            .await?;
+        let committed = staged.commit().await?;
+        assert_eq!(committed.version().version, version_before + 1);
+
+        let tx = committed
+            .read_transaction_by_version(committed.version().version)
+            .await?
+            .expect("committed version must have a transaction");
+        assert!(
+            matches!(tx.operation, Operation::Merge { .. }),
+            "control commit must remain Merge, got: {:?}",
+            tx.operation
+        );
+        assert_eq!(tx.transaction_properties, None);
+
+        Ok(())
+    }
+
+    /// Dropping a configured add handle creates no version and no transaction
+    /// metadata.
+    #[tokio::test]
+    async fn test_stage_add_columns_transaction_properties_drop() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_a2_three_fragment_dataset(test_uri, WriteParams::default()).await?;
+        let version_before = dataset.version().version;
+
+        let staged = dataset
+            .stage_add_columns(
+                NewColumnTransform::Reader(a2_output_column_reader(6)),
+                None,
+                None,
+            )
+            .await?;
+        let staged = staged.with_transaction_properties(staged_transaction_properties());
+        drop(staged);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_a2_base_schema_unchanged(&reopened, version_before);
+        let tx = reopened
+            .read_transaction_by_version(version_before)
+            .await?
+            .expect("base version has a transaction");
+        assert_eq!(tx.transaction_properties, None);
 
         Ok(())
     }
@@ -6341,6 +6622,134 @@ mod test {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(values, &Int32Array::from(vec![10, 20, 30, 40, 50, 60]));
+        Ok(())
+    }
+
+    /// ExactMerge replace persists a nonempty two-entry property map on the
+    /// same version that publishes the replacement. Stable output identity and
+    /// values still replace in that single commit.
+    #[tokio::test]
+    async fn test_stage_replace_column_transaction_properties_commit_exact() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_replace_three_fragment_dataset(test_uri).await?;
+        let version_before = dataset.version().version;
+        let value_id = dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+        let id_field_id = dataset.schema().field("id").expect("fixture has id").id;
+
+        let staged = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![11, 21, 31, 41, 51, 61])),
+                ),
+                None,
+            )
+            .await?;
+        let properties = staged_transaction_properties();
+        let staged = staged.with_transaction_properties(properties.clone());
+
+        assert_replace_source_unchanged(&dataset, version_before);
+        let before_commit = Dataset::open(test_uri).await?;
+        assert_replace_source_unchanged(&before_commit, version_before);
+        let before_data = before_commit.scan().try_into_batch().await?;
+        let old_values = before_data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(old_values, &Int32Array::from(vec![10, 20, 30, 40, 50, 60]));
+        let before_tx = before_commit
+            .read_transaction_by_version(version_before)
+            .await?
+            .expect("base version has a transaction");
+        assert_eq!(
+            before_tx.transaction_properties, None,
+            "properties must be absent before the staged commit"
+        );
+
+        let committed = staged.commit_exact(&[id_field_id]).await?;
+        assert_eq!(committed.version().version, version_before + 1);
+        assert_replace_source_unchanged(&dataset, version_before);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_eq!(reopened.version().version, version_before + 1);
+        assert_eq!(
+            reopened.schema().field("value").expect("value remains").id,
+            value_id
+        );
+        let data = reopened.scan().try_into_batch().await?;
+        let values = data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values, &Int32Array::from(vec![11, 21, 31, 41, 51, 61]));
+
+        let tx = reopened
+            .read_transaction_by_version(committed.version().version)
+            .await?
+            .expect("committed version must have a transaction");
+        assert!(
+            matches!(tx.operation, Operation::ExactMerge { .. }),
+            "replace commit_exact must persist ExactMerge, got: {:?}",
+            tx.operation
+        );
+        assert_eq!(tx.transaction_properties, Some(Arc::new(properties)));
+
+        Ok(())
+    }
+
+    /// Dropping a configured replace handle creates no version and no
+    /// transaction metadata.
+    #[tokio::test]
+    async fn test_stage_replace_column_transaction_properties_drop() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let dataset = write_replace_three_fragment_dataset(test_uri).await?;
+        let version_before = dataset.version().version;
+        let value_id = dataset
+            .schema()
+            .field("value")
+            .expect("fixture has value")
+            .id;
+
+        let staged = dataset
+            .stage_replace_column(
+                value_id,
+                replace_column_stream(
+                    ArrowField::new("value", DataType::Int32, true),
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                ),
+                None,
+            )
+            .await?;
+        let staged = staged.with_transaction_properties(staged_transaction_properties());
+        drop(staged);
+
+        let reopened = Dataset::open(test_uri).await?;
+        assert_replace_source_unchanged(&reopened, version_before);
+        let data = reopened.scan().try_into_batch().await?;
+        let values = data
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values, &Int32Array::from(vec![10, 20, 30, 40, 50, 60]));
+        let tx = reopened
+            .read_transaction_by_version(version_before)
+            .await?
+            .expect("base version has a transaction");
+        assert_eq!(tx.transaction_properties, None);
+
         Ok(())
     }
 
