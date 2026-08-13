@@ -3060,6 +3060,15 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return versions
 
+    def version_refs(self) -> List[VersionRef]:
+        """
+        Return lightweight references to all attached versions in the current branch.
+
+        Unlike :meth:`versions`, this does not read or deserialize every manifest.
+        Use :attr:`latest_version` instead when only the latest version is needed.
+        """
+        return self._ds.version_refs()
+
     @property
     def version(self) -> int:
         """
@@ -5798,6 +5807,10 @@ class Version(TypedDict):
     metadata: Dict[str, str]
 
 
+class VersionRef(TypedDict):
+    version: int
+
+
 class UpdateResult(TypedDict):
     num_rows_updated: int
 
@@ -7239,6 +7252,8 @@ class DatasetOptimizer:
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
         max_source_fragments: Optional[int] = None,
+        max_source_rows: Optional[int] = None,
+        max_source_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7270,7 +7285,9 @@ class DatasetOptimizer:
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
         ``lance.compaction.binary_copy_read_batch_bytes``,
-        ``lance.compaction.max_source_fragments``.
+        ``lance.compaction.max_source_fragments``,
+        ``lance.compaction.max_source_rows``,
+        ``lance.compaction.max_source_bytes``.
 
         Parameters
         ----------
@@ -7329,6 +7346,18 @@ class DatasetOptimizer:
             exceed this limit, allowing compaction to proceed incrementally.
             Fragments are processed oldest first. If not specified, uses the
             manifest config value, or applies no limit.
+        max_source_rows: int, optional
+            Maximum number of source rows to compact in a single run. Rows are
+            counted as live rows (physical rows minus soft-deleted rows).
+            Tasks are included until adding the next task would exceed this
+            limit.
+        max_source_bytes: int, optional
+            Maximum number of source bytes to compact in a single run,
+            measured as the total size of the source fragments' data and
+            overlay files. Tasks are included until adding the next task
+            would exceed this limit. Blob v2 payloads live in separate
+            blob files and are not counted, so this is not a cap on total
+            compaction I/O for datasets with blob columns.
 
         Returns
         -------
@@ -7353,6 +7382,8 @@ class DatasetOptimizer:
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
                 max_source_fragments=max_source_fragments,
+                max_source_rows=max_source_rows,
+                max_source_bytes=max_source_bytes,
             ).items()
             if v is not None
         }

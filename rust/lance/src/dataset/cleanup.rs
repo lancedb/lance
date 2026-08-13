@@ -3632,6 +3632,19 @@ mod tests {
 
         assert_eq!(after_count.num_data_files, 3);
         assert_eq!(after_count.num_manifest_files, 3);
+        assert_eq!(
+            fixture
+                .open()
+                .await
+                .unwrap()
+                .version_refs()
+                .await
+                .unwrap()
+                .iter()
+                .map(|version| version.version)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 
     #[tokio::test]

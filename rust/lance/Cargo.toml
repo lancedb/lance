@@ -57,8 +57,6 @@ crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
-# matches arrow-rs use
-half.workspace = true
 # Fast non-cryptographic hasher for the hot FTS mem-index insert path.
 rustc-hash = "2.1"
 # Compact FST term dictionary for the FTS mem-index partitions.
@@ -66,8 +64,6 @@ fst = "0.4"
 itertools.workspace = true
 moka.workspace = true
 object_store = { workspace = true }
-aws-credential-types.workspace = true
-aws-credential-types.optional = true
 pin-project.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -131,7 +127,9 @@ serial_test = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
+half.workspace = true
 geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
@@ -155,7 +153,7 @@ protoc = [
     "lance-index/protoc",
     "lance-table/protoc",
 ]
-aws = ["lance-io/aws", "dep:aws-credential-types"]
+aws = ["lance-io/aws"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]

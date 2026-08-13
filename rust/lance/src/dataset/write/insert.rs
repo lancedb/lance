@@ -400,10 +400,6 @@ impl<'a> InsertBuilder<'a> {
             normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
-        // The system columns (`_rowid`, `_rowaddr`, `_rowoffset`, and the row-version
-        // columns) are virtual: they're injected into scan results at read time and
-        // never stored. A stored column sharing one of these names would collide with
-        // the system column on read, so reject it at write time.
         for field in data_schema.fields.iter() {
             if is_system_column(&field.name) {
                 return Err(Error::invalid_input_source(

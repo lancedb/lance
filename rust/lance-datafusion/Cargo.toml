@@ -41,9 +41,6 @@ tracing.workspace = true
 prost-build.workspace = true
 protobuf-src = {version = "2.1", optional = true}
 
-[dev-dependencies]
-lance-datagen.workspace = true
-
 [features]
 geo = ["dep:lance-geo"]
 substrait = ["dep:datafusion-substrait"]

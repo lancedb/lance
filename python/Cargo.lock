@@ -2799,7 +2799,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -4007,7 +4007,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4023,7 +4023,6 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "async_cell",
- "aws-credential-types",
  "aws-sdk-dynamodb",
  "blake3",
  "byteorder",
@@ -4040,7 +4039,6 @@ dependencies = [
  "either",
  "fst",
  "futures",
- "half",
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
@@ -4082,7 +4080,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4125,7 +4123,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -4135,7 +4133,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4143,12 +4141,10 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "blake3",
- "byteorder",
  "bytes",
  "datafusion-common",
  "datafusion-sql",
  "futures",
- "itertools 0.14.0",
  "lance-arrow",
  "lance-derive",
  "libc",
@@ -4166,7 +4162,6 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tracing",
  "twox-hash",
@@ -4175,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4208,7 +4203,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4225,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4234,7 +4229,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4259,7 +4254,6 @@ dependencies = [
  "num-traits",
  "prost",
  "prost-build",
- "rand 0.9.5",
  "tokio",
  "tracing",
  "xxhash-rust",
@@ -4268,7 +4262,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4299,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4313,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4328,7 +4322,6 @@ dependencies = [
  "async-trait",
  "bitvec",
  "bytes",
- "chrono",
  "crossbeam-queue",
  "datafusion",
  "datafusion-common",
@@ -4349,7 +4342,6 @@ dependencies = [
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
- "lance-datagen",
  "lance-encoding",
  "lance-file",
  "lance-geo",
@@ -4379,12 +4371,11 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]
 name = "lance-index-core"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4406,7 +4397,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4420,7 +4411,6 @@ dependencies = [
  "futures",
  "http 1.4.2",
  "io-uring",
- "lance-arrow",
  "lance-core",
  "lance-namespace",
  "log",
@@ -4438,27 +4428,26 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
 name = "lance-linalg"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow-array",
- "arrow-buffer",
  "arrow-schema",
  "cc",
  "half",
  "lance-arrow",
  "lance-core",
  "num-traits",
- "rand 0.9.5",
  "rayon",
 ]
 
 [[package]]
 name = "lance-namespace"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4470,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4518,13 +4507,12 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
  "byteorder",
- "bytes",
  "itertools 0.14.0",
  "lance-core",
  "roaring",
@@ -4533,7 +4521,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4573,7 +4561,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -6081,7 +6069,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "11.0.0-beta.6"
+version = "11.0.0-beta.8"
 dependencies = [
  "alloc-stdlib",
  "arrow",
