@@ -7149,6 +7149,7 @@ class DatasetOptimizer:
         max_source_fragments: Optional[int] = None,
         max_source_rows: Optional[int] = None,
         max_source_bytes: Optional[int] = None,
+        excluded_fragment_ids: Optional[list[int]] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7253,6 +7254,11 @@ class DatasetOptimizer:
             would exceed this limit. Blob v2 payloads live in separate
             blob files and are not counted, so this is not a cap on total
             compaction I/O for datasets with blob columns.
+        excluded_fragment_ids: list[int], optional
+            Fragment IDs to exclude from compaction planning. Excluded
+            fragments remain unchanged and act as boundaries, so fragments
+            on opposite sides are not combined into the same compaction task.
+            Duplicate and unknown IDs are ignored.
 
         Returns
         -------
@@ -7279,6 +7285,7 @@ class DatasetOptimizer:
                 max_source_fragments=max_source_fragments,
                 max_source_rows=max_source_rows,
                 max_source_bytes=max_source_bytes,
+                excluded_fragment_ids=excluded_fragment_ids,
             ).items()
             if v is not None
         }

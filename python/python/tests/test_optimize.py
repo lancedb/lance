@@ -41,6 +41,27 @@ def test_dataset_optimize(tmp_path: Path):
     assert dataset.version == 3
 
 
+def test_dataset_optimize_excluded_fragment_ids(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(800)}),
+        tmp_path / "dataset",
+        max_rows_per_file=200,
+    )
+    fragments = dataset.get_fragments()
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=400,
+        excluded_fragment_ids=[1, 1, 999],
+        num_threads=1,
+    )
+
+    assert metrics.fragments_removed == 2
+    remaining_fragment_ids = {
+        fragment.fragment_id for fragment in dataset.get_fragments()
+    }
+    assert fragments[1].fragment_id in remaining_fragment_ids
+
+
 def test_compact_files_source_budgets(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     data = pa.table({"a": range(1000), "b": range(1000)})
