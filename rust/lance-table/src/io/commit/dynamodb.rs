@@ -22,7 +22,7 @@ use snafu::OptionExt;
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::io::commit::external_manifest::{ExternalManifestStore, ManifestETagPolicy};
+use crate::io::commit::external_manifest::ExternalManifestStore;
 use lance_core::error::NotFoundSnafu;
 use lance_core::error::box_error;
 use lance_core::{Error, Result};
@@ -243,17 +243,6 @@ impl DynamoDBExternalManifestStore {
 
 #[async_trait]
 impl ExternalManifestStore for DynamoDBExternalManifestStore {
-    fn manifest_etag_policy(&self) -> ManifestETagPolicy {
-        // DynamoDB selects one immutable staging object for each logical
-        // version. Equivalent helpers may materialize those same bytes as
-        // different physical object generations, so persisting a destination
-        // ETag would reintroduce the metadata race this implementation avoids.
-        // The commit handler still returns the generation observed in S3 to
-        // prevent downstream caches from reusing an older Dataset at the same
-        // URI and version.
-        ManifestETagPolicy::ReturnOnly
-    }
-
     /// Get the manifest path for a given base_uri and version
     async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
         let get_item_result = self

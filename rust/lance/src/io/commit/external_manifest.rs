@@ -191,8 +191,8 @@ mod test {
                 let final_meta = store.head(&Path::from(path)).await?;
                 assert_eq!(size, final_meta.size);
                 assert_eq!(
-                    e_tag, final_meta.e_tag,
-                    "the default policy must persist the finalized physical generation"
+                    e_tag, None,
+                    "the generic workflow must not persist a physical generation"
                 );
             }
             Ok(())
@@ -347,7 +347,7 @@ mod test {
         let resolved = handler
             .resolve_latest_location(&base_path, &object_store)
             .await
-            .expect("an absent external-store ETag must opt out of generation validation");
+            .expect("the canonical manifest should resolve from object storage");
         let current_meta = object_store
             .inner
             .head(&resolved.path)
@@ -357,7 +357,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn external_manifest_store_put_tracks_destination_etag() {
+    async fn external_manifest_store_put_returns_destination_etag() {
         let object_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
         let base_path = Path::from("repro");
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
@@ -404,12 +404,12 @@ mod test {
         assert_eq!(location.size, Some(final_meta.size));
         assert_eq!(
             location.e_tag, final_meta.e_tag,
-            "the default policy must return the finalized physical generation"
+            "the caller must receive the finalized physical generation"
         );
     }
 
     #[tokio::test]
-    async fn external_manifest_handler_finalize_tracks_destination_etag() {
+    async fn external_manifest_handler_finalize_returns_destination_etag() {
         let object_store = ObjectStore::memory();
         let base_path = Path::from("repro");
         let version = 1;
@@ -455,7 +455,7 @@ mod test {
         assert_eq!(location.size, Some(final_meta.size));
         assert_eq!(
             location.e_tag, final_meta.e_tag,
-            "the default policy must return the finalized physical generation"
+            "the caller must receive the finalized physical generation"
         );
     }
 
