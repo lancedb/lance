@@ -243,13 +243,17 @@ pub struct ManifestLocation {
     /// An [`ExternalManifestStore`](crate::io::commit::external_manifest::ExternalManifestStore)
     /// may also use `Some` to require an exact-generation match; implementations
     /// whose token can legitimately become stale after equivalent materialization
-    /// must return `None` instead.
+    /// may return it to the current caller without persisting it.
     ///
     /// An ETag is not necessarily a content checksum and may change when an
     /// object is rewritten with identical bytes. In particular, S3 Express
     /// returns an object-specific opaque value. Callers must not treat it as a
     /// content checksum, logical manifest identity, or dataset-incarnation
-    /// identity, and cache correctness must not depend on it.
+    /// identity. When present, however, it distinguishes the physical object
+    /// generation observed by this caller and can prevent reuse of an older
+    /// cached Dataset at the same URI and version. Conversely, `None` must not
+    /// be interpreted as proof that two observations belong to the same dataset
+    /// incarnation.
     pub e_tag: Option<String>,
 }
 

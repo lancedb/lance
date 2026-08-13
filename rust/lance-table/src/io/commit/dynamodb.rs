@@ -246,9 +246,12 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
     fn manifest_etag_policy(&self) -> ManifestETagPolicy {
         // DynamoDB selects one immutable staging object for each logical
         // version. Equivalent helpers may materialize those same bytes as
-        // different physical object generations, so publishing a destination
+        // different physical object generations, so persisting a destination
         // ETag would reintroduce the metadata race this implementation avoids.
-        ManifestETagPolicy::Omit
+        // The commit handler still returns the generation observed in S3 to
+        // prevent downstream caches from reusing an older Dataset at the same
+        // URI and version.
+        ManifestETagPolicy::ReturnOnly
     }
 
     /// Get the manifest path for a given base_uri and version
@@ -419,8 +422,10 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
     ) -> Result<()> {
         // Do not persist an object-store ETag. Staging paths are immutable and
         // uniquely selected by this conditional write; finalized paths are
-        // validated against object storage. An ETag adds no concurrency or
-        // integrity guarantee and can become stale after an identical copy.
+        // validated against object storage. Persisting an ETag adds no DDB
+        // concurrency or content-integrity guarantee and can make the row stale
+        // after an identical copy. The commit handler returns the destination
+        // ETag separately as an ephemeral runtime cache discriminator.
         self.ddb_put()
             .item(base_uri!(), AttributeValue::S(base_uri.into()))
             .item(version!(), AttributeValue::N(version.to_string()))
@@ -450,6 +455,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
     ) -> Result<()> {
         // Replacing the staging pointer with the canonical path publishes the
         // same generation-independent `(path, size)` tuple from every helper.
+        // Each helper still returns the canonical ETag it observed to its caller.
         self.ddb_put()
             .item(base_uri!(), AttributeValue::S(base_uri.into()))
             .item(version!(), AttributeValue::N(version.to_string()))

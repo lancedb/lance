@@ -346,12 +346,15 @@ async fn test_ddb_open_iops() {
     //    * write staged file
     //    * copy to final file
     //    * delete staged file
-    // Commit: 1 read IOP to list versions before creating the dataset. A
-    // successful manifest copy is sufficient proof of materialization, so the
-    // DynamoDB policy does not HEAD the destination for an ETag.
+    // Commit: 2 read IOPs: one to list versions before creating the dataset and
+    // one to HEAD the canonical manifest after COPY. DynamoDB does not persist
+    // that ETag, but the freshly committed Dataset needs the observed physical
+    // generation so downstream caches cannot reuse an older Dataset at the
+    // same URI and version.
     let io_stats = committed_ds.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 4);
-    assert_io_eq!(io_stats, read_iops, 1);
+    assert_io_eq!(io_stats, read_iops, 2);
+    assert!(committed_ds.manifest_location().e_tag.is_some());
 
     let committed_row = ddb_table.item_for_version(1).await;
     assert!(
@@ -394,11 +397,13 @@ async fn test_ddb_open_iops() {
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);
-    // Append reads once to list versions. The successful copy reuses the known
-    // staging size, while DDB stores only the stable final path and size.
+    // Append reads once to list versions and once to observe the canonical
+    // generation after COPY. DDB stores only the stable final path and size;
+    // the returned Dataset retains the observed ETag.
     // TODO: we can reduce this by implementing a specialized CommitHandler::list_manifest_locations()
     // for the DDB commit handler.
-    assert_io_eq!(io_stats, read_iops, 1);
+    assert_io_eq!(io_stats, read_iops, 2);
+    assert!(dataset.manifest_location().e_tag.is_some());
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();

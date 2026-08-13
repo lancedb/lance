@@ -28,10 +28,12 @@ use super::{
 use crate::format::{IndexMetadata, Manifest, Transaction};
 use crate::io::commit::{CommitError, CommitHandler};
 
-/// Controls how the generic staging workflow records destination ETags.
+/// Controls whether the generic staging workflow persists destination ETags.
 ///
-/// This policy affects physical-generation validation only. Neither policy
-/// makes an ETag a content checksum, logical manifest identity, cache identity,
+/// Both policies return the destination ETag in the [`ManifestLocation`] seen
+/// by the caller. The difference is only whether that observation is persisted
+/// in the external index and later enforced as an exact-generation check.
+/// Neither policy makes an ETag a content checksum, logical manifest identity,
 /// or dataset-incarnation identity.
 ///
 /// ```
@@ -41,15 +43,17 @@ use crate::io::commit::{CommitError, CommitHandler};
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ManifestETagPolicy {
-    /// HEAD the destination after materialization and publish its ETag when one
-    /// is available. A later reader that receives `Some(expected)` requires an
-    /// exact physical-generation match.
+    /// Persist the destination ETag when one is available. A later reader that
+    /// receives `Some(expected)` requires an exact physical-generation match.
     #[default]
     Track,
-    /// Publish no destination ETag and skip the post-copy HEAD on the successful
-    /// fast path. Implementations using this policy must also ignore legacy
-    /// stored ETags when returning manifest locations.
-    Omit,
+    /// Return the destination ETag to the caller without persisting it.
+    ///
+    /// This is appropriate when equivalent helpers may rewrite the canonical
+    /// object with identical bytes and thereby make a persisted physical-
+    /// generation token stale. Implementations using this policy must also
+    /// ignore legacy stored ETags when returning manifest locations.
+    ReturnOnly,
 }
 
 /// External manifest store
@@ -79,22 +83,25 @@ pub enum ManifestETagPolicy {
 ///    leave enough information for another helper and cannot undo step 3.
 ///
 /// Object-store overwrites can assign a new ETag to identical bytes. An ETag is
-/// therefore neither logical manifest identity nor dataset-incarnation identity,
-/// and cache correctness must not depend on it. Implementations choose whether
-/// to preserve the historical exact-generation check or publish only stable
-/// `(path, size)` metadata through [`ManifestETagPolicy`]. This protocol assumes
-/// one dataset incarnation owns the physical prefix; safe prefix reuse requires
-/// a separate incarnation identity.
+/// therefore neither logical manifest identity nor dataset-incarnation identity.
+/// It is still a useful opaque observation of the physical generation: returning
+/// it prevents runtime caches from treating a newly materialized object as the
+/// same observation as an older object at the same `(uri, version)`. Stores
+/// choose whether to persist that observation for later exact-generation checks
+/// or publish only stable `(path, size)` metadata through
+/// [`ManifestETagPolicy`]. This protocol assumes one dataset incarnation owns
+/// the physical prefix; a separate incarnation identity is required to make
+/// arbitrary prefix reuse unconditionally safe.
 /// For a visual explanation of the commit loop see
 /// <https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04>
 #[async_trait]
 pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
-    /// Selects the destination-ETag behavior for generic finalization.
+    /// Selects the destination-ETag persistence behavior for finalization.
     ///
     /// The default preserves the pre-existing exact-generation behavior for
     /// custom stores. Stores whose valid finalization protocol can replace an
     /// object with equivalent bytes but a different ETag should return
-    /// [`ManifestETagPolicy::Omit`].
+    /// [`ManifestETagPolicy::ReturnOnly`].
     fn manifest_etag_policy(&self) -> ManifestETagPolicy {
         ManifestETagPolicy::default()
     }
@@ -183,15 +190,9 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         // Step 2: Copy staging to final path
         let final_path = naming_scheme.manifest_path(base_path, version);
         let e_tag_policy = self.manifest_etag_policy();
-        let final_e_tag = copy_or_verify_final_manifest(
-            object_store,
-            staging_path,
-            &final_path,
-            version,
-            size,
-            e_tag_policy,
-        )
-        .await?;
+        let final_e_tag =
+            copy_or_verify_final_manifest(object_store, staging_path, &final_path, version, size)
+                .await?;
 
         let location = ManifestLocation {
             version,
@@ -203,13 +204,14 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
 
         // Step 3: Update the external index to the final path.
         //
-        // Preserve the public store's historical generation policy. Most custom
-        // implementations track the destination ETag, while stores that select
-        // one immutable staging object and permit equivalent canonical
-        // overwrites can explicitly publish only stable `(path, size)` metadata.
+        // Preserve the public store's historical persistence policy. Most
+        // custom implementations persist the destination ETag. Stores that
+        // select one immutable staging object and permit equivalent canonical
+        // overwrites publish only stable `(path, size)` metadata, while the
+        // caller still receives the just-observed destination generation.
         let published_e_tag = match e_tag_policy {
             ManifestETagPolicy::Track => final_e_tag.clone(),
-            ManifestETagPolicy::Omit => None,
+            ManifestETagPolicy::ReturnOnly => None,
         };
         let published = self
             .put_if_exists(
@@ -346,11 +348,11 @@ async fn copy_size_aware(
 /// Copy the selected staging manifest to its canonical path.
 ///
 /// A successful copy is the object store's acknowledgement that the known
-/// immutable bytes were materialized. [`ManifestETagPolicy::Track`] preserves
-/// the public store's historical behavior by HEADing the destination and
-/// returning its physical-generation token. [`ManifestETagPolicy::Omit`] skips
-/// that read because the token cannot establish content integrity and another
-/// equivalent helper can immediately invalidate it.
+/// immutable bytes were materialized. We then HEAD the destination for two
+/// separate reasons: validate that the materialized size matches the selected
+/// staging object, and return the physical-generation token observed by this
+/// caller. The token is not content identity, but downstream caches currently
+/// use it to avoid reusing an older object at the same `(uri, version)`.
 ///
 /// `NotFound` is different: the selected staging object may have disappeared
 /// because another helper finalized and deleted it, or because the commit is
@@ -364,27 +366,21 @@ async fn copy_or_verify_final_manifest(
     final_path: &Path,
     version: u64,
     selected_size: u64,
-    e_tag_policy: ManifestETagPolicy,
 ) -> Result<Option<String>> {
     match copy_size_aware(object_store, staging_path, final_path, selected_size).await {
         Ok(()) => {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
-            match e_tag_policy {
-                ManifestETagPolicy::Track => {
-                    let final_meta = object_store.head(final_path).await?;
-                    if final_meta.size != selected_size {
-                        return Err(Error::corrupt_file(
-                            final_path.clone(),
-                            format!(
-                                "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
-                                version, selected_size, final_meta.size
-                            ),
-                        ));
-                    }
-                    Ok(final_meta.e_tag)
-                }
-                ManifestETagPolicy::Omit => Ok(None),
+            let final_meta = object_store.head(final_path).await?;
+            if final_meta.size != selected_size {
+                return Err(Error::corrupt_file(
+                    final_path.clone(),
+                    format!(
+                        "Manifest size mismatch for version {}: selected staging manifest had {}, object store returned {}",
+                        version, selected_size, final_meta.size
+                    ),
+                ));
             }
+            Ok(final_meta.e_tag)
         }
         Err(ObjectStoreError::NotFound { .. }) => match object_store.head(final_path).await {
             Ok(final_meta) if final_meta.size == selected_size => Ok(final_meta.e_tag),
@@ -579,7 +575,6 @@ impl ExternalManifestCommitHandler {
             &final_manifest_path,
             version,
             size,
-            e_tag_policy,
         )
         .await?;
 
@@ -592,10 +587,12 @@ impl ExternalManifestCommitHandler {
         };
 
         // Step 2: point the external index at the final location using the same
-        // generation policy as direct writer finalization.
+        // persistence policy as direct writer finalization. Even when the
+        // token is not persisted, `location` retains the destination generation
+        // observed by this helper for runtime cache separation.
         let published_e_tag = match e_tag_policy {
             ManifestETagPolicy::Track => final_e_tag,
-            ManifestETagPolicy::Omit => None,
+            ManifestETagPolicy::ReturnOnly => None,
         };
         let published = self
             .external_manifest_store
@@ -729,7 +726,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         let published_e_tag =
                             match self.external_manifest_store.manifest_etag_policy() {
                                 ManifestETagPolicy::Track => e_tag.clone(),
-                                ManifestETagPolicy::Omit => None,
+                                ManifestETagPolicy::ReturnOnly => None,
                             };
                         let res = self
                             .external_manifest_store
@@ -949,16 +946,16 @@ mod tests {
             }
         }
 
-        fn generation_independent() -> Self {
+        fn return_only() -> Self {
             Self {
-                e_tag_policy: ManifestETagPolicy::Omit,
+                e_tag_policy: ManifestETagPolicy::ReturnOnly,
                 ..Self::new(false)
             }
         }
 
         fn failing_final_publish_once() -> Self {
             Self {
-                e_tag_policy: ManifestETagPolicy::Omit,
+                e_tag_policy: ManifestETagPolicy::ReturnOnly,
                 fail_next_final_publish: AtomicBool::new(true),
                 ..Self::new(false)
             }
@@ -966,7 +963,7 @@ mod tests {
 
         fn blocking_first_final_publish() -> Self {
             Self {
-                e_tag_policy: ManifestETagPolicy::Omit,
+                e_tag_policy: ManifestETagPolicy::ReturnOnly,
                 block_first_final_publish: true,
                 ..Self::new(false)
             }
@@ -1361,6 +1358,10 @@ mod tests {
             .await
             .expect("a failed index update must not overturn a canonical S3 commit");
         assert_eq!(committed.path, final_path);
+        assert!(
+            committed.e_tag.is_some(),
+            "the caller must retain the canonical generation even when index repair fails"
+        );
         object_store
             .inner
             .head(&final_path)
@@ -1383,6 +1384,10 @@ mod tests {
             .await
             .expect("a reader must be able to repair the pending external index");
         assert_eq!(repaired.path, final_path);
+        assert!(
+            repaired.e_tag.is_some(),
+            "a helping reader must receive the generation it observed"
+        );
         let indexed = external_store
             .get_manifest_location(base_path.as_ref(), version)
             .await
@@ -1402,7 +1407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_finalizers_publish_generation_independent_metadata() {
+    async fn test_concurrent_finalizers_return_but_do_not_persist_generations() {
         let external_store = Arc::new(TestExternalManifestStore::blocking_first_final_publish());
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
@@ -1451,10 +1456,11 @@ mod tests {
 
         // The writer created generation E1. While its final index update is
         // paused, a reader observes the DDB-selected staging path and performs
-        // the same immutable copy, producing generation E2. Neither successful
-        // copy performs a destination HEAD or publishes a generation token.
-        // Both copies have exactly the same bytes; only their physical object
-        // generations differ.
+        // the same immutable copy, producing generation E2. Each helper HEADs
+        // the canonical object after its copy and returns the generation it
+        // observed, but neither persists that race-prone token in the external
+        // index. Both copies have exactly the same bytes; only their physical
+        // object generations differ.
         let reader_location = handler
             .resolve_version_location(&base_path, version, object_store.inner.as_ref())
             .await
@@ -1481,8 +1487,8 @@ mod tests {
             first_generation.e_tag, final_meta.e_tag,
             "the deterministic race must create a new physical generation"
         );
-        assert_eq!(writer_location.e_tag, None);
-        assert_eq!(reader_location.e_tag, None);
+        assert_eq!(writer_location.e_tag, first_generation.e_tag);
+        assert_eq!(reader_location.e_tag, final_meta.e_tag);
         assert_eq!(indexed.path, final_path);
         assert_eq!(indexed.size, Some(final_meta.size));
         assert_eq!(
@@ -1536,37 +1542,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generation_independent_copy_skips_destination_head() {
-        let external_store = Arc::new(TestExternalManifestStore::generation_independent());
+    async fn test_return_only_policy_returns_etag_without_persisting_it() {
+        let external_store = Arc::new(TestExternalManifestStore::return_only());
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: external_store.clone(),
         };
-        let mut object_store = ObjectStore::memory();
+        let object_store = ObjectStore::memory();
         let base_path = Path::from("dataset");
         let mut manifest = test_manifest();
         let version = manifest.version;
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
-
-        let fail_final_head = Arc::new(AtomicBool::new(true));
-        let policy_fail_final_head = fail_final_head.clone();
-        let policy_final_path = final_path.clone();
-        let mut policy = ProxyObjectStorePolicy::new();
-        policy.set_obj_meta_policy(
-            "fail-final-head-once",
-            Arc::new(move |method, meta| {
-                if method == "head"
-                    && meta.location == policy_final_path
-                    && policy_fail_final_head.swap(false, Ordering::SeqCst)
-                {
-                    return Err(Error::io("simulated final HEAD failure"));
-                }
-                Ok(meta)
-            }),
-        );
-        object_store.inner = Arc::new(ProxyObjectStore::new(
-            object_store.inner.clone(),
-            Arc::new(Mutex::new(policy)),
-        ));
 
         let committed = handler
             .commit(
@@ -1579,15 +1564,12 @@ mod tests {
                 None,
             )
             .await
-            .expect("a successful canonical copy must not require a destination HEAD");
+            .expect("the return-only policy should commit the canonical manifest");
         assert_eq!(committed.path, final_path);
+        let final_meta = object_store.inner.head(&final_path).await.unwrap();
         assert_eq!(
-            committed.e_tag, None,
-            "the caller must not perform a HEAD only to observe the destination ETag"
-        );
-        assert!(
-            fail_final_head.load(Ordering::SeqCst),
-            "the destination HEAD trap must remain untouched after a successful copy"
+            committed.e_tag, final_meta.e_tag,
+            "the freshly committed Dataset needs the observed generation for cache separation"
         );
 
         let indexed = external_store
@@ -1595,13 +1577,10 @@ mod tests {
             .await
             .expect("the external index must advance after the canonical copy");
         assert_eq!(indexed.path, final_path);
-        assert_eq!(indexed.e_tag, None);
-        fail_final_head.store(false, Ordering::SeqCst);
-        object_store
-            .inner
-            .head(&final_path)
-            .await
-            .expect("the canonical copy must remain readable");
+        assert_eq!(
+            indexed.e_tag, None,
+            "the external index must remain independent of physical generations"
+        );
     }
 
     #[tokio::test]
@@ -1623,7 +1602,6 @@ mod tests {
             &final_path,
             1,
             manifest_bytes.len() as u64,
-            ManifestETagPolicy::Track,
         )
         .await
         .expect("an existing canonical manifest should prove another helper finalized it");
@@ -1643,7 +1621,6 @@ mod tests {
             &final_path,
             1,
             42,
-            ManifestETagPolicy::Omit,
         )
         .await
         .expect_err("missing staging and canonical objects cannot establish a commit");
@@ -1669,7 +1646,6 @@ mod tests {
             &final_path,
             1,
             42,
-            ManifestETagPolicy::Omit,
         )
         .await
         .expect_err("a same-path object with the wrong size is not the selected manifest");
