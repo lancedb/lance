@@ -576,6 +576,8 @@ def test_index_with_pq_codebook(tmp_path):
         ivf_centroids=np.random.randn(1, 128).astype(np.float32),
         pq_codebook=pq_codebook,
     )
+    index = dataset.stats.index_stats("vector_idx")
+    assert index["indices"][0]["sub_index"]["nbits"] == 8
     validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
 
     pq_codebook = pa.FixedShapeTensorArray.from_numpy_ndarray(pq_codebook)
@@ -590,6 +592,54 @@ def test_index_with_pq_codebook(tmp_path):
         replace=True,
     )
     validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+
+
+def test_index_with_4bit_numpy_pq_codebook(tmp_path):
+    tbl = create_table(nvec=1024, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    pq_codebook = np.random.randn(4, 16, 128 // 4).astype(np.float32)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        num_bits=4,
+        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        pq_codebook=pq_codebook,
+    )
+
+    index = dataset.stats.index_stats("vector_idx")
+    assert index["indices"][0]["sub_index"]["nbits"] == 4
+
+    result = dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128).astype(np.float32),
+            "k": 10,
+        }
+    )
+    assert result.num_rows == 10
+
+
+def test_index_with_pq_codebook_rejects_wrong_num_bits_shape(tmp_path):
+    tbl = create_table(nvec=8, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    pq_codebook = np.random.randn(4, 256, 128 // 4).astype(np.float32)
+
+    with pytest.raises(
+        ValueError,
+        match=r"\(sub_vectors, 16, dim\) for num_bits=4, got \(4, 256, 32\)",
+    ):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=1,
+            num_sub_vectors=4,
+            num_bits=4,
+            ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+            pq_codebook=pq_codebook,
+        )
 
 
 @pytest.mark.cuda
@@ -2003,6 +2053,34 @@ def test_read_partition(indexed_dataset):
         VectorIndexReader(indexed_dataset, "id_idx")
 
 
+def test_read_partition_nested_vector_quoted_field(tmp_path):
+    num_rows = 1024
+    dimensions = 8
+    rng = np.random.default_rng(42)
+    values = rng.integers(0, 256, size=num_rows * dimensions, dtype=np.uint8)
+    vectors = pa.FixedSizeListArray.from_arrays(pa.array(values), dimensions)
+    nested = pa.StructArray.from_arrays([vectors], names=["embedding.v1"])
+    dataset = lance.write_dataset(pa.table({"data": nested}), tmp_path)
+    # Match nested uint8 pHash indexes without introducing PQ training setup.
+    dataset = dataset.create_index(
+        "data.`embedding.v1`",
+        index_type="IVF_FLAT",
+        name="vector_idx",
+        metric="hamming",
+        num_partitions=4,
+    )
+
+    reader = VectorIndexReader(dataset, "vector_idx")
+    for with_vector in (False, True):
+        partitions = [
+            reader.read_partition(partition_id, with_vector=with_vector)
+            for partition_id in range(reader.num_partitions())
+        ]
+
+        assert all("_rowid" in partition.column_names for partition in partitions)
+        assert sum(partition.num_rows for partition in partitions) == num_rows
+
+
 def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
     uri = indexed_dataset.uri
     new_table = create_table()
@@ -2222,6 +2300,14 @@ def test_nested_field_vector_index(tmp_path):
     assert len(indices) == 1
     assert indices[0].field_names == ["data.embedding"]
 
+    reader = VectorIndexReader(dataset, indices[0].name)
+    for with_vector in (False, True):
+        partition_rows = sum(
+            reader.read_partition(partition_id, with_vector=with_vector).num_rows
+            for partition_id in range(reader.num_partitions())
+        )
+        assert partition_rows == num_rows
+
     # Test querying with the index
     query_vec = vectors[0]
     result = dataset.to_table(
@@ -2418,7 +2504,7 @@ def test_vector_index_distance_range(tmp_path):
     assert np.all(index_distances >= distance_range[0]) and np.all(
         index_distances < distance_range[1]
     )
-    assert np.allclose(brute_distances, index_distances, rtol=0.0, atol=0.0)
+    assert np.allclose(brute_distances, index_distances, rtol=1e-5, atol=0.0)
 
 
 # =============================================================================

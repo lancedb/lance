@@ -18,7 +18,7 @@ use core::mem::size_of;
 
 mod bitpacker_internal;
 
-pub use bitpacker_internal::{BitPacker, BitPacker4x};
+pub use bitpacker_internal::{BitPacker, BitPacker4x, BitPacker8x};
 
 pub const FL_ORDER: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
@@ -2127,6 +2127,10 @@ mod test {
         if bit_width == 64 {
             for value in &mut values {
                 *value = rng.next();
+            }
+        } else {
+            for value in &mut values {
+                *value = rng.next() % (1 << bit_width);
             }
         }
         let mut packed = vec![0; 1024 * bit_width / u64::T];

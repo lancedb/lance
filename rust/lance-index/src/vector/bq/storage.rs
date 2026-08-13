@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Sub;
@@ -21,7 +22,7 @@ use itertools::{Itertools, izip};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_linalg::distance::{DistanceType, Dot, dot, l2::l2};
 use lance_linalg::simd::{
     self,
@@ -463,7 +464,7 @@ impl QuantizerMetadata for RabitQuantizationMetadata {
         }
     }
 
-    async fn load(reader: &PreviousFileReader) -> Result<Self> {
+    async fn load(reader: &V1FileReader) -> Result<Self> {
         let metadata_str = reader
             .schema()
             .metadata
@@ -518,8 +519,8 @@ impl RabitQuantizationStorage {
 
     fn residual_query_factor(&self, dist_q_c: f32) -> f32 {
         match self.distance_type {
-            DistanceType::L2 => dist_q_c,
-            DistanceType::Cosine | DistanceType::Dot => dist_q_c - 1.0,
+            DistanceType::L2 | DistanceType::Cosine => dist_q_c,
+            DistanceType::Dot => dist_q_c - 1.0,
             _ => unimplemented!(
                 "RabitQ does not support distance type: {}",
                 self.distance_type
@@ -2534,7 +2535,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
-            Some(mapping) => storage.remap(&mapping),
+            Some(mapping) => storage.remap(&RowAddrRemap::direct(mapping)),
             None => Ok(storage),
         }
     }
@@ -2544,7 +2545,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
     }
 
     async fn load_partition(
-        reader: &PreviousFileReader,
+        reader: &V1FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
@@ -2555,7 +2556,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         Self::try_from_batch(batch, metadata, distance_type, frag_reuse_index)
     }
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
         let num_vectors = self.codes.len();
         let num_code_bytes = self.codes.value_length() as usize;
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
@@ -2565,10 +2566,10 @@ impl QuantizerStorage for RabitQuantizationStorage {
 
         let row_ids = self.row_ids.values();
         for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
+            match mapping.get(*row_id) {
                 Some(Some(new_id)) => {
                     indices.push(i as u32);
-                    new_row_ids.push(*new_id);
+                    new_row_ids.push(new_id);
                     new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
                 }
                 Some(None) => {}
@@ -2743,6 +2744,7 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::collections::{BinaryHeap, HashMap};
 
     use arrow_array::{ArrayRef, Float32Array, Float64Array, UInt64Array};
@@ -2750,7 +2752,6 @@ mod tests {
     use lance_linalg::distance::DistanceType;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
-    use rstest::rstest;
 
     use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
@@ -3929,7 +3930,7 @@ mod tests {
             .into_iter()
             .map(|(id, dist)| (id as u64, dist))
             .collect::<Vec<_>>();
-        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        expected.sort_by_key(|left| left.0);
 
         let mut heap = BinaryHeap::with_capacity(k);
         let mut distances = Vec::new();
@@ -3951,7 +3952,7 @@ mod tests {
             .into_iter()
             .map(|node| (node.id, node.dist.0))
             .collect::<Vec<_>>();
-        actual.sort_by(|left, right| left.0.cmp(&right.0));
+        actual.sort_by_key(|left| left.0);
 
         assert_eq!(actual.len(), expected.len());
         for ((actual_id, actual_dist), (expected_id, expected_dist)) in
@@ -4297,20 +4298,33 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_batch_keeps_cosine_for_legacy_residual_query() {
+    fn test_residual_query_cosine_uses_l2_query_factor() {
         let original_codes = make_test_codes(50, 64);
         let mut metadata = make_test_metadata(original_codes.value_length() as usize * 8);
         metadata.query_estimator = RabitQueryEstimator::ResidualQuery;
+        let batch = make_test_batch(original_codes);
 
-        let storage = RabitQuantizationStorage::try_from_batch(
-            make_test_batch(original_codes),
+        let cosine_storage = RabitQuantizationStorage::try_from_batch(
+            batch.clone(),
             &metadata,
             DistanceType::Cosine,
             None,
         )
         .unwrap();
+        let l2_storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
 
-        assert_eq!(storage.distance_type(), DistanceType::Cosine);
+        assert_eq!(cosine_storage.distance_type(), DistanceType::Cosine);
+
+        let query = Arc::new(Float32Array::from(vec![0.125; 64])) as ArrayRef;
+        let dist_q_c = 0.25;
+        let cosine_distances = cosine_storage
+            .dist_calculator(query.clone(), dist_q_c)
+            .distance_all(0);
+        let l2_distances = l2_storage.dist_calculator(query, dist_q_c).distance_all(0);
+
+        assert_eq!(cosine_distances, l2_distances);
     }
 
     #[test]
@@ -4425,7 +4439,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&mapping).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::direct(mapping)).unwrap();
         assert!(remapped.metadata().packed);
 
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
@@ -4470,7 +4484,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&mapping).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::direct(mapping)).unwrap();
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
         let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
         let expected_row_ids = UInt64Array::from_iter_values(

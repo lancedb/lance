@@ -4,57 +4,24 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use futures::future::BoxFuture;
 use lance_core::{
     Result,
-    cache::{LanceCache, UnsizedCacheKey},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey},
+    deepsize::DeepSizeOf,
 };
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+// Re-export training types that were previously defined here
+pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrainingOrdering {
-    /// The input will arrive sorted by the value column in ascending order
-    Values,
-    /// The input will arrive sorted by the address column in ascending order
-    Addresses,
-    /// The input will arrive in an arbitrary order
-    None,
-}
-
-#[derive(Debug, Clone)]
-pub struct TrainingCriteria {
-    pub ordering: TrainingOrdering,
-    pub needs_row_ids: bool,
-    pub needs_row_addrs: bool,
-}
-
-impl TrainingCriteria {
-    pub fn new(ordering: TrainingOrdering) -> Self {
-        Self {
-            ordering,
-            needs_row_ids: false,
-            needs_row_addrs: false,
-        }
-    }
-
-    pub fn with_row_id(mut self) -> Self {
-        self.needs_row_ids = true;
-        self
-    }
-
-    pub fn with_row_addr(mut self) -> Self {
-        self.needs_row_addrs = true;
-        self
-    }
-}
 
 /// A trait object for plugin-specific training parameters and data requirements.
 ///
@@ -204,7 +171,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// The default implementation reads an in-memory `Arc<dyn ScalarIndex>` entry.
     /// Plugins whose index has a serializable representation should override this
     /// (together with [`put_in_cache`](Self::put_in_cache)) to store that
-    /// representation under a sized [`CacheKey`](lance_core::cache::CacheKey) with
+    /// representation under a sized [`CacheKey`] with
     /// a codec, and reconstruct the index here. `index_store` and
     /// `frag_reuse_index` are provided so the override can rebuild the index
     /// without re-reading metadata.
@@ -230,6 +197,31 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Open an index through the cache, awaiting `load` only on a miss.
+    ///
+    /// The default read-through / write-back over
+    /// [`get_from_cache`](Self::get_from_cache) and
+    /// [`put_in_cache`](Self::put_in_cache) does not coalesce concurrent cold
+    /// opens; plugins with a serializable form should override with
+    /// [`single_flight_open`] so one shared load populates the sized state key.
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        if let Some(index) = self
+            .get_from_cache(index_store, frag_reuse_index, cache)
+            .await?
+        {
+            return Ok(index);
+        }
+        let index = load.await?;
+        self.put_in_cache(cache, index.clone()).await?;
+        Ok(index)
+    }
+
     /// Optional hook allowing a plugin to provide statistics without loading the index.
     async fn load_statistics(
         &self,
@@ -251,6 +243,97 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         // Return an empty JSON object as the default implementation
         Ok(serde_json::json!({}))
     }
+
+    /// Optionally create a seed writer for the given column.
+    ///
+    /// A seed writer observes column values during data file writes, accumulates
+    /// compact statistics in memory, and serializes them as a global buffer
+    /// embedded in the data file footer. The buffer is later harvested during
+    /// index updates to skip a full column scan.
+    ///
+    /// All parameters needed to construct the writer must be derivable from
+    /// `index_details` — this method must not perform any I/O. Return `Ok(None)`
+    /// if this index type does not support seed writing.
+    async fn create_seed_writer(
+        &self,
+        _field_path: &str,
+        _data_type: &DataType,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<Box<dyn super::seed::IndexSeedWriter>>> {
+        Ok(None)
+    }
+
+    /// Returns true if this index type may have seed buffers embedded in data
+    /// files for the given index configuration.
+    ///
+    /// When false the caller can skip opening data files to look for seeds
+    /// entirely, avoiding I/O for index types or configurations that never
+    /// write seeds.
+    fn might_use_seeds(&self, _index_details: &prost_types::Any) -> bool {
+        false
+    }
+
+    /// Attempt to update `reference_index` using pre-harvested `seeds` instead
+    /// of re-scanning column data.
+    ///
+    /// Each [`FragmentSeed`](super::seed::FragmentSeed) carries the raw bytes
+    /// written by the corresponding [`IndexSeedWriter`](super::seed::IndexSeedWriter)
+    /// and the original `metadata_value` stored in the data file, which the plugin
+    /// can use for compatibility validation (e.g. confirming `rows_per_zone`).
+    ///
+    /// Return `Ok(Some(created))` if the seed-based update succeeded, or
+    /// `Ok(None)` to signal that the caller should fall back to a full column scan.
+    async fn update_from_seeds(
+        &self,
+        _seeds: Vec<super::seed::FragmentSeed>,
+        _reference_index: Arc<dyn ScalarIndex>,
+        _index_details: &prost_types::Any,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<Option<CreatedIndex>> {
+        Ok(None)
+    }
+}
+
+/// A boxed, `Send` future performing the storage-level load of a scalar index
+/// (compat checks, `load_index`, metrics).
+///
+/// Passed to [`ScalarIndexPlugin::get_or_insert_in_cache`], which awaits it at
+/// most once on a cache miss and drops it un-awaited on a warm hit.
+pub type ScalarIndexLoad<'a> = BoxFuture<'a, Result<Arc<dyn ScalarIndex>>>;
+
+/// Single-flight open helper for plugins with a serializable form.
+///
+/// Concurrent cold opens of the same index coalesce onto one `load`: it runs
+/// once, `to_state` converts the opened index to its sized state, and the state
+/// is cached under `state_key` (persisted via the key's
+/// [`CacheCodec`](lance_core::cache::CacheCodec)). Every caller — warm hits
+/// included — then rebuilds the index from the shared state via `from_state`, an
+/// IO-free reconstruct.
+///
+/// `to_state` / `from_state` mirror the plugin's
+/// [`put_in_cache`](ScalarIndexPlugin::put_in_cache) /
+/// [`get_from_cache`](ScalarIndexPlugin::get_from_cache), keeping the state
+/// representation defined in one place.
+pub async fn single_flight_open<K, ToState, FromState>(
+    cache: &LanceCache,
+    state_key: K,
+    load: ScalarIndexLoad<'_>,
+    to_state: ToState,
+    from_state: FromState,
+) -> Result<Arc<dyn ScalarIndex>>
+where
+    K: CacheKey + Send,
+    K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    ToState: FnOnce(&dyn ScalarIndex) -> Result<K::ValueType> + Send,
+    FromState: FnOnce(Arc<K::ValueType>) -> Result<Arc<dyn ScalarIndex>> + Send,
+{
+    let state = cache
+        .get_or_insert_with_key(state_key, move || async move {
+            let index = load.await?;
+            to_state(index.as_ref())
+        })
+        .await?;
+    from_state(state)
 }
 
 /// In-memory cache key for a whole `Arc<dyn ScalarIndex>`.
@@ -272,5 +355,13 @@ impl UnsizedCacheKey for ScalarIndexCacheKey {
 
     fn type_name() -> &'static str {
         "ScalarIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.registry.scalar-index-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
     }
 }

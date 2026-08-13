@@ -310,16 +310,7 @@ class EncodedImageArray(ImageArray):
             img = Image.open(io.BytesIO(images[0].as_py()))
             return img
 
-        def tensorflow_metadata_decoder(images):
-            import tensorflow as tf
-
-            img = tf.io.decode_image(images[0].as_py())
-            return img
-
-        decoders = (
-            ("tensorflow", tensorflow_metadata_decoder),
-            ("PIL", pillow_metadata_decoder),
-        )
+        decoders = (("PIL", pillow_metadata_decoder),)
         decoder = None
 
         for libname, metadata_decoder in decoders:
@@ -351,7 +342,7 @@ class EncodedImageArray(ImageArray):
         decoder : Callable[pa.binary()], optional
             A function that takes a binary array and returns a numpy.ndarray
             or pa.fixed_shape_tensor. If not provided, will attempt to use
-            tensorflow and then pillow decoder in that order.
+            pillow.
 
         Returns
         -------
@@ -385,20 +376,7 @@ class EncodedImageArray(ImageArray):
                     ]
                 )
 
-            def tensorflow_decoder(images) -> "np.ndarray":
-                import tensorflow as tf
-
-                decoded_to_tensor = tuple(
-                    tf.io.decode_image(img) for img in images.to_pylist()
-                )
-                return tf.stack(  # pyright: ignore[reportOptionalCall]
-                    decoded_to_tensor, axis=0
-                ).numpy()
-
-            decoders = [
-                ("tensorflow", tensorflow_decoder),
-                ("PIL", pillow_decoder),
-            ]
+            decoders = [("PIL", pillow_decoder)]
             for libname, decoder_function in decoders:
                 try:
                     __import__(libname)
@@ -408,8 +386,8 @@ class EncodedImageArray(ImageArray):
                     pass
             else:
                 raise ValueError(
-                    "No image decoder available. Please either install one of "
-                    "tensorflow, pillow, or pass a decoder argument."
+                    "No image decoder available. Please install pillow or pass a "
+                    "decoder argument."
                 )
 
         image_array = decoder(self.storage)
@@ -499,19 +477,8 @@ class FixedShapeImageTensorArray(ImageArray):
                     encoded_images.append(buf.getvalue())
             return pa.array(encoded_images, type=storage_type)
 
-        def tensorflow_encoder(x):
-            import tensorflow as tf
-
-            encoded_images = (
-                tf.io.encode_png(y).numpy() for y in tf.convert_to_tensor(x)
-            )
-            return pa.array(encoded_images, type=storage_type)
-
         if not encoder:
-            encoders = (
-                ("PIL", pillow_encoder),
-                ("tensorflow", tensorflow_encoder),
-            )
+            encoders = (("PIL", pillow_encoder),)
             for libname, encoder_function in encoders:
                 try:
                     __import__(libname)
@@ -521,8 +488,8 @@ class FixedShapeImageTensorArray(ImageArray):
                     pass
             else:
                 raise ValueError(
-                    "No image encoder available. Please either install one of "
-                    "tensorflow, pillow, or pass an encoder argument."
+                    "No image encoder available. Please install pillow or pass an "
+                    "encoder argument."
                 )
 
         return EncodedImageArray.from_storage(

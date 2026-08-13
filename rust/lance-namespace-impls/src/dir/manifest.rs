@@ -36,7 +36,9 @@ use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{BuiltinIndexType, CreatedIndex, ScalarIndexParams};
+use lance_index::scalar::{
+    BuiltinIndexType, CreatedIndex, ScalarIndexParams, index_files_to_table,
+};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::stream::RecordBatchStream as LanceRecordBatchStream;
 use lance_namespace::LanceNamespace;
@@ -884,7 +886,60 @@ impl ManifestNamespace {
             Self::ensure_manifest_table_up_to_date(&root, &storage_options, session.clone())
                 .await?;
 
-        Ok(Self {
+        Ok(Self::new(
+            root,
+            storage_options,
+            session,
+            object_store,
+            base_path,
+            manifest_dataset,
+            dir_listing_enabled,
+            inline_optimization_enabled,
+            commit_retries,
+        ))
+    }
+
+    /// Open an existing manifest dataset without creating or migrating it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_from_directory(
+        root: String,
+        storage_options: Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        dir_listing_enabled: bool,
+        inline_optimization_enabled: bool,
+        commit_retries: Option<u32>,
+    ) -> Result<Self> {
+        let manifest_dataset =
+            Self::open_manifest_table(&root, &storage_options, session.clone()).await?;
+
+        Ok(Self::new(
+            root,
+            storage_options,
+            session,
+            object_store,
+            base_path,
+            manifest_dataset,
+            dir_listing_enabled,
+            inline_optimization_enabled,
+            commit_retries,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        root: String,
+        storage_options: Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        manifest_dataset: DatasetConsistencyWrapper,
+        dir_listing_enabled: bool,
+        inline_optimization_enabled: bool,
+        commit_retries: Option<u32>,
+    ) -> Self {
+        Self {
             root,
             storage_options,
             session,
@@ -895,7 +950,7 @@ impl ManifestNamespace {
             inline_optimization_enabled,
             commit_retries,
             manifest_mutation_lock: Arc::new(Mutex::new(())),
-        })
+        }
     }
 
     /// Build object ID from namespace path and name
@@ -1258,7 +1313,7 @@ impl ManifestNamespace {
             index_version: trained_index.created_index.index_version as i32,
             created_at: None,
             base_id: None,
-            files: Some(trained_index.created_index.files),
+            files: Some(index_files_to_table(trained_index.created_index.files)),
         })
     }
 
@@ -2443,6 +2498,37 @@ impl ManifestNamespace {
         Ok(found_result)
     }
 
+    /// Load an existing manifest dataset without creating or migrating it.
+    async fn open_manifest_table(
+        root: &str,
+        storage_options: &Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
+    ) -> Result<DatasetConsistencyWrapper> {
+        let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
+        log::debug!("Attempting to load manifest from {}", manifest_path);
+        let store_options = ObjectStoreParams {
+            storage_options_accessor: storage_options.as_ref().map(|opts| {
+                Arc::new(
+                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                        opts.clone(),
+                    ),
+                )
+            }),
+            ..Default::default()
+        };
+        let read_params = ReadParams {
+            session,
+            store_options: Some(store_options),
+            ..Default::default()
+        };
+        let dataset = DatasetBuilder::from_uri(&manifest_path)
+            .with_read_params(read_params)
+            .load()
+            .await?;
+        ensure_readable(dataset.metadata())?;
+        Ok(DatasetConsistencyWrapper::new(dataset))
+    }
+
     /// Create or load the manifest dataset, ensuring it has the latest schema setup.
     ///
     /// This function will:
@@ -2475,129 +2561,135 @@ impl ManifestNamespace {
             .with_read_params(read_params)
             .load()
             .await;
-        if let Ok(mut dataset) = dataset_result {
-            // Reject a manifest written with a reader feature flag this build
-            // does not understand before touching it.
-            ensure_readable(dataset.metadata())?;
+        match dataset_result {
+            Ok(mut dataset) => {
+                // Reject a manifest written with a reader feature flag this build
+                // does not understand before touching it.
+                ensure_readable(dataset.metadata())?;
 
-            // Check if the object_id field has primary key metadata, migrate if not
-            let needs_pk_migration = dataset
-                .schema()
-                .field("object_id")
-                .map(|f| {
-                    !f.metadata
-                        .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
-                })
-                .unwrap_or(false);
+                // Check if the object_id field has primary key metadata, migrate if not
+                let needs_pk_migration = dataset
+                    .schema()
+                    .field("object_id")
+                    .map(|f| {
+                        !f.metadata
+                            .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+                    })
+                    .unwrap_or(false);
 
-            if needs_pk_migration {
-                // This legacy migration writes to the manifest, so confirm this
-                // build is allowed to write the current format first.
-                ensure_writable(dataset.metadata())?;
-                log::info!("Migrating __manifest table to add primary key metadata on object_id");
-                dataset
-                    .update_field_metadata()
-                    .update("object_id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
-                    .map_err(|e| {
-                        lance_core::Error::from(NamespaceError::Internal {
-                            message: format!(
-                                "Failed to find object_id field for migration: {:?}",
-                                e
-                            ),
-                        })
-                    })?
-                    .await
-                    .map_err(|e| {
-                        lance_core::Error::from(NamespaceError::Internal {
-                            message: format!("Failed to migrate primary key metadata: {:?}", e),
-                        })
-                    })?;
-            }
-
-            Ok(DatasetConsistencyWrapper::new(dataset))
-        } else {
-            log::info!("Creating new manifest table at {}", manifest_path);
-            let schema = Self::manifest_schema();
-            let empty_batch = RecordBatch::new_empty(schema.clone());
-            let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
-
-            let store_params = ObjectStoreParams {
-                storage_options_accessor: storage_options.as_ref().map(|opts| {
-                    Arc::new(
-                        lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                            opts.clone(),
-                        ),
-                    )
-                }),
-                ..Default::default()
-            };
-            let write_params = WriteParams {
-                session: session.clone(),
-                store_params: Some(store_params),
-                ..Default::default()
-            };
-
-            let dataset =
-                Dataset::write(Box::new(reader), &manifest_path, Some(write_params)).await;
-
-            // Handle race condition where another process created the manifest concurrently
-            match dataset {
-                Ok(dataset) => {
+                if needs_pk_migration {
+                    // This legacy migration writes to the manifest, so confirm this
+                    // build is allowed to write the current format first.
+                    ensure_writable(dataset.metadata())?;
                     log::info!(
-                        "Successfully created manifest table at {}, version={}, uri={}",
-                        manifest_path,
-                        dataset.version().version,
-                        dataset.uri()
+                        "Migrating __manifest table to add primary key metadata on object_id"
                     );
-                    Ok(DatasetConsistencyWrapper::new(dataset))
-                }
-                Err(ref e)
-                    if matches!(
-                        e,
-                        LanceError::DatasetAlreadyExists { .. }
-                            | LanceError::CommitConflict { .. }
-                            | LanceError::IncompatibleTransaction { .. }
-                            | LanceError::RetryableCommitConflict { .. }
-                    ) =>
-                {
-                    // Another process created the manifest concurrently, try to load it
-                    log::info!(
-                        "Manifest table was created by another process, loading it: {}",
-                        manifest_path
-                    );
-                    let recovery_store_options = ObjectStoreParams {
-                        storage_options_accessor: storage_options.as_ref().map(|opts| {
-                            Arc::new(
-                                lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                                    opts.clone(),
-                                ),
-                            )
-                        }),
-                        ..Default::default()
-                    };
-                    let recovery_read_params = ReadParams {
-                        session,
-                        store_options: Some(recovery_store_options),
-                        ..Default::default()
-                    };
-                    let dataset = DatasetBuilder::from_uri(&manifest_path)
-                        .with_read_params(recovery_read_params)
-                        .load()
-                        .await
+                    dataset
+                        .update_field_metadata()
+                        .update("object_id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
                         .map_err(|e| {
                             lance_core::Error::from(NamespaceError::Internal {
                                 message: format!(
-                                    "Failed to load manifest dataset after creation conflict: {}",
+                                    "Failed to find object_id field for migration: {:?}",
                                     e
                                 ),
                             })
+                        })?
+                        .await
+                        .map_err(|e| {
+                            lance_core::Error::from(NamespaceError::Internal {
+                                message: format!("Failed to migrate primary key metadata: {:?}", e),
+                            })
                         })?;
-                    Ok(DatasetConsistencyWrapper::new(dataset))
                 }
-                Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create manifest dataset: {:?}", e),
-                })),
+
+                Ok(DatasetConsistencyWrapper::new(dataset))
             }
+            Err(err) if Self::is_not_found_load_error(&err) => {
+                log::info!("Creating new manifest table at {}", manifest_path);
+                let schema = Self::manifest_schema();
+                let empty_batch = RecordBatch::new_empty(schema.clone());
+                let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
+
+                let store_params = ObjectStoreParams {
+                    storage_options_accessor: storage_options.as_ref().map(|opts| {
+                        Arc::new(
+                            lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                                opts.clone(),
+                            ),
+                        )
+                    }),
+                    ..Default::default()
+                };
+                let write_params = WriteParams {
+                    session: session.clone(),
+                    store_params: Some(store_params),
+                    ..Default::default()
+                };
+
+                let dataset =
+                    Dataset::write(Box::new(reader), &manifest_path, Some(write_params)).await;
+
+                // Handle race condition where another process created the manifest concurrently
+                match dataset {
+                    Ok(dataset) => {
+                        log::info!(
+                            "Successfully created manifest table at {}, version={}, uri={}",
+                            manifest_path,
+                            dataset.version().version,
+                            dataset.uri()
+                        );
+                        Ok(DatasetConsistencyWrapper::new(dataset))
+                    }
+                    Err(ref e)
+                        if matches!(
+                            e,
+                            LanceError::DatasetAlreadyExists { .. }
+                                | LanceError::CommitConflict { .. }
+                                | LanceError::IncompatibleTransaction { .. }
+                                | LanceError::RetryableCommitConflict { .. }
+                        ) =>
+                    {
+                        // Another process created the manifest concurrently, try to load it
+                        log::info!(
+                            "Manifest table was created by another process, loading it: {}",
+                            manifest_path
+                        );
+                        let recovery_store_options = ObjectStoreParams {
+                            storage_options_accessor: storage_options.as_ref().map(|opts| {
+                                Arc::new(
+                                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                                        opts.clone(),
+                                    ),
+                                )
+                            }),
+                            ..Default::default()
+                        };
+                        let recovery_read_params = ReadParams {
+                            session,
+                            store_options: Some(recovery_store_options),
+                            ..Default::default()
+                        };
+                        let dataset = DatasetBuilder::from_uri(&manifest_path)
+                            .with_read_params(recovery_read_params)
+                            .load()
+                            .await
+                            .map_err(|e| {
+                                lance_core::Error::from(NamespaceError::Internal {
+                                    message: format!(
+                                        "Failed to load manifest dataset after creation conflict: {}",
+                                        e
+                                    ),
+                                })
+                            })?;
+                        Ok(DatasetConsistencyWrapper::new(dataset))
+                    }
+                    Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to create manifest dataset: {:?}", e),
+                    })),
+                }
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -3539,30 +3631,26 @@ impl LanceNamespace for ManifestNamespace {
             }
         }
 
-        // Create the .lance-reserved file to mark the table as existing
+        // Atomically create the .lance-reserved file to mark the table as declared.
+        // Shared with DirectoryNamespace via put_marker_file_atomic (dotfile-safe
+        // staging + MarkerFileError::AlreadyExists → TableAlreadyExists).
         let reserved_file_path = table_path.clone().join(".lance-reserved");
-
-        self.object_store
-            .create(&reserved_file_path)
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to create .lance-reserved file for table {}: {}",
-                        table_name, e
-                    ),
+        super::put_marker_file_atomic(
+            &self.object_store,
+            &reserved_file_path,
+            &format!("table {}", table_name),
+        )
+        .await
+        .map_err(|e| match e {
+            super::MarkerFileError::AlreadyExists { .. } => {
+                lance_core::Error::from(NamespaceError::TableAlreadyExists {
+                    message: table_name.to_string(),
                 })
-            })?
-            .shutdown()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to finalize .lance-reserved file for table {}: {}",
-                        table_name, e
-                    ),
-                })
-            })?;
+            }
+            super::MarkerFileError::Other { message } => {
+                lance_core::Error::from(NamespaceError::Internal { message })
+            }
+        })?;
 
         let metadata = Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
 

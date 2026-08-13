@@ -4,7 +4,7 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{FromJString, IntoJava};
-use crate::{JNIEnvExt, RT};
+use crate::{JNIEnvExt, block_on};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JObject, JString, JValueGen};
 use jni::sys::{jbyteArray, jint, jlong};
@@ -59,23 +59,26 @@ fn inner_take_blobs<'local>(
     let blobs = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        RT.block_on(Arc::new(dataset.inner.clone()).take_blobs(&row_ids_u64, col_name))?
+        block_on(Arc::new(dataset.inner.clone()).take_blobs(&row_ids_u64, col_name))?
     };
     let j_blobs = blobs
         .into_iter()
-        .map(BlockingBlobFile::from)
-        .collect::<Vec<BlockingBlobFile>>();
+        .map(|blob| blob.map(BlockingBlobFile::from))
+        .collect::<Vec<_>>();
     transform_vec(env, j_blobs)
 }
 
 fn transform_vec<'local>(
     env: &mut JNIEnv<'local>,
-    vec: Vec<BlockingBlobFile>,
+    vec: Vec<Option<BlockingBlobFile>>,
 ) -> Result<JObject<'local>> {
     let array_list_class = env.find_class("java/util/ArrayList")?;
     let array_list = env.new_object(array_list_class, "()V", &[])?;
     for blob_file in vec {
-        let blob_file_obj = blob_file.into_java(env)?;
+        let blob_file_obj = match blob_file {
+            Some(blob_file) => blob_file.into_java(env)?,
+            None => JObject::null(),
+        };
         env.call_method(
             &array_list,
             "add",
@@ -111,14 +114,12 @@ fn inner_take_blobs_by_indices<'local>(
     let blobs = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        RT.block_on(
-            Arc::new(dataset.inner.clone()).take_blobs_by_indices(&row_indices_u64, col_name),
-        )?
+        block_on(Arc::new(dataset.inner.clone()).take_blobs_by_indices(&row_indices_u64, col_name))?
     };
     let j_blobs = blobs
         .into_iter()
-        .map(BlockingBlobFile::from)
-        .collect::<Vec<BlockingBlobFile>>();
+        .map(|blob| blob.map(BlockingBlobFile::from))
+        .collect::<Vec<_>>();
     transform_vec(env, j_blobs)
 }
 
@@ -137,7 +138,7 @@ pub extern "system" fn Java_org_lance_BlobFile_nativeRead(
 fn inner_blob_read<'local>(env: &mut JNIEnv<'local>, jblob: JObject) -> Result<JByteArray<'local>> {
     let bytes = {
         let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
-        RT.block_on(blob.inner.read())?
+        block_on(blob.inner.read())?
     };
     let arr = env.new_byte_array(bytes.len() as jint)?;
     let u8_slice: &[u8] = bytes.as_ref();
@@ -167,7 +168,7 @@ fn inner_blob_read_up_to<'local>(
 ) -> Result<JByteArray<'local>> {
     let bytes = {
         let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
-        RT.block_on(blob.inner.read_up_to(len as usize))?
+        block_on(blob.inner.read_up_to(len as usize))?
     };
     let arr = env.new_byte_array(bytes.len() as jint)?;
     let u8_slice: &[u8] = bytes.as_ref();
@@ -202,7 +203,7 @@ fn inner_blob_read_range<'local>(
         .ok_or_else(|| lance_core::Error::invalid_input("offset + len overflowed".to_string()))?;
     let bytes = {
         let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
-        RT.block_on(blob.inner.read_range(offset as u64..end))?
+        block_on(blob.inner.read_range(offset as u64..end))?
     };
     let arr = env.new_byte_array(bytes.len() as jint)?;
     let u8_slice: &[u8] = bytes.as_ref();
@@ -223,7 +224,7 @@ pub extern "system" fn Java_org_lance_BlobFile_nativeSeek(
 
 fn inner_blob_seek(env: &mut JNIEnv, jblob: JObject, new_cursor: jlong) -> Result<()> {
     let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
-    RT.block_on(blob.inner.seek(new_cursor as u64))?;
+    block_on(blob.inner.seek(new_cursor as u64))?;
     Ok(())
 }
 
@@ -237,7 +238,7 @@ pub extern "system" fn Java_org_lance_BlobFile_nativeTell(
 
 fn inner_blob_tell(env: &mut JNIEnv, jblob: JObject) -> Result<u64> {
     let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
-    Ok(RT.block_on(blob.inner.tell())?)
+    Ok(block_on(blob.inner.tell())?)
 }
 
 #[unsafe(no_mangle)]
@@ -260,6 +261,6 @@ pub extern "system" fn Java_org_lance_BlobFile_nativeClose(mut env: JNIEnv, jblo
 
 fn inner_blob_close(env: &mut JNIEnv, jblob: JObject) -> Result<()> {
     let blob = unsafe { env.take_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB)? };
-    RT.block_on(blob.inner.close())?;
+    block_on(blob.inner.close())?;
     Ok(())
 }

@@ -19,6 +19,8 @@ pub mod f32;
 pub mod f64;
 pub mod i32;
 pub mod u8;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86;
 
 use num_traits::{Float, Num};
 use u8::u8x16;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     collections::HashMap,
@@ -19,7 +20,8 @@ use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchSt
 use datafusion_common::ScalarValue;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
 use lance_core::cache::{
-    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+    KeyBuilder, LanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
@@ -38,8 +40,8 @@ use crate::pbold;
 use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest, VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+    TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
 };
 use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -212,7 +214,7 @@ impl ScalarIndex for LabelListIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let state = self.values_index.load_bitmap_index_state().await?;
@@ -220,10 +222,7 @@ impl ScalarIndex for LabelListIndex {
         let remapped_nulls =
             RowAddrTreeMap::from_iter(self.list_nulls.row_addrs().unwrap().filter_map(|addr| {
                 let addr_as_u64 = u64::from(addr);
-                mapping
-                    .get(&addr_as_u64)
-                    .copied()
-                    .unwrap_or(Some(addr_as_u64))
+                mapping.get(addr_as_u64).unwrap_or(Some(addr_as_u64))
             }));
         let file = write_label_list_bitmap_index(
             remapped_state,
@@ -596,6 +595,18 @@ impl LabelListIndexState {
         })
     }
 
+    fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let label_list = index
+            .as_any()
+            .downcast_ref::<LabelListIndex>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "LabelListIndexState::from_scalar_index called with a non-label-list index",
+                )
+            })?;
+        Self::from_index(label_list)
+    }
+
     fn into_label_list_index(
         self,
         store: Arc<dyn IndexStore>,
@@ -654,6 +665,14 @@ impl CacheKey for LabelListIndexStateKey {
         "LabelListIndexState"
     }
 
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.label-list-index-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
+    }
+
     fn codec() -> Option<CacheCodec> {
         Some(CacheCodec::from_impl::<LabelListIndexState>())
     }
@@ -662,6 +681,33 @@ impl CacheKey for LabelListIndexStateKey {
 #[derive(Debug, Default)]
 pub struct LabelListIndexPlugin;
 
+pub(super) fn validate_label_list_data_type(data_type: &DataType) -> Result<()> {
+    let item_type = match data_type {
+        DataType::List(item_field) | DataType::LargeList(item_field) => item_field.data_type(),
+        _ => {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
+                    data_type
+                )
+                .into(),
+            ));
+        }
+    };
+
+    if item_type.is_nested() {
+        return Err(Error::invalid_input_source(
+            format!(
+                "LabelList index item type must be non-nested. Column has type {:?}",
+                data_type
+            )
+            .into(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl BasicTrainer for LabelListIndexPlugin {
     fn new_training_request(
@@ -669,16 +715,7 @@ impl BasicTrainer for LabelListIndexPlugin {
         _params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
-        if !matches!(
-            field.data_type(),
-            DataType::List(_) | DataType::LargeList(_)
-        ) {
-            return Err(Error::invalid_input_source(format!(
-                "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
-                field.data_type()
-            )
-            .into()));
-        }
+        validate_label_list_data_type(field.data_type())?;
 
         Ok(Box::new(DefaultTrainingRequest::new(
             TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
@@ -713,16 +750,7 @@ impl BasicTrainer for LabelListIndexPlugin {
             })?
             .1;
 
-        if !matches!(
-            field.data_type(),
-            DataType::List(_) | DataType::LargeList(_)
-        ) {
-            return Err(Error::invalid_input_source(format!(
-                "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
-                field.data_type()
-            )
-            .into()));
-        }
+        validate_label_list_data_type(field.data_type())?;
 
         let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
         let data = track_list_nulls(data, list_nulls.clone());
@@ -799,19 +827,33 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     }
 
     async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
-        let label_list = index
-            .as_any()
-            .downcast_ref::<LabelListIndex>()
-            .ok_or_else(|| {
-                Error::internal(
-                    "LabelListIndexPlugin::put_in_cache called with a non-label-list index",
-                )
-            })?;
-        let state = LabelListIndexState::from_index(label_list)?;
+        let state = LabelListIndexState::from_scalar_index(index.as_ref())?;
         cache
             .insert_with_key(&LabelListIndexStateKey, Arc::new(state))
             .await;
         Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            LabelListIndexStateKey,
+            load,
+            LabelListIndexState::from_scalar_index,
+            move |state| {
+                Ok((*state)
+                    .clone()
+                    .into_label_list_index(index_store, cache, frag_reuse_index)?
+                    as Arc<dyn ScalarIndex>)
+            },
+        )
+        .await
     }
 }
 
@@ -822,10 +864,41 @@ mod tests {
     use datafusion_common::ScalarValue;
     use lance_core::cache::CacheCodec;
     use lance_core::utils::address::RowAddress;
+    use rstest::rstest;
 
     use super::super::bitmap::BitmapIndexState;
     use super::super::btree::OrderableScalarValue;
     use super::*;
+
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    fn test_rejects_nested_item_type(#[case] data_type: DataType) {
+        let field = Field::new(VALUE_COLUMN_NAME, data_type, true);
+        let error = LabelListIndexPlugin
+            .new_training_request("", &field)
+            .err()
+            .expect("nested item type should be rejected");
+
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected invalid input error, got: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("LabelList index item type must be non-nested"),
+            "unexpected error: {error}"
+        );
+    }
 
     fn sample_state() -> LabelListIndexState {
         let mut index_map = BTreeMap::new();

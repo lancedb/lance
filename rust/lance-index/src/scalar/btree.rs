@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -25,7 +26,8 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
+            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -61,8 +63,8 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{
-        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
-        WeakLanceCache,
+        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+        KeyBuilder, LanceCache, WeakLanceCache,
     },
     error::LanceOptionExt,
     utils::{
@@ -395,6 +397,8 @@ impl Ord for OrderableScalarValue {
                 panic!("Attempt to compare List with non-List")
             }
             (LargeList(_), _) => todo!(),
+            (ListView(_), _) => todo!(),
+            (LargeListView(_), _) => todo!(),
             (Map(_), Map(_)) => todo!(),
             (Map(left), Null) => {
                 if left.is_null(0) {
@@ -1361,6 +1365,14 @@ impl CacheKey for BTreePageKey {
         "BTreePage"
     }
 
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.btree-page-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.page_number);
+    }
+
     fn codec() -> Option<CacheCodec> {
         // Pages are cached as `FlatIndex` values (see `ValueType` above).
         Some(CacheCodec::from_impl::<FlatIndex>())
@@ -1390,6 +1402,17 @@ impl DeepSizeOf for BTreeIndexState {
 }
 
 impl BTreeIndexState {
+    fn from_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
+            Error::internal("BTreeIndexState::from_index called with a non-BTree index")
+        })?;
+        Ok(Self {
+            lookup_batch: btree.page_lookup.batch.clone(),
+            batch_size: btree.batch_size,
+            ranges_to_files: btree.ranges_to_files.clone(),
+        })
+    }
+
     fn reconstruct(
         &self,
         store: Arc<dyn IndexStore>,
@@ -1474,6 +1497,14 @@ impl CacheKey for BTreeIndexStateKey {
 
     fn type_name() -> &'static str {
         "BTreeIndexState"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.btree-index-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
     }
 
     fn codec() -> Option<CacheCodec> {
@@ -1620,11 +1651,17 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<FlatIndex>> {
-        self.index_cache
-            .get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
+        let result = self
+            .index_cache
+            .get_or_insert_with_key_hit(BTreePageKey { page_number }, move || async move {
                 self.read_page(page_number, index_reader, metrics).await
             })
-            .await
+            .await;
+        match &result {
+            Ok((_, true)) => metrics.record_index_cache_hit(),
+            _ => metrics.record_index_cache_miss(),
+        }
+        result.map(|(page, _)| page)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2215,7 +2252,7 @@ impl ScalarIndex for BTreeIndex {
 
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // (part_id, path)
@@ -2331,6 +2368,10 @@ impl ScalarIndex for BTreeIndex {
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
+
+    fn training_data_type(&self) -> Option<DataType> {
+        Some(self.data_type.clone())
+    }
 }
 
 struct BatchStats {
@@ -2382,7 +2423,7 @@ pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
     async fn remap_subindex(
         &self,
         serialized: RecordBatch,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
     ) -> Result<RecordBatch>;
 }
 
@@ -2549,9 +2590,7 @@ pub async fn train_btree_index(
     Ok(vec![pages_file, lookup_file])
 }
 
-fn find_single_partition_files(
-    files: &[lance_table::format::IndexFile],
-) -> Result<Option<(&str, &str)>> {
+fn find_single_partition_files(files: &[super::IndexFile]) -> Result<Option<(&str, &str)>> {
     let lookup_files = files
         .iter()
         .filter_map(|file| {
@@ -3316,23 +3355,34 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
     }
 
     async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
-        let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
-            Error::internal("BTreeIndexPlugin::put_in_cache called with a non-BTree index")
-        })?;
-        let state = BTreeIndexState {
-            lookup_batch: btree.page_lookup.batch.clone(),
-            batch_size: btree.batch_size,
-            ranges_to_files: btree.ranges_to_files.clone(),
-        };
+        let state = BTreeIndexState::from_index(index.as_ref())?;
         cache
             .insert_with_key(&BTreeIndexStateKey, Arc::new(state))
             .await;
         Ok(())
     }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            BTreeIndexStateKey,
+            load,
+            BTreeIndexState::from_index,
+            move |state| state.reconstruct(index_store, cache, frag_reuse_index),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
@@ -3481,7 +3531,7 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         index
-            .remap(&HashMap::default(), remap_store.as_ref())
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
             .await
             .unwrap();
 
@@ -3678,6 +3728,53 @@ mod tests {
         let query2 = index.search(&query, &metrics);
         tokio::join!(query1, query2).0.unwrap();
         assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_page_cache_hit_miss_counts() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(1000), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(test_store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // First search: cold cache — the page fetch must miss.
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
+        let cold = LocalMetricsCollector::default();
+        index.search(&query, &cold).await.unwrap();
+        assert_eq!(cold.index_cache_hits(), 0);
+        assert_eq!(cold.index_cache_misses(), 1);
+        assert_eq!(cold.parts_loaded.load(Ordering::Relaxed), 1);
+
+        // Second search: same key, page must now be served from cache.
+        let warm = LocalMetricsCollector::default();
+        index.search(&query, &warm).await.unwrap();
+        assert_eq!(warm.index_cache_hits(), 1);
+        assert_eq!(warm.index_cache_misses(), 0);
+        assert_eq!(warm.parts_loaded.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -4992,7 +5089,7 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         ranged_index
-            .remap(&HashMap::default(), remap_store.as_ref())
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
             .await
             .unwrap();
 
@@ -5303,12 +5400,8 @@ mod tests {
             mapping.insert(old_id, None);
         }
 
-        let mut new_id_counter = 100_000;
-
         // Remap all other rows
-        for old_id in (0..1000).chain(10000..15000) {
-            let new_id = new_id_counter;
-            new_id_counter += 1;
+        for (new_id, old_id) in (100_000..).zip((0..1000).chain(10000..15000)) {
             mapping.insert(old_id, Some(new_id));
         }
 
@@ -5320,7 +5413,10 @@ mod tests {
         ));
 
         // Remap the index with our deletion mapping
-        index.remap(&mapping, remap_store.as_ref()).await.unwrap();
+        index
+            .remap(&RowAddrRemap::direct(mapping), remap_store.as_ref())
+            .await
+            .unwrap();
 
         let remapped_index = BTreeIndex::load(remap_store.clone(), None, &LanceCache::no_cache())
             .await
@@ -6262,7 +6358,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_btree_index_state_reconstruct_applies_frag_reuse_index() {
-        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
+        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
         use std::collections::HashMap;
         use uuid::Uuid;
 
@@ -6295,11 +6391,11 @@ mod tests {
         // Querying for value == 0 should now return row 5000, confirming reconstruct threaded
         // the FragReuseIndex through to the rebuilt BTreeIndex.
         let frag_reuse_index: Arc<dyn crate::scalar::RowIdRemapper> =
-            Arc::new(FragReuseIndex::new(
+            Arc::new(FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
                 Uuid::new_v4(),
                 vec![HashMap::from([(0u64, Some(5000u64))])],
                 FragReuseIndexDetails { versions: vec![] },
-            ));
+            ))));
         let reconstructed = state
             .reconstruct(
                 test_store.clone(),
