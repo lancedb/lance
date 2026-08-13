@@ -11,7 +11,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-24.04
-    if: github.repository == 'lancedb/lance'
+    if: github.repository == 'lance-format/lance'
     permissions:
       actions: write
     steps:
@@ -25,7 +25,7 @@ jobs:
   jumbo-tests:
     # jumbo tests need more resources
     runs-on: ubuntu-24.04-8x
-    if: github.repository == 'lancedb/lance'
+    if: github.repository == 'lance-format/lance'
     timeout-minutes: 60
     permissions:
       contents: read
@@ -51,7 +51,7 @@ jobs:
   # slow and unbounded in depth, so it runs nightly with a generous timeout rather than blocking
   # merges; the manual escape hatch for arbitrary ref pairs lives in compat-pair.yml.
   compat-sequence:
-    if: github.repository == 'lancedb/lance'
+    if: github.repository == 'lance-format/lance'
     timeout-minutes: 360
     runs-on: ubuntu-24.04
     name: Index Sequence Compat

@@ -5,7 +5,7 @@ use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use jni::objects::{JIntArray, JValue, JValueGen};
+use jni::objects::{JByteArray, JIntArray, JValue, JValueGen};
 use jni::{
     JNIEnv,
     objects::{JClass, JLongArray, JObject, JString},
@@ -19,6 +19,8 @@ use lance_io::utils::CachedFileSize;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use std::iter::once;
 
+use roaring::RoaringBitmap;
+
 use lance::dataset::fragment::write::FragmentCreateBuilder;
 use lance::io::ObjectStoreParams;
 use lance_datafusion::utils::StreamingWriteSource;
@@ -29,6 +31,7 @@ use std::sync::Arc;
 use crate::blocking_dataset::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::session::session_from_handle;
 use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
 use crate::utils::extract_storage_options;
 use crate::{
@@ -48,8 +51,8 @@ pub(crate) struct FragmentMergeResult {
 pub(crate) struct FragmentUpdateResult {
     updated_fragment: Fragment,
     fields_modified: Vec<u32>,
-    /// Physical row offsets that received column updates (from `_rowaddr` low bits).
-    updated_row_offsets: Vec<i64>,
+    /// Matched row offsets serialized as portable RoaringBitmap bytes.
+    updated_row_offset_bytes: Vec<u8>,
 }
 
 //////////////////
@@ -109,6 +112,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -132,6 +136,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
             schema_addr,
+            session_handle,
         ),
         JObject::default()
     )
@@ -158,6 +163,7 @@ fn inner_create_with_ffi_array<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -190,6 +196,7 @@ fn inner_create_with_ffi_array<'local>(
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         schema_addr,
+        session_handle,
         reader,
     )
 }
@@ -215,6 +222,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -237,6 +245,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
             schema_addr,
+            session_handle,
         ),
         JObject::null()
     )
@@ -262,6 +271,7 @@ fn inner_create_with_ffi_stream<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -284,6 +294,7 @@ fn inner_create_with_ffi_stream<'local>(
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         schema_addr,
+        session_handle,
         reader,
     )
 }
@@ -307,6 +318,7 @@ fn create_fragment<'a>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -327,6 +339,8 @@ fn create_fragment<'a>(
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
     )?;
+
+    write_params.session = session_from_handle(session_handle);
 
     // Set up storage options provider if namespace is provided
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
@@ -538,13 +552,109 @@ fn inner_update_column<'local>(
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
     let r = block_on(fragment.update_columns_with_offsets(reader, &left_on_str, &right_on_str))?;
-    let updated_row_offsets: Vec<i64> = r.matched_offsets.iter().map(|o| o as i64).collect();
+    let updated_row_offset_bytes = serialize_matched_offsets(&r.matched_offsets)?;
     let result = FragmentUpdateResult {
         updated_fragment: r.fragment,
         fields_modified: r.fields_modified,
-        updated_row_offsets,
+        updated_row_offset_bytes,
     };
     result.into_java(env)
+}
+
+fn serialize_matched_offsets(bitmap: &RoaringBitmap) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    bitmap.serialize_into(&mut buf).map_err(|e| {
+        Error::runtime_error(format!(
+            "failed to serialize matched row offsets RoaringBitmap: {e}"
+        ))
+    })?;
+    Ok(buf)
+}
+
+fn deserialize_row_offset_bytes(bytes: &[u8]) -> Result<RoaringBitmap> {
+    if bytes.is_empty() {
+        return Ok(RoaringBitmap::new());
+    }
+    RoaringBitmap::deserialize_from(bytes).map_err(|e| {
+        Error::input_error(format!(
+            "invalid updatedRowOffsetBytes RoaringBitmap bytes: {e}"
+        ))
+    })
+}
+
+fn expand_row_offset_bytes_to_i64(bitmap: &RoaringBitmap) -> Vec<i64> {
+    bitmap.iter().map(|o| o as i64).collect()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_fragment_FragmentUpdateResult_expandRowOffsetsFromBytes<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _cls: JClass,
+    jbytes: JByteArray,
+) -> JLongArray<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_expand_updated_row_offset_bytes(&mut env, jbytes),
+        unsafe { JLongArray::from_raw(std::ptr::null_mut()) }
+    )
+}
+
+fn inner_expand_updated_row_offset_bytes<'local>(
+    env: &mut JNIEnv<'local>,
+    jbytes: JByteArray,
+) -> Result<JLongArray<'local>> {
+    let buf = env.convert_byte_array(&jbytes)?;
+    let bitmap = deserialize_row_offset_bytes(&buf)?;
+    let offsets = expand_row_offset_bytes_to_i64(&bitmap);
+    let arr = env.new_long_array(offsets.len() as i32)?;
+    if !offsets.is_empty() {
+        env.set_long_array_region(&arr, 0, &offsets)?;
+    }
+    Ok(arr)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_fragment_FragmentUpdateResult_encodeRowOffsetsToBytes<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _cls: JClass,
+    joffsets: JLongArray,
+) -> JByteArray<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_encode_updated_row_offset_bytes(&mut env, joffsets),
+        unsafe { JByteArray::from_raw(std::ptr::null_mut()) }
+    )
+}
+
+fn inner_encode_updated_row_offset_bytes<'local>(
+    env: &mut JNIEnv<'local>,
+    joffsets: JLongArray,
+) -> Result<JByteArray<'local>> {
+    let len = env.get_array_length(&joffsets)?;
+    let mut buf: Vec<i64> = vec![0; len as usize];
+    if len > 0 {
+        env.get_long_array_region(&joffsets, 0, buf.as_mut_slice())?;
+    }
+    let mut bitmap = RoaringBitmap::new();
+    for offset in buf {
+        if offset < 0 {
+            return Err(Error::input_error(format!(
+                "updatedRowOffsets must be non-negative, got {offset}"
+            )));
+        }
+        if offset > u32::MAX as i64 {
+            return Err(Error::input_error(format!(
+                "updatedRowOffsets value {offset} exceeds u32::MAX"
+            )));
+        }
+        bitmap.insert(offset as u32);
+    }
+    let bytes = serialize_matched_offsets(&bitmap)?;
+    Ok(env.byte_array_from_slice(&bytes)?)
 }
 
 #[unsafe(no_mangle)]
@@ -590,7 +700,7 @@ const FRAGMENT_MERGE_RESULT_CLASS: &str = "org/lance/fragment/FragmentMergeResul
 const FRAGMENT_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/FragmentMetadata;Lorg/lance/schema/LanceSchema;)V";
 const FRAGMENT_UPDATE_RESULT_CLASS: &str = "org/lance/fragment/FragmentUpdateResult";
-const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;[J[J)V";
+const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/FragmentMetadata;[J[B)V";
 
 impl IntoJava for &FragmentMergeResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -611,14 +721,15 @@ impl IntoJava for &FragmentUpdateResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let java_updated_fragment = self.updated_fragment.into_java(env)?;
         let java_fields_modified = JLance(self.fields_modified.clone()).into_java(env)?;
-        let java_updated_row_offsets = JLance(self.updated_row_offsets.clone()).into_java(env)?;
+        let java_updated_row_offset_bytes =
+            env.byte_array_from_slice(&self.updated_row_offset_bytes)?;
         Ok(env.new_object(
             FRAGMENT_UPDATE_RESULT_CLASS,
             FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG,
             &[
                 JValueGen::Object(&java_updated_fragment),
                 JValueGen::Object(&java_fields_modified),
-                JValueGen::Object(&java_updated_row_offsets),
+                JValueGen::Object(&java_updated_row_offset_bytes),
             ],
         )?)
     }

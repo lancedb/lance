@@ -8,6 +8,7 @@ mod fragment;
 mod index;
 mod manifest;
 pub mod overlay;
+mod row_ids;
 mod transaction;
 
 pub use crate::rowids::version::{
@@ -20,6 +21,7 @@ pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
     WriterVersion, is_detached_version, populate_manifest_schema_dictionaries,
 };
+pub use row_ids::{ExternalFile, InlineRowIds, RowIdMeta};
 pub use transaction::Transaction;
 
 use lance_core::{Error, Result};

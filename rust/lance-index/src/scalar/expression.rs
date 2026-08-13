@@ -4923,6 +4923,44 @@ mod tests {
     }
 
     #[test]
+    fn test_optimize_parser_merges_ranges_for_multiple_columns() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves =
+            optimize_parsed_scalar_filter("x > 10 AND x < 20 AND y > 30 AND y < 40", &index_info);
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "x"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(10))),
+                                Bound::Excluded(ScalarValue::Int64(Some(20))),
+                            ))
+                        )
+            )
+        }));
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "y"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(30))),
+                                Bound::Excluded(ScalarValue::Int64(Some(40))),
+                            ))
+                        )
+            )
+        }));
+    }
+
+    #[test]
     fn test_optimize_parser_preserves_standalone_null_checks() {
         let index_info = int64_index_info("BTree", false);
 

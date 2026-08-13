@@ -25,7 +25,6 @@ use lance_core::{Error, FenceReason, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
-use object_store::{PutMode, PutOptions};
 use tokio::sync::{Mutex, mpsc, watch};
 
 use tracing::instrument;
@@ -1579,53 +1578,17 @@ async fn atomic_put(
     bytes: Bytes,
 ) -> std::result::Result<(), AtomicPutError> {
     let path = dir.clone().join(filename);
-    if object_store.is_local() {
-        let temp = dir
-            .clone()
-            .join(format!("{}.tmp.{}", filename, Uuid::new_v4()));
-        object_store
-            .inner
-            .put(&temp, bytes.into())
-            .await
-            .map_err(|e| {
-                AtomicPutError::Other(Error::io(format!("failed to write temp file: {}", e)))
-            })?;
-        match object_store.inner.rename_if_not_exists(&temp, &path).await {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                let _ = object_store.delete(&temp).await;
-                Err(AtomicPutError::AlreadyExists)
-            }
-            Err(e) => {
-                let _ = object_store.delete(&temp).await;
-                Err(AtomicPutError::Other(Error::io(format!(
-                    "failed to create {} atomically: {}",
-                    path, e
-                ))))
-            }
-        }
-    } else {
-        object_store
-            .inner
-            .put_opts(
-                &path,
-                bytes.into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } => AtomicPutError::AlreadyExists,
-                _ => AtomicPutError::Other(Error::io(format!(
-                    "failed to create {} atomically: {}",
-                    path, e
-                ))),
-            })?;
-        Ok(())
-    }
+    object_store
+        .put_if_absent(&path, bytes.into())
+        .await
+        .map_err(|error| match error {
+            object_store::Error::AlreadyExists { .. }
+            | object_store::Error::Precondition { .. } => AtomicPutError::AlreadyExists,
+            _ => AtomicPutError::Other(Error::io(format!(
+                "failed to create {} atomically: {}",
+                path, error
+            ))),
+        })
 }
 
 /// Probe forward from a hint position to find the next unwritten position.

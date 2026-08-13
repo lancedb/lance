@@ -203,7 +203,14 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                         Err(Error::not_supported_source(format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into()))
                     }
                 }
-                _ => todo!("Implement encoding for field {}", field),
+                _ => Err(Error::not_supported_source(
+                    format!(
+                        "Lance v2.0 has no field encoding for '{}' with data type {}",
+                        field.name,
+                        field.data_type()
+                    )
+                    .into(),
+                )),
             }
         }
     }
@@ -488,13 +495,46 @@ impl ArrayEncodingStrategy for ArrayStrategy {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArrayEncodingStrategy, ArrayStrategy, check_dict_encoding, check_fixed_size_encoding,
+        ArrayEncodingStrategy, ArrayFieldEncodingStrategy, ArrayStrategy, check_dict_encoding,
+        check_fixed_size_encoding,
     };
     use crate::constants::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY};
+    use crate::encoder::{BatchEncoder, EncodingOptions};
     use arrow_array::{ArrayRef, StringArray};
-    use arrow_schema::Field;
+    use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    use lance_core::{Error, datatypes::Schema};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn test_unsupported_field_type_returns_error() {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int32, true),
+            ])),
+            false,
+        );
+        let arrow_schema = ArrowSchema::new(vec![Field::new(
+            "attributes",
+            DataType::Map(Arc::new(entries), false),
+            true,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let error = BatchEncoder::try_new(
+            &schema,
+            &ArrayFieldEncodingStrategy::new(),
+            &EncodingOptions::default(),
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("attributes"));
+        assert!(error.to_string().contains("Map"));
+    }
 
     fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
         let arr = StringArray::from(arr);
