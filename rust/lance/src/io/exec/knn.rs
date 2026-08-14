@@ -3403,6 +3403,7 @@ mod tests {
             prepared_metrics(),
             state.clone(),
             usize::MAX,
+            None,
         )
         .try_collect::<Vec<_>>();
 
@@ -3420,6 +3421,7 @@ mod tests {
             prepared_metrics(),
             state,
             usize::MAX,
+            None,
         )
         .try_collect::<Vec<_>>();
 
