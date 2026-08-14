@@ -61,7 +61,7 @@ fn is_terminal_failure(error: &Error) -> bool {
 /// channels (`WalFlusher::terminal_error` and the per-flush `done` cell), since
 /// `lance_core::Error` is not `Clone`. Preserves the [`FenceReason`] so the typed
 /// [`Error::Fenced`] can be rebuilt rather than flattened to a string.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalFlushFailure {
     /// The fence reason if terminal; `None` for an ordinary flush error.
     pub fence_reason: Option<FenceReason>,

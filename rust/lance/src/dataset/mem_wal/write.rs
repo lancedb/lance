@@ -635,8 +635,10 @@ impl Default for TaskExecutor {
 pub enum DurabilityResult {
     /// Write is now durable.
     Durable,
-    /// Write failed with an error message.
-    Failed(String),
+    /// Write failed. Carries the fence reason as well as the message: a waiter
+    /// decides between retrying and reopening on the reason, and a peer takeover
+    /// calls for the opposite response to our own persistence failure.
+    Failed(WalFlushFailure),
 }
 
 impl DurabilityResult {
@@ -645,9 +647,9 @@ impl DurabilityResult {
         Self::Durable
     }
 
-    /// Create a failed durability result.
-    pub fn err(msg: impl Into<String>) -> Self {
-        Self::Failed(msg.into())
+    /// Create a failed durability result, preserving the error's fence reason.
+    pub fn err(error: &Error) -> Self {
+        Self::Failed(WalFlushFailure::from_error(error))
     }
 
     /// Check if the result is durable.
@@ -655,11 +657,11 @@ impl DurabilityResult {
         matches!(self, Self::Durable)
     }
 
-    /// Convert to a Result.
+    /// Convert to a Result, rebuilding the typed error the flush reported.
     pub fn into_result(self) -> Result<()> {
         match self {
             Self::Durable => Ok(()),
-            Self::Failed(msg) => Err(Error::io(msg)),
+            Self::Failed(failure) => Err(failure.into_error()),
         }
     }
 }
@@ -2717,20 +2719,6 @@ impl ShardWriter {
         }
     }
 
-    /// Restore a flush watcher's outcome to its typed form.
-    ///
-    /// [`DurabilityResult`] carries only a message, so a failure the flush path
-    /// latched as a poison would reach the caller as a plain IO error. Callers
-    /// key their reopen-versus-retry decision on `fence_reason()` rather than on
-    /// the text, and the latch is authoritative about whether this writer can
-    /// still make progress, so prefer it when it is set.
-    fn typed_flush_outcome(&self, durability: DurabilityResult) -> Result<()> {
-        match durability.into_result() {
-            Ok(()) => Ok(()),
-            Err(untyped) => Err(self.wal_flusher.check_poisoned().err().unwrap_or(untyped)),
-        }
-    }
-
     /// Block until every frozen memtable in the L0 flush queue has
     /// landed and been recorded in the manifest. Does not wait on the
     /// active memtable — call [`Self::force_seal_active`] first if you
@@ -2765,7 +2753,7 @@ impl ShardWriter {
             }
             for mut w in watchers {
                 match w.await_value().await {
-                    Some(durability) => self.typed_flush_outcome(durability)?,
+                    Some(durability) => durability.into_result()?,
                     None => {
                         return Err(Error::io(
                             "MemTable flush handler exited before reporting completion",
@@ -2959,7 +2947,7 @@ impl ShardWriter {
                     let mut drain_result: Result<()> = Ok(());
                     for mut watcher in watchers {
                         let stage_result = match watcher.await_value().await {
-                            Some(durability) => self.typed_flush_outcome(durability),
+                            Some(durability) => durability.into_result(),
                             None => Err(Error::io(
                                 "MemTable flush handler exited before reporting completion during close",
                             )),
@@ -3587,7 +3575,7 @@ impl MemTableFlushHandler {
         // backpressure state for this memtable, even on failure.
         let durability = match &flush_result {
             Ok(_) => DurabilityResult::ok(),
-            Err(e) => DurabilityResult::err(e.to_string()),
+            Err(e) => DurabilityResult::err(e),
         };
         memtable.signal_memtable_flush_complete(durability);
 
@@ -6704,6 +6692,66 @@ mod tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    /// Regression: a failure must reach a fence waiter with its reason intact.
+    /// `SealFence` is detached — it holds watchers and no writer handle — so it
+    /// cannot consult the poison latch to re-type an error after the fact. The
+    /// reason has to survive the watcher cell itself, or callers are left
+    /// string-matching to tell a peer takeover from our own failure.
+    #[tokio::test]
+    async fn test_seal_fence_wait_reports_the_typed_fence_reason() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let shard_id = Uuid::new_v4();
+        let schema = schema_with_pk();
+        let config = memtable_config_with_pk(shard_id);
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        controls.fail_sstable_puts(usize::MAX);
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        let fence = writer_a.force_seal_active().await.unwrap();
+
+        // A successor claims the shard while A is mid-retry, ending A's flush
+        // with a terminal error. The fence is a detached value holding only
+        // watchers, so this is the path that used to flatten the reason.
+        let (fence_result, writer_b) = tokio::join!(
+            fence.wait(),
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri,
+                config,
+                schema.clone(),
+                vec![],
+            )
+        );
+        let writer_b = writer_b.unwrap();
+
+        let err = fence_result.expect_err("a generation that never reached L0 must fail the fence");
+        assert_eq!(
+            err.fence_reason(),
+            Some(FenceReason::PersistenceFailure),
+            "the fence must carry the reason, not just a message: {err}"
+        );
+
+        // B replayed the row A never got to L0, so it needs a working store to
+        // close: the flush it owes would otherwise retry past the drain bound.
+        controls.recover();
+        writer_b.close().await.unwrap();
     }
 
     /// Retry is for transient failures. A fence is not one — a successor owns
