@@ -35,7 +35,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
@@ -855,7 +855,12 @@ impl ZoneMapIndex {
     }
 }
 
-fn remap_zone(zone: &ZoneMapStatistics, remapper: &dyn RowIdRemapper) -> Vec<ZoneMapStatistics> {
+fn remap_zone(
+    zone: &ZoneMapStatistics,
+    remapper: &dyn RowIdRemapper,
+    remapped_null_rows: Option<&RowAddrTreeMap>,
+    is_nested: bool,
+) -> Result<Vec<ZoneMapStatistics>> {
     let zone_start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
     let mut remapped = (0..zone.bound.length as u64)
         .filter_map(|offset| remapper.remap_row_id(zone_start.saturating_add(offset)))
@@ -863,16 +868,65 @@ fn remap_zone(zone: &ZoneMapStatistics, remapper: &dyn RowIdRemapper) -> Vec<Zon
     remapped.sort_unstable();
     remapped.dedup();
 
-    let make_zone = |start: u64, end: u64| ZoneMapStatistics {
-        min: zone.min.clone(),
-        max: zone.max.clone(),
-        null_count: zone.null_count,
-        nan_count: zone.nan_count,
-        bound: ZoneBound {
-            fragment_id: start >> 32,
-            start: start & u64::from(u32::MAX),
-            length: (end - start + 1) as usize,
-        },
+    let make_zone = |start: u64, end: u64| -> Result<ZoneMapStatistics> {
+        let length = (end - start + 1) as usize;
+        let null_count = if let Some(null_rows) = remapped_null_rows {
+            u32::try_from(
+                (start..=end)
+                    .filter(|row_id| null_rows.contains(*row_id))
+                    .count(),
+            )
+            .map_err(|_| {
+                Error::invalid_input(format!(
+                    "remapped ZoneMap zone has more null rows than can be represented: \
+                     fragment_id={}, start={}, length={}",
+                    start >> 32,
+                    start & u64::from(u32::MAX),
+                    length
+                ))
+            })?
+        } else if length == zone.bound.length {
+            zone.null_count
+        } else if zone.null_count == 0 {
+            0
+        } else if zone.null_count as usize == zone.bound.length {
+            u32::try_from(length).map_err(|_| {
+                Error::invalid_input(format!(
+                    "remapped all-null ZoneMap zone length cannot be represented: \
+                     fragment_id={}, start={}, length={}",
+                    start >> 32,
+                    start & u64::from(u32::MAX),
+                    length
+                ))
+            })?
+        } else if length > 1 || !is_nested {
+            // Without exact null positions, one null conservatively preserves both
+            // null and non-null candidates. Nested singleton zones cannot represent
+            // both states because null_count == length means all-null.
+            1
+        } else {
+            return Err(Error::not_supported(format!(
+                "cannot safely remap a mixed-null ZoneMap zone without an exact null bitmap: \
+                 fragment_id={}, start={}, original_length={}, null_count={}, remapped_length={}",
+                zone.bound.fragment_id,
+                zone.bound.start,
+                zone.bound.length,
+                zone.null_count,
+                length
+            )));
+        };
+
+        Ok(ZoneMapStatistics {
+            min: zone.min.clone(),
+            max: zone.max.clone(),
+            null_count,
+            nan_count: zone.nan_count,
+            bound: ZoneBound {
+                fragment_id: start >> 32,
+                start: start & u64::from(u32::MAX),
+                length,
+            },
+        })
     };
     let mut zones = Vec::new();
     let mut run_start = None;
@@ -882,16 +936,16 @@ fn remap_zone(zone: &ZoneMapStatistics, remapper: &dyn RowIdRemapper) -> Vec<Zon
             run_start = Some(row_id);
         } else if row_id != previous.saturating_add(1) || row_id >> 32 != previous >> 32 {
             if let Some(start) = run_start {
-                zones.push(make_zone(start, previous));
+                zones.push(make_zone(start, previous)?);
             }
             run_start = Some(row_id);
         }
         previous = row_id;
     }
     if let Some(start) = run_start {
-        zones.push(make_zone(start, previous));
+        zones.push(make_zone(start, previous)?);
     }
-    zones
+    Ok(zones)
 }
 
 /// Merge caller-selected ZoneMap segments into one self-contained segment.
@@ -923,22 +977,31 @@ pub async fn merge_zonemap_indices(
                 data_type, source.data_type
             )));
         }
-        let source_zones = source.zones.iter().flat_map(|zone| {
-            source
-                .fri
-                .as_deref()
-                .map_or_else(|| vec![zone.clone()], |remapper| remap_zone(zone, remapper))
+        let remapped_null_rows = source.null_rows.as_ref().map(|null_rows| {
+            source.fri.as_deref().map_or_else(
+                || null_rows.clone(),
+                |remapper| remapper.remap_row_addrs_tree_map(null_rows),
+            )
         });
-        zones.extend(source_zones.filter(|zone| {
-            u32::try_from(zone.bound.fragment_id)
-                .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
-        }));
-        match &source.null_rows {
-            Some(null_rows) => {
-                let mut filtered = source.fri.as_deref().map_or_else(
-                    || null_rows.clone(),
-                    |remapper| remapper.remap_row_addrs_tree_map(null_rows),
-                );
+        for zone in &source.zones {
+            let source_zones = source.fri.as_deref().map_or_else(
+                || Ok(vec![zone.clone()]),
+                |remapper| {
+                    remap_zone(
+                        zone,
+                        remapper,
+                        remapped_null_rows.as_ref(),
+                        source.data_type.is_nested(),
+                    )
+                },
+            )?;
+            zones.extend(source_zones.into_iter().filter(|zone| {
+                u32::try_from(zone.bound.fragment_id)
+                    .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
+            }));
+        }
+        match remapped_null_rows {
+            Some(mut filtered) => {
                 filtered.retain_fragments(fragment_filter.iter());
                 merged_null_rows |= &filtered;
             }
@@ -1845,7 +1908,7 @@ mod tests {
     use crate::Index; // Import Index trait to access calculate_included_frags
     use crate::metrics::NoOpMetricsCollector;
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
-    use std::collections::Bound;
+    use std::collections::{Bound, HashMap};
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
@@ -1916,45 +1979,46 @@ mod tests {
             .expect("Failed to load ZoneMapIndex")
     }
 
+    #[derive(Debug)]
+    struct TestRemapper {
+        mappings: HashMap<u64, u64>,
+    }
+
+    impl TestRemapper {
+        fn new(mappings: impl IntoIterator<Item = (u64, u64)>) -> Self {
+            Self {
+                mappings: mappings.into_iter().collect(),
+            }
+        }
+    }
+
+    impl RowIdRemapper for TestRemapper {
+        fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+            self.mappings.get(&row_id).copied()
+        }
+
+        fn remap_row_addrs_tree_map(&self, _row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+            unreachable!()
+        }
+
+        fn remap_row_ids_roaring_tree_map(
+            &self,
+            _row_ids: &roaring::RoaringTreemap,
+        ) -> roaring::RoaringTreemap {
+            unreachable!()
+        }
+
+        fn remap_row_ids_record_batch(
+            &self,
+            _batch: RecordBatch,
+            _row_id_idx: usize,
+        ) -> lance_core::Result<RecordBatch> {
+            unreachable!()
+        }
+    }
+
     #[test]
     fn test_remap_zone_splits_discontiguous_runs() {
-        #[derive(Debug)]
-        struct SplitRemapper {
-            old_start: u64,
-            new_start: u64,
-        }
-
-        impl RowIdRemapper for SplitRemapper {
-            fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-                match row_id.checked_sub(self.old_start)? {
-                    0 => Some(self.new_start + 1),
-                    1 => Some(self.new_start + 2),
-                    2 => Some(self.new_start + 7),
-                    3 => Some(self.new_start + 8),
-                    _ => None,
-                }
-            }
-
-            fn remap_row_addrs_tree_map(&self, _row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
-                unreachable!()
-            }
-
-            fn remap_row_ids_roaring_tree_map(
-                &self,
-                _row_ids: &roaring::RoaringTreemap,
-            ) -> roaring::RoaringTreemap {
-                unreachable!()
-            }
-
-            fn remap_row_ids_record_batch(
-                &self,
-                _batch: RecordBatch,
-                _row_id_idx: usize,
-            ) -> lance_core::Result<RecordBatch> {
-                unreachable!()
-            }
-        }
-
         let old_start = (2_u64 << 32) + 10;
         let new_start = 3_u64 << 32;
         let zone = ZoneMapStatistics {
@@ -1980,16 +2044,79 @@ mod tests {
             start: 7,
             length: 2,
         };
+        second_run.null_count = 0;
+
+        let remapper = TestRemapper::new([
+            (old_start, new_start + 1),
+            (old_start + 1, new_start + 2),
+            (old_start + 2, new_start + 7),
+            (old_start + 3, new_start + 8),
+        ]);
+        let mut remapped_null_rows = RowAddrTreeMap::new();
+        remapped_null_rows.insert(new_start + 1);
 
         assert_eq!(
-            remap_zone(
-                &zone,
-                &SplitRemapper {
-                    old_start,
-                    new_start,
-                }
-            ),
+            remap_zone(&zone, &remapper, Some(&remapped_null_rows), false).unwrap(),
             vec![first_run, second_run]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remap_nested_mixed_null_zone_keeps_non_null_candidates() {
+        let index = train_and_load_fsl(
+            vec![
+                vec![Some(0.0), Some(0.0)],
+                vec![Some(0.0), Some(0.0)],
+                vec![Some(3.0), Some(4.0)],
+                vec![Some(5.0), Some(6.0)],
+            ],
+            2,
+        )
+        .await;
+        let mut mixed_null_zone = index.zones[0].clone();
+        mixed_null_zone.null_count = 2;
+
+        let new_start = 3_u64 << 32;
+        let remapper = TestRemapper::new([(2, new_start), (3, new_start + 1)]);
+        let remapped_null_rows = RowAddrTreeMap::new();
+        let zones =
+            remap_zone(&mixed_null_zone, &remapper, Some(&remapped_null_rows), true).unwrap();
+
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].bound.length, 2);
+        assert_eq!(zones[0].null_count, 0);
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &zones[0],
+                    &SargableQuery::Equals(fsl_scalar(vec![Some(3.0), Some(4.0)])),
+                )
+                .unwrap(),
+            "the two surviving rows are non-null candidates"
+        );
+    }
+
+    #[test]
+    fn test_remap_nested_mixed_null_singleton_without_bitmap_is_rejected() {
+        let zone = ZoneMapStatistics {
+            min: ScalarValue::Null,
+            max: ScalarValue::Null,
+            null_count: 2,
+            nan_count: 0,
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: 4,
+            },
+        };
+        let remapper = TestRemapper::new([(2, 0)]);
+
+        let error = remap_zone(&zone, &remapper, None, true).unwrap_err();
+        assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot safely remap a mixed-null ZoneMap zone")
         );
     }
 
