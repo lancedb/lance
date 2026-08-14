@@ -4,7 +4,7 @@
 //! Builders and file-level writer helpers for Lance blob v2 columns.
 //!
 //! Logical blob input uses `Struct<data: LargeBinary?, uri: Utf8?>`. File-level blob
-//! descriptors use a physical writer-side struct with `kind`, `blob_id`, and range fields.
+//! preparation produces a kind-aware writer intermediate with `blob_id` and range fields.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -21,14 +21,17 @@ use arrow_array::{
     types::{UInt8Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::NullBufferBuilder;
-use arrow_schema::{DataType, Field, Fields};
+use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, FieldExt,
 };
 use lance_core::{
-    datatypes::{BlobKind, Field as LanceField, Schema as LanceSchema},
+    datatypes::{
+        BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
+        BlobV2Layout, Field as LanceField, Schema as LanceSchema,
+    },
     utils::blob::blob_path,
 };
 use lance_io::{
@@ -112,27 +115,10 @@ pub fn blob_field_with_options(name: &str, nullable: bool, options: BlobFieldOpt
     }
     Field::new(
         name,
-        DataType::Struct(
-            vec![
-                Field::new("data", DataType::LargeBinary, true),
-                Field::new("uri", DataType::Utf8, true),
-            ]
-            .into(),
-        ),
+        DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
         nullable,
     )
     .with_metadata(metadata)
-}
-
-fn prepared_blob_child_fields() -> Fields {
-    Fields::from(vec![
-        Field::new("kind", DataType::UInt8, true),
-        Field::new("data", DataType::LargeBinary, true),
-        Field::new("uri", DataType::Utf8, true),
-        Field::new("blob_id", DataType::UInt32, true),
-        Field::new("blob_size", DataType::UInt64, true),
-        Field::new("position", DataType::UInt64, true),
-    ])
 }
 
 fn prepared_blob_field_with_metadata(
@@ -140,97 +126,68 @@ fn prepared_blob_field_with_metadata(
     nullable: bool,
     metadata: HashMap<String, String>,
 ) -> Field {
-    Field::new(
-        name,
-        DataType::Struct(prepared_blob_child_fields()),
-        nullable,
-    )
-    .with_metadata(metadata)
+    Field::new(name, BLOB_V2_PREPARED_TYPE.clone(), nullable).with_metadata(metadata)
 }
 
 fn logical_blob_lance_children() -> Result<Vec<LanceField>> {
-    [
-        Field::new("data", DataType::LargeBinary, true),
-        Field::new("uri", DataType::Utf8, true),
-    ]
-    .iter()
-    .map(LanceField::try_from)
-    .collect()
+    BLOB_V2_LOGICAL_MINIMAL_FIELDS
+        .iter()
+        .map(|field| LanceField::try_from(field.as_ref()))
+        .collect()
 }
 
-fn field_matches(field: &Field, name: &str, data_type: &DataType, nullable: bool) -> bool {
-    field.name() == name && field.data_type() == data_type && field.is_nullable() == nullable
+pub(crate) fn blob_v2_layout(field: &Field) -> Option<BlobV2Layout> {
+    if !field.is_blob_v2() {
+        return None;
+    }
+    let DataType::Struct(fields) = field.data_type() else {
+        return None;
+    };
+    BlobV2Layout::classify(fields)
 }
 
-fn blob_v2_shape_error(field: &Field) -> Error {
+pub(crate) fn blob_v2_shape_error(field: &Field, expected: &[BlobV2Layout]) -> Error {
+    let expected = expected
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let actual = match field.data_type() {
+        DataType::Struct(fields) => BlobV2Layout::classify(fields)
+            .map(|layout| format!("{layout} layout"))
+            .unwrap_or_else(|| format!("unrecognized layout {fields:?}")),
+        data_type => format!("non-struct type {data_type}"),
+    };
     Error::invalid_input(format!(
-        "Blob v2 field '{}' must use either logical struct<data: LargeBinary?, uri: Utf8?> \
-         with optional position/size UInt64 fields or prepared struct<kind: UInt8?, data: \
-         LargeBinary?, uri: Utf8?, blob_id: UInt32?, blob_size: UInt64?, position: UInt64?>",
-        field.name()
+        "Blob v2 field '{}' has {actual}; expected {expected} layout",
+        field.name(),
     ))
 }
 
-/// Returns true when `field` is the writer-side prepared blob v2 struct.
-pub(crate) fn is_prepared_blob_v2_field(field: &Field) -> bool {
-    if !field.is_blob_v2() {
-        return false;
-    }
-    let DataType::Struct(fields) = field.data_type() else {
-        return false;
-    };
-    let expected = prepared_blob_child_fields();
-    fields.len() == expected.len()
-        && fields
-            .iter()
-            .zip(expected.iter())
-            .all(|(actual, expected)| actual.as_ref() == expected.as_ref())
-}
-
-/// Returns true when `field` is the logical blob v2 input struct.
-pub(crate) fn is_logical_blob_v2_field(field: &Field) -> bool {
-    if !field.is_blob_v2() {
-        return false;
-    }
-    let DataType::Struct(fields) = field.data_type() else {
-        return false;
-    };
-    match fields.len() {
-        2 => {
-            field_matches(fields[0].as_ref(), "data", &DataType::LargeBinary, true)
-                && field_matches(fields[1].as_ref(), "uri", &DataType::Utf8, true)
-        }
-        4 => {
-            field_matches(fields[0].as_ref(), "data", &DataType::LargeBinary, true)
-                && field_matches(fields[1].as_ref(), "uri", &DataType::Utf8, true)
-                && fields[2].name() == "position"
-                && fields[2].data_type() == &DataType::UInt64
-                && fields[3].name() == "size"
-                && fields[3].data_type() == &DataType::UInt64
-        }
-        _ => false,
-    }
-}
-
-fn normalize_prepared_blob_lance_field(field: &LanceField) -> Result<LanceField> {
+fn prepared_to_logical_blob_lance_field(field: &LanceField) -> Result<LanceField> {
     if field.is_blob_v2() {
         let arrow_field = Field::from(field);
-        if is_prepared_blob_v2_field(&arrow_field) {
-            let mut normalized = field.clone();
-            let mut logical_children = logical_blob_lance_children()?;
-            for (logical_child, prepared_child) in
-                logical_children.iter_mut().zip(field.children.iter())
-            {
-                logical_child.id = prepared_child.id;
-                logical_child.parent_id = field.id;
+        match blob_v2_layout(&arrow_field) {
+            Some(BlobV2Layout::Prepared) => {
+                let mut normalized = field.clone();
+                let mut logical_children = logical_blob_lance_children()?;
+                for (logical_child, prepared_child) in
+                    logical_children.iter_mut().zip(field.children.iter())
+                {
+                    logical_child.id = prepared_child.id;
+                    logical_child.parent_id = field.id;
+                }
+                normalized.children = logical_children;
+                return Ok(normalized);
             }
-            normalized.children = logical_children;
-            return Ok(normalized);
+            Some(BlobV2Layout::Logical) => return Ok(field.clone()),
+            _ => {
+                return Err(blob_v2_shape_error(
+                    &arrow_field,
+                    &[BlobV2Layout::Logical, BlobV2Layout::Prepared],
+                ));
+            }
         }
-        if is_logical_blob_v2_field(&arrow_field) {
-            return Ok(field.clone());
-        }
-        return Err(blob_v2_shape_error(&arrow_field));
     }
 
     if field.children.is_empty() {
@@ -240,7 +197,7 @@ fn normalize_prepared_blob_lance_field(field: &LanceField) -> Result<LanceField>
     let normalized_children = field
         .children
         .iter()
-        .map(normalize_prepared_blob_lance_field)
+        .map(prepared_to_logical_blob_lance_field)
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LanceField {
@@ -249,11 +206,11 @@ fn normalize_prepared_blob_lance_field(field: &LanceField) -> Result<LanceField>
     })
 }
 
-pub(crate) fn normalize_prepared_blob_schema(schema: &LanceSchema) -> Result<LanceSchema> {
+pub(crate) fn prepared_to_logical_blob_schema(schema: &LanceSchema) -> Result<LanceSchema> {
     let fields = schema
         .fields
         .iter()
-        .map(normalize_prepared_blob_lance_field)
+        .map(prepared_to_logical_blob_lance_field)
         .collect::<Result<Vec<_>>>()?;
     Ok(LanceSchema {
         fields,
@@ -331,14 +288,23 @@ fn validate_range(offset: u64, size: u64, object_size: u64, label: &str) -> Resu
 }
 
 fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result<()> {
-    if !is_prepared_blob_v2_field(field) {
-        return Err(blob_v2_shape_error(field));
+    if blob_v2_layout(field) != Some(BlobV2Layout::Prepared) {
+        return Err(blob_v2_shape_error(field, &[BlobV2Layout::Prepared]));
     }
 
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
         .ok_or_else(|| Error::invalid_input("Prepared blob column was not a struct array"))?;
+    if BlobV2Layout::classify(struct_arr.fields()) != Some(BlobV2Layout::Prepared) {
+        let actual = BlobV2Layout::classify(struct_arr.fields())
+            .map(|layout| layout.to_string())
+            .unwrap_or_else(|| format!("unrecognized ({:?})", struct_arr.fields()));
+        return Err(Error::invalid_input(format!(
+            "Prepared blob column '{}' has {actual} array layout; expected prepared layout",
+            field.name()
+        )));
+    }
     let kind_col = struct_arr
         .column_by_name("kind")
         .ok_or_else(|| Error::invalid_input("Prepared blob struct missing `kind` field"))?
@@ -465,7 +431,7 @@ pub struct BlobRange {
     pub size: u64,
 }
 
-/// A physical blob descriptor row.
+/// A kind-aware row used to build the writer-prepared blob representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobDescriptor {
     /// A null blob row.
@@ -489,19 +455,22 @@ pub enum BlobDescriptor {
     },
 }
 
-/// A physical blob descriptor column ready to be included in a [`RecordBatch`](arrow_array::RecordBatch).
+/// A writer-prepared blob column ready to be included in a [`RecordBatch`](arrow_array::RecordBatch).
+///
+/// Despite the legacy type name, its Arrow representation is
+/// [`BlobV2Layout::Prepared`], not the descriptor stored in a Lance file.
 pub struct BlobDescriptorColumn {
     field: Field,
     array: ArrayRef,
 }
 
 impl BlobDescriptorColumn {
-    /// Return the Arrow field for the descriptor column.
+    /// Return the Arrow field for the prepared column.
     pub fn field(&self) -> &Field {
         &self.field
     }
 
-    /// Return the Arrow array for the descriptor column.
+    /// Return the Arrow array for the prepared column.
     pub fn array(&self) -> &ArrayRef {
         &self.array
     }
@@ -512,9 +481,9 @@ impl BlobDescriptorColumn {
     }
 }
 
-/// Builds physical blob descriptors for one blob v2 column.
+/// Builds the writer-prepared representation for one blob v2 column.
 ///
-/// This builder only produces the writer-side descriptor struct array. It does not allocate blob ids,
+/// This builder only produces the writer-prepared struct array. It does not allocate blob ids,
 /// choose sidecar paths, write blob objects, or commit data files.
 pub struct BlobDescriptorArrayBuilder {
     field: Field,
@@ -606,12 +575,12 @@ impl BlobDescriptorArrayBuilder {
         self.push(BlobDescriptor::Null)
     }
 
-    /// Return the descriptor Arrow field for this blob column.
+    /// Return the prepared Arrow field for this blob column.
     pub fn field(&self) -> &Field {
         &self.field
     }
 
-    /// Finish this column and return the writer-side descriptor struct array.
+    /// Finish this column and return the writer-prepared struct array.
     pub fn finish(self) -> Result<BlobDescriptorColumn> {
         let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(self.values.len());
         let mut data_builder = LargeBinaryBuilder::with_capacity(self.values.len(), 0);
@@ -682,7 +651,7 @@ impl BlobDescriptorArrayBuilder {
         }
 
         let array = Arc::new(StructArray::try_new(
-            prepared_blob_child_fields(),
+            BLOB_V2_PREPARED_FIELDS.clone(),
             vec![
                 Arc::new(kind_builder.finish()),
                 Arc::new(data_builder.finish()),
@@ -736,12 +705,28 @@ fn validate_blob_descriptor(value: &BlobDescriptor) -> Result<()> {
     }
 }
 
+fn packed_descriptor(blob_id: u32, offset: u64, size: u64) -> Result<(BlobDescriptor, u64)> {
+    let next_offset = offset.checked_add(size).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Packed blob writer offset overflowed: offset={offset}, size={size}"
+        ))
+    })?;
+    Ok((
+        BlobDescriptor::Packed {
+            blob_id,
+            offset,
+            size,
+        },
+        next_offset,
+    ))
+}
+
 /// Writes a Lance-owned packed sidecar blob for one data file and returns descriptors.
 pub struct PackedBlobWriter {
     object_store: ObjectStore,
     path: Path,
     blob_id: u32,
-    writer: Box<dyn Writer>,
+    writer: Option<Box<dyn Writer>>,
     offset: u64,
     values: Vec<BlobDescriptor>,
 }
@@ -759,7 +744,7 @@ impl PackedBlobWriter {
             object_store,
             path,
             blob_id,
-            writer,
+            writer: Some(writer),
             offset: 0,
             values: Vec::new(),
         })
@@ -782,10 +767,60 @@ impl PackedBlobWriter {
         Ok(())
     }
 
+    /// Append multiple logical blobs, one per iterator item.
+    ///
+    /// Each `Some(bytes)` is appended to the sidecar and records a packed
+    /// descriptor; an empty slice records a valid zero-length blob. Each `None`
+    /// records a [`BlobDescriptor::Null`] without writing any bytes, so the
+    /// descriptors returned by [`Self::finish`] stay row-aligned with the input.
+    ///
+    /// If writing fails or the future is cancelled after a partial write, no
+    /// descriptors from this call are recorded, the active writer is dropped,
+    /// and this instance cannot be reused.
+    ///
+    /// ```
+    /// # use lance::{PackedBlobWriter, Result};
+    /// # async fn write(mut writer: PackedBlobWriter) -> Result<()> {
+    /// writer
+    ///     .write_packed_blobs([Some(b"first".as_slice()), None, Some(b"second".as_slice())])
+    ///     .await?;
+    /// let descriptors = writer.finish().await?;
+    /// assert_eq!(descriptors.len(), 3);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_packed_blobs<'a>(
+        &mut self,
+        blobs: impl IntoIterator<Item = Option<&'a [u8]>>,
+    ) -> Result<()> {
+        let mut writer = self.take_writer()?;
+        let mut descriptors = Vec::new();
+        let mut next_offset = self.offset;
+        for blob in blobs {
+            let Some(blob) = blob else {
+                descriptors.push(BlobDescriptor::Null);
+                continue;
+            };
+            let (descriptor, following_offset) =
+                packed_descriptor(self.blob_id, next_offset, blob.len() as u64)?;
+            if !blob.is_empty() {
+                writer.write_all(blob).await?;
+            }
+            descriptors.push(descriptor);
+            next_offset = following_offset;
+        }
+        self.writer = Some(writer);
+        self.offset = next_offset;
+        self.values.extend(descriptors);
+        Ok(())
+    }
+
     pub(crate) async fn write_blob_bytes(&mut self, bytes: &[u8]) -> Result<BlobDescriptor> {
         let size = bytes.len() as u64;
         let offset = self.offset;
-        self.writer.write_all(bytes).await?;
+        let mut writer = self.take_writer()?;
+        writer.write_all(bytes).await?;
+        self.writer = Some(writer);
         self.record_written_blob(offset, size)
     }
 
@@ -796,28 +831,32 @@ impl PackedBlobWriter {
     ) -> Result<BlobDescriptor> {
         let size = range.len() as u64;
         let offset = self.offset;
-        self.writer.copy_range_from_reader(reader, range).await?;
+        let mut writer = self.take_writer()?;
+        writer.copy_range_from_reader(reader, range).await?;
+        self.writer = Some(writer);
         self.record_written_blob(offset, size)
     }
 
     fn record_written_blob(&mut self, offset: u64, size: u64) -> Result<BlobDescriptor> {
-        self.offset = self.offset.checked_add(size).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Packed blob writer offset overflowed: offset={offset}, size={size}"
-            ))
-        })?;
-        let value = BlobDescriptor::Packed {
-            blob_id: self.blob_id,
-            offset,
-            size,
-        };
+        let (value, next_offset) = packed_descriptor(self.blob_id, offset, size)?;
+        self.offset = next_offset;
         self.values.push(value.clone());
         Ok(value)
     }
 
+    fn take_writer(&mut self) -> Result<Box<dyn Writer>> {
+        self.writer.take().ok_or_else(|| {
+            Error::io(format!(
+                "Packed blob writer for '{}' has no active upload",
+                self.path
+            ))
+        })
+    }
+
     /// Finish the packed sidecar and return descriptors in write order.
     pub async fn finish(mut self) -> Result<Vec<BlobDescriptor>> {
-        Writer::shutdown(self.writer.as_mut()).await?;
+        let mut writer = self.take_writer()?;
+        Writer::shutdown(writer.as_mut()).await?;
         let object_size = self.object_store.size(&self.path).await?;
         validate_range(0, self.offset, object_size, "Packed blob")?;
         Ok(self.values)
@@ -987,11 +1026,7 @@ impl BlobArrayBuilder {
         let validity = self.validity.finish();
 
         let struct_array = StructArray::try_new(
-            vec![
-                Field::new("data", DataType::LargeBinary, true),
-                Field::new("uri", DataType::Utf8, true),
-            ]
-            .into(),
+            BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone(),
             vec![data as ArrayRef, uri as ArrayRef],
             validity,
         )?;
@@ -1010,13 +1045,105 @@ impl BlobArrayBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::io;
     use std::num::NonZeroUsize;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
 
     use super::*;
     use arrow_array::cast::AsArray;
     use arrow_array::{Array, StringArray};
     use arrow_schema::Schema as ArrowSchema;
+    use async_trait::async_trait;
+    use futures::task::noop_waker;
     use lance_core::utils::tempfile::TempDir;
+    use lance_io::object_writer::WriteResult;
+    use tokio::io::AsyncWrite;
+
+    #[derive(Clone, Copy)]
+    enum WriteTerminal {
+        Error,
+        Pending,
+    }
+
+    struct PartialWriter {
+        bytes_before_terminal: usize,
+        terminal: WriteTerminal,
+        bytes_written: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for PartialWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.bytes_before_terminal > 0 {
+                let written = self.bytes_before_terminal.min(bytes.len());
+                self.bytes_before_terminal -= written;
+                self.bytes_written.fetch_add(written, Ordering::SeqCst);
+                return Poll::Ready(Ok(written));
+            }
+            match self.terminal {
+                WriteTerminal::Error => {
+                    Poll::Ready(Err(io::Error::other("injected write failure")))
+                }
+                WriteTerminal::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl Writer for PartialWriter {
+        async fn tell(&mut self) -> Result<usize> {
+            Ok(self.bytes_written.load(Ordering::SeqCst))
+        }
+
+        async fn shutdown(&mut self) -> Result<WriteResult> {
+            Ok(WriteResult::default())
+        }
+    }
+
+    impl Drop for PartialWriter {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn partial_writer(
+        terminal: WriteTerminal,
+    ) -> (Box<dyn Writer>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let bytes_written = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        (
+            Box::new(PartialWriter {
+                bytes_before_terminal: 2,
+                terminal,
+                bytes_written: bytes_written.clone(),
+                dropped: dropped.clone(),
+            }),
+            bytes_written,
+            dropped,
+        )
+    }
+
+    fn cancel_pending<F: Future>(future: F) {
+        let mut future = Box::pin(future);
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(future.as_mut().poll(&mut context).is_pending());
+    }
 
     #[test]
     fn test_field_metadata() {
@@ -1103,7 +1230,7 @@ mod tests {
         writer.push_null().unwrap();
 
         let column = writer.finish().unwrap();
-        assert!(is_prepared_blob_v2_field(column.field()));
+        assert_eq!(blob_v2_layout(column.field()), Some(BlobV2Layout::Prepared));
         let struct_arr = column.array().as_struct();
         let kinds = struct_arr
             .column_by_name("kind")
@@ -1145,7 +1272,7 @@ mod tests {
         ] {
             let array = Arc::new(
                 StructArray::try_new(
-                    prepared_blob_child_fields(),
+                    BLOB_V2_PREPARED_FIELDS.clone(),
                     vec![
                         Arc::new(arrow_array::UInt8Array::from(vec![kind as u8])) as ArrayRef,
                         Arc::new(arrow_array::LargeBinaryArray::from_iter([None::<&[u8]>])),
@@ -1165,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_prepared_blob_schema_preserves_non_blob_fields() {
+    fn test_prepared_to_logical_blob_schema_preserves_non_blob_fields() {
         let mut metadata = HashMap::new();
         metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
         let prepared_field = prepared_blob_field_with_metadata("blob", true, metadata);
@@ -1182,7 +1309,7 @@ mod tests {
         let dictionary_values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
         schema.fields[0].set_dictionary_values(&dictionary_values);
 
-        let normalized = normalize_prepared_blob_schema(&schema).unwrap();
+        let normalized = prepared_to_logical_blob_schema(&schema).unwrap();
 
         assert_eq!(normalized.fields[0].id, 42);
         assert_eq!(
@@ -1264,5 +1391,107 @@ mod tests {
         builder.push_dedicated(43, 3).unwrap();
         let column = builder.finish().unwrap();
         assert_eq!(column.array().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_packed_blob_writer_bulk_bytes() {
+        let temp_dir = TempDir::default();
+        let data_dir = Path::from_absolute_path(temp_dir.std_path().join("data")).unwrap();
+        let data_file_path = data_dir.join("data-file.lance");
+        let mut writer = PackedBlobWriter::try_new(ObjectStore::local(), data_file_path, 7)
+            .await
+            .unwrap();
+
+        writer
+            .write_packed_blobs([
+                Some(b"a".as_slice()),
+                Some(b"".as_slice()),
+                None,
+                Some(b"bc".as_slice()),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            writer.finish().await.unwrap(),
+            vec![
+                BlobDescriptor::Packed {
+                    blob_id: 7,
+                    offset: 0,
+                    size: 1,
+                },
+                BlobDescriptor::Packed {
+                    blob_id: 7,
+                    offset: 1,
+                    size: 0,
+                },
+                BlobDescriptor::Null,
+                BlobDescriptor::Packed {
+                    blob_id: 7,
+                    offset: 1,
+                    size: 2,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_packed_blob_writer_bulk_drops_after_partial_write_error() {
+        let (partial_writer, bytes_written, dropped) = partial_writer(WriteTerminal::Error);
+        let previous_descriptor = BlobDescriptor::Packed {
+            blob_id: 7,
+            offset: 0,
+            size: 3,
+        };
+        let mut writer = PackedBlobWriter {
+            object_store: ObjectStore::local(),
+            path: Path::from("packed.blob"),
+            blob_id: 7,
+            writer: Some(partial_writer),
+            offset: 3,
+            values: vec![previous_descriptor.clone()],
+        };
+
+        let error = writer
+            .write_packed_blobs([Some(b"abcdef".as_slice())])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("injected write failure"));
+        assert_eq!(bytes_written.load(Ordering::SeqCst), 2);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(writer.writer.is_none());
+        assert_eq!(writer.offset, 3);
+        assert_eq!(writer.values, vec![previous_descriptor]);
+        let retry_error = writer.write_blob(b"retry").await.unwrap_err();
+        assert!(matches!(retry_error, Error::IO { .. }));
+        assert!(retry_error.to_string().contains("no active upload"));
+    }
+
+    #[test]
+    fn test_packed_blob_writer_bulk_drops_if_cancelled() {
+        let (partial_writer, bytes_written, dropped) = partial_writer(WriteTerminal::Pending);
+        let previous_descriptor = BlobDescriptor::Packed {
+            blob_id: 7,
+            offset: 0,
+            size: 3,
+        };
+        let mut writer = PackedBlobWriter {
+            object_store: ObjectStore::local(),
+            path: Path::from("packed.blob"),
+            blob_id: 7,
+            writer: Some(partial_writer),
+            offset: 3,
+            values: vec![previous_descriptor.clone()],
+        };
+
+        cancel_pending(writer.write_packed_blobs([Some(b"abcdef".as_slice())]));
+
+        assert_eq!(bytes_written.load(Ordering::SeqCst), 2);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(writer.writer.is_none());
+        assert_eq!(writer.offset, 3);
+        assert_eq!(writer.values, vec![previous_descriptor]);
     }
 }

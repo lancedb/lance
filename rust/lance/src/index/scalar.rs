@@ -5,13 +5,17 @@
 //!
 
 pub(crate) mod bitmap;
+pub(crate) mod bloomfilter;
 pub(crate) mod btree;
 pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod label_list;
+pub(crate) mod ngram;
+#[cfg(feature = "geo")]
+pub(crate) mod rtree;
 pub(crate) mod zonemap;
 
-pub use inverted::{load_segment_details, load_segments};
+pub use inverted::{load_segment_details, load_segment_params, load_segments};
 
 pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
 
@@ -35,6 +39,7 @@ use lance_core::datatypes::Field;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
+use lance_index::frag_reuse::FragReuseIndexHandle;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
@@ -47,7 +52,8 @@ use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
 use lance_index::scalar::registry::{
-    ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
+    ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
@@ -57,6 +63,7 @@ use lance_index::scalar::{
 use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
+use prost::Message;
 use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
@@ -122,6 +129,12 @@ impl TrainingRequest {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Overrides the scalar training scan's I/O budget without mutating process-wide state.
+    pub(crate) static TEST_TRAINING_IO_BUFFER_SIZE: u64;
+}
+
 pub(crate) async fn scan_training_data(
     dataset: &Dataset,
     column: &str,
@@ -131,6 +144,10 @@ pub(crate) async fn scan_training_data(
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
+    #[cfg(test)]
+    if let Ok(io_buffer_size) = TEST_TRAINING_IO_BUFFER_SIZE.try_with(|size| *size) {
+        scan.io_buffer_size(io_buffer_size);
+    }
     // Fragment filtering is now handled in load_training_data function
     // This function just processes the fragments passed to it
 
@@ -235,6 +252,35 @@ pub(crate) async fn load_training_data(
     }
 }
 
+pub(crate) async fn load_fts_training_data(
+    dataset: &Dataset,
+    resolved: &inverted::ResolvedFtsField,
+    criteria: &TrainingCriteria,
+    fragments: Option<Vec<Fragment>>,
+    train: bool,
+    fragment_ids: Option<Vec<u32>>,
+) -> Result<SendableRecordBatchStream> {
+    let scan_column = if resolved.has_lists() {
+        resolved.root_column.as_str()
+    } else {
+        resolved.canonical_path.as_str()
+    };
+    let stream = load_training_data(
+        dataset,
+        scan_column,
+        criteria,
+        fragments,
+        train,
+        fragment_ids,
+    )
+    .await?;
+    if resolved.has_lists() {
+        inverted::transform_fts_document_stream(stream, resolved.clone())
+    } else {
+        Ok(stream)
+    }
+}
+
 // TODO: Allow users to register their own plugins
 static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
     LazyLock::new(IndexPluginRegistry::with_default_plugins);
@@ -286,13 +332,40 @@ pub(super) async fn build_scalar_index(
     preprocessed_data: Option<SendableRecordBatchStream>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
-    let field = dataset
-        .schema()
-        .field(column)
-        .ok_or(Error::invalid_input_source(
-            format!("No column with name {}", column).into(),
-        ))?;
-    let field: arrow_schema::Field = field.into();
+    let inverted_params = (params.index_type.eq_ignore_ascii_case("inverted")
+        || params.index_type.eq_ignore_ascii_case("fts"))
+    .then(|| serde_json::from_str::<InvertedIndexParams>(params.params.as_deref().unwrap_or("{}")))
+    .transpose()?;
+    let resolved_fts_field = inverted_params
+        .as_ref()
+        .map(|params| {
+            inverted::resolve_fts_field(dataset.schema(), column, params.get_document_granularity())
+        })
+        .transpose()?;
+    let field = if let Some(resolved) = &resolved_fts_field {
+        let source = dataset
+            .schema()
+            .field_by_id(resolved.final_field_id)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "FTS field id {} is missing from the dataset schema",
+                    resolved.final_field_id
+                ))
+            })?;
+        if resolved.has_lists() {
+            arrow_schema::Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true)
+        } else {
+            source.into()
+        }
+    } else {
+        let field = dataset
+            .schema()
+            .field(column)
+            .ok_or(Error::invalid_input_source(
+                format!("No column with name {}", column).into(),
+            ))?;
+        field.into()
+    };
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
 
@@ -306,9 +379,20 @@ pub(super) async fn build_scalar_index(
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
     progress.stage_start("load_data", None, "rows").await?;
-    let training_data = match preprocessed_data {
-        Some(preprocessed_data) => preprocessed_data,
-        None => {
+    let training_data = match (preprocessed_data, resolved_fts_field.as_ref()) {
+        (Some(preprocessed_data), _) => preprocessed_data,
+        (None, Some(resolved)) => {
+            load_fts_training_data(
+                dataset,
+                resolved,
+                training_request.criteria(),
+                None,
+                train,
+                fragment_ids.clone(),
+            )
+            .await?
+        }
+        (None, None) => {
             load_training_data(
                 dataset,
                 column,
@@ -401,6 +485,23 @@ pub async fn fetch_index_details(
         None => infer_scalar_index_details(dataset, column, index).await?,
     };
 
+    if index_details.type_url.ends_with("InvertedIndexDetails") {
+        let details =
+            InvertedIndexDetails::decode(index_details.value.as_slice()).map_err(|err| {
+                Error::io(format!(
+                    "failed to decode InvertedIndexDetails payload: {err}"
+                ))
+            })?;
+        let details = inverted::normalize_inverted_details(index, details)?;
+        return Ok(Arc::new(prost_types::Any::from_msg(&details).map_err(
+            |err| {
+                Error::io(format!(
+                    "failed to encode InvertedIndexDetails payload: {err}"
+                ))
+            },
+        )?));
+    }
+
     Ok(index_details)
 }
 
@@ -460,7 +561,7 @@ pub async fn open_scalar_index(
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
     let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
-        frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
+        frag_reuse_index.map(|f| Arc::new(FragReuseIndexHandle(f)) as Arc<dyn RowIdRemapper>);
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
@@ -490,6 +591,17 @@ pub async fn open_scalar_index(
         .await
 }
 
+pub(crate) async fn cached_scalar_index_container(
+    dataset: &Dataset,
+    uuid: &Uuid,
+) -> Option<Arc<dyn ScalarIndex>> {
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let index_cache = dataset
+        .index_cache
+        .for_index(uuid, frag_reuse_uuid.as_ref());
+    index_cache.get_unsized_with_key(&ScalarIndexCacheKey).await
+}
+
 pub(crate) async fn infer_scalar_index_details(
     dataset: &Dataset,
     column: &str,
@@ -515,11 +627,7 @@ pub(crate) async fn infer_scalar_index_details(
     let inverted_list_lookup = index_dir.clone().join(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.clone().join(INVERT_LIST_FILE);
     let object_store = dataset.object_store_for_index(index).await?;
-    let index_details = if let DataType::List(_) = col.data_type() {
-        prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
-    } else if object_store.exists(&bitmap_page_lookup).await? {
-        prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
-    } else if object_store.exists(&inverted_list_lookup).await? {
+    let index_details = if object_store.exists(&inverted_list_lookup).await? {
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
         let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
@@ -536,6 +644,10 @@ pub(crate) async fn infer_scalar_index_details(
         parse_params().await.unwrap_or(default_details)
     } else if object_store.exists(&legacy_inverted_list_lookup).await? {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
+    } else if let DataType::List(_) | DataType::LargeList(_) = col.data_type() {
+        prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
+    } else if object_store.exists(&bitmap_page_lookup).await? {
+        prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };
@@ -572,16 +684,46 @@ pub fn index_matches_criteria(
             // return false just in case
             return Ok(false);
         }
-        let field = fields[0];
-        // Build the full field path for nested fields
-        let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
-            let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
-            lance_core::datatypes::format_field_path(&field_refs)
+        let is_fts_index = index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"));
+        if criteria.must_support_fts && is_fts_index {
+            let requested_granularity = criteria
+                .fts_document_granularity
+                .unwrap_or(lance_index::scalar::inverted::DocumentGranularity::Row);
+            let requested = inverted::resolve_fts_field(schema, for_column, requested_granularity)?;
+            if index.fields[0] != requested.final_field_id {
+                return Ok(false);
+            }
+            let Some(details_any) = index.index_details.as_ref() else {
+                return Ok(false);
+            };
+            let details =
+                InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|err| {
+                    Error::io(format!(
+                        "failed to decode InvertedIndexDetails payload: {err}"
+                    ))
+                })?;
+            let details = inverted::normalize_inverted_details(index, details)?;
+            let stored_granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
+                details.document_granularity,
+            )?;
+            if stored_granularity != requested_granularity {
+                return Ok(false);
+            }
         } else {
-            field.name.clone()
-        };
-        if for_column != field_path {
-            return Ok(false);
+            let field = fields[0];
+            // Build the full field path for nested fields
+            let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+                let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+                lance_core::datatypes::format_field_path(&field_refs)
+            } else {
+                field.name.clone()
+            };
+            if for_column != field_path {
+                return Ok(false);
+            }
         }
     }
 
@@ -651,10 +793,17 @@ pub async fn initialize_scalar_index(
 
         // Parse the JSON into InvertedIndexParams
         let inverted_params: InvertedIndexParams = serde_json::from_str(params_json)?;
+        let resolved = inverted::resolve_fts_field_by_id(
+            target_dataset.schema(),
+            *source_index.fields.first().ok_or_else(|| {
+                Error::index("Inverted index metadata has no indexed field".to_string())
+            })?,
+            inverted_params.get_document_granularity(),
+        )?;
 
         target_dataset
             .create_index(
-                &[column_name],
+                &[&resolved.canonical_path],
                 index_type,
                 Some(source_index.name.clone()),
                 &inverted_params,
@@ -742,6 +891,7 @@ mod tests {
 
         let criteria = IndexCriteria {
             must_support_fts: false,
+            fts_document_granularity: None,
             must_support_exact_equality: false,
             for_column: None,
             has_name: None,
@@ -768,6 +918,7 @@ mod tests {
 
         let criteria = IndexCriteria {
             must_support_fts: false,
+            fts_document_granularity: None,
             must_support_exact_equality: false,
             for_column: None,
             has_name: None,
@@ -789,6 +940,7 @@ mod tests {
         // test for_column
         let mut criteria = IndexCriteria {
             must_support_fts: false,
+            fts_document_granularity: None,
             must_support_exact_equality: false,
             for_column: Some("mycol"),
             has_name: None,
@@ -805,6 +957,7 @@ mod tests {
         // test has_name
         let mut criteria = IndexCriteria {
             must_support_fts: false,
+            fts_document_granularity: None,
             must_support_exact_equality: false,
             for_column: None,
             has_name: Some("btree_index"),
@@ -827,6 +980,7 @@ mod tests {
         // test supports_exact_equality
         let mut criteria = IndexCriteria {
             must_support_fts: false,
+            fts_document_granularity: None,
             must_support_exact_equality: true,
             for_column: None,
             has_name: None,
@@ -848,6 +1002,7 @@ mod tests {
         // test multiple indices
         let mut criteria = IndexCriteria {
             must_support_fts: false,
+            fts_document_granularity: None,
             must_support_exact_equality: false,
             for_column: None,
             has_name: None,

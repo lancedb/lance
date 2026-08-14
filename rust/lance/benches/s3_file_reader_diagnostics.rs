@@ -580,6 +580,7 @@ fn page_layout_kind(encoding: &PageEncoding) -> &'static str {
             Some(pb21::page_layout::Layout::ConstantLayout(_)) => "constant",
             Some(pb21::page_layout::Layout::FullZipLayout(_)) => "fullzip",
             Some(pb21::page_layout::Layout::BlobLayout(_)) => "blob",
+            Some(pb21::page_layout::Layout::SparseLayout(_)) => "sparse",
             None => "missing",
         },
     }
@@ -2246,21 +2247,15 @@ async fn main() -> Result<()> {
         } else {
             0.0
         };
-        let bytes_per_row = if stats.rows == 0 {
-            0
-        } else {
-            stats.arrow_bytes / stats.rows
-        };
-        let avg_bytes_per_scheduler_request = if scheduler_stats.requests == 0 {
-            0
-        } else {
-            scheduler_stats.bytes_read / scheduler_stats.requests
-        };
-        let avg_bytes_per_scheduler_iop = if scheduler_stats.iops == 0 {
-            0
-        } else {
-            scheduler_stats.bytes_read / scheduler_stats.iops
-        };
+        let bytes_per_row = stats.arrow_bytes.checked_div(stats.rows).unwrap_or(0);
+        let avg_bytes_per_scheduler_request = scheduler_stats
+            .bytes_read
+            .checked_div(scheduler_stats.requests)
+            .unwrap_or(0);
+        let avg_bytes_per_scheduler_iop = scheduler_stats
+            .bytes_read
+            .checked_div(scheduler_stats.iops)
+            .unwrap_or(0);
         let counters = stats.counters.as_ref();
         let record = json!({
             "case": config.case_name,

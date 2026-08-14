@@ -8,7 +8,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.file import LanceFileReader
+from lance.file import LanceFileReader, LanceFileWriter
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 NUM_ROWS_PER_FRAGMENT = 10000
@@ -209,6 +209,29 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     assert pq.dimension == reloaded.dimension
     assert pq.codebook == reloaded.codebook
 
+    pq_4bit = IndicesBuilder(rand_dataset, "vectors").train_pq(
+        rand_ivf,
+        sample_rate=2,
+        num_bits=4,
+    )
+    assert pq_4bit.num_bits == 4
+    assert len(pq_4bit.codebook) == 16
+
+    pq_4bit.save(str(tmpdir / "pq_4bit"))
+    reloaded = PqModel.load(str(tmpdir / "pq_4bit"))
+    assert reloaded.num_bits == 4
+
+    legacy_pq_uri = str(tmpdir / "legacy_pq")
+    with LanceFileWriter(
+        legacy_pq_uri,
+        pa.schema(
+            [pa.field("codebook", pq.codebook.type)],
+            metadata={b"num_subvectors": str(pq.num_subvectors).encode()},
+        ),
+    ) as writer:
+        writer.write_batch(pa.table([pq.codebook], names=["codebook"]))
+    assert PqModel.load(legacy_pq_uri).num_bits == 8
+
 
 def test_ivf_centroids_fragment_ids(tmpdir):
     rows_per_fragment = 32
@@ -300,7 +323,7 @@ def test_indices_builder_multivector_distributed_dimensions(tmpdir, monkeypatch)
 
     captured_dimensions = {}
 
-    def train_pq_model(*args):
+    def train_pq_model(*args, **kwargs):
         captured_dimensions["train_pq"] = args[2]
         return codebook
 

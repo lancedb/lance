@@ -26,6 +26,7 @@ use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::DataOverlayFile;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
 };
@@ -452,6 +453,11 @@ impl FileFragment {
         rt().block_on(None, self.fragment.physical_rows())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
+
+    fn validate(&self) -> PyResult<()> {
+        rt().block_on(None, self.fragment.validate())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
 }
 
 impl From<FileFragment> for LanceFragment {
@@ -825,6 +831,10 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
+            // Round-tripped so overlays survive operations that pass existing
+            // fragments back (a manual Delete/Update/Merge commit). Sorting
+            // newest-last is deferred to the manifest reload after commit.
+            overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
         }))
     }
 }
@@ -857,6 +867,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             .created_at_version_meta
             .as_ref()
             .map(|r| PyRowDatasetVersionMeta(r.clone()));
+        let overlays = export_vec(py, &self.0.overlays)?;
 
         cls.call1((
             self.0.id,
@@ -866,6 +877,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
+            overlays,
         ))
     }
 }

@@ -49,7 +49,7 @@ use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilt
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
+    LanceFileStatistics, LanceFileWriteSummary, LanceFileWriter, LancePageMetadata, stable_version,
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
@@ -71,11 +71,13 @@ pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
+pub(crate) mod fts;
 pub(crate) mod indices;
 pub(crate) mod mem_wal;
 pub(crate) mod namespace;
 pub(crate) mod otel;
 pub(crate) mod reader;
+pub(crate) mod rowids;
 pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
@@ -96,6 +98,7 @@ pub use dataset::write_dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
+use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 
 use crate::blob::{
@@ -259,6 +262,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FileFragment>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
+    m.add_class::<PyRowIdSequence>()?;
+    m.add_class::<PyRowIdSequenceIterator>()?;
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
@@ -268,6 +273,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
+    m.add_class::<LanceFileWriteSummary>()?;
     m.add_class::<LanceFileSession>()?;
     m.add_class::<LanceFileMetadata>()?;
     m.add_class::<LanceFileStatistics>()?;
@@ -291,6 +297,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Session>()?;
     m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
@@ -299,7 +306,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<namespace::PyRestAdapter>()?;
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     // MemWAL classes
-    m.add_class::<mem_wal::PyMergedGeneration>()?;
+    m.add_class::<mem_wal::PyCompactedSsTable>()?;
     m.add_class::<mem_wal::PyShardSnapshot>()?;
     m.add_class::<mem_wal::PyShardWriter>()?;
     m.add_class::<mem_wal::PyLsmScanner>()?;
@@ -319,6 +326,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
+    m.add_wrapped(wrap_pyfunction!(fts::tokenize))?;
     // OpenTelemetry metrics bridge
     m.add_class::<otel::PyMetricPoint>()?;
     m.add_class::<otel::PyMetricDescription>()?;
@@ -329,6 +337,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
+    m.add_wrapped(wrap_pyfunction!(simd_info))?;
     m.add_wrapped(wrap_pyfunction!(stable_version))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
@@ -345,6 +354,37 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction(name = "iops_counter")]
 fn iops_counter() -> PyResult<u64> {
     Ok(::lance::io::iops_counter())
+}
+
+/// Returns a dict describing which SIMD tier the lance runtime dispatches to
+/// on this host, plus the raw CPU feature flags it detected.
+///
+/// Mirrors `pyarrow.runtime_info()`: a cheap, transparent way to verify that
+/// the host is hitting the expected SIMD tier (e.g., `"avx512_fp16"`,
+/// `"avx2"`) when debugging vector-search performance.
+///
+/// Returns:
+///   {
+///     "tier": str,                      # e.g. "avx2", "avx_fma", "neon", "none"
+///     "target_arch": str,               # e.g. "x86_64", "aarch64", "loongarch64"
+///     "host_features": list[str],       # raw CPU feature flags (x86_64 only)
+///   }
+///
+/// Examples:
+///   >>> import lance
+///   >>> info = lance.simd_info()
+///   >>> sorted(info)
+///   ['host_features', 'target_arch', 'tier']
+///   >>> isinstance(info["tier"], str)
+///   True
+#[pyfunction]
+pub fn simd_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let info = lance_core::utils::cpu::simd_info();
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("tier", info.tier.to_string())?;
+    dict.set_item("target_arch", info.target_arch)?;
+    dict.set_item("host_features", info.host_features)?;
+    Ok(dict.into())
 }
 
 #[pyfunction(name = "bytes_read_counter")]

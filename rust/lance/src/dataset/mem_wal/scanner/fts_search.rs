@@ -4,7 +4,7 @@
 //! Full-text search planner for LSM scanner (local scoring).
 //!
 //! Builds an execution plan that scores an FTS query across the base
-//! table, flushed memtable generations, and the active/frozen-undrained
+//! table, SSTable generations, and the active/frozen-undrained
 //! in-memory memtables, returning rows ordered by BM25 `_score` DESC.
 //!
 //! # Scoring
@@ -22,17 +22,17 @@
 //! benchmark in this PR shows it carries a real latency penalty, so the
 //! local path lands first and the global option is optimized separately.
 //!
-//! Staleness: within a flushed generation, the deletion vector written
+//! Staleness: within an SSTable, the deletion vector written
 //! at flush time (see #6929) already masks rows superseded by a newer
 //! generation, so per-source results are clean within each tier. The
-//! same primary key can still appear across tiers (active vs flushed)
+//! same primary key can still appear across tiers (active vs SSTable)
 //! when an updated row sits in the active memtable while the older
-//! copy lives in a flushed generation; cross-tier deduplication is
+//! copy lives in an SSTable; cross-tier deduplication is
 //! left to the caller in local mode.
 //!
 //! Everything here is contained in the `mem_wal` module — it reuses the
 //! existing per-source FTS read paths (`scanner.full_text_search` for
-//! base/flushed Lance datasets, `MemTableScanner` for the active
+//! base/SSTable Lance datasets, `MemTableScanner` for the active
 //! memtable) and requires no changes to `lance-index`.
 
 use std::sync::Arc;
@@ -48,16 +48,19 @@ use datafusion::prelude::Expr;
 use lance_core::{Error, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
+use lance_index::scalar::inverted::{DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity};
 use tracing::instrument;
 
 use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::PkBlockFilterExec;
-use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{project_to_canonical, validate_projection_names};
+use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
+use crate::index::scalar::inverted::{indexed_fts_document_granularities, resolve_fts_field};
 use crate::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 
 /// `_score` column name in FTS results — kept aligned with
 /// `lance_index::scalar::inverted::SCORE_COL` so this module doesn't
@@ -68,6 +71,140 @@ pub const SCORE_COLUMN: &str = "_score";
 /// dedup on with no over-fetch; callers (e.g. the sophon WAL handler) raise it
 /// so a blocked source still yields `k` live rows after the block-list filter.
 const DEFAULT_OVERFETCH_FACTOR: f64 = 1.0;
+
+fn requested_query_document_granularity(
+    query: &IndexFtsQuery,
+) -> Result<Option<DocumentGranularity>> {
+    fn merge(
+        current: &mut Option<DocumentGranularity>,
+        requested: Option<DocumentGranularity>,
+    ) -> Result<()> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        if let Some(current) = current
+            && *current != requested
+        {
+            return Err(Error::invalid_input(
+                "FTS queries cannot mix Row and ListElement document granularities".to_string(),
+            ));
+        }
+        *current = Some(requested);
+        Ok(())
+    }
+
+    fn visit(query: &IndexFtsQuery, current: &mut Option<DocumentGranularity>) -> Result<()> {
+        match query {
+            IndexFtsQuery::Match(query) => merge(current, query.document_granularity),
+            IndexFtsQuery::Phrase(query) => merge(current, query.document_granularity),
+            IndexFtsQuery::Boost(query) => {
+                visit(&query.positive, current)?;
+                visit(&query.negative, current)
+            }
+            IndexFtsQuery::Boolean(query) => {
+                for child in query
+                    .must
+                    .iter()
+                    .chain(&query.should)
+                    .chain(&query.must_not)
+                {
+                    visit(child, current)?;
+                }
+                Ok(())
+            }
+            IndexFtsQuery::MultiMatch(query) => {
+                for child in &query.match_queries {
+                    merge(current, child.document_granularity)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    let mut requested = None;
+    visit(query, &mut requested)?;
+    Ok(requested)
+}
+
+fn set_query_document_granularity(
+    query: &mut IndexFtsQuery,
+    document_granularity: DocumentGranularity,
+) {
+    match query {
+        IndexFtsQuery::Match(query) => {
+            query.document_granularity = Some(document_granularity);
+        }
+        IndexFtsQuery::Phrase(query) => {
+            query.document_granularity = Some(document_granularity);
+        }
+        IndexFtsQuery::Boost(query) => {
+            set_query_document_granularity(&mut query.positive, document_granularity);
+            set_query_document_granularity(&mut query.negative, document_granularity);
+        }
+        IndexFtsQuery::Boolean(query) => {
+            for child in query
+                .must
+                .iter_mut()
+                .chain(&mut query.should)
+                .chain(&mut query.must_not)
+            {
+                set_query_document_granularity(child, document_granularity);
+            }
+        }
+        IndexFtsQuery::MultiMatch(query) => {
+            for child in &mut query.match_queries {
+                child.document_granularity = Some(document_granularity);
+            }
+        }
+    }
+}
+
+fn query_document_granularity(query: &FullTextSearchQuery) -> Result<DocumentGranularity> {
+    requested_query_document_granularity(&query.query)?.ok_or_else(|| {
+        Error::internal("LSM FTS query document granularity was not resolved".to_string())
+    })
+}
+
+fn resolve_document_granularity_from_candidates(
+    column: &str,
+    requested: Option<DocumentGranularity>,
+    mut available: Vec<DocumentGranularity>,
+) -> Result<DocumentGranularity> {
+    available.sort_by_key(|document_granularity| match document_granularity {
+        DocumentGranularity::Row => 0,
+        DocumentGranularity::ListElement => 1,
+    });
+    available.dedup();
+    match requested {
+        Some(requested) if available.is_empty() || available.contains(&requested) => Ok(requested),
+        Some(requested) => Err(Error::invalid_input(format!(
+            "FTS query for field '{column}' requested {requested:?} document granularity, but \
+             the MemWAL sources use a different indexed granularity: {available:?}"
+        ))),
+        None if available.is_empty() => Ok(DocumentGranularity::Row),
+        None if available.len() == 1 => Ok(available[0]),
+        None => Err(Error::invalid_input(format!(
+            "FTS query for field '{column}' is ambiguous because Row and ListElement indexes \
+             coexist across MemWAL sources; specify document_granularity"
+        ))),
+    }
+}
+
+fn validate_source_document_granularities(
+    column: &str,
+    resolved: DocumentGranularity,
+    source_granularities: &[Vec<DocumentGranularity>],
+) -> Result<()> {
+    for granularities in source_granularities {
+        if !granularities.is_empty() && !granularities.contains(&resolved) {
+            return Err(Error::invalid_input(format!(
+                "FTS query for field '{column}' resolved to {resolved:?}, but a MemWAL source has \
+                 only incompatible indexed granularities: {granularities:?}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     match &query.query {
@@ -86,7 +223,11 @@ fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     }
 }
 
-fn active_source_can_execute_fts(source: &LsmDataSource, column: &str) -> bool {
+fn active_source_can_execute_fts(
+    source: &LsmDataSource,
+    column: &str,
+    document_granularity: DocumentGranularity,
+) -> bool {
     match source {
         LsmDataSource::ActiveMemTable {
             batch_store,
@@ -94,10 +235,10 @@ fn active_source_can_execute_fts(source: &LsmDataSource, column: &str) -> bool {
             ..
         } => {
             index_store
-                .get_fts_by_column(column)
+                .get_fts_by_column_and_granularity(column, document_granularity)
                 .is_some_and(|index| !index.is_empty())
                 && batch_store
-                    .max_visible_row(index_store.max_visible_batch_position())
+                    .max_visible_row(index_store.visible_count())
                     .is_some()
         }
         _ => false,
@@ -109,16 +250,18 @@ pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
     pk_columns: Vec<String>,
     base_schema: SchemaRef,
-    /// Session threaded into flushed-generation opens (shared caches).
+    /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
-    /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<dyn DatasetCache>>,
-    /// Optional warmer fired on first open of a flushed generation.
-    warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Store params for opening SSTables, reusing the base dataset's store.
+    store_params: Option<ObjectStoreParams>,
+    /// Cache of opened SSTable datasets.
+    sstable_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of an SSTable.
+    warmer: Option<Arc<dyn SsTableWarmer>>,
     /// Over-fetch multiple for blocked sources.
     overfetch_factor: f64,
     /// Optional prefilter predicate applied to every source arm so FTS hits
-    /// failing the predicate are dropped. Base/flushed arms use the dataset
+    /// failing the predicate are dropped. Base/SSTable arms use the dataset
     /// scanner's native filter; memtable arms filter the materialized hits.
     filter: Option<Expr>,
 }
@@ -135,7 +278,8 @@ impl LsmFtsSearchPlanner {
             pk_columns,
             base_schema,
             session: None,
-            flushed_cache: None,
+            store_params: None,
+            sstable_cache: None,
             warmer: None,
             overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
             filter: None,
@@ -144,7 +288,7 @@ impl LsmFtsSearchPlanner {
 
     /// Attach an optional prefilter predicate. Every source arm restricts its
     /// FTS hits to rows matching the predicate, matching a normal filtered
-    /// full-text scan over base ∪ flushed ∪ in-memory data.
+    /// full-text scan over base ∪ SSTables ∪ in-memory data.
     pub fn with_filter(mut self, filter: Option<Expr>) -> Self {
         self.filter = filter;
         self
@@ -158,22 +302,27 @@ impl LsmFtsSearchPlanner {
         self
     }
 
-    /// Thread a session into flushed-generation opens so the first open
-    /// populates the shared index / file-metadata caches.
+    /// Set the session used to open SSTables.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Inject a cache of opened flushed-generation datasets, making repeated
-    /// searches against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
-        self.flushed_cache = Some(cache);
+    /// Set the store params used to open SSTables.
+    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+        self.store_params = Some(store_params);
         self
     }
 
-    /// Inject the warmer fired on first open of a flushed generation.
-    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+    /// Inject a cache of opened SSTable datasets, making repeated
+    /// searches against the same generation a pure `Arc::clone`.
+    pub fn with_sstable_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
+        self.sstable_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of an SSTable.
+    pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
         self
     }
@@ -184,7 +333,7 @@ impl LsmFtsSearchPlanner {
     ///
     /// * `column` — text column to search.
     /// * `query` — the FTS query (match / phrase / boolean / fuzzy for
-    ///   base/flushed Lance sources; the active memtable currently
+    ///   base/SSTable Lance sources; the active memtable currently
     ///   supports `MatchQuery`).
     /// * `limit` — optional global top-k to return.
     /// * `projection` — user columns to project. PK columns are
@@ -202,19 +351,68 @@ impl LsmFtsSearchPlanner {
     pub async fn plan_search(
         &self,
         column: &str,
-        query: FullTextSearchQuery,
+        mut query: FullTextSearchQuery,
         limit: Option<usize>,
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let sources = self.collector.collect()?;
+        let requested = requested_query_document_granularity(&query.query)?;
+        let mut available = Vec::new();
+        let mut source_granularities = Vec::with_capacity(sources.len());
+        for source in &sources {
+            let granularities = match source {
+                LsmDataSource::BaseTable { dataset } => {
+                    indexed_fts_document_granularities(dataset, column)
+                        .await?
+                        .into_iter()
+                        .map(|(_, document_granularity)| document_granularity)
+                        .collect::<Vec<_>>()
+                }
+                LsmDataSource::SsTable { path, .. } => {
+                    let dataset = open_sstable(
+                        path,
+                        self.session.as_ref(),
+                        self.store_params.as_ref(),
+                        self.sstable_cache.as_ref(),
+                        self.warmer.as_ref(),
+                    )
+                    .await?;
+                    indexed_fts_document_granularities(&dataset, column)
+                        .await?
+                        .into_iter()
+                        .map(|(_, document_granularity)| document_granularity)
+                        .collect::<Vec<_>>()
+                }
+                LsmDataSource::ActiveMemTable { index_store, .. } => {
+                    index_store.fts_document_granularities_by_column(column)
+                }
+            };
+            available.extend(granularities.iter().copied());
+            source_granularities.push(granularities);
+        }
+        let document_granularity =
+            resolve_document_granularity_from_candidates(column, requested, available)?;
+        validate_source_document_granularities(
+            column,
+            document_granularity,
+            &source_granularities,
+        )?;
+        let schema = lance_core::datatypes::Schema::try_from(self.base_schema.as_ref())?;
+        resolve_fts_field(&schema, column, document_granularity)?;
+        set_query_document_granularity(&mut query.query, document_granularity);
         if sources
             .iter()
-            .any(|source| active_source_can_execute_fts(source, column))
+            .any(|source| active_source_can_execute_fts(source, column, document_granularity))
         {
             validate_lsm_fts_query(&query)?;
         }
-        validate_projection_names(projection, &self.base_schema, &[SCORE_COLUMN])?;
-        let target_schema = self.canonical_fts_schema(projection);
+        let allowed_system_columns: &[&str] = if document_granularity.is_list_element() {
+            &[SCORE_COLUMN, DOC_INDEX_COL]
+        } else {
+            &[SCORE_COLUMN]
+        };
+        validate_projection_names(projection, &self.base_schema, allowed_system_columns)?;
+        let target_schema = self.canonical_fts_schema(projection, document_granularity);
         let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
@@ -228,7 +426,8 @@ impl LsmFtsSearchPlanner {
         let block_lists = Box::pin(compute_source_block_lists(
             &sources,
             self.session.as_ref(),
-            self.flushed_cache.as_ref(),
+            self.store_params.as_ref(),
+            self.sstable_cache.as_ref(),
         ))
         .await?;
 
@@ -370,11 +569,12 @@ impl LsmFtsSearchPlanner {
                 scanner.full_text_search(bound_query)?;
                 scanner.create_plan().await
             }
-            LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = open_flushed_dataset(
+            LsmDataSource::SsTable { path, .. } => {
+                let dataset = open_sstable(
                     path,
                     self.session.as_ref(),
-                    self.flushed_cache.as_ref(),
+                    self.store_params.as_ref(),
+                    self.sstable_cache.as_ref(),
                     self.warmer.as_ref(),
                 )
                 .await?;
@@ -402,8 +602,10 @@ impl LsmFtsSearchPlanner {
                 schema,
                 ..
             } => {
-                if !active_source_can_execute_fts(source, column) {
-                    return self.empty_plan(&self.canonical_fts_schema(projection));
+                let document_granularity = query_document_granularity(query)?;
+                if !active_source_can_execute_fts(source, column, document_granularity) {
+                    return self
+                        .empty_plan(&self.canonical_fts_schema(projection, document_granularity));
                 }
                 validate_lsm_fts_query(query)?;
                 let mut scanner =
@@ -460,7 +662,11 @@ impl LsmFtsSearchPlanner {
     }
 
     /// Canonical FTS output: user-projected cols + PK + `_score`.
-    fn canonical_fts_schema(&self, user_projection: Option<&[String]>) -> SchemaRef {
+    fn canonical_fts_schema(
+        &self,
+        user_projection: Option<&[String]>,
+        document_granularity: DocumentGranularity,
+    ) -> SchemaRef {
         let mut ordered: Vec<String> = if let Some(p) = user_projection {
             p.to_vec()
         } else {
@@ -475,6 +681,9 @@ impl LsmFtsSearchPlanner {
                 ordered.push(pk.clone());
             }
         }
+        if document_granularity.is_list_element() && !ordered.iter().any(|c| c == DOC_INDEX_COL) {
+            ordered.push(DOC_INDEX_COL.to_string());
+        }
         if !ordered.iter().any(|c| c == SCORE_COLUMN) {
             ordered.push(SCORE_COLUMN.to_string());
         }
@@ -483,6 +692,8 @@ impl LsmFtsSearchPlanner {
             .filter_map(|name| {
                 if name == SCORE_COLUMN {
                     Some(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)))
+                } else if name == DOC_INDEX_COL {
+                    Some(Arc::new(DOC_INDEX_FIELD.clone()))
                 } else if is_system_column(name) {
                     Some(Arc::new(Field::new(name.clone(), DataType::UInt64, true)))
                 } else {
@@ -508,9 +719,14 @@ mod tests {
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
-    use arrow_array::{BooleanArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::{
+        Array, BooleanArray, Int32Array, ListArray, RecordBatch, RecordBatchIterator, StringArray,
+        UInt32Array,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
+    use lance_index::scalar::inverted::query::MatchQuery;
     use std::collections::HashMap;
 
     fn fts_schema() -> Arc<ArrowSchema> {
@@ -608,10 +824,321 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolves_document_granularity_from_memwal_indexes() {
+        assert_eq!(
+            resolve_document_granularity_from_candidates("tags", None, vec![]).unwrap(),
+            DocumentGranularity::Row
+        );
+        assert_eq!(
+            resolve_document_granularity_from_candidates(
+                "tags",
+                None,
+                vec![DocumentGranularity::ListElement],
+            )
+            .unwrap(),
+            DocumentGranularity::ListElement
+        );
+        assert!(
+            resolve_document_granularity_from_candidates(
+                "tags",
+                Some(DocumentGranularity::Row),
+                vec![DocumentGranularity::ListElement],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("different indexed granularity")
+        );
+        let both = vec![DocumentGranularity::Row, DocumentGranularity::ListElement];
+        assert!(
+            resolve_document_granularity_from_candidates("tags", None, both.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert_eq!(
+            resolve_document_granularity_from_candidates(
+                "tags",
+                Some(DocumentGranularity::ListElement),
+                both,
+            )
+            .unwrap(),
+            DocumentGranularity::ListElement
+        );
+        assert!(
+            validate_source_document_granularities(
+                "tags",
+                DocumentGranularity::ListElement,
+                &[
+                    vec![DocumentGranularity::ListElement],
+                    vec![DocumentGranularity::Row],
+                ],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible indexed granularities")
+        );
+    }
+
+    #[tokio::test]
+    async fn memwal_rejects_list_element_without_a_list_path() {
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("lance".to_string())
+                .with_document_granularity(DocumentGranularity::ListElement),
+        ));
+
+        let error = planner
+            .plan_search("text", query, Some(1), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("has no List layer"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn active_element_document_search_returns_physical_ordinals() {
+        use lance_index::scalar::inverted::InvertedIndexParams;
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(id_meta);
+
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        tags.values().append_value("alpha");
+        tags.values().append_value("beta gamma");
+        tags.values().append_null();
+        tags.values().append_value("beta");
+        tags.append(true);
+        tags.append(true);
+        tags.values().append_value("beta");
+        tags.append(true);
+        let tags = tags.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            id_field,
+            Field::new("tags", tags.data_type().clone(), true),
+        ]));
+        let active_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(tags)],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes
+            .add_fts_with_params(
+                "tags_list_element_fts".to_string(),
+                1,
+                "tags".to_string(),
+                InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
+            )
+            .unwrap();
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: Arc::new(indexes),
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let projection = vec!["id".to_string()];
+        let plan = planner
+            .plan_search(
+                "tags",
+                FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
+                    "beta".to_string(),
+                ))),
+                Some(10),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut hits = Vec::new();
+        for batch in batches {
+            let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+            let doc_indices = batch[DOC_INDEX_COL]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let coordinate = doc_indices
+                    .value(row)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .value(0);
+                hits.push((ids.value(row), coordinate));
+            }
+        }
+        hits.sort_unstable();
+        assert_eq!(hits, vec![(1, 1), (1, 3), (3, 0)]);
+    }
+
+    #[tokio::test]
+    async fn element_document_search_unions_base_and_active_sources() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::InvertedIndexParams;
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(id_meta);
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            id_field,
+            Field::new("tags", list_type, true),
+        ]));
+
+        let mut base_tags = ListBuilder::new(StringBuilder::new());
+        base_tags.values().append_value("beta");
+        base_tags.values().append_value("other");
+        base_tags.append(true);
+        let base_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(base_tags.finish()),
+            ],
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(base_batch)], schema.clone()),
+            &base_uri,
+            None,
+        )
+        .await
+        .unwrap();
+        base_ds
+            .create_index(
+                &["tags"],
+                IndexType::Inverted,
+                Some("tags_list_element_fts".to_string()),
+                &InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        let mut active_tags = ListBuilder::new(StringBuilder::new());
+        active_tags.values().append_value("other");
+        active_tags.values().append_value("beta");
+        active_tags.append(true);
+        let active_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(active_tags.finish()),
+            ],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes
+            .add_fts_with_params(
+                "tags_list_element_fts".to_string(),
+                1,
+                "tags".to_string(),
+                InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
+            )
+            .unwrap();
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: Arc::new(indexes),
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let projection = vec!["id".to_string()];
+        let plan = planner
+            .plan_search(
+                "tags",
+                FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
+                    "beta".to_string(),
+                ))),
+                Some(10),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut hits = Vec::new();
+        for batch in batches {
+            let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+            let coordinates = batch[DOC_INDEX_COL]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let coordinate = coordinates
+                    .value(row)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .value(0);
+                hits.push((ids.value(row), coordinate));
+            }
+        }
+        hits.sort_unstable();
+        assert_eq!(hits, vec![(1, 0), (2, 1)]);
+    }
+
     #[tokio::test]
     async fn local_mode_unions_base_and_active_with_consistent_score_schema() {
         // Regression for the `_score` nullability mismatch between
-        // FtsIndexExec (active arm) and FTS_SCHEMA (base/flushed). The
+        // FtsIndexExec (active arm) and FTS_SCHEMA (base/SSTable). The
         // active-only test below would not catch this — UnionExec rejects
         // schema-inequality, so we need at least one base + one active
         // source to exercise that code path.
@@ -818,12 +1345,12 @@ mod tests {
         );
     }
 
-    /// The flushed arm must apply the filter as a true FTS prefilter, and that
+    /// The SSTable arm must apply the filter as a true FTS prefilter, and that
     /// prefiltered candidate set must compose with cross-generation block-list
     /// filtering plus over-fetch. Gen 1's best predicate-matching hit (id=3) is
     /// superseded by gen 2; with over-fetch, gen 1 should still contribute id=4.
     #[tokio::test]
-    async fn prefilter_on_flushed_composes_with_block_list() {
+    async fn prefilter_on_sstable_composes_with_block_list() {
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
         use crate::index::DatasetIndexExt;
         use datafusion::prelude::{col, lit};
@@ -837,7 +1364,7 @@ mod tests {
 
         // Gen 1: id=1 matches strongly but fails the predicate. id=3 matches
         // strongly but is stale (blocked by gen 2). id=4 is the next live
-        // predicate match that only survives if the flushed arm prefilters and
+        // predicate match that only survives if the SSTable arm prefilters and
         // over-fetches before the block-list drops id=3.
         let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let mut gen1 = write_dataset(
@@ -875,8 +1402,8 @@ mod tests {
 
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(3)
-            .with_flushed_generation(1, "gen_1".to_string())
-            .with_flushed_generation(2, "gen_2".to_string());
+            .with_sstable(1, "gen_1".to_string())
+            .with_sstable(2, "gen_2".to_string());
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot]);
 
         let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
@@ -890,7 +1417,7 @@ mod tests {
                 None,
             )
             .await
-            .expect("planner should produce a filtered flushed plan");
+            .expect("planner should produce a filtered SSTable plan");
 
         let ctx = datafusion::prelude::SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
@@ -911,7 +1438,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![4],
-            "flushed FTS prefilter should return live id=4 after stale id=3 is blocked; got {ids:?}"
+            "SSTable FTS prefilter should return live id=4 after stale id=3 is blocked; got {ids:?}"
         );
     }
 

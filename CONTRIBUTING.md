@@ -25,6 +25,10 @@ Currently Lance is implemented in Rust and comes with a Python wrapper. So you'l
     a. Install pre-commit: https://pre-commit.com/#install
     b. Run `pre-commit install` in the root of the repo
 
+## x86_64 CPU compatibility
+
+The default workspace build targets `x86-64-v2` (SSE4.2), so binaries can run on pre-Haswell silicon that does not support AVX2. Runtime SIMD dispatch in `lance-linalg::distance` picks the appropriate tier (scalar / AVX / AVX+FMA / AVX2+FMA / AVX-512) based on the host. From Python, use `lance.simd_info()` to verify which tier was selected.
+
 ## Sample Workflow
 
 1. Fork the repo
