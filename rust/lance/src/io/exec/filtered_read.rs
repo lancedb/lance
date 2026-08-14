@@ -11,7 +11,7 @@ use std::{
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
@@ -3027,10 +3027,34 @@ impl ExecutionPlan for FilteredReadExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        match &self.input {
+        let stream = match &self.input {
             RowSelector::RowStream(source) => self.execute_row_stream(source, partition, context),
             _ => Ok(self.obtain_stream(partition, context)),
-        }
+        }?;
+
+        // Readers can omit the logical schema metadata, while row-stream merges
+        // can retain metadata from their input. Normalize once at the execution
+        // boundary so every selector satisfies RecordBatchStream's exact schema
+        // contract. Rebuilding the batch reuses the arrays without copying them.
+        let output_schema = self.schema();
+        let batch_schema = output_schema.clone();
+        let stream = stream.map(move |batch| {
+            let batch = batch?;
+            if batch.schema_ref() == &batch_schema {
+                return Ok(batch);
+            }
+            let (_, columns, row_count) = batch.into_parts();
+            RecordBatch::try_new_with_options(
+                batch_schema.clone(),
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(row_count)),
+            )
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -3107,7 +3131,7 @@ impl ExecutionPlan for FilteredReadExec {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use crate::index::DatasetIndexExt;
     use arrow::{
@@ -3130,6 +3154,7 @@ mod tests {
     };
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use rstest::rstest;
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -3348,6 +3373,70 @@ mod tests {
             .await
             .unwrap();
         (tmp_path, Arc::new(dataset))
+    }
+
+    #[rstest]
+    #[case::unfiltered(None)]
+    #[case::filtered(Some("value > 2"))]
+    #[tokio::test]
+    async fn test_output_batches_preserve_schema_metadata(#[case] filter: Option<&str>) {
+        let tmp_path = TempStrDir::default();
+        let metadata = HashMap::from([(
+            "embedding_functions".to_string(),
+            "[{\"name\":\"test\"}]".to_string(),
+        )]);
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![arrow_schema::Field::new(
+                "value",
+                arrow_schema::DataType::Int32,
+                true,
+            )],
+            metadata.clone(),
+        ));
+        let batch = arrow_array::record_batch!(("value", Int32, [1, 2, 3, 4]))
+            .unwrap()
+            .with_schema(schema.clone())
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut options = FilteredReadOptions::basic_full_read(&dataset);
+        if let Some(filter) = filter {
+            let arrow_schema = Arc::new(ArrowSchema::from(dataset.schema()));
+            let planner = Planner::new(arrow_schema);
+            let expr = planner.parse_filter(filter).unwrap();
+            options = options.with_filter(Some(expr.clone()), Some(expr)).unwrap();
+        }
+
+        let plan = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        let expected_schema = plan.schema();
+        assert_eq!(expected_schema.metadata(), &metadata);
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert!(!batches.is_empty());
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.schema() == expected_schema),
+            "output schema metadata was not preserved with filter {filter:?}"
+        );
     }
 
     fn u32s(ranges: Vec<Range<u32>>) -> Arc<dyn Array> {
@@ -4997,16 +5086,22 @@ mod tests {
         }
 
         /// 30 rows across 3 fragments with columns i, s, and struct{x, y}
-        async fn take_fixture(stable_row_ids: bool) -> TakeFixture {
+        async fn take_fixture_with_metadata(
+            stable_row_ids: bool,
+            metadata: HashMap<String, String>,
+        ) -> TakeFixture {
             let struct_fields = Fields::from(vec![
                 Arc::new(ArrowField::new("x", DataType::Int32, false)),
                 Arc::new(ArrowField::new("y", DataType::Int32, false)),
             ]);
-            let schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("i", DataType::Int32, false),
-                ArrowField::new("s", DataType::Utf8, false),
-                ArrowField::new("struct", DataType::Struct(struct_fields.clone()), false),
-            ]));
+            let schema = Arc::new(ArrowSchema::new_with_metadata(
+                vec![
+                    ArrowField::new("i", DataType::Int32, false),
+                    ArrowField::new("s", DataType::Utf8, false),
+                    ArrowField::new("struct", DataType::Struct(struct_fields.clone()), false),
+                ],
+                metadata,
+            ));
             let batches: Vec<RecordBatch> = (0..3)
                 .map(|batch_id| {
                     let value_range = batch_id * 10..batch_id * 10 + 10;
@@ -5044,6 +5139,10 @@ mod tests {
                 dataset: Arc::new(Dataset::open(uri).await.unwrap()),
                 _tmp_dir: tmp_dir,
             }
+        }
+
+        async fn take_fixture(stable_row_ids: bool) -> TakeFixture {
+            take_fixture_with_metadata(stable_row_ids, HashMap::new()).await
         }
 
         /// Wrap batches of (payload, key) rows into an input plan
@@ -5093,6 +5192,58 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
+        }
+
+        #[rstest]
+        #[case::aligned(false, HashMap::new())]
+        #[case::reordered(
+            true,
+            HashMap::from([("input_only".to_string(), "true".to_string())])
+        )]
+        #[tokio::test]
+        async fn row_stream_output_preserves_plan_schema_metadata(
+            #[case] reordered: bool,
+            #[case] input_metadata: HashMap<String, String>,
+        ) {
+            let dataset_metadata = HashMap::from([(
+                "embedding_functions".to_string(),
+                "[{\"name\":\"test\"}]".to_string(),
+            )]);
+            let fixture = take_fixture_with_metadata(false, dataset_metadata.clone()).await;
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            let keys = if reordered {
+                vec![addr(1, 0), addr(0, 0)]
+            } else {
+                vec![addr(0, 0), addr(0, 1)]
+            };
+            let input_schema = Arc::new(ArrowSchema::new_with_metadata(
+                vec![
+                    ArrowField::new("payload", DataType::Float32, false),
+                    ArrowField::new(ROW_ADDR, DataType::UInt64, false),
+                ],
+                input_metadata,
+            ));
+            let input = RecordBatch::try_new(
+                input_schema,
+                vec![
+                    Arc::new(Float32Array::from(vec![0.5, 1.5])),
+                    Arc::new(UInt64Array::from(keys)),
+                ],
+            )
+            .unwrap();
+
+            let plan = take_plan(&fixture.dataset, rows_input(vec![input]), &["i"]).unwrap();
+            let expected_schema = plan.schema();
+            assert_eq!(expected_schema.metadata(), &dataset_metadata);
+            let batches = run(&plan).await;
+
+            assert!(!batches.is_empty());
+            assert!(
+                batches
+                    .iter()
+                    .all(|batch| batch.schema() == expected_schema),
+                "row-stream output did not match the plan schema for reordered={reordered}"
+            );
         }
 
         /// A sparse plan constructs fragment handles only for the fragments
