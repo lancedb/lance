@@ -20,7 +20,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use super::index::IndexStore;
-use super::util::{generate_random_hash, WatchableOnceCell, WatchableOnceCellReader};
+use super::util::{WatchableOnceCell, WatchableOnceCellReader, generate_random_hash};
 use super::wal::WalFlushFailure;
 use super::write::{DurabilityResult, WalFlushResult};
 use crate::Dataset;
