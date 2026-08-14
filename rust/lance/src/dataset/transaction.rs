@@ -4903,18 +4903,24 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 ///
 /// Readers resolve columns by field id (name -> schema id -> DataFile::fields
 /// position), so renumbered ids silently rebind live columns to other columns'
-/// bytes. Shared ids must keep their field path, logical type, nullability,
-/// storage encoding, and dictionary. New ids must exceed the manifest's max so
-/// a dropped field's id is never reused. An existing path may move to a fresh
-/// id only when every proposed fragment materializes that id in a base data
-/// file (the `alter_columns` cast path). Omitting a field (dropping it) and
-/// updating field metadata remain legal.
+/// bytes. Shared ids must keep their field path. Their logical type,
+/// nullability, storage encoding, and dictionary may change only when every
+/// existing base or overlay file carrying the id is replaced and every
+/// proposed fragment materializes the id in a base data file. New ids must
+/// exceed the manifest's max so a dropped field's id is never reused. An
+/// existing path may move to a fresh id only when every proposed fragment
+/// materializes that id in a base data file (the `alter_columns` cast path).
+/// Omitting a field (dropping it) and updating field metadata remain legal.
 fn merge_schema_valid(
     manifest: &Manifest,
     new_schema: &Schema,
     fragments: &[Fragment],
 ) -> Result<()> {
     let prior_schema = &manifest.schema;
+    let new_fragment_map: HashMap<u64, &Fragment> = fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect();
 
     // Remap and semantic errors first: a renumbered schema usually violates
     // both the shared-id and new-id clauses.
@@ -4932,12 +4938,14 @@ fn merge_schema_valid(
                 field.id, prior_path, new_path
             )));
         }
-        if let Some(changes) = shared_field_binding_changes(prior_field, field) {
+        if let Some(changes) = shared_field_binding_changes(prior_field, field)
+            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, field.id)
+        {
             return Err(Error::invalid_input(format!(
-                "Merge operation changes field id {} (\"{}\"): {}. \
-                 Merge must preserve each existing field's path, logical type, \
-                 nullability, storage encoding, and dictionary; only field metadata \
-                 updates and field drops are allowed.",
+                "Merge operation changes field id {} (\"{}\") without rewriting it in \
+                 every existing fragment: {}. Merge must preserve each existing field's \
+                 logical type, nullability, storage encoding, and dictionary unless all \
+                 existing base and overlay files carrying that field are replaced.",
                 field.id, new_path, changes
             )));
         }
@@ -4992,6 +5000,37 @@ fn merge_schema_valid(
     }
 
     Ok(())
+}
+
+fn is_field_binding_fully_rewritten(
+    manifest: &Manifest,
+    new_fragment_map: &HashMap<u64, &Fragment>,
+    field_id: i32,
+) -> bool {
+    manifest.fragments.iter().all(|prior_fragment| {
+        let Some(new_fragment) = new_fragment_map.get(&prior_fragment.id) else {
+            return false;
+        };
+
+        let is_materialized = new_fragment
+            .files
+            .iter()
+            .any(|file| file.fields.contains(&field_id));
+        if !is_materialized {
+            return false;
+        }
+
+        prior_fragment
+            .referenced_lance_files()
+            .filter(|file| file.fields.contains(&field_id))
+            .all(|prior_file| {
+                !new_fragment.referenced_lance_files().any(|new_file| {
+                    new_file.fields.contains(&field_id)
+                        && new_file.base_id == prior_file.base_id
+                        && new_file.path == prior_file.path
+                })
+            })
+    })
 }
 
 fn shared_field_binding_changes(prior: &Field, new: &Field) -> Option<String> {
@@ -5301,14 +5340,18 @@ mod tests {
         .unwrap()
     }
 
-    fn manifest_with_file_fields(schema: LanceSchema, fields: Vec<i32>) -> Manifest {
-        let mut fragment = Fragment::new(0);
+    fn fragment_with_file_fields(id: u64, path: &str, fields: Vec<i32>) -> Fragment {
+        let mut fragment = Fragment::new(id);
         fragment
             .files
-            .push(DataFile::new_legacy_from_fields("f.lance", fields, None));
+            .push(DataFile::new_legacy_from_fields(path, fields, None));
+        fragment
+    }
+
+    fn manifest_with_file_fields(schema: LanceSchema, fields: Vec<i32>) -> Manifest {
         Manifest::new(
             schema,
-            Arc::new(vec![fragment]),
+            Arc::new(vec![fragment_with_file_fields(0, "f.lance", fields)]),
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
@@ -5507,6 +5550,76 @@ mod tests {
                 && message.contains(expected),
             "unexpected error: {}",
             message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::logical_type(DataType::Float32, true)]
+    #[case::nullability(DataType::Int32, false)]
+    #[test]
+    fn test_merge_shared_id_change_requires_full_rewrite(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+    ) {
+        let schema = one_field_schema();
+        let prior_fragments = vec![
+            fragment_with_file_fields(0, "old-0.lance", vec![0]),
+            fragment_with_file_fields(1, "old-1.lance", vec![0]),
+        ];
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(prior_fragments.clone()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        new_schema.fields[0].logical_type = LogicalType::try_from(&data_type).unwrap();
+        new_schema.fields[0].nullable = nullable;
+
+        let rewritten_fragments = vec![
+            fragment_with_file_fields(0, "new-0.lance", vec![0]),
+            fragment_with_file_fields(1, "new-1.lance", vec![0]),
+        ];
+        merge_schema_valid(&manifest, &new_schema, &rewritten_fragments).unwrap();
+
+        let partially_rewritten = vec![rewritten_fragments[0].clone(), prior_fragments[1].clone()];
+        let err = merge_schema_valid(&manifest, &new_schema, &partially_rewritten).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_merge_shared_id_change_rejects_retained_overlay() {
+        let schema = one_field_schema();
+        let mut prior_fragment = fragment_with_file_fields(0, "old.lance", vec![0]);
+        prior_fragment.overlays.push(DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("old-overlay.lance", vec![0], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        });
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![prior_fragment.clone()]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        new_schema.fields[0].nullable = false;
+
+        let mut rewritten = fragment_with_file_fields(0, "new.lance", vec![0]);
+        rewritten.overlays = prior_fragment.overlays.clone();
+        let err = merge_schema_valid(&manifest, &new_schema, &[rewritten]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {}",
+            err
         );
     }
 
