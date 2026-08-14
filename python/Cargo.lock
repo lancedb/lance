@@ -4189,7 +4189,6 @@ dependencies = [
  "jsonb",
  "lance-arrow",
  "lance-core",
- "lance-datagen",
  "lance-geo",
  "log",
  "pin-project",
