@@ -916,14 +916,16 @@ impl RTreeIndexPlugin {
             let mut indexable_indices = Vec::with_capacity(num_rows);
             let lower = bbox_array.lower().raw_buffers();
             let upper = bbox_array.upper().raw_buffers();
-            let x_bounds = lower[0].as_ref().iter().zip(upper[0].as_ref());
-            let y_bounds = lower[1].as_ref().iter().zip(upper[1].as_ref());
+            let (min_x, min_y) = (&lower[0][..num_rows], &lower[1][..num_rows]);
+            let (max_x, max_y) = (&upper[0][..num_rows], &upper[1][..num_rows]);
+            let x_bounds = min_x.iter().zip(max_x);
+            let y_bounds = min_y.iter().zip(max_y);
 
             for (i, ((minx, maxx), (miny, maxy))) in x_bounds.zip(y_bounds).enumerate() {
                 if bbox_array.is_null(i) {
                     let rowaddr = rowaddr_array.value(i);
                     null_rowaddrs.insert(rowaddr);
-                } else if minx <= maxx && miny <= maxy {
+                } else if !(minx > maxx || miny > maxy) {
                     indexable_indices.push(i as u32);
                 }
             }
@@ -1444,6 +1446,46 @@ mod tests {
         let (empty_index, _store, _tmpdir) = train_index(&empty_geometries, Some(4)).await;
         assert_eq!(empty_index.metadata.num_items, 0);
         assert_eq!(empty_index.metadata.num_pages, 0);
+    }
+
+    #[tokio::test]
+    async fn test_non_finite_bounds_are_not_treated_as_empty() {
+        let rect_type = RectType::new(Dimension::XY, Default::default());
+        let mut builder = RectBuilder::new(rect_type);
+        builder.push_rect(Some(&Rect::new(
+            coord! { x: f64::NAN, y: 1.0 },
+            coord! { x: 2.0, y: 3.0 },
+        )));
+        let bounds = builder.finish();
+        assert!(!is_empty_rect(&bounds.value(0).unwrap()));
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let batch = RecordBatch::try_new(
+            BBOX_ROWID_SCHEMA.clone(),
+            vec![
+                bounds.into_array_ref(),
+                Arc::new(UInt64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            BBOX_ROWID_SCHEMA.clone(),
+            stream::once(async move { Ok(batch) }),
+        ));
+
+        let (mut analyzed, stats) =
+            RTreeIndexPlugin::process_and_analyze_bbox_stream(stream, 4, store)
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_items, 1);
+        assert_eq!(analyzed.try_next().await.unwrap().unwrap().num_rows(), 1);
+        assert!(analyzed.try_next().await.unwrap().is_none());
     }
 
     #[tokio::test]
