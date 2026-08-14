@@ -37,7 +37,6 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
-use lance_geo::bbox::is_empty_rect;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -756,36 +755,26 @@ impl ScalarIndex for RTreeIndex {
         _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
+        let combined_bbox_data = self.clone().combine_old_new(bbox_data).await?;
         let tmpdir = Arc::new(TempDir::default());
         let spill_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
-        let (new_bbox_data, stats) = RTreeIndexPlugin::process_and_analyze_bbox_stream(
-            bbox_data,
+        let (bbox_data, mut stats) = RTreeIndexPlugin::process_and_analyze_bbox_stream(
+            combined_bbox_data,
             self.metadata.page_size,
             spill_store.clone(),
         )
         .await?;
 
-        let merged_bbox_data = self.clone().combine_old_new(new_bbox_data).await?;
-
         let null_map = self.search_null(&NoOpMetricsCollector).await?;
-
-        let mut new_bbox = BoundingBox::new();
-        new_bbox.add_rect(&stats.total_bbox);
-        new_bbox.add_rect(&self.metadata.bbox);
-
-        let merge_stats = BboxStreamStats {
-            null_map: RowAddrTreeMap::union_all(&[&null_map, &stats.null_map]),
-            total_bbox: new_bbox,
-            num_items: self.metadata.num_items + stats.num_items,
-        };
+        stats.null_map |= &null_map;
 
         let files = RTreeIndexPlugin::train_rtree_index(
-            merged_bbox_data,
-            merge_stats,
+            bbox_data,
+            stats,
             self.metadata.page_size,
             dest_store,
         )
@@ -925,18 +914,17 @@ impl RTreeIndexPlugin {
             let num_rows = bbox_array.len();
 
             let mut indexable_indices = Vec::with_capacity(num_rows);
+            let lower = bbox_array.lower().raw_buffers();
+            let upper = bbox_array.upper().raw_buffers();
+            let x_bounds = lower[0].as_ref().iter().zip(upper[0].as_ref());
+            let y_bounds = lower[1].as_ref().iter().zip(upper[1].as_ref());
 
-            for i in 0..num_rows {
+            for (i, ((minx, maxx), (miny, maxy))) in x_bounds.zip(y_bounds).enumerate() {
                 if bbox_array.is_null(i) {
                     let rowaddr = rowaddr_array.value(i);
                     null_rowaddrs.insert(rowaddr);
-                } else {
-                    let rect = bbox_array
-                        .value(i)
-                        .map_err(arrow_schema::ArrowError::from)?;
-                    if !is_empty_rect(&rect) {
-                        indexable_indices.push(i as u32);
-                    }
+                } else if minx <= maxx && miny <= maxy {
+                    indexable_indices.push(i as u32);
                 }
             }
 
@@ -1222,6 +1210,7 @@ mod tests {
     use geoarrow_array::builder::{LineStringBuilder, PointBuilder, RectBuilder};
     use geoarrow_schema::{Dimension, LineStringType, PointType, RectType};
     use lance_core::utils::tempfile::TempObjDir;
+    use lance_geo::bbox::is_empty_rect;
     use rand::Rng;
 
     fn expected_num_pages(num_items: usize, page_size: u32) -> u64 {
@@ -1552,6 +1541,71 @@ mod tests {
             merged.search_null(&NoOpMetricsCollector).await.unwrap(),
             expected_null
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_removes_pre_fix_empty_entries() {
+        let rect_type = RectType::new(Dimension::XY, Default::default());
+        let mut builder = RectBuilder::new(rect_type);
+        builder.push_rect(Some(&BoundingBox::new()));
+        let empty_bounds = builder.finish();
+
+        let old_tmpdir = TempObjDir::default();
+        let old_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            old_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let old_batch = RecordBatch::try_new(
+            BBOX_ROWID_SCHEMA.clone(),
+            vec![
+                empty_bounds.clone().into_array_ref(),
+                Arc::new(UInt64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let old_stream = Box::pin(RecordBatchStreamAdapter::new(
+            BBOX_ROWID_SCHEMA.clone(),
+            stream::once(async move { Ok(old_batch) }),
+        ));
+        RTreeIndexPlugin::train_rtree_index(
+            old_stream,
+            BboxStreamStats {
+                null_map: RowAddrTreeMap::new(),
+                total_bbox: BoundingBox::new(),
+                num_items: 1,
+            },
+            4,
+            old_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let old_index = RTreeIndex::load(old_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let new_tmpdir = TempObjDir::default();
+        let new_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            new_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let new_stream = convert_bbox_rowid_batch_stream(
+            &empty_bounds,
+            Arc::new(UInt64Array::from(vec![u64::from(
+                RowAddress::new_from_parts(1, 0),
+            )])),
+        );
+        old_index
+            .update(new_stream, new_store.as_ref(), None)
+            .await
+            .unwrap();
+
+        let updated = RTreeIndex::load(new_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(updated.metadata.num_items, 0);
+        assert_eq!(updated.metadata.num_pages, 0);
     }
 
     #[tokio::test]
