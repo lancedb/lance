@@ -691,10 +691,10 @@ where
                 false
             };
 
+            let current_file_bytes = writer.as_mut().unwrap().tell().await?;
             if let Some(cb) = &params.write_progress {
-                let current_bytes = writer.as_mut().unwrap().tell().await?;
                 cb.call(WriteStats {
-                    bytes_written: bytes_completed + current_bytes,
+                    bytes_written: bytes_completed + current_file_bytes,
                     rows_written: rows_completed + num_rows_in_current_file as u64,
                     files_written,
                 });
@@ -705,9 +705,50 @@ where
             } else {
                 num_rows_in_current_file >= params.max_rows_per_file as u32
             };
-            if reached_row_limit
-                || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
+            let reached_byte_limit = current_file_bytes >= params.max_bytes_per_file as u64;
+
+            // Once the pending row remainder is smaller than the current file,
+            // finish the planned boundary instead of creating a smaller tail.
+            // Equal halves remain separate so byte-limited rewrites preserve
+            // their existing batch-boundary behavior.
+            let defer_byte_close = if reached_byte_limit
+                && has_file_row_counts
+                && !reached_planned_file_boundary
             {
+                let rows_remaining = rows_remaining_in_planned_file.ok_or_else(|| {
+                    Error::internal(
+                        "Writer reached a byte limit without an active planned file boundary",
+                    )
+                })?;
+                rows_remaining < num_rows_in_current_file as usize
+            } else {
+                false
+            };
+
+            let close_for_byte_limit = reached_byte_limit && !defer_byte_close;
+            if reached_row_limit || close_for_byte_limit {
+                if close_for_byte_limit
+                    && has_file_row_counts
+                    && !reached_planned_file_boundary
+                {
+                    let rows_remaining = rows_remaining_in_planned_file.ok_or_else(|| {
+                        Error::internal(
+                            "Writer reached a byte limit without an active planned file boundary",
+                        )
+                    })?;
+                    if let Some(next_file_rows) =
+                        file_row_counts.as_mut().and_then(VecDeque::pop_front)
+                    {
+                        rows_remaining_in_planned_file = Some(
+                            rows_remaining.checked_add(next_file_rows).ok_or_else(|| {
+                                Error::internal(format!(
+                                    "Replanned file row count overflowed usize: rows_remaining={rows_remaining}, next_file_rows={next_file_rows}"
+                                ))
+                            })?,
+                        );
+                    }
+                }
+
                 let mut w = writer.take().unwrap();
                 flush_seed_writers(w.as_mut(), &mut seed_writers).await?;
                 let (num_rows, data_file) = w.finish().await?;
@@ -1929,7 +1970,9 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
+    use arrow_array::{
+        Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StructArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use datafusion_physical_plan::RecordBatchStream;
@@ -1941,6 +1984,7 @@ mod tests {
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
+    use rstest::rstest;
 
     async fn open_v2_1_test_writer(
         object_store: Arc<ObjectStore>,
@@ -2111,6 +2155,82 @@ mod tests {
         let (fragments, _) = reader_to_frags(data_reader).await.unwrap();
 
         assert_eq!(fragments.len(), 2);
+    }
+
+    #[rstest]
+    #[case::absorb_pending_remainder(
+        &[9_999, 10_001],
+        &[10_000, 10_000],
+        2 * 1024,
+        &[10_000, 10_000]
+    )]
+    #[case::replan_pending_boundary(
+        &[9_999, 1, 10_000, 10_000],
+        &[20_000, 10_000],
+        100 * 1024,
+        &[9_999, 20_001]
+    )]
+    #[tokio::test]
+    async fn test_planned_file_boundary_with_byte_limit(
+        #[case] input_batch_sizes: &[usize],
+        #[case] file_row_counts: &[usize],
+        #[case] max_bytes_per_file: usize,
+        #[case] expected_file_rows: &[usize],
+    ) {
+        let value = vec![0_u8; 1024];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let total_rows = input_batch_sizes.iter().sum::<usize>();
+        let data = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from_iter_values(
+                (0..total_rows).map(|_| value.as_slice()),
+            ))],
+        )
+        .unwrap();
+        let mut offset = 0;
+        let batches = input_batch_sizes
+            .iter()
+            .map(|&batch_rows| {
+                let batch = data.slice(offset, batch_rows);
+                offset += batch_rows;
+                Ok::<_, DataFusionError>(batch)
+            })
+            .collect::<Vec<_>>();
+        let stream =
+            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+
+        let (fragments, _) = write_fragments_internal_with_file_row_counts(
+            ConcreteFileVersion::V2_0,
+            None,
+            object_store,
+            &Path::from("planned_byte_boundary"),
+            schema,
+            Box::pin(stream),
+            WriteParams {
+                max_rows_per_file: file_row_counts[0],
+                max_bytes_per_file,
+                mode: WriteMode::Create,
+                ..Default::default()
+            },
+            None,
+            Some(file_row_counts.to_vec()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.physical_rows.unwrap())
+                .collect::<Vec<_>>(),
+            expected_file_rows
+        );
     }
 
     #[tokio::test]
