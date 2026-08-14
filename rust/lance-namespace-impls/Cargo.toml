@@ -89,17 +89,9 @@ hmac = { version = "0.12", optional = true }
 quick-xml = { version = "0.40", optional = true }
 
 [dev-dependencies]
-opendal = { workspace = true, features = ["services-goosefs"] }
-tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 wiremock.workspace = true
-arrow = { workspace = true }
-arrow-array = { workspace = true }
-arrow-ipc = { workspace = true }
 rstest.workspace = true
-lance-table.workspace = true
-lance-arrow = { workspace = true }
-lance = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 
 [[example]]

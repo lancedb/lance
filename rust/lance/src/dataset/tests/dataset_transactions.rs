@@ -672,6 +672,16 @@ async fn test_list_detached_manifests() {
     // Now there should be one detached manifest
     let detached = dataset.list_detached_manifests().await.unwrap();
     assert_eq!(detached.len(), 1);
+    assert_eq!(
+        dataset
+            .version_refs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
 
     // The detached version should have the high bit set
     let detached_version = detached[0].version;
