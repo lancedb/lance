@@ -22,7 +22,7 @@ use crate::index::mem_wal::{
 };
 use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
-    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
+    Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
 use lance_core::deepsize::DeepSizeOf;
@@ -4696,7 +4696,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             fragments, schema, ..
         } => {
             merge_fragments_valid(manifest, fragments)?;
-            merge_schema_valid(manifest, schema)?;
+            merge_schema_valid(manifest, schema, fragments)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
@@ -4903,17 +4903,25 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 ///
 /// Readers resolve columns by field id (name -> schema id -> DataFile::fields
 /// position), so renumbered ids silently rebind live columns to other columns'
-/// bytes. Shared ids must keep their field path; new ids must exceed the
-/// manifest's max so a dropped field's id is never reused. Omitting a field
-/// (dropping it) remains legal.
-fn merge_schema_valid(manifest: &Manifest, new_schema: &Schema) -> Result<()> {
+/// bytes. Shared ids must keep their field path, logical type, nullability,
+/// storage encoding, and dictionary. New ids must exceed the manifest's max so
+/// a dropped field's id is never reused. An existing path may move to a fresh
+/// id only when every proposed fragment materializes that id in a base data
+/// file (the `alter_columns` cast path). Omitting a field (dropping it) and
+/// updating field metadata remain legal.
+fn merge_schema_valid(
+    manifest: &Manifest,
+    new_schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
     let prior_schema = &manifest.schema;
 
-    // Remap errors first: a renumbered schema usually violates both clauses.
+    // Remap and semantic errors first: a renumbered schema usually violates
+    // both the shared-id and new-id clauses.
     for field in new_schema.fields_pre_order() {
-        if prior_schema.field_by_id(field.id).is_none() {
+        let Some(prior_field) = prior_schema.field_by_id(field.id) else {
             continue;
-        }
+        };
         let prior_path = prior_schema.field_path(field.id)?;
         let new_path = new_schema.field_path(field.id)?;
         if prior_path != new_path {
@@ -4924,19 +4932,61 @@ fn merge_schema_valid(manifest: &Manifest, new_schema: &Schema) -> Result<()> {
                 field.id, prior_path, new_path
             )));
         }
+        if let Some(changes) = shared_field_binding_changes(prior_field, field) {
+            return Err(Error::invalid_input(format!(
+                "Merge operation changes field id {} (\"{}\"): {}. \
+                 Merge must preserve each existing field's path, logical type, \
+                 nullability, storage encoding, and dictionary; only field metadata \
+                 updates and field drops are allowed.",
+                field.id, new_path, changes
+            )));
+        }
     }
 
     let max_field_id = manifest.max_field_id();
     for field in new_schema.fields_pre_order() {
         if prior_schema.field_by_id(field.id).is_none() && field.id <= max_field_id {
+            let next_id_msg = match max_field_id.checked_add(1) {
+                Some(next_id) => format!("New fields must use ids of at least {}.", next_id),
+                None => {
+                    "No further field id can be allocated because ids are exhausted.".to_string()
+                }
+            };
             return Err(Error::invalid_input(format!(
                 "Merge operation assigns id {} to new field \"{}\", but ids up to {} are \
-                 already used by current or dropped fields. New fields must use ids of at \
-                 least {}.",
+                 already used by current or dropped fields. {}",
                 field.id,
                 new_schema.field_path(field.id)?,
                 max_field_id,
-                max_field_id + 1
+                next_id_msg
+            )));
+        }
+    }
+
+    let mut prior_paths = HashMap::with_capacity(prior_schema.fields_pre_order().count());
+    for field in prior_schema.fields_pre_order() {
+        prior_paths.insert(prior_schema.field_path(field.id)?, field);
+    }
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_some() {
+            continue;
+        }
+        let new_path = new_schema.field_path(field.id)?;
+        let Some(prior_field) = prior_paths.get(&new_path) else {
+            continue;
+        };
+        let materialized = fragments.iter().all(|fragment| {
+            fragment
+                .files
+                .iter()
+                .any(|file| file.fields.contains(&field.id))
+        });
+        if !materialized {
+            return Err(Error::invalid_input(format!(
+                "Merge operation remaps existing field \"{}\" from id {} to id {} without \
+                 rewriting its data. Every proposed fragment must materialize the new field \
+                 id in a base data file.",
+                new_path, prior_field.id, field.id
             )));
         }
     }
@@ -4944,16 +4994,43 @@ fn merge_schema_valid(manifest: &Manifest, new_schema: &Schema) -> Result<()> {
     Ok(())
 }
 
+fn shared_field_binding_changes(prior: &Field, new: &Field) -> Option<String> {
+    let mut changes = Vec::with_capacity(4);
+    if prior.logical_type != new.logical_type {
+        changes.push(format!(
+            "logical type {} -> {}",
+            prior.logical_type, new.logical_type
+        ));
+    }
+    if prior.nullable != new.nullable {
+        changes.push(format!("nullable {} -> {}", prior.nullable, new.nullable));
+    }
+    if prior.encoding != new.encoding {
+        changes.push(format!(
+            "storage encoding {:?} -> {:?}",
+            prior.encoding, new.encoding
+        ));
+    }
+    if prior.dictionary != new.dictionary {
+        changes.push("dictionary".to_string());
+    }
+    if changes.is_empty() {
+        None
+    } else {
+        Some(changes.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Int32Type, UInt64Type};
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StructArray};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use chrono::Utc;
     use futures::TryStreamExt;
-    use lance_core::datatypes::{Field as LanceCoreField, Schema as LanceSchema};
+    use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
@@ -4970,8 +5047,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::Dataset;
-    use crate::dataset::NewColumnTransform;
     use crate::dataset::write::WriteParams;
+    use crate::dataset::{ColumnAlteration, NewColumnTransform};
     use crate::session::Session;
 
     fn sample_manifest() -> Manifest {
@@ -5183,7 +5260,7 @@ mod tests {
 
     fn assert_columns(batch: &RecordBatch, cols: &[(&str, [i32; 2])]) {
         for (name, expected) in cols {
-            let col = batch.column_by_name(name).unwrap();
+            let col = &batch[*name];
             assert_eq!(
                 col.as_primitive::<Int32Type>().values(),
                 expected,
@@ -5200,15 +5277,41 @@ mod tests {
             .map(|f| f.metadata().clone())
             .collect();
         Dataset::commit(
-            dataset.uri(),
-            Operation::Merge { fragments, schema },
+            Arc::new(dataset.clone()),
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
             Some(dataset.manifest.version),
             None,
             None,
-            Default::default(),
+            dataset.session(),
             false,
         )
         .await
+    }
+
+    fn one_field_schema() -> LanceSchema {
+        LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]))
+        .unwrap()
+    }
+
+    fn manifest_with_file_fields(schema: LanceSchema, fields: Vec<i32>) -> Manifest {
+        let mut fragment = Fragment::new(0);
+        fragment
+            .files
+            .push(DataFile::new_legacy_from_fields("f.lance", fields, None));
+        Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        )
     }
 
     // Which clause rejects the lossy round-trip depends on the hole's
@@ -5223,8 +5326,7 @@ mod tests {
         #[case] dropped: &str,
         #[case] expected: &str,
     ) {
-        let test_dir = TempStrDir::default();
-        let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
 
         let arrow_schema = ArrowSchema::from(dataset.schema());
         let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -5240,8 +5342,7 @@ mod tests {
     async fn test_merge_rejects_dropped_field_id_reuse() {
         // Deliberate reuse of a tombstoned id, as opposed to the renumbering
         // accident covered above.
-        let test_dir = TempStrDir::default();
-        let dataset = dataset_with_dropped_column(test_dir.as_str(), "b").await;
+        let dataset = dataset_with_dropped_column("memory://", "b").await;
 
         let mut schema = dataset.schema().clone();
         let mut field =
@@ -5265,10 +5366,6 @@ mod tests {
         // A hole inside a struct shifts a nested leaf's id onto a field
         // outside the struct on renumbering; the full-path comparison must
         // catch the cross-parent remap.
-        use arrow_array::StructArray;
-        use arrow_schema::Fields;
-
-        let test_dir = TempStrDir::default();
         let struct_fields = Fields::from(vec![
             ArrowField::new("x", DataType::Int32, true),
             ArrowField::new("y", DataType::Int32, true),
@@ -5293,9 +5390,7 @@ mod tests {
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
-        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
         dataset.drop_columns(&["s.x"]).await.unwrap();
         assert_eq!(dataset.schema().field_ids(), vec![0, 2, 3]);
 
@@ -5319,8 +5414,7 @@ mod tests {
     #[case::drop_c("c")]
     #[tokio::test]
     async fn test_merge_allows_id_preserving_schema_change(#[case] dropped: &str) {
-        let test_dir = TempStrDir::default();
-        let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
 
         let survivors = surviving_columns(dropped);
         let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
@@ -5352,8 +5446,7 @@ mod tests {
     #[case::drop_c("c")]
     #[tokio::test]
     async fn test_merge_allows_dropping_field(#[case] dropped: &str) {
-        let test_dir = TempStrDir::default();
-        let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+        let dataset = dataset_with_dropped_column("memory://", dropped).await;
 
         let mut survivors = surviving_columns(dropped);
         let omitted = survivors.remove(0);
@@ -5365,6 +5458,110 @@ mod tests {
 
         let batch = dataset.scan().try_into_batch().await.unwrap();
         assert_columns(&batch, &survivors);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_schema_only_path_remap() {
+        let dataset = dataset_with_dropped_column("memory://", "c").await;
+        let prior_id = dataset.schema().field("a").unwrap().id;
+        let fresh_id = dataset.manifest.max_field_id() + 1;
+
+        let mut schema = dataset.schema().clone();
+        schema.mut_field_by_id(prior_id).unwrap().id = fresh_id;
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "remaps existing field \"a\" from id {} to id {}",
+                prior_id, fresh_id
+            )) && message.contains("base data file"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::logical_type(DataType::Float32, true, "logical type")]
+    #[case::nullability(DataType::Int32, false, "nullable")]
+    #[tokio::test]
+    async fn test_merge_rejects_shared_id_type_or_nullability_change(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+        #[case] expected: &str,
+    ) {
+        let dataset = dataset_with_dropped_column("memory://", "c").await;
+        let field_id = dataset.schema().field("a").unwrap().id;
+
+        let mut schema = dataset.schema().clone();
+        let field = schema.mut_field_by_id(field_id).unwrap();
+        field.logical_type = LogicalType::try_from(&data_type).unwrap();
+        field.nullable = nullable;
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("changes field id {} (\"a\")", field_id))
+                && message.contains(expected),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_allows_rewritten_fresh_field_id() {
+        let schema = one_field_schema();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![0]);
+        let mut rewritten_schema = schema.clone();
+        rewritten_schema.fields[0].id = 1;
+        let mut rewritten = manifest.fragments[0].clone();
+        rewritten.files[0] = DataFile::new_legacy_from_fields("rewritten.lance", vec![1], None);
+        merge_schema_valid(&manifest, &rewritten_schema, &[rewritten]).unwrap();
+
+        let mut dataset = dataset_with_dropped_column("memory://", "c").await;
+        let prior_id = dataset.schema().field("a").unwrap().id;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int64)])
+            .await
+            .unwrap();
+        let new_id = dataset.schema().field("a").unwrap().id;
+        assert_ne!(new_id, prior_id);
+        assert!(
+            dataset.get_fragments().iter().all(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .any(|file| file.fields.contains(&new_id))
+            }),
+            "alter_columns must materialize the fresh id in every fragment base file"
+        );
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_merge_rejects_max_field_id_overflow() {
+        let schema = one_field_schema();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![0, i32::MAX]);
+        assert_eq!(manifest.max_field_id(), i32::MAX);
+
+        let mut new_schema = schema;
+        let mut extra =
+            LanceCoreField::try_from(&ArrowField::new("b", DataType::Int32, true)).unwrap();
+        extra.id = 1;
+        new_schema.fields.push(extra);
+
+        let err = merge_schema_valid(&manifest, &new_schema, &manifest.fragments).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(
+            message.contains("assigns id 1 to new field \"b\"") && message.contains("exhausted"),
+            "unexpected error: {}",
+            message
+        );
     }
 
     #[test]
