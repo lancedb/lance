@@ -76,6 +76,12 @@ fn parse_compaction_options(
             "max_source_fragments" => {
                 opts.max_source_fragments = value.extract()?;
             }
+            "max_source_rows" => {
+                opts.max_source_rows = value.extract()?;
+            }
+            "max_source_bytes" => {
+                opts.max_source_bytes = value.extract()?;
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
