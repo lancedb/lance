@@ -611,8 +611,6 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                         .l0_flush_retry_base_delay,
                                     l0_flush_retry_max_delay: default_config
                                         .l0_flush_retry_max_delay,
-                                    close_flush_drain_timeout: default_config
-                                        .close_flush_drain_timeout,
                                     durable_write: durable,
                                     max_wal_buffer_size: max_wal_buffer_size
                                         .unwrap_or(default_config.max_wal_buffer_size),
