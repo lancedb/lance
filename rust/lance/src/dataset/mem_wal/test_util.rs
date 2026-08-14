@@ -74,6 +74,20 @@ impl FailControls {
             .any(|p| p.contains(needle))
     }
 
+    /// Distinct `{hash}_gen_{n}` directory segments written through this store.
+    /// A generation whose flush retries must reuse one: a fresh directory per
+    /// attempt strands everything the previous attempt wrote.
+    pub fn generation_dirs(&self) -> std::collections::BTreeSet<String> {
+        self.put_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|p| p.split('/'))
+            .filter(|segment| segment.contains("_gen_"))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Did any read land on a path containing `needle`? See [`Self::wrote_under`].
     pub fn read_under(&self, needle: &str) -> bool {
         self.get_paths

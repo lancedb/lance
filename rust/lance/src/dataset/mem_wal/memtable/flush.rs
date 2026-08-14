@@ -32,7 +32,7 @@ use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
-use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
+use crate::dataset::mem_wal::util::{derived_store_params, sstable_path};
 use crate::index::vector::details::vector_index_details_default;
 use crate::session::Session;
 
@@ -240,10 +240,10 @@ impl MemTableFlusher {
             ));
         }
 
-        let random_hash = generate_random_hash();
+        let random_hash = memtable.sstable_hash();
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let gen_path = sstable_path(&self.base_path, &self.shard_id, random_hash, generation);
 
         info!(
             "Flushing MemTable generation {} to {} ({} rows, {} batches)",
@@ -316,7 +316,7 @@ impl MemTableFlusher {
     ) -> Result<(usize, RoaringBitmap)> {
         use arrow_array::RecordBatchIterator;
 
-        use crate::dataset::WriteParams;
+        use crate::dataset::{WriteMode, WriteParams};
 
         if memtable.row_count() == 0 {
             return Ok((0, RoaringBitmap::new()));
@@ -368,6 +368,11 @@ impl MemTableFlusher {
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
             data_storage_version: Some(self.base_storage_version().await?.to_selector()),
+            // Retries reuse the generation's path, so a previous attempt may have
+            // left a dataset here. Overwrite creates when absent and supersedes a
+            // partial attempt otherwise; `Create` would turn every retry into an
+            // already-exists error that no amount of retrying clears.
+            mode: WriteMode::Overwrite,
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the
             // generation URI: a path-bound store binding would send this write at
@@ -473,10 +478,10 @@ impl MemTableFlusher {
             ));
         }
 
-        let random_hash = generate_random_hash();
+        let random_hash = memtable.sstable_hash();
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let gen_path = sstable_path(&self.base_path, &self.shard_id, random_hash, generation);
 
         info!(
             "Flushing MemTable generation {} with indexes to {} ({} rows, {} batches)",

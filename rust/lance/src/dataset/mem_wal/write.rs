@@ -8357,6 +8357,48 @@ mod tests {
         writer_b.close().await.unwrap();
     }
 
+    /// Regression: every attempt at one generation must write to the same
+    /// directory. A fresh `{hash}_gen_N` per attempt leaves the previous
+    /// attempt's data file, bloom filter and indexes behind with nothing
+    /// referencing them, so an outage leaks a directory per retry.
+    #[tokio::test]
+    async fn test_flush_retries_reuse_one_generation_directory() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // Fail the first attempt's SSTable write, then let the retry through.
+        controls.fail_sstable_puts(1);
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let dirs = controls.generation_dirs();
+        assert_eq!(
+            dirs.len(),
+            1,
+            "a retried generation must reuse its directory, wrote to {dirs:?}"
+        );
+
+        writer.close().await.unwrap();
+    }
+
     /// Regression: a flush failure must NOT reopen the concurrent-read-vs-flush
     /// hole. For as long as the retry loop is still working a generation, it
     /// stays in the queryable set with its rows — and healing inside the budget
