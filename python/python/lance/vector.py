@@ -289,12 +289,12 @@ def compute_pq_codes(
         Dataset to compute pq codes for.
     kmeans_list: List[lance.torch.kmeans.KMeans]
         KMeans models to use to compute pq (one per subspace)
-    batch_size: int, default 10240
+    batch_size: int, default 40960
         The batch size used to read the dataset.
     dst_dataset_uri: Union[str, Path], optional
         The path to store the partitions.  If not specified a random
         directory is used instead
-    allow_tf32: bool, default True
+    allow_cuda_tf32: bool, default True
         Whether to allow tf32 for matmul on CUDA.
 
     Returns
@@ -418,12 +418,12 @@ def compute_partitions(
         Column name of the vector column.
     kmeans: lance.torch.kmeans.KMeans
         KMeans model to use to compute partitions.
-    batch_size: int, default 10240
+    batch_size: int, default 40960
         The batch size used to read the dataset.
     dst_dataset_uri: Union[str, Path], optional
         The path to store the partitions.  If not specified a random
         directory is used instead
-    allow_tf32: bool, default True
+    allow_cuda_tf32: bool, default True
         Whether to allow tf32 for matmul on CUDA.
 
     Returns

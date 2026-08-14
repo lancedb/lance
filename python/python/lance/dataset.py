@@ -1266,16 +1266,19 @@ class LanceDataset(pa.dataset.Dataset):
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
         io_buffer_size: int, default None
-            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
-            for more information.
+            The maximum number of bytes to buffer from storage before applying
+            backpressure. See ``ScannerBuilder.io_buffer_size`` for more information.
         batch_readahead: int, optional
-            The number of batches to read ahead.
+            The number of batches to decode concurrently.
         fragment_readahead: int, optional
-            The number of fragments to read ahead.
+            The number of fragments whose reads may be scheduled concurrently.
+            This applies even when ``scan_in_order`` is true. Set this to ``1``
+            to avoid overlapping I/O from multiple fragments.
         scan_in_order: bool, default True
-            Whether to read the fragments and batches in order. If false,
-            throughput may be higher, but batches will be returned out of order
-            and memory use might increase.
+            Whether to return fragments and batches in order. This does not make
+            storage reads sequential; use ``fragment_readahead=1`` for that. If
+            false, throughput may be higher, but batches will be returned out of
+            order and memory use might increase.
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
@@ -2983,6 +2986,15 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return versions
 
+    def version_refs(self) -> List[VersionRef]:
+        """
+        Return lightweight references to all attached versions in the current branch.
+
+        Unlike :meth:`versions`, this does not read or deserialize every manifest.
+        Use :attr:`latest_version` instead when only the latest version is needed.
+        """
+        return self._ds.version_refs()
+
     @property
     def version(self) -> int:
         """
@@ -3151,7 +3163,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -3210,7 +3222,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Include unverified files that cleanup would remove when this is set.
@@ -5721,6 +5733,10 @@ class Version(TypedDict):
     metadata: Dict[str, str]
 
 
+class VersionRef(TypedDict):
+    version: int
+
+
 class UpdateResult(TypedDict):
     num_rows_updated: int
 
@@ -5993,8 +6009,15 @@ class LanceOperation:
             The ids of the fragments that have been removed entirely.
         updated_fragments: list[FragmentMetadata]
             The fragments that have been updated with new deletion vectors.
+            These are used as given, so pass back the metadata read from the
+            dataset rather than a freshly constructed object, or the fragment
+            loses its row id and version metadata.
         new_fragments: list[FragmentMetadata]
-            The fragments that contain the new rows.
+            The fragments that contain the new rows. On a dataset that uses
+            stable row ids, set ``row_id_meta`` on these to carry the ids of
+            rewritten rows over; see :class:`lance.fragment.RowIdSequence`. The
+            created-at and last-updated-at version metadata are derived during
+            the commit and should be left as None.
         fields_modified: list[int]
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
@@ -6002,6 +6025,11 @@ class LanceOperation:
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        updated_fragment_offsets: dict[int, bytes], optional
+            Physical row offsets that matched the update, keyed by fragment id,
+            each serialized in the portable RoaringBitmap format. Set on
+            ``rewrite_columns`` updates over stable row ids so the commit
+            refreshes row-level version metadata for the matched rows only.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6014,6 +6042,7 @@ class LanceOperation:
             default_factory=list
         )
         update_mode: str = ""
+        updated_fragment_offsets: Optional[Dict[int, bytes]] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -6032,6 +6061,14 @@ class LanceOperation:
         schema: LanceSchema or pyarrow.Schema
             The schema of the new dataset. Passing a LanceSchema is preferred,
             and passing a pyarrow.Schema is deprecated.
+        preserves_nullability: bool
+            True when this merge makes no nullability-affecting schema change:
+            it introduces no field that data staged against an earlier schema
+            could not safely omit. Without the assertion (the default) the
+            merge conservatively conflicts with concurrent appends, whose
+            fragments would omit new columns and read as null; that can only
+            cause a retry. Pass True when every column this merge introduces
+            is nullable to let concurrent appends commit without conflict.
 
         Warning
         -------
@@ -6077,6 +6114,7 @@ class LanceOperation:
 
         fragments: Iterable[FragmentMetadata]
         schema: LanceSchema | pa.Schema
+        preserves_nullability: bool = False
 
         def __post_init__(self):
             if isinstance(self.schema, pa.Schema):
@@ -6249,6 +6287,11 @@ class LanceOperation:
         ----------
         schema: LanceSchema
             The lance schema of the new dataset.
+        preserves_nullability: bool
+            True when this projection makes no nullability-affecting schema
+            change, as a rename or a drop does not. Without the assertion
+            (the default) the projection conservatively conflicts with
+            concurrent writes, which can only cause a retry.
 
         Examples
         --------
@@ -6277,6 +6320,7 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+        preserves_nullability: bool = False
 
     @dataclass
     class UpdateMap:
@@ -7065,6 +7109,9 @@ class LanceScanner(pa.dataset.Scanner):
     def analyze_plan(self, count_rows: bool = False) -> str:
         """Execute the plan for this scanner and display with runtime metrics.
 
+        Full-text-search nodes include the execution-time ``tokenized_query``
+        text and positions.
+
         Parameters
         ----------
         count_rows : bool, default False
@@ -7100,6 +7147,8 @@ class DatasetOptimizer:
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
         max_source_fragments: Optional[int] = None,
+        max_source_rows: Optional[int] = None,
+        max_source_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7131,7 +7180,9 @@ class DatasetOptimizer:
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
         ``lance.compaction.binary_copy_read_batch_bytes``,
-        ``lance.compaction.max_source_fragments``.
+        ``lance.compaction.max_source_fragments``,
+        ``lance.compaction.max_source_rows``,
+        ``lance.compaction.max_source_bytes``.
 
         Parameters
         ----------
@@ -7190,6 +7241,18 @@ class DatasetOptimizer:
             exceed this limit, allowing compaction to proceed incrementally.
             Fragments are processed oldest first. If not specified, uses the
             manifest config value, or applies no limit.
+        max_source_rows: int, optional
+            Maximum number of source rows to compact in a single run. Rows are
+            counted as live rows (physical rows minus soft-deleted rows).
+            Tasks are included until adding the next task would exceed this
+            limit.
+        max_source_bytes: int, optional
+            Maximum number of source bytes to compact in a single run,
+            measured as the total size of the source fragments' data and
+            overlay files. Tasks are included until adding the next task
+            would exceed this limit. Blob v2 payloads live in separate
+            blob files and are not counted, so this is not a cap on total
+            compaction I/O for datasets with blob columns.
 
         Returns
         -------
@@ -7214,6 +7277,8 @@ class DatasetOptimizer:
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
                 max_source_fragments=max_source_fragments,
+                max_source_rows=max_source_rows,
+                max_source_bytes=max_source_bytes,
             ).items()
             if v is not None
         }

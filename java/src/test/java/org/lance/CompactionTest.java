@@ -33,6 +33,7 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.Optional;
 
@@ -53,8 +54,20 @@ public class CompactionTest {
       testDataset.write(1, 10).close();
       try (Dataset dataset = testDataset.write(2, 10)) {
         CompactionOptions compactionOptions =
-            CompactionOptions.builder().withTargetRowsPerFragment(100).withNumThreads(1).build();
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withNumThreads(1)
+                .withMaxSourceRows(1000)
+                .withMaxSourceBytes(10L * 1024 * 1024)
+                .build();
         CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
+
+        // The source budgets are loose, so the plan is unaffected and the
+        // options must survive the JNI round trip.
+        assertEquals(Optional.of(1000L), compactionPlan.getCompactionOptions().getMaxSourceRows());
+        assertEquals(
+            Optional.of(10L * 1024 * 1024),
+            compactionPlan.getCompactionOptions().getMaxSourceBytes());
 
         // will plan to compact two fragments into one.
         assertEquals(1, compactionPlan.getCompactionTasks().size());
@@ -166,6 +179,39 @@ public class CompactionTest {
         assertEquals(1, result.getMetrics().getFragmentsAdded());
       }
     }
+  }
+
+  /**
+   * A serialized CompactionOptions produced by the class as it existed before maxSourceRows and
+   * maxSourceBytes were added (no declared serialVersionUID, stream ends after maxSourceFragments),
+   * built with targetRowsPerFragment=1024, materializeDeletions=true,
+   * compactionMode=TRY_BINARY_COPY, maxSourceFragments=4.
+   */
+  private static final String PRE_SOURCE_BUDGET_OPTIONS_BASE64 =
+      "rO0ABXNyACZvcmcubGFuY2UuY29tcGFjdGlvbi5Db21wYWN0aW9uT3B0aW9ucys6bRwua1fWAwALTAAJYmF0Y2hTaXpl"
+          + "dAAUTGphdmEvdXRpbC9PcHRpb25hbDtMABhiaW5hcnlDb3B5UmVhZEJhdGNoQnl0ZXNxAH4AAUwADmNvbXBhY3Rpb25N"
+          + "b2RlcQB+AAFMAA9kZWZlckluZGV4UmVtYXBxAH4AAUwAFG1hdGVyaWFsaXplRGVsZXRpb25zcQB+AAFMAB1tYXRlcmlh"
+          + "bGl6ZURlbGV0aW9uc1RocmVzaG9sZHEAfgABTAAPbWF4Qnl0ZXNQZXJGaWxlcQB+AAFMAA9tYXhSb3dzUGVyR3JvdXBx"
+          + "AH4AAUwAEm1heFNvdXJjZUZyYWdtZW50c3EAfgABTAAKbnVtVGhyZWFkc3EAfgABTAAVdGFyZ2V0Um93c1BlckZyYWdt"
+          + "ZW50cQB+AAF4cHNyAA5qYXZhLmxhbmcuTG9uZzuL5JDMjyPfAgABSgAFdmFsdWV4cgAQamF2YS5sYW5nLk51bWJlcoas"
+          + "lR0LlOCLAgAAeHAAAAAAAAAEAHBwc3IAEWphdmEubGFuZy5Cb29sZWFuzSBygNWc+u4CAAFaAAV2YWx1ZXhwAXBwcHB0"
+          + "AA90cnlfYmluYXJ5X2NvcHlwc3EAfgADAAAAAAAAAAR4";
+
+  @Test
+  public void testDeserializeOptionsFromOlderVersion() throws Exception {
+    byte[] serialized = Base64.getDecoder().decode(PRE_SOURCE_BUDGET_OPTIONS_BASE64);
+    CompactionOptions options;
+    try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(serialized))) {
+      options = (CompactionOptions) in.readObject();
+    }
+    assertEquals(Optional.of(1024L), options.getTargetRowsPerFragment());
+    assertEquals(Optional.of(true), options.getMaterializeDeletions());
+    assertEquals(
+        Optional.of(CompactionMode.TRY_BINARY_COPY.getValue()), options.getCompactionMode());
+    assertEquals(Optional.of(4L), options.getMaxSourceFragments());
+    // Fields absent from the old stream deserialize as unset.
+    assertEquals(Optional.empty(), options.getMaxSourceRows());
+    assertEquals(Optional.empty(), options.getMaxSourceBytes());
   }
 
   private static <T> T serializeAndDeserialize(T object)

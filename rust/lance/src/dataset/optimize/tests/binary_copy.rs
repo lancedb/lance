@@ -3,9 +3,16 @@
 
 use super::*;
 
+const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [
+    LanceFileVersion::V2_0,
+    LanceFileVersion::V2_1,
+    LanceFileVersion::V2_2,
+    LanceFileVersion::V2_3,
+];
+
 #[tokio::test]
 async fn test_binary_copy_merge_small_files() {
-    for version in LanceFileVersion::iter_non_legacy() {
+    for version in NON_LEGACY_VERSIONS {
         do_test_binary_copy_merge_small_files(version).await;
     }
 }
@@ -46,8 +53,69 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
 }
 
 #[tokio::test]
+async fn test_binary_copy_packed_struct_column_mapping() {
+    for version in NON_LEGACY_VERSIONS {
+        do_test_binary_copy_packed_struct_column_mapping(version).await;
+    }
+}
+
+async fn do_test_binary_copy_packed_struct_column_mapping(version: LanceFileVersion) {
+    use arrow_array::StructArray;
+    use arrow_schema::Fields;
+    use std::collections::HashMap;
+
+    let packed_fields = Fields::from(vec![Field::new("child", DataType::Int32, true)]);
+    let packed_field = Field::new("packed", DataType::Struct(packed_fields.clone()), true)
+        .with_metadata(HashMap::from([("packed".to_string(), "true".to_string())]));
+    let schema = Arc::new(Schema::new(vec![
+        packed_field,
+        Field::new("tail", DataType::Int32, true),
+    ]));
+    let packed: ArrayRef = Arc::new(StructArray::new(
+        packed_fields,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+        None,
+    ));
+    let tail: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30, 40]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![packed, tail]).unwrap();
+
+    let test_dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100_000,
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let after = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(before, after);
+
+    let data_file = &dataset.manifest.fragments[0].files[0];
+    assert_eq!(data_file.fields.len(), 2);
+    assert_eq!(data_file.column_indices.as_ref(), &[0, 1]);
+}
+
+#[tokio::test]
 async fn test_binary_copy_empty_string_scalar_index() {
-    for version in LanceFileVersion::iter_non_legacy() {
+    for version in NON_LEGACY_VERSIONS {
         do_test_binary_copy_empty_string_scalar_index(version).await;
     }
 }
@@ -115,7 +183,7 @@ async fn do_test_binary_copy_empty_string_scalar_index(version: LanceFileVersion
 
 #[tokio::test]
 async fn test_binary_copy_with_defer_remap() {
-    for version in LanceFileVersion::iter_non_legacy() {
+    for version in NON_LEGACY_VERSIONS {
         do_test_binary_copy_with_defer_remap(version).await;
     }
 }
@@ -187,7 +255,7 @@ async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
 
 #[tokio::test]
 async fn test_binary_copy_preserves_stable_row_ids() {
-    for version in LanceFileVersion::iter_non_legacy() {
+    for version in NON_LEGACY_VERSIONS {
         do_binary_copy_preserves_stable_row_ids(version).await;
     }
 }
@@ -320,7 +388,7 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
 
 #[tokio::test]
 async fn test_binary_copy_remaps_unstable_row_ids() {
-    for version in LanceFileVersion::iter_non_legacy() {
+    for version in NON_LEGACY_VERSIONS {
         do_binary_copy_remaps_unstable_row_ids(version).await;
     }
 }
@@ -722,11 +790,27 @@ async fn test_can_use_binary_copy_reject_deletions() {
     assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 }
 
+#[rstest::rstest]
+#[case(LanceFileVersion::V2_0)]
+#[case(LanceFileVersion::V2_1)]
+#[case(LanceFileVersion::V2_2)]
+#[case(LanceFileVersion::V2_3)]
 #[tokio::test]
-async fn test_binary_copy_compaction_with_complex_schema() {
-    for version in LanceFileVersion::iter_non_legacy() {
-        do_test_binary_copy_compaction_with_complex_schema(version).await;
-    }
+async fn test_binary_copy_compaction_with_complex_schema(#[case] version: LanceFileVersion) {
+    do_test_binary_copy_compaction_with_complex_schema(version).await;
+}
+
+#[test]
+fn test_binary_copy_complex_schema_covers_every_non_legacy_version() {
+    assert_eq!(
+        [
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        ],
+        NON_LEGACY_VERSIONS
+    );
 }
 
 async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVersion) {
@@ -734,7 +818,10 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 
-    let row_num = 1_000;
+    let row_num: u64 = 1_000;
+    let batches: u32 = 10;
+    const NUM_FRAGMENTS: usize = 100;
+    let rows_per_file = (row_num as usize * batches as usize) / NUM_FRAGMENTS;
 
     let inner_fields = Fields::from(vec![
         Field::new("x", DataType::UInt32, true),
@@ -795,7 +882,7 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
             "events",
             array::rand_list_any(array::rand_struct(event_fields.clone()), true),
         )
-        .into_reader_rows(RowCount::from(row_num), BatchCount::from(10));
+        .into_reader_rows(RowCount::from(row_num), BatchCount::from(batches));
 
     let full_dir = TempStrDir::default();
     let mut dataset = Dataset::write(
@@ -804,12 +891,18 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
         Some(WriteParams {
             enable_stable_row_ids: true,
             data_storage_version: Some(version),
-            max_rows_per_file: (row_num / 100) as usize,
+            max_rows_per_file: rows_per_file,
             ..Default::default()
         }),
     )
     .await
     .unwrap();
+
+    assert_eq!(
+        dataset.get_fragments().len(),
+        NUM_FRAGMENTS,
+        "compaction must have many input fragments to merge"
+    );
 
     let opt_full = CompactionOptions {
         compaction_mode: Some(CompactionMode::Reencode),

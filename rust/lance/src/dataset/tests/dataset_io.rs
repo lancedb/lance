@@ -982,15 +982,18 @@ async fn test_write_params(
     assert_eq!(dataset.count_fragments(), 10);
     for fragment in &fragments {
         assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
-        let reader = fragment
-            .open(dataset.schema(), FragReadConfig::default())
-            .await
-            .unwrap();
         // No group / batch concept in v2
         if data_storage_version == LanceFileVersion::Legacy {
-            assert_eq!(reader.legacy_num_batches(), 10);
-            for i in 0..reader.legacy_num_batches() as u32 {
-                assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
+            let reader = crate::dataset::versions::open_v1_fragment_reader(
+                fragment,
+                dataset.schema(),
+                &FragReadConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reader.num_batches(), 10);
+            for i in 0..reader.num_batches() as u32 {
+                assert_eq!(reader.num_rows_in_batch(i).unwrap(), 10);
             }
         }
     }
@@ -1052,7 +1055,7 @@ async fn test_write_manifest(
 
     assert_eq!(
         manifest.data_storage_format,
-        DataStorageFormat::new(ConcreteFileVersion::from(data_storage_version))
+        DataStorageFormat::new(data_storage_version.resolve())
     );
     assert!(!matches!(
         manifest.data_storage_format.version.to_manifest_string(),
@@ -1176,8 +1179,8 @@ async fn test_rle_v2_v23_write_and_append() {
     .await
     .unwrap();
     assert_eq!(
-        manifest.data_storage_format.lance_file_version().unwrap(),
-        LanceFileVersion::V2_3
+        manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 
     let append_batch = RecordBatch::try_new(
@@ -1199,12 +1202,8 @@ async fn test_rle_v2_v23_write_and_append() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 
     let actual = dataset.scan().try_into_batch().await.unwrap();
@@ -1246,12 +1245,8 @@ async fn test_rle_v2_uncommitted_create_commits_v23_storage() {
         .await
         .unwrap();
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 }
 
@@ -1286,12 +1281,8 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
         .await
         .unwrap();
     assert_eq!(
-        clone
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        clone.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 }
 
@@ -2129,6 +2120,53 @@ async fn append_dictionary(
 }
 
 #[rstest]
+#[case::appended_null_value(
+    (0..=i8::MAX)
+        .map(|value| Some(format!("value-{value}")))
+        .collect(),
+    (0..=i8::MAX).map(Some).chain([None]).collect()
+)]
+#[case::existing_unaddressable_null_value(
+    (0..130)
+        .map(|value| (value != 129).then(|| format!("value-{value}")))
+        .collect(),
+    vec![Some(0_i8), None]
+)]
+#[tokio::test]
+async fn write_rejects_dictionary_null_index_outside_declared_key_range(
+    #[case] values: Vec<Option<String>>,
+    #[case] indices: Vec<Option<i8>>,
+) {
+    let dictionary = Arc::new(StringArray::from(values));
+    let indices = Int8Array::from(indices);
+    let dictionary = Int8DictionaryArray::try_new(indices, dictionary).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect_err("the widened indices cannot be represented by Int8");
+
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("dictionary indices use 32 bits but the declared Int8 key type uses 8 bits")
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn overwrite_dataset(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
@@ -2457,12 +2495,8 @@ async fn test_overwrite_mixed_version() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::Legacy
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
     );
 
     let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
@@ -2478,12 +2512,8 @@ async fn test_overwrite_mixed_version() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::Legacy
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
     );
 }
 
