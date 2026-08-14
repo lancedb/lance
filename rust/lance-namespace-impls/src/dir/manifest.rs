@@ -2513,6 +2513,77 @@ impl ManifestNamespace {
         .await
     }
 
+    /// Drop a directory staged for an operation that then failed. The directory is
+    /// unreferenced by any commit, so a failed cleanup only wastes storage.
+    async fn discard_staged_directory(&self, staged_dir: &Path) {
+        if let Err(err) = self.object_store.remove_dir_all(staged_dir.clone()).await {
+            log::warn!(
+                "Failed to remove staged directory '{}' after an aborted operation: {:?}",
+                staged_dir,
+                err
+            );
+        }
+    }
+
+    /// Undo a committed rename whose data copy failed, returning the error to report.
+    ///
+    /// The destination name is owned by this caller at this point, so removing its
+    /// directory cannot destroy another writer's data. If either step of the rollback
+    /// fails the returned error says so, because the catalog is then left naming a
+    /// destination that holds no data.
+    async fn roll_back_rename(
+        &self,
+        destination_object_id: &str,
+        source_object_id: &str,
+        source_info: &TableInfo,
+        destination_dir: &Path,
+        copy_err: LanceError,
+    ) -> LanceError {
+        let mut rollback_failure = None;
+        if let Err(err) = self
+            .object_store
+            .remove_dir_all(destination_dir.clone())
+            .await
+        {
+            rollback_failure = Some(format!("removing '{}' failed: {:?}", destination_dir, err));
+        }
+
+        let source_entry = match Self::serialize_metadata(
+            source_info.metadata.as_ref(),
+            "table",
+            source_object_id,
+        ) {
+            Ok(metadata) => ManifestEntry {
+                object_id: source_object_id.to_string(),
+                object_type: ObjectType::Table,
+                location: Some(source_info.location.clone()),
+                metadata,
+            },
+            Err(err) => return err,
+        };
+        if let Err(err) = self
+            .rename_in_manifest(destination_object_id, source_entry)
+            .await
+        {
+            rollback_failure = Some(match rollback_failure {
+                Some(previous) => format!("{}; restoring the catalog failed: {:?}", previous, err),
+                None => format!("restoring the catalog failed: {:?}", err),
+            });
+        }
+
+        match rollback_failure {
+            None => copy_err,
+            Some(failure) => NamespaceError::Internal {
+                message: format!(
+                    "Failed to copy table data while renaming '{}' to '{}' ({:?}), and the \
+                     rollback did not complete: {}. The namespace needs manual repair.",
+                    source_object_id, destination_object_id, copy_err, failure
+                ),
+            }
+            .into(),
+        }
+    }
+
     /// Register a table in the manifest without creating the physical table (internal helper for migration)
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
         let object_id = Self::build_object_id(&[], name);
@@ -3414,11 +3485,15 @@ impl LanceNamespace for ManifestNamespace {
         // leaves no orphaned copy behind.
         self.ensure_manifest_writable().boxed().await?;
 
+        // Root tables in directory-listing mode are resolved by directory name, so their
+        // directory *is* the published table: it appears to readers as soon as it is
+        // written, before any catalog commit can vet it. Every other destination gets a
+        // generated directory name that no reader can find until the catalog points at it.
+        let destination_is_dir_listed =
+            destination_namespace.is_empty() && self.dir_listing_enabled;
         // Choose the destination directory the same way create_table does so the
         // physical layout stays consistent with how tables are otherwise created.
-        let destination_dir_name = if destination_namespace.is_empty() && self.dir_listing_enabled {
-            // Root tables are resolved from the directory listing here, so the destination
-            // directory name is dictated by the new table name and cannot be varied.
+        let destination_dir_name = if destination_is_dir_listed {
             // Copying into a prefix that still holds objects would interleave two datasets
             // under one name, so the name is only usable while the prefix is empty.
             let dir_name = format!("{}.lance", request.new_table_name);
@@ -3446,29 +3521,71 @@ impl LanceNamespace for ManifestNamespace {
 
         let source_dir = self.base_path.clone().join(source_info.location.as_str());
         let destination_dir = self.base_path.clone().join(destination_dir_name.as_str());
-        copy_dir_all(&self.object_store, &source_dir, &destination_dir)
-            .boxed()
-            .await?;
-
-        // Retire the old name and publish the new one in a single manifest commit: two
-        // commits would expose both names at once, and a failure between them would leave
-        // the extra alias behind for good.
+        // Retiring the old name and publishing the new one is a single manifest commit:
+        // two commits would expose both names at once, and a failure between them would
+        // leave the extra alias behind for good.
         let metadata = Self::serialize_metadata(
             source_info.metadata.as_ref(),
             "table",
             &destination_object_id,
         )?;
-        self.rename_in_manifest(
-            &source_object_id,
-            ManifestEntry {
-                object_id: destination_object_id,
-                object_type: ObjectType::Table,
-                location: Some(destination_dir_name),
-                metadata,
-            },
-        )
-        .boxed()
-        .await?;
+        let destination_entry = ManifestEntry {
+            object_id: destination_object_id.clone(),
+            object_type: ObjectType::Table,
+            location: Some(destination_dir_name),
+            metadata,
+        };
+
+        if destination_is_dir_listed {
+            // The commit goes first, because the copy is what publishes this destination
+            // and a rejected commit must not leave a readable table behind. Claiming the
+            // name also locks out concurrent renames and creates, so the copy below owns
+            // the directory and can be rolled back without destroying another writer's
+            // data. Until the copy lands the source directory is still listed, so the
+            // table keeps its old name rather than disappearing.
+            self.rename_in_manifest(&source_object_id, destination_entry)
+                .boxed()
+                .await?;
+
+            if let Err(copy_err) = copy_dir_all(&self.object_store, &source_dir, &destination_dir)
+                .boxed()
+                .await
+            {
+                return Err(self
+                    .roll_back_rename(
+                        &destination_object_id,
+                        &source_object_id,
+                        &source_info,
+                        &destination_dir,
+                        copy_err,
+                    )
+                    .boxed()
+                    .await);
+            }
+        } else {
+            // The copy goes first, into a directory no reader can name yet, so a rejected
+            // commit leaves nothing but unreferenced files behind.
+            if let Err(copy_err) = copy_dir_all(&self.object_store, &source_dir, &destination_dir)
+                .boxed()
+                .await
+            {
+                self.discard_staged_directory(&destination_dir)
+                    .boxed()
+                    .await;
+                return Err(copy_err);
+            }
+
+            if let Err(commit_err) = self
+                .rename_in_manifest(&source_object_id, destination_entry)
+                .boxed()
+                .await
+            {
+                self.discard_staged_directory(&destination_dir)
+                    .boxed()
+                    .await;
+                return Err(commit_err);
+            }
+        }
 
         // The rename is committed; the source directory is now unreferenced garbage.
         // Failing to delete it wastes storage but does not undo the rename, so it is

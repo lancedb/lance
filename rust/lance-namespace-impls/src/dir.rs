@@ -3798,7 +3798,24 @@ impl LanceNamespace for DirectoryNamespace {
 
         let source_path = self.table_path(&source_name);
         let destination_path = self.table_path(&new_table_name);
-        manifest::copy_dir_all(&self.object_store, &source_path, &destination_path).await?;
+        // The copy publishes the new name as it goes, so an incomplete one is removed
+        // again: the prefix was empty a moment ago, and leaving a half-copied dataset
+        // there would turn a failed rename into a permanently unreadable table.
+        if let Err(copy_err) =
+            manifest::copy_dir_all(&self.object_store, &source_path, &destination_path).await
+        {
+            if let Err(cleanup_err) = self.object_store.remove_dir_all(destination_path).await {
+                return Err(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to copy table {} to {} ({:?}), and removing the partial copy \
+                         also failed (it must be dropped manually): {:?}",
+                        source_name, new_table_name, copy_err, cleanup_err
+                    ),
+                }
+                .into());
+            }
+            return Err(copy_err);
+        }
         // The source is only retired once the destination holds a complete copy. A failure
         // here leaves both names readable, which is reported rather than cleaned up: a
         // partially removed source may already be unopenable, so the fresh copy is the only
@@ -9442,6 +9459,43 @@ mod tests {
         );
         let destination_status = namespace.check_table_status("destination").await.unwrap();
         assert!(destination_status.is_deregistered);
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_with_manifest_rolls_back_failed_copy() {
+        use lance_namespace::models::RenameTableRequest;
+
+        let (namespace, temp_dir) = create_test_namespace().await;
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["source".to_string()]);
+        namespace
+            .create_table(
+                create_request,
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        // A plain file where the destination directory would go: the prefix still lists as
+        // empty, but nothing can be written underneath it, so the copy fails after the
+        // rename has been committed.
+        let blocker = std::path::Path::new(temp_dir.to_str().unwrap()).join("renamed.lance");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let mut rename_request = RenameTableRequest::new("renamed".to_string());
+        rename_request.id = Some(vec!["source".to_string()]);
+        namespace.rename_table(rename_request).await.unwrap_err();
+
+        // The commit was rolled back, so the source still owns its catalog entry and can
+        // be renamed again. Without the rollback this fails with "table not found".
+        let mut retry_request = RenameTableRequest::new("elsewhere".to_string());
+        retry_request.id = Some(vec!["source".to_string()]);
+        namespace.rename_table(retry_request).await.unwrap();
+        assert_eq!(
+            rows_at_location(&namespace, vec!["elsewhere".to_string()]).await,
+            2
+        );
     }
 
     #[tokio::test]
