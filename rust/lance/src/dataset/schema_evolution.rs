@@ -9,7 +9,7 @@ use std::{
 use super::fragment::FileFragment;
 use super::{
     Dataset,
-    transaction::{Operation, Transaction},
+    transaction::{CellFlagFieldTransfer, CellFlagTransaction, Operation, Transaction},
     write::cleanup_data_fragments,
 };
 use crate::index::DatasetIndexExt;
@@ -107,6 +107,47 @@ pub enum NewColumnTransform {
     Reader(Box<dyn RecordBatchReader + Send>),
     /// Add new columns that are initially all null
     AllNulls(Arc<ArrowSchema>),
+}
+
+fn collect_cell_flag_transfers(
+    dataset: &Dataset,
+    source: &Field,
+    target: &Field,
+    transfers: &mut Vec<CellFlagFieldTransfer>,
+) -> Result<()> {
+    if dataset
+        .cell_flag_definitions()
+        .iter()
+        .any(|definition| definition.field_id == source.id)
+    {
+        transfers.push(CellFlagFieldTransfer {
+            source_field_id: source.id,
+            target_field_id: target.id,
+        });
+    }
+    for source_child in &source.children {
+        fn has_registered_flag(dataset: &Dataset, field: &Field) -> bool {
+            dataset
+                .cell_flag_definitions()
+                .iter()
+                .any(|definition| definition.field_id == field.id)
+                || field
+                    .children
+                    .iter()
+                    .any(|child| has_registered_flag(dataset, child))
+        }
+        if !has_registered_flag(dataset, source_child) {
+            continue;
+        }
+        let target_child = target.child(&source_child.name).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Cannot cast field '{}' because nested field '{}' with a registered cell flag has no corresponding target field",
+                source.name, source_child.name
+            ))
+        })?;
+        collect_cell_flag_transfers(dataset, source_child, target_child, transfers)?;
+    }
+    Ok(())
 }
 
 /// Definition of a change to a column in a dataset
@@ -734,6 +775,7 @@ pub(super) async fn alter_columns(
 
     // Mapping of old to new fields that need to be casted.
     let mut cast_fields: Vec<(Field, Field)> = Vec::new();
+    let mut cell_flag_transfers = Vec::new();
     let mut tightens_nullability = false;
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
@@ -784,6 +826,8 @@ pub(super) async fn alter_columns(
             );
             *field_dest = Field::try_from(&arrow_field)?;
             field_dest.set_id(field_src.parent_id, &mut next_field_id);
+
+            collect_cell_flag_transfers(dataset, field_src, field_dest, &mut cell_flag_transfers)?;
 
             cast_fields.push((field_src.clone(), field_dest.clone()));
         }
@@ -925,6 +969,15 @@ pub(super) async fn alter_columns(
             },
             /*blob_op= */ None,
         )
+    };
+
+    let transaction = if cell_flag_transfers.is_empty() {
+        transaction
+    } else {
+        transaction.with_cell_flag_transaction(CellFlagTransaction {
+            transfers: cell_flag_transfers,
+            ..Default::default()
+        })
     };
 
     // TODO: adjust the indices here for the new schema

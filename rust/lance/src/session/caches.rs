@@ -12,6 +12,7 @@
 
 use std::{borrow::Cow, ops::Deref};
 
+use bytes::Bytes;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
@@ -99,6 +100,43 @@ impl CacheKey for ManifestKey<'_> {
 #[derive(Debug)]
 pub struct TransactionKey {
     pub version: u64,
+}
+
+/// Cache key for an immutable field-cell flag root or bitmap.
+///
+/// The cache is already namespaced by the destination dataset URI. The source
+/// URI is still part of the key because shallow clones may read immutable
+/// cell-flag objects from more than one external dataset base.
+#[derive(Debug)]
+pub struct CellFlagFileKey<'a> {
+    pub source_uri: &'a str,
+    pub path: &'a str,
+    pub size_bytes: u64,
+}
+
+impl CacheKey for CellFlagFileKey<'_> {
+    type ValueType = Bytes;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "cell_flag/{}/{}/{}",
+            self.source_uri, self.path, self.size_bytes
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "CellFlagBytes"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.cell-flag-file-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.source_uri);
+        builder.write_str(self.path);
+        builder.write_u64(self.size_bytes);
+    }
 }
 
 impl CacheKey for TransactionKey {

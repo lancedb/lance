@@ -15,12 +15,13 @@ use super::FileRow;
 use super::file_types::FileType;
 
 pub static FILE_TYPE_DICT_ARRAY: LazyLock<ArrayRef> = LazyLock::new(|| {
-    let mut builder = StringBuilder::with_capacity(5, 20);
+    let mut builder = StringBuilder::with_capacity(6, 20);
     builder.append_value(FileType::Manifest.to_string());
     builder.append_value(FileType::DataFile.to_string());
     builder.append_value(FileType::DeletionFile.to_string());
     builder.append_value(FileType::TransactionFile.to_string());
     builder.append_value(FileType::IndexFile.to_string());
+    builder.append_value(FileType::CellFlagFile.to_string());
     Arc::new(builder.finish())
 });
 

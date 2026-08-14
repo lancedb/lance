@@ -14,6 +14,7 @@ import time
 import uuid
 import warnings
 from abc import ABC
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -103,6 +104,35 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[Union[float, Iterable[float]]],
     ]
+
+CellFlagChanges = Mapping[str, Mapping[str, bool]]
+
+
+def _normalize_cell_flags(
+    cell_flags: Optional[CellFlagChanges],
+) -> Optional[Dict[str, Dict[str, bool]]]:
+    if cell_flags is None:
+        return None
+    if not isinstance(cell_flags, Mapping):
+        raise TypeError("cell_flags must map field names to mappings of flag names")
+
+    normalized: Dict[str, Dict[str, bool]] = {}
+    for field, flags in cell_flags.items():
+        if not isinstance(field, str):
+            raise TypeError("cell_flags field names must be strings")
+        if not isinstance(flags, Mapping):
+            raise TypeError(f"cell_flags[{field!r}] must be a mapping")
+        normalized_flags: Dict[str, bool] = {}
+        for name, value in flags.items():
+            if not isinstance(name, str):
+                raise TypeError(f"cell_flags[{field!r}] names must be strings")
+            if not isinstance(value, bool):
+                raise TypeError(f"cell_flags[{field!r}][{name!r}] must be a bool")
+            normalized_flags[name] = value
+        normalized[field] = normalized_flags
+    return normalized
+
+
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 # Mirrors Rust's `lance::dataset::DEFAULT_COMMIT_TIMEOUT`; keep the two in sync.
 _DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=30)
@@ -452,6 +482,81 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         a "matched" row to become a "not matched" row.
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
+
+    def set_matched_cell_flag(
+        self, field: str, name: str, value: bool
+    ) -> "MergeInsertBuilder":
+        """Set a registered flag on matched target rows.
+
+        The explicit flag change is atomic with the matched action. It may be
+        used with a value update or as a flag-only matched action.
+
+        Parameters
+        ----------
+        field : str
+            Field path that owns the flag.
+        name : str
+            Registered field-local flag name.
+        value : bool
+            Explicit flag value.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"id": [1], "value": [10]}), "merge_cell_flags"
+        ... )
+        >>> _ = dataset.register_cell_flag("value", "reviewed", True)
+        >>> source = dataset.to_table(columns=["_rowid", "id"])
+        >>> _ = (
+        ...     dataset.merge_insert(on="_rowid")
+        ...     .set_matched_cell_flag("value", "reviewed", False)
+        ...     .execute(source)
+        ... )
+        >>> dataset.to_table(
+        ...     columns={"reviewed": "cell_flag(value, 'reviewed')"}
+        ... )["reviewed"].to_pylist()
+        [False]
+        """
+        return super(MergeInsertBuilder, self).set_matched_cell_flag(field, name, value)
+
+    def set_inserted_cell_flag(
+        self, field: str, name: str, value: bool
+    ) -> "MergeInsertBuilder":
+        """Set a registered flag on rows inserted by the not-matched action.
+
+        Parameters
+        ----------
+        field : str
+            Field path that owns the flag.
+        name : str
+            Registered field-local flag name.
+        value : bool
+            Explicit flag value for inserted rows.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"id": [1], "value": [10]}), "insert_cell_flags"
+        ... )
+        >>> _ = dataset.register_cell_flag("value", "reviewed")
+        >>> _ = (
+        ...     dataset.merge_insert(on="id")
+        ...     .when_not_matched_insert_all()
+        ...     .set_inserted_cell_flag("value", "reviewed", True)
+        ...     .execute(pa.table({"id": [2], "value": [20]}))
+        ... )
+        >>> dataset.to_table(
+        ...     columns={"reviewed": "cell_flag(value, 'reviewed')"}
+        ... )["reviewed"].to_pylist()
+        [False, True]
+        """
+        return super(MergeInsertBuilder, self).set_inserted_cell_flag(
+            field, name, value
+        )
 
     def when_matched_delete(self) -> "MergeInsertBuilder":
         """
@@ -1475,6 +1580,43 @@ class LanceDataset(pa.dataset.Dataset):
         The LanceSchema for this dataset
         """
         return self._ds.lance_schema
+
+    def cell_flag_definitions(self) -> List[CellFlagDefinition]:
+        """Return field-scoped cell flags registered in this snapshot."""
+        return self._ds.cell_flag_definitions()
+
+    def register_cell_flag(
+        self, field: str, name: str, initial_value: bool = False
+    ) -> CellFlagDefinition:
+        """Register a Boolean flag for a field and initialize current live rows.
+
+        The returned ``flag_id`` is stable for this registration. Flag state is
+        independent of field values and Arrow validity; ``initial_value`` is
+        applied explicitly to every live row in the current snapshot.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"id": [1, 2], "embedding": [None, [1.0, 2.0]]}),
+        ...     "cell_flags",
+        ... )
+        >>> definition = dataset.register_cell_flag(
+        ...     "embedding", "computed", initial_value=False
+        ... )
+        >>> definition["name"]
+        'computed'
+        """
+        return self._ds.register_cell_flag(field, name, initial_value)
+
+    def rename_cell_flag(self, field: str, name: str, new_name: str) -> None:
+        """Rename a registered flag without changing its stable ID or state."""
+        self._ds.rename_cell_flag(field, name, new_name)
+
+    def drop_cell_flag(self, field: str, name: str) -> None:
+        """Drop a registered flag from the current snapshot."""
+        self._ds.drop_cell_flag(field, name)
 
     @property
     def data_storage_version(self) -> str:
@@ -2536,6 +2678,7 @@ class LanceDataset(pa.dataset.Dataset):
         left_on: str,
         right_on: Optional[str] = None,
         schema=None,
+        cell_flags: Optional[CellFlagChanges] = None,
     ):
         """
         Merge another dataset into this one.
@@ -2556,6 +2699,10 @@ class LanceDataset(pa.dataset.Dataset):
         right_on: str or None
             The name of the column in data_obj to join on. If None, defaults to
             left_on.
+        cell_flags: mapping of str to mapping of str to bool, optional
+            Explicit flag values to set on matched target rows, grouped first
+            by field and then by registered flag name. Unmentioned flags are
+            preserved, and ordinary value or NULL writes do not infer state.
 
         Examples
         --------
@@ -2587,7 +2734,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         reader = _coerce_reader(data_obj, schema)
 
-        self._ds.merge(reader, left_on, right_on)
+        self._ds.merge(reader, left_on, right_on, _normalize_cell_flags(cell_flags))
 
     def add_columns(
         self,
@@ -2915,28 +3062,30 @@ class LanceDataset(pa.dataset.Dataset):
         ...             .execute(new_table)
         {'num_inserted_rows': 1, 'num_updated_rows': 2, 'num_deleted_rows': 0}
         >>> dataset.to_table().sort_by("a").to_pandas()
-           a  b    c
-        0  1  a    x
-        1  2  x    y
-        2  3  y    z
-        3  4  z  NaN
+           a  b     c
+        0  1  a     x
+        1  2  x     y
+        2  3  y     z
+        3  4  z  None
         """
         return MergeInsertBuilder(self._ds, on)
 
     def update(
         self,
-        updates: Dict[str, str],
+        updates: Optional[Dict[str, str]] = None,
         where: Optional[str] = None,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
+        cell_flags: Optional[CellFlagChanges] = None,
     ) -> UpdateResult:
         """
         Update column values for rows matching where.
 
         Parameters
         ----------
-        updates : dict of str to str
-            A mapping of column names to a SQL expression.
+        updates : dict of str to str, optional
+            A mapping of column names to a SQL expression. This may be omitted
+            for a flag-only mutation.
         where : str, optional
             A SQL predicate indicating which rows should be updated.
         conflict_retries : int, optional
@@ -2947,6 +3096,10 @@ class LanceDataset(pa.dataset.Dataset):
             the operation before giving up. At least one attempt will be made,
             regardless of how long it takes to complete. Subsequent attempts will be
             cancelled once this timeout is reached. Default is 30 seconds.
+        cell_flags : mapping of str to mapping of str to bool, optional
+            Explicit flag values for matching rows, grouped first by field and
+            then by registered flag name. Flags may be changed alongside their
+            field values. Unmentioned flags are preserved.
 
         Returns
         -------
@@ -2966,10 +3119,26 @@ class LanceDataset(pa.dataset.Dataset):
         0  1  a
         1  4  b
         2  5  c
+
+        A flag-only update does not rewrite data files.
+
+        >>> dataset.add_columns(pa.field("embedding", pa.int32()))
+        >>> _ = dataset.register_cell_flag("embedding", "computed", True)
+        >>> dataset.update(
+        ...     where="a = 1",
+        ...     cell_flags={"embedding": {"computed": False}},
+        ... )
+        {'num_rows_updated': 1}
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        return self._ds.update(updates, where, conflict_retries, retry_timeout)
+        return self._ds.update(
+            updates,
+            where,
+            conflict_retries,
+            retry_timeout,
+            _normalize_cell_flags(cell_flags),
+        )
 
     def versions(self):
         """
@@ -5508,7 +5677,7 @@ class LanceDataset(pa.dataset.Dataset):
             - **path** (utf8): file path relative to ``base_uri``
             - **type** (dictionary<int8, utf8>): one of ``manifest``,
               ``data file``, ``deletion file``, ``transaction file``,
-              ``index file``
+              ``index file``, ``cell flag file``
 
             Output order is non-deterministic.
         """
@@ -5743,6 +5912,12 @@ class UpdateResult(TypedDict):
 
 class DeleteResult(TypedDict):
     num_deleted_rows: int
+
+
+class CellFlagDefinition(TypedDict):
+    flag_id: int
+    field_id: int
+    name: str
 
 
 class AlterColumn(TypedDict):
@@ -7568,6 +7743,7 @@ def write_dataset(
     schema: Optional[pa.Schema] = None,
     mode: str = "create",
     *,
+    cell_flags: Optional[CellFlagChanges] = None,
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
@@ -7613,6 +7789,11 @@ def write_dataset(
         **overwrite** - create a new snapshot version
         **append** - create a new version that is the concat of the input and the
         latest version, or a new dataset if uri doesn't exist.
+    cell_flags: mapping of str to mapping of str to bool, optional
+        Explicit flag values for every row appended by this operation, grouped
+        first by field and then by registered flag name. This requires an
+        existing dataset with those flags registered. Unmentioned flags are
+        false on new rows.
     max_rows_per_file: int, default 1024 * 1024
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
@@ -7834,6 +8015,7 @@ def write_dataset(
 
     params = {
         "mode": mode,
+        "cell_flags": _normalize_cell_flags(cell_flags),
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,

@@ -5301,7 +5301,8 @@ def _write_overlay_file(
     )
 
 
-def test_data_overlay_dense(tmp_path: Path):
+def test_data_overlay_dense(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5333,7 +5334,8 @@ def test_data_overlay_dense(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_newest_wins(tmp_path: Path):
+def test_data_overlay_newest_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5387,7 +5389,8 @@ def test_data_overlay_newest_wins(tmp_path: Path):
     assert val[4] == 444  # only the older overlay covers offset 4
 
 
-def test_data_overlay_sparse_per_field(tmp_path: Path):
+def test_data_overlay_sparse_per_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5427,7 +5430,10 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
-def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+def test_data_overlay_round_trips_through_fragment_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
     import json
 
     base_dir = tmp_path / "test"
@@ -6535,3 +6541,201 @@ def test_all_files(tmp_path):
     assert result.schema.field("size_bytes").type == pa.int64()
     assert result.num_rows >= 2  # at least manifest + data file
     assert all(s > 0 for s in result.column("size_bytes").to_pylist())
+
+
+def _flag_rows(
+    dataset: lance.LanceDataset, field: str = "embedding", name: str = "computed"
+) -> list[tuple[int, bool]]:
+    table = dataset.to_table(
+        columns={"id": "id", "flag": f"cell_flag({field}, '{name}')"}
+    ).sort_by("id")
+    assert table["flag"].null_count == 0
+    return list(zip(table["id"].to_pylist(), table["flag"].to_pylist()))
+
+
+def test_cell_flag_public_api(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"id": range(4)}), tmp_path)
+    dataset.add_columns(pa.field("embedding", pa.int32()))
+    computed = dataset.register_cell_flag("embedding", "computed")
+    reviewed = dataset.register_cell_flag("embedding", "reviewed", True)
+    same_name = dataset.register_cell_flag("id", "computed")
+    assert len({computed["flag_id"], reviewed["flag_id"], same_name["flag_id"]}) == 3
+    assert dataset.cell_flag_definitions() == [computed, reviewed, same_name]
+    assert _flag_rows(dataset) == [
+        (0, False),
+        (1, False),
+        (2, False),
+        (3, False),
+    ]
+    assert all(value for _, value in _flag_rows(dataset, name="reviewed"))
+
+    # The cell_flags option is trailing so existing positional retry
+    # arguments keep their meaning.
+    result = dataset.update({"id": "id"}, "id < 0", 1, timedelta(seconds=1))
+    assert result["num_rows_updated"] == 0
+
+    result = dataset.update({"embedding": "CAST(NULL AS INT)"}, where="id = 0")
+    assert result["num_rows_updated"] == 1
+    assert _flag_rows(dataset)[0] == (0, False)
+
+    fragments_before = [fragment.metadata for fragment in dataset.get_fragments()]
+    result = dataset.update(
+        where="id = 0", cell_flags={"embedding": {"computed": True}}
+    )
+    assert result["num_rows_updated"] == 1
+    assert [
+        fragment.metadata for fragment in dataset.get_fragments()
+    ] == fragments_before
+    assert _flag_rows(dataset)[0] == (0, True)
+
+    dataset.update(
+        where="id = 1",
+        cell_flags={
+            "embedding": {"computed": True, "reviewed": False},
+            "id": {"computed": True},
+        },
+    )
+    assert _flag_rows(dataset)[1] == (1, True)
+    assert _flag_rows(dataset, name="reviewed")[1] == (1, False)
+    assert _flag_rows(dataset, field="id")[1] == (1, True)
+
+    transaction = dataset.read_transaction(dataset.version)
+    assert not any(
+        key.startswith("__lance_cell_flag_transaction")
+        for key in transaction.transaction_properties
+    )
+
+    for reserved_key in (
+        "__lance_cell_flag_transaction",
+        "__lance_cell_flag_transaction_auth",
+    ):
+        forged = lance.Transaction(
+            dataset.version,
+            lance.LanceOperation.Update(),
+            transaction_properties={reserved_key: "00"},
+        )
+        with pytest.raises(ValueError, match="properties are reserved"):
+            lance.LanceDataset.commit(dataset, forged)
+
+    dataset = lance.write_dataset(
+        pa.table({"id": [4], "embedding": pa.array([None], pa.int32())}),
+        dataset,
+        mode="append",
+        cell_flags={"embedding": {"computed": True}},
+    )
+    dataset = lance.write_dataset(pa.table({"id": [5]}), dataset, mode="append")
+    assert _flag_rows(dataset)[-2:] == [(4, True), (5, False)]
+
+    with pytest.raises(ValueError, match="unknown flag"):
+        dataset.to_table(columns={"flag": "cell_flag(id, 'missing')"})
+    with pytest.raises(TypeError, match="must be a bool"):
+        dataset.update(where="id = 0", cell_flags={"embedding": {"computed": 1}})
+
+
+def test_cell_flag_alter_and_rowid_merge(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(6), "embedding": pa.array(range(10, 16), pa.int32())}),
+        tmp_path,
+    )
+    definition = dataset.register_cell_flag("embedding", "computed", True)
+    assert all(value for _, value in _flag_rows(dataset))
+
+    dataset.update(
+        where="id IN (1, 4)",
+        cell_flags={"embedding": {"computed": False}},
+    )
+    pending = dataset.to_table(
+        columns=["_rowid", "id"], filter="NOT cell_flag(embedding, 'computed')"
+    ).sort_by("id")
+    source = pa.table(
+        {
+            "_rowid": pending["_rowid"],
+            "embedding": pa.array([None, 400], pa.int32()),
+        }
+    )
+    stats = (
+        dataset.merge_insert(on="_rowid")
+        .when_matched_update_all()
+        .set_matched_cell_flag("embedding", "computed", True)
+        .execute(source)
+    )
+    assert stats == {
+        "num_inserted_rows": 0,
+        "num_updated_rows": 2,
+        "num_deleted_rows": 0,
+    }
+    assert all(value for _, value in _flag_rows(dataset))
+
+    dataset.rename_cell_flag("embedding", "computed", "ready")
+    renamed = dataset.cell_flag_definitions()[0]
+    assert renamed["flag_id"] == definition["flag_id"]
+    assert renamed["name"] == "ready"
+    assert all(value for _, value in _flag_rows(dataset, name="ready"))
+    dataset.drop_cell_flag("embedding", "ready")
+    assert dataset.cell_flag_definitions() == []
+
+
+def test_cell_flag_merge_and_merge_insert_actions(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(4), "value": pa.array(range(10, 14), pa.int32())}),
+        tmp_path,
+    )
+    dataset.register_cell_flag("value", "computed")
+
+    dataset.merge(
+        pa.table({"id": [1, 3], "joined": [100, 300]}),
+        "id",
+        cell_flags={"value": {"computed": True}},
+    )
+    assert _flag_rows(dataset, field="value") == [
+        (0, False),
+        (1, True),
+        (2, False),
+        (3, True),
+    ]
+
+    dataset.merge(pa.table({"id": [1, 2], "ordinary": [101, 202]}), "id")
+    assert [row for row, value in _flag_rows(dataset, field="value") if value] == [
+        1,
+        3,
+    ]
+
+    source = pa.table(
+        {
+            "id": [1, 4],
+            "value": pa.array([101, None], pa.int32()),
+        }
+    )
+    stats = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .set_matched_cell_flag("value", "computed", False)
+        .set_inserted_cell_flag("value", "computed", True)
+        .execute(source)
+    )
+    assert stats == {
+        "num_inserted_rows": 1,
+        "num_updated_rows": 1,
+        "num_deleted_rows": 0,
+    }
+    assert [row for row, value in _flag_rows(dataset, field="value") if value] == [
+        3,
+        4,
+    ]
+
+    fragments_before = [fragment.metadata for fragment in dataset.get_fragments()]
+    stats = (
+        dataset.merge_insert(on="id")
+        .set_matched_cell_flag("value", "computed", False)
+        .execute(pa.table({"id": [3]}))
+    )
+    assert stats == {
+        "num_inserted_rows": 0,
+        "num_updated_rows": 1,
+        "num_deleted_rows": 0,
+    }
+    assert [
+        fragment.metadata for fragment in dataset.get_fragments()
+    ] == fragments_before
+    assert [row for row, value in _flag_rows(dataset, field="value") if value] == [4]

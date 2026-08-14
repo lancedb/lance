@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
-use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
+use super::{CellFlagDefinition, CellFlagState, Fragment};
+use crate::feature_flags::{FLAG_CELL_FLAGS, FLAG_MEM_WAL_INDEX_CATCHUP};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -27,6 +27,8 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
+
+const MAX_INLINE_CELL_FLAG_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
 /// Manifest of a dataset
 ///
@@ -104,6 +106,18 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Registered field-scoped Boolean flags, sorted by stable flag ID.
+    pub cell_flag_definitions: Vec<CellFlagDefinition>,
+
+    /// Snapshot-level state descriptors keyed by stable flag ID.
+    ///
+    /// A missing descriptor means the flag is false for every row. Immutable
+    /// roots are loaded only when a query or mutation needs that flag.
+    pub cell_flag_states: Vec<CellFlagState>,
+
+    /// Next stable flag ID. IDs remain consumed after their definition is dropped.
+    pub next_cell_flag_id: u32,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -199,6 +213,9 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            cell_flag_definitions: Vec::new(),
+            cell_flag_states: Vec::new(),
+            next_cell_flag_id: 0,
         }
     }
 
@@ -230,6 +247,9 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            cell_flag_definitions: previous.cell_flag_definitions.clone(),
+            cell_flag_states: previous.cell_flag_states.clone(),
+            next_cell_flag_id: previous.next_cell_flag_id,
         }
     }
 
@@ -266,6 +286,18 @@ impl Manifest {
             })
             .collect::<Vec<_>>();
 
+        let cell_flag_states = self
+            .cell_flag_states
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                if state.root.base_id.is_none() {
+                    state.root.base_id = Some(ref_base_id);
+                }
+                state
+            })
+            .collect();
+
         Self {
             schema: self.schema.clone(),
             version: self.version,
@@ -295,6 +327,9 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            cell_flag_definitions: self.cell_flag_definitions.clone(),
+            cell_flag_states,
+            next_cell_flag_id: self.next_cell_flag_id,
         }
     }
 
@@ -941,6 +976,97 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let schema = Schema::try_from(fields_with_meta)?;
 
+        let has_cell_flag_metadata = p.next_cell_flag_id != 0
+            || !p.cell_flag_definitions.is_empty()
+            || !p.cell_flag_states.is_empty();
+        if has_cell_flag_metadata && p.writer_feature_flags & FLAG_CELL_FLAGS == 0 {
+            return Err(Error::invalid_input(
+                "Manifest contains cell flag metadata without the required writer feature flag",
+            ));
+        }
+
+        let mut cell_flag_definitions = p
+            .cell_flag_definitions
+            .into_iter()
+            .map(CellFlagDefinition::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        cell_flag_definitions.sort_by_key(|definition| definition.flag_id);
+        for definitions in cell_flag_definitions.windows(2) {
+            if definitions[0].flag_id == definitions[1].flag_id {
+                return Err(Error::invalid_input(format!(
+                    "Manifest contains duplicate cell flag definition for flag ID {}",
+                    definitions[0].flag_id
+                )));
+            }
+        }
+        let mut names_by_field = HashMap::<i32, std::collections::HashSet<String>>::new();
+        for definition in &cell_flag_definitions {
+            if schema.field_by_id(definition.field_id).is_none() {
+                return Err(Error::invalid_input(format!(
+                    "Manifest cell flag {} ('{}') references unknown field ID {}",
+                    definition.flag_id, definition.name, definition.field_id
+                )));
+            }
+            if !names_by_field
+                .entry(definition.field_id)
+                .or_default()
+                .insert(definition.name.clone())
+            {
+                return Err(Error::invalid_input(format!(
+                    "Manifest contains duplicate cell flag name '{}' for field ID {}",
+                    definition.name, definition.field_id
+                )));
+            }
+        }
+        if let Some(max_flag_id) = cell_flag_definitions
+            .iter()
+            .map(|definition| definition.flag_id)
+            .max()
+            && p.next_cell_flag_id <= max_flag_id
+        {
+            return Err(Error::invalid_input(format!(
+                "Manifest next_cell_flag_id {} must be greater than registered flag ID {}",
+                p.next_cell_flag_id, max_flag_id
+            )));
+        }
+
+        let mut cell_flag_states = p
+            .cell_flag_states
+            .into_iter()
+            .map(CellFlagState::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        cell_flag_states.sort_by_key(|state| state.flag_id);
+        for states in cell_flag_states.windows(2) {
+            if states[0].flag_id == states[1].flag_id {
+                return Err(Error::invalid_input(format!(
+                    "Manifest contains duplicate cell flag state for flag ID {}",
+                    states[0].flag_id
+                )));
+            }
+        }
+        for state in &cell_flag_states {
+            if cell_flag_definitions
+                .binary_search_by_key(&state.flag_id, |definition| definition.flag_id)
+                .is_err()
+            {
+                return Err(Error::invalid_input(format!(
+                    "Manifest cell flag state references unknown flag ID {}",
+                    state.flag_id
+                )));
+            }
+        }
+        let inline_flag_bytes = cell_flag_states
+            .iter()
+            .filter_map(|state| state.root.inline_bytes.as_ref())
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
+            .ok_or_else(|| Error::invalid_input("Inline cell flag manifest size overflow"))?;
+        if inline_flag_bytes > MAX_INLINE_CELL_FLAG_MANIFEST_BYTES {
+            return Err(Error::invalid_input(format!(
+                "Manifest contains {} inline cell flag bytes, maximum is {}",
+                inline_flag_bytes, MAX_INLINE_CELL_FLAG_MANIFEST_BYTES
+            )));
+        }
+
         Ok(Self {
             schema,
             version: p.version,
@@ -970,6 +1096,9 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            cell_flag_definitions,
+            cell_flag_states,
+            next_cell_flag_id: p.next_cell_flag_id,
         })
     }
 }
@@ -1037,6 +1166,9 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            cell_flag_definitions: m.cell_flag_definitions.iter().map(Into::into).collect(),
+            cell_flag_states: m.cell_flag_states.iter().map(Into::into).collect(),
+            next_cell_flag_id: m.next_cell_flag_id,
         }
     }
 }
@@ -1101,7 +1233,9 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
+    use crate::feature_flags::{
+        FLAG_CELL_FLAGS, FLAG_USE_V2_FORMAT_DEPRECATED, apply_feature_flags,
+    };
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
 
@@ -1109,6 +1243,39 @@ mod tests {
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+
+    #[test]
+    fn cell_flag_metadata_requires_writer_capability_marker() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "tracked",
+            arrow_schema::DataType::Int64,
+            true,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let field_id = schema.fields[0].id;
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(Vec::new()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.cell_flag_definitions = vec![CellFlagDefinition {
+            flag_id: 0,
+            field_id,
+            name: "reviewed".to_string(),
+        }];
+        manifest.next_cell_flag_id = 1;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.writer_feature_flags &= !FLAG_CELL_FLAGS;
+
+        assert!(
+            Manifest::try_from(encoded)
+                .unwrap_err()
+                .to_string()
+                .contains("required writer feature flag")
+        );
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same

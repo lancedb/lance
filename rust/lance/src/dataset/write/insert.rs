@@ -23,7 +23,10 @@ use crate::Dataset;
 use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use crate::dataset::cell_flag::CellFlagChange;
+use crate::dataset::transaction::{
+    CellFlagTransaction, Operation, Transaction, TransactionBuilder,
+};
 use crate::dataset::write::{
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
@@ -53,6 +56,7 @@ pub struct InsertBuilder<'a> {
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
+    cell_flags: Option<Arc<Vec<CellFlagChange>>>,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -61,11 +65,35 @@ impl<'a> InsertBuilder<'a> {
             dest: dest.into(),
             params: None,
             write_progress: None,
+            cell_flags: None,
         }
     }
 
     pub fn with_params(mut self, params: &'a WriteParams) -> Self {
         self.params = Some(params);
+        self
+    }
+
+    /// Attach explicit cell flag values to every row written by this operation.
+    ///
+    /// Unmentioned registered flags are false for new rows. Arrow values and
+    /// validity never infer flag state.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{CellFlagChange, InsertBuilder};
+    /// # async fn append(dataset: Arc<Dataset>) -> Result<()> {
+    /// InsertBuilder::new(dataset)
+    ///     .with_cell_flags([CellFlagChange::new("embedding", "computed", true)])
+    ///     .execute(Vec::new())
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_cell_flags(mut self, changes: impl IntoIterator<Item = CellFlagChange>) -> Self {
+        let changes = changes.into_iter().collect::<Vec<_>>();
+        self.cell_flags = (!changes.is_empty()).then(|| Arc::new(changes));
         self
     }
 
@@ -203,6 +231,20 @@ impl<'a> InsertBuilder<'a> {
         );
 
         self.validate_write(&mut context, &schema)?;
+        let cell_flag_changes = self
+            .cell_flags
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let cell_flag_values = match context.dest.dataset() {
+            Some(dataset) => dataset.resolve_cell_flag_changes(cell_flag_changes)?,
+            None if cell_flag_changes.is_empty() => HashMap::new(),
+            None => {
+                return Err(Error::invalid_input(
+                    "Cell flags must be registered on an existing dataset before a write can change them",
+                ));
+            }
+        };
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
         let target_base_info = validate_and_resolve_target_bases_with_primary(
@@ -226,7 +268,12 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
+        let transaction = Self::build_transaction(
+            written_schema,
+            written_fragments,
+            &context,
+            &cell_flag_values,
+        )?;
 
         Ok((transaction, context))
     }
@@ -235,6 +282,7 @@ impl<'a> InsertBuilder<'a> {
         schema: Schema,
         fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
+        cell_flag_values: &HashMap<u32, bool>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
@@ -276,7 +324,7 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments },
         };
 
-        let transaction = TransactionBuilder::new(
+        let mut transaction = TransactionBuilder::new(
             context
                 .dest
                 .dataset()
@@ -286,6 +334,22 @@ impl<'a> InsertBuilder<'a> {
         )
         .transaction_properties(context.params.transaction_properties.clone())
         .build();
+
+        if let Some(dataset) = context.dest.dataset()
+            && !cell_flag_values.is_empty()
+        {
+            let (Operation::Append { fragments } | Operation::Overwrite { fragments, .. }) =
+                &transaction.operation
+            else {
+                unreachable!("insert only creates append or overwrite operations");
+            };
+            let fragment_states =
+                dataset.cell_flag_states_for_new_fragments(fragments, cell_flag_values)?;
+            transaction = transaction.with_cell_flag_transaction(CellFlagTransaction {
+                fragment_states,
+                ..Default::default()
+            });
+        }
 
         Ok(transaction)
     }

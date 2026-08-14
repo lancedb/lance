@@ -75,6 +75,7 @@ rayon.workspace = true
 futures.workspace = true
 uuid.workspace = true
 arrow.workspace = true
+blake3.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion.workspace = true
 datafusion-functions.workspace = true

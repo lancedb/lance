@@ -125,6 +125,9 @@ message Manifest {
   //   MemWAL SSTables still hold. Writers must refuse it too: one that does not
   //   maintain index_catchup can change an index without withdrawing the
   //   position recorded for it. Setting it is one-way.
+  // * 1 << 8: snapshot-level cell flag state is present. This is a writer-only
+  //   requirement: readers may ignore flags they do not query, but every writer
+  //   must preserve definitions and state across mutations and physical rewrites.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -217,7 +220,66 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // Cell flag definitions registered in this snapshot, sorted by flag_id.
+  // Names are unique within one stable schema field ID.
+  repeated CellFlagDefinition cell_flag_definitions = 22;
+
+  // Snapshot-level Boolean state for registered cell flags, sorted by flag_id.
+  // A registered flag with no entry is false for every row.
+  repeated CellFlagState cell_flag_states = 23;
+
+  // The next flag ID to allocate. IDs are never reused after a definition is
+  // dropped, so historical snapshots retain unambiguous identities.
+  uint32 next_cell_flag_id = 24;
 } // Manifest
+
+// Stable schema-level identity for one field-scoped Boolean cell flag.
+message CellFlagDefinition {
+  uint32 flag_id = 1;
+  int32 field_id = 2;
+  string name = 3;
+}
+
+// A reference to a file under the dataset root. When base_id is present, the
+// referenced file belongs to that base dataset (for example after a shallow
+// clone).
+message CellFlagFile {
+  string path = 1;
+  uint64 size_bytes = 2;
+  optional uint32 base_id = 3;
+  // Optional exact byte copy for small immutable roots. The referenced object
+  // remains authoritative for reachability, clone, and cleanup; readers may
+  // use this copy to avoid a separate metadata request.
+  optional bytes inline_bytes = 4;
+}
+
+// Manifest descriptor for one registered flag that has at least one true row.
+message CellFlagState {
+  uint32 flag_id = 1;
+  CellFlagFile root = 2;
+}
+
+// Immutable root for one flag's state in one snapshot. A fragment absent from
+// this list has no set rows. Entries are sorted by fragment ID.
+message CellFlagRoot {
+  repeated CellFlagFragment fragments = 1;
+}
+
+// Flag state for one physical fragment. all_set=true means every physical row
+// is true. Partial states are portable serialized Roaring
+// bitmaps of physical row offsets. Small bitmaps may be embedded in the root;
+// larger bitmaps are referenced as immutable files. all_set=false is invalid.
+message CellFlagFragment {
+  uint64 fragment_id = 1;
+  uint64 physical_rows = 2;
+
+  oneof state {
+    bool all_set = 3;
+    CellFlagFile partial = 4;
+    bytes inline_partial = 5;
+  }
+}
 
 // external dataset base path
 message BasePath {

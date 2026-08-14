@@ -4,6 +4,7 @@
 use arrow_buffer::ToByteSlice;
 use uuid::Uuid;
 
+mod cell_flag;
 mod fragment;
 mod index;
 mod manifest;
@@ -13,6 +14,10 @@ mod transaction;
 
 pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
+};
+pub use cell_flag::{
+    CellFlagDefinition, CellFlagFile, CellFlagFragment, CellFlagFragmentState, CellFlagRoot,
+    CellFlagState,
 };
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};

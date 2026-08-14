@@ -189,7 +189,14 @@ For the full specification — coverage and resolution rules, dense vs. sparse l
 versioning, index integration, compaction, and a worked example — see the
 [Data Overlay Files Specification](data_overlay_file.md).
 
+## Cell Flags
 
+Cell Flags are schema-registered, field-scoped Boolean state identified by stable
+flag and field IDs. State is false by absence and changes only through explicit
+mutation-local actions; Arrow values and NULLs do not imply it. The
+`cell_flag(field, name)` expression reads flag state without changing ordinary
+projection semantics. See the [Cell Flags specification](cell_flags.md) for
+registry, storage, query, mutation, lifecycle, and compatibility rules.
 
 ## Related Specifications
 

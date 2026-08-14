@@ -6,4 +6,4 @@
 pub(crate) mod dataframe;
 pub(crate) mod logical_plan;
 
-pub use dataframe::LanceTableProvider;
+pub use dataframe::{LanceTableProvider, SessionContextExt, register_cell_flag_analyzer};

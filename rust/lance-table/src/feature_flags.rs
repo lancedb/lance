@@ -39,12 +39,16 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// invalidating the catch-up position recorded for that index, leaving a stale
 /// position behind. Both must refuse the table.
 pub const FLAG_MEM_WAL_INDEX_CATCHUP: u64 = 128;
+/// The dataset has allocated cell flag identities. Older readers may ignore
+/// flags for ordinary field reads, but older writers must refuse the dataset so
+/// they cannot lose definitions, state, or the monotonic ID allocator.
+pub const FLAG_CELL_FLAGS: u64 = 256;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 256;
+pub const FLAG_UNKNOWN: u64 = 512;
 
 // This build only understands flags below the unknown boundary, so a bit
 // allocated at or above it would be refused by the very readers meant to use it.
-const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_CELL_FLAGS < FLAG_UNKNOWN);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -128,6 +132,13 @@ pub fn apply_feature_flags(
     if has_overlays {
         manifest.reader_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
+    }
+
+    if manifest.next_cell_flag_id != 0
+        || !manifest.cell_flag_definitions.is_empty()
+        || !manifest.cell_flag_states.is_empty()
+    {
+        manifest.writer_feature_flags |= FLAG_CELL_FLAGS;
     }
 
     if disable_transaction_file {
@@ -244,6 +255,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_CELL_FLAGS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -320,6 +332,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(super::FLAG_CELL_FLAGS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -335,6 +348,64 @@ mod tests {
                 | super::FLAG_BASE_PATHS
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_apply_feature_flags_sets_cell_flag_writer_flag_only() {
+        use crate::format::{CellFlagDefinition, CellFlagFile, CellFlagState, DataStorageFormat};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "tracked",
+            arrow_schema::DataType::Int64,
+            true,
+        )]))
+        .unwrap();
+        let field_id = schema.fields[0].id;
+        let flag_id = 0;
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(Vec::new()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.cell_flag_definitions = vec![CellFlagDefinition {
+            flag_id,
+            field_id,
+            name: "computed".to_string(),
+        }];
+        manifest.cell_flag_states = vec![CellFlagState {
+            flag_id,
+            root: CellFlagFile {
+                path: format!(
+                    "_cell_flags/roots/{flag_id}/00000000-0000-0000-0000-000000000001.root"
+                ),
+                size_bytes: 0,
+                base_id: None,
+                inline_bytes: None,
+            },
+        }];
+        manifest.next_cell_flag_id = 1;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & FLAG_CELL_FLAGS, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_CELL_FLAGS, 0);
+    }
+
+    #[test]
+    fn test_cell_flag_mixed_version_capability_behavior() {
+        // The immediately preceding feature boundary models a released reader
+        // and writer that know every earlier bit but do not know Cell Flags.
+        let legacy_supported_flags = FLAG_CELL_FLAGS - 1;
+        let reader_feature_flags = 0;
+        let writer_feature_flags = FLAG_CELL_FLAGS;
+
+        assert_eq!(reader_feature_flags & !legacy_supported_flags, 0);
+        assert_ne!(writer_feature_flags & !legacy_supported_flags, 0);
+        assert!(can_read_dataset(reader_feature_flags));
+        assert!(can_write_dataset(writer_feature_flags));
     }
 
     #[test]

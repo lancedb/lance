@@ -12,6 +12,7 @@ use std::time::Instant;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::Expr;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
@@ -30,7 +31,9 @@ use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexHandle};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser};
+use lance_index::scalar::expression::{
+    ExactRowSelection, IndexInformationProvider, MultiQueryParser,
+};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
@@ -58,6 +61,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
@@ -100,6 +104,7 @@ pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
+use lance_datafusion::udf::{FlagFragment, bound_cell_flag_snapshot};
 pub use lance_index::IndexDescription;
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
@@ -1217,6 +1222,37 @@ impl IndexInformationProvider for ScalarIndexInfo {
         self.fragment_bitmaps
             .get(&(column.to_string(), index_name.to_string()))
             .cloned()
+    }
+
+    fn exact_row_selection(&self, expr: &Expr) -> Option<Arc<ExactRowSelection>> {
+        let Expr::ScalarFunction(function) = expr else {
+            return None;
+        };
+        let (flag_id, fragments, covered_fragments) =
+            bound_cell_flag_snapshot(function.func.as_ref())?;
+        if fragments
+            .keys()
+            .any(|fragment_id| !covered_fragments.contains(*fragment_id))
+        {
+            return None;
+        }
+
+        let mut rows = RowAddrTreeMap::new();
+        for (fragment_id, state) in fragments.iter() {
+            match state {
+                FlagFragment::All => rows.insert_fragment(*fragment_id),
+                FlagFragment::Partial(bitmap) => {
+                    rows.insert_bitmap(*fragment_id, bitmap.as_ref().clone());
+                }
+            }
+        }
+        Some(Arc::new(ExactRowSelection::new(
+            format!("CellFlag(flag_id={flag_id})"),
+            expr.clone(),
+            RowAddrMask::from_allowed(rows),
+            covered_fragments,
+            true,
+        )))
     }
 }
 

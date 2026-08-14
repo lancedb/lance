@@ -26,7 +26,9 @@ use super::{
 use super::{GeoQuery, RelationQuery};
 use lance_core::{Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
-use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
+use lance_select::{
+    IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
+};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
@@ -1490,6 +1492,60 @@ impl PartialEq for ScalarIndexSearch {
     }
 }
 
+/// An exact row selection supplied by a snapshot-native metadata source.
+///
+/// This is an internal extension point for predicates whose authoritative
+/// state is already represented as a row mask, such as a cell flag. The
+/// mask participates in the same boolean algebra, stable-row-id translation,
+/// deletion filtering, and distributed result serialization as scalar-index
+/// searches without requiring a user-created index.
+#[derive(Debug, Clone, PartialEq)]
+#[doc(hidden)]
+pub struct ExactRowSelection {
+    source: String,
+    expression: Expr,
+    rows: RowAddrMask,
+    fragment_bitmap: RoaringBitmap,
+    results_are_row_addresses: bool,
+}
+
+impl ExactRowSelection {
+    /// Create an exact selection over the supplied fragment domain.
+    #[doc(hidden)]
+    pub fn new(
+        source: impl Into<String>,
+        expression: Expr,
+        rows: RowAddrMask,
+        fragment_bitmap: RoaringBitmap,
+        results_are_row_addresses: bool,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            expression,
+            rows,
+            fragment_bitmap,
+            results_are_row_addresses,
+        }
+    }
+
+    /// Complete fragment domain for which this selection is authoritative.
+    pub fn fragment_bitmap(&self) -> &RoaringBitmap {
+        &self.fragment_bitmap
+    }
+
+    fn nullable_result(&self) -> NullableIndexExprResult {
+        let mask = match self.rows.clone() {
+            RowAddrMask::AllowList(rows) => {
+                NullableRowAddrMask::AllowList(NullableRowAddrSet::new(rows, Default::default()))
+            }
+            RowAddrMask::BlockList(rows) => {
+                NullableRowAddrMask::BlockList(NullableRowAddrSet::new(rows, Default::default()))
+            }
+        };
+        NullableIndexExprResult::exact(mask)
+    }
+}
+
 /// This represents a lookup into one or more scalar indices
 ///
 /// This is a tree of operations because we may need to logically combine or
@@ -1500,6 +1556,8 @@ pub enum ScalarIndexExpr {
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
     Query(ScalarIndexSearch),
+    /// An exact snapshot-native row selection.
+    Exact(Arc<ExactRowSelection>),
 }
 
 impl PartialEq for ScalarIndexExpr {
@@ -1509,6 +1567,7 @@ impl PartialEq for ScalarIndexExpr {
             (Self::And(l0, l1), Self::And(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::Or(l0, l1), Self::Or(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::Query(l_search), Self::Query(r_search)) => l_search == r_search,
+            (Self::Exact(lhs), Self::Exact(rhs)) => lhs == rhs,
             _ => false,
         }
     }
@@ -1912,6 +1971,7 @@ impl std::fmt::Display for ScalarIndexExpr {
                 search.index_name,
                 search.index_type
             ),
+            Self::Exact(selection) => write!(f, "[{}](exact)", selection.source),
         }
     }
 }
@@ -1975,6 +2035,14 @@ impl ScalarIndexExpr {
                     Ok(result)
                 }
             }
+            Self::Exact(selection) => {
+                let result = selection.nullable_result();
+                if selection.results_are_row_addresses {
+                    index_loader.row_addr_result_to_row_ids(result).await
+                } else {
+                    Ok(result)
+                }
+            }
         }
     }
 
@@ -2004,6 +2072,7 @@ impl ScalarIndexExpr {
                 lhs.or(rhs)
             }
             Self::Query(search) => search.query.to_expr(search.column.clone()),
+            Self::Exact(selection) => selection.expression.clone(),
         }
     }
 
@@ -2012,6 +2081,7 @@ impl ScalarIndexExpr {
             Self::Not(inner) => inner.needs_recheck(),
             Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
             Self::Query(search) => search.needs_recheck,
+            Self::Exact(_) => false,
         }
     }
 }
@@ -2428,6 +2498,12 @@ fn visit_node(
             MAX_DEPTH
         )));
     }
+    if let Some(selection) = index_info.exact_row_selection(expr) {
+        return Ok(Some(IndexedExpression {
+            scalar_query: Some(ScalarIndexExpr::Exact(selection)),
+            refine_expr: None,
+        }));
+    }
     match expr {
         Expr::Between(between) => Ok(visit_between(between, index_info)),
         Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth),
@@ -2478,6 +2554,15 @@ pub trait IndexInformationProvider {
     fn fragment_bitmap(&self, _column: &str, _index_name: &str) -> Option<RoaringBitmap> {
         None
     }
+
+    /// Return a snapshot-native exact row selection for `expr`, if available.
+    ///
+    /// The default implementation exposes no native predicates. Providers
+    /// must only return selections that are exact and non-null over the entire
+    /// reported fragment bitmap.
+    fn exact_row_selection(&self, _expr: &Expr) -> Option<Arc<ExactRowSelection>> {
+        None
+    }
 }
 
 /// Attempt to split a filter expression into a search of scalar indexes and an
@@ -2510,6 +2595,7 @@ fn populate_fragment_bitmaps(
         ScalarIndexExpr::Query(search) => {
             search.fragment_bitmap = index_info.fragment_bitmap(&search.column, &search.index_name);
         }
+        ScalarIndexExpr::Exact(_) => {}
     }
 }
 
@@ -4707,7 +4793,7 @@ mod tests {
             ScalarIndexExpr::And(lhs, rhs) => 1 + test_and_depth(lhs).max(test_and_depth(rhs)),
             ScalarIndexExpr::Or(lhs, rhs) => test_and_depth(lhs).max(test_and_depth(rhs)),
             ScalarIndexExpr::Not(inner) => test_and_depth(inner),
-            ScalarIndexExpr::Query(_) => 0,
+            ScalarIndexExpr::Query(_) | ScalarIndexExpr::Exact(_) => 0,
         }
     }
 

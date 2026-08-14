@@ -570,6 +570,39 @@ def test_fragment_update_columns_basic(tmp_path):
     assert result["id"] == [1, 2, 3, 4]  # id column should remain unchanged
 
 
+def test_fragment_update_columns_preserves_cell_flags(tmp_path):
+    dataset_uri = tmp_path / "test_update_columns_cell_flags"
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": pa.array([10, 20], pa.int32())}),
+        dataset_uri,
+    )
+    dataset.register_cell_flag("value", "computed")
+    dataset.update(where="id = 1", cell_flags={"value": {"computed": True}})
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table({"id": [1], "value": pa.array([None], pa.int32())}),
+        left_on="id",
+        right_on="id",
+    )
+    operation = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+
+    dataset = lance.LanceDataset.commit(
+        str(dataset_uri), operation, read_version=dataset.version
+    )
+    result = dataset.to_table(
+        columns={
+            "id": "id",
+            "value": "value",
+            "computed": "cell_flag(value, 'computed')",
+        }
+    ).sort_by("id")
+    assert result["value"].to_pylist() == [None, 20]
+    assert result["computed"].to_pylist() == [True, False]
+
+
 def test_fragment_update_columns_with_custom_join_key(tmp_path):
     """Test fragment update columns with custom join key."""
     # Create initial dataset

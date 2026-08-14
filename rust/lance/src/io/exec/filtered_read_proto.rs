@@ -51,10 +51,10 @@ pub async fn filtered_read_exec_to_proto(
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
     let filter_schema = Arc::new(prune_schema_for_substrait(&exec.dataset().schema().into()));
-    let options = fr_options_to_proto(exec.options(), &filter_schema, state)?;
+    let options = fr_options_to_proto(exec.options(), exec.dataset(), &filter_schema, state)?;
 
     let plan = match exec.plan() {
-        Some(plan) => Some(plan_to_proto(&plan, &filter_schema, state)?),
+        Some(plan) => Some(plan_to_proto(&plan, exec.dataset(), &filter_schema, state)?),
         None => None,
     };
 
@@ -96,12 +96,13 @@ pub async fn filtered_read_exec_from_proto(
 
 fn fr_options_to_proto(
     options: &FilteredReadOptions,
+    dataset: &Dataset,
     filter_schema: &Arc<ArrowSchema>,
     state: &SessionState,
 ) -> Result<pb::FilteredReadOptionsProto> {
     let refine_filter_substrait = match &options.refine_filter {
         Some(expr) => Some(encode_substrait(
-            expr.clone(),
+            crate::dataset::cell_flag::unbind_cell_flag_expression(dataset, expr.clone())?,
             filter_schema.clone(),
             state,
         )?),
@@ -110,7 +111,7 @@ fn fr_options_to_proto(
 
     let full_filter_substrait = match &options.full_filter {
         Some(expr) => Some(encode_substrait(
-            expr.clone(),
+            crate::dataset::cell_flag::unbind_cell_flag_expression(dataset, expr.clone())?,
             filter_schema.clone(),
             state,
         )?),
@@ -210,11 +211,32 @@ async fn fr_options_from_proto(
             })?)?;
 
         if let Some(bytes) = &proto.refine_filter_substrait {
-            options.refine_filter =
-                Some(parse_substrait(bytes, filter_schema.clone(), state).await?);
+            let expression = parse_substrait(bytes, filter_schema.clone(), state).await?;
+            options.refine_filter = Some(
+                crate::dataset::cell_flag::bind_cell_flag_expression(
+                    dataset,
+                    expression,
+                    options
+                        .fragments
+                        .as_ref()
+                        .map(|fragments| fragments.as_slice()),
+                )
+                .await?,
+            );
         }
         if let Some(bytes) = &proto.full_filter_substrait {
-            options.full_filter = Some(parse_substrait(bytes, filter_schema, state).await?);
+            let expression = parse_substrait(bytes, filter_schema, state).await?;
+            options.full_filter = Some(
+                crate::dataset::cell_flag::bind_cell_flag_expression(
+                    dataset,
+                    expression,
+                    options
+                        .fragments
+                        .as_ref()
+                        .map(|fragments| fragments.as_slice()),
+                )
+                .await?,
+            );
         }
     }
 
@@ -231,6 +253,7 @@ async fn fr_options_from_proto(
 /// We detect sharing via `Arc::as_ptr()` and encode each unique expression only once.
 pub fn plan_to_proto(
     plan: &FilteredReadPlan,
+    dataset: &Dataset,
     filter_schema: &Arc<ArrowSchema>,
     state: &SessionState,
 ) -> Result<pb::FilteredReadPlanProto> {
@@ -248,8 +271,11 @@ pub fn plan_to_proto(
             Some(&id) => id,
             None => {
                 let id = filter_expressions.len() as u32;
-                let encoded =
-                    encode_substrait(expr.as_ref().clone(), filter_schema.clone(), state)?;
+                let expression = crate::dataset::cell_flag::unbind_cell_flag_expression(
+                    dataset,
+                    expr.as_ref().clone(),
+                )?;
+                let encoded = encode_substrait(expression, filter_schema.clone(), state)?;
                 filter_expressions.push(encoded);
                 ptr_to_id.insert(ptr, id);
                 id
@@ -275,7 +301,7 @@ pub fn plan_to_proto(
 
 async fn plan_from_proto(
     proto: pb::FilteredReadPlanProto,
-    _dataset: &Arc<Dataset>,
+    dataset: &Arc<Dataset>,
     state: &SessionState,
 ) -> Result<FilteredReadPlan> {
     let rows = RowAddrTreeMap::deserialize_from(Cursor::new(&proto.row_addr_tree_map))?;
@@ -291,6 +317,8 @@ async fn plan_from_proto(
         let mut decoded: Vec<Arc<Expr>> = Vec::with_capacity(proto.filter_expressions.len());
         for bytes in &proto.filter_expressions {
             let expr = parse_substrait(bytes, filter_schema.clone(), state).await?;
+            let expr =
+                crate::dataset::cell_flag::bind_cell_flag_expression(dataset, expr, None).await?;
             decoded.push(Arc::new(expr));
         }
 
@@ -486,13 +514,16 @@ mod tests {
     use arrow_array::types::UInt32Type;
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
+    use futures::TryStreamExt;
     use lance_core::datatypes::OnMissing;
+    use lance_datafusion::udf::cell_flag;
     use lance_datagen::{array, gen_batch};
     use lance_select::RowAddrTreeMap;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
+    use crate::dataset::UpdateBuilder;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[test]
@@ -602,7 +633,7 @@ mod tests {
             .with_fragment_readahead(4)
             .with_io_buffer_size(1024 * 1024);
 
-        let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        let proto = fr_options_to_proto(&options, &dataset, &filter_schema, &state).unwrap();
         let back = fr_options_from_proto(proto, &dataset, &state)
             .await
             .unwrap();
@@ -645,7 +676,7 @@ mod tests {
         options.refine_filter = Some(refine_expr);
         options.threading_mode = FilteredReadThreadingMode::MultiplePartitions(4);
 
-        let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        let proto = fr_options_to_proto(&options, &dataset, &filter_schema, &state).unwrap();
 
         // Verify filter schema IPC was generated
         assert!(proto.filter_schema_ipc.is_some());
@@ -665,6 +696,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cell_flag_filter_roundtrip_executes_after_snapshot_rebinding() {
+        let mut dataset = make_test_dataset().await.as_ref().clone();
+        dataset
+            .register_cell_flag("x", "computed", true)
+            .await
+            .unwrap();
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("x IN (5, 55)")
+            .unwrap()
+            .set_cell_flag("x", "computed", false)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = Arc::new(result.new_dataset.as_ref().clone());
+        let context = SessionContext::new();
+        lance_datafusion::udf::register_functions(&context);
+        let state = context.state();
+        // Cell flag transport uses the stable flag ID, so it remains
+        // serializable when the tracked field type is pruned from Substrait.
+        let filter_schema = Arc::new(ArrowSchema::empty());
+
+        let public_expression = cell_flag(datafusion_expr::col("x"), "computed");
+        let bound_expression =
+            crate::dataset::cell_flag::bind_cell_flag_expression(&dataset, public_expression, None)
+                .await
+                .unwrap();
+        let mut options = FilteredReadOptions::basic_full_read(&dataset);
+        options.projection = options.projection.with_row_addr();
+        options.full_filter = Some(bound_expression);
+
+        let proto = fr_options_to_proto(&options, &dataset, &filter_schema, &state).unwrap();
+        let decoded = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap();
+        let exec = FilteredReadExec::try_new(dataset, decoded, None).unwrap();
+        let batches = exec
+            .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            98
+        );
+    }
+
+    #[tokio::test]
     async fn test_options_roundtrip_with_fragments() {
         let dataset = make_test_dataset().await;
         let ctx = SessionContext::new();
@@ -676,7 +758,7 @@ mod tests {
         let options =
             FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(first_frag));
 
-        let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        let proto = fr_options_to_proto(&options, &dataset, &filter_schema, &state).unwrap();
         assert_eq!(proto.fragment_ids.len(), 1);
 
         let back = fr_options_from_proto(proto, &dataset, &state)
@@ -807,7 +889,7 @@ mod tests {
         };
 
         let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
-        let proto = plan_to_proto(&plan, &filter_schema, &state).unwrap();
+        let proto = plan_to_proto(&plan, &dataset, &filter_schema, &state).unwrap();
 
         // Verify dedup: 2 fragments but only 1 unique expression
         assert_eq!(proto.fragment_filter_ids.len(), 2);

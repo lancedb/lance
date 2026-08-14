@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::{Dataset, Error, Result};
 use arrow_array::ArrayRef;
-use arrow_array::{Array, RecordBatch, RecordBatchReader, new_null_array};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, RecordBatchReader, new_null_array};
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
@@ -69,7 +69,12 @@ impl HashJoiner {
                 for i in &keep_indices {
                     columns.push(batch.column(*i).clone());
                 }
-                RecordBatch::try_new(out_schema.clone(), columns).unwrap()
+                RecordBatch::try_new_with_options(
+                    out_schema.clone(),
+                    columns,
+                    &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
 
@@ -143,6 +148,7 @@ impl HashJoiner {
         // Indices are a pair of (batch_i, row_i). We'll add a null batch at the
         // end with one null element, and that's what we resolve when no match is
         // found.
+        let row_count = index_column.len();
         let indices = column_to_rows(index_column)?
             .into_iter()
             .map(|row| {
@@ -190,7 +196,11 @@ impl HashJoiner {
             .try_collect::<Vec<_>>()
             .await?;
 
-        Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
+        Ok(RecordBatch::try_new_with_options(
+            self.batches[0].schema(),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(row_count)),
+        )?)
     }
 
     pub fn check_lance_support_null(array: &ArrayRef, dataset: &Dataset) -> Result<()> {
@@ -222,6 +232,7 @@ impl HashJoiner {
         let left_batch_index = self.batches.len();
         // Indices are a pair of (batch_i, row_i). We'll add values in the left table at the end,
         // and when no match is found we fall back to left table values.
+        let row_count = index_column.len();
         let indices = column_to_rows(index_column)?
             .into_iter()
             .enumerate()
@@ -266,7 +277,11 @@ impl HashJoiner {
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
+        Ok(RecordBatch::try_new_with_options(
+            self.batches[0].schema(),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(row_count)),
+        )?)
     }
 
     /// Returns `true` for each row where [collect_with_fallback] would take values from the

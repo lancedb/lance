@@ -88,6 +88,7 @@ use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
+use super::cell_flag::{CellFlagExprBindings, expression_references_cell_flag};
 use super::versions;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::row_offsets_to_row_addresses;
@@ -920,6 +921,9 @@ pub struct Scanner {
     /// If this is Some then the value of `ordered` is ignored.  The scan
     /// will always be unordered since we are just going to reorder it anyways.
     ordering: Option<Vec<ColumnOrdering>>,
+    /// Dataset-bound ordering expressions. Present only when cell flag
+    /// binding rewrites an ordering key such as `cell_flag(field, name)`.
+    bound_ordering_exprs: Option<Vec<Expr>>,
 
     nearest: Option<Query>,
     nearest_query_count: usize,
@@ -974,6 +978,7 @@ pub struct Scanner {
     file_reader_options: Option<FileReaderOptions>,
 
     aggregate: Option<Aggregate>,
+    cell_flags_bound: bool,
 
     /// Which version of the relational algebra to use when generating the physical plan
     relational_algebra_version: u32,
@@ -1192,6 +1197,7 @@ impl Scanner {
             limit: None,
             offset: None,
             ordering: None,
+            bound_ordering_exprs: None,
             nearest: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
@@ -1206,6 +1212,7 @@ impl Scanner {
             strict_batch_size: false,
             file_reader_options,
             aggregate: None,
+            cell_flags_bound: false,
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
             explicit_projection: false,
@@ -1877,7 +1884,8 @@ impl Scanner {
         self
     }
 
-    /// Sort the results of the scan by one or more columns
+    /// Sort the results of the scan by one or more columns or Lance SQL
+    /// expressions such as `cell_flag(embedding, 'computed')`.
     ///
     /// If Some, then the resulting stream will be sorted according to the given ordering.
     /// This may increase the latency of the first result since all data must be read before
@@ -1890,16 +1898,22 @@ impl Scanner {
             }
             // Verify early that the fields exist
             for column in ordering {
-                self.dataset
-                    .schema()
-                    .field(&column.column_name)
-                    .ok_or(Error::invalid_input(format!(
-                        "Column {} not found",
-                        column.column_name
-                    )))?;
+                if self.dataset.schema().field(&column.column_name).is_none() {
+                    let schema = Arc::new(ArrowSchema::from(self.filterable_schema()?.as_ref()));
+                    let planner = Planner::new(schema);
+                    let expression = planner.parse_expr(&column.column_name)?;
+                    let expression = planner.optimize_expr(expression)?;
+                    if !expression_references_cell_flag(&expression)? {
+                        return Err(Error::invalid_input(format!(
+                            "Column {} not found",
+                            column.column_name
+                        )));
+                    }
+                }
             }
         }
         self.ordering = ordering;
+        self.bound_ordering_exprs = None;
         Ok(self)
     }
 
@@ -2791,8 +2805,130 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
+    fn references_cell_flag(&self) -> Result<bool> {
+        for output in &self.projection_plan.requested_output_expr {
+            if expression_references_cell_flag(&output.expr)? {
+                return Ok(true);
+            }
+        }
+
+        if let Some(filter) = &self.filter.expr_filter {
+            let references_cell_flag = match filter {
+                ExprFilter::Sql(sql) => sql.to_ascii_lowercase().contains("cell_flag"),
+                ExprFilter::Substrait(_) => true,
+                ExprFilter::Datafusion(expression) => expression_references_cell_flag(expression)?,
+            };
+            if references_cell_flag {
+                return Ok(true);
+            }
+        }
+
+        if let Some(ordering) = &self.ordering
+            && ordering
+                .iter()
+                .any(|ordering| self.dataset.schema().field(&ordering.column_name).is_none())
+        {
+            return Ok(true);
+        }
+
+        if let Some(aggregate) = &self.aggregate {
+            for expression in aggregate.group_by.iter().chain(&aggregate.aggregates) {
+                if expression_references_cell_flag(expression)? {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn bind_cell_flag_expressions(&mut self) -> Result<()> {
+        let filter_expression = self
+            .filter
+            .expr_filter
+            .as_ref()
+            .map(|filter| {
+                let filter_schema = self.filterable_schema()?;
+                filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())
+            })
+            .transpose()?;
+
+        let ordering_expressions = self
+            .ordering
+            .as_ref()
+            .map(|ordering| {
+                let filter_schema = self.filterable_schema()?;
+                let planner = Planner::new(Arc::new(ArrowSchema::from(filter_schema.as_ref())));
+                ordering
+                    .iter()
+                    .map(|ordering| {
+                        let expression = planner.parse_expr(&ordering.column_name)?;
+                        planner.optimize_expr(expression)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let mut expressions = self
+            .projection_plan
+            .requested_output_expr
+            .iter()
+            .map(|output| &output.expr)
+            .collect::<Vec<_>>();
+        expressions.extend(filter_expression.iter());
+        expressions.extend(ordering_expressions.iter());
+        if let Some(aggregate) = &self.aggregate {
+            expressions.extend(aggregate.group_by.iter());
+            expressions.extend(aggregate.aggregates.iter());
+        }
+
+        let Some(bindings) =
+            CellFlagExprBindings::try_new(&self.dataset, &expressions, self.fragments.as_deref())
+                .await?
+        else {
+            return Ok(());
+        };
+
+        for output in &mut self.projection_plan.requested_output_expr {
+            output.expr = bindings.bind(output.expr.clone(), &self.dataset)?;
+        }
+        self.projection_plan
+            .rebuild_physical_projection(self.dataset.clone())?;
+
+        if let Some(filter_expression) = filter_expression {
+            self.filter.expr_filter = Some(ExprFilter::Datafusion(
+                bindings.bind(filter_expression, &self.dataset)?,
+            ));
+        }
+        if let Some(aggregate) = &mut self.aggregate {
+            for expression in &mut aggregate.group_by {
+                *expression = bindings.bind(expression.clone(), &self.dataset)?;
+            }
+            for expression in &mut aggregate.aggregates {
+                *expression = bindings.bind(expression.clone(), &self.dataset)?;
+            }
+        }
+        if !ordering_expressions.is_empty() {
+            self.bound_ordering_exprs = Some(
+                ordering_expressions
+                    .into_iter()
+                    .map(|expression| bindings.bind(expression, &self.dataset))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(())
+    }
+
     #[instrument(level = "debug", skip_all)]
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        if !self.cell_flags_bound && self.references_cell_flag()? {
+            let mut bound = self.clone();
+            bound.cell_flags_bound = true;
+            bound.bind_cell_flag_expressions().await?;
+            return Box::pin(bound.create_plan()).await;
+        }
+
         log::trace!("creating scanner plan");
         self.validate_options()?;
 
@@ -2891,10 +3027,23 @@ impl Scanner {
         // grab the ordering column in the initial scan (if it is eager) and if it isn't then we should
         // take it after the filtering phase, if any (we already have a take there).
         if let Some(ordering) = &self.ordering {
-            pre_filter_projection = pre_filter_projection.union_columns(
-                ordering.iter().map(|col| &col.column_name),
-                OnMissing::Error,
-            )?;
+            let ordering_columns = self
+                .bound_ordering_exprs
+                .as_ref()
+                .map(|expressions| {
+                    expressions
+                        .iter()
+                        .flat_map(Planner::column_names_in_expr)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    ordering
+                        .iter()
+                        .map(|ordering| ordering.column_name.clone())
+                        .collect()
+                });
+            pre_filter_projection =
+                pre_filter_projection.union_columns(&ordering_columns, OnMissing::Error)?;
         }
 
         plan = self.take(plan, pre_filter_projection)?;
@@ -2931,22 +3080,46 @@ impl Scanner {
 
         // Sort
         if let Some(ordering) = &self.ordering {
-            let ordering_columns = ordering.iter().map(|col| &col.column_name);
+            let ordering_columns = self
+                .bound_ordering_exprs
+                .as_ref()
+                .map(|expressions| {
+                    expressions
+                        .iter()
+                        .flat_map(Planner::column_names_in_expr)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    ordering
+                        .iter()
+                        .map(|ordering| ordering.column_name.clone())
+                        .collect()
+                });
             let projection_with_ordering = self
                 .dataset
                 .empty_projection()
-                .union_columns(ordering_columns, OnMissing::Error)?;
+                .union_columns(&ordering_columns, OnMissing::Error)?;
             // We haven't loaded the sort column yet so take it now
             plan = self.take(plan, projection_with_ordering)?;
+            let ordering_schema = DFSchema::try_from(plan.schema().as_ref().clone())?;
             let col_exprs = ordering
                 .iter()
-                .map(|col| {
+                .enumerate()
+                .map(|(index, col)| {
                     Ok(PhysicalSortExpr {
-                        expr: Self::create_column_expr(
-                            &col.column_name,
-                            &self.dataset,
-                            plan.schema().as_ref(),
-                        )?,
+                        expr: if let Some(expressions) = &self.bound_ordering_exprs {
+                            create_physical_expr(
+                                &expressions[index],
+                                &ordering_schema,
+                                &ExecutionProps::default(),
+                            )?
+                        } else {
+                            Self::create_column_expr(
+                                &col.column_name,
+                                &self.dataset,
+                                plan.schema().as_ref(),
+                            )?
+                        },
                         options: SortOptions {
                             descending: !col.ascending,
                             nulls_first: col.nulls_first,
@@ -5115,6 +5288,7 @@ impl Scanner {
                     search.index_name
                 ))
             }),
+            ScalarIndexExpr::Exact(selection) => Ok(selection.fragment_bitmap().clone()),
         }
     }
 
@@ -5180,6 +5354,7 @@ impl Scanner {
                     stack.push(rhs);
                 }
                 ScalarIndexExpr::Query(search) => searches.push(search),
+                ScalarIndexExpr::Exact(_) => {}
             }
         }
 
@@ -6718,6 +6893,7 @@ mod test {
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+    use lance_datafusion::udf::cell_flag;
     use lance_datagen::{
         ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount, array, gen_batch,
     };
@@ -6748,6 +6924,21 @@ mod test {
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
+
+    #[tokio::test]
+    async fn test_cell_flag_binding_fast_path_for_ordinary_scan() {
+        let test_dataset = TestVectorDataset::new(LanceFileVersion::V2_2, false)
+            .await
+            .unwrap();
+        let mut scanner = test_dataset.dataset.scan();
+
+        assert!(!scanner.references_cell_flag().unwrap());
+        scanner.filter("i > 10").unwrap();
+        assert!(!scanner.references_cell_flag().unwrap());
+
+        scanner.filter_expr(cell_flag(col("i"), "computed"));
+        assert!(scanner.references_cell_flag().unwrap());
+    }
 
     #[test]
     fn test_fts_query_contract_rejects_invalid_values() {

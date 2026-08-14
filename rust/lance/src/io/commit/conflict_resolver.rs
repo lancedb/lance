@@ -72,12 +72,50 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
+fn cell_flag_replacing_fragment_ids(operation: &Operation) -> HashSet<u64> {
+    match operation {
+        Operation::Rewrite { groups, .. } => groups
+            .iter()
+            .flat_map(|group| group.old_fragments.iter().map(|fragment| fragment.id))
+            .collect(),
+        Operation::Update {
+            updated_fragments,
+            removed_fragment_ids,
+            new_fragments,
+            ..
+        } if !new_fragments.is_empty()
+            || !updated_fragments.is_empty()
+            || !removed_fragment_ids.is_empty() =>
+        {
+            updated_fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .chain(removed_fragment_ids.iter().copied())
+                .collect()
+        }
+        _ => HashSet::new(),
+    }
+}
+
+fn cell_flag_row_changes_conflict(
+    ours: &crate::dataset::transaction::CellFlagConflictScope,
+    theirs: &crate::dataset::transaction::CellFlagConflictScope,
+) -> bool {
+    ours.row_addresses_by_flag.iter().any(|(flag_id, rows)| {
+        theirs
+            .row_addresses_by_flag
+            .get(flag_id)
+            .is_some_and(|other_rows| !rows.is_disjoint(other_rows))
+    })
+}
+
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
         dataset: &Dataset,
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        let cell_flag_fragment_ids = transaction.cell_flag_conflict_scope()?.row_fragment_ids;
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -107,16 +145,23 @@ impl<'a> TransactionRebase<'a> {
                 removed_fragment_ids: deleted_fragment_ids,
                 ..
             } => {
-                let modified_fragment_ids = updated_fragments
+                let operation_modified_fragment_ids = updated_fragments
                     .iter()
                     .map(|f| f.id)
                     .chain(deleted_fragment_ids.iter().copied())
+                    .collect::<HashSet<_>>();
+                let modified_fragment_ids = operation_modified_fragment_ids
+                    .union(&cell_flag_fragment_ids)
+                    .copied()
                     .collect::<HashSet<_>>();
 
                 // short circuit for full fragment update or delete case
                 // set affected_rows as None with non-empty modified_fragment_ids
                 // to indicate this condition to be used in [check_delete_update_txn]
-                if updated_fragments.is_empty() && affected_rows.is_some() {
+                if updated_fragments.is_empty()
+                    && affected_rows.is_some()
+                    && !operation_modified_fragment_ids.is_empty()
+                {
                     return Ok(Self {
                         transaction,
                         initial_fragments: HashMap::new(),
@@ -276,6 +321,30 @@ impl<'a> TransactionRebase<'a> {
         let theirs = &other_transaction.operation;
         if (may_alter_nullability(ours) && supplies_values(theirs))
             || (supplies_values(ours) && may_alter_nullability(theirs))
+        {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+
+        let our_cell_flags = self.transaction.cell_flag_conflict_scope()?;
+        let their_cell_flags = other_transaction.cell_flag_conflict_scope()?;
+        let our_cell_flag_replacements = cell_flag_replacing_fragment_ids(ours);
+        let their_cell_flag_replacements = cell_flag_replacing_fragment_ids(theirs);
+        if cell_flag_row_changes_conflict(&our_cell_flags, &their_cell_flags)
+            || !our_cell_flags
+                .row_fragment_ids
+                .is_disjoint(&their_cell_flag_replacements)
+            || !their_cell_flags
+                .row_fragment_ids
+                .is_disjoint(&our_cell_flag_replacements)
+            || (our_cell_flags.changes_registry && their_cell_flags.changes_registry)
+            || (our_cell_flags.changes_registry
+                && (supplies_values(theirs)
+                    || !their_cell_flag_replacements.is_empty()
+                    || !their_cell_flags.row_fragment_ids.is_empty()))
+            || (their_cell_flags.changes_registry
+                && (supplies_values(ours)
+                    || !our_cell_flag_replacements.is_empty()
+                    || !our_cell_flags.row_fragment_ids.is_empty()))
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
@@ -1710,7 +1779,8 @@ impl<'a> TransactionRebase<'a> {
 
     /// Writes
     pub async fn finish(self, dataset: &Dataset) -> Result<Transaction> {
-        match &self.transaction.operation {
+        let cell_flag_transaction = self.transaction.cell_flag_transaction()?;
+        let transaction = match &self.transaction.operation {
             Operation::Delete { .. } | Operation::Update { .. } => {
                 self.finish_delete_update(dataset).await
             }
@@ -1728,7 +1798,12 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
-        }
+        }?;
+        Ok(if let Some(changes) = cell_flag_transaction {
+            transaction.with_cell_flag_transaction(changes)
+        } else {
+            transaction
+        })
     }
 
     async fn finish_delete_update(mut self, dataset: &Dataset) -> Result<Transaction> {
@@ -2258,7 +2333,9 @@ mod tests {
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
-    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup};
+    use crate::dataset::transaction::{
+        CellFlagRowChange, CellFlagTransaction, DataReplacementGroup, RewriteGroup,
+    };
     use crate::dataset::write::WriteMode;
     use crate::session::caches::DeletionFileKey;
     use crate::{
@@ -2411,6 +2488,110 @@ mod tests {
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
+    }
+
+    #[tokio::test]
+    async fn cell_flag_row_changes_use_exact_conflicts_and_reject_row_moving_rewrites() {
+        let dataset = test_dataset(4, 2).await;
+        let affected_rows = RowAddrTreeMap::from_iter([1_u64]);
+        let invalidation = Transaction::new_from_version(
+            dataset.manifest.version,
+            Operation::Update {
+                removed_fragment_ids: Vec::new(),
+                updated_fragments: Vec::new(),
+                new_fragments: Vec::new(),
+                fields_modified: Vec::new(),
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: Vec::new(),
+                update_mode: Some(RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+        )
+        .with_cell_flag_transaction(CellFlagTransaction {
+            row_changes: vec![CellFlagRowChange {
+                flag_id: 1,
+                value: false,
+                row_addresses: roaring::RoaringTreemap::from_iter([1_u64]),
+            }],
+            ..Default::default()
+        });
+        let rewrite = Transaction::new_from_version(
+            dataset.manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![dataset.manifest.fragments[0].clone()],
+                    new_fragments: vec![Fragment::new(2)],
+                }],
+                rewritten_indices: Vec::new(),
+                frag_reuse_index: None,
+            },
+        );
+
+        let rewrite_columns = Transaction::new_from_version(
+            dataset.manifest.version,
+            Operation::Update {
+                removed_fragment_ids: Vec::new(),
+                updated_fragments: vec![dataset.manifest.fragments[0].clone()],
+                new_fragments: Vec::new(),
+                fields_modified: vec![1],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: Vec::new(),
+                update_mode: Some(RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+        );
+
+        for replacement in [rewrite, rewrite_columns] {
+            let mut invalidation_rebase =
+                TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
+                    .await
+                    .unwrap();
+            assert!(matches!(
+                invalidation_rebase.check_txn(&replacement, dataset.manifest.version + 1),
+                Err(Error::RetryableCommitConflict { .. })
+            ));
+
+            let mut replacement_rebase = TransactionRebase::try_new(&dataset, replacement, None)
+                .await
+                .unwrap();
+            assert!(matches!(
+                replacement_rebase.check_txn(&invalidation, dataset.manifest.version + 1),
+                Err(Error::RetryableCommitConflict { .. })
+            ));
+        }
+
+        let flag_change = |flag_id, row_address| {
+            Transaction::new_from_version(dataset.manifest.version, invalidation.operation.clone())
+                .with_cell_flag_transaction(CellFlagTransaction {
+                    row_changes: vec![CellFlagRowChange {
+                        flag_id,
+                        value: true,
+                        row_addresses: roaring::RoaringTreemap::from_iter([row_address]),
+                    }],
+                    ..Default::default()
+                })
+        };
+
+        for compatible in [flag_change(1, 2), flag_change(2, 1)] {
+            let mut rebase =
+                TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
+                    .await
+                    .unwrap();
+            rebase
+                .check_txn(&compatible, dataset.manifest.version + 1)
+                .unwrap();
+        }
+
+        let mut overlapping_rebase =
+            TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
+                .await
+                .unwrap();
+        assert!(matches!(
+            overlapping_rebase.check_txn(&flag_change(1, 1), dataset.manifest.version + 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
     }
 
     async fn apply_deletion(

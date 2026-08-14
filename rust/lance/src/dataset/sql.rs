@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::datafusion::LanceTableProvider;
+use crate::datafusion::{LanceTableProvider, register_cell_flag_analyzer};
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
@@ -89,6 +89,7 @@ impl SqlQueryBuilder {
         }
         ctx.register_table(self.table_name, Arc::new(provider))?;
         register_functions(&ctx);
+        register_cell_flag_analyzer(&ctx);
         let df = ctx.sql(&self.sql).await?;
         Ok(SqlQuery::new(df))
     }

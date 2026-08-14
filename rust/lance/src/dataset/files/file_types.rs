@@ -11,6 +11,7 @@ pub enum FileType {
     DeletionFile = 2,
     TransactionFile = 3,
     IndexFile = 4,
+    CellFlagFile = 5,
 }
 
 impl std::fmt::Display for FileType {
@@ -21,6 +22,7 @@ impl std::fmt::Display for FileType {
             Self::DeletionFile => "deletion file",
             Self::TransactionFile => "transaction file",
             Self::IndexFile => "index file",
+            Self::CellFlagFile => "cell flag file",
         };
         write!(f, "{s}")
     }
@@ -40,12 +42,13 @@ mod tests {
 
     use crate::dataset::files::arrow::FILE_TYPE_DICT_ARRAY;
 
-    const ALL: [FileType; 5] = [
+    const ALL: [FileType; 6] = [
         FileType::Manifest,
         FileType::DataFile,
         FileType::DeletionFile,
         FileType::TransactionFile,
         FileType::IndexFile,
+        FileType::CellFlagFile,
     ];
 
     /// The discriminants double as dictionary keys for the `tracked_files`

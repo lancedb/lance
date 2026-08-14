@@ -4024,6 +4024,7 @@ dependencies = [
  "async-trait",
  "async_cell",
  "aws-sdk-dynamodb",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",
@@ -4194,6 +4195,7 @@ dependencies = [
  "pin-project",
  "prost",
  "prost-build",
+ "roaring",
  "tokio",
  "tracing",
 ]

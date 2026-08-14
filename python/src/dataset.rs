@@ -45,8 +45,8 @@ use lance::dataset::scanner::{
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
-    BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
-    WriteDestination,
+    BatchInfo, BatchUDF, CellFlagChange, CommitBuilder, MergeStats, NewColumnTransform,
+    UDFCheckpointStore, WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::dataset::{
@@ -128,6 +128,22 @@ const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
 type PyBlobBytes = Option<Py<PyBytes>>;
+
+type PyCellFlagChanges = HashMap<String, HashMap<String, bool>>;
+
+fn parse_cell_flag_changes(value: Option<PyCellFlagChanges>) -> Vec<CellFlagChange> {
+    let mut changes = value
+        .into_iter()
+        .flat_map(|fields| fields.into_iter())
+        .flat_map(|(field, flags)| {
+            flags
+                .into_iter()
+                .map(move |(name, value)| CellFlagChange::new(field.clone(), name, value))
+        })
+        .collect::<Vec<_>>();
+    changes.sort_by(|left, right| (left.field(), left.name()).cmp(&(right.field(), right.name())));
+    changes
+}
 type PyReadBlob = (u64, PyBlobBytes);
 type PyReadBlobRange = (usize, u64, PyBlobBytes);
 
@@ -388,6 +404,32 @@ impl MergeInsertBuilder {
 
     pub fn when_not_matched_insert_all(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
         slf.builder.when_not_matched(WhenNotMatched::InsertAll);
+        Ok(slf)
+    }
+
+    /// Set a registered cell flag on matched target rows.
+    pub fn set_matched_cell_flag(
+        mut slf: PyRefMut<Self>,
+        field: String,
+        name: String,
+        value: bool,
+    ) -> PyResult<PyRefMut<Self>> {
+        slf.builder
+            .set_matched_cell_flag(field, name, value)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(slf)
+    }
+
+    /// Set a registered cell flag on rows inserted by the not-matched action.
+    pub fn set_inserted_cell_flag(
+        mut slf: PyRefMut<Self>,
+        field: String,
+        name: String,
+        value: bool,
+    ) -> PyResult<PyRefMut<Self>> {
+        slf.builder
+            .set_inserted_cell_flag(field, name, value)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(slf)
     }
 
@@ -1837,6 +1879,58 @@ impl Dataset {
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }
 
+    fn cell_flag_definitions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let definitions = PyList::empty(py);
+        for definition in self.ds.cell_flag_definitions() {
+            let value = PyDict::new(py);
+            value.set_item("flag_id", definition.flag_id)?;
+            value.set_item("field_id", definition.field_id)?;
+            value.set_item("name", &definition.name)?;
+            definitions.append(value)?;
+        }
+        Ok(definitions.into_any().unbind())
+    }
+
+    #[pyo3(signature=(field, name, initial_value=false))]
+    fn register_cell_flag(
+        &mut self,
+        py: Python<'_>,
+        field: String,
+        name: String,
+        initial_value: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let mut new_self = self.ds.as_ref().clone();
+        let definition = rt()
+            .block_on(
+                None,
+                new_self.register_cell_flag(field, name, initial_value),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+
+        let value = PyDict::new(py);
+        value.set_item("flag_id", definition.flag_id)?;
+        value.set_item("field_id", definition.field_id)?;
+        value.set_item("name", definition.name)?;
+        Ok(value.into_any().unbind())
+    }
+
+    fn rename_cell_flag(&mut self, field: String, name: String, new_name: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.rename_cell_flag(field, name, new_name))?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn drop_cell_flag(&mut self, field: String, name: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.drop_cell_flag(field, name))?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn alter_columns(&mut self, alterations: &Bound<'_, PyList>) -> PyResult<()> {
         let alterations = alterations
             .iter()
@@ -1895,17 +1989,20 @@ impl Dataset {
         Ok(())
     }
 
+    #[pyo3(signature=(reader, left_on, right_on, cell_flags=None))]
     fn merge(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
+        cell_flags: Option<PyCellFlagChanges>,
     ) -> PyResult<()> {
+        let cell_flags = parse_cell_flag_changes(cell_flags);
         let mut new_self = self.ds.as_ref().clone();
         let new_self = rt()
             .spawn(None, async move {
                 new_self
-                    .merge(reader.0, &left_on, &right_on)
+                    .merge_with_cell_flags(reader.0, &left_on, &right_on, &cell_flags)
                     .await
                     .map(|_| new_self)
             })?
@@ -1941,13 +2038,15 @@ impl Dataset {
         Ok(dict.into())
     }
 
-    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
+    #[pyo3(signature=(updates=None, predicate=None, conflict_retries=None, retry_timeout=None, cell_flags=None))]
     fn update(
         &mut self,
-        updates: &Bound<'_, PyDict>,
+        py: Python<'_>,
+        updates: Option<&Bound<'_, PyDict>>,
         predicate: Option<&str>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
+        cell_flags: Option<PyCellFlagChanges>,
     ) -> PyResult<Py<PyAny>> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
@@ -1964,13 +2063,21 @@ impl Dataset {
             builder = builder.retry_timeout(timeout);
         }
 
-        for (key, value) in updates {
-            let column: PyBackedStr = key.cast::<PyString>()?.clone().try_into()?;
-            let expr: PyBackedStr = value.cast::<PyString>()?.clone().try_into()?;
-
+        for change in parse_cell_flag_changes(cell_flags) {
             builder = builder
-                .set(column, &expr)
+                .set_cell_flag(change.field(), change.name(), change.value())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
+        if let Some(updates) = updates {
+            for (key, value) in updates {
+                let column: PyBackedStr = key.cast::<PyString>()?.clone().try_into()?;
+                let expr: PyBackedStr = value.cast::<PyString>()?.clone().try_into()?;
+
+                builder = builder
+                    .set(column, &expr)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
         }
 
         let operation = builder
@@ -1982,7 +2089,7 @@ impl Dataset {
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         self.ds = new_self.new_dataset;
-        let update_dict = PyDict::new(updates.py());
+        let update_dict = PyDict::new(py);
         let num_rows_updated = new_self.rows_updated;
         update_dict.set_item("num_rows_updated", num_rows_updated)?;
         Ok(update_dict.into())
@@ -4578,6 +4685,8 @@ pub fn write_dataset(
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
     let params = get_write_params(options, &dest.table_root_uri()?)?;
+    let cell_flags =
+        parse_cell_flag_changes(get_dict_opt::<PyCellFlagChanges>(options, "cell_flags")?);
     let py = options.py();
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
@@ -4587,14 +4696,14 @@ pub fn write_dataset(
 
         rt().block_on(
             Some(py),
-            LanceDataset::write(batches, dest.as_dest(), params),
+            LanceDataset::write_with_cell_flags(batches, dest.as_dest(), params, cell_flags),
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
         rt().block_on(
             Some(py),
-            LanceDataset::write(batches, dest.as_dest(), params),
+            LanceDataset::write_with_cell_flags(batches, dest.as_dest(), params, cell_flags),
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?
     };

@@ -56,7 +56,9 @@ use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
         fragment::FileFragment,
-        transaction::{Operation, Transaction},
+        transaction::{
+            CellFlagRowChange, CellFlagTransaction, Operation, Transaction, UpdatedFragmentOffsets,
+        },
         versions,
         write::merge_insert::logical_plan::MergeInsertPlanner,
     },
@@ -149,6 +151,58 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+async fn resolve_row_ids(dataset: &Dataset, row_ids: Vec<u64>) -> Result<Vec<u64>> {
+    let Some(index) = get_row_id_index(dataset).await? else {
+        return Ok(row_ids);
+    };
+    row_ids
+        .into_iter()
+        .map(|row_id| {
+            index.get(row_id).map(Into::into).ok_or_else(|| {
+                Error::internal(format!("Row ID {} is missing from the index", row_id))
+            })
+        })
+        .collect()
+}
+
+async fn resolve_optional_row_ids(
+    dataset: &Dataset,
+    row_ids: Vec<Option<u64>>,
+) -> Result<Vec<Option<u64>>> {
+    let Some(index) = get_row_id_index(dataset).await? else {
+        return Ok(row_ids);
+    };
+    row_ids
+        .into_iter()
+        .map(|row_id| {
+            row_id
+                .map(|row_id| {
+                    index.get(row_id).map(Into::into).ok_or_else(|| {
+                        Error::internal(format!("Row ID {} is missing from the index", row_id))
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+fn cell_flag_row_changes(
+    values: &BTreeMap<u32, bool>,
+    row_addresses: &RoaringTreemap,
+) -> Vec<CellFlagRowChange> {
+    if row_addresses.is_empty() {
+        return Vec::new();
+    }
+    values
+        .iter()
+        .map(|(flag_id, value)| CellFlagRowChange {
+            flag_id: *flag_id,
+            value: *value,
+            row_addresses: row_addresses.clone(),
+        })
+        .collect()
+}
 
 struct UpdatedRowAddrReconciler<I>
 where
@@ -477,6 +531,10 @@ struct MergeInsertParams {
     // Target all registered bases, mirroring WriteParams::target_all_bases.
     // Some(include_primary); resolved at execution time.
     target_all_bases: Option<bool>,
+    // Explicit values for flags on matched target rows.
+    matched_cell_flag_values: BTreeMap<u32, bool>,
+    // Explicit values for flags on newly inserted rows.
+    inserted_cell_flag_values: BTreeMap<u32, bool>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -569,6 +627,9 @@ impl MergeInsertBuilder {
             // lowercased column names from SQL parsing or user input
             on.iter()
                 .map(|col| {
+                    if col == ROW_ID {
+                        return Ok(ROW_ID.to_string());
+                    }
                     dataset
                         .schema()
                         .field_case_insensitive(col)
@@ -601,6 +662,8 @@ impl MergeInsertBuilder {
                 target_bases: None,
                 target_base_names_or_paths: None,
                 target_all_bases: None,
+                matched_cell_flag_values: BTreeMap::new(),
+                inserted_cell_flag_values: BTreeMap::new(),
             },
         })
     }
@@ -628,6 +691,83 @@ impl MergeInsertBuilder {
     pub fn when_not_matched_by_source(&mut self, behavior: WhenNotMatchedBySource) -> &mut Self {
         self.params.delete_not_matched_by_source = behavior;
         self
+    }
+
+    /// Set a registered cell flag on matched target rows.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    /// # fn build(dataset: Arc<Dataset>) -> Result<()> {
+    /// let mut merge = MergeInsertBuilder::try_new(dataset, vec!["_rowid".to_string()])?;
+    /// merge
+    ///     .when_matched(WhenMatched::UpdateAll)
+    ///     .when_not_matched(WhenNotMatched::DoNothing)
+    ///     .set_matched_cell_flag("embedding", "lancedb.computed", false)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_matched_cell_flag(
+        &mut self,
+        field: impl AsRef<str>,
+        name: impl AsRef<str>,
+        value: bool,
+    ) -> Result<&mut Self> {
+        let definition = self
+            .dataset
+            .resolve_cell_flag_definition(field.as_ref(), name.as_ref())?;
+        if self
+            .params
+            .matched_cell_flag_values
+            .insert(definition.flag_id, value)
+            .is_some()
+        {
+            return Err(Error::invalid_input(format!(
+                "Cell flag '{}' for matched field '{}' is changed more than once",
+                name.as_ref(),
+                field.as_ref()
+            )));
+        }
+        Ok(self)
+    }
+
+    /// Set a registered cell flag on rows inserted by the not-matched action.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::write::merge_insert::{MergeInsertBuilder, WhenNotMatched};
+    /// # fn build(dataset: Arc<Dataset>) -> Result<()> {
+    /// let mut merge = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?;
+    /// merge
+    ///     .when_not_matched(WhenNotMatched::InsertAll)
+    ///     .set_inserted_cell_flag("embedding", "lancedb.computed", true)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_inserted_cell_flag(
+        &mut self,
+        field: impl AsRef<str>,
+        name: impl AsRef<str>,
+        value: bool,
+    ) -> Result<&mut Self> {
+        let definition = self
+            .dataset
+            .resolve_cell_flag_definition(field.as_ref(), name.as_ref())?;
+        if self
+            .params
+            .inserted_cell_flag_values
+            .insert(definition.flag_id, value)
+            .is_some()
+        {
+            return Err(Error::invalid_input(format!(
+                "Cell flag '{}' for inserted field '{}' is changed more than once",
+                name.as_ref(),
+                field.as_ref()
+            )));
+        }
+        Ok(self)
     }
 
     /// Set number of times to retry the operation if there is contention.
@@ -774,9 +914,44 @@ impl MergeInsertBuilder {
 
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
+        if !self.params.matched_cell_flag_values.is_empty()
+            && !matches!(
+                self.params.when_matched,
+                WhenMatched::DoNothing
+                    | WhenMatched::UpdateAll
+                    | WhenMatched::UpdateIf(_)
+                    | WhenMatched::UpdateIfExpr(_)
+            )
+        {
+            return Err(Error::invalid_input(
+                "Matched cell flag changes require a do-nothing or update matched action",
+            ));
+        }
+        if !self.params.inserted_cell_flag_values.is_empty() && !self.params.insert_not_matched {
+            return Err(Error::invalid_input(
+                "Inserted cell flag changes require an insert not-matched action",
+            ));
+        }
+        if self.params.on.iter().any(|column| column == ROW_ID)
+            && (self.params.on.len() != 1
+                || self.params.insert_not_matched
+                || self.params.delete_not_matched_by_source != WhenNotMatchedBySource::Keep
+                || !matches!(
+                    self.params.when_matched,
+                    WhenMatched::UpdateAll
+                        | WhenMatched::UpdateIf(_)
+                        | WhenMatched::UpdateIfExpr(_)
+                        | WhenMatched::DoNothing
+                ))
+        {
+            return Err(Error::invalid_input(
+                "_rowid is supported only as the sole key of an update-only merge insert",
+            ));
+        }
         if !self.params.insert_not_matched
             && self.params.when_matched == WhenMatched::DoNothing
             && self.params.delete_not_matched_by_source == WhenNotMatchedBySource::Keep
+            && self.params.matched_cell_flag_values.is_empty()
         {
             return Err(Error::invalid_input(
                 "The merge insert job is not configured to change the data in any way",
@@ -964,7 +1139,8 @@ impl MergeInsertJob {
     }
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<SchemaComparison> {
-        let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
+        let user_schema = schema.without_column(ROW_ID).without_column(ROW_ADDR);
+        let lance_schema: lance_core::datatypes::Schema = (&user_schema).try_into()?;
         let target_schema = self.dataset.schema();
 
         let version = self
@@ -1278,12 +1454,25 @@ impl MergeInsertJob {
             }
             SchemaComparison::Subschema => {
                 let existing = session_ctx.read_lance(self.dataset.clone(), true, true)?;
-                let columns = schema
+                let row_id_is_join_key = self.params.on.len() == 1 && self.params.on[0] == ROW_ID;
+                let mut column_names = schema
                     .field_names()
-                    .iter()
-                    .map(|s| s.as_str())
-                    .chain([ROW_ID, ROW_ADDR])
+                    .into_iter()
+                    .filter(|name| name.as_str() != ROW_ID && name.as_str() != ROW_ADDR)
+                    .cloned()
                     .collect::<Vec<_>>();
+                if row_id_is_join_key {
+                    column_names.insert(
+                        schema
+                            .index_of(ROW_ID)
+                            .expect("_rowid join key is in source schema"),
+                        ROW_ID.to_string(),
+                    );
+                    column_names.push(ROW_ADDR.to_string());
+                } else {
+                    column_names.extend([ROW_ID.to_string(), ROW_ADDR.to_string()]);
+                }
+                let columns = column_names.iter().map(String::as_str).collect::<Vec<_>>();
                 let projected = existing.select_columns(&columns)?;
                 // We need to rename the columns from the target table so that they don't conflict with the source table
                 let projected = Self::prefix_columns(projected, "target_");
@@ -2223,6 +2412,9 @@ impl MergeInsertJob {
     /// `InvalidInput` error, because inserted rows would otherwise attempt to
     /// write a non-nullable NULL downstream.
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
+        if self.params.on.iter().any(|column| column == ROW_ID) {
+            return Ok(false);
+        }
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
         let full_schema = self.dataset.schema();
@@ -2351,7 +2543,11 @@ impl MergeInsertJob {
         // The slow path consumes a single stream; adapt the provider back into one.
         let source = provider_to_stream(provider).await?;
         let source_schema = source.schema();
-        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
+        let data_source_schema = source_schema
+            .as_ref()
+            .without_column(ROW_ID)
+            .without_column(ROW_ADDR);
+        let lance_schema = lance_core::datatypes::Schema::try_from(&data_source_schema)?;
         let full_schema = self.dataset.schema();
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
@@ -2372,6 +2568,8 @@ impl MergeInsertJob {
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let updating_row_ids = merger.updating_row_ids.clone();
+        let matched_flag_row_ids = merger.matched_flag_row_ids.clone();
+        let output_source_row_ids = merger.output_source_row_ids.clone();
         let merger_schema = merger.output_schema().clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
@@ -2395,22 +2593,14 @@ impl MergeInsertJob {
         let is_delete_only = matches!(self.params.when_matched, WhenMatched::Delete)
             && !self.params.insert_not_matched;
 
-        let (operation, affected_rows) = if is_delete_only {
+        let (operation, affected_rows, cell_flag_changes) = if is_delete_only {
             // Consume the stream so the merger records the matched row ids in
             // `deleted_rows`; it produces no batches.
             let drained: Vec<RecordBatch> = Box::pin(stream).try_collect().await?;
             debug_assert!(drained.is_empty(), "delete-only merge must not emit rows");
 
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
-            let removed_row_addr_vec =
-                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    removed_row_ids
-                        .iter()
-                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                        .collect::<Vec<_>>()
-                } else {
-                    removed_row_ids
-                };
+            let removed_row_addr_vec = resolve_row_ids(&self.dataset, removed_row_ids).await?;
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec);
 
             let (updated_fragments, removed_fragment_ids) =
@@ -2433,7 +2623,7 @@ impl MergeInsertJob {
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (operation, affected_rows, CellFlagTransaction::default())
         } else if !is_full_schema {
             // Non-delete partial-schema merge: patch the provided columns into
             // existing fragments in place. (Delete is handled above; a wider
@@ -2455,6 +2645,42 @@ impl MergeInsertJob {
             )
             .await?;
 
+            let updated_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
+            let updated_row_addrs =
+                RoaringTreemap::from_iter(resolve_row_ids(&self.dataset, updated_row_ids).await?);
+            let matched_flag_row_ids = Arc::into_inner(matched_flag_row_ids)
+                .unwrap()
+                .into_inner()
+                .unwrap();
+            let matched_flag_row_addrs = RoaringTreemap::from_iter(
+                resolve_row_ids(&self.dataset, matched_flag_row_ids).await?,
+            );
+            let mut offsets = HashMap::new();
+            for raw_address in &updated_row_addrs {
+                let address = RowAddress::from(raw_address);
+                offsets
+                    .entry(address.fragment_id() as u64)
+                    .or_insert_with(roaring::RoaringBitmap::new)
+                    .insert(address.row_offset());
+            }
+            let inserted_values = self
+                .params
+                .inserted_cell_flag_values
+                .iter()
+                .map(|(flag_id, value)| (*flag_id, *value))
+                .collect();
+            let fragment_states = self
+                .dataset
+                .exact_cell_flag_states_for_inserted_fragments(&new_fragments, &inserted_values)?;
+            let cell_flag_changes = CellFlagTransaction {
+                row_changes: cell_flag_row_changes(
+                    &self.params.matched_cell_flag_values,
+                    &matched_flag_row_addrs,
+                ),
+                fragment_states,
+                ..Default::default()
+            };
+
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
@@ -2464,11 +2690,13 @@ impl MergeInsertJob {
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
-                updated_fragment_offsets: None,
+                updated_fragment_offsets: (!offsets.is_empty())
+                    .then_some(UpdatedFragmentOffsets(offsets)),
             };
-            // We have rewritten the fragments, not just the deletion files, so
-            // we can't use affected rows here.
-            (operation, None)
+            let mut affected_row_addrs = updated_row_addrs;
+            affected_row_addrs |= matched_flag_row_addrs;
+            let affected_rows = Some(RowAddrTreeMap::from(affected_row_addrs));
+            (operation, affected_rows, cell_flag_changes)
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
@@ -2515,16 +2743,7 @@ impl MergeInsertJob {
                 // Apply deletions
                 let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
 
-                let removed_row_addr_vec =
-                    if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                        let addresses: Vec<u64> = removed_row_ids
-                            .iter()
-                            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                            .collect::<Vec<_>>();
-                        addresses
-                    } else {
-                        removed_row_ids
-                    };
+                let removed_row_addr_vec = resolve_row_ids(&self.dataset, removed_row_ids).await?;
 
                 Ok(RoaringTreemap::from_iter(removed_row_addr_vec))
             }
@@ -2558,6 +2777,59 @@ impl MergeInsertJob {
                 }
             };
 
+            let output_source_row_ids = Arc::into_inner(output_source_row_ids)
+                .unwrap()
+                .into_inner()
+                .unwrap();
+            let output_source_row_addresses =
+                resolve_optional_row_ids(&self.dataset, output_source_row_ids).await?;
+            let matched_values = self
+                .params
+                .matched_cell_flag_values
+                .iter()
+                .map(|(flag_id, value)| (*flag_id, *value))
+                .collect();
+            let inserted_values = self
+                .params
+                .inserted_cell_flag_values
+                .iter()
+                .map(|(flag_id, value)| (*flag_id, *value))
+                .collect();
+            let fragment_states = self
+                .dataset
+                .cell_flag_states_for_mapped_rows(
+                    &new_fragments,
+                    &output_source_row_addresses,
+                    &matched_values,
+                    &inserted_values,
+                )
+                .await?;
+            let mut flag_only_affected_rows = RoaringTreemap::new();
+            let row_changes = if matches!(
+                self.params.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            ) {
+                Vec::new()
+            } else {
+                let matched_flag_row_ids = Arc::into_inner(matched_flag_row_ids)
+                    .unwrap()
+                    .into_inner()
+                    .unwrap();
+                let matched_flag_row_addrs = RoaringTreemap::from_iter(
+                    resolve_row_ids(&self.dataset, matched_flag_row_ids).await?,
+                );
+                flag_only_affected_rows |= &matched_flag_row_addrs;
+                cell_flag_row_changes(
+                    &self.params.matched_cell_flag_values,
+                    &matched_flag_row_addrs,
+                )
+            };
+            let cell_flag_changes = CellFlagTransaction {
+                row_changes,
+                fragment_states,
+                ..Default::default()
+            };
+
             // Commit updated and new fragments
             let operation = Operation::Update {
                 removed_fragment_ids,
@@ -2577,8 +2849,10 @@ impl MergeInsertJob {
                 updated_fragment_offsets: None,
             };
 
-            let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            let mut affected_row_addrs = removed_row_addrs;
+            affected_row_addrs |= flag_only_affected_rows;
+            let affected_rows = Some(RowAddrTreeMap::from(affected_row_addrs));
+            (operation, affected_rows, cell_flag_changes)
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -2586,7 +2860,8 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
+        let transaction = Transaction::new(self.dataset.manifest.version, operation, None)
+            .with_cell_flag_transaction(cell_flag_changes);
 
         Ok(UncommittedMergeInsert {
             transaction,
@@ -2850,6 +3125,10 @@ struct Merger {
     deleted_rows: Arc<Mutex<Vec<u64>>>,
     // Shared collection to capture row ids that need to be updated
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
+    // Matched target row IDs selected for explicit flag-only changes.
+    matched_flag_row_ids: Arc<Mutex<Vec<u64>>>,
+    // Source row ID for each emitted output row; inserted rows use None.
+    output_source_row_ids: Arc<Mutex<Vec<Option<u64>>>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
     // User statistics for merging
@@ -2928,6 +3207,8 @@ impl Merger {
         Ok(Self {
             deleted_rows: Arc::new(Mutex::new(Vec::new())),
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_stable_row_ids))),
+            matched_flag_row_ids: Arc::new(Mutex::new(Vec::new())),
+            output_source_row_ids: Arc::new(Mutex::new(Vec::new())),
             delete_expr,
             merge_stats: Arc::new(Mutex::new(MergeStats::default())),
             match_filter_expr,
@@ -3032,7 +3313,18 @@ impl Merger {
         // The schema of the combined batches will be:
         // source_keys, source_payload, target_keys, target_payload, row_id, row_addr?
         // The keys and non_keys on both sides will be equal
-        let (row_id_col, row_addr_col, right_offset) = if num_fields % 2 == 1 {
+        let row_id_is_join_key = self.params.on.len() == 1 && self.params.on[0] == ROW_ID;
+        let (row_id_col, row_addr_col, right_offset) = if row_id_is_join_key {
+            let right_offset = self.schema.fields().len();
+            assert!(self.with_row_addr);
+            assert_eq!(num_fields, right_offset * 2 + 1);
+            let row_id_col = right_offset
+                + self
+                    .schema
+                    .index_of(ROW_ID)
+                    .expect("_rowid join key is in merger schema");
+            (row_id_col, Some(num_fields - 1), right_offset)
+        } else if num_fields % 2 == 1 {
             // No rowaddr
             assert!(!self.with_row_addr);
             (num_fields - 1, None, num_fields / 2)
@@ -3059,7 +3351,33 @@ impl Merger {
         // differently.
         let match_filter_expr = self.match_filter_expr;
         match &self.params.when_matched {
-            WhenMatched::DoNothing => {}
+            WhenMatched::DoNothing => {
+                if !self.params.matched_cell_flag_values.is_empty() {
+                    let matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+                    let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
+                    let mut processed_row_ids = self.processed_row_ids.lock().unwrap();
+                    let mut matched_flag_row_ids = self.matched_flag_row_ids.lock().unwrap();
+                    for (row_idx, &row_id) in row_ids.values().iter().enumerate() {
+                        if processed_row_ids.insert(row_id) {
+                            matched_flag_row_ids.push(row_id);
+                            merge_statistics.num_updated_rows += 1;
+                        } else {
+                            match self.params.source_dedupe_behavior {
+                                SourceDedupeBehavior::Fail => {
+                                    return Err(create_duplicate_row_error(
+                                        &matched,
+                                        row_idx,
+                                        &self.params.on,
+                                    ));
+                                }
+                                SourceDedupeBehavior::FirstSeen => {
+                                    merge_statistics.num_skipped_duplicates += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             WhenMatched::Delete => {
                 // Matched rows are removed, not rewritten: record their row ids
                 // for the commit to delete and emit no replacement batch. A
@@ -3168,6 +3486,16 @@ impl Merger {
                         // Get row_ids again after filtering (if any duplicates were removed)
                         let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
                         deleted_row_ids.extend(row_ids.values());
+                        if !self.params.matched_cell_flag_values.is_empty() {
+                            self.matched_flag_row_ids
+                                .lock()
+                                .unwrap()
+                                .extend(row_ids.values());
+                        }
+                        self.output_source_row_ids
+                            .lock()
+                            .unwrap()
+                            .extend(row_ids.values().iter().copied().map(Some));
                         if self.enable_stable_row_ids {
                             self.updating_row_ids
                                 .lock()
@@ -3229,6 +3557,10 @@ impl Merger {
             )?;
 
             merge_statistics.num_inserted_rows += not_matched.num_rows() as u64;
+            self.output_source_row_ids
+                .lock()
+                .unwrap()
+                .extend(std::iter::repeat_n(None, not_matched.num_rows()));
             batches.push(Ok(not_matched));
         }
         match self.params.delete_not_matched_by_source {

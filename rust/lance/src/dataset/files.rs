@@ -18,7 +18,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use either::Either;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt, TryStreamExt};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{CellFlagFragmentState, IndexMetadata, Manifest};
 use lance_table::utils::LanceIteratorExtension;
 use object_store::path::Path;
 use uuid::Uuid;
@@ -27,7 +27,7 @@ use crate::Dataset;
 use crate::dataset::files::arrow::{TRACKED_FILES_SCHEMA, TrackedFileBatch};
 use crate::dataset::files::file_types::FileType;
 use crate::dataset::{DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_table::io::deletion::relative_deletion_file_path;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 
@@ -254,6 +254,79 @@ async fn index_file_batch(version: u64, base_uri: &str, paths: &[Path]) -> Resul
     builder.finish()
 }
 
+async fn send_tracked_file_batch(
+    sender: &tokio::sync::mpsc::Sender<datafusion::error::Result<RecordBatch>>,
+    builder: TrackedFileBatch,
+) -> Result<bool> {
+    Ok(sender.send(Ok(builder.finish()?)).await.is_ok())
+}
+
+async fn emit_cell_flag_file_batches(
+    sender: &tokio::sync::mpsc::Sender<datafusion::error::Result<RecordBatch>>,
+    dataset: &Dataset,
+    manifest: Arc<Manifest>,
+    base_uri: &str,
+) -> Result<bool> {
+    if manifest.cell_flag_states.is_empty() {
+        return Ok(true);
+    }
+
+    let mut snapshot = dataset.clone();
+    snapshot.manifest = manifest.clone();
+    snapshot.base_object_stores = Default::default();
+
+    let mut builder = TrackedFileBatch::with_capacity(BATCH_SIZE);
+    for state in &manifest.cell_flag_states {
+        let root_base = resolve_file_base(&manifest, state.root.base_id, base_uri);
+        builder.append(&FileRow {
+            version: manifest.version,
+            base_uri: Cow::Borrowed(root_base.uri),
+            path: Cow::Borrowed(&state.root.path),
+            file_type: FileType::CellFlagFile,
+        });
+        if builder.len() == BATCH_SIZE {
+            let full = std::mem::replace(&mut builder, TrackedFileBatch::with_capacity(BATCH_SIZE));
+            if !send_tracked_file_batch(sender, full).await? {
+                return Ok(false);
+            }
+        }
+
+        let root = snapshot
+            .load_cell_flag_root(state.flag_id)
+            .await?
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Missing cell flag root for flag ID {}",
+                    state.flag_id
+                ))
+            })?;
+        for fragment in root.fragments {
+            let CellFlagFragmentState::Partial(bitmap) = fragment.state else {
+                continue;
+            };
+            let bitmap_base = resolve_file_base(&manifest, bitmap.base_id, base_uri);
+            builder.append(&FileRow {
+                version: manifest.version,
+                base_uri: Cow::Borrowed(bitmap_base.uri),
+                path: Cow::Borrowed(&bitmap.path),
+                file_type: FileType::CellFlagFile,
+            });
+            if builder.len() == BATCH_SIZE {
+                let full =
+                    std::mem::replace(&mut builder, TrackedFileBatch::with_capacity(BATCH_SIZE));
+                if !send_tracked_file_batch(sender, full).await? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
+    if builder.len() != 0 && !send_tracked_file_batch(sender, builder).await? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Progress update for [`Dataset::tracked_files_with_options`].
 #[derive(Debug, Clone)]
 pub struct TrackedFilesProgress {
@@ -295,7 +368,7 @@ impl Dataset {
     /// | `version`  | `Int64` (non-null)                | Manifest version number |
     /// | `base_uri` | `Dictionary(Int32, Utf8)` (non-null) | Storage root for this file |
     /// | `path`     | `Utf8` (non-null)                 | Relative to `base_uri` |
-    /// | `type`     | `Dictionary(Int8, Utf8)` (non-null)  | One of: `data file`, `manifest`, `deletion file`, `transaction file`, `index file` |
+    /// | `type`     | `Dictionary(Int8, Utf8)` (non-null)  | One of: `data file`, `manifest`, `deletion file`, `transaction file`, `index file`, `cell flag file` |
     ///
     /// Output order is non-deterministic.
     pub async fn tracked_files(&self) -> SendableRecordBatchStream {
@@ -315,6 +388,7 @@ impl Dataset {
         let uri = self.uri().to_string();
         let object_store = self.object_store.clone();
         let commit_handler = self.commit_handler.clone();
+        let dataset_emitter = self.clone();
 
         // Pipeline architecture:
         //
@@ -492,6 +566,23 @@ impl Dataset {
                 for batch_result in batches {
                     let df_result = batch_result.map_err(datafusion::error::DataFusionError::from);
                     if tx_emitter.send(df_result).await.is_err() {
+                        return;
+                    }
+                }
+                match emit_cell_flag_file_batches(
+                    &tx_emitter,
+                    &dataset_emitter,
+                    manifest.clone(),
+                    &uri_emitter,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(error) => {
+                        let _ = tx_emitter
+                            .send(Err(datafusion::error::DataFusionError::from(error)))
+                            .await;
                         return;
                     }
                 }
@@ -911,7 +1002,7 @@ mod tests {
     /// `all_files` listing of the dataset directory.
     #[tokio::test]
     async fn test_tracked_files_paths_match_disk() {
-        use crate::dataset::WriteParams;
+        use crate::dataset::{UpdateBuilder, WriteParams};
 
         let uri = "memory://test_tracked_files_paths_match_disk";
 
@@ -924,6 +1015,20 @@ mod tests {
             .unwrap();
         // Triggers a deletion file on one of the fragments.
         ds.delete("id = 1").await.unwrap();
+        ds.register_cell_flag("id", "reviewed", false)
+            .await
+            .unwrap();
+        let update = UpdateBuilder::new(Arc::new(ds))
+            .update_where("id = 0")
+            .unwrap()
+            .set_cell_flag("id", "reviewed", true)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let ds = update.new_dataset.as_ref();
         let latest_version = ds.version().version as i64;
 
         // Sanity-check the multi-fragment setup: 3 data files in the latest manifest.
@@ -985,7 +1090,8 @@ mod tests {
             }
         }
 
-        // The latest manifest references one manifest, 3 data files, and 1 deletion file.
+        // The latest manifest references one manifest, 3 data files, 1 deletion
+        // file, and the flag's root plus partial bitmap.
         assert_eq!(
             tracked_at_latest.get("manifest").map(Vec::len),
             Some(1),
@@ -1001,12 +1107,23 @@ mod tests {
             Some(1),
             "expected 1 deletion file at latest version"
         );
+        assert_eq!(
+            tracked_at_latest.get("cell flag file").map(Vec::len),
+            Some(2),
+            "expected one root and one partial bitmap at latest version"
+        );
 
         // Path shapes are as documented (relative to base_uri, no leading slash).
         for p in tracked_at_latest.get("data file").unwrap() {
             assert!(
                 p.starts_with("data/"),
                 "data file path {p:?} should start with data/"
+            );
+        }
+        for p in tracked_at_latest.get("cell flag file").unwrap() {
+            assert!(
+                p.starts_with("_cell_flags/"),
+                "cell flag file path {p:?} should start with _cell_flags/"
             );
         }
         let manifest_path = &tracked_at_latest.get("manifest").unwrap()[0];

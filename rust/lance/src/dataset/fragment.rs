@@ -1929,10 +1929,33 @@ impl FileFragment {
         Ok((new_fragment, new_schema))
     }
 
-    pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        let mut updater = self.updater(Some(&[join_column]), None, None, None).await?;
+    pub(crate) async fn merge(self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
+        self.merge_with_matches(join_column, joiner)
+            .await
+            .map(|(fragment, _)| fragment)
+    }
+
+    pub(crate) async fn merge_with_matches(
+        mut self,
+        join_column: &str,
+        joiner: &HashJoiner,
+    ) -> Result<(Self, RoaringBitmap)> {
+        let mut updater = self
+            .updater(Some(&[join_column, ROW_ADDR]), None, None, None)
+            .await?;
+        let mut matched_offsets = RoaringBitmap::new();
 
         while let Some(batch) = updater.next().await? {
+            let matches = joiner.matched_join_rows(batch[join_column].clone())?;
+            let row_addresses = batch
+                .column_by_name(ROW_ADDR)
+                .ok_or_else(|| Error::internal("Merge updater did not return row addresses"))?;
+            let row_addresses = as_primitive_array::<UInt64Type>(row_addresses);
+            for (is_match, row_address) in matches.into_iter().zip(row_addresses.values()) {
+                if is_match {
+                    matched_offsets.insert(RowAddress::from(*row_address).row_offset());
+                }
+            }
             let batch = joiner
                 .collect(&self.dataset, batch[join_column].clone())
                 .await?;
@@ -1941,7 +1964,7 @@ impl FileFragment {
 
         self.metadata = updater.finish().await?;
 
-        Ok(self)
+        Ok((self, matched_offsets))
     }
 
     /// Same as [`Self::update_columns_with_offsets`] but discards the matched row offsets.
@@ -3609,7 +3632,8 @@ mod tests {
         use std::sync::Arc;
 
         use arrow_array::{
-            Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StructArray, UInt64Array,
+            Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, RecordBatchIterator,
+            StructArray, UInt64Array,
         };
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
@@ -3623,7 +3647,7 @@ mod tests {
         use rstest::rstest;
 
         use crate::dataset::transaction::{DataOverlayGroup, Operation};
-        use crate::dataset::{Dataset, WriteDestination, WriteParams};
+        use crate::dataset::{Dataset, UpdateBuilder, WriteDestination, WriteParams};
 
         fn bitmap(offsets: impl IntoIterator<Item = u32>) -> RoaringBitmap {
             RoaringBitmap::from_iter(offsets)
@@ -3731,6 +3755,63 @@ mod tests {
             )
             .await
             .unwrap()
+        }
+
+        #[tokio::test]
+        async fn data_overlay_value_writes_preserve_cell_flags() {
+            let version = LanceFileVersion::Stable;
+            let mut dataset = create_base_dataset(version).await;
+            dataset
+                .register_cell_flag("val", "computed", false)
+                .await
+                .unwrap();
+            let result = UpdateBuilder::new(Arc::new(dataset))
+                .update_where("id IN (1, 4)")
+                .unwrap()
+                .set_cell_flag("val", "computed", true)
+                .unwrap()
+                .build()
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
+            let dataset = commit_overlay(
+                result.new_dataset.as_ref().clone(),
+                "flag-preserving-overlay",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([None, Some(999)])],
+                version,
+            )
+            .await;
+
+            let mut scanner = dataset.scan();
+            scanner
+                .project_with_transform(&[
+                    ("id", "id"),
+                    ("val", "val"),
+                    ("computed", "cell_flag(val, 'computed')"),
+                ])
+                .unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let flags = batch
+                .column_by_name("computed")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            let flagged_ids = (0..batch.num_rows())
+                .filter_map(|index| flags.value(index).then_some(ids.value(index)))
+                .collect::<Vec<_>>();
+            assert_eq!(flagged_ids, vec![1, 4]);
+            assert!(batch.column_by_name("val").unwrap().is_null(1));
         }
 
         /// `collect_paths` feeds `deep_clone`'s copy loop, so an overlay data file

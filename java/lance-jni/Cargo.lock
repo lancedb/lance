@@ -3697,6 +3697,7 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "async_cell",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",
@@ -3867,6 +3868,7 @@ dependencies = [
  "pin-project",
  "prost",
  "prost-build",
+ "roaring",
  "tokio",
  "tracing",
 ]

@@ -40,9 +40,10 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
 use lance_namespace::LanceNamespace;
+pub use lance_table::format::CellFlagDefinition;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb, populate_manifest_schema_dictionaries,
+    CellFlagFragmentState, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata,
+    MAGIC, Manifest, RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -55,7 +56,7 @@ use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -70,6 +71,7 @@ use tracing::{info, instrument};
 pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
+pub(crate) mod cell_flag;
 pub mod cleanup;
 pub mod delta;
 pub mod files;
@@ -103,7 +105,10 @@ use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
-use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
+use self::transaction::{
+    CellFlagRowChange, CellFlagTransaction, Operation, Transaction, TransactionBuilder,
+    UpdateMapEntry,
+};
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
@@ -122,6 +127,7 @@ pub use blob::{
     BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
     ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
 };
+pub use cell_flag::CellFlagChange;
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
@@ -897,6 +903,44 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut builder = InsertBuilder::new(dest);
+        if let Some(params) = &params {
+            builder = builder.with_params(params);
+        }
+        Box::pin(builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>))
+            .await
+    }
+
+    /// Write rows and atomically apply explicit registered cell flag values.
+    ///
+    /// Each change applies to every new row in this write. Unmentioned flags
+    /// are false for new rows, and ordinary value or NULL writes never infer
+    /// flag state.
+    ///
+    /// ```no_run
+    /// # use arrow_array::RecordBatchReader;
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{CellFlagChange, WriteMode, WriteParams};
+    /// # async fn append(
+    /// #     dataset: Arc<Dataset>,
+    /// #     reader: impl RecordBatchReader + Send + 'static,
+    /// # ) -> Result<Dataset> {
+    /// Dataset::write_with_cell_flags(
+    ///     reader,
+    ///     dataset,
+    ///     Some(WriteParams { mode: WriteMode::Append, ..Default::default() }),
+    ///     [CellFlagChange::new("embedding", "computed", true)],
+    /// )
+    /// .await
+    /// # }
+    /// ```
+    pub async fn write_with_cell_flags(
+        batches: impl RecordBatchReader + Send + 'static,
+        dest: impl Into<WriteDestination<'_>>,
+        params: Option<WriteParams>,
+        cell_flags: impl IntoIterator<Item = CellFlagChange>,
+    ) -> Result<Self> {
+        let mut builder = InsertBuilder::new(dest).with_cell_flags(cell_flags);
         if let Some(params) = &params {
             builder = builder.with_params(params);
         }
@@ -3046,6 +3090,30 @@ impl Dataset {
 
         rowids::validate_stable_row_ids(self).await?;
 
+        // Cell flag roots and partial pages are lazy during ordinary scans,
+        // but an explicit dataset validation must verify the complete snapshot
+        // contract, including fragment cardinalities and bitmap bounds.
+        for state in &self.manifest.cell_flag_states {
+            self.validate_cell_flag_root_object(state.flag_id).await?;
+            let root = self
+                .load_cell_flag_root(state.flag_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "Missing cell flag root for flag ID {}",
+                        state.flag_id
+                    ))
+                })?;
+            for fragment in root.fragments {
+                if matches!(
+                    fragment.state,
+                    CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_)
+                ) {
+                    self.load_cell_flag_bitmap(state.flag_id, &fragment).await?;
+                }
+            }
+        }
+
         // Validate indices
         let indices = self.load_indices().await?;
         self.validate_indices(&indices)?;
@@ -3378,6 +3446,53 @@ impl Dataset {
                 }
             }
         }
+
+        for state in &self.manifest.cell_flag_states {
+            state.root.validate_root_path_for_flag(state.flag_id)?;
+            let root_base = if let Some(base_id) = state.root.base_id {
+                let base_path = self
+                    .manifest
+                    .base_paths
+                    .get(&base_id)
+                    .ok_or_else(|| Error::internal(format!("base_id {} not found", base_id)))?;
+                Path::parse(base_path.path.as_str())?
+            } else {
+                self.base.clone()
+            };
+            file_paths.push((state.root.path.clone(), root_base));
+
+            let root = self
+                .load_cell_flag_root(state.flag_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "Missing cell flag root for flag ID {}",
+                        state.flag_id
+                    ))
+                })?;
+            for fragment in root.fragments {
+                let CellFlagFragmentState::Partial(bitmap) = fragment.state else {
+                    continue;
+                };
+                bitmap.validate_bitmap_path_for_fragment(state.flag_id, fragment.fragment_id)?;
+                let bitmap_base = if let Some(base_id) = bitmap.base_id {
+                    let base_path =
+                        self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                            Error::internal(format!("base_id {} not found", base_id))
+                        })?;
+                    Path::parse(base_path.path.as_str())?
+                } else {
+                    self.base.clone()
+                };
+                file_paths.push((bitmap.path, bitmap_base));
+            }
+        }
+
+        // Casts may transfer a tracked field to a new stable ID while reusing
+        // the same immutable root. Deep clone must not race two copies to the
+        // same destination object.
+        let mut seen = HashSet::new();
+        file_paths.retain(|path| seen.insert(path.clone()));
         Ok(file_paths)
     }
 
@@ -3565,6 +3680,7 @@ impl Dataset {
         stream: Box<dyn RecordBatchReader + Send>,
         left_on: &str,
         right_on: &str,
+        cell_flags: &[CellFlagChange],
     ) -> Result<()> {
         // Sanity check.
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
@@ -3594,6 +3710,8 @@ impl Dataset {
             }
         }
 
+        let cell_flag_values = self.resolve_cell_flag_changes(cell_flags)?;
+
         // Hash join
         let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
         // Final schema is union of current schema, plus the RHS schema without
@@ -3603,17 +3721,41 @@ impl Dataset {
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
-        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
+        let updated_fragments = stream::iter(self.get_fragments())
             .then(|f| {
                 let joiner = joiner.clone();
-                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
+                async move {
+                    let fragment_id = f.id();
+                    f.merge_with_matches(left_on, &joiner).await.map(
+                        |(fragment, matched_offsets)| {
+                            (fragment.metadata, fragment_id, matched_offsets)
+                        },
+                    )
+                }
             })
             .try_collect::<Vec<_>>()
             .await?;
+        let mut matched_row_addresses = RoaringTreemap::new();
+        let updated_fragments = updated_fragments
+            .into_iter()
+            .map(|(fragment, fragment_id, matched_offsets)| {
+                let fragment_id = u32::try_from(fragment_id).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Fragment id {} does not fit RowAddress fragment id",
+                        fragment_id
+                    ))
+                })?;
+                for row_offset in matched_offsets {
+                    matched_row_addresses
+                        .insert(RowAddress::new_from_parts(fragment_id, row_offset).into());
+                }
+                Ok(fragment)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let preserves_nullability =
             !schema_evolution::merge_introduces_required_field(self.schema(), &new_schema);
-        let transaction = Transaction::new(
+        let mut transaction = Transaction::new(
             self.manifest.version,
             Operation::Merge {
                 fragments: updated_fragments,
@@ -3622,6 +3764,19 @@ impl Dataset {
             },
             None,
         );
+        if !cell_flag_values.is_empty() && !matched_row_addresses.is_empty() {
+            transaction = transaction.with_cell_flag_transaction(CellFlagTransaction {
+                row_changes: cell_flag_values
+                    .into_iter()
+                    .map(|(flag_id, value)| CellFlagRowChange {
+                        flag_id,
+                        value,
+                        row_addresses: matched_row_addresses.clone(),
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+        }
 
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
@@ -3647,7 +3802,42 @@ impl Dataset {
         right_on: &str,
     ) -> Result<()> {
         let stream = Box::new(stream);
-        self.merge_impl(stream, left_on, right_on).await
+        self.merge_impl(stream, left_on, right_on, &[]).await
+    }
+
+    /// Merge columns and atomically set registered cell flags on matched rows.
+    ///
+    /// Unmatched target rows retain their existing flag state. Ordinary merge
+    /// value and NULL writes do not infer flag values.
+    ///
+    /// ```no_run
+    /// # use arrow_array::RecordBatchReader;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::CellFlagChange;
+    /// # async fn merge(
+    /// #     dataset: &mut Dataset,
+    /// #     reader: impl RecordBatchReader + Send + 'static,
+    /// # ) -> Result<()> {
+    /// dataset
+    ///     .merge_with_cell_flags(
+    ///         reader,
+    ///         "id",
+    ///         "id",
+    ///         &[CellFlagChange::new("embedding", "computed", true)],
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn merge_with_cell_flags(
+        &mut self,
+        stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+        cell_flags: &[CellFlagChange],
+    ) -> Result<()> {
+        self.merge_impl(Box::new(stream), left_on, right_on, cell_flags)
+            .await
     }
 
     /// Merge a distributed scalar index into a single root artifact and report

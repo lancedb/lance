@@ -198,6 +198,7 @@ impl ScalarIndexExec {
                         ))
                     })
             }
+            ScalarIndexExpr::Exact(selection) => Ok(selection.fragment_bitmap().clone()),
         }
     }
 

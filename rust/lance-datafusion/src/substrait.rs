@@ -27,6 +27,46 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Substrait extension URN for Lance-native scalar functions.
+///
+/// ```
+/// use lance_datafusion::substrait::LANCE_FUNCTIONS_EXTENSION_URN;
+/// assert_eq!(LANCE_FUNCTIONS_EXTENSION_URN, "urn:lance:extension:functions");
+/// ```
+pub const LANCE_FUNCTIONS_EXTENSION_URN: &str = "urn:lance:extension:functions";
+
+fn validate_lance_function_extensions(
+    extension_urns: &[datafusion_substrait::substrait::proto::extensions::SimpleExtensionUrn],
+    extensions: &[datafusion_substrait::substrait::proto::extensions::SimpleExtensionDeclaration],
+) -> Result<()> {
+    use datafusion_substrait::substrait::proto::extensions::simple_extension_declaration::MappingType;
+
+    let urns = extension_urns
+        .iter()
+        .map(|extension| (extension.extension_urn_anchor, extension.urn.as_str()))
+        .collect::<HashMap<_, _>>();
+    for extension in extensions {
+        let Some(MappingType::ExtensionFunction(function)) = &extension.mapping_type else {
+            continue;
+        };
+        if function.name != crate::udf::CELL_FLAG_NAME
+            && function.name != crate::udf::CELL_FLAG_ID_NAME
+        {
+            continue;
+        }
+        let actual = urns.get(&function.extension_urn_reference).copied();
+        if actual != Some(LANCE_FUNCTIONS_EXTENSION_URN) {
+            return Err(Error::invalid_input(format!(
+                "Substrait function '{}' must reference Lance extension URN '{}', found {:?}",
+                crate::udf::CELL_FLAG_NAME,
+                LANCE_FUNCTIONS_EXTENSION_URN,
+                actual
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// FixedSizeList has no Substrait producer support in datafusion-substrait.
 /// Other unsupported types (Null, Float16) are encoded as UserDefined and
 /// handled by `remove_extension_types` on the decode side.
@@ -76,11 +116,45 @@ pub fn encode_substrait(
     let output_type = expr.get_type(&df_schema)?;
     // Nullability doesn't matter
     let output_field = Field::new("output", output_type, /*nullable=*/ true);
-    let extended_expr = datafusion_substrait::logical_plan::producer::to_substrait_extended_expr(
-        &[(&expr, &output_field)],
-        &df_schema,
-        state,
-    )?;
+    let mut extended_expr =
+        datafusion_substrait::logical_plan::producer::to_substrait_extended_expr(
+            &[(&expr, &output_field)],
+            &df_schema,
+            state,
+        )?;
+
+    use datafusion_substrait::substrait::proto::extensions::{
+        SimpleExtensionUrn, simple_extension_declaration::MappingType,
+    };
+    let has_lance_function = extended_expr.extensions.iter().any(|extension| {
+        matches!(
+            &extension.mapping_type,
+            Some(MappingType::ExtensionFunction(function))
+                if function.name == crate::udf::CELL_FLAG_NAME
+                    || function.name == crate::udf::CELL_FLAG_ID_NAME
+        )
+    });
+    if has_lance_function {
+        let anchor = extended_expr
+            .extension_urns
+            .iter()
+            .map(|extension| extension.extension_urn_anchor)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        extended_expr.extension_urns.push(SimpleExtensionUrn {
+            extension_urn_anchor: anchor,
+            urn: LANCE_FUNCTIONS_EXTENSION_URN.to_string(),
+        });
+        for extension in &mut extended_expr.extensions {
+            if let Some(MappingType::ExtensionFunction(function)) = &mut extension.mapping_type
+                && (function.name == crate::udf::CELL_FLAG_NAME
+                    || function.name == crate::udf::CELL_FLAG_ID_NAME)
+            {
+                function.extension_urn_reference = anchor;
+            }
+        }
+    }
 
     Ok(extended_expr.encode_to_vec())
 }
@@ -388,6 +462,7 @@ pub async fn parse_substrait(
     state: &SessionState,
 ) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
+    validate_lance_function_extensions(&envelope.extension_urns, &envelope.extensions)?;
     if envelope.referred_expr.is_empty() {
         return Err(Error::invalid_input_source(
             "the provided substrait expression is empty (contains no expressions)".into(),
@@ -476,6 +551,7 @@ pub async fn parse_substrait_aggregate(
     state: &SessionState,
 ) -> Result<Aggregate> {
     let plan = Plan::decode(bytes)?;
+    validate_lance_function_extensions(&plan.extension_urns, &plan.extensions)?;
     let (aggregate_rel, output_names) = extract_aggregate_from_plan(&plan)?;
     let extensions = Extensions::try_from(&plan.extensions)?;
 
@@ -658,7 +734,7 @@ mod tests {
     use datafusion::{
         execution::SessionState,
         logical_expr::{BinaryExpr, Operator},
-        prelude::{Expr, SessionContext},
+        prelude::{Expr, SessionContext, col},
     };
     use datafusion_common::{Column, ScalarValue};
     use datafusion_substrait::substrait::proto::{
@@ -680,10 +756,11 @@ mod tests {
     };
     use prost::Message;
 
-    use crate::substrait::{encode_substrait, parse_substrait};
+    use crate::substrait::{LANCE_FUNCTIONS_EXTENSION_URN, encode_substrait, parse_substrait};
 
     fn session_state() -> SessionState {
         let ctx = SessionContext::new();
+        crate::udf::register_functions(&ctx);
         ctx.state()
     }
 
@@ -798,6 +875,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
+    async fn test_cell_flag_uses_lance_substrait_extension() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::Int32,
+            true,
+        )]));
+        let expr = crate::udf::cell_flag(col("embedding"), "computed");
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let encoded = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        let urn = encoded
+            .extension_urns
+            .iter()
+            .find(|extension| extension.urn == LANCE_FUNCTIONS_EXTENSION_URN)
+            .unwrap();
+        assert!(encoded.extensions.iter().any(|extension| {
+            matches!(
+                &extension.mapping_type,
+                Some(MappingType::ExtensionFunction(function))
+                    if function.name == crate::udf::CELL_FLAG_NAME
+                        && function.extension_urn_reference == urn.extension_urn_anchor
+            )
+        }));
+
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
+            .await
+            .unwrap();
+        assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
+    async fn test_cell_flag_id_transport_needs_no_field_schema() {
+        let schema = Arc::new(Schema::empty());
+        let expr = crate::udf::cell_flag_id(7);
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
+            .await
+            .unwrap();
+        assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
+    async fn test_cell_flag_rejects_wrong_substrait_extension_urn() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::Int32,
+            true,
+        )]));
+        let expr = crate::udf::cell_flag(col("embedding"), "computed");
+        let bytes = encode_substrait(expr, schema.clone(), &session_state()).unwrap();
+        let mut encoded = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        let lance_urn = encoded
+            .extension_urns
+            .iter_mut()
+            .find(|extension| extension.urn == LANCE_FUNCTIONS_EXTENSION_URN)
+            .unwrap();
+        lance_urn.urn = "urn:example:not-lance".to_string();
+
+        let error = parse_substrait(encoded.encode_to_vec().as_slice(), schema, &session_state())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must reference Lance extension URN")
+        );
     }
 
     /// Helper to create a simple equality filter on the "id" field

@@ -28,6 +28,8 @@ pub enum Action {
     Delete = 3,
     /// Fail the operation if a match is found
     Fail = 4,
+    /// Apply explicit cell flag changes without rewriting field values.
+    FlagOnly = 5,
 }
 
 impl TryFrom<u8> for Action {
@@ -40,6 +42,7 @@ impl TryFrom<u8> for Action {
             2 => Ok(Self::Insert),
             3 => Ok(Self::Delete),
             4 => Ok(Self::Fail),
+            5 => Ok(Self::FlagOnly),
             _ => Err(crate::Error::invalid_input(format!(
                 "Invalid action code: {}",
                 value
@@ -131,7 +134,11 @@ pub fn merge_insert_action(
                 Action::UpdateAll.as_literal_expr(),
             ));
         }
-        WhenMatched::DoNothing => {}
+        WhenMatched::DoNothing => {
+            if !params.matched_cell_flag_values.is_empty() {
+                cases.push((matched, Action::FlagOnly.as_literal_expr()));
+            }
+        }
         WhenMatched::Fail => {
             cases.push((matched, Action::Fail.as_literal_expr()));
         }

@@ -48,6 +48,90 @@ assert dataset.schema == pa.schema([
 
 This operation is very fast, as it only updates the metadata of the dataset.
 
+### Tracking field-scoped Boolean state
+
+Cell Flags attach explicitly managed Boolean state to a field without adding a
+physical Boolean column. A flag name must be registered before use and is unique
+within its field. State is independent of Arrow values and validity.
+
+```python
+tracked_dataset = lance.write_dataset(
+    pa.table({
+        "id": [1, 2, 3],
+        "text": ["one", "two", "three"],
+        "priority": [1, 20, 3],
+    }),
+    "cell_flags",
+)
+tracked_dataset.add_columns(pa.field("embedding", pa.list_(pa.float32(), 128)))
+tracked_dataset.register_cell_flag("embedding", "computed")
+
+pending = tracked_dataset.to_table(
+    columns=["_rowid", "text"],
+    filter="NOT cell_flag(embedding, 'computed')",
+)
+```
+
+`cell_flag(field, name)` is a non-null Boolean expression and can be used anywhere
+other Lance SQL expressions are accepted, including projections, filters,
+Boolean combinations, aggregation, and ordering:
+
+```python
+scanner = tracked_dataset.scanner(
+    columns={
+        "id": "id",
+        "embedding": "embedding",
+        "computed": "cell_flag(embedding, 'computed')",
+    },
+    filter="cell_flag(embedding, 'computed') OR priority > 10",
+    order_by=["cell_flag(embedding, 'computed')"],
+)
+```
+
+Ordinary projection always returns the stored Arrow value. Value writes,
+including explicit NULL, do not change flags. Attach explicit changes to the
+mutation that owns the affected row set; a flag-only update does not rewrite
+data files.
+
+```python
+tracked_dataset.update(
+    updates={"text": "'replacement text'"},
+    where="id = 42",
+    cell_flags={"embedding": {"computed": False}},
+)
+
+tracked_dataset.update(
+    where="id = 43",
+    cell_flags={"embedding": {"computed": True}},
+)
+```
+
+Precomputed results can be written back by physical row ID with an update-only
+merge. The flag change is committed atomically with the matched value writes.
+
+```python
+source = pa.table({
+    "_rowid": pending["_rowid"],
+    "embedding": embed(pending["text"]),
+})
+
+stats = (
+    tracked_dataset.merge_insert(on="_rowid")
+    .when_matched_update_all()
+    .set_matched_cell_flag("embedding", "computed", True)
+    .execute(source)
+)
+```
+
+Registration can initialize an existing field's current live rows explicitly.
+This is a migration assertion, not an inference from stored values. Multiple
+flags may be registered on one field, and the same name may be used on a
+different field.
+
+```python
+existing_dataset.register_cell_flag("thumbnail", "reviewed", initial_value=True)
+```
+
 For Lance file format `<= 2.1`, adding sub-columns under an existing `struct` is not supported.
 Starting with Lance file format `2.2`, schema-only add can also extend nested `struct` fields
 (including `struct` fields nested inside list types), for example by adding

@@ -32,13 +32,13 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
-    format_key_values_on_columns, resolve_target_bases,
+    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, cell_flag_row_changes,
+    create_duplicate_row_error, format_key_values_on_columns, resolve_target_bases,
 };
 use crate::{
     Dataset,
     dataset::{
-        transaction::{Operation, Transaction},
+        transaction::{CellFlagTransaction, Operation, Transaction},
         write::{
             WriteParams, cleanup_data_fragments,
             merge_insert::{
@@ -72,6 +72,15 @@ struct MergeState {
     on_columns: Vec<String>,
     /// How to handle duplicate source rows
     source_dedupe_behavior: SourceDedupeBehavior,
+    /// Source row addresses in the exact order emitted by the streaming writer.
+    written_source_row_addrs: Vec<Option<u64>>,
+    /// Stable-row-id writes emit every update before every insert.
+    updated_source_row_addrs: Vec<Option<u64>>,
+    inserted_source_row_addrs: Vec<Option<u64>>,
+    /// Matched rows changed only by an explicit flag action.
+    matched_flag_row_addrs: RoaringTreemap,
+    /// Avoid row-mapping overhead for datasets that do not use Cell Flags.
+    capture_cell_flag_sources: bool,
 }
 
 impl MergeState {
@@ -81,6 +90,7 @@ impl MergeState {
         on_columns: Vec<String>,
         field_ids: Vec<i32>,
         source_dedupe_behavior: SourceDedupeBehavior,
+        capture_cell_flag_sources: bool,
     ) -> Self {
         Self {
             delete_row_addrs: RoaringTreemap::new(),
@@ -92,6 +102,26 @@ impl MergeState {
             processed_insert_keys: InsertedKeyTracker::default(),
             on_columns,
             source_dedupe_behavior,
+            written_source_row_addrs: Vec::new(),
+            updated_source_row_addrs: Vec::new(),
+            inserted_source_row_addrs: Vec::new(),
+            matched_flag_row_addrs: RoaringTreemap::new(),
+            capture_cell_flag_sources,
+        }
+    }
+
+    fn record_written_source(&mut self, action: Action, source_row_addr: Option<u64>) {
+        if !self.capture_cell_flag_sources {
+            return;
+        }
+        if self.stable_row_ids {
+            match action {
+                Action::UpdateAll => self.updated_source_row_addrs.push(source_row_addr),
+                Action::Insert => self.inserted_source_row_addrs.push(source_row_addr),
+                _ => {}
+            }
+        } else {
+            self.written_source_row_addrs.push(source_row_addr);
         }
     }
 
@@ -161,6 +191,7 @@ impl MergeState {
                     }
 
                     self.delete_row_addrs.insert(row_addr);
+                    self.record_written_source(Action::UpdateAll, Some(row_addr));
 
                     if self.stable_row_ids {
                         self.updating_row_ids.lock().unwrap().capture(&[row_id])?;
@@ -190,10 +221,35 @@ impl MergeState {
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 }
                 self.metrics.num_inserted_rows.add(1);
+                self.record_written_source(Action::Insert, None);
                 Ok(Some(row_idx)) // Keep this row for writing
             }
-            Action::Nothing => {
-                // Do nothing action - keep the row but don't count it
+            Action::Nothing => Ok(None),
+            Action::FlagOnly => {
+                if row_addr_array.is_null(row_idx) {
+                    return Err(DataFusionError::Internal(
+                        "Flag-only merge action is missing a target row address".to_string(),
+                    ));
+                }
+                let row_id = row_id_array.value(row_idx);
+                if !self.processed_row_ids.insert(row_id) {
+                    match self.source_dedupe_behavior {
+                        SourceDedupeBehavior::Fail => {
+                            return Err(create_duplicate_row_error(
+                                batch,
+                                row_idx,
+                                &self.on_columns,
+                            ));
+                        }
+                        SourceDedupeBehavior::FirstSeen => {
+                            self.metrics.num_skipped_duplicates.add(1);
+                            return Ok(None);
+                        }
+                    }
+                }
+                self.matched_flag_row_addrs
+                    .insert(row_addr_array.value(row_idx));
+                self.metrics.num_updated_rows.add(1);
                 Ok(None)
             }
             Action::Fail => {
@@ -930,6 +986,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             self.params.on.clone(),
             field_ids,
             self.params.source_dedupe_behavior,
+            !self.dataset.manifest.cell_flag_definitions.is_empty(),
         )));
         let write_data_stream =
             self.create_filtered_write_stream(input_stream, merge_state.clone())?;
@@ -1012,12 +1069,64 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let merge_state =
                 Mutex::into_inner(merge_state).expect("MergeState lock should be available");
             let delete_row_addrs_clone = merge_state.delete_row_addrs;
+            let matched_flag_row_addrs = merge_state.matched_flag_row_addrs;
             let inserted_rows_filter = if is_primary_key {
                 Some(KeyExistenceFilter::from_bloom_filter(
                     &merge_state.inserted_rows_filter,
                 ))
             } else {
                 None
+            };
+
+            let cell_flag_transaction = if dataset.cell_flag_definitions().is_empty() {
+                CellFlagTransaction::default()
+            } else {
+                let output_source_row_addrs = if merge_state.stable_row_ids {
+                    let mut source_row_addrs = merge_state.updated_source_row_addrs;
+                    source_row_addrs.extend(merge_state.inserted_source_row_addrs);
+                    source_row_addrs
+                } else {
+                    merge_state.written_source_row_addrs
+                };
+                let matched_values = params
+                    .matched_cell_flag_values
+                    .iter()
+                    .map(|(flag_id, value)| (*flag_id, *value))
+                    .collect();
+                let inserted_values = params
+                    .inserted_cell_flag_values
+                    .iter()
+                    .map(|(flag_id, value)| (*flag_id, *value))
+                    .collect();
+                let fragment_states = match dataset
+                    .cell_flag_states_for_mapped_rows(
+                        &new_fragments,
+                        &output_source_row_addrs,
+                        &matched_values,
+                        &inserted_values,
+                    )
+                    .await
+                {
+                    Ok(fragment_states) => fragment_states,
+                    Err(error) => {
+                        cleanup_data_fragments(
+                            &dataset.object_store,
+                            &dataset.base,
+                            cleanup_bases.as_deref(),
+                            &new_fragments,
+                        )
+                        .await;
+                        return Err(error.into());
+                    }
+                };
+                CellFlagTransaction {
+                    row_changes: cell_flag_row_changes(
+                        &params.matched_cell_flag_values,
+                        &matched_flag_row_addrs,
+                    ),
+                    fragment_states,
+                    ..Default::default()
+                }
             };
 
             let (updated_fragments, removed_fragment_ids) =
@@ -1061,6 +1170,11 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
             // Step 5: Create and store the transaction
             let transaction = Transaction::new(dataset.manifest.version, operation, None);
+            let transaction = if cell_flag_transaction.is_empty() {
+                transaction
+            } else {
+                transaction.with_cell_flag_transaction(cell_flag_transaction)
+            };
 
             // Step 6: Store transaction, merge stats, and affected rows for later retrieval
             {
@@ -1089,7 +1203,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     merge_stats_guard.replace(stats);
                 }
                 if let Ok(mut affected_rows_guard) = affected_rows_holder.lock() {
-                    affected_rows_guard.replace(delete_row_addrs_clone);
+                    let mut affected_rows = delete_row_addrs_clone;
+                    affected_rows |= matched_flag_row_addrs;
+                    affected_rows_guard.replace(affected_rows);
                 }
                 if let Ok(mut filter_guard) = inserted_rows_filter_holder.lock() {
                     *filter_guard = inserted_rows_filter;
@@ -1124,6 +1240,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             SourceDedupeBehavior::Fail,
+            false,
         );
 
         let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
@@ -1180,6 +1297,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             SourceDedupeBehavior::FirstSeen,
+            false,
         );
 
         let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);

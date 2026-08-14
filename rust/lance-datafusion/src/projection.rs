@@ -224,6 +224,49 @@ pub struct ProjectionPlan {
 }
 
 impl ProjectionPlan {
+    /// Recompute the physical dataset projection after logical expressions have
+    /// been rewritten by a dataset-aware binder.
+    ///
+    /// This is used by `cell_flag(field, name)`: the unbound logical expression
+    /// names the user field for stable-ID resolution, while the bound fallback
+    /// consumes only `_rowaddr`. Rebuilding here prevents cell flag queries
+    /// from reading the field's stored values and keeps ordinary queries
+    /// unchanged.
+    pub fn rebuild_physical_projection(&mut self, base: Arc<dyn Projectable>) -> Result<()> {
+        let blob_handling = self.physical_projection.blob_handling.clone();
+        let mut physical_columns = Vec::new();
+        let mut with_row_id = false;
+        let mut with_row_addr = self.must_add_row_offset;
+        let mut with_row_last_updated_at_version = false;
+        let mut with_row_created_at_version = false;
+
+        for column in self
+            .requested_output_expr
+            .iter()
+            .flat_map(|output| Planner::column_names_in_expr(&output.expr))
+        {
+            match column.as_str() {
+                ROW_ID => with_row_id = true,
+                ROW_ADDR | ROW_OFFSET => with_row_addr = true,
+                ROW_LAST_UPDATED_AT_VERSION => with_row_last_updated_at_version = true,
+                ROW_CREATED_AT_VERSION => with_row_created_at_version = true,
+                _ => physical_columns.push(column),
+            }
+        }
+        physical_columns.sort();
+        physical_columns.dedup();
+
+        let mut physical_projection =
+            Projection::empty(base).union_columns(&physical_columns, OnMissing::Ignore)?;
+        physical_projection.with_row_id = with_row_id;
+        physical_projection.with_row_addr = with_row_addr;
+        physical_projection.with_row_last_updated_at_version = with_row_last_updated_at_version;
+        physical_projection.with_row_created_at_version = with_row_created_at_version;
+        physical_projection.blob_handling = blob_handling;
+        self.physical_projection = physical_projection;
+        Ok(())
+    }
+
     fn add_system_columns(schema: &ArrowSchema) -> ArrowSchema {
         let mut fields = Vec::from_iter(schema.fields.iter().cloned());
         fields.push(Arc::new(ArrowField::new(ROW_ID, DataType::UInt64, true)));
@@ -518,6 +561,7 @@ mod tests {
 
     use arrow_array::{ArrayRef, Float32Array, Int64Array};
     use lance_arrow::json::{is_json_field, json_field};
+    use lance_core::datatypes::BlobHandling;
 
     #[test]
     fn test_scoring_column_expression() {
@@ -729,5 +773,26 @@ mod tests {
         let output = plan.output_schema().unwrap();
         let output_field = output.field_with_name("meta").unwrap();
         assert!(is_json_field(output_field));
+    }
+
+    #[test]
+    fn test_rebuild_physical_projection_preserves_blob_handling() {
+        let base = Arc::new(
+            Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                "blob",
+                DataType::Binary,
+                true,
+            )]))
+            .unwrap(),
+        );
+        let mut plan = ProjectionPlan::from_expressions(base.clone(), &[("blob", "blob")]).unwrap();
+        plan.physical_projection.blob_handling = BlobHandling::AllBinary;
+
+        plan.rebuild_physical_projection(base).unwrap();
+
+        assert_eq!(
+            plan.physical_projection.blob_handling,
+            BlobHandling::AllBinary
+        );
     }
 }

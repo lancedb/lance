@@ -33,6 +33,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
+use super::cell_flag::read_cell_flag_bytes;
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
@@ -60,6 +61,7 @@ use lance_table::{
 };
 use object_store::ObjectMeta;
 use object_store::path::Path;
+use prost::Message;
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
@@ -77,6 +79,7 @@ struct ReferencedFiles {
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
+    cell_flag_paths: HashSet<Path>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -546,6 +549,7 @@ impl<'a> CleanupTask<'a> {
             }
             Err(error) => return Err(error),
         };
+        let cell_flag_paths = self.primary_cell_flag_paths(&manifest).await?;
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
@@ -560,7 +564,13 @@ impl<'a> CleanupTask<'a> {
             inspection.tagged_old_versions.insert(manifest.version);
         }
 
-        self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
+        self.process_manifest(
+            &manifest,
+            &indexes,
+            &cell_flag_paths,
+            in_working_set,
+            &mut inspection,
+        )?;
         if !in_working_set {
             inspection
                 .old_manifests
@@ -582,6 +592,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         manifest: &Manifest,
         indexes: &Vec<IndexMetadata>,
+        cell_flag_paths: &HashSet<Path>,
         in_working_set: bool,
         inspection: &mut MutexGuard<CleanupInspection>,
     ) -> Result<()> {
@@ -618,7 +629,109 @@ impl<'a> CleanupTask<'a> {
             let uuid_str = index.uuid.to_string();
             referenced_files.index_uuids.insert(uuid_str);
         }
+        referenced_files
+            .cell_flag_paths
+            .extend(cell_flag_paths.iter().cloned());
         Ok(())
+    }
+
+    async fn primary_cell_flag_paths(&self, manifest: &Manifest) -> Result<HashSet<Path>> {
+        let mut paths = HashSet::new();
+        for state in &manifest.cell_flag_states {
+            // Cleanup scans only this dataset's object store. Files owned by an
+            // external base are managed by that dataset's cleanup lifecycle.
+            if state.root.base_id.is_some() {
+                continue;
+            }
+            state.root.validate_root_path_for_flag(state.flag_id)?;
+            let root_path = Path::parse(&state.root.path)?;
+            paths.insert(root_path.clone());
+            let full_root_path =
+                Path::from_iter(self.dataset.base.parts().chain(root_path.parts()));
+            let root_bytes =
+                read_cell_flag_bytes(&self.dataset.object_store, &full_root_path, &state.root)
+                    .await?;
+            let root_proto = lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "Failed to decode cell flag root '{}': {}",
+                        state.root.path, error
+                    ))
+                })?;
+            let root = lance_table::format::CellFlagRoot::try_from(root_proto)?;
+            for fragment in root.fragments {
+                if let lance_table::format::CellFlagFragmentState::Partial(file) = fragment.state
+                    && file.base_id.is_none()
+                {
+                    file.validate_bitmap_path_for_fragment(state.flag_id, fragment.fragment_id)?;
+                    paths.insert(Path::parse(file.path)?);
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    async fn branch_cell_flag_paths(
+        &self,
+        manifest: &Manifest,
+        branch_base: &Path,
+    ) -> Result<HashSet<Path>> {
+        let mut paths = HashSet::new();
+        for state in &manifest.cell_flag_states {
+            state.root.validate_root_path_for_flag(state.flag_id)?;
+            let root_path = Path::parse(&state.root.path)?;
+            let (root_base, root_is_parent_owned) = match state.root.base_id {
+                None => (branch_base.clone(), false),
+                Some(root_base_id) => {
+                    let root_base = manifest.base_paths.get(&root_base_id).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Branch cell flag root '{}' references unknown base ID {}",
+                            state.root.path, root_base_id
+                        ))
+                    })?;
+                    if root_base.path != self.dataset.uri {
+                        // This cleanup owns only the parent dataset's object store.
+                        // Cell-flag objects in any other external base are
+                        // protected by that base's own cleanup lifecycle.
+                        continue;
+                    }
+                    (self.dataset.base.clone(), true)
+                }
+            };
+            if root_is_parent_owned {
+                paths.insert(root_path.clone());
+            }
+            let full_root_path = Path::from_iter(root_base.parts().chain(root_path.parts()));
+            let root_bytes =
+                read_cell_flag_bytes(&self.dataset.object_store, &full_root_path, &state.root)
+                    .await?;
+            let root_proto = lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "Failed to decode branch cell flag root '{}': {}",
+                        state.root.path, error
+                    ))
+                })?;
+            let root = lance_table::format::CellFlagRoot::try_from(root_proto)?;
+            for fragment in root.fragments {
+                let lance_table::format::CellFlagFragmentState::Partial(bitmap) = fragment.state
+                else {
+                    continue;
+                };
+                bitmap.validate_bitmap_path_for_fragment(state.flag_id, fragment.fragment_id)?;
+                let bitmap_is_local = match bitmap.base_id {
+                    None => root_is_parent_owned,
+                    Some(base_id) => manifest
+                        .base_paths
+                        .get(&base_id)
+                        .is_some_and(|base| base.path == self.dataset.uri),
+                };
+                if bitmap_is_local {
+                    paths.insert(Path::parse(bitmap.path)?);
+                }
+            }
+        }
+        Ok(paths)
     }
 
     #[instrument(
@@ -699,6 +812,17 @@ impl<'a> CleanupTask<'a> {
             // the proof when the old manifests are removed by this cleanup pass.
             build_listing_stream(self.dataset.indices_dir(), None),
             build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
+            // Cell flag roots and pages from manifests being removed are
+            // verified objects. Scan the complete managed subtree while that
+            // proof is available; a retained-manifest timestamp can otherwise
+            // skip an object written in the same commit and strand it forever.
+            build_listing_stream(
+                self.dataset
+                    .base
+                    .clone()
+                    .join(super::cell_flag::CELL_FLAGS_DIR),
+                None,
+            ),
         ];
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
@@ -854,6 +978,26 @@ impl<'a> CleanupTask<'a> {
                     size_bytes,
                 ));
             }
+        }
+        if relative_path.as_ref().starts_with("_cell_flags") {
+            if inspection
+                .referenced_files
+                .cell_flag_paths
+                .contains(&relative_path)
+            {
+                return Ok(None);
+            }
+            if !maybe_in_progress {
+                return Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes));
+            }
+            if inspection
+                .verified_files
+                .cell_flag_paths
+                .contains(&relative_path)
+            {
+                return Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes));
+            }
+            return Ok(None);
         }
         if relative_path.as_ref().starts_with("_indices") {
             // Indices are referenced by UUID so we need to examine the UUID
@@ -1162,6 +1306,7 @@ impl<'a> CleanupTask<'a> {
             // This avoids creating a dataset instance and prevents manifest deletion
             // during the retain operation.
             let branch_location = self.dataset.branch_location().find_branch(Some(branch))?;
+            let branch_base = branch_location.path.clone();
             self.dataset
                 .commit_handler
                 .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
@@ -1173,6 +1318,7 @@ impl<'a> CleanupTask<'a> {
                         location,
                         *root_version_number,
                         &inspection,
+                        &branch_base,
                     )
                 })
                 .await?;
@@ -1185,11 +1331,13 @@ impl<'a> CleanupTask<'a> {
         location: ManifestLocation,
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
+        branch_base: &Path,
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+        let cell_flag_paths = self.branch_cell_flag_paths(&manifest, branch_base).await?;
         let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
 
@@ -1253,6 +1401,13 @@ impl<'a> CleanupTask<'a> {
                     is_referenced = true;
                 }
             }
+        }
+        if !cell_flag_paths.is_empty() {
+            for path in cell_flag_paths {
+                inspection.verified_files.cell_flag_paths.remove(&path);
+                inspection.referenced_files.cell_flag_paths.insert(path);
+            }
+            is_referenced = true;
         }
         if is_referenced {
             inspection

@@ -33,6 +33,65 @@ message Transaction {
   // __lance_commit_message is a reserved key
   map<string, string> transaction_properties = 4;
 
+  // Explicit cell flag registry and row-state changes atomically committed with
+  // the operation. This is independent of Arrow values and Data Overlay coverage.
+  CellFlagTransaction cell_flag_transaction = 5;
+
+  message CellFlagTransaction {
+    message Registration {
+      uint32 flag_id = 1;
+      int32 field_id = 2;
+      string name = 3;
+      // Initial value for rows live in the transaction's read snapshot.
+      bool initial_value = 4;
+    }
+
+    message Rename {
+      uint32 flag_id = 1;
+      string name = 2;
+    }
+
+    message Drop {
+      uint32 flag_id = 1;
+    }
+
+    // Changes existing rows addressed in the transaction's read snapshot.
+    message RowChange {
+      uint32 flag_id = 1;
+      bool value = 2;
+      // Portable serialized RoaringTreemap of physical row addresses.
+      bytes row_addresses = 3;
+    }
+
+    message FragmentState {
+      // Path of the first data file in the uncommitted fragment. Paths remain
+      // stable when the commit assigns or rebases fragment IDs.
+      string fragment_path = 1;
+      uint32 flag_id = 2;
+
+      oneof state {
+        bool all_set = 3;
+        bool none_set = 4;
+        // Portable serialized RoaringBitmap of local physical row offsets.
+        bytes partial = 5;
+      }
+    }
+
+    // Preserve a tracked logical field across schema evolution that replaces
+    // its stable field ID (for example, a type cast).
+    message Transfer {
+      int32 source_field_id = 1;
+      int32 target_field_id = 2;
+    }
+
+    repeated Registration registrations = 1;
+    repeated Rename renames = 2;
+    repeated Drop drops = 3;
+    repeated RowChange row_changes = 4;
+    repeated FragmentState fragment_states = 5;
+    repeated Transfer transfers = 6;
+  }
+
   // Add new rows to the dataset.
   message Append {
     // The new fragments to append.
