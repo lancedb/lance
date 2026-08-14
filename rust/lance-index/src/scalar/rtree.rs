@@ -37,6 +37,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
+use lance_geo::bbox::is_empty_rect;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -244,7 +245,7 @@ pub fn extract_bounding_boxes(
 struct BboxStreamStats {
     null_map: RowAddrTreeMap,
     total_bbox: BoundingBox,
-    // Number of non-null items
+    // Number of indexable items
     num_items: usize,
 }
 
@@ -894,8 +895,8 @@ impl RTreeIndexPlugin {
         )))
     }
 
-    /// Processes a bounding box data stream, separating null and non-null elements, and collects
-    /// statistics about non-null elements.
+    /// Processes a bounding box data stream, separating null and empty elements, and collects
+    /// statistics about indexable elements.
     async fn process_and_analyze_bbox_stream(
         mut data: SendableRecordBatchStream,
         page_size: u32,
@@ -903,7 +904,7 @@ impl RTreeIndexPlugin {
     ) -> Result<(SendableRecordBatchStream, BboxStreamStats)> {
         let mut null_rowaddrs = RowAddrTreeMap::new();
         let mut total_bbox = BoundingBox::new();
-        let mut num_non_null_rows = 0;
+        let mut num_items = 0;
 
         let schema = data.schema();
 
@@ -923,27 +924,32 @@ impl RTreeIndexPlugin {
 
             let num_rows = bbox_array.len();
 
-            let mut non_null_indexes = vec![];
+            let mut indexable_indices = Vec::with_capacity(num_rows);
 
             for i in 0..num_rows {
                 if bbox_array.is_null(i) {
                     let rowaddr = rowaddr_array.value(i);
                     null_rowaddrs.insert(rowaddr);
                 } else {
-                    non_null_indexes.push(i as u32);
+                    let rect = bbox_array
+                        .value(i)
+                        .map_err(arrow_schema::ArrowError::from)?;
+                    if !is_empty_rect(&rect) {
+                        indexable_indices.push(i as u32);
+                    }
                 }
             }
 
-            let new_batch = if non_null_indexes.is_empty() {
-                // all nulls, skip write
+            let new_batch = if indexable_indices.is_empty() {
+                // No indexable bounds, skip write.
                 continue;
-            } else if non_null_indexes.len() == num_rows {
+            } else if indexable_indices.len() == num_rows {
                 batch
             } else {
-                batch.take(&UInt32Array::from(non_null_indexes))?
+                batch.take(&UInt32Array::from(indexable_indices))?
             };
 
-            num_non_null_rows += new_batch.num_rows();
+            num_items += new_batch.num_rows();
             writer.write_record_batch(new_batch).await?;
         }
         writer.finish().await?;
@@ -960,7 +966,7 @@ impl RTreeIndexPlugin {
             BboxStreamStats {
                 null_map: null_rowaddrs,
                 total_bbox,
-                num_items: num_non_null_rows,
+                num_items,
             },
         ))
     }
@@ -1212,9 +1218,9 @@ mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use arrow_array::ArrayRef;
     use arrow_schema::Schema;
-    use geo_types::{Rect, coord};
-    use geoarrow_array::builder::{PointBuilder, RectBuilder};
-    use geoarrow_schema::{Dimension, PointType, RectType};
+    use geo_types::{LineString, Rect, coord, line_string};
+    use geoarrow_array::builder::{LineStringBuilder, PointBuilder, RectBuilder};
+    use geoarrow_schema::{Dimension, LineStringType, PointType, RectType};
     use lance_core::utils::tempfile::TempObjDir;
     use rand::Rng;
 
@@ -1263,12 +1269,10 @@ mod tests {
         page_size: Option<u32>,
     ) -> (Arc<RTreeIndex>, Arc<LanceIndexStore>, TempObjDir) {
         let page_size = page_size.unwrap_or(DEFAULT_RTREE_PAGE_SIZE);
-        let mut num_items = 0;
-        for i in 0..geo_array.len() {
-            if !geo_array.is_null(i) {
-                num_items += 1;
-            }
-        }
+        let bbox_array = bounding_box(geo_array).unwrap();
+        let num_items = (0..bbox_array.len())
+            .filter(|i| !bbox_array.is_null(*i) && !is_empty_rect(&bbox_array.value(*i).unwrap()))
+            .count();
 
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
@@ -1391,6 +1395,66 @@ mod tests {
         expected_nulls.sort();
 
         assert_eq!(actual_nulls, expected_nulls);
+    }
+
+    #[tokio::test]
+    async fn test_empty_geometries_are_not_indexed() {
+        let line_string_type = LineStringType::new(Dimension::XY, Default::default());
+        let mut builder = LineStringBuilder::new(line_string_type);
+        builder
+            .push_line_string(Some(&line_string![(x: 1.0, y: 2.0), (x: 3.0, y: 4.0)]))
+            .unwrap();
+        builder
+            .push_line_string(Some(&line_string![(x: 2.0, y: 3.0)]))
+            .unwrap();
+        builder
+            .push_line_string(Some(&LineString::new(vec![])))
+            .unwrap();
+        builder.push_line_string(None::<&LineString>).unwrap();
+        let geometries = builder.finish();
+
+        let (rtree_index, _store, _tmpdir) = train_index(&geometries, Some(4)).await;
+
+        assert_eq!(rtree_index.metadata.num_items, 2);
+        assert_eq!(rtree_index.metadata.bbox.minx(), 1.0);
+        assert_eq!(rtree_index.metadata.bbox.miny(), 2.0);
+        assert_eq!(rtree_index.metadata.bbox.maxx(), 3.0);
+        assert_eq!(rtree_index.metadata.bbox.maxy(), 4.0);
+
+        let query = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 0.0, y: 0.0 },
+            coord! { x: 5.0, y: 5.0 },
+        ));
+        let mut expected_match = RowAddrTreeMap::new();
+        expected_match.insert(0);
+        expected_match.insert(1);
+        assert_eq!(
+            rtree_index
+                .search_bbox(query, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected_match
+        );
+
+        let mut expected_null = RowAddrTreeMap::new();
+        expected_null.insert(3);
+        assert_eq!(
+            rtree_index
+                .search_null(&NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected_null
+        );
+
+        let line_string_type = LineStringType::new(Dimension::XY, Default::default());
+        let mut builder = LineStringBuilder::new(line_string_type);
+        builder.push_empty();
+        builder.push_empty();
+        let empty_geometries = builder.finish();
+
+        let (empty_index, _store, _tmpdir) = train_index(&empty_geometries, Some(4)).await;
+        assert_eq!(empty_index.metadata.num_items, 0);
+        assert_eq!(empty_index.metadata.num_pages, 0);
     }
 
     #[tokio::test]
