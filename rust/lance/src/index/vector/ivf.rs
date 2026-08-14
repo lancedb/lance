@@ -61,6 +61,7 @@ use lance_encoding::decoder::FilterExpression;
 use lance_file::{
     format::MAGIC,
     reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions},
+    versions as file_versions,
     versions::v1::writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     writer::{FileWriter as V2Writer, FileWriterOptions as V2WriterOptions},
 };
@@ -2697,7 +2698,7 @@ async fn write_root_vector_index_from_auxiliary(
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
-    let mut v2_writer = lance_file::versions::create_writer(
+    let mut v2_writer = file_versions::create_writer(
         format_version,
         obj_writer,
         schema,

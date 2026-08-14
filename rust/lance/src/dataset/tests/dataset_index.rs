@@ -37,13 +37,16 @@ use lance_core::cache::{
 };
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::exec::ExecutionSummaryCounts;
+use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::metrics::{
     COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC, COMPOUND_ADDRESSES_RESOLVED_METRIC,
     COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC, COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC,
-    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC,
+    COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC, COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
+    COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC, COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
+    COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
@@ -1318,6 +1321,125 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
     assert!(
         plan.contains("CompoundFtsScorer"),
         "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_pure_should_maxscore_is_exact_across_fragments() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "alpha beta rare blocked",
+            "alpha beta rare",
+            "alpha beta",
+            "alpha gamma",
+            "beta gamma",
+            "alpha beta rare",
+            "alpha beta",
+            "gamma",
+            "alpha beta rare",
+            "alpha beta",
+            "beta",
+            "alpha"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    create_fragmented_fts_index_with_order(&mut dataset, "text", true, true).await;
+
+    let match_query = |term: &str, boost: f32| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_boost(boost)
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, match_query("alpha", 0.25)),
+        (Occur::Should, match_query("beta", 0.25)),
+        (Occur::Should, match_query("rare", 4.0)),
+        (
+            Occur::Should,
+            PhraseQuery::new("alpha beta".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("blocked", 1.0)),
+    ])
+    .into();
+
+    let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
+    assert!(!exhaustive.iter().any(|(row_id, _)| *row_id == 0));
+    assert!(exhaustive.len() >= 3);
+    assert!(
+        exhaustive[..3]
+            .iter()
+            .all(|(_, score)| *score == exhaustive[0].1)
+            && exhaustive[..3].windows(2).all(|rows| rows[0].0 < rows[1].0),
+        "the top three identical rows should tie in ascending row-id order"
+    );
+    let limited = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    assert_eq!(limited, exhaustive[..2]);
+
+    let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
+    let stats_setter = collected_stats.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .scan_stats_callback(Arc::new(move |stats| {
+            *stats_setter.lock().unwrap() = Some(stats.clone());
+        }))
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    scanner.try_into_batch().await.unwrap();
+    let stats = collected_stats.lock().unwrap().take().unwrap();
+    for metric in [
+        COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC,
+        COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC,
+        COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC,
+        COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC,
+    ] {
+        assert!(
+            stats.all_counts.contains_key(metric),
+            "pure-SHOULD execution stats should expose {metric}"
+        );
+    }
+    assert!(
+        stats.all_counts[COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC] > 0,
+        "pure-SHOULD execution should recompute clause bounds"
+    );
+    assert!(
+        stats.all_counts[COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC] > 0,
+        "pure-SHOULD execution should evaluate essential clauses"
+    );
+    assert_eq!(
+        stats.all_counts.get(PARTITIONS_SEARCHED_METRIC),
+        Some(&(4 * 5)),
+        "four index partitions should be searched once for each of five query leaves"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column pure SHOULD should use the compound scorer:\n{plan}"
     );
 }
 
@@ -4157,6 +4279,26 @@ async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
     dataset
 }
 
+#[tokio::test]
+async fn test_json_btree_index_statistics() {
+    let dataset = json_btree_dataset(vec![
+        r#"{"val": 1000}"#,
+        r#"{"val": 2000}"#,
+        r#"{"val": 3000}"#,
+    ])
+    .await;
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("json_idx").await.unwrap()).unwrap();
+
+    assert_eq!(stats["name"], "json_idx");
+    assert_eq!(stats["num_indices"], 1);
+    assert_eq!(stats["num_indexed_rows"], 3);
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    assert_eq!(stats["indices"][0]["min"], "1000");
+    assert_eq!(stats["indices"][0]["max"], "3000");
+}
+
 #[rstest]
 #[case::merge(false)]
 #[case::append_rebuild(true)]
@@ -5050,7 +5192,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Verify that the index file uses the same version as the dataset
     assert_eq!(
         index_reader.metadata().version(),
-        dataset_version.into(),
+        dataset_version.resolve(),
         "Index file should use the same format version as the dataset"
     );
 
@@ -5079,7 +5221,7 @@ async fn test_index_inherits_dataset_file_version() {
 
         assert_eq!(
             aux_reader.metadata().version(),
-            dataset_version.into(),
+            dataset_version.resolve(),
             "Auxiliary index file should use the same format version as the dataset"
         );
     }
@@ -5158,7 +5300,7 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Verify that the index file uses V2_0 (not legacy)
     assert_eq!(
         index_reader.metadata().version(),
-        LanceFileVersion::V2_0.into(),
+        ConcreteFileVersion::V2_0,
         "Index files should never use legacy format, even for legacy datasets"
     );
 }

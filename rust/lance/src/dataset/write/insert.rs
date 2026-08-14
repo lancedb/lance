@@ -11,9 +11,8 @@ use lance_core::datatypes::{NullabilityComparison, Schema};
 use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::version::ConcreteFileVersion;
-#[cfg(test)]
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
@@ -329,10 +328,6 @@ impl<'a> InsertBuilder<'a> {
             normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
-        // The system columns (`_rowid`, `_rowaddr`, `_rowoffset`, and the row-version
-        // columns) are virtual: they're injected into scan results at read time and
-        // never stored. A stored column sharing one of these names would collide with
-        // the system column on read, so reject it at write time.
         for field in data_schema.fields.iter() {
             if is_system_column(&field.name) {
                 return Err(Error::invalid_input_source(
@@ -422,7 +417,7 @@ impl<'a> InsertBuilder<'a> {
                 // the existing version if they don't
                 params
                     .data_storage_version
-                    .map(ConcreteFileVersion::from)
+                    .map(LanceFileVersion::resolve)
                     .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
             }
             (_, WriteDestination::Dataset(dataset)) => {
