@@ -3746,94 +3746,21 @@ impl LanceNamespace for DirectoryNamespace {
             return LanceNamespace::rename_table(manifest_ns.as_ref(), request).await;
         }
 
-        if request.new_table_name.trim().is_empty() {
-            return Err(NamespaceError::InvalidInput {
-                message: "new_table_name cannot be empty".to_string(),
-            }
-            .into());
+        // Without a manifest there is nothing that can reserve a name across processes.
+        // A table's name is its directory, so renaming is check, copy, delete -- and no
+        // step of that is a claim another caller can lose. Two callers renaming the same
+        // source to different names, or different sources to the same name, both pass
+        // their checks and both publish, leaving one table under two names or two tables
+        // merged under one. There is no cheap fix at this layer: object storage has no
+        // atomic directory rename and no place to record ownership. Renaming therefore
+        // requires the manifest, which does provide a durable cross-instance claim.
+        Err(NamespaceError::Unsupported {
+            message: "rename_table requires manifest mode: a directory-only namespace \
+                      cannot reserve the source and destination names against concurrent \
+                      callers"
+                .to_string(),
         }
-
-        // Without manifest mode, only the root namespace exists, so a table cannot
-        // be moved into a different namespace.
-        if request
-            .new_namespace_id
-            .as_ref()
-            .is_some_and(|namespace| !namespace.is_empty())
-        {
-            return Err(NamespaceError::Unsupported {
-                message: "Cross-namespace rename is only supported when manifest mode is enabled"
-                    .to_string(),
-            }
-            .into());
-        }
-
-        let source_name = Self::table_name_from_id(&request.id)?;
-        let new_table_name = request.new_table_name.clone();
-
-        let source_status = self.check_table_status(&source_name).await?;
-        if !source_status.exists || source_status.is_deregistered {
-            return Err(NamespaceError::TableNotFound {
-                message: Self::format_table_id_from_request(&request.id),
-            }
-            .into());
-        }
-
-        // Without a manifest the table name is the directory name, so the copy below can
-        // only publish a readable table into an empty prefix. Copying into a prefix that
-        // still holds objects (a deregistered table, a declaration marker, or the debris
-        // of an interrupted rename) would interleave two datasets under one name and
-        // report success for a destination nobody can open.
-        let destination_status = self.check_table_status(&new_table_name).await?;
-        if destination_status.exists {
-            let message = if destination_status.is_deregistered {
-                format!(
-                    "{}: a deregistered table directory still occupies this name, drop it before renaming into it",
-                    new_table_name
-                )
-            } else {
-                new_table_name
-            };
-            return Err(NamespaceError::TableAlreadyExists { message }.into());
-        }
-
-        let source_path = self.table_path(&source_name);
-        let destination_path = self.table_path(&new_table_name);
-        // The copy publishes the new name as it goes, so an incomplete one is removed
-        // again: the prefix was empty a moment ago, and leaving a half-copied dataset
-        // there would turn a failed rename into a permanently unreadable table.
-        if let Err(copy_err) =
-            manifest::copy_dir_all(&self.object_store, &source_path, &destination_path).await
-        {
-            if let Err(cleanup_err) = self.object_store.remove_dir_all(destination_path).await {
-                return Err(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to copy table {} to {} ({:?}), and removing the partial copy \
-                         also failed (it must be dropped manually): {:?}",
-                        source_name, new_table_name, copy_err, cleanup_err
-                    ),
-                }
-                .into());
-            }
-            return Err(copy_err);
-        }
-        // The source is only retired once the destination holds a complete copy. A failure
-        // here leaves both names readable, which is reported rather than cleaned up: a
-        // partially removed source may already be unopenable, so the fresh copy is the only
-        // intact one and must not be rolled back.
-        self.object_store
-            .remove_dir_all(source_path)
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Renamed table {} to {}, but failed to remove the source directory \
-                         (it must be dropped manually): {:?}",
-                        source_name, new_table_name, e
-                    ),
-                })
-            })?;
-
-        Ok(RenameTableResponse::new())
+        .into())
     }
 
     async fn alter_table_add_columns(
@@ -9200,8 +9127,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rename_table_v1_mode_moves_data() {
-        use lance_namespace::models::{RenameTableRequest, TableExistsRequest};
+    async fn test_rename_table_without_manifest_is_unsupported() {
+        use lance_namespace::models::RenameTableRequest;
 
         let temp_dir = TempStdDir::default();
         let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
@@ -9211,7 +9138,7 @@ mod tests {
             .unwrap();
 
         let mut create_request = CreateTableRequest::new();
-        create_request.id = Some(vec!["original".to_string()]);
+        create_request.id = Some(vec!["source".to_string()]);
         namespace
             .create_table(
                 create_request,
@@ -9220,73 +9147,30 @@ mod tests {
             .await
             .unwrap();
 
+        // A directory-only namespace has no way to claim the two names, so the rename is
+        // refused rather than racing other callers into a corrupted namespace.
         let mut rename_request = RenameTableRequest::new("renamed".to_string());
-        rename_request.id = Some(vec!["original".to_string()]);
-        namespace.rename_table(rename_request).await.unwrap();
-
-        let mut old_exists = TableExistsRequest::new();
-        old_exists.id = Some(vec!["original".to_string()]);
-        assert!(namespace.table_exists(old_exists).await.is_err());
-
-        let mut new_exists = TableExistsRequest::new();
-        new_exists.id = Some(vec!["renamed".to_string()]);
-        namespace.table_exists(new_exists).await.unwrap();
-
-        assert_eq!(
-            rows_at_location(&namespace, vec!["renamed".to_string()]).await,
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rename_table_v1_mode_rejects_existing_destination() {
-        use lance_namespace::models::RenameTableRequest;
-
-        let temp_dir = TempStdDir::default();
-        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
-            .manifest_enabled(false)
-            .build()
-            .await
-            .unwrap();
-
-        for name in ["source", "destination"] {
-            let mut create_request = CreateTableRequest::new();
-            create_request.id = Some(vec![name.to_string()]);
-            namespace
-                .create_table(
-                    create_request,
-                    Bytes::from(create_non_empty_test_ipc_data()),
-                )
-                .await
-                .unwrap();
-        }
-
-        let mut rename_request = RenameTableRequest::new("destination".to_string());
         rename_request.id = Some(vec!["source".to_string()]);
         let err = namespace.rename_table(rename_request).await.unwrap_err();
+        let lance_core::Error::Namespace { source, .. } = &err else {
+            panic!("expected a Namespace error, got: {err}");
+        };
         assert!(
-            err.to_string().contains("already exists"),
+            matches!(
+                source.downcast_ref::<NamespaceError>(),
+                Some(NamespaceError::Unsupported { .. })
+            ),
             "unexpected error: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_rename_table_v1_mode_source_not_found() {
-        use lance_namespace::models::RenameTableRequest;
-
-        let temp_dir = TempStdDir::default();
-        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
-            .manifest_enabled(false)
-            .build()
-            .await
-            .unwrap();
-
-        let mut rename_request = RenameTableRequest::new("renamed".to_string());
-        rename_request.id = Some(vec!["missing".to_string()]);
-        let err = namespace.rename_table(rename_request).await.unwrap_err();
         assert!(
-            err.to_string().contains("not found"),
+            err.to_string().contains("requires manifest mode"),
             "unexpected error: {err}"
+        );
+
+        // The table is untouched.
+        assert_eq!(
+            rows_at_location(&namespace, vec!["source".to_string()]).await,
+            2
         );
     }
 
@@ -9294,12 +9178,7 @@ mod tests {
     async fn test_rename_table_rejects_empty_new_name() {
         use lance_namespace::models::RenameTableRequest;
 
-        let temp_dir = TempStdDir::default();
-        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
-            .manifest_enabled(false)
-            .build()
-            .await
-            .unwrap();
+        let (namespace, _temp_dir) = create_test_namespace().await;
 
         let mut create_request = CreateTableRequest::new();
         create_request.id = Some(vec!["source".to_string()]);
@@ -9316,37 +9195,6 @@ mod tests {
         let err = namespace.rename_table(rename_request).await.unwrap_err();
         assert!(
             err.to_string().contains("Invalid input"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rename_table_cross_namespace_rejected_without_manifest() {
-        use lance_namespace::models::RenameTableRequest;
-
-        let temp_dir = TempStdDir::default();
-        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
-            .manifest_enabled(false)
-            .build()
-            .await
-            .unwrap();
-
-        let mut create_request = CreateTableRequest::new();
-        create_request.id = Some(vec!["source".to_string()]);
-        namespace
-            .create_table(
-                create_request,
-                Bytes::from(create_non_empty_test_ipc_data()),
-            )
-            .await
-            .unwrap();
-
-        let mut rename_request = RenameTableRequest::new("renamed".to_string());
-        rename_request.id = Some(vec!["source".to_string()]);
-        rename_request.new_namespace_id = Some(vec!["child".to_string()]);
-        let err = namespace.rename_table(rename_request).await.unwrap_err();
-        assert!(
-            err.to_string().contains("Cross-namespace rename"),
             "unexpected error: {err}"
         );
     }
@@ -9410,55 +9258,6 @@ mod tests {
             err.to_string().contains("already exists"),
             "unexpected error: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_rename_table_v1_mode_rejects_deregistered_destination() {
-        use lance_namespace::models::{DeregisterTableRequest, RenameTableRequest};
-
-        let temp_dir = TempStdDir::default();
-        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
-            .manifest_enabled(false)
-            .build()
-            .await
-            .unwrap();
-
-        for name in ["source", "destination"] {
-            let mut create_request = CreateTableRequest::new();
-            create_request.id = Some(vec![name.to_string()]);
-            namespace
-                .create_table(
-                    create_request,
-                    Bytes::from(create_non_empty_test_ipc_data()),
-                )
-                .await
-                .unwrap();
-        }
-
-        let mut deregister_request = DeregisterTableRequest::new();
-        deregister_request.id = Some(vec!["destination".to_string()]);
-        namespace
-            .deregister_table(deregister_request)
-            .await
-            .unwrap();
-
-        // The deregistered table still owns the directory, so the copy would land on top
-        // of another dataset instead of publishing a readable table.
-        let mut rename_request = RenameTableRequest::new("destination".to_string());
-        rename_request.id = Some(vec!["source".to_string()]);
-        let err = namespace.rename_table(rename_request).await.unwrap_err();
-        assert!(
-            err.to_string().contains("deregistered table directory"),
-            "unexpected error: {err}"
-        );
-
-        // Neither side moved.
-        assert_eq!(
-            rows_at_location(&namespace, vec!["source".to_string()]).await,
-            2
-        );
-        let destination_status = namespace.check_table_status("destination").await.unwrap();
-        assert!(destination_status.is_deregistered);
     }
 
     #[tokio::test]
