@@ -30,7 +30,7 @@ use log::{debug, error, info, warn};
 use object_store::path::Path;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{Interval, interval_at};
+use tokio::time::{Interval, interval_at, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use uuid::Uuid;
@@ -131,6 +131,16 @@ pub struct ShardWriterConfig {
     /// `l0_flush_retry_base_delay` above this is simply clamped to it.
     /// Default: 30s.
     pub l0_flush_retry_max_delay: Duration,
+
+    /// How long [`ShardWriter::close`] waits for outstanding L0 flushes before
+    /// giving up on them and shutting the background tasks down.
+    ///
+    /// Close cancels the flush tasks, but only *after* draining their watchers,
+    /// and a flush retries until it lands — so without a bound a close during a
+    /// storage outage would never return. On expiry close reports which
+    /// generations are still owed and returns an error; their rows remain
+    /// WAL-durable, so reopening replays them. Default: 30s.
+    pub close_flush_drain_timeout: Duration,
 
     /// Maximum MemTable size in bytes before triggering a flush to storage.
     ///
@@ -270,6 +280,7 @@ impl Default for ShardWriterConfig {
             max_l0_flush_retries: 8,
             l0_flush_retry_base_delay: Duration::from_millis(50),
             l0_flush_retry_max_delay: Duration::from_secs(30),
+            close_flush_drain_timeout: Duration::from_secs(30),
             max_memtable_size: 256 * 1024 * 1024, // 256MB
             max_memtable_rows: 100_000,           // 100k rows
             max_memtable_batches: 8_000,          // 8k batches
@@ -2958,19 +2969,43 @@ impl ShardWriter {
                         .map(|(_, w)| w.clone())
                         .collect()
                 };
-                for mut watcher in watchers {
-                    let stage_result = match watcher.await_value().await {
-                        Some(durability) => self.typed_flush_outcome(durability),
-                        None => Err(Error::io(
-                            "MemTable flush handler exited before reporting completion during close",
-                        )),
+                // Bound the drain. A flush retries until it lands, and the only
+                // thing that breaks that loop is the cancellation issued by
+                // `shutdown_all()` below — which this drain stands in front of.
+                // Waiting here without a deadline would therefore hang close for
+                // the length of an outage, waiting on tasks that are waiting on
+                // us to cancel them.
+                let outstanding = watchers.len();
+                let drain = async {
+                    let mut drain_result: Result<()> = Ok(());
+                    for mut watcher in watchers {
+                        let stage_result = match watcher.await_value().await {
+                            Some(durability) => self.typed_flush_outcome(durability),
+                            None => Err(Error::io(
+                                "MemTable flush handler exited before reporting completion during close",
+                            )),
+                        };
+                        drain_result = Self::merge_close_stage(
+                            drain_result,
+                            "frozen MemTable flush watcher",
+                            stage_result,
+                        );
+                    }
+                    drain_result
+                };
+
+                let drain_result =
+                    match timeout(self.config.close_flush_drain_timeout, drain).await {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::io(format!(
+                            "close timed out after {:?} waiting for {} outstanding L0 flush(es) \
+                             on shard {}; their rows are still WAL-durable, so reopening the \
+                             shard replays them",
+                            self.config.close_flush_drain_timeout, outstanding, self.config.shard_id
+                        ))),
                     };
-                    close_result = Self::merge_close_stage(
-                        close_result,
-                        "frozen MemTable flush watcher",
-                        stage_result,
-                    );
-                }
+                close_result =
+                    Self::merge_close_stage(close_result, "frozen MemTable flush drain", drain_result);
             }
             WriterMode::WalOnly {
                 state,
@@ -8355,6 +8390,54 @@ mod tests {
         );
 
         writer_b.close().await.unwrap();
+    }
+
+    /// Regression: `close()` must return while an L0 flush is still failing.
+    /// The drain stands in front of the cancellation that would stop the retry
+    /// loop, so an unbounded drain would wait on a task that is waiting to be
+    /// cancelled. The error has to name the generations still owed.
+    #[tokio::test]
+    async fn test_close_bounds_the_flush_drain_and_reports_what_is_owed() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            // Long enough that the retry loop is still backing off when the
+            // drain deadline expires, short enough to keep the test quick.
+            close_flush_drain_timeout: Duration::from_millis(200),
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // Storage never heals, so the generation retries for as long as it is
+        // allowed to. Close must still come back.
+        controls.fail_sstable_puts(usize::MAX);
+        writer.force_seal_active().await.unwrap();
+
+        let error = timeout(Duration::from_secs(10), writer.close())
+            .await
+            .expect("close must not hang while a flush keeps retrying")
+            .expect_err("close cannot report success when a generation never reached L0");
+        assert!(
+            error.to_string().contains("outstanding L0 flush"),
+            "close must name what is still owed, got: {error}"
+        );
     }
 
     /// Regression: every attempt at one generation must write to the same
