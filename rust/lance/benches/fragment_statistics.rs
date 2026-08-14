@@ -5,13 +5,13 @@
 //!
 //! The flattened baseline mirrors the old Java `Dataset.getFragmentStatistics()` path: it creates
 //! `FileFragment` wrappers and allocates three `i64` values per fragment before JNI copies and
-//! Java-side array splitting. The typed-chunk path mirrors the current implementation's native
+//! Java-side array splitting. The typed-array path mirrors the current implementation's native
 //! preparation before it copies directly into the three final Java arrays.
 //!
 //! At 100,000 fragments, the old flattened path allocates a 2.4 MB native vector, followed by a
 //! 2.4 MB Java `long[]` JNI copy and 1.6 MB across the three final Java primitive arrays. The
-//! typed-chunk path bounds native staging memory to 64 KiB and creates only the 1.6 MB final Java
-//! arrays.
+//! typed-array path allocates 1.6 MB of native staging and creates only the 1.6 MB final Java
+//! arrays. It also writes each Java array with a single JNI region call.
 //!
 //! ```text
 //! cargo bench -p lance --bench fragment_statistics
@@ -27,7 +27,6 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_table::format::Fragment;
 
 const NUM_FRAGMENTS: usize = 100_000;
-const STATISTICS_CHUNK_SIZE: usize = 4096;
 
 struct Fixture {
     _data_dir: TempStrDir,
@@ -94,33 +93,26 @@ fn legacy_flattened_fragment_statistics(dataset: &Dataset) -> Vec<i64> {
     statistics
 }
 
-fn prepare_typed_fragment_statistics_chunks(dataset: &Dataset) -> usize {
-    let fragments = dataset.fragments();
-    let chunk_capacity = fragments.len().min(STATISTICS_CHUNK_SIZE);
-    let mut ids = Vec::with_capacity(chunk_capacity);
-    let mut row_counts = Vec::with_capacity(chunk_capacity);
-    let mut data_file_nums = Vec::with_capacity(chunk_capacity);
-    let mut value_count = 0;
+fn prepare_typed_fragment_statistics(dataset: &Dataset) -> usize {
+    let fragments = dataset.fragments().clone();
+    let mut ids = Vec::with_capacity(fragments.len());
+    let mut row_counts = Vec::with_capacity(fragments.len());
+    let mut data_file_nums = Vec::with_capacity(fragments.len());
 
-    for fragments in fragments.chunks(STATISTICS_CHUNK_SIZE) {
-        ids.clear();
-        row_counts.clear();
-        data_file_nums.clear();
-        for fragment in fragments {
-            let physical_rows = fragment.physical_rows.unwrap_or(0) as i64;
-            let deleted_rows = fragment
-                .deletion_file
-                .as_ref()
-                .and_then(|deletion_file| deletion_file.num_deleted_rows)
-                .unwrap_or(0) as i64;
-            ids.push(fragment.id as i32);
-            row_counts.push(physical_rows - deleted_rows);
-            data_file_nums.push(fragment.files.len() as i32);
-        }
-        value_count += ids.len() + row_counts.len() + data_file_nums.len();
-        black_box((&ids, &row_counts, &data_file_nums));
+    for fragment in fragments.iter() {
+        let physical_rows = fragment.physical_rows.unwrap_or(0) as i64;
+        let deleted_rows = fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|deletion_file| deletion_file.num_deleted_rows)
+            .unwrap_or(0) as i64;
+        ids.push(fragment.id as i32);
+        row_counts.push(physical_rows - deleted_rows);
+        data_file_nums.push(fragment.files.len() as i32);
     }
 
+    let value_count = ids.len() + row_counts.len() + data_file_nums.len();
+    black_box((ids, row_counts, data_file_nums));
     value_count
 }
 
@@ -133,7 +125,7 @@ fn bench_fragment_statistics(c: &mut Criterion) {
         NUM_FRAGMENTS * 3
     );
     assert_eq!(
-        prepare_typed_fragment_statistics_chunks(&fixture.dataset),
+        prepare_typed_fragment_statistics(&fixture.dataset),
         NUM_FRAGMENTS * 3
     );
 
@@ -142,8 +134,8 @@ fn bench_fragment_statistics(c: &mut Criterion) {
     group.bench_function("legacy_materialize_flattened_statistics", |b| {
         b.iter(|| black_box(legacy_flattened_fragment_statistics(&fixture.dataset)))
     });
-    group.bench_function("prepare_typed_statistics_chunks", |b| {
-        b.iter(|| black_box(prepare_typed_fragment_statistics_chunks(&fixture.dataset)))
+    group.bench_function("prepare_typed_statistics", |b| {
+        b.iter(|| black_box(prepare_typed_fragment_statistics(&fixture.dataset)))
     });
     group.finish();
 }

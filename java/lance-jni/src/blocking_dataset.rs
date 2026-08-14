@@ -1661,9 +1661,6 @@ fn inner_get_fragment_statistics<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
 ) -> Result<JObject<'local>> {
-    // Three 4096-entry typed buffers use 64 KiB while keeping JNI calls amortized.
-    const CHUNK_SIZE: usize = 4096;
-
     let fragments = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
@@ -1680,33 +1677,25 @@ fn inner_get_fragment_statistics<'local>(
     let row_counts = env.new_long_array(fragment_count)?;
     let data_file_nums = env.new_int_array(fragment_count)?;
 
-    let chunk_capacity = fragments.len().min(CHUNK_SIZE);
-    let mut id_chunk = Vec::with_capacity(chunk_capacity);
-    let mut row_count_chunk = Vec::with_capacity(chunk_capacity);
-    let mut data_file_num_chunk = Vec::with_capacity(chunk_capacity);
+    let mut id_values = Vec::with_capacity(fragments.len());
+    let mut row_count_values = Vec::with_capacity(fragments.len());
+    let mut data_file_num_values = Vec::with_capacity(fragments.len());
 
-    for (chunk_index, fragment_chunk) in fragments.chunks(CHUNK_SIZE).enumerate() {
-        id_chunk.clear();
-        row_count_chunk.clear();
-        data_file_num_chunk.clear();
-
-        for fragment in fragment_chunk {
-            let physical_rows = fragment.physical_rows.unwrap_or(0) as i64;
-            let deleted_rows = fragment
-                .deletion_file
-                .as_ref()
-                .and_then(|deletion_file| deletion_file.num_deleted_rows)
-                .unwrap_or(0) as i64;
-            id_chunk.push(fragment.id as i32);
-            row_count_chunk.push(physical_rows - deleted_rows);
-            data_file_num_chunk.push(fragment.files.len() as i32);
-        }
-
-        let offset = (chunk_index * CHUNK_SIZE) as i32;
-        env.set_int_array_region(&ids, offset, &id_chunk)?;
-        env.set_long_array_region(&row_counts, offset, &row_count_chunk)?;
-        env.set_int_array_region(&data_file_nums, offset, &data_file_num_chunk)?;
+    for fragment in fragments.iter() {
+        let physical_rows = fragment.physical_rows.unwrap_or(0) as i64;
+        let deleted_rows = fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|deletion_file| deletion_file.num_deleted_rows)
+            .unwrap_or(0) as i64;
+        id_values.push(fragment.id as i32);
+        row_count_values.push(physical_rows - deleted_rows);
+        data_file_num_values.push(fragment.files.len() as i32);
     }
+
+    env.set_int_array_region(&ids, 0, &id_values)?;
+    env.set_long_array_region(&row_counts, 0, &row_count_values)?;
+    env.set_int_array_region(&data_file_nums, 0, &data_file_num_values)?;
 
     Ok(env.new_object(
         "org/lance/FragmentStatistics",
