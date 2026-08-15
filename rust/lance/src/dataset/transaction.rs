@@ -43,9 +43,9 @@ use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-        overlay::DataOverlayFile, pb,
+        BasePath, CELL_FLAG_MANIFEST_CONFIG_KEY, DataFile, DataStorageFormat, Fragment, IndexFile,
+        IndexMetadata, Manifest, RowDatasetVersionMeta, RowDatasetVersionRun,
+        RowDatasetVersionSequence, RowIdMeta, overlay::DataOverlayFile, pb,
     },
     io::{
         commit::CommitHandler,
@@ -268,9 +268,8 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    pub(crate) cell_flag_transaction: Option<String>,
 }
-
-const CELL_FLAG_TRANSACTION_PROPERTY: &str = "__lance_cell_flag_transaction";
 
 /// Register one stable field-scoped Boolean flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2341,11 +2340,7 @@ impl TransactionBuilder {
         mut self,
         transaction_properties: Option<Arc<HashMap<String, String>>>,
     ) -> Self {
-        self.transaction_properties = transaction_properties.map(|properties| {
-            let mut properties = properties.as_ref().clone();
-            properties.remove(CELL_FLAG_TRANSACTION_PROPERTY);
-            Arc::new(properties)
-        });
+        self.transaction_properties = transaction_properties;
         self
     }
 
@@ -2376,6 +2371,7 @@ impl TransactionBuilder {
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            cell_flag_transaction: None,
         };
         if let Some(changes) = self.cell_flag_transaction {
             transaction.with_cell_flag_transaction(*changes)
@@ -2399,16 +2395,8 @@ impl Transaction {
         if changes.is_empty() {
             return self;
         }
-        if let Some(properties) = self.transaction_properties.as_mut() {
-            Arc::make_mut(properties).remove(CELL_FLAG_TRANSACTION_PROPERTY);
-        }
         changes.operation_digest = Some(cell_flag_operation_digest(&self));
-        let encoded = encode_cell_flag_transaction(&changes);
-        let properties = self
-            .transaction_properties
-            .get_or_insert_with(|| Arc::new(HashMap::new()));
-        let properties = Arc::make_mut(properties);
-        properties.insert(CELL_FLAG_TRANSACTION_PROPERTY.to_string(), encoded);
+        self.cell_flag_transaction = Some(encode_cell_flag_transaction(&changes));
         self
     }
 
@@ -2416,11 +2404,7 @@ impl Transaction {
         mut self,
         affected_rows: Option<RowAddrTreeMap>,
     ) -> Result<Self> {
-        let Some(encoded) = self
-            .transaction_properties
-            .as_ref()
-            .and_then(|properties| properties.get(CELL_FLAG_TRANSACTION_PROPERTY))
-        else {
+        let Some(encoded) = self.cell_flag_transaction.as_deref() else {
             return Ok(self);
         };
         let mut changes = decode_cell_flag_transaction(encoded)?;
@@ -2453,10 +2437,7 @@ impl Transaction {
     }
 
     pub(crate) fn cell_flag_transaction(&self) -> Result<Option<CellFlagTransaction>> {
-        let Some(properties) = self.transaction_properties.as_ref() else {
-            return Ok(None);
-        };
-        let Some(encoded) = properties.get(CELL_FLAG_TRANSACTION_PROPERTY) else {
+        let Some(encoded) = self.cell_flag_transaction.as_deref() else {
             return Ok(None);
         };
         let changes = decode_cell_flag_transaction(encoded)?;
@@ -2472,6 +2453,20 @@ impl Transaction {
         Ok(Some(changes))
     }
 
+    /// Installs an encoded internal Cell Flag sidecar supplied by a language binding.
+    #[doc(hidden)]
+    pub fn with_cell_flag_transaction_payload(mut self, payload: Option<String>) -> Result<Self> {
+        self.cell_flag_transaction = payload;
+        self.validate_internal_extensions()?;
+        Ok(self)
+    }
+
+    /// Returns the encoded internal Cell Flag sidecar for language binding transport.
+    #[doc(hidden)]
+    pub fn cell_flag_transaction_payload(&self) -> Option<&str> {
+        self.cell_flag_transaction.as_deref()
+    }
+
     fn validate_cell_flag_operation(&self, changes: &CellFlagTransaction) -> Result<()> {
         if Uuid::parse_str(&changes.dataset_identity).is_err() {
             return Err(Error::invalid_input(format!(
@@ -2482,6 +2477,30 @@ impl Transaction {
         if changes.affected_rows.is_some() && !matches!(self.operation, Operation::Update { .. }) {
             return Err(Error::invalid_input(
                 "Cell Flag affected rows are only valid for update transactions",
+            ));
+        }
+        if !changes.row_changes.is_empty()
+            && !matches!(
+                self.operation,
+                Operation::Update { .. } | Operation::Merge { .. }
+            )
+        {
+            return Err(Error::invalid_input(
+                "Cell Flag row changes are only valid for update and merge transactions",
+            ));
+        }
+        if (!changes.registrations.is_empty()
+            || !changes.renames.is_empty()
+            || !changes.drops.is_empty())
+            && !matches!(self.operation, Operation::Project { .. })
+        {
+            return Err(Error::invalid_input(
+                "Cell Flag registry changes are only valid for project transactions",
+            ));
+        }
+        if !changes.transfers.is_empty() && !matches!(self.operation, Operation::Merge { .. }) {
+            return Err(Error::invalid_input(
+                "Cell Flag field transfers are only valid for merge transactions",
             ));
         }
         if matches!(
@@ -3053,6 +3072,26 @@ impl Transaction {
         config: &ManifestWriteConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        let writes_reserved_cell_flag_config = match &self.operation {
+            Operation::Overwrite {
+                config_upsert_values: Some(values),
+                ..
+            } => values.contains_key(CELL_FLAG_MANIFEST_CONFIG_KEY),
+            Operation::UpdateConfig {
+                config_updates: Some(updates),
+                ..
+            } => updates
+                .update_entries
+                .iter()
+                .any(|entry| entry.key == CELL_FLAG_MANIFEST_CONFIG_KEY && entry.value.is_some()),
+            _ => false,
+        };
+        if writes_reserved_cell_flag_config {
+            return Err(Error::invalid_input(format!(
+                "Dataset config key '{}' is reserved for internal Cell Flag metadata",
+                CELL_FLAG_MANIFEST_CONFIG_KEY
+            )));
+        }
         if config.use_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
@@ -5152,27 +5191,18 @@ impl TryFrom<pb::Transaction> for Transaction {
                 ));
             }
         };
-        if message
-            .transaction_properties
-            .contains_key(CELL_FLAG_TRANSACTION_PROPERTY)
-            && typed_cell_flag_transaction.is_some()
+        let cell_flag_transaction = if let Some(cell_flag_transaction) = typed_cell_flag_transaction
         {
-            return Err(Error::invalid_input(
-                "Transaction contains both typed and legacy Cell Flag state",
-            ));
-        }
-        if let Some(cell_flag_transaction) = typed_cell_flag_transaction {
             let changes = CellFlagTransaction::try_from(cell_flag_transaction)?;
             if changes.is_empty() {
                 return Err(Error::invalid_input(
                     "Typed Cell Flag transaction contains no changes",
                 ));
             }
-            message.transaction_properties.insert(
-                CELL_FLAG_TRANSACTION_PROPERTY.to_string(),
-                encode_cell_flag_transaction(&changes),
-            );
-        }
+            Some(encode_cell_flag_transaction(&changes))
+        } else {
+            None
+        };
         let transaction = Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
@@ -5187,6 +5217,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            cell_flag_transaction,
         };
         transaction.cell_flag_transaction()?;
         Ok(transaction)
@@ -5481,18 +5512,16 @@ fn transaction_to_proto(
     };
 
     let (transaction_properties, cell_flag_transaction) = if include_cell_flag_transaction {
-        let mut transaction_properties = value
+        let transaction_properties = value
             .transaction_properties
             .as_ref()
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
-        let cell_flag_transaction = transaction_properties
-            .get(CELL_FLAG_TRANSACTION_PROPERTY)
+        let cell_flag_transaction = value
+            .cell_flag_transaction
+            .as_deref()
             .and_then(|encoded| decode_cell_flag_transaction(encoded).ok())
             .map(|changes| pb::transaction::CellFlagTransaction::from(&changes));
-        if cell_flag_transaction.is_some() {
-            transaction_properties.remove(CELL_FLAG_TRANSACTION_PROPERTY);
-        }
         (transaction_properties, cell_flag_transaction)
     } else {
         (HashMap::new(), None)
@@ -5850,6 +5879,39 @@ mod tests {
             base_id: None,
             files: None,
         }
+    }
+
+    #[test]
+    fn overwrite_rejects_cell_flag_manifest_config_key() {
+        let manifest = sample_manifest();
+        let transaction = Transaction::new_from_version(
+            manifest.version,
+            Operation::Overwrite {
+                fragments: manifest.fragments.as_ref().clone(),
+                schema: manifest.schema.clone(),
+                config_upsert_values: Some(HashMap::from([(
+                    CELL_FLAG_MANIFEST_CONFIG_KEY.to_string(),
+                    "user-controlled".to_string(),
+                )])),
+                initial_bases: None,
+            },
+        );
+
+        let error = transaction
+            .build_manifest(
+                Some(&manifest),
+                Vec::new(),
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("reserved for internal Cell Flag metadata"),
+            "got {error}"
+        );
     }
 
     #[test]
@@ -7245,19 +7307,9 @@ mod tests {
 
     #[test]
     fn test_cell_flag_transaction_round_trip_uses_typed_sidecar() {
+        const USER_PROPERTY: &str = "__lance_cell_flag_transaction";
         let row_addresses = roaring::RoaringTreemap::from_iter([3_u64, (2_u64 << 32) | 4]);
         let changes = CellFlagTransaction {
-            registrations: vec![CellFlagRegistration {
-                flag_id: 11,
-                field_id: 7,
-                name: "computed".to_string(),
-                initial_value: false,
-            }],
-            renames: vec![CellFlagRename {
-                flag_id: 12,
-                name: "verified".to_string(),
-            }],
-            drops: vec![CellFlagDrop { flag_id: 13 }],
             row_changes: vec![CellFlagRowChange {
                 flag_id: 11,
                 value: true,
@@ -7268,13 +7320,10 @@ mod tests {
                 flag_id: 11,
                 state: CellFlagFragmentValue::Partial(RoaringBitmap::from_iter([1, 3])),
             }],
-            transfers: vec![CellFlagFieldTransfer {
-                source_field_id: 7,
-                target_field_id: 9,
-            }],
             dataset_identity: Uuid::new_v4().to_string(),
             affected_rows: Some(RowAddrTreeMap::from(row_addresses)),
             operation_digest: None,
+            ..Default::default()
         };
         let mut new_fragment = Fragment::new(3);
         new_fragment.files = vec![DataFile::new_legacy_from_fields(
@@ -7282,7 +7331,7 @@ mod tests {
             vec![7],
             None,
         )];
-        let tx = Transaction::new_from_version(
+        let tx = TransactionBuilder::new(
             1,
             Operation::Update {
                 removed_fragment_ids: Vec::new(),
@@ -7296,30 +7345,34 @@ mod tests {
                 updated_fragment_offsets: None,
             },
         )
+        .transaction_properties(Some(Arc::new(HashMap::from([(
+            USER_PROPERTY.to_string(),
+            "application-value".to_string(),
+        )]))))
+        .build()
         .with_cell_flag_transaction(changes.clone());
         let expected = tx.cell_flag_transaction().unwrap().unwrap();
         let proto = pb::Transaction::from(&tx);
         assert!(proto.cell_flag_transaction.is_some());
-        assert!(
-            !proto
-                .transaction_properties
-                .contains_key(CELL_FLAG_TRANSACTION_PROPERTY)
+        assert_eq!(
+            proto.transaction_properties.get(USER_PROPERTY),
+            Some(&"application-value".to_string())
         );
 
         let decoded = Transaction::try_from(proto).unwrap();
         assert_eq!(decoded.cell_flag_transaction().unwrap(), Some(expected));
-        assert!(
+        assert_eq!(
             decoded
                 .transaction_properties
                 .as_ref()
                 .unwrap()
-                .contains_key(CELL_FLAG_TRANSACTION_PROPERTY)
+                .get(USER_PROPERTY),
+            Some(&"application-value".to_string())
         );
 
-        let encoded = encode_cell_flag_transaction(&changes);
         let properties = Arc::new(HashMap::from([(
-            CELL_FLAG_TRANSACTION_PROPERTY.to_string(),
-            encoded.clone(),
+            USER_PROPERTY.to_string(),
+            encode_cell_flag_transaction(&changes),
         )]));
         let user_transaction =
             TransactionBuilder::new(1, Operation::ReserveFragments { num_fragments: 1 })
@@ -7327,11 +7380,22 @@ mod tests {
                 .build();
         assert_eq!(user_transaction.cell_flag_transaction().unwrap(), None);
 
-        let mut user_proto = pb::Transaction::from(&user_transaction);
-        user_proto
-            .transaction_properties
-            .insert(CELL_FLAG_TRANSACTION_PROPERTY.to_string(), encoded);
-        assert!(Transaction::try_from(user_proto).is_err());
+        let user_proto = pb::Transaction::from(&user_transaction);
+        assert!(user_proto.cell_flag_transaction.is_none());
+        let decoded_user = Transaction::try_from(user_proto).unwrap();
+        assert_eq!(decoded_user.cell_flag_transaction().unwrap(), None);
+        assert_eq!(
+            decoded_user
+                .transaction_properties
+                .as_ref()
+                .unwrap()
+                .get(USER_PROPERTY),
+            user_transaction
+                .transaction_properties
+                .as_ref()
+                .unwrap()
+                .get(USER_PROPERTY)
+        );
     }
 
     #[test]
@@ -7360,6 +7424,98 @@ mod tests {
 
         let error = transaction.cell_flag_transaction().unwrap_err();
         assert!(error.to_string().contains("outside the public transaction"));
+    }
+
+    #[test]
+    fn cell_flag_row_changes_must_match_a_public_row_mutation() {
+        let transaction = Transaction::new_from_version(
+            1,
+            Operation::Append {
+                fragments: Vec::new(),
+            },
+        )
+        .with_cell_flag_transaction(CellFlagTransaction {
+            row_changes: vec![CellFlagRowChange {
+                flag_id: 0,
+                value: true,
+                row_addresses: roaring::RoaringTreemap::from_iter([0_u64]),
+            }],
+            dataset_identity: Uuid::new_v4().to_string(),
+            ..Default::default()
+        });
+
+        let error = transaction.cell_flag_transaction().unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("only valid for update and merge transactions"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn cell_flag_registry_changes_must_match_a_public_schema_mutation() {
+        let transaction = Transaction::new_from_version(
+            1,
+            Operation::Append {
+                fragments: Vec::new(),
+            },
+        )
+        .with_cell_flag_transaction(CellFlagTransaction {
+            registrations: vec![CellFlagRegistration {
+                flag_id: 0,
+                field_id: 0,
+                name: "reviewed".to_string(),
+                initial_value: false,
+            }],
+            dataset_identity: Uuid::new_v4().to_string(),
+            ..Default::default()
+        });
+
+        let error = transaction.cell_flag_transaction().unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("only valid for project transactions"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn cell_flag_field_transfers_must_match_a_public_schema_merge() {
+        let transaction = Transaction::new_from_version(
+            1,
+            Operation::Update {
+                removed_fragment_ids: Vec::new(),
+                updated_fragments: Vec::new(),
+                new_fragments: Vec::new(),
+                fields_modified: Vec::new(),
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: Vec::new(),
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+        )
+        .with_cell_flag_transaction(CellFlagTransaction {
+            transfers: vec![CellFlagFieldTransfer {
+                source_field_id: 0,
+                target_field_id: 1,
+            }],
+            dataset_identity: Uuid::new_v4().to_string(),
+            ..Default::default()
+        });
+
+        let error = transaction.cell_flag_transaction().unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("only valid for merge transactions"),
+            "got {error}"
+        );
     }
 
     #[test]
@@ -7443,6 +7599,7 @@ mod tests {
                 },
                 tag: Some("release".to_string()),
                 transaction_properties: None,
+                cell_flag_transaction: None,
             }
         }
 
@@ -7472,6 +7629,7 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
+            cell_flag_transaction: None,
         };
         let first = update_transaction(HashSet::from([7, 11, 13]));
         let second = update_transaction(HashSet::from([13, 7, 11]));
@@ -7482,27 +7640,40 @@ mod tests {
     }
 
     #[test]
-    fn malformed_reserved_transaction_property_is_rejected_without_panicking() {
-        let transaction = Transaction {
-            read_version: 1,
-            uuid: Uuid::new_v4().to_string(),
-            operation: Operation::ReserveFragments { num_fragments: 1 },
-            tag: None,
-            transaction_properties: Some(Arc::new(HashMap::from([(
-                CELL_FLAG_TRANSACTION_PROPERTY.to_string(),
-                "not-base64".to_string(),
-            )]))),
-        };
-        assert!(transaction.validate_internal_extensions().is_err());
+    fn transaction_property_named_like_internal_state_is_application_data() {
+        const USER_PROPERTY: &str = "__lance_cell_flag_transaction";
+        let transaction =
+            TransactionBuilder::new(1, Operation::ReserveFragments { num_fragments: 1 })
+                .transaction_properties(Some(Arc::new(HashMap::from([(
+                    USER_PROPERTY.to_string(),
+                    "not-base64".to_string(),
+                )]))))
+                .build();
+        transaction.validate_internal_extensions().unwrap();
 
         let proto = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pb::Transaction::from(&transaction)
         }))
         .expect("infallible protobuf conversion must not panic");
-        assert!(
-            proto
+        assert_eq!(
+            proto.transaction_properties.get(USER_PROPERTY),
+            Some(&"not-base64".to_string())
+        );
+        let decoded = Transaction::try_from(proto).unwrap();
+        assert_eq!(decoded.cell_flag_transaction().unwrap(), None);
+        assert_eq!(
+            decoded
                 .transaction_properties
-                .contains_key(CELL_FLAG_TRANSACTION_PROPERTY)
+                .as_ref()
+                .unwrap()
+                .get(USER_PROPERTY),
+            Some(&"not-base64".to_string())
+        );
+
+        assert!(
+            transaction
+                .with_cell_flag_transaction_payload(Some("not-base64".to_string()))
+                .is_err()
         );
 
         let mut empty_sidecar = pb::Transaction::from(&Transaction::new_from_version(
@@ -7560,10 +7731,8 @@ mod tests {
             uuid: Uuid::new_v4().to_string(),
             operation: Operation::ReserveFragments { num_fragments: 1 },
             tag: None,
-            transaction_properties: Some(Arc::new(HashMap::from([(
-                CELL_FLAG_TRANSACTION_PROPERTY.to_string(),
-                encoded,
-            )]))),
+            transaction_properties: None,
+            cell_flag_transaction: Some(encoded),
         };
         assert!(forged.validate_internal_extensions().is_err());
 

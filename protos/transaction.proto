@@ -86,8 +86,8 @@ message Transaction {
     repeated RowChange row_changes = 4;
     repeated FragmentState fragment_states = 5;
     repeated Transfer transfers = 6;
-    // Stable random identity of the dataset incarnation that produced this
-    // transaction.
+    // Stable deterministic UUIDv8-shaped identity of the dataset incarnation
+    // that produced this transaction.
     string dataset_identity = 7;
 
     // Complete existing-row rewrite or deletion scope in physical row-address

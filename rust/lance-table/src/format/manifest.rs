@@ -33,6 +33,7 @@ use lance_io::utils::read_struct;
 
 const MAX_INLINE_CELL_FLAG_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENCODED_CELL_FLAG_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+/// Reserved manifest config key for encoded Cell Flag registry and state metadata.
 pub const CELL_FLAG_MANIFEST_CONFIG_KEY: &str = "lance.cell_flags.v1";
 const CELL_FLAG_MANIFEST_ENCODING_PREFIX: &str = "protobuf-base64:";
 

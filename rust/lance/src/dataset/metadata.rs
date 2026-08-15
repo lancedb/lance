@@ -241,6 +241,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_config_rejects_cell_flag_manifest_key() {
+        use lance_table::format::CELL_FLAG_MANIFEST_CONFIG_KEY;
+
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let version = dataset.version().version;
+
+        let error = dataset
+            .update_config([(CELL_FLAG_MANIFEST_CONFIG_KEY, "user-controlled")])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "got {error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("reserved for internal Cell Flag metadata"),
+            "got {error}"
+        );
+        assert_eq!(dataset.version().version, version);
+        assert!(!dataset.config().contains_key(CELL_FLAG_MANIFEST_CONFIG_KEY));
+    }
+
+    #[tokio::test]
     async fn test_update_table_metadata() {
         let data = gen_batch()
             .col("i", array::step::<Int32Type>())

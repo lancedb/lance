@@ -25,7 +25,7 @@ message CellFlagManifest {
 
 Using the existing config extension slot preserves the public generated `Manifest` API and lets readers that do not understand Cell Flags ignore the metadata while reading ordinary fields. Cell Flag-aware readers remove this reserved entry from user-visible dataset config and reject attempts to write it through the public config API.
 
-Definitions and state descriptors are sorted by `flag_id`. IDs are never reused, including after a definition is dropped. `dataset_id` is a random UUID that identifies the dataset incarnation and prevents an uncommitted transaction from being replayed into a dataset recreated at the same URI. Renaming a field preserves its definitions because they bind to `field_id`. Dropping a field removes its definitions from the new snapshot; historical snapshots retain their own registry and state.
+Definitions and state descriptors are sorted by `flag_id`. IDs are never reused, including after a definition is dropped. `dataset_id` is a deterministic UUIDv8-shaped identity derived from the founding snapshot. It identifies the dataset incarnation and prevents an uncommitted transaction from being replayed into a dataset recreated at the same URI. Renaming a field preserves its definitions because they bind to `field_id`. Dropping a field removes its definitions from the new snapshot; historical snapshots retain their own registry and state.
 
 Registering a flag initializes all current live rows explicitly to `false` by default or to a caller-supplied Boolean value. A mutation cannot create an unregistered name.
 

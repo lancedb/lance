@@ -8,7 +8,7 @@ use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
+    TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use lance::datatypes::Schema;
@@ -16,7 +16,7 @@ use lance_index::mem_wal::CompactedSsTable;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata, pb};
 use prost::Message;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::types::{PyBytes, PySet};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
@@ -871,31 +871,23 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
         let read_version = ob.getattr("read_version")?.extract()?;
         let uuid = ob.getattr("uuid")?.extract()?;
         let operation = ob.getattr("operation")?.extract::<PyLance<Operation>>()?.0;
-        let mut transaction_properties = ob
+        let transaction_properties = ob
             .getattr("transaction_properties")?
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .unwrap_or_default();
-        if transaction_properties.contains_key("__lance_cell_flag_transaction") {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "cell flag transaction properties are reserved",
-            ));
-        }
         let internal_cell_flag_transaction = ob
             .getattr("_cell_flag_transaction")?
             .extract::<Option<String>>()?;
-        if let Some(payload) = internal_cell_flag_transaction {
-            transaction_properties.insert("__lance_cell_flag_transaction".to_string(), payload);
-        }
         let transaction_properties =
             (!transaction_properties.is_empty()).then(|| Arc::new(transaction_properties));
-        Ok(Self(Transaction {
-            read_version,
-            uuid,
-            operation,
-            tag: None,
-            transaction_properties,
-        }))
+        let transaction = TransactionBuilder::new(read_version, operation)
+            .uuid(uuid)
+            .transaction_properties(transaction_properties)
+            .build()
+            .with_cell_flag_transaction_payload(internal_cell_flag_transaction)
+            .map_err(|error| PyIOError::new_err(error.to_string()))?;
+        Ok(Self(transaction))
     }
 }
 
@@ -919,16 +911,14 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
 
         let py_transaction = cls.call1((read_version, operation, uuid))?;
 
-        if let Some(transaction_properties_arc) = &self.0.transaction_properties {
-            let mut transaction_properties = transaction_properties_arc.as_ref().clone();
-            let internal_payload = transaction_properties.remove("__lance_cell_flag_transaction");
-            if let Some(payload) = internal_payload {
-                py_transaction.setattr("_cell_flag_transaction", payload)?;
-            }
-            if !transaction_properties.is_empty() {
-                let py_dict = transaction_properties.into_pyobject(py)?;
-                py_transaction.setattr("transaction_properties", py_dict)?;
-            }
+        if let Some(payload) = self.0.cell_flag_transaction_payload() {
+            py_transaction.setattr("_cell_flag_transaction", payload)?;
+        }
+        if let Some(transaction_properties) = &self.0.transaction_properties
+            && !transaction_properties.is_empty()
+        {
+            let py_dict = transaction_properties.as_ref().clone().into_pyobject(py)?;
+            py_transaction.setattr("transaction_properties", py_dict)?;
         }
         // Unwrap due to infallible
         Ok(py_transaction.into_pyobject(py).unwrap())

@@ -603,6 +603,7 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             tag: None,
             transaction_properties: None,
+            cell_flag_transaction: None,
         };
         let merged = if cell_flag_changes.is_empty() {
             merged
@@ -677,6 +678,7 @@ mod tests {
             read_version,
             tag: None,
             transaction_properties: None,
+            cell_flag_transaction: None,
         }
     }
 
@@ -1149,6 +1151,7 @@ mod tests {
             read_version: 1,
             tag: None,
             transaction_properties: None,
+            cell_flag_transaction: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

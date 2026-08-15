@@ -239,8 +239,9 @@ message CellFlagManifest {
   // The next flag ID to allocate. IDs are never reused after definition drop.
   uint32 next_flag_id = 3;
 
-  // Stable random identity of the dataset incarnation. It is created with the
-  // first flag registration and retained after all definitions are dropped.
+  // Stable deterministic UUIDv8-shaped identity derived from the founding
+  // snapshot. It is persisted by the first flag registration and retained
+  // after all definitions are dropped.
   string dataset_id = 4;
 }
 

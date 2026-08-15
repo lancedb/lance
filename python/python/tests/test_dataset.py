@@ -6556,6 +6556,10 @@ def _flag_rows(
 
 def test_cell_flag_public_api(tmp_path: Path):
     dataset = lance.write_dataset(pa.table({"id": range(4)}), tmp_path)
+    version = dataset.version
+    with pytest.raises(OSError, match="reserved for internal Cell Flag metadata"):
+        dataset.update_config({"lance.cell_flags.v1": "user-controlled"})
+    assert dataset.version == version
     dataset.add_columns(pa.field("embedding", pa.int32()))
     computed = dataset.register_cell_flag("embedding", "computed")
     reviewed = dataset.register_cell_flag("embedding", "reviewed", True)
@@ -6605,15 +6609,6 @@ def test_cell_flag_public_api(tmp_path: Path):
         key.startswith("__lance_cell_flag_transaction")
         for key in transaction.transaction_properties
     )
-
-    for reserved_key in ("__lance_cell_flag_transaction",):
-        forged = lance.Transaction(
-            dataset.version,
-            lance.LanceOperation.Update(),
-            transaction_properties={reserved_key: "00"},
-        )
-        with pytest.raises(ValueError, match="properties are reserved"):
-            lance.LanceDataset.commit(dataset, forged)
 
     dataset = lance.write_dataset(
         pa.table({"id": [4], "embedding": pa.array([None], pa.int32())}),
@@ -6869,12 +6864,19 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     with pytest.raises(OSError, match="different dataset incarnation"):
         lance.LanceDataset.commit(replacement, recreated_transaction)
 
+    user_property = "__lance_cell_flag_transaction"
+    transaction.transaction_properties = {user_property: "application-value"}
     committed = lance.LanceDataset.commit(dataset, transaction)
     assert _flag_rows(committed, field="value", name="reviewed") == [
         (0, False),
         (1, True),
         (2, False),
     ]
+    committed_transaction = committed.read_transaction(committed.version)
+    assert committed_transaction.transaction_properties == {
+        user_property: "application-value"
+    }
+    assert committed_transaction._cell_flag_transaction is not None
 
     concurrent_uri = tmp_path / "concurrent"
     concurrent = lance.write_dataset(
