@@ -5461,7 +5461,6 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
-            cell_flag_transaction: None,
         };
         let dataset = Arc::new(
             CommitBuilder::new(dataset)
@@ -5645,7 +5644,6 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
-            cell_flag_transaction: None,
         };
         let dataset = Arc::new(
             CommitBuilder::new(dataset)

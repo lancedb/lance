@@ -338,6 +338,36 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_write_manifest_rejects_invalid_cell_flag_registry() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/invalid_cell_flag_registry");
+        let mut writer = store.create(&path).await.unwrap();
+        let arrow_schema =
+            ArrowSchema::new(vec![ArrowField::new("tracked", DataType::Int32, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let field_id = schema.fields[0].id;
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.cell_flag_definitions = vec![crate::format::CellFlagDefinition {
+            flag_id: 0,
+            field_id,
+            name: String::new(),
+        }];
+        manifest.next_cell_flag_id = 1;
+        manifest.cell_flag_dataset_id = Some(uuid::Uuid::new_v4().to_string());
+        crate::feature_flags::apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        let error = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("empty name"), "{error}");
+    }
+
+    #[tokio::test]
     async fn test_update_schema_metadata() {
         let store = ObjectStore::memory();
         let path = Path::from("/update_schema_metadata");

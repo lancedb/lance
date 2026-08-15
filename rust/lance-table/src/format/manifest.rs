@@ -15,7 +15,7 @@ use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -98,16 +98,131 @@ fn encode_cell_flag_manifest(manifest: &Manifest) -> Option<String> {
     ))
 }
 
-pub fn validate_cell_flag_manifest_metadata(manifest: &Manifest) -> Result<()> {
-    let Some(metadata) = cell_flag_manifest_proto(manifest) else {
+fn validate_cell_flag_registry(
+    schema: &Schema,
+    definitions: &[CellFlagDefinition],
+    states: &[CellFlagState],
+    next_flag_id: u32,
+    dataset_id: Option<&str>,
+    has_metadata: bool,
+) -> Result<()> {
+    if !has_metadata {
+        if dataset_id.is_some() {
+            return Err(Error::invalid_input(
+                "Cell Flag manifest dataset ID requires a non-empty registry",
+            ));
+        }
         return Ok(());
-    };
-    Uuid::parse_str(&metadata.dataset_id).map_err(|error| {
+    }
+    if next_flag_id == 0 && definitions.is_empty() && states.is_empty() {
+        return Err(Error::invalid_input(
+            "Cell Flag manifest metadata must not encode an empty registry",
+        ));
+    }
+    let dataset_id = dataset_id.ok_or_else(|| {
+        Error::invalid_input("Cell Flag manifest metadata is missing its dataset ID")
+    })?;
+    Uuid::parse_str(dataset_id).map_err(|error| {
         Error::invalid_input(format!(
             "Cell Flag manifest dataset ID '{}' is invalid: {}",
-            metadata.dataset_id, error
+            dataset_id, error
         ))
     })?;
+
+    let mut flag_ids = HashSet::with_capacity(definitions.len());
+    let mut names_by_field = HashSet::with_capacity(definitions.len());
+    let mut max_flag_id = None;
+    for definition in definitions {
+        if definition.name.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "Cell flag {} for field ID {} has an empty name",
+                definition.flag_id, definition.field_id
+            )));
+        }
+        if !flag_ids.insert(definition.flag_id) {
+            return Err(Error::invalid_input(format!(
+                "Manifest contains duplicate cell flag definition for flag ID {}",
+                definition.flag_id
+            )));
+        }
+        if schema.field_by_id(definition.field_id).is_none() {
+            return Err(Error::invalid_input(format!(
+                "Manifest cell flag {} ('{}') references unknown field ID {}",
+                definition.flag_id, definition.name, definition.field_id
+            )));
+        }
+        if !names_by_field.insert((definition.field_id, definition.name.as_str())) {
+            return Err(Error::invalid_input(format!(
+                "Manifest contains duplicate cell flag name '{}' for field ID {}",
+                definition.name, definition.field_id
+            )));
+        }
+        max_flag_id = Some(max_flag_id.map_or(definition.flag_id, |current: u32| {
+            current.max(definition.flag_id)
+        }));
+    }
+    if let Some(max_flag_id) = max_flag_id
+        && next_flag_id <= max_flag_id
+    {
+        return Err(Error::invalid_input(format!(
+            "Manifest next_cell_flag_id {} must be greater than registered flag ID {}",
+            next_flag_id, max_flag_id
+        )));
+    }
+
+    let mut state_flag_ids = HashSet::with_capacity(states.len());
+    let mut inline_flag_bytes = 0usize;
+    for state in states {
+        if !state_flag_ids.insert(state.flag_id) {
+            return Err(Error::invalid_input(format!(
+                "Manifest contains duplicate cell flag state for flag ID {}",
+                state.flag_id
+            )));
+        }
+        if !flag_ids.contains(&state.flag_id) {
+            return Err(Error::invalid_input(format!(
+                "Manifest cell flag state references unknown flag ID {}",
+                state.flag_id
+            )));
+        }
+        state.root.validate_root_path_for_flag(state.flag_id)?;
+        if let Some(bytes) = state.root.inline_bytes.as_ref() {
+            inline_flag_bytes = inline_flag_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| Error::invalid_input("Inline cell flag manifest size overflow"))?;
+        }
+    }
+    if inline_flag_bytes > MAX_INLINE_CELL_FLAG_MANIFEST_BYTES {
+        return Err(Error::invalid_input(format!(
+            "Manifest contains {} inline cell flag bytes, maximum is {}",
+            inline_flag_bytes, MAX_INLINE_CELL_FLAG_MANIFEST_BYTES
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_cell_flag_manifest_metadata(manifest: &Manifest) -> Result<()> {
+    let metadata = cell_flag_manifest_proto(manifest);
+    let has_metadata = metadata.is_some();
+    validate_cell_flag_registry(
+        &manifest.schema,
+        &manifest.cell_flag_definitions,
+        &manifest.cell_flag_states,
+        manifest.next_cell_flag_id,
+        manifest.cell_flag_dataset_id.as_deref(),
+        has_metadata,
+    )?;
+    let has_feature = manifest.writer_feature_flags & FLAG_CELL_FLAGS != 0;
+    if has_metadata != has_feature {
+        return Err(Error::invalid_input(if has_metadata {
+            "Manifest contains cell flag metadata without the required writer feature flag"
+        } else {
+            "Manifest declares the Cell Flag writer feature without cell flag metadata"
+        }));
+    }
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
     let payload_len = base64::encoded_len(metadata.encoded_len(), false)
         .ok_or_else(|| Error::invalid_input("Encoded Cell Flag manifest metadata size overflow"))?;
     if payload_len > MAX_ENCODED_CELL_FLAG_MANIFEST_BYTES {
@@ -1025,26 +1140,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             next_flag_id: next_cell_flag_id,
             dataset_id: cell_flag_dataset_id,
         } = cell_flag_metadata.unwrap_or_default();
-        if has_cell_flag_metadata
-            && next_cell_flag_id == 0
-            && cell_flag_definitions.is_empty()
-            && cell_flag_states.is_empty()
-        {
-            return Err(Error::invalid_input(
-                "Cell Flag manifest metadata must not encode an empty registry",
-            ));
-        }
-        let cell_flag_dataset_id = if has_cell_flag_metadata {
-            Uuid::parse_str(&cell_flag_dataset_id).map_err(|error| {
-                Error::invalid_input(format!(
-                    "Cell Flag manifest dataset ID '{}' is invalid: {}",
-                    cell_flag_dataset_id, error
-                ))
-            })?;
-            Some(cell_flag_dataset_id)
-        } else {
-            None
-        };
+        let cell_flag_dataset_id = has_cell_flag_metadata.then_some(cell_flag_dataset_id);
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -1119,80 +1215,19 @@ impl TryFrom<pb::Manifest> for Manifest {
             .map(CellFlagDefinition::try_from)
             .collect::<Result<Vec<_>>>()?;
         cell_flag_definitions.sort_by_key(|definition| definition.flag_id);
-        for definitions in cell_flag_definitions.windows(2) {
-            if definitions[0].flag_id == definitions[1].flag_id {
-                return Err(Error::invalid_input(format!(
-                    "Manifest contains duplicate cell flag definition for flag ID {}",
-                    definitions[0].flag_id
-                )));
-            }
-        }
-        let mut names_by_field = HashMap::<i32, std::collections::HashSet<String>>::new();
-        for definition in &cell_flag_definitions {
-            if schema.field_by_id(definition.field_id).is_none() {
-                return Err(Error::invalid_input(format!(
-                    "Manifest cell flag {} ('{}') references unknown field ID {}",
-                    definition.flag_id, definition.name, definition.field_id
-                )));
-            }
-            if !names_by_field
-                .entry(definition.field_id)
-                .or_default()
-                .insert(definition.name.clone())
-            {
-                return Err(Error::invalid_input(format!(
-                    "Manifest contains duplicate cell flag name '{}' for field ID {}",
-                    definition.name, definition.field_id
-                )));
-            }
-        }
-        if let Some(max_flag_id) = cell_flag_definitions
-            .iter()
-            .map(|definition| definition.flag_id)
-            .max()
-            && next_cell_flag_id <= max_flag_id
-        {
-            return Err(Error::invalid_input(format!(
-                "Manifest next_cell_flag_id {} must be greater than registered flag ID {}",
-                next_cell_flag_id, max_flag_id
-            )));
-        }
-
         let mut cell_flag_states = cell_flag_states
             .into_iter()
             .map(CellFlagState::try_from)
             .collect::<Result<Vec<_>>>()?;
         cell_flag_states.sort_by_key(|state| state.flag_id);
-        for states in cell_flag_states.windows(2) {
-            if states[0].flag_id == states[1].flag_id {
-                return Err(Error::invalid_input(format!(
-                    "Manifest contains duplicate cell flag state for flag ID {}",
-                    states[0].flag_id
-                )));
-            }
-        }
-        for state in &cell_flag_states {
-            if cell_flag_definitions
-                .binary_search_by_key(&state.flag_id, |definition| definition.flag_id)
-                .is_err()
-            {
-                return Err(Error::invalid_input(format!(
-                    "Manifest cell flag state references unknown flag ID {}",
-                    state.flag_id
-                )));
-            }
-        }
-        let inline_flag_bytes = cell_flag_states
-            .iter()
-            .filter_map(|state| state.root.inline_bytes.as_ref())
-            .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
-            .ok_or_else(|| Error::invalid_input("Inline cell flag manifest size overflow"))?;
-        if inline_flag_bytes > MAX_INLINE_CELL_FLAG_MANIFEST_BYTES {
-            return Err(Error::invalid_input(format!(
-                "Manifest contains {} inline cell flag bytes, maximum is {}",
-                inline_flag_bytes, MAX_INLINE_CELL_FLAG_MANIFEST_BYTES
-            )));
-        }
+        validate_cell_flag_registry(
+            &schema,
+            &cell_flag_definitions,
+            &cell_flag_states,
+            next_cell_flag_id,
+            cell_flag_dataset_id.as_deref(),
+            has_cell_flag_metadata,
+        )?;
 
         Ok(Self {
             schema,

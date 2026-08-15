@@ -828,6 +828,11 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
         let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
         field.id = *new_field_id;
     }
+    for definition in &mut manifest.cell_flag_definitions {
+        if let Some(new_field_id) = old_field_id_mapping.get(&definition.field_id) {
+            definition.field_id = *new_field_id;
+        }
+    }
 
     // Drop data files that are no longer in use.
     let remaining_field_ids = manifest

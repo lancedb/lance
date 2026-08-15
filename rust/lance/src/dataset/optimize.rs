@@ -2676,7 +2676,15 @@ pub async fn commit_compaction(
     let mut any_group_indexed = false;
 
     for task in completed_tasks {
-        if !dataset.manifest.cell_flag_states.is_empty() {
+        let source_fragment_ids = task
+            .original_fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<HashSet<_>>();
+        if dataset
+            .cell_flag_rewrite_required(&source_fragment_ids, &HashMap::new(), &HashMap::new())
+            .await?
+        {
             let source_row_addresses = compaction_source_row_addresses(dataset, &task).await?;
             cell_flag_changes.fragment_states.extend(
                 dataset

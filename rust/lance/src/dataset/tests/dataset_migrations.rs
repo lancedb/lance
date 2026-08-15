@@ -319,6 +319,29 @@ async fn test_fix_v0_10_5_corrupt_schema() {
 }
 
 #[tokio::test]
+async fn test_fix_v0_10_5_corrupt_schema_preserves_cell_flag_binding() {
+    let test_dir = copy_test_data_to_tmp("v0.10.5/corrupt_schema").unwrap();
+    let test_uri = test_dir.path_str();
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
+
+    dataset
+        .register_cell_flag("b", "reviewed", false)
+        .await
+        .unwrap();
+    let reopened = Dataset::open(&test_uri).await.unwrap();
+    reopened.validate().await.unwrap();
+    let definition = reopened
+        .cell_flag_definitions()
+        .iter()
+        .find(|definition| definition.name == "reviewed")
+        .unwrap();
+    assert_eq!(
+        definition.field_id,
+        reopened.schema().field("b").unwrap().id
+    );
+}
+
+#[tokio::test]
 async fn test_fix_v0_21_0_corrupt_fragment_bitmap() {
     // In v0.21.0 and earlier, delta indices had a bug where the fragment bitmap
     // could contain fragments that are part of other index deltas.

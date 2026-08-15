@@ -279,6 +279,7 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        let transaction = transaction.with_cell_flag_affected_rows(self.affected_rows.clone())?;
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -603,7 +604,6 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             tag: None,
             transaction_properties: None,
-            cell_flag_transaction: None,
         };
         let merged = if cell_flag_changes.is_empty() {
             merged
@@ -678,7 +678,6 @@ mod tests {
             read_version,
             tag: None,
             transaction_properties: None,
-            cell_flag_transaction: None,
         }
     }
 
@@ -1151,7 +1150,6 @@ mod tests {
             read_version: 1,
             tag: None,
             transaction_properties: None,
-            cell_flag_transaction: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

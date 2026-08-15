@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import os
 import sys
 from typing import Optional
 
@@ -87,6 +88,7 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    os.environ.setdefault("LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED", "1")
     config.addinivalue_line(
         "markers",
         "forward: mark tests that require forward compatibility datagen files",

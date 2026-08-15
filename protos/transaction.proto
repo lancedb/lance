@@ -203,6 +203,9 @@ message Transaction {
     repeated RewriteGroup groups = 3;
     // Indices that have been rewritten
     repeated RewrittenIndex rewritten_indices = 4;
+    // Replacement Fragment Reuse Index produced by deferred index remapping.
+    // When absent, the rewrite leaves the current Fragment Reuse Index unchanged.
+    IndexMetadata frag_reuse_index = 5;
   }
 
   // An operation that merges in a new column, altering the schema.
@@ -233,6 +236,8 @@ message Transaction {
     // conservatively conflicts with concurrent value-writes, which can only
     // cause a retry. A nullability tightening must not set this.
     bool preserves_nullability = 2;
+    // Top-level schema metadata preserved by this projection.
+    map<string, bytes> schema_metadata = 3;
   }
 
   // An operation that restores a dataset to a previous version.

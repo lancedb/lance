@@ -27,6 +27,7 @@ use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_datafusion::expr::safe_coerce_scalar;
@@ -523,8 +524,18 @@ impl UpdateJob {
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-        let needs_cell_flag_mapping = !self.dataset.manifest.cell_flag_states.is_empty()
-            || self.cell_flag_values.values().any(|value| *value);
+        let source_fragment_ids = row_addrs
+            .iter()
+            .map(|address| RowAddress::from(address).fragment_id() as u64)
+            .collect::<HashSet<_>>();
+        let needs_cell_flag_mapping = self
+            .dataset
+            .cell_flag_rewrite_required(
+                &source_fragment_ids,
+                self.cell_flag_values.as_ref(),
+                &HashMap::new(),
+            )
+            .await?;
         let source_row_addresses = if !needs_cell_flag_mapping {
             Vec::new()
         } else {
@@ -654,8 +665,7 @@ impl UpdateJob {
             }
         }
 
-        let needs_cell_flag_mapping = !dataset.manifest.cell_flag_states.is_empty()
-            || self.cell_flag_values.values().any(|value| *value);
+        let needs_cell_flag_mapping = !update_data.source_row_addresses.is_empty();
         let fragment_states = if needs_cell_flag_mapping {
             dataset
                 .cell_flag_states_for_rewritten_rows(

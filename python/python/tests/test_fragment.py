@@ -15,6 +15,7 @@ import pytest
 from helper import ProgressForTest
 from lance import (
     FragmentMetadata,
+    Index,
     LanceDataset,
     LanceFragment,
     LanceOperation,
@@ -372,12 +373,28 @@ def test_create_from_file(tmp_path):
         old_fragments=[frag.metadata for frag in dataset.get_fragments()],
         new_fragments=[frag],
     )
-    op = LanceOperation.Rewrite(groups=[group], rewritten_indices=[])
+    frag_reuse_index = Index(
+        uuid=str(uuid.uuid4()),
+        name="__lance_frag_reuse",
+        fields=[],
+        dataset_version=dataset.version,
+        fragment_ids={fragment.fragment_id for fragment in dataset.get_fragments()},
+        index_version=7,
+    )
+    op = LanceOperation.Rewrite(
+        groups=[group],
+        rewritten_indices=[],
+        frag_reuse_index=frag_reuse_index,
+    )
     dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
 
     assert dataset.count_rows() == 1600
     assert len(dataset.get_fragments()) == 1
     assert dataset.get_fragments()[0].fragment_id == 2
+    assert (
+        dataset.read_transaction(dataset.version).operation.frag_reuse_index
+        == frag_reuse_index
+    )
 
 
 def test_fragment_merge(tmp_path):

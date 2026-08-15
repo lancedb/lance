@@ -36,7 +36,9 @@ use lance_table::format::Fragment;
 
 use crate::{
     Dataset,
-    dataset::cell_flag::{cell_flag_call_flag_id, load_cell_flag_fragments},
+    dataset::cell_flag::{
+        cell_flag_call_flag_id, cell_flag_call_flag_id_and_relation, load_cell_flag_fragments,
+    },
 };
 
 /// A [TableProvider] for Lance datasets.
@@ -431,8 +433,8 @@ impl BindCellFlags {
     ) -> datafusion::common::Result<Expr> {
         let mut captured_error = None;
         let transformed = expression.transform(|node| {
-            let flag_id = match cell_flag_call_flag_id(dataset, &node) {
-                Ok(Some(flag_id)) => flag_id,
+            let (flag_id, relation) = match cell_flag_call_flag_id_and_relation(dataset, &node) {
+                Ok(Some(binding)) => binding,
                 Ok(None) => return Ok(Transformed::no(node)),
                 Err(error) => {
                     captured_error = Some(DataFusionError::from(error));
@@ -448,7 +450,7 @@ impl BindCellFlags {
             Ok(Transformed::yes(Expr::ScalarFunction(
                 ScalarFunction::new_udf(
                     function.clone(),
-                    vec![Expr::Column(Column::new_unqualified(lance_core::ROW_ADDR))],
+                    vec![Expr::Column(Column::new(relation, lance_core::ROW_ADDR))],
                 ),
             )))
         })?;
@@ -537,7 +539,14 @@ impl BindCellFlags {
                 .collect::<datafusion::common::Result<Vec<_>>>()?;
 
             if required_by_parent && matches!(plan, LogicalPlan::Projection(_)) {
-                expressions.push(Expr::Column(Column::new_unqualified(lance_core::ROW_ADDR)));
+                for input in &inputs {
+                    for index in 0..input.schema().fields().len() {
+                        let qualified_field = input.schema().qualified_field(index);
+                        if qualified_field.1.name() == lance_core::ROW_ADDR {
+                            expressions.push(Expr::Column(Column::from(qualified_field)));
+                        }
+                    }
+                }
             }
             plan.with_new_exprs(expressions, inputs)?
         };
@@ -994,5 +1003,31 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(sql_ids, vec![1, 4, 7]);
+
+        let self_join = manual_context
+            .sql(
+                "SELECT a.id FROM items a JOIN items b ON a.id = b.id \
+                 WHERE cell_flag(a.embedding, 'computed') ORDER BY a.id",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let self_join_ids = self_join
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(self_join_ids, vec![1, 4, 7]);
     }
 }

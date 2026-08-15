@@ -39,6 +39,8 @@ use lance_core::utils::address::RowAddress;
 use lance_io::object_store::ObjectStore;
 
 pub const CELL_FLAGS_DIR: &str = "_cell_flags";
+pub const ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED_ENV: &str =
+    "LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED";
 const CELL_FLAG_ROOTS_DIR: &str = "roots";
 const CELL_FLAG_BITMAPS_DIR: &str = "bitmaps";
 const MAX_CELL_FLAG_FILE_BYTES: u64 = 512 * 1024 * 1024;
@@ -277,6 +279,9 @@ impl Dataset {
     /// The returned `flag_id` is stable for the lifetime of the registration.
     /// `initial_value` applies to rows visible in the current snapshot and is
     /// independent of the field's Arrow values and validity bits.
+    /// The first registration requires
+    /// [`ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED_ENV`] to be set after every
+    /// possible writer has deployed the gate-only compatibility release.
     ///
     /// ```no_run
     /// # use lance::{Dataset, Result};
@@ -294,6 +299,15 @@ impl Dataset {
         name: impl Into<String>,
         initial_value: bool,
     ) -> Result<CellFlagDefinition> {
+        if self.manifest.next_cell_flag_id == 0
+            && !cfg!(test)
+            && std::env::var_os(ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED_ENV).is_none()
+        {
+            return Err(Error::not_supported(format!(
+                "Registering the first Cell Flag is disabled until every writer has the gate-only release; set {} only after that deployment is complete",
+                ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED_ENV
+            )));
+        }
         let field = field.as_ref();
         let field_id = self
             .schema()
@@ -893,6 +907,34 @@ impl Dataset {
         Ok(states)
     }
 
+    pub(crate) async fn cell_flag_rewrite_required(
+        &self,
+        source_fragment_ids: &HashSet<u64>,
+        matched_changes: &HashMap<u32, bool>,
+        inserted_changes: &HashMap<u32, bool>,
+    ) -> Result<bool> {
+        if matched_changes
+            .values()
+            .chain(inserted_changes.values())
+            .any(|value| *value)
+        {
+            return Ok(true);
+        }
+        for state in &self.manifest.cell_flag_states {
+            let Some(root) = self.load_cell_flag_root(state.flag_id).await? else {
+                continue;
+            };
+            if root
+                .fragments
+                .iter()
+                .any(|fragment| source_fragment_ids.contains(&fragment.fragment_id))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Remap flag membership from source rows to rewritten fragments. Explicit
     /// operation-local changes override the preserved source state.
     pub(crate) async fn cell_flag_states_for_rewritten_rows(
@@ -971,12 +1013,16 @@ impl Dataset {
                 .unwrap_or(CellFlagRoot {
                     fragments: Vec::new(),
                 });
-            let mut source_states = HashMap::new();
-            for fragment in root
+            let source_fragments = root
                 .fragments
                 .into_iter()
                 .filter(|fragment| source_fragment_ids.contains(&fragment.fragment_id))
-            {
+                .collect::<Vec<_>>();
+            if source_fragments.is_empty() && !produces_true {
+                continue;
+            }
+            let mut source_states = HashMap::new();
+            for fragment in source_fragments {
                 let state = match &fragment.state {
                     CellFlagFragmentState::All => None,
                     CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
@@ -1066,6 +1112,16 @@ fn field_reference_segments(expr: &Expr) -> Result<Vec<String>> {
         _ => Err(Error::invalid_input(
             "cell_flag(field, name) requires a direct field reference as its first argument",
         )),
+    }
+}
+
+fn field_reference_column(expr: &Expr) -> Option<&datafusion::common::Column> {
+    match expr {
+        Expr::Column(column) => Some(column),
+        Expr::ScalarFunction(function) if function.func.name() == "get_field" => {
+            function.args.first().and_then(field_reference_column)
+        }
+        _ => None,
     }
 }
 
@@ -1209,9 +1265,28 @@ fn resolve_cell_flag(dataset: &Dataset, segments: &[String], name: &str) -> Resu
 }
 
 pub fn cell_flag_call_flag_id(dataset: &Dataset, expression: &Expr) -> Result<Option<u32>> {
-    is_cell_flag_call(expression)?
-        .map(|(segments, name)| resolve_cell_flag(dataset, &segments, &name))
-        .transpose()
+    Ok(cell_flag_call_flag_id_and_relation(dataset, expression)?.map(|(flag_id, _)| flag_id))
+}
+
+pub fn cell_flag_call_flag_id_and_relation(
+    dataset: &Dataset,
+    expression: &Expr,
+) -> Result<Option<(u32, Option<datafusion::common::TableReference>)>> {
+    let Some((segments, name)) = is_cell_flag_call(expression)? else {
+        return Ok(None);
+    };
+    let Expr::ScalarFunction(function) = expression else {
+        unreachable!("is_cell_flag_call only matches scalar functions");
+    };
+    let relation = function
+        .args
+        .first()
+        .and_then(field_reference_column)
+        .and_then(|column| column.relation.clone());
+    Ok(Some((
+        resolve_cell_flag(dataset, &segments, &name)?,
+        relation,
+    )))
 }
 
 pub async fn load_cell_flag_fragments(
@@ -1893,41 +1968,45 @@ pub async fn apply_cell_flag_transaction(
         }
     }
 
-    let exact_rewrite_paths: Vec<&str> = match &transaction.operation {
+    let exact_rewrite_requirements: Vec<(HashSet<u64>, Vec<&str>)> = match &transaction.operation {
         Operation::Rewrite { groups, .. } => groups
             .iter()
-            .flat_map(|group| group.new_fragments.iter())
-            .map(fragment_path)
+            .map(|group| {
+                Ok((
+                    group
+                        .old_fragments
+                        .iter()
+                        .map(|fragment| fragment.id)
+                        .collect(),
+                    group
+                        .new_fragments
+                        .iter()
+                        .map(fragment_path)
+                        .collect::<Result<_>>()?,
+                ))
+            })
             .collect::<Result<_>>()?,
         Operation::Update {
             new_fragments,
             update_mode: Some(UpdateMode::RewriteRows),
             ..
-        } => new_fragments
-            .iter()
-            .map(fragment_path)
-            .collect::<Result<_>>()?,
+        } => vec![(
+            changes
+                .affected_rows
+                .iter()
+                .flat_map(|rows| rows.iter().map(|(fragment_id, _)| *fragment_id as u64))
+                .collect(),
+            new_fragments
+                .iter()
+                .map(fragment_path)
+                .collect::<Result<_>>()?,
+        )],
         _ => Vec::new(),
     };
-
-    for path in &exact_rewrite_paths {
-        let fragment = fragment_by_path.get(path).ok_or_else(|| {
-            Error::internal(format!(
-                "Rewritten fragment '{}' is missing from the final manifest",
-                path
-            ))
-        })?;
-        for definition in &definitions {
-            if current.cell_flag_state(definition.flag_id).is_some()
-                && !overrides.contains_key(&(definition.flag_id, fragment.id))
-            {
-                return Err(Error::invalid_input(format!(
-                    "Physical row rewrite must supply exact state for cell flag ID {}, new fragment '{}'",
-                    definition.flag_id, path
-                )));
-            }
-        }
-    }
+    let exact_rewrite_paths = exact_rewrite_requirements
+        .iter()
+        .flat_map(|(_, paths)| paths.iter().copied())
+        .collect::<Vec<_>>();
 
     let mut descriptors = Vec::with_capacity(definitions.len());
     for definition in &definitions {
@@ -1939,6 +2018,43 @@ pub async fn apply_cell_flag_transaction(
             || pending_changes
                 .keys()
                 .any(|(change_flag_id, _)| *change_flag_id == flag_id);
+        let mut current_root =
+            if exact_rewrite_paths.is_empty() || current.cell_flag_state(flag_id).is_none() {
+                None
+            } else {
+                current.load_cell_flag_root(flag_id).await?
+            };
+        let required_exact_paths = current_root
+            .as_ref()
+            .map(|root| {
+                exact_rewrite_requirements
+                    .iter()
+                    .filter(|(source_fragment_ids, _)| {
+                        root.fragments
+                            .iter()
+                            .any(|fragment| source_fragment_ids.contains(&fragment.fragment_id))
+                    })
+                    .flat_map(|(_, paths)| paths.iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let exact_rewrite_needs_state = !required_exact_paths.is_empty();
+        if exact_rewrite_needs_state {
+            for path in required_exact_paths {
+                let fragment = fragment_by_path.get(path).ok_or_else(|| {
+                    Error::internal(format!(
+                        "Rewritten fragment '{}' is missing from the final manifest",
+                        path
+                    ))
+                })?;
+                if !overrides.contains_key(&(flag_id, fragment.id)) {
+                    return Err(Error::invalid_input(format!(
+                        "Physical row rewrite must supply exact state for cell flag ID {}, new fragment '{}'",
+                        flag_id, path
+                    )));
+                }
+            }
+        }
 
         let append_only_adds_false_state =
             matches!(transaction.operation, Operation::Append { .. })
@@ -1959,6 +2075,9 @@ pub async fn apply_cell_flag_transaction(
             && !has_explicit_state_change
             && !matches!(transaction.operation, Operation::Overwrite { .. }))
             || append_only_adds_false_state
+            || (!exact_rewrite_paths.is_empty()
+                && !exact_rewrite_needs_state
+                && !has_explicit_state_change)
         {
             if let Some(descriptor) = current.cell_flag_state(flag_id) {
                 descriptors.push(descriptor.clone());
@@ -1988,17 +2107,19 @@ pub async fn apply_cell_flag_transaction(
             } else if matches!(transaction.operation, Operation::Overwrite { .. }) {
                 BTreeMap::new()
             } else {
-                current
-                    .load_cell_flag_root(flag_id)
-                    .await?
-                    .map(|root| {
-                        root.fragments
-                            .into_iter()
-                            .filter(|entry| final_fragments.contains_key(&entry.fragment_id))
-                            .map(|entry| (entry.fragment_id, entry))
-                            .collect()
-                    })
-                    .unwrap_or_default()
+                let root = if current_root.is_some() {
+                    current_root.take()
+                } else {
+                    current.load_cell_flag_root(flag_id).await?
+                };
+                root.map(|root| {
+                    root.fragments
+                        .into_iter()
+                        .filter(|entry| final_fragments.contains_key(&entry.fragment_id))
+                        .map(|entry| (entry.fragment_id, entry))
+                        .collect()
+                })
+                .unwrap_or_default()
             };
 
         for ((override_flag_id, fragment_id), value) in &overrides {
@@ -2156,7 +2277,9 @@ mod tests {
 
     use super::*;
     use crate::dataset::cleanup::CleanupPolicyBuilder;
-    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::optimize::{
+        CompactionOptions, CompactionTask, IgnoreRemap, TaskData, commit_compaction, compact_files,
+    };
     use crate::dataset::transaction::CellFlagRowChange;
     use crate::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use crate::dataset::{
@@ -2322,6 +2445,12 @@ mod tests {
         assert_eq!(
             dataset
                 .count_rows(Some(format!("cell_flag(x, '{}')", FLAG_NAME)))
+                .await?,
+            90
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!("cell_flag(x, '{}') OR x < 0", FLAG_NAME)))
                 .await?,
             90
         );
@@ -2949,6 +3078,47 @@ mod tests {
                 flagged_ids(&dataset, "value", FLAG_NAME).await?,
                 vec![1, 5, 7]
             );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disjoint_compaction_reuses_cell_flag_root() -> Result<()> {
+        for enable_stable_row_ids in [false, true] {
+            let directory = TempStrDir::default();
+            let mut dataset =
+                dataset_with_rows_and_stable_ids(&directory, 2, enable_stable_row_ids).await?;
+            dataset
+                .register_cell_flag("value", FLAG_NAME, false)
+                .await?;
+            let result = UpdateBuilder::new(Arc::new(dataset))
+                .update_where("id = 0")?
+                .set_cell_flag("value", FLAG_NAME, true)?
+                .build()?
+                .execute()
+                .await?;
+            let mut dataset = result.new_dataset.as_ref().clone();
+            let root_before = dataset.manifest.cell_flag_states[0].root.clone();
+            let options = CompactionOptions::default();
+            let task = CompactionTask {
+                task: TaskData {
+                    fragments: dataset.fragments()[1..].to_vec(),
+                },
+                read_version: dataset.version().version,
+                options: options.clone(),
+            };
+            let completed = task.execute(&dataset).await?;
+
+            commit_compaction(
+                &mut dataset,
+                vec![completed],
+                Arc::new(IgnoreRemap::default()),
+                &options,
+            )
+            .await?;
+
+            assert_eq!(dataset.manifest.cell_flag_states[0].root, root_before);
+            assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![0]);
         }
         Ok(())
     }

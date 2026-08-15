@@ -2888,6 +2888,9 @@ impl Scanner {
         let Some(bindings) =
             CellFlagExprBindings::try_new(&self.dataset, &expressions, selected_fragments).await?
         else {
+            if let Some(filter_expression) = filter_expression {
+                self.filter.expr_filter = Some(ExprFilter::Datafusion(filter_expression));
+            }
             return Ok(());
         };
 
@@ -3217,6 +3220,14 @@ impl Scanner {
         false
     }
 
+    fn filter_references_non_data_columns(&self, filter_plan: &ExprFilterPlan) -> bool {
+        filter_plan.refine_expr.as_ref().is_some_and(|refine_expr| {
+            Planner::column_names_in_expr(refine_expr)
+                .iter()
+                .any(|column| self.dataset.schema().field(column).is_none())
+        })
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -3247,10 +3258,16 @@ impl Scanner {
             && self.batch_size.is_none()
             && self.use_stats
             && !self.filter_references_version_columns(filter_plan)
+            && !self.filter_references_non_data_columns(filter_plan)
         {
             filter_pushed_down = true;
             self.pushdown_scan(false, filter_plan)
         } else {
+            let refine_needs_row_addr = filter_plan.refine_expr.as_ref().is_some_and(|expr| {
+                Planner::column_names_in_expr(expr)
+                    .iter()
+                    .any(|column| column == ROW_ADDR)
+            });
             let ordered = if self.ordering.is_some() || self.nearest.is_some() {
                 // If we are sorting the results there is no need to scan in order
                 false
@@ -3284,7 +3301,7 @@ impl Scanner {
 
             let scan = self.scan_fragments(
                 projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
+                self.projection_plan.physical_projection.with_row_addr || refine_needs_row_addr,
                 self.projection_plan
                     .physical_projection
                     .with_row_last_updated_at_version,

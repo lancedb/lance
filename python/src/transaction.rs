@@ -521,11 +521,17 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             "Rewrite" => {
                 let groups = extract_vec(&ob.getattr("groups")?)?;
                 let rewritten_indices = extract_vec(&ob.getattr("rewritten_indices")?)?;
+                let frag_reuse_index = ob
+                    .getattr("frag_reuse_index")
+                    .ok()
+                    .map(|value| value.extract::<Option<PyLance<IndexMetadata>>>())
+                    .transpose()?
+                    .flatten()
+                    .map(|value| value.0);
                 let op = Operation::Rewrite {
                     groups,
                     rewritten_indices,
-                    // TODO: pass frag_reuse_index when available
-                    frag_reuse_index: None,
+                    frag_reuse_index,
                 };
                 Ok(Self(op))
             }
@@ -777,14 +783,19 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
-                ..
+                frag_reuse_index,
             } => {
                 let groups_py = export_vec(py, groups.as_slice())?;
                 let rewritten_indices_py = export_vec(py, rewritten_indices.as_slice())?;
+                let frag_reuse_index_py = if let Some(index) = frag_reuse_index.as_ref() {
+                    PyLance(index).into_pyobject(py)?.into_any()
+                } else {
+                    py.None().into_bound(py)
+                };
                 let cls = namespace
                     .getattr("Rewrite")
                     .expect("Failed to get Rewrite class");
-                cls.call1((groups_py, rewritten_indices_py))
+                cls.call1((groups_py, rewritten_indices_py, frag_reuse_index_py))
             }
             Operation::CreateIndex {
                 new_indices,
@@ -914,10 +925,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         if let Some(payload) = self.0.cell_flag_transaction_payload() {
             py_transaction.setattr("_cell_flag_transaction", payload)?;
         }
-        if let Some(transaction_properties) = &self.0.transaction_properties
-            && !transaction_properties.is_empty()
-        {
-            let py_dict = transaction_properties.as_ref().clone().into_pyobject(py)?;
+        if let Some(transaction_properties) = self.0.application_transaction_properties() {
+            let py_dict = transaction_properties.into_pyobject(py)?;
             py_transaction.setattr("transaction_properties", py_dict)?;
         }
         // Unwrap due to infallible

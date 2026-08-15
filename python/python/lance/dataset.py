@@ -1604,6 +1604,9 @@ class LanceDataset(pa.dataset.Dataset):
         The returned ``flag_id`` is stable for this registration. Flag state is
         independent of field values and Arrow validity; ``initial_value`` is
         applied explicitly to every live row in the current snapshot.
+        The first registration is disabled until every writer has deployed the
+        gate-only compatibility release and the process sets
+        ``LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED``.
 
         Examples
         --------
@@ -6399,6 +6402,8 @@ class LanceOperation:
             Groups of files that have been rewritten.
         rewritten_indices: list[RewrittenIndex]
             Indices that have been rewritten.
+        frag_reuse_index: Index, optional
+            Replacement Fragment Reuse Index produced by deferred remapping.
 
         Warning
         -------
@@ -6406,7 +6411,8 @@ class LanceOperation:
         """
 
         groups: Iterable[LanceOperation.RewriteGroup]
-        rewritten_indices: Iterable[LanceOperation.RewrfittenIndex]
+        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+        frag_reuse_index: Optional[Index] = None
 
         def __post_init__(self):
             all_frags = [old for group in self.groups for old in group.old_fragments]

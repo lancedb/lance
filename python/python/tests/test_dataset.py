@@ -5569,7 +5569,9 @@ def test_schema_project_drop_column(tmp_path: Path):
 
     dataset = lance.write_dataset(table, base_dir)
 
-    schema = pa.Table.from_pydict({"a": range(1)}).schema
+    schema = pa.Table.from_pydict({"a": range(1)}).schema.with_metadata(
+        {b"owner": b"cell-flags"}
+    )
     lance_schema = LanceSchema.from_pyarrow(schema)
 
     project = lance.LanceOperation.Project(lance_schema)
@@ -5583,6 +5585,10 @@ def test_schema_project_drop_column(tmp_path: Path):
         }
     )
     assert tbl == expected
+    assert dataset.schema.metadata == {b"owner": b"cell-flags"}
+    assert dataset.read_transaction(
+        dataset.version
+    ).operation.schema.to_pyarrow().metadata == {b"owner": b"cell-flags"}
 
 
 def test_schema_project_rename_column(tmp_path: Path):
@@ -6552,6 +6558,21 @@ def _flag_rows(
     ).sort_by("id")
     assert table["flag"].null_count == 0
     return list(zip(table["id"].to_pylist(), table["flag"].to_pylist()))
+
+
+def test_first_cell_flag_registration_requires_writer_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED", raising=False)
+    dataset = lance.write_dataset(
+        pa.table({"value": [1]}), tmp_path / "registration_gate"
+    )
+
+    with pytest.raises(ValueError, match="gate-only release"):
+        dataset.register_cell_flag("value", "reviewed")
+
+    monkeypatch.setenv("LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED", "1")
+    assert dataset.register_cell_flag("value", "reviewed")["name"] == "reviewed"
 
 
 def test_cell_flag_public_api(tmp_path: Path):
