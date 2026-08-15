@@ -566,19 +566,21 @@ impl Dataset {
                 })?;
                 let mut root = CellFlagRoot::try_from(proto)?;
 
-                let fragments_by_id = self
-                    .manifest
-                    .fragments
-                    .iter()
-                    .map(|fragment| (fragment.id, fragment))
-                    .collect::<HashMap<_, _>>();
                 for entry in &mut root.fragments {
-                    let fragment = fragments_by_id.get(&entry.fragment_id).ok_or_else(|| {
+                    let fragment_id = u32::try_from(entry.fragment_id).map_err(|_| {
                         Error::invalid_input(format!(
-                            "Cell flag root for flag ID {} references unknown fragment {}",
+                            "Cell flag root for flag ID {} references invalid fragment {}",
                             flag_id, entry.fragment_id
                         ))
                     })?;
+                    let fragment = self
+                        .get_fragment_metadata_by_id(fragment_id)
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "Cell flag root for flag ID {} references unknown fragment {}",
+                                flag_id, entry.fragment_id
+                            ))
+                        })?;
                     let physical_rows = fragment.physical_rows.ok_or_else(|| {
                         Error::invalid_input(format!(
                             "Fragment {} has no physical row count for cell flag",

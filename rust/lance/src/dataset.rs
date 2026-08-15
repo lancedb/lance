@@ -2832,10 +2832,24 @@ impl Dataset {
         &self,
         fragment_ids: &[u32],
     ) -> Vec<Fragment> {
-        self.get_existing_fragments_from_ids(fragment_ids)
+        Self::normalize_fragment_ids(fragment_ids)
             .into_iter()
-            .map(|fragment| fragment.metadata().clone())
+            .filter_map(|fragment_id| self.get_fragment_metadata_by_id(fragment_id).cloned())
             .collect()
+    }
+
+    pub(crate) fn get_fragment_metadata_by_id(&self, fragment_id: u32) -> Option<&Fragment> {
+        if !self.fragment_bitmap.contains(fragment_id) {
+            return None;
+        }
+        let fragment_index = self.fragment_bitmap.rank(fragment_id) as usize - 1;
+        let fragment = self.manifest.fragments.get(fragment_index)?;
+        debug_assert_eq!(
+            fragment.id, fragment_id as u64,
+            "fragment_bitmap rank({fragment_id}) resolved to fragment {}, but fragment_bitmap and manifest.fragments are expected to stay in sync",
+            fragment.id
+        );
+        Some(fragment)
     }
 
     pub(crate) async fn count_rows_in_fragments(&self, fragment_ids: &[u32]) -> Result<usize> {
@@ -2872,17 +2886,9 @@ impl Dataset {
         ordered_ids
             .iter()
             .map(|id| {
-                if !self.fragment_bitmap.contains(*id) {
-                    return None;
-                }
-                let fragment_index = self.fragment_bitmap.rank(*id) as usize - 1;
-                let fragment = self.manifest.fragments.get(fragment_index)?;
-                debug_assert_eq!(
-                    fragment.id, *id as u64,
-                    "fragment_bitmap rank({id}) resolved to fragment {}, but fragment_bitmap and manifest.fragments are expected to stay in sync",
-                    fragment.id
-                );
-                Some(FileFragment::new(dataset.clone(), fragment.clone()))
+                self.get_fragment_metadata_by_id(*id)
+                    .cloned()
+                    .map(|fragment| FileFragment::new(dataset.clone(), fragment))
             })
             .collect()
     }

@@ -6627,6 +6627,8 @@ def test_cell_flag_public_api(tmp_path: Path):
     taken = dataset.take(take_indices, columns=take_columns)
     expected = dataset.to_table(columns=take_columns).take(take_indices)
     assert taken == expected
+    with pytest.raises(OSError, match="unknown flag"):
+        dataset.take([], columns={"flag": "cell_flag(embedding, 'missing')"})
 
     with pytest.raises(ValueError, match="unknown flag"):
         dataset.to_table(columns={"flag": "cell_flag(id, 'missing')"})

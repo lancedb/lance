@@ -111,15 +111,13 @@ pub async fn take(
     projection: ProjectionRequest,
 ) -> Result<RecordBatch> {
     let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
-    if offsets.is_empty() {
-        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
-            projection.output_schema()?,
-        )));
-    }
-
-    // First, convert the dataset offsets into row addresses
-    let fragments = dataset.get_fragments();
-    let addrs = row_offsets_to_row_addresses(&fragments, offsets).await?;
+    let addrs = if offsets.is_empty() {
+        Vec::new()
+    } else {
+        // First, convert the dataset offsets into row addresses
+        let fragments = dataset.get_fragments();
+        row_offsets_to_row_addresses(&fragments, offsets).await?
+    };
 
     let builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),
@@ -327,6 +325,11 @@ async fn do_take_rows(
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
+        if batches.is_empty() {
+            return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
+                projection.output_schema()?,
+            )));
+        }
         let one_batch = if batches.len() > 1 {
             concat_batches(&batches[0].schema(), &batches)?
         } else {
@@ -402,9 +405,6 @@ async fn do_take_rows(
 }
 
 async fn bind_cell_flag_projection(builder: &mut TakeBuilder) -> Result<()> {
-    if builder.dataset.cell_flag_definitions().is_empty() {
-        return Ok(());
-    }
     let mut references_cell_flag = false;
     for output in &builder.projection.requested_output_expr {
         if expression_references_cell_flag(&output.expr)? {
@@ -416,19 +416,19 @@ async fn bind_cell_flag_projection(builder: &mut TakeBuilder) -> Result<()> {
         return Ok(());
     }
     let mut projection = builder.projection.as_ref().clone();
-    let selected_fragment_ids = builder
-        .get_row_addrs()
-        .await?
-        .iter()
-        .map(|address| RowAddress::from(*address).fragment_id() as u64)
-        .collect::<HashSet<_>>();
-    let selected_fragments = builder
-        .dataset
-        .fragments()
-        .iter()
-        .filter(|fragment| selected_fragment_ids.contains(&fragment.id))
-        .cloned()
-        .collect::<Vec<_>>();
+    let selected_fragment_ids = if builder.is_empty() {
+        HashSet::new()
+    } else {
+        builder
+            .get_row_addrs()
+            .await?
+            .iter()
+            .map(|address| RowAddress::from(*address).fragment_id())
+            .collect::<HashSet<_>>()
+    };
+    let selected_fragments = builder.dataset.get_existing_fragment_metadata_from_ids(
+        &selected_fragment_ids.into_iter().collect::<Vec<_>>(),
+    );
     let expressions = projection
         .requested_output_expr
         .iter()
@@ -449,13 +449,13 @@ async fn bind_cell_flag_projection(builder: &mut TakeBuilder) -> Result<()> {
 }
 
 async fn take_rows(mut builder: TakeBuilder) -> Result<RecordBatch> {
+    bind_cell_flag_projection(&mut builder).await?;
     if builder.is_empty() {
         return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
             builder.projection.output_schema()?,
         )));
     }
 
-    bind_cell_flag_projection(&mut builder).await?;
     let projection = builder.projection.clone();
 
     do_take_rows(builder, projection).await
@@ -985,6 +985,19 @@ mod test {
         .unwrap();
         let batches = RecordBatchIterator::new([Ok(batch)], schema);
         let mut dataset = Dataset::write(batches, "memory://", None).await.unwrap();
+        let invalid_projection =
+            ProjectionRequest::from_sql([("missing", "cell_flag(value, 'missing')")]);
+        let error = dataset
+            .take(&[], invalid_projection.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown flag 'missing'"));
+        let error = dataset
+            .take_rows(&[], invalid_projection)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown flag 'missing'"));
+
         dataset
             .register_cell_flag("value", "reviewed", false)
             .await
@@ -1036,6 +1049,50 @@ mod test {
         assert_eq!(empty.num_rows(), 0);
         assert_eq!(
             empty
+                .schema()
+                .field_with_name("reviewed")
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
+
+        let invalid_projection =
+            ProjectionRequest::from_sql([("missing", "cell_flag(value, 'missing')")]);
+        let error = dataset
+            .take(&[], invalid_projection.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown flag 'missing'"));
+        let error = dataset
+            .take_rows(&[], invalid_projection)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown flag 'missing'"));
+
+        let data = test_batch(0..4);
+        let write_params = WriteParams {
+            max_rows_per_file: 2,
+            max_rows_per_group: 2,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut deleted_dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        deleted_dataset
+            .register_cell_flag("s", "reviewed", true)
+            .await
+            .unwrap();
+        deleted_dataset.delete("i >= 0").await.unwrap();
+        let deleted_projection =
+            ProjectionRequest::from_sql([("i", "i"), ("reviewed", "cell_flag(s, 'reviewed')")]);
+        let deleted = deleted_dataset
+            .take_rows(&[1_u64 << 32, 0], deleted_projection)
+            .await
+            .unwrap();
+        assert_eq!(deleted.num_rows(), 0);
+        assert_eq!(
+            deleted
                 .schema()
                 .field_with_name("reviewed")
                 .unwrap()
