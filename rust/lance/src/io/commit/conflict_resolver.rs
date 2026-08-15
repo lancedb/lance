@@ -101,6 +101,24 @@ fn cell_flag_replacing_fragment_ids(operation: &Operation) -> HashSet<u64> {
     }
 }
 
+fn is_flag_only_update(transaction: &Transaction) -> Result<bool> {
+    Ok(matches!(
+        &transaction.operation,
+        Operation::Update {
+            updated_fragments,
+            removed_fragment_ids,
+            new_fragments,
+            fields_modified,
+            ..
+        } if updated_fragments.is_empty()
+            && removed_fragment_ids.is_empty()
+            && new_fragments.is_empty()
+            && fields_modified.is_empty()
+    ) && transaction
+        .cell_flag_transaction()?
+        .is_some_and(|changes| !changes.row_changes.is_empty()))
+}
+
 fn cell_flag_row_changes_conflict(
     ours: &crate::dataset::transaction::CellFlagConflictScope,
     theirs: &crate::dataset::transaction::CellFlagConflictScope,
@@ -499,6 +517,14 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        let self_is_flag_only_update = is_flag_only_update(&self.transaction)?;
+        let other_is_rewrite_columns = matches!(
+            &other_transaction.operation,
+            Operation::Update {
+                update_mode: Some(UpdateMode::RewriteColumns),
+                ..
+            }
+        );
         if let Operation::Update {
             inserted_rows_filter: self_inserted_rows_filter,
             compacted_sstables: self_compacted_sstables,
@@ -661,7 +687,9 @@ impl<'a> TransactionRebase<'a> {
                         {
                             // If data files, not just deletion files, are modified,
                             // then we can't rebase.
-                            if fragment.files != updated.files {
+                            if fragment.files != updated.files
+                                && !(self_is_flag_only_update && other_is_rewrite_columns)
+                            {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -681,6 +709,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
+                Operation::Merge { .. } if self_is_flag_only_update => Ok(()),
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
                 }
@@ -1471,8 +1500,14 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
 
-            Operation::Update { .. }
-            | Operation::Append { .. }
+            Operation::Update { .. } => {
+                if is_flag_only_update(other_transaction)? {
+                    Ok(())
+                } else {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+            }
+            Operation::Append { .. }
             | Operation::Delete { .. }
             | Operation::Rewrite { .. }
             | Operation::Merge { .. }
@@ -1811,28 +1846,66 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_delete_update(mut self, dataset: &Dataset) -> Result<Transaction> {
-        let is_flag_only_update = matches!(
-            &self.transaction.operation,
-            Operation::Update {
-                updated_fragments,
-                removed_fragment_ids,
-                new_fragments,
-                fields_modified,
-                ..
-            } if updated_fragments.is_empty()
-                && removed_fragment_ids.is_empty()
-                && new_fragments.is_empty()
-                && fields_modified.is_empty()
-        ) && self
-            .transaction
-            .cell_flag_transaction()?
-            .is_some_and(|changes| !changes.row_changes.is_empty());
+        let is_flag_only_update = is_flag_only_update(&self.transaction)?;
 
         // Flag-only updates use affected rows for OCC precision, not as a
-        // deletion intent. A concurrent deletion file preserves physical row
-        // addresses, so rebasing only needs to advance the read version. The
+        // deletion intent. Concurrent deletion files preserve physical row
+        // addresses, so verify row-level overlap without rewriting them. The
         // Cell Flag delta is reconciled against the actual head later.
         if is_flag_only_update {
+            if self
+                .initial_fragments
+                .iter()
+                .any(|(_, (_, needs_check))| *needs_check)
+            {
+                let affected_rows = self.affected_rows.as_ref().ok_or_else(|| {
+                    crate::Error::internal(
+                        "A flag-only update needs row-level conflict data to rebase",
+                    )
+                })?;
+                let fragments_to_check = self
+                    .initial_fragments
+                    .iter()
+                    .filter_map(|(_, (fragment, needs_check))| needs_check.then_some(fragment.id))
+                    .collect::<HashSet<_>>();
+                let current_fragments = dataset
+                    .fragments()
+                    .iter()
+                    .filter(|fragment| fragments_to_check.contains(&fragment.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let current_deletions = futures::stream::iter(current_fragments)
+                    .map(|fragment| async move {
+                        read_fragment_deletion_bitmap(dataset, &fragment)
+                            .await
+                            .map(|deletions| (fragment.id, deletions))
+                    })
+                    .buffered(dataset.object_store.as_ref().io_parallelism())
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                let mut deleted_rows = RowAddrTreeMap::new();
+                for (fragment_id, deletions) in current_deletions {
+                    deleted_rows.insert_bitmap(fragment_id as u32, deletions);
+                }
+                let conflicting_rows = deleted_rows & (*affected_rows).clone();
+                if conflicting_rows.len().map(|len| len > 0).unwrap_or(true) {
+                    let row_addresses = conflicting_rows
+                        .row_addrs()
+                        .expect("a non-empty row map has addresses")
+                        .take(5)
+                        .collect::<Vec<_>>();
+                    return Err(crate::Error::retryable_commit_conflict_source(
+                        dataset.manifest.version,
+                        format!(
+                            "This {} transaction was preempted by concurrent transaction {} (both modified rows at addresses {:?}). Please retry",
+                            self.transaction.uuid,
+                            dataset.manifest.version,
+                            row_addresses.as_slice()
+                        )
+                        .into(),
+                    ));
+                }
+            }
             return Ok(Transaction {
                 read_version: dataset.manifest.version,
                 ..self.transaction
@@ -2560,11 +2633,13 @@ mod tests {
             },
         );
 
+        let mut rewritten_fragment = dataset.manifest.fragments[0].clone();
+        rewritten_fragment.files[0].path = "rewritten-columns.lance".to_string();
         let rewrite_columns = Transaction::new_from_version(
             dataset.manifest.version,
             Operation::Update {
                 removed_fragment_ids: Vec::new(),
-                updated_fragments: vec![dataset.manifest.fragments[0].clone()],
+                updated_fragments: vec![rewritten_fragment],
                 new_fragments: Vec::new(),
                 fields_modified: vec![1],
                 compacted_sstables: Vec::new(),
@@ -2605,6 +2680,30 @@ mod tests {
                 .await
                 .unwrap();
         rewrite_columns_rebase
+            .check_txn(&invalidation, dataset.manifest.version + 1)
+            .unwrap();
+
+        let mut merged_fragments = dataset.manifest.fragments.as_ref().clone();
+        merged_fragments[0].files[0].path = "merged-columns.lance".to_string();
+        let merge = Transaction::new_from_version(
+            dataset.manifest.version,
+            Operation::Merge {
+                fragments: merged_fragments,
+                schema: dataset.schema().clone(),
+                preserves_nullability: true,
+            },
+        );
+        let mut invalidation_rebase =
+            TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
+                .await
+                .unwrap();
+        invalidation_rebase
+            .check_txn(&merge, dataset.manifest.version + 1)
+            .unwrap();
+        let mut merge_rebase = TransactionRebase::try_new(&dataset, merge, None)
+            .await
+            .unwrap();
+        merge_rebase
             .check_txn(&invalidation, dataset.manifest.version + 1)
             .unwrap();
 

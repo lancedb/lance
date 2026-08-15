@@ -1189,7 +1189,7 @@ pub async fn load_cell_flag_fragments(
 }
 
 #[cfg(feature = "substrait")]
-pub fn unbind_cell_flag_expression(dataset: &Dataset, expression: Expr) -> Result<Expr> {
+pub fn cell_flag_expression_for_transport(expression: Expr) -> Result<Expr> {
     Ok(expression
         .transform(|node| {
             let Expr::ScalarFunction(function) = &node else {
@@ -1198,15 +1198,33 @@ pub fn unbind_cell_flag_expression(dataset: &Dataset, expression: Expr) -> Resul
             let Some(flag_id) = bound_cell_flag_flag_id(function.func.as_ref()) else {
                 return Ok(Transformed::no(node));
             };
-            let definition = dataset.cell_flag_definition_by_id(flag_id).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "Bound cell_flag references unknown flag ID {}",
-                    flag_id
-                ))
-            })?;
-            Ok(Transformed::yes(cell_flag_id(definition.flag_id)))
+            Ok(Transformed::yes(cell_flag_id(flag_id)))
         })
         .map(|transformed| transformed.data)?)
+}
+
+#[cfg(feature = "substrait")]
+pub fn unbind_cell_flag_expression(dataset: &Dataset, expression: Expr) -> Result<Expr> {
+    let mut unknown_flag_id = None;
+    expression.apply(|node| {
+        let Expr::ScalarFunction(function) = node else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+        if let Some(flag_id) = bound_cell_flag_flag_id(function.func.as_ref())
+            && dataset.cell_flag_definition_by_id(flag_id).is_none()
+        {
+            unknown_flag_id = Some(flag_id);
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if let Some(flag_id) = unknown_flag_id {
+        return Err(Error::invalid_input(format!(
+            "Bound cell_flag references unknown flag ID {}",
+            flag_id
+        )));
+    }
+    cell_flag_expression_for_transport(expression)
 }
 
 #[cfg(feature = "substrait")]
@@ -2173,6 +2191,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_rejects_unreadable_manifest_metadata_size() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 1).await?;
+        let initial_version = dataset.version().version;
+        let oversized_name = "x".repeat(6_300_000);
+
+        let error = dataset
+            .register_cell_flag("value", oversized_name, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Encoded Cell Flag manifest metadata")
+        );
+        assert_eq!(dataset.version().version, initial_version);
+        let reopened = Dataset::open(directory.as_ref()).await?;
+        assert_eq!(reopened.version().version, initial_version);
+        assert!(reopened.cell_flag_definitions().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_uses_stable_ids_for_nested_fields() -> Result<()> {
         let directory = TempStrDir::default();
         let payload_fields = Fields::from(vec![
@@ -3047,6 +3089,33 @@ mod tests {
             flagged_ids(result.new_dataset.as_ref(), "value", FLAG_NAME).await?,
             vec![1]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flag_only_update_conflicts_with_same_row_delete() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 8).await?;
+        dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
+        let mut delete_writer = dataset.clone();
+        let flag_writer = Arc::new(dataset);
+
+        delete_writer.delete("id = 1").await?;
+        let error = UpdateBuilder::new(flag_writer)
+            .update_where("id = 1")?
+            .set_cell_flag("value", FLAG_NAME, true)?
+            .conflict_retries(0)
+            .build()?
+            .execute()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::TooMuchWriteContention { .. }));
+        let current = Dataset::open(directory.as_ref()).await?;
+        assert_eq!(current.count_rows(None).await?, 7);
+        assert!(flagged_ids(&current, "value", FLAG_NAME).await?.is_empty());
         Ok(())
     }
 

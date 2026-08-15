@@ -5276,19 +5276,23 @@ impl Scanner {
             ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
                 & self.fragments_covered_by_index_query(rhs).await?),
             ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
-            ScalarIndexExpr::Query(search) => scalar_index_fragment_bitmap(
-                self.dataset.as_ref(),
-                &search.column,
-                &search.index_name,
-            )
-            .await?
-            .ok_or_else(|| {
-                crate::Error::internal(format!(
-                    "Index not found even though it must have been found earlier: {}",
-                    search.index_name
-                ))
-            }),
-            ScalarIndexExpr::Exact(selection) => Ok(selection.fragment_bitmap().clone()),
+            ScalarIndexExpr::Query(search) => {
+                if let Some(fragment_bitmap) = &search.fragment_bitmap {
+                    return Ok(fragment_bitmap.clone());
+                }
+                scalar_index_fragment_bitmap(
+                    self.dataset.as_ref(),
+                    &search.column,
+                    &search.index_name,
+                )
+                .await?
+                .ok_or_else(|| {
+                    crate::Error::internal(format!(
+                        "Index not found even though it must have been found earlier: {}",
+                        search.index_name
+                    ))
+                })
+            }
         }
     }
 
@@ -5353,8 +5357,11 @@ impl Scanner {
                     stack.push(lhs);
                     stack.push(rhs);
                 }
-                ScalarIndexExpr::Query(search) => searches.push(search),
-                ScalarIndexExpr::Exact(_) => {}
+                ScalarIndexExpr::Query(search) => {
+                    if search.exact_row_selection().is_none() {
+                        searches.push(search);
+                    }
+                }
             }
         }
 

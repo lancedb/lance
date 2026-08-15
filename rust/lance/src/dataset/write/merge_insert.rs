@@ -2615,11 +2615,13 @@ impl MergeInsertJob {
             },
         );
         let joined = self.create_joined_stream(source).await?;
+        let capture_cell_flag_sources = !self.dataset.cell_flag_definitions().is_empty();
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
             !is_full_schema,
             self.dataset.manifest.uses_stable_row_ids(),
+            capture_cell_flag_sources,
         )?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
@@ -2833,34 +2835,37 @@ impl MergeInsertJob {
                 }
             };
 
-            let output_source_row_ids = Arc::into_inner(output_source_row_ids)
-                .unwrap()
-                .into_inner()
-                .unwrap();
-            let output_source_rows =
-                resolve_output_source_rows(&self.dataset, output_source_row_ids).await?;
-            let matched_values = self
-                .params
-                .matched_cell_flag_values
-                .iter()
-                .map(|(flag_id, value)| (*flag_id, *value))
-                .collect();
-            let inserted_values = self
-                .params
-                .inserted_cell_flag_values
-                .iter()
-                .map(|(flag_id, value)| (*flag_id, *value))
-                .collect();
-            let fragment_states = self
-                .dataset
-                .cell_flag_states_for_mapped_rows(
-                    &new_fragments,
-                    &output_source_rows.row_ids,
-                    &output_source_rows.inserted_positions,
-                    &matched_values,
-                    &inserted_values,
-                )
-                .await?;
+            let fragment_states = if capture_cell_flag_sources {
+                let output_source_row_ids = Arc::into_inner(output_source_row_ids)
+                    .unwrap()
+                    .into_inner()
+                    .unwrap();
+                let output_source_rows =
+                    resolve_output_source_rows(&self.dataset, output_source_row_ids).await?;
+                let matched_values = self
+                    .params
+                    .matched_cell_flag_values
+                    .iter()
+                    .map(|(flag_id, value)| (*flag_id, *value))
+                    .collect();
+                let inserted_values = self
+                    .params
+                    .inserted_cell_flag_values
+                    .iter()
+                    .map(|(flag_id, value)| (*flag_id, *value))
+                    .collect();
+                self.dataset
+                    .cell_flag_states_for_mapped_rows(
+                        &new_fragments,
+                        &output_source_rows.row_ids,
+                        &output_source_rows.inserted_positions,
+                        &matched_values,
+                        &inserted_values,
+                    )
+                    .await?
+            } else {
+                Vec::new()
+            };
             let mut flag_only_affected_rows = RoaringTreemap::new();
             let row_changes = if matches!(
                 self.params.when_matched,
@@ -3202,6 +3207,8 @@ struct Merger {
     output_schema: Arc<Schema>,
     /// Whether to enable stable row ids
     enable_stable_row_ids: bool,
+    /// Avoid output-row mapping overhead when the registry is empty.
+    capture_cell_flag_sources: bool,
     /// Set to track processed row IDs to detect duplicates
     processed_row_ids: Arc<Mutex<HashSet<u64>>>,
     /// Set to track non-null keys of rows inserted by FirstSeen mode
@@ -3215,6 +3222,7 @@ impl Merger {
         schema: Arc<Schema>,
         with_row_addr: bool,
         enable_stable_row_ids: bool,
+        capture_cell_flag_sources: bool,
     ) -> Result<Self> {
         let delete_expr = if let WhenNotMatchedBySource::DeleteIf(expr) =
             &params.delete_not_matched_by_source
@@ -3274,6 +3282,7 @@ impl Merger {
             with_row_addr,
             output_schema,
             enable_stable_row_ids,
+            capture_cell_flag_sources,
             processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
             processed_insert_keys: Arc::new(Mutex::new(InsertedKeyTracker::default())),
         })
@@ -3281,6 +3290,28 @@ impl Merger {
 
     fn output_schema(&self) -> &Arc<Schema> {
         &self.output_schema
+    }
+
+    fn record_matched_output_sources(&self, row_ids: &[u64]) {
+        if self.capture_cell_flag_sources {
+            self.output_source_row_ids
+                .lock()
+                .unwrap()
+                .extend_matched(row_ids);
+        }
+    }
+
+    fn record_inserted_output_sources(
+        &self,
+        count: usize,
+    ) -> std::result::Result<(), DataFusionError> {
+        if self.capture_cell_flag_sources {
+            self.output_source_row_ids
+                .lock()
+                .unwrap()
+                .extend_inserted(count)?;
+        }
+        Ok(())
     }
 
     // Retrieves a bitmap of rows where at least one of the given columns is
@@ -3406,7 +3437,7 @@ impl Merger {
 
         // Each `WhenMatched` variant handles the matched rows (`in_both`)
         // differently.
-        let match_filter_expr = self.match_filter_expr;
+        let match_filter_expr = self.match_filter_expr.clone();
         match &self.params.when_matched {
             WhenMatched::DoNothing => {
                 if !self.params.matched_cell_flag_values.is_empty() {
@@ -3549,10 +3580,7 @@ impl Merger {
                                 .unwrap()
                                 .extend(row_ids.values());
                         }
-                        self.output_source_row_ids
-                            .lock()
-                            .unwrap()
-                            .extend_matched(row_ids.values());
+                        self.record_matched_output_sources(row_ids.values());
                         if self.enable_stable_row_ids {
                             self.updating_row_ids
                                 .lock()
@@ -3614,10 +3642,7 @@ impl Merger {
             )?;
 
             merge_statistics.num_inserted_rows += not_matched.num_rows() as u64;
-            self.output_source_row_ids
-                .lock()
-                .unwrap()
-                .extend_inserted(not_matched.num_rows())?;
+            self.record_inserted_output_sources(not_matched.num_rows())?;
             batches.push(Ok(not_matched));
         }
         match self.params.delete_not_matched_by_source {
@@ -3707,6 +3732,39 @@ mod tests {
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    #[tokio::test]
+    async fn merger_skips_output_mapping_without_cell_flags() {
+        let batch = record_batch!(("id", Int32, [1, 2])).unwrap();
+        let schema = batch.schema();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![batch])
+                .await
+                .unwrap(),
+        );
+        let params = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .params;
+        let merger = Merger::try_new(params.clone(), schema.clone(), false, false, false).unwrap();
+
+        merger.record_matched_output_sources(&[10, 11]);
+        merger.record_inserted_output_sources(2).unwrap();
+        let captured = merger.output_source_row_ids.lock().unwrap();
+        assert!(captured.row_ids.is_empty());
+        assert!(captured.inserted_positions.is_empty());
+        drop(captured);
+
+        let merger = Merger::try_new(params, schema, false, false, true).unwrap();
+        merger.record_matched_output_sources(&[10, 11]);
+        merger.record_inserted_output_sources(2).unwrap();
+        let captured = merger.output_source_row_ids.lock().unwrap();
+        assert_eq!(captured.row_ids, vec![10, 11, 0, 0]);
+        assert_eq!(
+            captured.inserted_positions.iter().collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[test]

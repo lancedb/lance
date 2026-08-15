@@ -1546,6 +1546,24 @@ impl ExactRowSelection {
     }
 }
 
+impl AnyQuery for ExactRowSelection {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn format(&self, _column: &str) -> String {
+        self.source.clone()
+    }
+
+    fn to_expr(&self, _column: String) -> Expr {
+        self.expression.clone()
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+}
+
 /// This represents a lookup into one or more scalar indices
 ///
 /// This is a tree of operations because we may need to logically combine or
@@ -1556,8 +1574,6 @@ pub enum ScalarIndexExpr {
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
     Query(ScalarIndexSearch),
-    /// An exact snapshot-native row selection.
-    Exact(Arc<ExactRowSelection>),
 }
 
 impl PartialEq for ScalarIndexExpr {
@@ -1567,9 +1583,16 @@ impl PartialEq for ScalarIndexExpr {
             (Self::And(l0, l1), Self::And(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::Or(l0, l1), Self::Or(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::Query(l_search), Self::Query(r_search)) => l_search == r_search,
-            (Self::Exact(lhs), Self::Exact(rhs)) => lhs == rhs,
             _ => false,
         }
+    }
+}
+
+impl ScalarIndexSearch {
+    /// Return the snapshot-native selection carried by this query, if any.
+    #[doc(hidden)]
+    pub fn exact_row_selection(&self) -> Option<&ExactRowSelection> {
+        self.query.as_any().downcast_ref::<ExactRowSelection>()
     }
 }
 
@@ -1971,7 +1994,6 @@ impl std::fmt::Display for ScalarIndexExpr {
                 search.index_name,
                 search.index_type
             ),
-            Self::Exact(selection) => write!(f, "[{}](exact)", selection.source),
         }
     }
 }
@@ -2021,6 +2043,14 @@ impl ScalarIndexExpr {
                 Ok(lhs_result | rhs_result)
             }
             Self::Query(search) => {
+                if let Some(selection) = search.exact_row_selection() {
+                    let result = selection.nullable_result();
+                    return if selection.results_are_row_addresses {
+                        index_loader.row_addr_result_to_row_ids(result).await
+                    } else {
+                        Ok(result)
+                    };
+                }
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
@@ -2030,14 +2060,6 @@ impl ScalarIndexExpr {
                     // Translate address-domain results to the row-id domain
                     // before combining or scanning; otherwise stable-row-id
                     // datasets silently drop matches (issue #7434).
-                    index_loader.row_addr_result_to_row_ids(result).await
-                } else {
-                    Ok(result)
-                }
-            }
-            Self::Exact(selection) => {
-                let result = selection.nullable_result();
-                if selection.results_are_row_addresses {
                     index_loader.row_addr_result_to_row_ids(result).await
                 } else {
                     Ok(result)
@@ -2072,7 +2094,6 @@ impl ScalarIndexExpr {
                 lhs.or(rhs)
             }
             Self::Query(search) => search.query.to_expr(search.column.clone()),
-            Self::Exact(selection) => selection.expression.clone(),
         }
     }
 
@@ -2081,7 +2102,6 @@ impl ScalarIndexExpr {
             Self::Not(inner) => inner.needs_recheck(),
             Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
             Self::Query(search) => search.needs_recheck,
-            Self::Exact(_) => false,
         }
     }
 }
@@ -2499,8 +2519,17 @@ fn visit_node(
         )));
     }
     if let Some(selection) = index_info.exact_row_selection(expr) {
+        let fragment_bitmap = selection.fragment_bitmap.clone();
+        let source = selection.source.clone();
         return Ok(Some(IndexedExpression {
-            scalar_query: Some(ScalarIndexExpr::Exact(selection)),
+            scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: source,
+                index_name: "__lance_exact_row_selection".to_string(),
+                index_type: "Exact".to_string(),
+                query: selection,
+                needs_recheck: false,
+                fragment_bitmap: Some(fragment_bitmap),
+            })),
             refine_expr: None,
         }));
     }
@@ -2593,9 +2622,11 @@ fn populate_fragment_bitmaps(
             populate_fragment_bitmaps(rhs, index_info);
         }
         ScalarIndexExpr::Query(search) => {
-            search.fragment_bitmap = index_info.fragment_bitmap(&search.column, &search.index_name);
+            if search.exact_row_selection().is_none() {
+                search.fragment_bitmap =
+                    index_info.fragment_bitmap(&search.column, &search.index_name);
+            }
         }
-        ScalarIndexExpr::Exact(_) => {}
     }
 }
 
@@ -4793,7 +4824,7 @@ mod tests {
             ScalarIndexExpr::And(lhs, rhs) => 1 + test_and_depth(lhs).max(test_and_depth(rhs)),
             ScalarIndexExpr::Or(lhs, rhs) => test_and_depth(lhs).max(test_and_depth(rhs)),
             ScalarIndexExpr::Not(inner) => test_and_depth(inner),
-            ScalarIndexExpr::Query(_) | ScalarIndexExpr::Exact(_) => 0,
+            ScalarIndexExpr::Query(_) => 0,
         }
     }
 

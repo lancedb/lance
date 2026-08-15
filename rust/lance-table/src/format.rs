@@ -22,11 +22,11 @@ pub use cell_flag::{
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 
-pub(crate) use manifest::CELL_FLAG_MANIFEST_CONFIG_KEY;
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
     WriterVersion, is_detached_version, populate_manifest_schema_dictionaries,
 };
+pub(crate) use manifest::{CELL_FLAG_MANIFEST_CONFIG_KEY, validate_cell_flag_manifest_metadata};
 pub use row_ids::{ExternalFile, InlineRowIds, RowIdMeta};
 pub use transaction::Transaction;
 

@@ -441,7 +441,6 @@ fn collect_coverage(expr: &ScalarIndexExpr) -> Option<RoaringBitmap> {
             Some(l & r)
         }
         ScalarIndexExpr::Query(search) => search.fragment_bitmap.clone(),
-        ScalarIndexExpr::Exact(selection) => Some(selection.fragment_bitmap().clone()),
     }
 }
 

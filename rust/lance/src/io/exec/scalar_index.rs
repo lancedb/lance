@@ -189,6 +189,9 @@ impl ScalarIndexExec {
                 Self::fragments_covered_by_index_query(expr, dataset).await
             }
             ScalarIndexExpr::Query(search_key) => {
+                if let Some(fragment_bitmap) = &search_key.fragment_bitmap {
+                    return Ok(fragment_bitmap.clone());
+                }
                 scalar_index_fragment_bitmap(dataset, &search_key.column, &search_key.index_name)
                     .await?
                     .ok_or_else(|| {
@@ -198,7 +201,6 @@ impl ScalarIndexExec {
                         ))
                     })
             }
-            ScalarIndexExpr::Exact(selection) => Ok(selection.fragment_bitmap().clone()),
         }
     }
 

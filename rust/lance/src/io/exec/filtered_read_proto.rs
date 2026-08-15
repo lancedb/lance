@@ -299,7 +299,9 @@ fn plan_to_proto_impl(
                         expr.as_ref().clone(),
                     )?
                 } else {
-                    expr.as_ref().clone()
+                    crate::dataset::cell_flag::cell_flag_expression_for_transport(
+                        expr.as_ref().clone(),
+                    )?
                 };
                 let encoded = encode_substrait(expression, filter_schema.clone(), state)?;
                 filter_expressions.push(encoded);
@@ -934,5 +936,61 @@ mod tests {
         assert!(back.filters.contains_key(&1));
         // After roundtrip, the decoded expressions should be shared via Arc too
         assert!(Arc::ptr_eq(&back.filters[&0], &back.filters[&1]));
+    }
+
+    #[tokio::test]
+    async fn test_public_plan_proto_roundtrip_with_bound_cell_flag() {
+        let mut dataset = make_test_dataset().await.as_ref().clone();
+        dataset
+            .register_cell_flag("x", "computed", true)
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let context = SessionContext::new();
+        lance_datafusion::udf::register_functions(&context);
+        let state = context.state();
+
+        let expression = crate::dataset::cell_flag::bind_cell_flag_expression(
+            &dataset,
+            cell_flag(datafusion_expr::col("x"), "computed"),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut rows = RowAddrTreeMap::new();
+        let mut filters = HashMap::new();
+        for fragment in dataset.fragments().iter() {
+            rows.insert_fragment(fragment.id as u32);
+            filters.insert(fragment.id as u32, Arc::new(expression.clone()));
+        }
+        let plan = FilteredReadPlan {
+            rows,
+            filters,
+            scan_range_after_filter: None,
+        };
+
+        // The compatibility wrapper has no Dataset argument. A bound flag
+        // therefore travels by stable ID and needs no tracked-field schema.
+        let proto = plan_to_proto(&plan, &Arc::new(ArrowSchema::empty()), &state).unwrap();
+        let decoded = plan_from_proto(proto, &dataset, &state).await.unwrap();
+        let exec = FilteredReadExec::try_new(
+            dataset.clone(),
+            FilteredReadOptions::basic_full_read(&dataset),
+            None,
+        )
+        .unwrap()
+        .with_plan(decoded)
+        .await
+        .unwrap();
+        let batches = exec
+            .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            100
+        );
     }
 }

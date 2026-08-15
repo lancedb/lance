@@ -68,14 +68,14 @@ fn decode_cell_flag_manifest(
     Ok(Some(metadata))
 }
 
-fn encode_cell_flag_manifest(manifest: &Manifest) -> Option<String> {
+fn cell_flag_manifest_proto(manifest: &Manifest) -> Option<pb::CellFlagManifest> {
     if manifest.next_cell_flag_id == 0
         && manifest.cell_flag_definitions.is_empty()
         && manifest.cell_flag_states.is_empty()
     {
         return None;
     }
-    let metadata = pb::CellFlagManifest {
+    Some(pb::CellFlagManifest {
         definitions: manifest
             .cell_flag_definitions
             .iter()
@@ -83,12 +83,31 @@ fn encode_cell_flag_manifest(manifest: &Manifest) -> Option<String> {
             .collect(),
         states: manifest.cell_flag_states.iter().map(Into::into).collect(),
         next_flag_id: manifest.next_cell_flag_id,
-    };
+    })
+}
+
+fn encode_cell_flag_manifest(manifest: &Manifest) -> Option<String> {
+    let metadata = cell_flag_manifest_proto(manifest)?;
     Some(format!(
         "{}{}",
         CELL_FLAG_MANIFEST_ENCODING_PREFIX,
         STANDARD_NO_PAD.encode(metadata.encode_to_vec())
     ))
+}
+
+pub fn validate_cell_flag_manifest_metadata(manifest: &Manifest) -> Result<()> {
+    let Some(metadata) = cell_flag_manifest_proto(manifest) else {
+        return Ok(());
+    };
+    let payload_len = base64::encoded_len(metadata.encoded_len(), false)
+        .ok_or_else(|| Error::invalid_input("Encoded Cell Flag manifest metadata size overflow"))?;
+    if payload_len > MAX_ENCODED_CELL_FLAG_MANIFEST_BYTES {
+        return Err(Error::invalid_input(format!(
+            "Encoded Cell Flag manifest metadata is {} bytes, maximum is {}",
+            payload_len, MAX_ENCODED_CELL_FLAG_MANIFEST_BYTES
+        )));
+    }
+    Ok(())
 }
 
 /// Manifest of a dataset
@@ -1058,6 +1077,11 @@ impl TryFrom<pb::Manifest> for Manifest {
                 "Manifest contains cell flag metadata without the required writer feature flag",
             ));
         }
+        if !has_cell_flag_metadata && p.writer_feature_flags & FLAG_CELL_FLAGS != 0 {
+            return Err(Error::invalid_input(
+                "Manifest declares the Cell Flag writer feature without cell flag metadata",
+            ));
+        }
 
         let mut cell_flag_definitions = cell_flag_definitions
             .into_iter()
@@ -1347,6 +1371,25 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("required writer feature flag")
+        );
+    }
+
+    #[test]
+    fn cell_flag_capability_marker_requires_metadata() {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(Vec::new()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.writer_feature_flags |= FLAG_CELL_FLAGS;
+
+        assert!(
+            Manifest::try_from(encoded)
+                .unwrap_err()
+                .to_string()
+                .contains("without cell flag metadata")
         );
     }
 

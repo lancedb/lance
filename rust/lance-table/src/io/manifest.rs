@@ -24,7 +24,10 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
+use crate::format::{
+    DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb,
+    validate_cell_flag_manifest_metadata,
+};
 
 use super::commit::ManifestLocation;
 
@@ -162,6 +165,10 @@ async fn do_write_manifest(
     indices: Option<Vec<IndexMetadata>>,
     mut transaction: Option<Transaction>,
 ) -> Result<usize> {
+    // Validate before writing index, transaction, or manifest sections so a
+    // commit cannot publish metadata that this reader rejects on reopen.
+    validate_cell_flag_manifest_metadata(manifest)?;
+
     // Write indices if presented.
     if let Some(indices) = indices.as_ref() {
         let section = pb::IndexSection {
