@@ -5928,7 +5928,7 @@ class Transaction:
         default_factory=dict
     )
     _cell_flag_transaction: Optional[str] = dataclasses.field(
-        default=None, init=False, repr=False, compare=False
+        default=None, kw_only=True, repr=False, compare=False
     )
 
 

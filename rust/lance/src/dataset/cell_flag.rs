@@ -1095,7 +1095,7 @@ impl Dataset {
     }
 }
 
-fn field_reference_segments(expr: &Expr) -> Result<Vec<String>> {
+pub fn field_reference_segments(expr: &Expr) -> Result<Vec<String>> {
     match expr {
         Expr::Column(column) => Ok(vec![column.name.clone()]),
         Expr::ScalarFunction(function) if function.func.name() == "get_field" => {
@@ -1125,7 +1125,7 @@ fn field_reference_segments(expr: &Expr) -> Result<Vec<String>> {
     }
 }
 
-fn field_reference_column(expr: &Expr) -> Option<&datafusion::common::Column> {
+pub fn field_reference_column(expr: &Expr) -> Option<&datafusion::common::Column> {
     match expr {
         Expr::Column(column) => Some(column),
         Expr::ScalarFunction(function) if function.func.name() == "get_field" => {
@@ -1219,7 +1219,7 @@ pub fn expression_references_cell_flag(expression: &Expr) -> Result<bool> {
     Ok(references_flag)
 }
 
-fn resolve_cell_flag(dataset: &Dataset, segments: &[String], name: &str) -> Result<u32> {
+fn resolve_cell_flag(dataset: &Dataset, segments: &[String], name: &str) -> Result<(u32, i32)> {
     let Some(first) = segments.first() else {
         return Err(Error::invalid_input(
             "cell_flag(field, name) requires a non-empty field reference",
@@ -1261,9 +1261,8 @@ fn resolve_cell_flag(dataset: &Dataset, segments: &[String], name: &str) -> Resu
                 ))
             })?;
     }
-    dataset
+    let definition = dataset
         .cell_flag_definition(field.id, name)
-        .map(|definition| definition.flag_id)
         .ok_or_else(|| {
             Error::invalid_input(format!(
                 "cell_flag references unknown flag '{}' for field '{}' (stable field ID {})",
@@ -1271,17 +1270,21 @@ fn resolve_cell_flag(dataset: &Dataset, segments: &[String], name: &str) -> Resu
                 segments.join("."),
                 field.id
             ))
-        })
+        })?;
+    Ok((definition.flag_id, field.id))
 }
 
-pub fn cell_flag_call_flag_id(dataset: &Dataset, expression: &Expr) -> Result<Option<u32>> {
-    Ok(cell_flag_call_flag_id_and_relation(dataset, expression)?.map(|(flag_id, _)| flag_id))
+pub struct CellFlagCallBinding {
+    pub flag_id: u32,
+    pub field_id: i32,
+    pub relation: Option<datafusion::common::TableReference>,
+    pub field_expression: Expr,
 }
 
 pub fn cell_flag_call_flag_id_and_relation(
     dataset: &Dataset,
     expression: &Expr,
-) -> Result<Option<(u32, Option<datafusion::common::TableReference>)>> {
+) -> Result<Option<CellFlagCallBinding>> {
     let Some((segments, name)) = is_cell_flag_call(expression)? else {
         return Ok(None);
     };
@@ -1293,10 +1296,13 @@ pub fn cell_flag_call_flag_id_and_relation(
         .first()
         .and_then(field_reference_column)
         .and_then(|column| column.relation.clone());
-    Ok(Some((
-        resolve_cell_flag(dataset, &segments, &name)?,
+    let (flag_id, field_id) = resolve_cell_flag(dataset, &segments, &name)?;
+    Ok(Some(CellFlagCallBinding {
+        flag_id,
+        field_id,
         relation,
-    )))
+        field_expression: function.args[0].clone(),
+    }))
 }
 
 pub async fn load_cell_flag_fragments(
@@ -1445,7 +1451,7 @@ impl CellFlagExprBindings {
                     match is_cell_flag_call(node) {
                         Ok(Some((segments, name))) => {
                             match resolve_cell_flag(dataset, &segments, &name) {
-                                Ok(flag_id) => {
+                                Ok((flag_id, _)) => {
                                     flag_ids.insert(flag_id);
                                 }
                                 Err(error) => {
@@ -1532,7 +1538,7 @@ impl CellFlagExprBindings {
                 };
                 let flag_id = if let Some((segments, name)) = public_call {
                     match resolve_cell_flag(dataset, &segments, &name) {
-                        Ok(flag_id) => flag_id,
+                        Ok((flag_id, _)) => flag_id,
                         Err(error) => {
                             captured_error = Some(error);
                             return Ok(Transformed::no(node));
@@ -1738,6 +1744,47 @@ pub async fn apply_cell_flag_transaction(
         return Ok(());
     }
     let final_field_ids: HashSet<i32> = manifest.schema.field_ids().into_iter().collect();
+
+    if matches!(transaction.operation, Operation::Merge { .. }) {
+        let transfer_sources = changes
+            .transfers
+            .iter()
+            .map(|transfer| transfer.source_field_id)
+            .collect::<HashSet<_>>();
+        let dropped_flag_ids = changes
+            .drops
+            .iter()
+            .map(|drop| drop.flag_id)
+            .collect::<HashSet<_>>();
+        if let Some(definition) = current
+            .manifest
+            .cell_flag_definitions
+            .iter()
+            .find(|definition| {
+                !final_field_ids.contains(&definition.field_id)
+                    && !transfer_sources.contains(&definition.field_id)
+                    && !dropped_flag_ids.contains(&definition.flag_id)
+            })
+        {
+            return Err(Error::invalid_input(format!(
+                "Merge removes field ID {} tracked by cell flag ID {} without an explicit field transfer or flag drop",
+                definition.field_id, definition.flag_id
+            )));
+        }
+        if let Some(drop) = changes.drops.iter().find(|drop| {
+            current
+                .manifest
+                .cell_flag_definitions
+                .iter()
+                .find(|definition| definition.flag_id == drop.flag_id)
+                .is_some_and(|definition| final_field_ids.contains(&definition.field_id))
+        }) {
+            return Err(Error::invalid_input(format!(
+                "Merge cannot drop cell flag ID {} while its field remains in the final schema",
+                drop.flag_id
+            )));
+        }
+    }
 
     let mut definitions = current.manifest.cell_flag_definitions.clone();
     let mut transfer_targets = HashSet::new();
@@ -2044,6 +2091,7 @@ pub async fn apply_cell_flag_transaction(
         })
         .collect::<HashMap<_, _>>();
     let has_exact_rewrite = !exact_rewrite_requirements.is_empty();
+    let has_exact_rewrite_sources = !exact_rewrite_group_by_source_fragment.is_empty();
 
     let mut descriptors = Vec::with_capacity(definitions.len());
     for definition in &definitions {
@@ -2056,7 +2104,7 @@ pub async fn apply_cell_flag_transaction(
                 .keys()
                 .any(|(change_flag_id, _)| *change_flag_id == flag_id);
         let current_rewrite_root =
-            if !has_exact_rewrite || current.cell_flag_state(flag_id).is_none() {
+            if !has_exact_rewrite_sources || current.cell_flag_state(flag_id).is_none() {
                 None
             } else {
                 current.load_cell_flag_root_shared(flag_id).await?
@@ -2316,7 +2364,7 @@ mod tests {
     use crate::dataset::optimize::{
         CompactionOptions, CompactionTask, IgnoreRemap, TaskData, commit_compaction, compact_files,
     };
-    use crate::dataset::transaction::{CellFlagRowChange, RewriteGroup};
+    use crate::dataset::transaction::{CellFlagRowChange, RewriteGroup, TransactionBuilder};
     use crate::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use crate::dataset::{
         ColumnAlteration, CommitBuilder, InsertBuilder, UpdateBuilder, WriteMode, WriteParams,
@@ -3086,6 +3134,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_merge_cannot_remove_a_tracked_field_without_a_transfer() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        let definition = dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
+
+        let mut manifest = dataset.manifest.as_ref().clone();
+        let replacement_field_id = manifest.max_field_id() + 1;
+        manifest
+            .schema
+            .fields
+            .iter_mut()
+            .find(|field| field.id == definition.field_id)
+            .unwrap()
+            .id = replacement_field_id;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Merge {
+                fragments: manifest.fragments.to_vec(),
+                schema: manifest.schema.clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+
+        let error = apply_cell_flag_transaction(
+            &dataset,
+            dataset.object_store.as_ref(),
+            &mut manifest,
+            &transaction,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit field transfer or flag drop"),
+            "got {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn delete_and_compaction_preserve_flags() -> Result<()> {
         for enable_stable_row_ids in [false, true] {
             let all_false_directory = TempStrDir::default();
@@ -3303,6 +3395,75 @@ mod tests {
             assert_eq!(dataset.manifest.fragments, fragments_before);
             assert_eq!(flagged_ids(&dataset, "value", FLAG_NAME).await?, vec![1, 8]);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pure_insert_merge_does_not_load_existing_cell_flag_roots() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        let definition = dataset.register_cell_flag("value", FLAG_NAME, true).await?;
+        let dataset = Dataset::open(directory.as_ref()).await?;
+        let descriptor = dataset
+            .cell_flag_state(definition.flag_id)
+            .unwrap()
+            .root
+            .clone();
+        let root_key = CellFlagRootKey {
+            source_uri: dataset.cell_flag_source_uri(&descriptor)?.to_string(),
+            path: descriptor.path.clone(),
+            size_bytes: descriptor.size_bytes,
+            inline_hash: descriptor
+                .inline_bytes
+                .as_deref()
+                .map(blake3::hash)
+                .map(|hash| *hash.as_bytes()),
+        };
+        dataset.metadata_cache.clear().await;
+        assert!(
+            dataset
+                .metadata_cache
+                .get_with_key(&root_key)
+                .await
+                .is_none()
+        );
+
+        let source_schema: Arc<Schema> = Arc::new(dataset.schema().into());
+        let source = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100, 101])),
+                Arc::new(Int32Array::from(vec![1000, 1010])),
+            ],
+        )?;
+        let mut builder = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])?;
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll);
+        let (dataset, stats) = builder
+            .try_build()?
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                [Ok(source)],
+                source_schema,
+            )))
+            .await?;
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_inserted_rows, 2);
+        assert_eq!(
+            dataset.cell_flag_state(definition.flag_id).unwrap().root,
+            descriptor
+        );
+        assert!(
+            dataset
+                .metadata_cache
+                .get_with_key(&root_key)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            flagged_ids(&dataset, "value", FLAG_NAME).await?,
+            (0..8).collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -3659,7 +3820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_rejects_removed_cell_flag_sidecar() -> Result<()> {
+    async fn carrier_preserving_transaction_edits_keep_cell_flag_changes() -> Result<()> {
         let directory = TempStrDir::default();
         let mut dataset = dataset_with_rows(&directory, 8).await?;
         let definition = dataset
@@ -3667,16 +3828,16 @@ mod tests {
             .await?;
         let operation = Operation::Update {
             removed_fragment_ids: Vec::new(),
-            updated_fragments: vec![dataset.fragments()[0].clone()],
+            updated_fragments: Vec::new(),
             new_fragments: Vec::new(),
             fields_modified: Vec::new(),
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: Vec::new(),
-            update_mode: Some(UpdateMode::RewriteColumns),
+            update_mode: None,
             inserted_rows_filter: None,
             updated_fragment_offsets: None,
         };
-        let mut transaction = Transaction::new(dataset.manifest.version, operation, None)
+        let transaction = Transaction::new(dataset.manifest.version, operation, None)
             .with_cell_flag_transaction_for_dataset(
                 CellFlagTransaction {
                     row_changes: vec![CellFlagRowChange {
@@ -3687,61 +3848,50 @@ mod tests {
                     ..Default::default()
                 },
                 &dataset,
-            );
-        transaction.transaction_properties = None;
-
-        let error = CommitBuilder::new(Arc::new(dataset))
-            .execute(transaction)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("UUID indicates an internal Cell Flag sidecar"),
-            "got {error}"
+            )
+            .with_application_transaction_properties(Some(Arc::new(HashMap::from_iter([(
+                "application".to_string(),
+                "value".to_string(),
+            )]))))?;
+        let transaction = transaction.with_uuid("ea5b9838-d30b-4b80-9938-403f96af3b24")?;
+        assert_eq!(transaction.uuid, "ea5b9838-d30b-4b80-9938-403f96af3b24");
+        let transaction = transaction.regenerate_uuid()?;
+        assert_ne!(transaction.uuid, "ea5b9838-d30b-4b80-9938-403f96af3b24");
+        assert_eq!(
+            transaction.application_transaction_properties(),
+            Some(HashMap::from_iter([(
+                "application".to_string(),
+                "value".to_string(),
+            )]))
         );
-        let reopened = Dataset::open(directory.as_ref()).await?;
-        assert!(flagged_ids(&reopened, "value", FLAG_NAME).await?.is_empty());
+        assert!(transaction.cell_flag_transaction()?.is_some());
+
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await?;
+        assert_eq!(flagged_ids(&committed, "value", FLAG_NAME).await?, vec![0]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn first_registration_rejects_a_removed_cell_flag_sidecar() -> Result<()> {
+    async fn ordinary_transaction_can_use_the_internal_sidecar_uuid_prefix() -> Result<()> {
         let directory = TempStrDir::default();
-        let dataset = dataset_with_rows(&directory, 8).await?;
-        let field_id = dataset.schema().field("value").unwrap().id;
+        let mut dataset = dataset_with_rows(&directory, 8).await?;
+        dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
         let operation = Operation::Project {
             schema: dataset.schema().clone(),
             preserves_nullability: true,
         };
-        let mut transaction = Transaction::new(dataset.manifest.version, operation, None)
-            .with_cell_flag_transaction_for_dataset(
-                CellFlagTransaction {
-                    registrations: vec![CellFlagRegistration {
-                        flag_id: 0,
-                        field_id,
-                        name: FLAG_NAME.to_string(),
-                        initial_value: false,
-                    }],
-                    ..Default::default()
-                },
-                &dataset,
-            );
-        transaction.transaction_properties = None;
+        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+            .uuid("4c434601-0000-8000-8000-000000000000".to_string())
+            .build();
 
-        let error = CommitBuilder::new(Arc::new(dataset))
+        let committed = CommitBuilder::new(Arc::new(dataset))
             .execute(transaction)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("UUID indicates an internal Cell Flag sidecar"),
-            "got {error}"
-        );
-        let reopened = Dataset::open(directory.as_ref()).await?;
-        assert!(reopened.cell_flag_definitions().is_empty());
-        assert_eq!(reopened.manifest.next_cell_flag_id, 0);
+            .await?;
+        assert_eq!(committed.cell_flag_definitions().len(), 1);
         Ok(())
     }
 

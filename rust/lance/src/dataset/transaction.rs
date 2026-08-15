@@ -264,9 +264,16 @@ pub struct Transaction {
     /// The version of the table this transaction is based off of. If this is
     /// the first transaction, this should be 0.
     pub read_version: u64,
+    /// The transaction identity. Use [`Self::with_uuid`] or
+    /// [`Self::regenerate_uuid`] when changing an uncommitted transaction so
+    /// opaque extensions remain valid.
     pub uuid: String,
     pub operation: Operation,
     pub tag: Option<String>,
+    /// Application properties plus opaque Lance extension entries.
+    ///
+    /// Use [`Self::with_application_transaction_properties`] instead of
+    /// replacing this field on an uncommitted transaction returned by Lance.
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
@@ -381,29 +388,9 @@ fn encode_cell_flag_transaction(value: &CellFlagTransaction) -> String {
 }
 
 const CELL_FLAG_TRANSACTION_PROPERTY_PREFIX: &str = "\0lance.cell_flag_transaction.";
-// The custom UUIDv8 prefix survives public property-map replacement, so a
-// removed internal sidecar is distinguishable from a transaction that never
-// carried Cell Flag changes without changing Transaction's public shape.
-const CELL_FLAG_TRANSACTION_UUID_MARKER: [u8; 4] = [0x4c, 0x43, 0x46, 0x01];
 
 fn cell_flag_transaction_property_key(uuid: &str) -> String {
     format!("{}{}", CELL_FLAG_TRANSACTION_PROPERTY_PREFIX, uuid)
-}
-
-fn has_cell_flag_transaction_uuid_marker(value: &str) -> bool {
-    Uuid::parse_str(value).is_ok_and(|uuid| {
-        uuid.get_version_num() == 8
-            && uuid.as_bytes()[..CELL_FLAG_TRANSACTION_UUID_MARKER.len()]
-                == CELL_FLAG_TRANSACTION_UUID_MARKER
-    })
-}
-
-fn cell_flag_transaction_uuid() -> String {
-    let mut bytes = *Uuid::new_v4().as_bytes();
-    bytes[..CELL_FLAG_TRANSACTION_UUID_MARKER.len()]
-        .copy_from_slice(&CELL_FLAG_TRANSACTION_UUID_MARKER);
-    bytes[6] = (bytes[6] & 0x0f) | 0x80;
-    Uuid::from_bytes(bytes).hyphenated().to_string()
 }
 
 fn decode_cell_flag_transaction(value: &str) -> Result<CellFlagTransaction> {
@@ -2438,9 +2425,6 @@ impl Transaction {
         if changes.is_empty() {
             return self;
         }
-        if !has_cell_flag_transaction_uuid_marker(&self.uuid) {
-            self.uuid = cell_flag_transaction_uuid();
-        }
         changes.operation_digest = Some(cell_flag_operation_digest(&self));
         self.set_cell_flag_transaction_payload(Some(encode_cell_flag_transaction(&changes)));
         self
@@ -2521,13 +2505,74 @@ impl Transaction {
         (!properties.is_empty()).then_some(properties)
     }
 
+    /// Replaces application-defined properties while preserving and re-signing
+    /// any opaque internal transaction extension.
+    ///
+    /// ```
+    /// # use std::{collections::HashMap, sync::Arc};
+    /// # use lance::{Result, dataset::transaction::Transaction};
+    /// # fn replace_properties(transaction: Transaction) -> Result<Transaction> {
+    /// let properties = Arc::new(HashMap::from([(
+    ///     "source".to_string(),
+    ///     "batch-7".to_string(),
+    /// )]));
+    /// transaction.with_application_transaction_properties(Some(properties))
+    /// # }
+    /// ```
+    pub fn with_application_transaction_properties(
+        mut self,
+        properties: Option<Arc<HashMap<String, String>>>,
+    ) -> Result<Self> {
+        if properties.as_deref().is_some_and(|properties| {
+            properties
+                .keys()
+                .any(|key| key.starts_with(CELL_FLAG_TRANSACTION_PROPERTY_PREFIX))
+        }) {
+            return Err(Error::invalid_input(
+                "Application transaction properties cannot use Lance's reserved internal prefix",
+            ));
+        }
+        let changes = self.cell_flag_transaction()?;
+        self.transaction_properties = properties.filter(|properties| !properties.is_empty());
+        Ok(match changes {
+            Some(changes) => self.with_cell_flag_transaction(changes),
+            None => self,
+        })
+    }
+
+    /// Replaces the transaction UUID while preserving and re-signing any opaque
+    /// internal transaction extension.
+    ///
+    /// ```
+    /// # use lance::{Result, dataset::transaction::Transaction};
+    /// # fn replace_uuid(transaction: Transaction) -> Result<Transaction> {
+    /// transaction.with_uuid("ea5b9838-d30b-4b80-9938-403f96af3b24")
+    /// # }
+    /// ```
+    pub fn with_uuid(mut self, uuid: impl Into<String>) -> Result<Self> {
+        let changes = self.cell_flag_transaction()?;
+        self.uuid = uuid.into();
+        Ok(match changes {
+            Some(changes) => self.with_cell_flag_transaction(changes),
+            None => self,
+        })
+    }
+
+    /// Assigns a fresh random transaction UUID while preserving and re-signing
+    /// any opaque internal transaction extension.
+    ///
+    /// ```
+    /// # use lance::{Result, dataset::transaction::Transaction};
+    /// # fn regenerate_uuid(transaction: Transaction) -> Result<Transaction> {
+    /// transaction.regenerate_uuid()
+    /// # }
+    /// ```
+    pub fn regenerate_uuid(self) -> Result<Self> {
+        self.with_uuid(Uuid::new_v4().hyphenated().to_string())
+    }
+
     fn cell_flag_transaction_payload_result(&self) -> Result<Option<&str>> {
         let Some(properties) = self.transaction_properties.as_deref() else {
-            if has_cell_flag_transaction_uuid_marker(&self.uuid) {
-                return Err(Error::invalid_input(
-                    "Transaction UUID indicates an internal Cell Flag sidecar, but the sidecar is missing",
-                ));
-            }
             return Ok(None);
         };
         let mut payloads = properties
@@ -2539,13 +2584,7 @@ impl Transaction {
                 "Transaction contains more than one internal Cell Flag sidecar",
             ));
         }
-        let payload = first.map(|(_, payload)| payload.as_str());
-        if payload.is_none() && has_cell_flag_transaction_uuid_marker(&self.uuid) {
-            return Err(Error::invalid_input(
-                "Transaction UUID indicates an internal Cell Flag sidecar, but the sidecar is missing",
-            ));
-        }
-        Ok(payload)
+        Ok(first.map(|(_, payload)| payload.as_str()))
     }
 
     fn set_cell_flag_transaction_payload(&mut self, payload: Option<String>) {
@@ -2584,13 +2623,21 @@ impl Transaction {
                 "Cell Flag row changes are only valid for update and merge transactions",
             ));
         }
-        if (!changes.registrations.is_empty()
-            || !changes.renames.is_empty()
-            || !changes.drops.is_empty())
+        if (!changes.registrations.is_empty() || !changes.renames.is_empty())
             && !matches!(self.operation, Operation::Project { .. })
         {
             return Err(Error::invalid_input(
-                "Cell Flag registry changes are only valid for project transactions",
+                "Cell Flag registrations and renames are only valid for project transactions",
+            ));
+        }
+        if !changes.drops.is_empty()
+            && !matches!(
+                self.operation,
+                Operation::Project { .. } | Operation::Merge { .. }
+            )
+        {
+            return Err(Error::invalid_input(
+                "Cell Flag drops are only valid for project and merge transactions",
             ));
         }
         if !changes.transfers.is_empty() && !matches!(self.operation, Operation::Merge { .. }) {

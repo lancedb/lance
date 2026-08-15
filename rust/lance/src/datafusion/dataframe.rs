@@ -37,7 +37,8 @@ use lance_table::format::Fragment;
 use crate::{
     Dataset,
     dataset::cell_flag::{
-        cell_flag_call_flag_id, cell_flag_call_flag_id_and_relation, load_cell_flag_fragments,
+        cell_flag_call_flag_id_and_relation, field_reference_column, field_reference_segments,
+        load_cell_flag_fragments,
     },
 };
 
@@ -362,7 +363,211 @@ fn project_original_schema(
     Projection::try_new(expressions, Arc::new(plan)).map(LogicalPlan::Projection)
 }
 
+#[derive(Clone)]
+struct CellFlagFieldOrigin {
+    dataset: Arc<Dataset>,
+    field_id: i32,
+}
+
+fn direct_field_reference(expression: &Expr) -> datafusion::common::Result<(Column, Vec<String>)> {
+    let expression = match expression {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        expression => expression,
+    };
+    let column = field_reference_column(expression).cloned().ok_or_else(|| {
+        DataFusionError::Plan(
+            "cell_flag cannot trace a computed field to a Lance dataset column".to_string(),
+        )
+    })?;
+    let mut segments = field_reference_segments(expression).map_err(DataFusionError::from)?;
+    if segments.is_empty() {
+        return Err(DataFusionError::Plan(
+            "cell_flag cannot trace an empty field reference".to_string(),
+        ));
+    }
+    segments.remove(0);
+    Ok((column, segments))
+}
+
 impl BindCellFlags {
+    fn trace_field_origin(
+        &self,
+        plan: &LogicalPlan,
+        expression: &Expr,
+    ) -> datafusion::common::Result<Option<CellFlagFieldOrigin>> {
+        let (column, nested_segments) = direct_field_reference(expression)?;
+        self.trace_column_origin(plan, &column, &nested_segments)
+    }
+
+    fn trace_column_origin(
+        &self,
+        plan: &LogicalPlan,
+        column: &Column,
+        nested_segments: &[String],
+    ) -> datafusion::common::Result<Option<CellFlagFieldOrigin>> {
+        let index = plan.schema().index_of_column(column)?;
+        match plan {
+            LogicalPlan::TableScan(scan) => {
+                let source = source_as_provider(&scan.source)?;
+                let Some(provider) = source.downcast_ref::<LanceTableProvider>() else {
+                    return Ok(None);
+                };
+                let field_name = plan.schema().qualified_field(index).1.name();
+                let mut field = provider
+                    .dataset
+                    .schema()
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *field_name)
+                    .or_else(|| {
+                        provider
+                            .dataset
+                            .schema()
+                            .fields
+                            .iter()
+                            .find(|field| field.name.eq_ignore_ascii_case(field_name))
+                    })
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "cell_flag cannot trace field '{}' to the Lance dataset schema",
+                            field_name
+                        ))
+                    })?;
+                for segment in nested_segments {
+                    field = field
+                        .children
+                        .iter()
+                        .find(|child| child.name == *segment)
+                        .or_else(|| {
+                            field
+                                .children
+                                .iter()
+                                .find(|child| child.name.eq_ignore_ascii_case(segment))
+                        })
+                        .ok_or_else(|| {
+                            DataFusionError::Plan(format!(
+                                "cell_flag cannot trace nested field '{}' through the Lance dataset schema",
+                                segment
+                            ))
+                        })?;
+                }
+                Ok(Some(CellFlagFieldOrigin {
+                    dataset: provider.dataset.clone(),
+                    field_id: field.id,
+                }))
+            }
+            LogicalPlan::Projection(projection) => {
+                let (input_column, mut projected_segments) =
+                    direct_field_reference(&projection.expr[index])?;
+                projected_segments.extend_from_slice(nested_segments);
+                self.trace_column_origin(
+                    projection.input.as_ref(),
+                    &input_column,
+                    &projected_segments,
+                )
+            }
+            LogicalPlan::SubqueryAlias(alias) => {
+                let input_column = Column::from(alias.input.schema().qualified_field(index));
+                self.trace_column_origin(alias.input.as_ref(), &input_column, nested_segments)
+            }
+            LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_) => Err(DataFusionError::Plan(
+                "cell_flag cannot trace a field through an aggregate or distinct operation"
+                    .to_string(),
+            )),
+            LogicalPlan::Union(union) => {
+                let mut origin: Option<CellFlagFieldOrigin> = None;
+                for input in &union.inputs {
+                    let input_column = Column::from(input.schema().qualified_field(index));
+                    let Some(input_origin) =
+                        self.trace_column_origin(input, &input_column, nested_segments)?
+                    else {
+                        return Ok(None);
+                    };
+                    if let Some(existing) = &origin
+                        && (!Arc::ptr_eq(&existing.dataset, &input_origin.dataset)
+                            || existing.field_id != input_origin.field_id)
+                    {
+                        return Err(DataFusionError::Plan(
+                            "cell_flag cannot trace a union field to one Lance dataset field"
+                                .to_string(),
+                        ));
+                    }
+                    origin = Some(input_origin);
+                }
+                Ok(origin)
+            }
+            LogicalPlan::Join(_) => {
+                let inputs = plan.inputs();
+                let candidates = inputs
+                    .iter()
+                    .filter_map(|input| {
+                        input
+                            .schema()
+                            .maybe_index_of_column(column)
+                            .map(|input_index| (*input, input_index))
+                    })
+                    .collect::<Vec<_>>();
+                if candidates.len() == 1 {
+                    let (input, input_index) = candidates[0];
+                    let input_column = Column::from(input.schema().qualified_field(input_index));
+                    return self.trace_column_origin(input, &input_column, nested_segments);
+                }
+                Err(DataFusionError::Plan(format!(
+                    "cell_flag cannot trace field '{}' to exactly one logical-plan input",
+                    column
+                )))
+            }
+            LogicalPlan::Extension(_) => Err(DataFusionError::Plan(
+                "cell_flag cannot trace a field through an extension logical plan".to_string(),
+            )),
+            _ => {
+                let inputs = plan.inputs();
+                if inputs.len() == 1 && index < inputs[0].schema().fields().len() {
+                    let output_field = plan.schema().qualified_field(index);
+                    let input_field = inputs[0].schema().qualified_field(index);
+                    if output_field == input_field {
+                        let input_column = Column::from(input_field);
+                        return self.trace_column_origin(inputs[0], &input_column, nested_segments);
+                    }
+                }
+                Err(DataFusionError::Plan(format!(
+                    "cell_flag cannot trace field '{}' through this logical-plan operation",
+                    column
+                )))
+            }
+        }
+    }
+
+    fn trace_expression_field_origin(
+        &self,
+        plan: &LogicalPlan,
+        expression: &Expr,
+    ) -> datafusion::common::Result<Option<CellFlagFieldOrigin>> {
+        if matches!(plan, LogicalPlan::TableScan(_)) {
+            return self.trace_field_origin(plan, expression);
+        }
+        let (column, nested_segments) = direct_field_reference(expression)?;
+        let inputs = plan.inputs();
+        let candidates = inputs
+            .iter()
+            .filter_map(|input| {
+                input
+                    .schema()
+                    .maybe_index_of_column(&column)
+                    .map(|index| (*input, index))
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(DataFusionError::Plan(format!(
+                "cell_flag cannot trace field '{}' to exactly one logical-plan input",
+                column
+            )));
+        }
+        let (input, index) = candidates[0];
+        let input_column = Column::from(input.schema().qualified_field(index));
+        self.trace_column_origin(input, &input_column, &nested_segments)
+    }
+
     fn find_provider(
         &self,
         plan: &LogicalPlan,
@@ -393,16 +598,44 @@ impl BindCellFlags {
     fn collect_flag_ids(
         &self,
         plan: &LogicalPlan,
-        dataset: &Dataset,
+        provider: &LanceTableProvider,
     ) -> datafusion::common::Result<HashSet<u32>> {
         let mut flag_ids = HashSet::new();
         let mut captured_error = None;
-        plan.apply(|node| {
-            for expression in node.expressions() {
+        plan.apply(|plan_node| {
+            for expression in plan_node.expressions() {
                 expression.apply(|expr| {
-                    match cell_flag_call_flag_id(dataset, expr) {
-                        Ok(Some(flag_id)) => {
-                            flag_ids.insert(flag_id);
+                    match cell_flag_call_flag_id_and_relation(&provider.dataset, expr) {
+                        Ok(Some(binding)) => {
+                            let origin = match self
+                                .trace_expression_field_origin(
+                                    plan_node,
+                                    &binding.field_expression,
+                                )
+                            {
+                                Ok(Some(origin)) => origin,
+                                Ok(None) => {
+                                    captured_error = Some(DataFusionError::Plan(
+                                        "cell_flag field does not originate from a Lance dataset"
+                                            .to_string(),
+                                    ));
+                                    return Ok(TreeNodeRecursion::Stop);
+                                }
+                                Err(error) => {
+                                    captured_error = Some(error);
+                                    return Ok(TreeNodeRecursion::Stop);
+                                }
+                            };
+                            if !Arc::ptr_eq(&origin.dataset, &provider.dataset)
+                                || origin.field_id != binding.field_id
+                            {
+                                captured_error = Some(DataFusionError::Plan(
+                                    "cell_flag field does not originate from the bound Lance dataset field"
+                                        .to_string(),
+                                ));
+                                return Ok(TreeNodeRecursion::Stop);
+                            }
+                            flag_ids.insert(binding.flag_id);
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -433,7 +666,7 @@ impl BindCellFlags {
     ) -> datafusion::common::Result<Expr> {
         let mut captured_error = None;
         let transformed = expression.transform(|node| {
-            let (flag_id, relation) = match cell_flag_call_flag_id_and_relation(dataset, &node) {
+            let binding = match cell_flag_call_flag_id_and_relation(dataset, &node) {
                 Ok(Some(binding)) => binding,
                 Ok(None) => return Ok(Transformed::no(node)),
                 Err(error) => {
@@ -441,16 +674,19 @@ impl BindCellFlags {
                     return Ok(Transformed::no(node));
                 }
             };
-            let function = functions.get(&flag_id).ok_or_else(|| {
+            let function = functions.get(&binding.flag_id).ok_or_else(|| {
                 DataFusionError::Internal(format!(
                     "missing deferred cell_flag binding for flag ID {}",
-                    flag_id
+                    binding.flag_id
                 ))
             })?;
             Ok(Transformed::yes(Expr::ScalarFunction(
                 ScalarFunction::new_udf(
                     function.clone(),
-                    vec![Expr::Column(Column::new(relation, lance_core::ROW_ADDR))],
+                    vec![Expr::Column(Column::new(
+                        binding.relation,
+                        lance_core::ROW_ADDR,
+                    ))],
                 ),
             )))
         })?;
@@ -588,7 +824,7 @@ impl AnalyzerRule for BindCellFlags {
         let Some(provider) = self.find_provider(&plan)? else {
             return Ok(plan);
         };
-        let flag_ids = self.collect_flag_ids(&plan, &provider.dataset)?;
+        let flag_ids = self.collect_flag_ids(&plan, &provider)?;
         if flag_ids.is_empty() {
             return Ok(plan);
         }
@@ -728,7 +964,7 @@ mod tests {
         datatypes::{Int32Type, Int64Type},
     };
     use datafusion::{
-        datasource::TableProvider,
+        datasource::{MemTable, TableProvider},
         functions_aggregate::count::count,
         logical_expr::JoinType,
         prelude::{SessionContext, col},
@@ -994,7 +1230,7 @@ mod tests {
         manual_context
             .register_table(
                 "items",
-                Arc::new(LanceTableProvider::new(dataset, false, false)),
+                Arc::new(LanceTableProvider::new(dataset.clone(), false, false)),
             )
             .unwrap();
         let sql = manual_context
@@ -1045,6 +1281,61 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(self_join_ids, vec![1, 4, 7]);
+
+        let other_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("embedding", DataType::Int32, true),
+        ]));
+        let other_batch = RecordBatch::try_new(
+            other_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 11])),
+                Arc::new(Int32Array::from(vec![100, 110])),
+            ],
+        )
+        .unwrap();
+        manual_context
+            .register_table(
+                "other",
+                Arc::new(MemTable::try_new(other_schema, vec![vec![other_batch]]).unwrap()),
+            )
+            .unwrap();
+        let mixed_provider = manual_context
+            .sql(
+                "SELECT j.bid FROM (\
+                   SELECT b.id AS bid, b.embedding \
+                   FROM items a CROSS JOIN other b\
+                 ) j \
+                 WHERE cell_flag(j.embedding, 'computed') ORDER BY j.bid",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            mixed_provider
+                .to_string()
+                .contains("does not originate from a Lance dataset"),
+            "{mixed_provider}"
+        );
+
+        let renamed_other_field = manual_context
+            .sql(
+                "SELECT j.embedding FROM (SELECT id AS embedding FROM items) j \
+                 WHERE cell_flag(j.embedding, 'computed')",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            renamed_other_field
+                .to_string()
+                .contains("does not originate from the bound Lance dataset field"),
+            "{renamed_other_field}"
+        );
 
         let derived_self_join = manual_context
             .sql(

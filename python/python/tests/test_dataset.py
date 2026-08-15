@@ -4,6 +4,7 @@
 import base64
 import contextlib
 import copy
+import dataclasses
 import importlib
 import os
 import pickle
@@ -6843,7 +6844,6 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     }
     assert transaction.transaction_properties == {}
     assert transaction._cell_flag_transaction is not None
-    assert uuid.UUID(transaction.uuid).version == 8
 
     tampered = copy.deepcopy(transaction)
     tampered._cell_flag_transaction = "not-base64"
@@ -6860,8 +6860,8 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     with pytest.raises(OSError, match="does not match the public transaction"):
         lance.LanceDataset.commit(dataset, retargeted)
 
-    uuid_retargeted = copy.deepcopy(transaction)
-    uuid_retargeted.uuid = str(uuid.uuid4())
+    uuid_retargeted = dataclasses.replace(transaction, uuid=str(uuid.uuid4()))
+    assert uuid_retargeted._cell_flag_transaction == transaction._cell_flag_transaction
     with pytest.raises(OSError, match="does not match the public transaction"):
         lance.LanceDataset.commit(dataset, uuid_retargeted)
 
@@ -7083,11 +7083,6 @@ def test_cell_flag_mixed_merge_insert_conflicts_with_matched_row_delete(
         .set_matched_cell_flag("value", "reviewed", True)
         .execute_uncommitted(pa.table({"id": [1]}))
     )
-
-    removed_carrier = copy.deepcopy(transaction)
-    removed_carrier._cell_flag_transaction = None
-    with pytest.raises(OSError, match="UUID indicates an internal Cell Flag sidecar"):
-        lance.LanceDataset.commit(tmp_path, removed_carrier, max_retries=0)
 
     dataset.delete("id = 1")
     with pytest.raises(OSError, match="Retryable commit conflict"):
