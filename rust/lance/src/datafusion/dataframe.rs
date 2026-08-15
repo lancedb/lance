@@ -538,7 +538,12 @@ impl BindCellFlags {
                 })
                 .collect::<datafusion::common::Result<Vec<_>>>()?;
 
-            if required_by_parent && matches!(plan, LogicalPlan::Projection(_)) {
+            if required_by_parent
+                && matches!(
+                    plan,
+                    LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_)
+                )
+            {
                 let mut row_address_columns = Vec::new();
                 for input in &inputs {
                     for index in 0..input.schema().fields().len() {
@@ -550,11 +555,13 @@ impl BindCellFlags {
                 }
                 if row_address_columns.len() != 1 {
                     return Err(DataFusionError::Plan(format!(
-                        "cell_flag cannot trace physical row identity through a projection with {} candidate _rowaddr columns",
+                        "cell_flag cannot trace physical row identity through a projection or alias with {} candidate _rowaddr columns",
                         row_address_columns.len()
                     )));
                 }
-                expressions.push(Expr::Column(row_address_columns.pop().unwrap()));
+                if matches!(plan, LogicalPlan::Projection(_)) {
+                    expressions.push(Expr::Column(row_address_columns.pop().unwrap()));
+                }
             }
             plan.with_new_exprs(expressions, inputs)?
         };
@@ -723,6 +730,7 @@ mod tests {
     use datafusion::{
         datasource::TableProvider,
         functions_aggregate::count::count,
+        logical_expr::JoinType,
         prelude::{SessionContext, col},
     };
     use lance_core::utils::tempfile::TempStrDir;
@@ -1056,6 +1064,41 @@ mod tests {
                 .to_string()
                 .contains("cannot trace physical row identity through a projection"),
             "{derived_self_join}"
+        );
+
+        let left = manual_context
+            .table("items")
+            .await
+            .unwrap()
+            .select(vec![col("id").alias("aid")])
+            .unwrap()
+            .alias("a")
+            .unwrap();
+        let right = manual_context
+            .table("items")
+            .await
+            .unwrap()
+            .select(vec![col("id").alias("bid"), col("embedding")])
+            .unwrap()
+            .alias("b")
+            .unwrap();
+        let aliased_self_join = left
+            .join_on(right, JoinType::Inner, [col("a.aid").not_eq(col("b.bid"))])
+            .unwrap()
+            .alias("j")
+            .unwrap()
+            .filter(cell_flag(col("j.embedding"), "computed"))
+            .unwrap()
+            .select(vec![col("j.bid")])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            aliased_self_join
+                .to_string()
+                .contains("cannot trace physical row identity through a projection or alias"),
+            "{aliased_self_join}"
         );
     }
 }

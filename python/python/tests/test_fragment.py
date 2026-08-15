@@ -1333,7 +1333,7 @@ def test_manual_row_rewrite_without_cell_flag_state_fails_closed(tmp_path: Path)
 
     updated_fragment = dataset.get_fragments()[0].delete("id = 2")
     (new_fragment,) = write_fragments(pa.table({"id": [2], "v": [99]}), tmp_path)
-    with pytest.raises(OSError, match="Cell Flag attestation"):
+    with pytest.raises(OSError, match="exact state"):
         LanceDataset.commit(
             tmp_path,
             LanceOperation.Update(

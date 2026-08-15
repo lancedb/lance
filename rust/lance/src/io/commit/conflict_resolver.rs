@@ -1630,7 +1630,6 @@ impl<'a> TransactionRebase<'a> {
             Operation::Append { .. }
             | Operation::Update { .. }
             | Operation::Delete { .. }
-            | Operation::UpdateConfig { .. }
             | Operation::CreateIndex { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. }
@@ -1638,6 +1637,17 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            Operation::UpdateConfig {
+                schema_metadata_updates,
+                field_metadata_updates,
+                ..
+            } => {
+                if schema_metadata_updates.is_some() || !field_metadata_updates.is_empty() {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
                 Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -1703,9 +1713,15 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Update { .. }
-                | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::Project { .. } => {
+                    if schema_metadata_updates.is_some() || !field_metadata_updates.is_empty() {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -4133,6 +4149,85 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_project_conflicts_with_schema_or_field_metadata_updates() {
+        let project = Operation::Project {
+            schema: lance_core::datatypes::Schema::default(),
+            preserves_nullability: true,
+        };
+        let metadata_updates = [
+            create_update_config_for_test(
+                None,
+                None,
+                Some(HashMap::from_iter([(
+                    "owner".to_string(),
+                    "concurrent".to_string(),
+                )])),
+                None,
+            ),
+            create_update_config_for_test(
+                None,
+                None,
+                None,
+                Some(HashMap::from_iter([(
+                    0,
+                    HashMap::from_iter([("owner".to_string(), "concurrent".to_string())]),
+                )])),
+            ),
+        ];
+
+        for metadata_update in metadata_updates {
+            for (ours, theirs) in [
+                (project.clone(), metadata_update.clone()),
+                (metadata_update.clone(), project.clone()),
+            ] {
+                let mut rebase = TransactionRebase {
+                    transaction: Transaction::new(0, ours.clone(), None),
+                    initial_fragments: HashMap::new(),
+                    modified_fragment_ids: modified_fragment_ids(&ours).collect(),
+                    affected_rows: None,
+                    cell_flag_conflict_scope: Default::default(),
+                    conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_compacted_sstables: Vec::new(),
+                };
+                let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "got {result:?}"
+                );
+            }
+        }
+
+        let config_only = create_update_config_for_test(
+            Some(HashMap::from_iter([(
+                "application".to_string(),
+                "value".to_string(),
+            )])),
+            None,
+            None,
+            None,
+        );
+        for (ours, theirs) in [
+            (project.clone(), config_only.clone()),
+            (config_only, project),
+        ] {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(0, ours.clone(), None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: modified_fragment_ids(&ours).collect(),
+                affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            assert!(
+                rebase
+                    .check_txn(&Transaction::new(0, theirs, None), 1)
+                    .is_ok()
+            );
         }
     }
 

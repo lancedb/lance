@@ -6595,6 +6595,19 @@ def test_cell_flag_public_api(tmp_path: Path):
     ]
     assert all(value for _, value in _flag_rows(dataset, name="reviewed"))
 
+    flags_before_schema_changes = _flag_rows(dataset)
+    dataset.add_columns({"derived": "id + 1"})
+    assert dataset.to_table(columns=["derived"])["derived"].to_pylist() == [1, 2, 3, 4]
+    assert _flag_rows(dataset) == flags_before_schema_changes
+
+    no_op_project = lance.LanceOperation.Project(
+        LanceSchema.from_pyarrow(dataset.schema)
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset, no_op_project, read_version=dataset.version
+    )
+    assert _flag_rows(dataset) == flags_before_schema_changes
+
     # The cell_flags option is trailing so existing positional retry
     # arguments keep their meaning.
     result = dataset.update({"id": "id"}, "id < 0", 1, timedelta(seconds=1))
@@ -6796,6 +6809,19 @@ def test_cell_flag_merge_and_merge_insert_actions(tmp_path: Path):
     ] == fragments_before
     assert [row for row, value in _flag_rows(dataset, field="value") if value] == [4]
 
+    flags_before_no_op_delete = _flag_rows(dataset, field="value")
+    stats = (
+        dataset.merge_insert(on="id")
+        .when_matched_delete()
+        .execute(pa.table({"id": [999], "value": [999]}))
+    )
+    assert stats == {
+        "num_inserted_rows": 0,
+        "num_updated_rows": 0,
+        "num_deleted_rows": 0,
+    }
+    assert _flag_rows(dataset, field="value") == flags_before_no_op_delete
+
 
 def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     dataset_uri = tmp_path / "dataset"
@@ -6817,6 +6843,7 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     }
     assert transaction.transaction_properties == {}
     assert transaction._cell_flag_transaction is not None
+    assert uuid.UUID(transaction.uuid).version == 8
 
     tampered = copy.deepcopy(transaction)
     tampered._cell_flag_transaction = "not-base64"
@@ -6825,7 +6852,7 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
 
     empty = copy.deepcopy(transaction)
     empty._cell_flag_transaction = ""
-    with pytest.raises(OSError, match="operation commitment"):
+    with pytest.raises(OSError, match="contains no changes"):
         lance.LanceDataset.commit(dataset, empty)
 
     retargeted = copy.deepcopy(transaction)
@@ -7057,6 +7084,11 @@ def test_cell_flag_mixed_merge_insert_conflicts_with_matched_row_delete(
         .execute_uncommitted(pa.table({"id": [1]}))
     )
 
+    removed_carrier = copy.deepcopy(transaction)
+    removed_carrier._cell_flag_transaction = None
+    with pytest.raises(OSError, match="UUID indicates an internal Cell Flag sidecar"):
+        lance.LanceDataset.commit(tmp_path, removed_carrier, max_retries=0)
+
     dataset.delete("id = 1")
     with pytest.raises(OSError, match="Retryable commit conflict"):
         lance.LanceDataset.commit(tmp_path, transaction, max_retries=0)
@@ -7092,3 +7124,12 @@ def test_cell_flag_distributed_append_and_batch_commit(tmp_path: Path):
         (1, True),
         (2, False),
     ]
+
+    ordinary = lance.fragment.write_fragments(
+        pa.table({"id": [3], "value": pa.array([3], pa.int32())}),
+        result["dataset"],
+        return_transaction=True,
+    )
+    assert ordinary._cell_flag_transaction is None
+    committed = lance.LanceDataset.commit(result["dataset"], ordinary)
+    assert _flag_rows(committed, field="value", name="reviewed")[-1] == (3, False)

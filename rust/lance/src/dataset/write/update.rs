@@ -947,12 +947,7 @@ mod tests {
             .await
             .unwrap()
             .expect("update transaction");
-        let attestation = committed
-            .cell_flag_transaction()
-            .unwrap()
-            .expect("active Cell Flag registry requires an attestation");
-        assert!(attestation.is_empty());
-        assert!(attestation.affected_rows.is_none());
+        assert!(committed.cell_flag_transaction().unwrap().is_none());
     }
 
     #[rstest]

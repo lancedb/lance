@@ -168,41 +168,50 @@ async fn resolve_row_ids(dataset: &Dataset, row_ids: Vec<u64>) -> Result<Vec<u64
 
 #[derive(Debug, Default)]
 struct OutputSourceRows {
+    /// Dense through the last matched output, but trailing inserted rows stay implicit.
     row_ids: Vec<u64>,
     inserted_positions: RoaringTreemap,
+    output_rows: u64,
 }
 
 impl OutputSourceRows {
     fn push(&mut self, source_row_id: Option<u64>) {
-        let position = self.row_ids.len() as u64;
+        let position = self.output_rows;
         match source_row_id {
-            Some(row_id) => self.row_ids.push(row_id),
+            Some(row_id) => {
+                self.row_ids.resize(position as usize, 0);
+                self.row_ids.push(row_id);
+            }
             None => {
-                self.row_ids.push(0);
                 self.inserted_positions.insert(position);
             }
         }
+        self.output_rows += 1;
     }
 
     fn append(&mut self, other: Self) {
-        let offset = self.row_ids.len() as u64;
-        self.row_ids.extend(other.row_ids);
+        let offset = self.output_rows;
+        if !other.row_ids.is_empty() {
+            self.row_ids.resize(offset as usize, 0);
+            self.row_ids.extend(other.row_ids);
+        }
         self.inserted_positions.extend(
             other
                 .inserted_positions
                 .into_iter()
                 .map(|position| position + offset),
         );
+        self.output_rows += other.output_rows;
     }
 
     fn extend_matched(&mut self, row_ids: &[u64]) {
+        self.row_ids.resize(self.output_rows as usize, 0);
         self.row_ids.extend_from_slice(row_ids);
+        self.output_rows += row_ids.len() as u64;
     }
 
     fn extend_inserted(&mut self, count: usize) -> std::result::Result<(), DataFusionError> {
-        let start = u64::try_from(self.row_ids.len()).map_err(|_| {
-            DataFusionError::Execution("merge output row count does not fit in u64".to_string())
-        })?;
+        let start = self.output_rows;
         let end = start
             .checked_add(u64::try_from(count).map_err(|_| {
                 DataFusionError::Execution(
@@ -212,15 +221,22 @@ impl OutputSourceRows {
             .ok_or_else(|| {
                 DataFusionError::Execution("merge output row count overflowed u64".to_string())
             })?;
+        self.inserted_positions.insert_range(start..end);
+        self.output_rows = end;
+        Ok(())
+    }
+
+    fn has_matched_rows(&self) -> bool {
+        !self.row_ids.is_empty()
+    }
+
+    fn finish_dense(&mut self) -> Result<()> {
         self.row_ids.resize(
-            usize::try_from(end).map_err(|_| {
-                DataFusionError::Execution(
-                    "merge output row count does not fit on this platform".to_string(),
-                )
+            usize::try_from(self.output_rows).map_err(|_| {
+                Error::internal("merge output row count does not fit on this platform")
             })?,
             0,
         );
-        self.inserted_positions.insert_range(start..end);
         Ok(())
     }
 }
@@ -2855,12 +2871,10 @@ impl MergeInsertJob {
             };
 
             let fragment_states = if capture_cell_flag_sources {
-                let output_source_row_ids = Arc::into_inner(output_source_row_ids)
+                let mut output_source_row_ids = Arc::into_inner(output_source_row_ids)
                     .unwrap()
                     .into_inner()
                     .unwrap();
-                let output_source_rows =
-                    resolve_output_source_rows(&self.dataset, output_source_row_ids).await?;
                 let matched_values = self
                     .params
                     .matched_cell_flag_values
@@ -2873,15 +2887,25 @@ impl MergeInsertJob {
                     .iter()
                     .map(|(flag_id, value)| (*flag_id, *value))
                     .collect();
-                self.dataset
-                    .cell_flag_states_for_mapped_rows(
+                if output_source_row_ids.has_matched_rows() {
+                    output_source_row_ids.finish_dense()?;
+                    let output_source_rows =
+                        resolve_output_source_rows(&self.dataset, output_source_row_ids).await?;
+                    self.dataset
+                        .cell_flag_states_for_mapped_rows(
+                            &new_fragments,
+                            &output_source_rows.row_ids,
+                            &output_source_rows.inserted_positions,
+                            &matched_values,
+                            &inserted_values,
+                        )
+                        .await?
+                } else {
+                    self.dataset.exact_cell_flag_states_for_inserted_fragments(
                         &new_fragments,
-                        &output_source_rows.row_ids,
-                        &output_source_rows.inserted_positions,
-                        &matched_values,
                         &inserted_values,
-                    )
-                    .await?
+                    )?
+                }
             } else {
                 Vec::new()
             };
@@ -3787,11 +3811,29 @@ mod tests {
         merger.record_matched_output_sources(&[10, 11]);
         merger.record_inserted_output_sources(2).unwrap();
         let captured = merger.output_source_row_ids.lock().unwrap();
-        assert_eq!(captured.row_ids, vec![10, 11, 0, 0]);
+        assert_eq!(captured.row_ids, vec![10, 11]);
+        assert_eq!(captured.output_rows, 4);
         assert_eq!(
             captured.inserted_positions.iter().collect::<Vec<_>>(),
             vec![2, 3]
         );
+        drop(captured);
+
+        let pure_insert = Merger::try_new(
+            updating_params,
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        pure_insert
+            .record_inserted_output_sources(1_000_000)
+            .unwrap();
+        let captured = pure_insert.output_source_row_ids.lock().unwrap();
+        assert!(captured.row_ids.is_empty());
+        assert_eq!(captured.output_rows, 1_000_000);
+        assert_eq!(captured.inserted_positions.len(), 1_000_000);
     }
 
     #[test]

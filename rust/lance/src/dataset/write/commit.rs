@@ -579,16 +579,11 @@ impl<'a> CommitBuilder<'a> {
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
         let mut cell_flag_changes = crate::dataset::transaction::CellFlagTransaction::default();
-        let mut transactions_with_cell_flag_sidecar = 0_usize;
         for transaction in &transactions {
             let changes = transaction.cell_flag_transaction()?;
-            if let Some(dataset) = self.dest.dataset() {
-                transaction.validate_cell_flag_attestation_presence(dataset, changes.is_some())?;
-            }
             let Some(changes) = changes else {
                 continue;
             };
-            transactions_with_cell_flag_sidecar += 1;
             if cell_flag_changes.dataset_identity.is_empty() {
                 cell_flag_changes.dataset_identity = changes.dataset_identity.clone();
             } else if cell_flag_changes.dataset_identity != changes.dataset_identity {
@@ -611,13 +606,6 @@ impl<'a> CommitBuilder<'a> {
                 .fragment_states
                 .extend(changes.fragment_states);
         }
-        if transactions_with_cell_flag_sidecar != 0
-            && transactions_with_cell_flag_sidecar != transactions.len()
-        {
-            return Err(Error::invalid_input(
-                "Batch append transactions must either all carry Cell Flag attestations or all omit them",
-            ));
-        }
 
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
@@ -634,12 +622,11 @@ impl<'a> CommitBuilder<'a> {
             tag: None,
             transaction_properties: None,
         };
-        let merged =
-            if cell_flag_changes.is_empty() && cell_flag_changes.dataset_identity.is_empty() {
-                merged
-            } else {
-                merged.with_cell_flag_transaction(cell_flag_changes)
-            };
+        let merged = if cell_flag_changes.is_empty() {
+            merged
+        } else {
+            merged.with_cell_flag_transaction(cell_flag_changes)
+        };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
     }

@@ -1085,7 +1085,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let cell_flag_transaction = if !merge_state.capture_cell_flag_sources {
                 CellFlagTransaction::default()
             } else {
-                let output_source_row_addrs = if merge_state.stable_row_ids {
+                let mut output_source_row_addrs = if merge_state.stable_row_ids {
                     let mut source_row_addrs = merge_state.updated_source_row_addrs;
                     source_row_addrs.append(merge_state.inserted_source_row_addrs);
                     source_row_addrs
@@ -1102,16 +1102,23 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .iter()
                     .map(|(flag_id, value)| (*flag_id, *value))
                     .collect();
-                let fragment_states = match dataset
-                    .cell_flag_states_for_mapped_rows(
+                let fragment_states = match if output_source_row_addrs.has_matched_rows() {
+                    output_source_row_addrs.finish_dense()?;
+                    dataset
+                        .cell_flag_states_for_mapped_rows(
+                            &new_fragments,
+                            &output_source_row_addrs.row_ids,
+                            &output_source_row_addrs.inserted_positions,
+                            &matched_values,
+                            &inserted_values,
+                        )
+                        .await
+                } else {
+                    dataset.exact_cell_flag_states_for_inserted_fragments(
                         &new_fragments,
-                        &output_source_row_addrs.row_ids,
-                        &output_source_row_addrs.inserted_positions,
-                        &matched_values,
                         &inserted_values,
                     )
-                    .await
-                {
+                } {
                     Ok(fragment_states) => fragment_states,
                     Err(error) => {
                         cleanup_data_fragments(

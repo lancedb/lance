@@ -242,7 +242,7 @@ impl Dataset {
             None if self.manifest.next_cell_flag_id == 0
                 && self.manifest.cell_flag_definitions.is_empty()
                 && self.manifest.cell_flag_states.is_empty()
-                && (!changes.registrations.is_empty() || changes.is_empty())
+                && !changes.registrations.is_empty()
                 && changes.dataset_identity == self.cell_flag_bootstrap_identity() =>
             {
                 Ok(())
@@ -921,7 +921,7 @@ impl Dataset {
             return Ok(true);
         }
         for state in &self.manifest.cell_flag_states {
-            let Some(root) = self.load_cell_flag_root(state.flag_id).await? else {
+            let Some(root) = self.load_cell_flag_root_shared(state.flag_id).await? else {
                 continue;
             };
             if root
@@ -1683,7 +1683,6 @@ pub async fn apply_cell_flag_transaction(
     transaction: &Transaction,
 ) -> Result<()> {
     let changes = transaction.cell_flag_transaction()?;
-    transaction.validate_cell_flag_attestation_presence(current, changes.is_some())?;
     if transaction.cell_flag_rewrite_requires_affected_rows()
         && changes
             .as_ref()
@@ -2667,6 +2666,14 @@ mod tests {
             }),
         )
         .await?;
+        assert!(
+            dataset
+                .read_transaction()
+                .await?
+                .expect("append transaction")
+                .cell_flag_transaction()?
+                .is_none()
+        );
         assert_eq!(
             dataset.cell_flag_state(definition.flag_id),
             Some(&root_before_false_appends)
@@ -3660,7 +3667,7 @@ mod tests {
             .await?;
         let operation = Operation::Update {
             removed_fragment_ids: Vec::new(),
-            updated_fragments: Vec::new(),
+            updated_fragments: vec![dataset.fragments()[0].clone()],
             new_fragments: Vec::new(),
             fields_modified: Vec::new(),
             compacted_sstables: Vec::new(),
@@ -3690,7 +3697,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires an internal Cell Flag attestation"),
+                .contains("UUID indicates an internal Cell Flag sidecar"),
             "got {error}"
         );
         let reopened = Dataset::open(directory.as_ref()).await?;
@@ -3729,7 +3736,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires an internal Cell Flag attestation"),
+                .contains("UUID indicates an internal Cell Flag sidecar"),
             "got {error}"
         );
         let reopened = Dataset::open(directory.as_ref()).await?;
