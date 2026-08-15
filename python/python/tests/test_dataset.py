@@ -6627,6 +6627,13 @@ def test_cell_flag_public_api(tmp_path: Path):
     taken = dataset.take(take_indices, columns=take_columns)
     expected = dataset.to_table(columns=take_columns).take(take_indices)
     assert taken == expected
+
+    dataset.delete("id = 2")
+    assert dataset._take_rows([2, 2], columns=["id"]).num_rows == 0
+    deleted = dataset._take_rows([2, 2], columns=take_columns)
+    assert deleted.num_rows == 0
+    assert deleted.schema.field("computed").type == pa.bool_()
+
     with pytest.raises(OSError, match="unknown flag"):
         dataset.take([], columns={"flag": "cell_flag(embedding, 'missing')"})
 

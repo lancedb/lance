@@ -400,6 +400,13 @@ async fn do_take_rows(
     if builder.with_row_address || projection.must_add_row_offset {
         // compile `ROW_ADDR` column
         if batch.num_rows() != row_addrs.len() {
+            if builder.missing_row_policy == MissingRowPolicy::Error {
+                return Err(Error::invalid_input(format!(
+                    "Could not resolve all requested row addresses: requested {}, resolved {}; one or more rows were deleted or not found",
+                    row_addrs.len(),
+                    batch.num_rows()
+                )));
+            }
             return Err(Error::not_supported_source(format!(
                 "Expected {} rows, got {}.  A take operation that includes row addresses must not target deleted rows.",
                 row_addrs.len(),
@@ -700,6 +707,7 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 
 #[cfg(test)]
 mod test {
+    use arrow_array::types::Int32Type;
     use arrow_array::{
         BooleanArray, Int32Array, LargeBinaryArray, ListArray, RecordBatchIterator, StringArray,
         StructArray,
@@ -1151,6 +1159,50 @@ mod test {
                 &DataType::Boolean
             );
         }
+
+        let data = test_batch(0..4);
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut partially_deleted =
+            Dataset::write(batches, "memory://partially-deleted-cell-flags", None)
+                .await
+                .unwrap();
+        partially_deleted
+            .register_cell_flag("s", "reviewed", true)
+            .await
+            .unwrap();
+        partially_deleted.delete("i = 1").await.unwrap();
+        let projection =
+            ProjectionRequest::from_sql([("i", "i"), ("reviewed", "cell_flag(s, 'reviewed')")]);
+        let values = partially_deleted
+            .take_rows(&[0, 1, 1, 2, 2], projection.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            values.column(0).as_primitive::<Int32Type>().values(),
+            &[0, 2, 2]
+        );
+        assert_eq!(
+            values
+                .column_by_name("reviewed")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap(),
+            &BooleanArray::from(vec![true, true, true])
+        );
+        let deleted = partially_deleted
+            .take_rows(&[1, 1], projection)
+            .await
+            .unwrap();
+        assert_eq!(deleted.num_rows(), 0);
+        assert_eq!(
+            deleted
+                .schema()
+                .field_with_name("reviewed")
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
     }
 
     #[tokio::test]
@@ -1625,6 +1677,30 @@ mod test {
             values
         );
 
+        let fragment_two = 2_u64 << 32;
+        let values = dataset
+            .take_rows(
+                &[
+                    fragment_two + 19,
+                    fragment_two + 20,
+                    fragment_two + 20,
+                    fragment_two + 21,
+                    fragment_two + 21,
+                ],
+                projection.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            values.column(0).as_primitive::<Int32Type>().values(),
+            &[99, 101, 101]
+        );
+        let values = dataset
+            .take_rows(&[fragment_two + 20, fragment_two + 20], projection.clone())
+            .await
+            .unwrap();
+        assert_eq!(values.num_rows(), 0);
+
         // Take an empty selection.
         let values = dataset.take_rows(&[], projection).await.unwrap();
         assert_eq!(RecordBatch::new_empty(data.schema()), values);
@@ -1636,8 +1712,6 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        use arrow::datatypes::Int32Type;
-
         let data = test_batch(1..5);
         let write_params = WriteParams {
             max_rows_per_group: 2,

@@ -1876,6 +1876,15 @@ impl Dataset {
     ) -> Result<Vec<Option<BlobFile>>> {
         let fragments = self.get_fragments();
         let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
+        if let Some(position) = row_addrs
+            .iter()
+            .position(|address| *address == RowAddress::TOMBSTONE_ROW)
+        {
+            return Err(Error::invalid_input(format!(
+                "Blob row index {} at position {} is out of bounds",
+                row_indices[position], position
+            )));
+        }
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
     }
 

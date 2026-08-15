@@ -2924,6 +2924,7 @@ async fn take_blob_descriptions_by_row_addresses(
     let projection_request = ProjectionRequest::from(projection);
     let projection_plan = Arc::new(projection_request.into_projection_plan(dataset.clone())?);
     TakeBuilder::try_new_from_addresses(dataset.clone(), row_addrs.to_vec(), projection_plan)?
+        .with_missing_row_policy(MissingRowPolicy::Error)
         .with_row_address(true)
         .execute()
         .await
@@ -2949,6 +2950,15 @@ async fn collect_blob_selection_for_selection(
             let row_addrs =
                 super::take::row_offsets_to_row_addresses(&dataset.get_fragments(), row_indices)
                     .await?;
+            if let Some(position) = row_addrs
+                .iter()
+                .position(|address| *address == RowAddress::TOMBSTONE_ROW)
+            {
+                return Err(Error::invalid_input(format!(
+                    "Blob row index {} at position {} is out of bounds",
+                    row_indices[position], position
+                )));
+            }
             take_blob_descriptions_by_row_addresses(dataset, &row_addrs, column).await?
         }
         ReadBlobsSelection::RowAddresses(row_addrs) => {
@@ -4405,7 +4415,8 @@ mod tests {
         }
     }
 
-    async fn stable_row_id_blob_dataset_with_deleted_row() -> (TempStrDir, Arc<Dataset>, Vec<u64>) {
+    async fn stable_row_id_blob_dataset_with_deleted_row()
+    -> (TempStrDir, Arc<Dataset>, Vec<u64>, Vec<u64>) {
         let test_dir = TempStrDir::default();
         let mut blob_builder = BlobArrayBuilder::new(3);
         blob_builder.push_bytes(b"AAaa").unwrap();
@@ -4440,18 +4451,27 @@ mod tests {
             .project(&["idx"])
             .unwrap()
             .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
         let indices = with_row_ids["idx"].as_primitive::<UInt64Type>();
         let ids = with_row_ids[ROW_ID].as_primitive::<UInt64Type>();
+        let addresses = with_row_ids[ROW_ADDR].as_primitive::<UInt64Type>();
         let mut row_ids = vec![0; with_row_ids.num_rows()];
-        for (index, row_id) in indices.values().iter().zip(ids.values()) {
+        let mut row_addresses = vec![0; with_row_ids.num_rows()];
+        for ((index, row_id), row_address) in indices
+            .values()
+            .iter()
+            .zip(ids.values())
+            .zip(addresses.values())
+        {
             row_ids[*index as usize] = *row_id;
+            row_addresses[*index as usize] = *row_address;
         }
 
         dataset.delete("idx = 1").await.unwrap();
-        (test_dir, Arc::new(dataset), row_ids)
+        (test_dir, Arc::new(dataset), row_ids, row_addresses)
     }
 
     async fn create_multi_base_blob_v2_fixture(
@@ -4654,6 +4674,85 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_blob_selection_rejects_missing_indices_and_addresses() {
+        let fixture = BlobTestFixture::new().await;
+        let row_count = fixture.dataset.count_rows(None).await.unwrap() as u64;
+        let missing_address = 999_u64 << 32;
+
+        for row_indices in [vec![row_count], vec![0, row_count]] {
+            let err = fixture
+                .dataset
+                .take_blobs_by_indices(&row_indices, "blobs")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("out of bounds"));
+
+            let err = fixture
+                .dataset
+                .read_blobs("blobs")
+                .unwrap()
+                .with_row_indices(row_indices.clone())
+                .execute()
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("out of bounds"));
+
+            let err = fixture
+                .dataset
+                .read_blob_ranges("blobs")
+                .unwrap()
+                .with_row_indices(
+                    row_indices
+                        .into_iter()
+                        .map(|row_index| BlobRangeRequest::new(row_index, 0, 1)),
+                )
+                .execute()
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("out of bounds"));
+        }
+
+        for row_addrs in [vec![missing_address], vec![0, missing_address]] {
+            let err = fixture
+                .dataset
+                .take_blobs_by_addresses(&row_addrs, "blobs")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("not part of this dataset version"));
+
+            let err = fixture
+                .dataset
+                .read_blobs("blobs")
+                .unwrap()
+                .with_row_addresses(row_addrs.clone())
+                .execute()
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("not part of this dataset version"));
+
+            let err = fixture
+                .dataset
+                .read_blob_ranges("blobs")
+                .unwrap()
+                .with_row_addresses(
+                    row_addrs
+                        .into_iter()
+                        .map(|row_addr| BlobRangeRequest::new(row_addr, 0, 1)),
+                )
+                .execute()
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("not part of this dataset version"));
+        }
+    }
+
     #[rstest]
     #[case::all_valid_first(false)]
     #[case::nullable_first(true)]
@@ -4719,7 +4818,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_blobs_by_ids_rejects_deleted_stable_row_id() {
-        let (_test_dir, dataset, row_ids) = stable_row_id_blob_dataset_with_deleted_row().await;
+        let (_test_dir, dataset, row_ids, _) = stable_row_id_blob_dataset_with_deleted_row().await;
 
         let err = dataset.take_blobs(&row_ids, "blob").await.unwrap_err();
 
@@ -4732,7 +4831,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_blobs_by_ids_rejects_deleted_stable_row_id() {
-        let (_test_dir, dataset, row_ids) = stable_row_id_blob_dataset_with_deleted_row().await;
+        let (_test_dir, dataset, row_ids, _) = stable_row_id_blob_dataset_with_deleted_row().await;
 
         let err = dataset
             .read_blobs("blob")
@@ -4751,7 +4850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_blob_ranges_by_ids_rejects_deleted_stable_row_id() {
-        let (_test_dir, dataset, row_ids) = stable_row_id_blob_dataset_with_deleted_row().await;
+        let (_test_dir, dataset, row_ids, _) = stable_row_id_blob_dataset_with_deleted_row().await;
         let requests = [
             BlobRangeRequest::new(row_ids[0], 0, 2),
             BlobRangeRequest::new(row_ids[1], 0, 2),
@@ -4770,6 +4869,53 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Could not resolve all requested row IDs")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blob_selection_rejects_deleted_row_address() {
+        let (_test_dir, dataset, _, row_addresses) =
+            stable_row_id_blob_dataset_with_deleted_row().await;
+        let requested = vec![row_addresses[0], row_addresses[1], row_addresses[2]];
+
+        let err = dataset
+            .take_blobs_by_addresses(&requested, "blob")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("Could not resolve all requested row addresses")
+        );
+
+        let err = dataset
+            .read_blobs("blob")
+            .unwrap()
+            .with_row_addresses(requested.clone())
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("Could not resolve all requested row addresses")
+        );
+
+        let err = dataset
+            .read_blob_ranges("blob")
+            .unwrap()
+            .with_row_addresses(
+                requested
+                    .into_iter()
+                    .map(|row_address| BlobRangeRequest::new(row_address, 0, 1)),
+            )
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("Could not resolve all requested row addresses")
         );
     }
 

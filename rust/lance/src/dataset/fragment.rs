@@ -3460,11 +3460,27 @@ impl FragmentReader {
         let (unique_indices, expand_map) = if has_duplicates {
             let mut unique: Vec<u32> = Vec::with_capacity(indices.len());
             let mut mapping: Vec<u32> = Vec::with_capacity(indices.len());
+            let mut output_index = 0;
+            let mut current_output_index = None;
             for &idx in indices {
                 if unique.last() != Some(&idx) {
                     unique.push(idx);
+                    current_output_index = if !self.make_deletions_null
+                        && self
+                            .deletion_vec
+                            .as_ref()
+                            .is_some_and(|deletions| deletions.contains(idx))
+                    {
+                        None
+                    } else {
+                        let index = output_index;
+                        output_index += 1;
+                        Some(index)
+                    };
                 }
-                mapping.push((unique.len() - 1) as u32);
+                if let Some(output_index) = current_output_index {
+                    mapping.push(output_index);
+                }
             }
             (Cow::Owned(unique), Some(UInt32Array::from(mapping)))
         } else {
@@ -3480,7 +3496,11 @@ impl FragmentReader {
         let mut batch = concat_batches(&Arc::new(self.output_schema.clone()), batches.iter())?;
 
         if let Some(expand_map) = expand_map {
-            batch = arrow_select::take::take_record_batch(&batch, &expand_map)?;
+            batch = if expand_map.is_empty() {
+                batch.slice(0, 0)
+            } else {
+                arrow_select::take::take_record_batch(&batch, &expand_map)?
+            };
         }
 
         Ok(batch)
