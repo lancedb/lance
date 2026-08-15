@@ -6784,6 +6784,11 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     with pytest.raises(OSError, match="base64"):
         lance.LanceDataset.commit(dataset, tampered)
 
+    empty = copy.deepcopy(transaction)
+    empty._cell_flag_transaction = ""
+    with pytest.raises(OSError, match="contains no changes"):
+        lance.LanceDataset.commit(dataset, empty)
+
     retargeted = copy.deepcopy(transaction)
     retargeted.operation.fields_modified = [1]
     with pytest.raises(OSError, match="does not match the public transaction"):

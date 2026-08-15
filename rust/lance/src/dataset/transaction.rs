@@ -390,7 +390,13 @@ fn decode_cell_flag_transaction(value: &str) -> Result<CellFlagTransaction> {
                 error
             ))
         })?;
-    proto.try_into()
+    let changes: CellFlagTransaction = proto.try_into()?;
+    if changes.is_empty() {
+        return Err(Error::invalid_input(
+            "Cell Flag transaction contains no changes",
+        ));
+    }
+    Ok(changes)
 }
 
 type CanonicalMapEntry = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -7672,8 +7678,22 @@ mod tests {
 
         assert!(
             transaction
+                .clone()
                 .with_cell_flag_transaction_payload(Some("not-base64".to_string()))
                 .is_err()
+        );
+
+        let empty_changes = CellFlagTransaction {
+            dataset_identity: Uuid::new_v4().to_string(),
+            operation_digest: Some(cell_flag_operation_digest(&transaction)),
+            ..Default::default()
+        };
+        let error = transaction
+            .with_cell_flag_transaction_payload(Some(encode_cell_flag_transaction(&empty_changes)))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("contains no changes"),
+            "got {error}"
         );
 
         let mut empty_sidecar = pb::Transaction::from(&Transaction::new_from_version(
