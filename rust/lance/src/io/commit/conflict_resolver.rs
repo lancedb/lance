@@ -8,7 +8,8 @@ use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
     dataset::transaction::{
-        CellFlagTransaction, DataOverlayGroup, Operation, Transaction, UpdateMode,
+        CellFlagConflictScope, CellFlagTransaction, DataOverlayGroup, Operation, Transaction,
+        UpdateMode,
     },
 };
 use futures::{StreamExt, TryStreamExt};
@@ -34,6 +35,7 @@ pub struct TransactionRebase<'a> {
     initial_fragments: HashMap<u64, (Fragment, bool)>,
     /// Fragments that have been deleted or modified
     modified_fragment_ids: HashSet<u64>,
+    cell_flag_conflict_scope: CellFlagConflictScope,
     affected_rows: Option<&'a RowAddrTreeMap>,
     conflicting_frag_reuse_indices: Vec<IndexMetadata>,
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
@@ -103,14 +105,6 @@ fn cell_flag_replacing_fragment_ids(operation: &Operation) -> HashSet<u64> {
     }
 }
 
-fn is_flag_only_update(transaction: &Transaction) -> Result<bool> {
-    let cell_flag_transaction = transaction.cell_flag_transaction()?;
-    Ok(is_flag_only_update_with_changes(
-        &transaction.operation,
-        cell_flag_transaction.as_ref(),
-    ))
-}
-
 fn is_flag_only_update_with_changes(
     operation: &Operation,
     cell_flag_transaction: Option<&CellFlagTransaction>,
@@ -128,6 +122,25 @@ fn is_flag_only_update_with_changes(
             && new_fragments.is_empty()
             && fields_modified.is_empty()
     ) && cell_flag_transaction.is_some_and(|changes| !changes.row_changes.is_empty())
+}
+
+fn is_flag_only_update_with_scope(
+    operation: &Operation,
+    cell_flag_conflict_scope: &CellFlagConflictScope,
+) -> bool {
+    matches!(
+        operation,
+        Operation::Update {
+            updated_fragments,
+            removed_fragment_ids,
+            new_fragments,
+            fields_modified,
+            ..
+        } if updated_fragments.is_empty()
+            && removed_fragment_ids.is_empty()
+            && new_fragments.is_empty()
+            && fields_modified.is_empty()
+    ) && !cell_flag_conflict_scope.row_addresses_by_flag.is_empty()
 }
 
 fn cell_flag_row_changes_conflict(
@@ -148,7 +161,8 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
-        let cell_flag_fragment_ids = transaction.cell_flag_conflict_scope()?.row_fragment_ids;
+        let cell_flag_conflict_scope = transaction.cell_flag_conflict_scope()?;
+        let cell_flag_fragment_ids = cell_flag_conflict_scope.row_fragment_ids.clone();
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -165,6 +179,7 @@ impl<'a> TransactionRebase<'a> {
                 affected_rows,
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
+                cell_flag_conflict_scope,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             }),
@@ -199,6 +214,7 @@ impl<'a> TransactionRebase<'a> {
                         transaction,
                         initial_fragments: HashMap::new(),
                         modified_fragment_ids,
+                        cell_flag_conflict_scope,
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
@@ -213,6 +229,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
+                    cell_flag_conflict_scope,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
@@ -231,6 +248,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
+                    cell_flag_conflict_scope,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
@@ -246,6 +264,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
+                    cell_flag_conflict_scope,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
@@ -261,6 +280,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
+                    cell_flag_conflict_scope,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
@@ -275,6 +295,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
+                    cell_flag_conflict_scope,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
@@ -358,12 +379,12 @@ impl<'a> TransactionRebase<'a> {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
 
-        let our_cell_flags = self.transaction.cell_flag_conflict_scope()?;
+        let our_cell_flags = &self.cell_flag_conflict_scope;
         let their_cell_flags = other_transaction.cell_flag_conflict_scope()?;
         if !our_cell_flags.is_empty() || !their_cell_flags.is_empty() {
             let our_cell_flag_replacements = cell_flag_replacing_fragment_ids(ours);
             let their_cell_flag_replacements = cell_flag_replacing_fragment_ids(theirs);
-            if cell_flag_row_changes_conflict(&our_cell_flags, &their_cell_flags)
+            if cell_flag_row_changes_conflict(our_cell_flags, &their_cell_flags)
                 || !our_cell_flags
                     .row_fragment_ids
                     .is_disjoint(&their_cell_flag_replacements)
@@ -402,7 +423,9 @@ impl<'a> TransactionRebase<'a> {
             Operation::DataOverlay { .. } => {
                 self.check_data_overlay_txn(other_transaction, other_version)
             }
-            Operation::Merge { .. } => self.check_merge_txn(other_transaction, other_version),
+            Operation::Merge { .. } => {
+                self.check_merge_txn(other_transaction, other_version, &their_cell_flags)
+            }
             Operation::Restore { .. } => self.check_restore_txn(other_transaction, other_version),
             Operation::ReserveFragments { .. } => {
                 self.check_reserve_fragments_txn(other_transaction, other_version)
@@ -530,7 +553,10 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        let self_is_flag_only_update = is_flag_only_update(&self.transaction)?;
+        let self_is_flag_only_update = is_flag_only_update_with_scope(
+            &self.transaction.operation,
+            &self.cell_flag_conflict_scope,
+        );
         let other_is_rewrite_columns = matches!(
             &other_transaction.operation,
             Operation::Update {
@@ -1498,6 +1524,7 @@ impl<'a> TransactionRebase<'a> {
         &mut self,
         other_transaction: &Transaction,
         other_version: u64,
+        other_cell_flag_conflict_scope: &CellFlagConflictScope,
     ) -> Result<()> {
         match &other_transaction.operation {
             // See the MemWAL exception in check_create_index_txn.
@@ -1514,7 +1541,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => Ok(()),
 
             Operation::Update { .. } => {
-                if is_flag_only_update(other_transaction)? {
+                if is_flag_only_update_with_scope(
+                    &other_transaction.operation,
+                    other_cell_flag_conflict_scope,
+                ) {
                     Ok(())
                 } else {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -1942,7 +1972,7 @@ impl<'a> TransactionRebase<'a> {
                 // 3. Write out new deletion files with existing deletes | affected rows.
                 // 4. Update the transaction with the new deletion files.
 
-                let fragments_ids_to_rewrite = self
+                let fragment_ids_to_check = self
                     .initial_fragments
                     .iter()
                     .filter_map(|(_, (fragment, needs_rewrite))| {
@@ -1959,7 +1989,7 @@ impl<'a> TransactionRebase<'a> {
                     .as_slice()
                     .iter()
                     .filter_map(|fragment| {
-                        if fragments_ids_to_rewrite.contains(&fragment.id) {
+                        if fragment_ids_to_check.contains(&fragment.id) {
                             Some((fragment.id, fragment.deletion_file.clone()))
                         } else {
                             None
@@ -2019,9 +2049,26 @@ impl<'a> TransactionRebase<'a> {
                 };
                 let merged = existing_deletions.clone() | affected_rows.clone();
 
+                // Cell Flag row changes participate in the overlap check above,
+                // but they are not deletion intent. Only fragments carried by
+                // the public data mutation can receive rewritten deletion files.
+                let fragment_ids_to_rewrite = match &self.transaction.operation {
+                    Operation::Update {
+                        updated_fragments, ..
+                    }
+                    | Operation::Delete {
+                        updated_fragments, ..
+                    } => updated_fragments
+                        .iter()
+                        .map(|fragment| fragment.id)
+                        .filter(|fragment_id| fragment_ids_to_check.contains(fragment_id))
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+
                 let mut new_deleted_frag_ids = Vec::new();
-                let mut new_deletion_files = HashMap::with_capacity(fragments_ids_to_rewrite.len());
-                for fragment_id in fragments_ids_to_rewrite.iter() {
+                let mut new_deletion_files = HashMap::with_capacity(fragment_ids_to_rewrite.len());
+                for fragment_id in fragment_ids_to_rewrite.iter() {
                     let dv = DeletionVector::from(
                         merged
                             .get_fragment_bitmap(*fragment_id as u32)
@@ -3559,6 +3606,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: modified_fragment_ids(operation).collect::<HashSet<_>>(),
                 affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -3764,6 +3812,7 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(&overlay_op(1))
                     .collect::<HashSet<_>>(),
                 affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -3823,6 +3872,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: modified_fragment_ids(&rewrite_op).collect::<HashSet<_>>(),
                 affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -3935,6 +3985,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: modified_fragment_ids(&update_op).collect::<HashSet<_>>(),
                 affected_rows: affected_rows.as_ref(),
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -3977,6 +4028,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -3992,6 +4044,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::from_iter([0]),
                 affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -4068,6 +4121,7 @@ mod tests {
                         initial_fragments: HashMap::new(),
                         modified_fragment_ids: modified_fragment_ids(&ours).collect::<HashSet<_>>(),
                         affected_rows: None,
+                        cell_flag_conflict_scope: Default::default(),
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                     };
@@ -4201,6 +4255,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -4276,6 +4331,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -4297,6 +4353,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -4340,6 +4397,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -4394,6 +4452,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -4460,6 +4519,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -5106,6 +5166,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: modified_fragment_ids(&op1).collect::<HashSet<_>>(),
                 affected_rows: None,
+                cell_flag_conflict_scope: Default::default(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
@@ -5171,6 +5232,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -5211,6 +5273,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -5252,6 +5315,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -5293,6 +5357,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -5344,6 +5409,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -5370,6 +5436,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
@@ -5417,6 +5484,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
+            cell_flag_conflict_scope: Default::default(),
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
         };

@@ -61,7 +61,10 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
-    if manifest.config.contains_key(CELL_FLAG_MANIFEST_CONFIG_KEY) {
+    let has_cell_flags = manifest.next_cell_flag_id != 0
+        || !manifest.cell_flag_definitions.is_empty()
+        || !manifest.cell_flag_states.is_empty();
+    if has_cell_flags && manifest.config.contains_key(CELL_FLAG_MANIFEST_CONFIG_KEY) {
         return Err(Error::invalid_input(format!(
             "Dataset config key '{}' is reserved for internal Cell Flag metadata",
             CELL_FLAG_MANIFEST_CONFIG_KEY
@@ -141,10 +144,7 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
     }
 
-    if manifest.next_cell_flag_id != 0
-        || !manifest.cell_flag_definitions.is_empty()
-        || !manifest.cell_flag_states.is_empty()
-    {
+    if has_cell_flags {
         manifest.writer_feature_flags |= FLAG_CELL_FLAGS;
     }
 
@@ -531,8 +531,25 @@ mod tests {
     }
 
     #[test]
-    fn apply_feature_flags_rejects_internal_cell_flag_config_key() {
+    fn apply_feature_flags_preserves_legacy_cell_flag_config_key() {
         let mut manifest = empty_manifest();
+        manifest.config.insert(
+            CELL_FLAG_MANIFEST_CONFIG_KEY.to_string(),
+            "user-controlled".to_string(),
+        );
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(
+            manifest.config.get(CELL_FLAG_MANIFEST_CONFIG_KEY),
+            Some(&"user-controlled".to_string())
+        );
+        assert_eq!(manifest.writer_feature_flags & FLAG_CELL_FLAGS, 0);
+    }
+
+    #[test]
+    fn apply_feature_flags_rejects_internal_cell_flag_config_key_when_active() {
+        let mut manifest = empty_manifest();
+        manifest.next_cell_flag_id = 1;
         manifest.config.insert(
             CELL_FLAG_MANIFEST_CONFIG_KEY.to_string(),
             "user-controlled".to_string(),

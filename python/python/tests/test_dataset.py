@@ -6794,6 +6794,29 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     with pytest.raises(OSError, match="does not match the public transaction"):
         lance.LanceDataset.commit(dataset, retargeted)
 
+    append_transaction = lance.fragment.write_fragments(
+        pa.table({"id": [3], "value": pa.array([13], pa.int32())}),
+        dataset,
+        return_transaction=True,
+        cell_flags={"value": {"reviewed": True}},
+    )
+    existing_path = dataset.get_fragments()[0].metadata.files[0].path
+    appended_path = append_transaction.operation.fragments[0].files[0].path
+    encoded_sidecar = append_transaction._cell_flag_transaction
+    assert encoded_sidecar is not None
+    raw_sidecar = base64.b64decode(encoded_sidecar + "=" * (-len(encoded_sidecar) % 4))
+    assert appended_path.encode() in raw_sidecar
+    retargeted_sidecar = copy.deepcopy(append_transaction)
+    retargeted_sidecar._cell_flag_transaction = (
+        base64.b64encode(
+            raw_sidecar.replace(appended_path.encode(), existing_path.encode(), 1)
+        )
+        .decode()
+        .rstrip("=")
+    )
+    with pytest.raises(OSError, match="outside the public transaction"):
+        lance.LanceDataset.commit(dataset, retargeted_sidecar)
+
     replay = lance.write_dataset(
         pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
         tmp_path / "replay",
@@ -6801,6 +6824,30 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     replay.register_cell_flag("value", "reviewed")
     with pytest.raises(OSError, match="different dataset"):
         lance.LanceDataset.commit(replay, transaction)
+
+    registration_uri = tmp_path / "registration-source"
+    registration_source = lance.write_dataset(
+        pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
+        registration_uri,
+    )
+    registration_source.register_cell_flag("value", "reviewed")
+    registration_transaction = registration_source.read_transaction(
+        registration_source.version
+    )
+    registration_target = lance.write_dataset(
+        pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
+        tmp_path / "registration-target",
+    )
+    with pytest.raises(OSError, match="different dataset incarnation"):
+        lance.LanceDataset.commit(registration_target, registration_transaction)
+
+    registration_uri.rename(tmp_path / "registration-source-old")
+    registration_replacement = lance.write_dataset(
+        pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
+        registration_uri,
+    )
+    with pytest.raises(OSError, match="different dataset incarnation"):
+        lance.LanceDataset.commit(registration_replacement, registration_transaction)
 
     recreated_uri = tmp_path / "recreated"
     recreated = lance.write_dataset(
@@ -6901,7 +6948,9 @@ def test_cell_flag_uncommitted_merge_insert_preserves_update_metadata(tmp_path: 
 
 def test_cell_flag_uncommitted_merge_insert_rebase_keeps_delete_scope(tmp_path: Path):
     dataset = lance.write_dataset(
-        pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}), tmp_path
+        pa.table({"id": [1, 3, 2, 4], "value": [10, 30, 20, 40]}),
+        tmp_path,
+        max_rows_per_file=2,
     )
     dataset.register_cell_flag("value", "reviewed")
     stale = lance.dataset(tmp_path)
@@ -6911,10 +6960,19 @@ def test_cell_flag_uncommitted_merge_insert_rebase_keeps_delete_scope(tmp_path: 
         .set_matched_cell_flag("value", "reviewed", True)
         .execute_uncommitted(pa.table({"id": [1]}))
     )
+    deletion_dir = tmp_path / "_deletions"
+    staged_deletion_files = len(list(deletion_dir.iterdir()))
 
     dataset.delete("id = 3")
+    concurrent_deletion_files = len(list(deletion_dir.iterdir()))
     committed = lance.LanceDataset.commit(tmp_path, transaction, max_retries=0)
-    assert _flag_rows(committed, field="value", name="reviewed") == [(1, True)]
+    assert _flag_rows(committed, field="value", name="reviewed") == [
+        (1, True),
+        (4, False),
+    ]
+    assert staged_deletion_files == 1
+    assert concurrent_deletion_files == 2
+    assert len(list(deletion_dir.iterdir())) == concurrent_deletion_files
 
 
 def test_cell_flag_uncommitted_explicit_clear_conflicts_with_set(tmp_path: Path):

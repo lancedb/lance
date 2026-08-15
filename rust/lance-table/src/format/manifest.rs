@@ -1012,7 +1012,11 @@ impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
     fn try_from(mut p: pb::Manifest) -> Result<Self> {
-        let cell_flag_metadata = decode_cell_flag_manifest(&mut p.config)?;
+        let cell_flag_metadata = if p.writer_feature_flags & FLAG_CELL_FLAGS != 0 {
+            decode_cell_flag_manifest(&mut p.config)?
+        } else {
+            None
+        };
         let has_cell_flag_metadata = cell_flag_metadata.is_some();
         let pb::CellFlagManifest {
             definitions: cell_flag_definitions,
@@ -1369,7 +1373,7 @@ mod tests {
     use lance_core::datatypes::Field;
 
     #[test]
-    fn cell_flag_metadata_requires_writer_capability_marker() {
+    fn cell_flag_metadata_key_without_writer_capability_remains_user_config() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "tracked",
             arrow_schema::DataType::Int64,
@@ -1394,11 +1398,12 @@ mod tests {
         let mut encoded = pb::Manifest::from(&manifest);
         encoded.writer_feature_flags &= !FLAG_CELL_FLAGS;
 
-        assert!(
-            Manifest::try_from(encoded)
-                .unwrap_err()
-                .to_string()
-                .contains("required writer feature flag")
+        let decoded = Manifest::try_from(encoded).unwrap();
+        assert!(decoded.cell_flag_definitions.is_empty());
+        assert_eq!(decoded.next_cell_flag_id, 0);
+        assert_eq!(
+            decoded.config.get(CELL_FLAG_MANIFEST_CONFIG_KEY),
+            Some(&encode_cell_flag_manifest(&manifest).unwrap())
         );
     }
 

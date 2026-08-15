@@ -189,11 +189,43 @@ fn decode_cell_flag_bitmap(
 }
 
 impl Dataset {
+    fn cell_flag_bootstrap_identity(&self) -> String {
+        fn update(hasher: &mut blake3::Hasher, value: &[u8]) {
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        update(&mut hasher, b"lance-cell-flag-dataset-v1");
+        update(&mut hasher, &self.manifest.version.to_le_bytes());
+        update(&mut hasher, &self.manifest.timestamp_nanos.to_le_bytes());
+        update(
+            &mut hasher,
+            self.manifest
+                .transaction_file
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        for fragment in self.manifest.fragments.iter() {
+            update(&mut hasher, &fragment.id.to_le_bytes());
+            for file in &fragment.files {
+                update(&mut hasher, file.path.as_bytes());
+            }
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(bytes).hyphenated().to_string()
+    }
+
     pub(crate) fn cell_flag_transaction_identity(&self) -> String {
         self.manifest
             .cell_flag_dataset_id
             .clone()
-            .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string())
+            .unwrap_or_else(|| self.cell_flag_bootstrap_identity())
     }
 
     pub(crate) fn validate_cell_flag_transaction_identity(
@@ -208,9 +240,15 @@ impl Dataset {
             None if self.manifest.next_cell_flag_id == 0
                 && self.manifest.cell_flag_definitions.is_empty()
                 && self.manifest.cell_flag_states.is_empty()
-                && !changes.registrations.is_empty() =>
+                && !changes.registrations.is_empty()
+                && changes.dataset_identity == self.cell_flag_bootstrap_identity() =>
             {
                 Ok(())
+            }
+            None if !changes.registrations.is_empty() => {
+                Err(Error::incompatible_transaction_source(
+                    "Cell flag transaction belongs to a different dataset incarnation".into(),
+                ))
             }
             None => Err(Error::incompatible_transaction_source(
                 "Cell flag transaction cannot target a dataset without a Cell Flag incarnation"
@@ -1559,7 +1597,16 @@ pub async fn apply_cell_flag_transaction(
 ) -> Result<()> {
     let changes = transaction.cell_flag_transaction()?.unwrap_or_default();
     if !changes.is_empty() {
-        current.validate_cell_flag_transaction_identity(&changes)?;
+        if current.manifest.cell_flag_dataset_id.is_none()
+            && current.manifest.version != transaction.read_version
+        {
+            current
+                .checkout_version(transaction.read_version)
+                .await?
+                .validate_cell_flag_transaction_identity(&changes)?;
+        } else {
+            current.validate_cell_flag_transaction_identity(&changes)?;
+        }
     }
     if matches!(
         transaction.operation,

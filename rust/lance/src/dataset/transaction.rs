@@ -2496,6 +2496,43 @@ impl Transaction {
                 "Append and overwrite Cell Flag changes must apply uniformly to every row in a fragment",
             ));
         }
+        if !changes.fragment_states.is_empty() {
+            let new_fragment_paths = match &self.operation {
+                Operation::Append { fragments } | Operation::Overwrite { fragments, .. } => {
+                    fragments
+                        .iter()
+                        .filter_map(|fragment| fragment.files.first())
+                        .map(|file| file.path.as_str())
+                        .collect::<HashSet<_>>()
+                }
+                Operation::Update { new_fragments, .. } => new_fragments
+                    .iter()
+                    .filter_map(|fragment| fragment.files.first())
+                    .map(|file| file.path.as_str())
+                    .collect::<HashSet<_>>(),
+                Operation::Rewrite { groups, .. } => groups
+                    .iter()
+                    .flat_map(|group| group.new_fragments.iter())
+                    .filter_map(|fragment| fragment.files.first())
+                    .map(|file| file.path.as_str())
+                    .collect::<HashSet<_>>(),
+                _ => {
+                    return Err(Error::invalid_input(
+                        "Cell Flag fragment state is only valid for fragments created by append, overwrite, update, or rewrite",
+                    ));
+                }
+            };
+            if let Some(state) = changes
+                .fragment_states
+                .iter()
+                .find(|state| !new_fragment_paths.contains(state.fragment_path.as_str()))
+            {
+                return Err(Error::invalid_input(format!(
+                    "Cell Flag state references fragment '{}' outside the public transaction",
+                    state.fragment_path
+                )));
+            }
+        }
         if let Operation::Update {
             updated_fragments,
             removed_fragment_ids,
@@ -2533,7 +2570,10 @@ impl Transaction {
         let Some(changes) = self.cell_flag_transaction()? else {
             return Ok(None);
         };
-        if let Some(dataset) = dataset {
+        if let Some(dataset) = dataset
+            && (dataset.manifest.cell_flag_dataset_id.is_some()
+                || dataset.manifest.version == self.read_version)
+        {
             dataset.validate_cell_flag_transaction_identity(&changes)?;
         }
         let is_flag_only = matches!(
@@ -7236,12 +7276,18 @@ mod tests {
             affected_rows: Some(RowAddrTreeMap::from(row_addresses)),
             operation_digest: None,
         };
+        let mut new_fragment = Fragment::new(3);
+        new_fragment.files = vec![DataFile::new_legacy_from_fields(
+            "data/new.lance",
+            vec![7],
+            None,
+        )];
         let tx = Transaction::new_from_version(
             1,
             Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments: vec![Fragment::new(2)],
-                new_fragments: Vec::new(),
+                new_fragments: vec![new_fragment],
                 fields_modified: Vec::new(),
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: Vec::new(),
@@ -7286,6 +7332,34 @@ mod tests {
             .transaction_properties
             .insert(CELL_FLAG_TRANSACTION_PROPERTY.to_string(), encoded);
         assert!(Transaction::try_from(user_proto).is_err());
+    }
+
+    #[test]
+    fn cell_flag_fragment_state_must_target_a_public_new_fragment() {
+        let mut new_fragment = Fragment::new(1);
+        new_fragment.files = vec![DataFile::new_legacy_from_fields(
+            "data/new.lance",
+            vec![0],
+            None,
+        )];
+        let transaction = Transaction::new_from_version(
+            1,
+            Operation::Append {
+                fragments: vec![new_fragment],
+            },
+        )
+        .with_cell_flag_transaction(CellFlagTransaction {
+            fragment_states: vec![CellFlagFragmentState {
+                fragment_path: "data/existing.lance".to_string(),
+                flag_id: 0,
+                state: CellFlagFragmentValue::All,
+            }],
+            dataset_identity: Uuid::new_v4().to_string(),
+            ..Default::default()
+        });
+
+        let error = transaction.cell_flag_transaction().unwrap_err();
+        assert!(error.to_string().contains("outside the public transaction"));
     }
 
     #[test]
