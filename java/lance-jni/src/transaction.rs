@@ -308,26 +308,31 @@ pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
 ) -> Result<JObject<'local>> {
-    let uuid = env.new_string(transaction.uuid)?;
-    let tag = match transaction.tag {
-        Some(tag) => JObject::from(env.new_string(tag)?),
-        None => JObject::null(),
-    };
-    let transaction_properties = match transaction.transaction_properties {
+    let transaction_properties = match transaction.application_transaction_properties() {
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
+    };
+    let cell_flag_transaction_payload = match transaction.cell_flag_transaction_payload() {
+        Some(payload) => JObject::from(env.new_string(payload)?),
+        None => JObject::null(),
+    };
+    let uuid = env.new_string(&transaction.uuid)?;
+    let tag = match &transaction.tag {
+        Some(tag) => JObject::from(env.new_string(tag)?),
+        None => JObject::null(),
     };
     let operation = convert_to_java_operation(env, Some(transaction.operation))?;
 
     let java_transaction = env.new_object(
         "org/lance/Transaction",
-        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
+        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;Ljava/lang/String;)V",
         &[
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
             JValue::Object(&tag),
             JValue::Object(&transaction_properties),
+            JValue::Object(&cell_flag_transaction_payload),
         ],
     )?;
     Ok(java_transaction)
@@ -908,11 +913,24 @@ fn convert_to_rust_transaction(
             to_rust_map(env, &transaction_properties)
         },
     )?;
-    Ok(TransactionBuilder::new(read_ver, op)
+    let cell_flag_transaction_payload = env
+        .get_field(
+            &java_transaction,
+            "cellFlagTransactionPayload",
+            "Ljava/lang/String;",
+        )?
+        .l()?;
+    let cell_flag_transaction_payload = if cell_flag_transaction_payload.is_null() {
+        None
+    } else {
+        Some(JString::from(cell_flag_transaction_payload).extract(env)?)
+    };
+    let transaction = TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
         .tag(tag)
-        .transaction_properties(transaction_properties.map(Arc::new))
-        .build())
+        .build()
+        .with_application_transaction_properties(transaction_properties.map(Arc::new))?;
+    Ok(transaction.with_cell_flag_transaction_payload(cell_flag_transaction_payload)?)
 }
 
 fn convert_schema_from_operation(

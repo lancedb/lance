@@ -881,8 +881,8 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
     dataset_with_blobs.delete("idx = 1")
 
     with pytest.raises(
-        NotImplementedError,
-        match="A take operation that includes row addresses must not target deleted",
+        ValueError,
+        match="Could not resolve all requested row addresses",
     ):
         dataset_with_blobs.take_blobs("blobs", ids=row_ids)
 

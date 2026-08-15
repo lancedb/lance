@@ -19,6 +19,7 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.operation.Append;
 import org.lance.operation.CreateIndex;
+import org.lance.operation.Operation;
 import org.lance.operation.Overwrite;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -26,6 +27,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.lang.reflect.Constructor;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
@@ -35,9 +37,47 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TransactionTest {
+
+  @Test
+  public void testInternalPayloadIsHiddenAndTransported(@TempDir Path tempDir) throws Exception {
+    Constructor<Transaction> constructor =
+        Transaction.class.getDeclaredConstructor(
+            long.class, String.class, Operation.class, String.class, Map.class, String.class);
+    constructor.setAccessible(true);
+
+    String datasetPath = tempDir.resolve("testInternalPayloadIsHiddenAndTransported").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        FragmentMetadata fragment = testDataset.createNewFragment(1);
+        try (Transaction transaction =
+            constructor.newInstance(
+                dataset.version(),
+                "internal-payload-test",
+                Append.builder().fragments(Collections.singletonList(fragment)).build(),
+                null,
+                Map.of("source", "application"),
+                "not-a-valid-cell-flag-payload")) {
+          assertEquals(Map.of("source", "application"), transaction.transactionProperties().get());
+          assertFalse(transaction.toString().contains("not-a-valid-cell-flag-payload"));
+
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new CommitBuilder(dataset).execute(transaction));
+          assertTrue(
+              error.getMessage().toLowerCase().contains("cell flag transaction"),
+              error.getMessage());
+          assertEquals(1, dataset.version());
+        }
+      }
+    }
+  }
 
   @Test
   public void testReadTransactionCreateIndex(@TempDir Path tempDir) {

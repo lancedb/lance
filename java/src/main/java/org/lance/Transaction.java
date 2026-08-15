@@ -38,6 +38,7 @@ public class Transaction implements AutoCloseable {
   private final Operation operation;
   private final Optional<String> tag;
   private final Optional<Map<String, String>> transactionProperties;
+  private final String cellFlagTransactionPayload;
 
   /**
    * Constructor used by JNI when reading transactions from native code.
@@ -47,18 +48,21 @@ public class Transaction implements AutoCloseable {
    * @param operation the operation to perform
    * @param tag optional tag for the transaction
    * @param transactionProperties optional transaction properties
+   * @param cellFlagTransactionPayload opaque internal payload reserved for JNI
    */
   private Transaction(
       long readVersion,
       String uuid,
       Operation operation,
       String tag,
-      Map<String, String> transactionProperties) {
+      Map<String, String> transactionProperties,
+      String cellFlagTransactionPayload) {
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
     this.tag = Optional.ofNullable(tag);
     this.transactionProperties = Optional.ofNullable(transactionProperties);
+    this.cellFlagTransactionPayload = cellFlagTransactionPayload;
   }
 
   /**
@@ -69,7 +73,7 @@ public class Transaction implements AutoCloseable {
    * @param operation the operation to perform
    */
   public Transaction(long readVersion, Operation operation) {
-    this(readVersion, UUID.randomUUID().toString(), operation, null, null);
+    this(readVersion, UUID.randomUUID().toString(), operation, null, null, null);
   }
 
   public long readVersion() {
@@ -180,7 +184,7 @@ public class Transaction implements AutoCloseable {
 
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
-      return new Transaction(readVersion, uuid, operation, tag, transactionProperties);
+      return new Transaction(readVersion, uuid, operation, tag, transactionProperties, null);
     }
   }
 }

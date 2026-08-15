@@ -1535,9 +1535,19 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
             }
+            Operation::UpdateConfig {
+                schema_metadata_updates,
+                field_metadata_updates,
+                ..
+            } => {
+                if schema_metadata_updates.is_some() || !field_metadata_updates.is_empty() {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
             Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
-            | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
 
             Operation::Update { .. } => {
@@ -1709,13 +1719,12 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Rewrite { .. }
                 | Operation::DataReplacement { .. }
                 | Operation::DataOverlay { .. }
-                | Operation::Merge { .. }
                 | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Update { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
-                Operation::Project { .. } => {
+                Operation::Merge { .. } | Operation::Project { .. } => {
                     if schema_metadata_updates.is_some() || !field_metadata_updates.is_empty() {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -3394,7 +3403,7 @@ mod tests {
                     schema: lance_core::datatypes::Schema::default(),
                     preserves_nullability: true,
                 },
-                // Merge conflicts with everything except CreateIndex and ReserveFragments.
+                // Merge also conflicts with schema or field metadata updates.
                 [
                     Retryable,     // append
                     Compatible,    // create index
@@ -3404,7 +3413,7 @@ mod tests {
                     Retryable,     // rewrite
                     Compatible,    // reserve
                     Retryable,     // update
-                    Compatible,    // update config
+                    Retryable,     // update config
                 ],
             ),
             (
@@ -3552,7 +3561,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -3579,7 +3588,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -3605,7 +3614,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -4153,11 +4162,18 @@ mod tests {
     }
 
     #[test]
-    fn test_project_conflicts_with_schema_or_field_metadata_updates() {
-        let project = Operation::Project {
-            schema: lance_core::datatypes::Schema::default(),
-            preserves_nullability: true,
-        };
+    fn test_schema_writers_conflict_with_schema_or_field_metadata_updates() {
+        let schema_writers = [
+            Operation::Project {
+                schema: lance_core::datatypes::Schema::default(),
+                preserves_nullability: true,
+            },
+            Operation::Merge {
+                fragments: vec![],
+                schema: lance_core::datatypes::Schema::default(),
+                preserves_nullability: true,
+            },
+        ];
         let metadata_updates = [
             create_update_config_for_test(
                 None,
@@ -4179,25 +4195,27 @@ mod tests {
             ),
         ];
 
-        for metadata_update in metadata_updates {
-            for (ours, theirs) in [
-                (project.clone(), metadata_update.clone()),
-                (metadata_update.clone(), project.clone()),
-            ] {
-                let mut rebase = TransactionRebase {
-                    transaction: Transaction::new(0, ours.clone(), None),
-                    initial_fragments: HashMap::new(),
-                    modified_fragment_ids: modified_fragment_ids(&ours).collect(),
-                    affected_rows: None,
-                    cell_flag_conflict_scope: Default::default(),
-                    conflicting_frag_reuse_indices: Vec::new(),
-                    conflicting_mem_wal_compacted_sstables: Vec::new(),
-                };
-                let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
-                assert!(
-                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
-                    "got {result:?}"
-                );
+        for schema_writer in &schema_writers {
+            for metadata_update in &metadata_updates {
+                for (ours, theirs) in [
+                    (schema_writer.clone(), metadata_update.clone()),
+                    (metadata_update.clone(), schema_writer.clone()),
+                ] {
+                    let mut rebase = TransactionRebase {
+                        transaction: Transaction::new(0, ours.clone(), None),
+                        initial_fragments: HashMap::new(),
+                        modified_fragment_ids: modified_fragment_ids(&ours).collect(),
+                        affected_rows: None,
+                        cell_flag_conflict_scope: Default::default(),
+                        conflicting_frag_reuse_indices: Vec::new(),
+                        conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    };
+                    let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
+                    assert!(
+                        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                        "got {result:?}"
+                    );
+                }
             }
         }
 
@@ -4210,24 +4228,26 @@ mod tests {
             None,
             None,
         );
-        for (ours, theirs) in [
-            (project.clone(), config_only.clone()),
-            (config_only, project),
-        ] {
-            let mut rebase = TransactionRebase {
-                transaction: Transaction::new(0, ours.clone(), None),
-                initial_fragments: HashMap::new(),
-                modified_fragment_ids: modified_fragment_ids(&ours).collect(),
-                affected_rows: None,
-                cell_flag_conflict_scope: Default::default(),
-                conflicting_frag_reuse_indices: Vec::new(),
-                conflicting_mem_wal_compacted_sstables: Vec::new(),
-            };
-            assert!(
-                rebase
-                    .check_txn(&Transaction::new(0, theirs, None), 1)
-                    .is_ok()
-            );
+        for schema_writer in schema_writers {
+            for (ours, theirs) in [
+                (schema_writer.clone(), config_only.clone()),
+                (config_only.clone(), schema_writer.clone()),
+            ] {
+                let mut rebase = TransactionRebase {
+                    transaction: Transaction::new(0, ours.clone(), None),
+                    initial_fragments: HashMap::new(),
+                    modified_fragment_ids: modified_fragment_ids(&ours).collect(),
+                    affected_rows: None,
+                    cell_flag_conflict_scope: Default::default(),
+                    conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_compacted_sstables: Vec::new(),
+                };
+                assert!(
+                    rebase
+                        .check_txn(&Transaction::new(0, theirs, None), 1)
+                        .is_ok()
+                );
+            }
         }
     }
 

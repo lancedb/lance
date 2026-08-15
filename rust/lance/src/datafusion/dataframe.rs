@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, streaming::StreamingTable},
     common::{
-        Column,
+        Column, DFSchema,
         config::ConfigOptions,
+        metadata::FieldMetadata,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     dataframe::DataFrame,
@@ -255,7 +256,9 @@ impl TableProvider for LanceTableProvider {
                         columns.push(self.full_schema.field(*field_idx).name());
                     }
                 }
-                if !columns.is_empty() {
+                if columns.is_empty() {
+                    scan.empty_project()?;
+                } else {
                     scan.project(&columns)?;
                 }
             }
@@ -363,6 +366,35 @@ fn project_original_schema(
     Projection::try_new(expressions, Arc::new(plan)).map(LogicalPlan::Projection)
 }
 
+fn preserve_output_expression_names(
+    plan: &LogicalPlan,
+    expressions: Vec<Expr>,
+    original_schema: &DFSchema,
+) -> Vec<Expr> {
+    if !matches!(plan, LogicalPlan::Projection(_) | LogicalPlan::Aggregate(_))
+        || expressions.len() != original_schema.fields().len()
+    {
+        return expressions;
+    }
+
+    expressions
+        .into_iter()
+        .enumerate()
+        .map(|(index, expression)| {
+            let (qualifier, field) = original_schema.qualified_field(index);
+            if expression.schema_name().to_string() == field.name().as_str() {
+                expression
+            } else {
+                expression.alias_qualified_with_metadata(
+                    qualifier.cloned(),
+                    field.name(),
+                    Some(FieldMetadata::new_from_field(field)),
+                )
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 struct CellFlagFieldOrigin {
     dataset: Arc<Dataset>,
@@ -405,57 +437,68 @@ impl BindCellFlags {
         column: &Column,
         nested_segments: &[String],
     ) -> datafusion::common::Result<Option<CellFlagFieldOrigin>> {
-        let index = plan.schema().index_of_column(column)?;
-        match plan {
-            LogicalPlan::TableScan(scan) => {
-                let source = source_as_provider(&scan.source)?;
-                let Some(provider) = source.downcast_ref::<LanceTableProvider>() else {
-                    return Ok(None);
-                };
-                let field_name = plan.schema().qualified_field(index).1.name();
-                let mut field = provider
-                    .dataset
-                    .schema()
-                    .fields
+        if let LogicalPlan::TableScan(scan) = plan {
+            if column
+                .relation
+                .as_ref()
+                .is_some_and(|relation| !relation.resolved_eq(&scan.table_name))
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "cell_flag field '{}' does not belong to table '{}'",
+                    column, scan.table_name
+                )));
+            }
+            let source = source_as_provider(&scan.source)?;
+            let Some(provider) = source.downcast_ref::<LanceTableProvider>() else {
+                return Ok(None);
+            };
+            let field_name = &column.name;
+            let mut field = provider
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.name == *field_name)
+                .or_else(|| {
+                    provider
+                        .dataset
+                        .schema()
+                        .fields
+                        .iter()
+                        .find(|field| field.name.eq_ignore_ascii_case(field_name))
+                })
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "cell_flag cannot trace field '{}' to the Lance dataset schema",
+                        field_name
+                    ))
+                })?;
+            for segment in nested_segments {
+                field = field
+                    .children
                     .iter()
-                    .find(|field| field.name == *field_name)
+                    .find(|child| child.name == *segment)
                     .or_else(|| {
-                        provider
-                            .dataset
-                            .schema()
-                            .fields
+                        field
+                            .children
                             .iter()
-                            .find(|field| field.name.eq_ignore_ascii_case(field_name))
+                            .find(|child| child.name.eq_ignore_ascii_case(segment))
                     })
                     .ok_or_else(|| {
                         DataFusionError::Plan(format!(
-                            "cell_flag cannot trace field '{}' to the Lance dataset schema",
-                            field_name
+                            "cell_flag cannot trace nested field '{}' through the Lance dataset schema",
+                            segment
                         ))
                     })?;
-                for segment in nested_segments {
-                    field = field
-                        .children
-                        .iter()
-                        .find(|child| child.name == *segment)
-                        .or_else(|| {
-                            field
-                                .children
-                                .iter()
-                                .find(|child| child.name.eq_ignore_ascii_case(segment))
-                        })
-                        .ok_or_else(|| {
-                            DataFusionError::Plan(format!(
-                                "cell_flag cannot trace nested field '{}' through the Lance dataset schema",
-                                segment
-                            ))
-                        })?;
-                }
-                Ok(Some(CellFlagFieldOrigin {
-                    dataset: provider.dataset.clone(),
-                    field_id: field.id,
-                }))
             }
+            return Ok(Some(CellFlagFieldOrigin {
+                dataset: provider.dataset.clone(),
+                field_id: field.id,
+            }));
+        }
+
+        let index = plan.schema().index_of_column(column)?;
+        match plan {
             LogicalPlan::Projection(projection) => {
                 let (input_column, mut projected_segments) =
                     direct_field_reference(&projection.expr[index])?;
@@ -519,6 +562,10 @@ impl BindCellFlags {
             }
             LogicalPlan::Extension(_) => Err(DataFusionError::Plan(
                 "cell_flag cannot trace a field through an extension logical plan".to_string(),
+            )),
+            LogicalPlan::TableScan(_) => Err(DataFusionError::Internal(
+                "cell_flag TableScan lineage was not handled before projected-schema lookup"
+                    .to_string(),
             )),
             _ => {
                 let inputs = plan.inputs();
@@ -706,11 +753,13 @@ impl BindCellFlags {
         functions: &HashMap<u32, Arc<datafusion::logical_expr::ScalarUDF>>,
     ) -> datafusion::common::Result<LogicalPlan> {
         let original_schema = plan.schema().as_ref().clone();
-        let mut expressions = plan
+        let expressions = plan
             .expressions()
             .into_iter()
             .map(|expression| self.rewrite_expression(expression, &provider.dataset, functions))
             .collect::<datafusion::common::Result<Vec<_>>>()?;
+        let mut expressions =
+            preserve_output_expression_names(&plan, expressions, &original_schema);
         let own_requires = expressions
             .iter()
             .map(expression_contains_bound_cell_flag)
@@ -964,9 +1013,9 @@ mod tests {
         datatypes::{Int32Type, Int64Type},
     };
     use datafusion::{
-        datasource::{MemTable, TableProvider},
+        datasource::{MemTable, TableProvider, provider_as_source},
         functions_aggregate::count::count,
-        logical_expr::JoinType,
+        logical_expr::{JoinType, LogicalPlanBuilder},
         prelude::{SessionContext, col},
     };
     use lance_core::utils::tempfile::TempStrDir;
@@ -1255,6 +1304,95 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(sql_ids, vec![1, 4, 7]);
+
+        let sql_aggregate = manual_context
+            .sql(
+                "SELECT cell_flag(embedding, 'computed') AS flag_value, COUNT(*) AS rows \
+                 FROM items GROUP BY cell_flag(embedding, 'computed')",
+            )
+            .await
+            .unwrap();
+        let sql_aggregate = sql_aggregate.collect().await.unwrap();
+        let mut sql_groups = sql_aggregate
+            .iter()
+            .flat_map(|batch| {
+                let flag_value = batch
+                    .column_by_name("flag_value")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap();
+                let rows = batch
+                    .column_by_name("rows")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..batch.num_rows()).map(|index| (flag_value.value(index), rows.value(index)))
+            })
+            .collect::<Vec<_>>();
+        sql_groups.sort_unstable();
+        assert_eq!(sql_groups, vec![(false, 5), (true, 3)]);
+
+        let sql_distinct = manual_context
+            .sql("SELECT DISTINCT cell_flag(embedding, 'computed') AS flag_value FROM items")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut distinct_values = sql_distinct
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("flag_value")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .values()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        distinct_values.sort_unstable();
+        assert_eq!(distinct_values, vec![false, true]);
+
+        let projected_filter_plan = LogicalPlanBuilder::scan_with_filters(
+            "projected_items",
+            provider_as_source(Arc::new(LanceTableProvider::new(
+                dataset.clone(),
+                false,
+                false,
+            ))),
+            Some(vec![0]),
+            vec![cell_flag(col("embedding"), "computed")],
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let projected_filter = manual_context
+            .execute_logical_plan(projected_filter_plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut projected_filter_ids = projected_filter
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        projected_filter_ids.sort_unstable();
+        assert_eq!(projected_filter_ids, vec![1, 4, 7]);
 
         let self_join = manual_context
             .sql(
