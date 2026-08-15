@@ -54,7 +54,12 @@ pub async fn filtered_read_exec_to_proto(
     let options = fr_options_to_proto(exec.options(), exec.dataset(), &filter_schema, state)?;
 
     let plan = match exec.plan() {
-        Some(plan) => Some(plan_to_proto(&plan, exec.dataset(), &filter_schema, state)?),
+        Some(plan) => Some(plan_to_proto_with_dataset(
+            &plan,
+            exec.dataset(),
+            &filter_schema,
+            state,
+        )?),
         None => None,
     };
 
@@ -253,7 +258,24 @@ async fn fr_options_from_proto(
 /// We detect sharing via `Arc::as_ptr()` and encode each unique expression only once.
 pub fn plan_to_proto(
     plan: &FilteredReadPlan,
+    filter_schema: &Arc<ArrowSchema>,
+    state: &SessionState,
+) -> Result<pb::FilteredReadPlanProto> {
+    plan_to_proto_impl(plan, None, filter_schema, state)
+}
+
+fn plan_to_proto_with_dataset(
+    plan: &FilteredReadPlan,
     dataset: &Dataset,
+    filter_schema: &Arc<ArrowSchema>,
+    state: &SessionState,
+) -> Result<pb::FilteredReadPlanProto> {
+    plan_to_proto_impl(plan, Some(dataset), filter_schema, state)
+}
+
+fn plan_to_proto_impl(
+    plan: &FilteredReadPlan,
+    dataset: Option<&Dataset>,
     filter_schema: &Arc<ArrowSchema>,
     state: &SessionState,
 ) -> Result<pb::FilteredReadPlanProto> {
@@ -271,10 +293,14 @@ pub fn plan_to_proto(
             Some(&id) => id,
             None => {
                 let id = filter_expressions.len() as u32;
-                let expression = crate::dataset::cell_flag::unbind_cell_flag_expression(
-                    dataset,
-                    expr.as_ref().clone(),
-                )?;
+                let expression = if let Some(dataset) = dataset {
+                    crate::dataset::cell_flag::unbind_cell_flag_expression(
+                        dataset,
+                        expr.as_ref().clone(),
+                    )?
+                } else {
+                    expr.as_ref().clone()
+                };
                 let encoded = encode_substrait(expression, filter_schema.clone(), state)?;
                 filter_expressions.push(encoded);
                 ptr_to_id.insert(ptr, id);
@@ -889,7 +915,7 @@ mod tests {
         };
 
         let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
-        let proto = plan_to_proto(&plan, &dataset, &filter_schema, &state).unwrap();
+        let proto = plan_to_proto(&plan, &filter_schema, &state).unwrap();
 
         // Verify dedup: 2 fragments but only 1 unique expression
         assert_eq!(proto.fragment_filter_ids.len(), 2);
