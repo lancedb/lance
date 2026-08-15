@@ -21,13 +21,17 @@ use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
+use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
+use lance_index::mem_wal::CompactedSsTable;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
+use lance_select::RowAddrTreeMap;
+use lance_table::format::pb;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
@@ -36,6 +40,20 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
+
+impl IntoJava for &CompactedSsTable {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let shard_id = env.new_string(self.shard_id.to_string())?;
+        Ok(env.new_object(
+            "org/lance/memwal/CompactedSsTable",
+            "(Ljava/lang/String;J)V",
+            &[
+                JValue::Object(&shard_id),
+                JValue::Long(self.generation as i64),
+            ],
+        )?)
+    }
+}
 
 impl IntoJava for &RewriteGroup {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -430,10 +448,10 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified,
-            compacted_sstables: _,
+            compacted_sstables,
             fields_for_preserving_frag_bitmap,
             update_mode,
-            inserted_rows_filter: _,
+            inserted_rows_filter,
             updated_fragment_offsets,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
@@ -458,6 +476,20 @@ fn convert_to_java_operation_inner<'local>(
                     &[JValue::Object(&update_mode)],
                 )?
                 .l()?;
+            let compacted_sstables_obj = export_vec(env, &compacted_sstables)?;
+            let inserted_rows_filter_obj = match inserted_rows_filter {
+                Some(ref filter) => {
+                    let pb_filter = pb::transaction::KeyExistenceFilter::from(filter);
+                    let bytes = pb_filter.encode_to_vec();
+                    let bytes_i8: &[i8] = unsafe {
+                        std::slice::from_raw_parts(bytes.as_ptr() as *const i8, bytes.len())
+                    };
+                    let java_arr = env.new_byte_array(bytes_i8.len() as i32)?;
+                    env.set_byte_array_region(&java_arr, 0, bytes_i8)?;
+                    JObject::from(java_arr)
+                }
+                None => JObject::null(),
+            };
             // Serialize updated_fragment_offsets to Java Map<Long, byte[]>.
             // Values are portable RoaringBitmap bytes so the JNI boundary stays O(bitmap size)
             // rather than O(n rows). Empty HashMap when None so the Java constructor always
@@ -499,7 +531,7 @@ fn convert_to_java_operation_inner<'local>(
             };
             Ok(env.new_object(
                 "org/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;)V",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;Ljava/util/List;[B)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
@@ -508,6 +540,8 @@ fn convert_to_java_operation_inner<'local>(
                     JValueGen::Object(&fields_for_preserving_frag_bitmap),
                     JValue::Object(&update_mode_optional),
                     JValue::Object(&java_offsets_map),
+                    JValue::Object(&compacted_sstables_obj),
+                    JValue::Object(&inserted_rows_filter_obj),
                 ],
             )?)
         }
@@ -708,6 +742,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     table_id_obj: JObject,
     namespace_client_managed_versioning: jboolean,
     commit_timeout_nanos: jlong,
+    affected_rows_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -726,6 +761,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             table_id_obj,
             namespace_client_managed_versioning != 0,
             commit_timeout_nanos,
+            affected_rows_obj,
         )
     )
 }
@@ -746,8 +782,21 @@ fn inner_commit_to_dataset<'local>(
     table_id_obj: JObject,
     namespace_client_managed_versioning: bool,
     commit_timeout_nanos: jlong,
+    affected_rows_obj: JObject,
 ) -> Result<JObject<'local>> {
     let commit_timeout = parse_commit_timeout(commit_timeout_nanos);
+    let affected_rows = if affected_rows_obj.is_null() {
+        None
+    } else {
+        let buf: Vec<u8> = env.convert_byte_array(JByteArray::from(affected_rows_obj))?;
+        if buf.is_empty() {
+            None
+        } else {
+            Some(RowAddrTreeMap::deserialize_from(buf.as_slice()).map_err(|e| {
+                Error::input_error(format!("invalid affectedRows bytes: {e}"))
+            })?)
+        }
+    };
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
     } else {
@@ -872,6 +921,7 @@ fn inner_commit_to_dataset<'local>(
             skip_auto_cleanup,
             commit_handler,
             commit_timeout,
+            affected_rows,
         )?
     };
     new_blocking_ds.into_java(env)
@@ -1361,15 +1411,50 @@ fn convert_to_rust_operation(
                 }
             };
 
+            let compacted_sstables = import_vec_from_method(
+                env,
+                java_operation,
+                "compactedSstables",
+                |env, obj| {
+                    let shard_id: JString = env
+                        .call_method(&obj, "shardId", "()Ljava/lang/String;", &[])?
+                        .l()?
+                        .into();
+                    let shard_id = shard_id.extract(env)?;
+                    let generation = env.call_method(&obj, "generation", "()J", &[])?.j()? as u64;
+                    let uuid = Uuid::parse_str(&shard_id)
+                        .map_err(|e| Error::input_error(format!("Invalid shard_id UUID: {}", e)))?;
+                    Ok(CompactedSsTable::new(uuid, generation))
+                },
+            )?;
+
+            let inserted_rows_filter: Option<KeyExistenceFilter> = {
+                let bytes_obj = env
+                    .call_method(java_operation, "insertedRowsFilter", "()[B", &[])?
+                    .l()?;
+                if bytes_obj.is_null() {
+                    None
+                } else {
+                    let buf: Vec<u8> = env.convert_byte_array(JByteArray::from(bytes_obj))?;
+                    if buf.is_empty() {
+                        None
+                    } else {
+                        let pb_filter = pb::transaction::KeyExistenceFilter::decode(buf.as_slice())
+                            .map_err(|e| Error::input_error(format!("invalid insertedRowsFilter bytes: {e}")))?;
+                        Some(KeyExistenceFilter::try_from(&pb_filter)?)
+                    }
+                }
+            };
+
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                compacted_sstables: vec![],
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
-                inserted_rows_filter: None,
+                inserted_rows_filter,
                 updated_fragment_offsets,
             }
         }
@@ -1533,6 +1618,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     skip_auto_cleanup: jboolean,
     namespace_client_managed_versioning: jboolean,
     commit_timeout_nanos: jlong,
+    affected_rows_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1552,6 +1638,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             skip_auto_cleanup != 0,
             namespace_client_managed_versioning != 0,
             commit_timeout_nanos,
+            affected_rows_obj,
         )
     )
 }
@@ -1573,8 +1660,21 @@ fn inner_commit_to_uri<'local>(
     skip_auto_cleanup: bool,
     namespace_client_managed_versioning: bool,
     commit_timeout_nanos: jlong,
+    affected_rows_obj: JObject,
 ) -> Result<JObject<'local>> {
     let commit_timeout = parse_commit_timeout(commit_timeout_nanos);
+    let affected_rows = if affected_rows_obj.is_null() {
+        None
+    } else {
+        let buf: Vec<u8> = env.convert_byte_array(JByteArray::from(affected_rows_obj))?;
+        if buf.is_empty() {
+            None
+        } else {
+            Some(RowAddrTreeMap::deserialize_from(buf.as_slice()).map_err(|e| {
+                Error::input_error(format!("invalid affectedRows bytes: {e}"))
+            })?)
+        }
+    };
     let uri_str: String = uri.extract(env)?;
 
     // Extract write params from parameter
@@ -1687,6 +1787,9 @@ fn inner_commit_to_uri<'local>(
     }
     if skip_auto_cleanup {
         builder = builder.with_skip_auto_cleanup(true);
+    }
+    if let Some(affected_rows) = affected_rows {
+        builder = builder.with_affected_rows(affected_rows);
     }
 
     // Set namespace commit handler only if namespace_client_managed_versioning is true

@@ -129,7 +129,13 @@ fn inner_merge_insert_uncommitted<'local>(
         block_on(async move { merge_insert_job.execute_uncommitted(source_stream).await })?
     };
 
-    UncommittedMergeResult(&jdataset, uncommitted.transaction, uncommitted.stats).into_java(env)
+    UncommittedMergeResult(
+        &jdataset,
+        uncommitted.transaction,
+        uncommitted.stats,
+        uncommitted.affected_rows,
+    )
+    .into_java(env)
 }
 
 fn extract_on<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<Vec<String>> {
@@ -311,7 +317,7 @@ const MERGE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/Dataset;Lorg/lance/merge/MergeInsertStats;)V";
 const UNCOMMITTED_MERGE_RESULT_CLASS: &str = "org/lance/merge/UncommittedMergeInsertResult";
 const UNCOMMITTED_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
-    "(Lorg/lance/Dataset;Lorg/lance/Transaction;Lorg/lance/merge/MergeInsertStats;)V";
+    "(Lorg/lance/Dataset;Lorg/lance/Transaction;Lorg/lance/merge/MergeInsertStats;[B)V";
 
 impl IntoJava for MergeStats {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -344,12 +350,32 @@ impl IntoJava for MergeResult {
     }
 }
 
-struct UncommittedMergeResult<'a>(&'a JObject<'a>, Transaction, MergeStats);
+struct UncommittedMergeResult<'a>(
+    &'a JObject<'a>,
+    Transaction,
+    MergeStats,
+    Option<lance_select::RowAddrTreeMap>,
+);
 
 impl IntoJava for UncommittedMergeResult<'_> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let jtransaction = convert_to_java_transaction(env, self.1)?;
         let jstats = self.2.into_java(env)?;
+        let jaffected_rows = match self.3 {
+            Some(tree_map) => {
+                let mut buf = Vec::new();
+                tree_map.serialize_into(&mut buf).map_err(|e| {
+                    Error::runtime_error(format!("failed to serialize affected_rows: {e}"))
+                })?;
+                let buf_i8: &[i8] = unsafe {
+                    std::slice::from_raw_parts(buf.as_ptr() as *const i8, buf.len())
+                };
+                let java_arr = env.new_byte_array(buf_i8.len() as i32)?;
+                env.set_byte_array_region(&java_arr, 0, buf_i8)?;
+                JObject::from(java_arr)
+            }
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             UNCOMMITTED_MERGE_RESULT_CLASS,
             UNCOMMITTED_MERGE_RESULT_CONSTRUCTOR_SIG,
@@ -357,6 +383,7 @@ impl IntoJava for UncommittedMergeResult<'_> {
                 JValueGen::Object(self.0),
                 JValueGen::Object(&jtransaction),
                 JValueGen::Object(&jstats),
+                JValueGen::Object(&jaffected_rows),
             ],
         )?)
     }

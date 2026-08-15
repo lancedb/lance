@@ -14,6 +14,7 @@
 package org.lance.operation;
 
 import org.lance.FragmentMetadata;
+import org.lance.memwal.CompactedSsTable;
 
 import com.google.common.base.MoreObjects;
 
@@ -41,6 +42,40 @@ public class Update implements Operation {
    */
   private final Map<Long, byte[]> updatedFragmentOffsets;
 
+  /** MemWAL SSTables to mark as compacted after this transaction. */
+  private final List<CompactedSsTable> compactedSstables;
+
+  /**
+   * Serialized protobuf bytes of {@code lance.table.transaction.KeyExistenceFilter} for detecting
+   * conflicts on inserted row keys during merge insert.
+   */
+  private final byte[] insertedRowsFilter;
+
+  private Update(
+      List<Long> removedFragmentIds,
+      List<FragmentMetadata> updatedFragments,
+      List<FragmentMetadata> newFragments,
+      long[] fieldsModified,
+      long[] fieldsForPreservingFragBitmap,
+      Optional<UpdateMode> updateMode,
+      Map<Long, byte[]> updatedFragmentOffsets,
+      List<CompactedSsTable> compactedSstables,
+      byte[] insertedRowsFilter) {
+    this.removedFragmentIds =
+        removedFragmentIds != null ? removedFragmentIds : Collections.emptyList();
+    this.updatedFragments = updatedFragments != null ? updatedFragments : Collections.emptyList();
+    this.newFragments = newFragments != null ? newFragments : Collections.emptyList();
+    this.fieldsModified = fieldsModified != null ? fieldsModified : new long[0];
+    this.fieldsForPreservingFragBitmap =
+        fieldsForPreservingFragBitmap != null ? fieldsForPreservingFragBitmap : new long[0];
+    this.updateMode = updateMode != null ? updateMode : Optional.empty();
+    this.updatedFragmentOffsets =
+        updatedFragmentOffsets != null ? updatedFragmentOffsets : Collections.emptyMap();
+    this.compactedSstables =
+        compactedSstables != null ? compactedSstables : Collections.emptyList();
+    this.insertedRowsFilter = insertedRowsFilter;
+  }
+
   private Update(
       List<Long> removedFragmentIds,
       List<FragmentMetadata> updatedFragments,
@@ -49,13 +84,16 @@ public class Update implements Operation {
       long[] fieldsForPreservingFragBitmap,
       Optional<UpdateMode> updateMode,
       Map<Long, byte[]> updatedFragmentOffsets) {
-    this.removedFragmentIds = removedFragmentIds;
-    this.updatedFragments = updatedFragments;
-    this.newFragments = newFragments;
-    this.fieldsModified = fieldsModified;
-    this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
-    this.updateMode = updateMode;
-    this.updatedFragmentOffsets = updatedFragmentOffsets;
+    this(
+        removedFragmentIds,
+        updatedFragments,
+        newFragments,
+        fieldsModified,
+        fieldsForPreservingFragBitmap,
+        updateMode,
+        updatedFragmentOffsets,
+        Collections.emptyList(),
+        null);
   }
 
   public static Builder builder() {
@@ -90,6 +128,22 @@ public class Update implements Operation {
     return updatedFragmentOffsets;
   }
 
+  public List<CompactedSsTable> compactedSstables() {
+    return compactedSstables;
+  }
+
+  public List<CompactedSsTable> getCompactedSstables() {
+    return compactedSstables;
+  }
+
+  public byte[] insertedRowsFilter() {
+    return insertedRowsFilter;
+  }
+
+  public byte[] getInsertedRowsFilter() {
+    return insertedRowsFilter;
+  }
+
   @Override
   public String name() {
     return "Update";
@@ -104,6 +158,8 @@ public class Update implements Operation {
         .add("fieldsForPreservingFragBitmap", fieldsForPreservingFragBitmap)
         .add("updateMode", updateMode)
         .add("updatedFragmentOffsets", updatedFragmentOffsets)
+        .add("compactedSstables", compactedSstables)
+        .add("hasInsertedRowsFilter", insertedRowsFilter != null)
         .toString();
   }
 
@@ -118,7 +174,9 @@ public class Update implements Operation {
         && Arrays.equals(fieldsModified, that.fieldsModified)
         && Arrays.equals(fieldsForPreservingFragBitmap, that.fieldsForPreservingFragBitmap)
         && Objects.equals(updateMode, that.updateMode)
-        && offsetMapsEqual(updatedFragmentOffsets, that.updatedFragmentOffsets);
+        && offsetMapsEqual(updatedFragmentOffsets, that.updatedFragmentOffsets)
+        && Objects.equals(compactedSstables, that.compactedSstables)
+        && Arrays.equals(insertedRowsFilter, that.insertedRowsFilter);
   }
 
   /** Deep-equality for {@code Map<Long, byte[]>}: keys by value, arrays by content. */
@@ -133,9 +191,12 @@ public class Update implements Operation {
 
   @Override
   public int hashCode() {
-    int h = Objects.hash(removedFragmentIds, updatedFragments, newFragments, updateMode);
+    int h =
+        Objects.hash(
+            removedFragmentIds, updatedFragments, newFragments, updateMode, compactedSstables);
     h = 31 * h + Arrays.hashCode(fieldsModified);
     h = 31 * h + Arrays.hashCode(fieldsForPreservingFragBitmap);
+    h = 31 * h + Arrays.hashCode(insertedRowsFilter);
     // Sum entry hashes (XOR key ^ array-content hash) so result is insertion-order-independent.
     int mapHash = 0;
     for (Map.Entry<Long, byte[]> entry : updatedFragmentOffsets.entrySet()) {
@@ -158,6 +219,8 @@ public class Update implements Operation {
     private long[] fieldsForPreservingFragBitmap = new long[0];
     private Optional<UpdateMode> updateMode = Optional.empty();
     private Map<Long, byte[]> updatedFragmentOffsets = Collections.emptyMap();
+    private List<CompactedSsTable> compactedSstables = Collections.emptyList();
+    private byte[] insertedRowsFilter = null;
 
     private Builder() {}
 
@@ -205,6 +268,16 @@ public class Update implements Operation {
       return this;
     }
 
+    public Builder compactedSstables(List<CompactedSsTable> compactedSstables) {
+      this.compactedSstables = compactedSstables;
+      return this;
+    }
+
+    public Builder insertedRowsFilter(byte[] insertedRowsFilter) {
+      this.insertedRowsFilter = insertedRowsFilter;
+      return this;
+    }
+
     public Update build() {
       return new Update(
           removedFragmentIds,
@@ -213,7 +286,9 @@ public class Update implements Operation {
           fieldsModified,
           fieldsForPreservingFragBitmap,
           updateMode,
-          updatedFragmentOffsets);
+          updatedFragmentOffsets,
+          compactedSstables,
+          insertedRowsFilter);
     }
   }
 }

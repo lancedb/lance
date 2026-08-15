@@ -41,9 +41,36 @@ public class CompactedSsTable {
     return shardId;
   }
 
+  /** UUID string for the write shard. */
+  public String shardId() {
+    return shardId;
+  }
+
   /** The compacted SSTable's generation number. */
   public long getGeneration() {
     return generation;
+  }
+
+  /** The compacted SSTable's generation number. */
+  public long generation() {
+    return generation;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    CompactedSsTable that = (CompactedSsTable) o;
+    return generation == that.generation && java.util.Objects.equals(shardId, that.shardId);
+  }
+
+  @Override
+  public int hashCode() {
+    return java.util.Objects.hash(shardId, generation);
   }
 
   @Override

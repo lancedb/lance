@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.merge.UncommittedMergeInsertResult;
 import org.lance.namespace.LanceNamespace;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -76,6 +77,7 @@ public class CommitBuilder {
   private boolean skipAutoCleanup = false;
   // -1 disables the timeout; any positive value is the timeout in nanoseconds.
   private long commitTimeoutNanos = Duration.ofMinutes(30).toNanos();
+  private byte[] affectedRows;
 
   /**
    * Create a commit builder for committing against an existing dataset.
@@ -104,9 +106,9 @@ public class CommitBuilder {
   }
 
   /**
-   * Set write parameters (storage options) for the commit.
+   * Set write parameters for object storage configuration.
    *
-   * @param writeParams the write parameters
+   * @param writeParams map of storage option key-value pairs
    * @return this builder instance
    */
   public CommitBuilder writeParams(Map<String, String> writeParams) {
@@ -115,9 +117,20 @@ public class CommitBuilder {
   }
 
   /**
-   * Set the namespace client for managed versioning. When set, commits are routed through the
-   * namespace client's {@code createTableVersion} API instead of writing directly to the object
-   * store. This is supported for both dataset-based and URI-based commits.
+   * Set the namespace client and table ID for managed versioning.
+   *
+   * @param namespaceClient the namespace client
+   * @param tableId the table ID parts
+   * @return this builder instance
+   */
+  public CommitBuilder namespace(LanceNamespace namespaceClient, List<String> tableId) {
+    this.namespaceClient = namespaceClient;
+    this.tableId = tableId;
+    return this;
+  }
+
+  /**
+   * Set the namespace client for managed versioning.
    *
    * @param namespaceClient the LanceNamespace client instance
    * @return this builder instance
@@ -130,8 +143,6 @@ public class CommitBuilder {
   /**
    * Set the table ID for namespace client-based commit handling.
    *
-   * <p>Must be provided together with `namespaceClient`.
-   *
    * @param tableId the table identifier (e.g., ["workspace", "table_name"])
    * @return this builder instance
    */
@@ -141,28 +152,20 @@ public class CommitBuilder {
   }
 
   /**
-   * Set whether namespace manages versioning.
+   * Enable or disable namespace-managed versioning.
    *
-   * <p>When true and namespaceClient/tableId are set, commits are routed through the namespace
-   * client's create_table_version API. This is typically set based on the managed_versioning field
-   * from describe_table or declare_table responses.
-   *
-   * @param namespaceClientManagedVersioning whether namespace manages versioning
+   * @param managed whether the namespace manages versioning
    * @return this builder instance
    */
-  public CommitBuilder namespaceClientManagedVersioning(boolean namespaceClientManagedVersioning) {
-    this.namespaceClientManagedVersioning = namespaceClientManagedVersioning;
+  public CommitBuilder namespaceClientManagedVersioning(boolean managed) {
+    this.namespaceClientManagedVersioning = managed;
     return this;
   }
 
   /**
-   * Enable or disable v2 manifest paths for new datasets.
+   * Enable or disable V2 manifest paths.
    *
-   * <p>Defaults to true. V2 manifest paths allow constant-time lookups for the latest manifest on
-   * object storage. Warning: enabling this makes the dataset unreadable for Lance versions prior to
-   * 0.17.0.
-   *
-   * @param enable whether to enable v2 manifest paths
+   * @param enable whether to enable V2 manifest paths
    * @return this builder instance
    */
   public CommitBuilder enableV2ManifestPaths(boolean enable) {
@@ -171,9 +174,9 @@ public class CommitBuilder {
   }
 
   /**
-   * Set whether the commit should be detached from the main dataset lineage.
+   * Set detached mode for the commit.
    *
-   * @param detached if true, the commit will not be part of the main dataset lineage
+   * @param detached whether the commit is detached
    * @return this builder instance
    */
   public CommitBuilder detached(boolean detached) {
@@ -182,13 +185,9 @@ public class CommitBuilder {
   }
 
   /**
-   * Whether to use stable row ids. This makes the {@code _rowid} column stable after compaction,
-   * but not updates.
+   * Enable or disable stable row IDs.
    *
-   * <p>This is only used for new datasets. Existing datasets will use their existing setting.
-   * Default is false.
-   *
-   * @param useStableRowIds whether to use stable row ids
+   * @param useStableRowIds whether to use stable row IDs
    * @return this builder instance
    */
   public CommitBuilder useStableRowIds(boolean useStableRowIds) {
@@ -197,19 +196,20 @@ public class CommitBuilder {
   }
 
   /**
-   * Set the storage format to use for the dataset.
+   * Enable or disable stable row IDs.
    *
-   * <p>This is only needed when creating a new empty table. If any data files are passed, the
-   * storage format will be inferred from the data files. Valid values are the numeric versions
-   * ("0.1", "2.0", "2.1", "2.2", "2.3") and the release selectors ("legacy", "stable", "next"),
-   * matching {@link WriteParams.Builder#withDataStorageVersion(String)}. Parsing is
-   * case-insensitive.
+   * @param useStableRowIds whether to use stable row IDs, or null for default
+   * @return this builder instance
+   */
+  public CommitBuilder useStableRowIds(Boolean useStableRowIds) {
+    this.useStableRowIds = useStableRowIds;
+    return this;
+  }
+
+  /**
+   * Set the storage format version.
    *
-   * <p>The {@code v}-prefixed spellings ("v2_0", "v2.0", "v2_1", "v2.1", "v2_2", "v2.2") are
-   * deprecated. They were accepted only by this method, never by the rest of Lance, and will be
-   * removed in a future release — use the numeric version instead ("v2_1" becomes "2.1").
-   *
-   * @param storageFormat the storage format name
+   * @param storageFormat format version string (e.g., "0.1", "0.2", "2.0", "legacy", "stable")
    * @return this builder instance
    */
   public CommitBuilder storageFormat(String storageFormat) {
@@ -218,12 +218,9 @@ public class CommitBuilder {
   }
 
   /**
-   * Set the maximum number of retries for commit operations.
+   * Set the maximum number of retries for transaction conflict resolution.
    *
-   * <p>If a commit operation fails, it will be retried up to {@code maxRetries} times. Default is
-   * 0.
-   *
-   * @param maxRetries the maximum number of retries
+   * @param maxRetries the maximum retry count
    * @return this builder instance
    */
   public CommitBuilder maxRetries(int maxRetries) {
@@ -232,11 +229,9 @@ public class CommitBuilder {
   }
 
   /**
-   * Set whether to skip automatic cleanup after commit.
+   * Set whether to skip automatic cleanup of unreferenced files after commit.
    *
-   * <p>Default is false.
-   *
-   * @param skipAutoCleanup if true, skip automatic cleanup
+   * @param skipAutoCleanup true to skip cleanup, false to run cleanup (default)
    * @return this builder instance
    */
   public CommitBuilder skipAutoCleanup(boolean skipAutoCleanup) {
@@ -268,6 +263,35 @@ public class CommitBuilder {
   }
 
   /**
+   * Set the serialized affected row addresses for fast conflict resolution.
+   *
+   * @param affectedRows the serialized RowAddrTreeMap bytes
+   * @return this builder instance
+   */
+  public CommitBuilder withAffectedRows(byte[] affectedRows) {
+    this.affectedRows = affectedRows;
+    return this;
+  }
+
+  public byte[] getAffectedRows() {
+    return affectedRows;
+  }
+
+  /**
+   * Execute the commit with the given uncommitted merge insert result.
+   *
+   * @param uncommitted the uncommitted result containing transaction and metadata
+   * @return a new Dataset at the committed version
+   */
+  public Dataset execute(UncommittedMergeInsertResult uncommitted) {
+    Preconditions.checkNotNull(uncommitted, "Uncommitted result must not be null");
+    if (uncommitted.affectedRows() != null && this.affectedRows == null) {
+      this.affectedRows = uncommitted.affectedRows();
+    }
+    return execute(uncommitted.transaction());
+  }
+
+  /**
    * Execute the commit with the given transaction.
    *
    * <p>The caller is responsible for closing the transaction (via try-with-resources or {@link
@@ -293,7 +317,8 @@ public class CommitBuilder {
               namespaceClient,
               tableId,
               namespaceClientManagedVersioning,
-              commitTimeoutNanos);
+              commitTimeoutNanos,
+              affectedRows);
       result.setAllocator(dataset.allocator());
       return result;
     }
@@ -313,7 +338,8 @@ public class CommitBuilder {
               maxRetries,
               skipAutoCleanup,
               namespaceClientManagedVersioning,
-              commitTimeoutNanos);
+              commitTimeoutNanos,
+              affectedRows);
       result.setAllocator(allocator);
       return result;
     }
@@ -333,7 +359,8 @@ public class CommitBuilder {
       Object namespace,
       Object tableId,
       boolean namespaceClientManagedVersioning,
-      long commitTimeoutNanos);
+      long commitTimeoutNanos,
+      byte[] affectedRows);
 
   private static native Dataset nativeCommitToUri(
       String uri,
@@ -349,5 +376,6 @@ public class CommitBuilder {
       int maxRetries,
       boolean skipAutoCleanup,
       boolean namespaceClientManagedVersioning,
-      long commitTimeoutNanos);
+      long commitTimeoutNanos,
+      byte[] affectedRows);
 }

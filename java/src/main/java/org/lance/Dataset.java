@@ -637,6 +637,40 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Commit an uncommitted merge insert result and return a new Dataset with the new version.
+   *
+   * @param uncommitted The uncommitted merge insert result
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(UncommittedMergeInsertResult uncommitted) {
+    return commitTransaction(uncommitted, false, true);
+  }
+
+  /**
+   * Commit an uncommitted merge insert result and return a new Dataset with the new version.
+   *
+   * @param uncommitted The uncommitted merge insert result
+   * @param detached If true, the commit will not be part of the main dataset lineage.
+   * @param enableV2ManifestPaths If true, uses V2 manifest paths.
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(
+      UncommittedMergeInsertResult uncommitted, boolean detached, boolean enableV2ManifestPaths) {
+    Preconditions.checkNotNull(uncommitted, "uncommitted must not be null");
+    Dataset dataset =
+        new CommitBuilder(this)
+            .detached(detached)
+            .enableV2ManifestPaths(enableV2ManifestPaths)
+            .execute(uncommitted);
+    if (selfManagedAllocator) {
+      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      dataset.allocator = allocator;
+    }
+    return dataset;
+  }
+
+  /**
    * Commit a single transaction and return a new Dataset with the new version. Original dataset
    * version will not be refreshed.
    *

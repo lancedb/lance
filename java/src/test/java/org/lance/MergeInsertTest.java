@@ -13,9 +13,12 @@
  */
 package org.lance;
 
+import org.lance.memwal.CompactedSsTable;
+import org.lance.memwal.InitializeMemWalParams;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 import org.lance.merge.UncommittedMergeInsertResult;
+import org.lance.operation.Update;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -26,6 +29,9 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -389,6 +395,134 @@ public class MergeInsertTest {
         }
       }
     }
+  }
+
+  @Test
+  public void testMergeInsertUncommitted_PrimaryKeyConflict() throws Exception {
+    Map<String, String> pkMeta =
+        Collections.singletonMap("lance-schema:unenforced-primary-key", "true");
+    Schema pkSchema =
+        new Schema(
+            Arrays.asList(
+                new Field(
+                    "id", new FieldType(false, new ArrowType.Int(32, true), null, pkMeta), null),
+                Field.nullable("name", new ArrowType.Utf8())));
+
+    String pkDatasetPath = tempDir.resolve("pk_conflict_" + UUID.randomUUID()).toString();
+    try (VectorSchemaRoot baseRoot =
+            buildSourceWithIds(pkSchema, allocator, Arrays.asList(1, 2, 3));
+        ArrowArrayStream baseStream = convertToStream(baseRoot, allocator);
+        Dataset pkDataset =
+            Dataset.write().allocator(allocator).stream(baseStream).uri(pkDatasetPath).execute()) {
+
+      // Prepare two concurrent uncommitted merge_insert operations inserting id=100
+      try (VectorSchemaRoot root1 =
+              buildSourceWithIds(pkSchema, allocator, Collections.singletonList(100));
+          ArrowArrayStream stream1 = convertToStream(root1, allocator);
+          VectorSchemaRoot root2 =
+              buildSourceWithIds(pkSchema, allocator, Collections.singletonList(100));
+          ArrowArrayStream stream2 = convertToStream(root2, allocator)) {
+
+        MergeInsertParams params =
+            new MergeInsertParams(Collections.singletonList("id"))
+                .withMatchedUpdateAll()
+                .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll);
+
+        try (UncommittedMergeInsertResult uncommitted1 =
+                pkDataset.mergeInsertUncommitted(params, stream1);
+            UncommittedMergeInsertResult uncommitted2 =
+                pkDataset.mergeInsertUncommitted(params, stream2)) {
+
+          // Verify insertedRowsFilter is populated on the Update operation
+          Assertions.assertInstanceOf(Update.class, uncommitted1.transaction().operation());
+          Update update1 = (Update) uncommitted1.transaction().operation();
+          Assertions.assertNotNull(update1.insertedRowsFilter());
+          Assertions.assertTrue(update1.insertedRowsFilter().length > 0);
+
+          // Commit transaction 1 successfully
+          try (Dataset committed1 = new CommitBuilder(pkDataset).execute(uncommitted1)) {
+            Assertions.assertEquals(4, committed1.countRows());
+            Assertions.assertEquals(1, committed1.countRows("id = 100"));
+
+            // Attempting to commit transaction 2 should either fail due to PK conflict
+            // or resolve without duplicating id=100 in the dataset
+            try (Dataset committed2 = new CommitBuilder(committed1).execute(uncommitted2)) {
+              Assertions.assertEquals(1, committed2.countRows("id = 100"));
+            } catch (Exception e) {
+              Assertions.assertTrue(
+                  e.getMessage().toLowerCase().contains("conflict")
+                      || e.getMessage().toLowerCase().contains("transaction")
+                      || e.getMessage().toLowerCase().contains("primary key"));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInsertUncommitted_MemWalCompactedSstablesPreserved() throws Exception {
+    String shardId = UUID.randomUUID().toString();
+    Map<String, String> pkMeta =
+        Collections.singletonMap("lance-schema:unenforced-primary-key", "true");
+    Schema pkSchema =
+        new Schema(
+            Arrays.asList(
+                new Field(
+                    "id", new FieldType(false, new ArrowType.Int(32, true), null, pkMeta), null),
+                Field.nullable("name", new ArrowType.Utf8())));
+
+    String memwalPath = tempDir.resolve("memwal_" + UUID.randomUUID()).toString();
+    try (VectorSchemaRoot baseRoot =
+            buildSourceWithIds(pkSchema, allocator, Arrays.asList(1, 2, 3));
+        ArrowArrayStream baseStream = convertToStream(baseRoot, allocator);
+        Dataset baseDataset =
+            Dataset.write().allocator(allocator).stream(baseStream).uri(memwalPath).execute()) {
+
+      baseDataset.initializeMemWal(new InitializeMemWalParams());
+
+      MergeInsertParams params =
+          new MergeInsertParams(Collections.singletonList("id"))
+              .withMatchedUpdateAll()
+              .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+              .markSstablesAsCompacted(Collections.singletonList(new CompactedSsTable(shardId, 1)));
+
+      try (VectorSchemaRoot root = buildSourceWithIds(pkSchema, allocator, Arrays.asList(2, 4));
+          ArrowArrayStream stream = convertToStream(root, allocator);
+          UncommittedMergeInsertResult uncommitted =
+              baseDataset.mergeInsertUncommitted(params, stream)) {
+
+        // Verify Update operation preserved compactedSstables and insertedRowsFilter
+        Assertions.assertInstanceOf(Update.class, uncommitted.transaction().operation());
+        Update update = (Update) uncommitted.transaction().operation();
+        Assertions.assertEquals(1, update.compactedSstables().size());
+        Assertions.assertEquals(shardId, update.compactedSstables().get(0).shardId());
+        Assertions.assertEquals(1L, update.compactedSstables().get(0).generation());
+        Assertions.assertNotNull(update.insertedRowsFilter());
+
+        try (Dataset committed = new CommitBuilder(baseDataset).execute(uncommitted)) {
+          Assertions.assertEquals(4, committed.countRows());
+        }
+      }
+    }
+  }
+
+  private VectorSchemaRoot buildSourceWithIds(
+      Schema schema, RootAllocator allocator, List<Integer> sourceIds) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    root.allocateNew();
+
+    IntVector idVector = (IntVector) root.getVector("id");
+    VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+    for (int i = 0; i < sourceIds.size(); i++) {
+      idVector.setSafe(i, sourceIds.get(i));
+      String name = "Source " + sourceIds.get(i);
+      nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
+    }
+
+    root.setRowCount(sourceIds.size());
+    return root;
   }
 
   private TreeMap<Integer, String> readAll(Dataset dataset) throws Exception {

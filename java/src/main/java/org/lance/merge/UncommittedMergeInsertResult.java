@@ -30,12 +30,19 @@ public class UncommittedMergeInsertResult implements AutoCloseable {
   private final Dataset dataset;
   private final Transaction transaction;
   private final MergeInsertStats stats;
+  private final byte[] affectedRows;
 
   public UncommittedMergeInsertResult(
-      Dataset dataset, Transaction transaction, MergeInsertStats stats) {
+      Dataset dataset, Transaction transaction, MergeInsertStats stats, byte[] affectedRows) {
     this.dataset = Preconditions.checkNotNull(dataset);
     this.transaction = Preconditions.checkNotNull(transaction);
     this.stats = Preconditions.checkNotNull(stats);
+    this.affectedRows = affectedRows;
+  }
+
+  public UncommittedMergeInsertResult(
+      Dataset dataset, Transaction transaction, MergeInsertStats stats) {
+    this(dataset, transaction, stats, null);
   }
 
   public Dataset dataset() {
@@ -62,6 +69,14 @@ public class UncommittedMergeInsertResult implements AutoCloseable {
     return stats;
   }
 
+  public byte[] affectedRows() {
+    return affectedRows;
+  }
+
+  public byte[] getAffectedRows() {
+    return affectedRows;
+  }
+
   @Override
   public void close() {
     transaction.close();
@@ -73,6 +88,7 @@ public class UncommittedMergeInsertResult implements AutoCloseable {
         .add("dataset", dataset)
         .add("transaction", transaction)
         .add("stats", stats)
+        .add("hasAffectedRows", affectedRows != null)
         .toString();
   }
 }

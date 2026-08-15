@@ -402,6 +402,7 @@ impl BlockingDataset {
         skip_auto_cleanup: bool,
         commit_handler: Option<Arc<dyn CommitHandler>>,
         commit_timeout: Option<std::time::Duration>,
+        affected_rows: Option<lance_select::RowAddrTreeMap>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
             .with_store_params(store_params)
@@ -422,6 +423,9 @@ impl BlockingDataset {
         }
         if let Some(handler) = commit_handler {
             builder = builder.with_commit_handler(handler);
+        }
+        if let Some(affected_rows) = affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
         }
         let new_dataset = block_on(builder.execute(transaction))?;
         Ok(BlockingDataset { inner: new_dataset })
