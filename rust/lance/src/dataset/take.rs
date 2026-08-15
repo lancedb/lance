@@ -161,7 +161,27 @@ async fn do_take_rows(
         .physical_projection
         .with_row_last_updated_at_version;
 
-    let row_addrs = builder.get_row_addrs().await?.clone();
+    let mut row_addrs = builder.get_row_addrs().await?.clone();
+    if builder.missing_row_policy == MissingRowPolicy::Error {
+        if let Some(address) = row_addrs.iter().find(|address| {
+            builder
+                .dataset
+                .get_fragment_metadata_by_id(RowAddress::from(**address).fragment_id())
+                .is_none()
+        }) {
+            return Err(Error::invalid_input(format!(
+                "Row address {} belongs to a fragment that is not part of this dataset version",
+                address
+            )));
+        }
+    } else {
+        row_addrs.retain(|address| {
+            builder
+                .dataset
+                .get_fragment_metadata_by_id(RowAddress::from(*address).fragment_id())
+                .is_some()
+        });
+    }
 
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
@@ -1086,19 +1106,26 @@ mod test {
         deleted_dataset.delete("i >= 0").await.unwrap();
         let deleted_projection =
             ProjectionRequest::from_sql([("i", "i"), ("reviewed", "cell_flag(s, 'reviewed')")]);
-        let deleted = deleted_dataset
-            .take_rows(&[1_u64 << 32, 0], deleted_projection)
-            .await
-            .unwrap();
-        assert_eq!(deleted.num_rows(), 0);
-        assert_eq!(
-            deleted
-                .schema()
-                .field_with_name("reviewed")
-                .unwrap()
-                .data_type(),
-            &DataType::Boolean
-        );
+        for row_ids in [
+            vec![0],
+            vec![0, 1],
+            vec![0, 1_u64 << 32],
+            vec![1_u64 << 32, 0],
+        ] {
+            let deleted = deleted_dataset
+                .take_rows(&row_ids, deleted_projection.clone())
+                .await
+                .unwrap();
+            assert_eq!(deleted.num_rows(), 0);
+            assert_eq!(
+                deleted
+                    .schema()
+                    .field_with_name("reviewed")
+                    .unwrap()
+                    .data_type(),
+                &DataType::Boolean
+            );
+        }
     }
 
     #[tokio::test]
