@@ -3,6 +3,7 @@
 
 import base64
 import contextlib
+import copy
 import importlib
 import os
 import pickle
@@ -6739,3 +6740,37 @@ def test_cell_flag_merge_and_merge_insert_actions(tmp_path: Path):
         fragment.metadata for fragment in dataset.get_fragments()
     ] == fragments_before
     assert [row for row, value in _flag_rows(dataset, field="value") if value] == [4]
+
+
+def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
+        tmp_path,
+    )
+    dataset.register_cell_flag("value", "reviewed")
+
+    transaction, stats = (
+        dataset.merge_insert(on="id")
+        .set_matched_cell_flag("value", "reviewed", True)
+        .execute_uncommitted(pa.table({"id": [1]}))
+    )
+    assert stats == {
+        "num_inserted_rows": 0,
+        "num_updated_rows": 1,
+        "num_deleted_rows": 0,
+    }
+    assert transaction.transaction_properties == {}
+    assert transaction._cell_flag_transaction is not None
+
+    tampered = copy.deepcopy(transaction)
+    payload, auth = tampered._cell_flag_transaction
+    tampered._cell_flag_transaction = (payload + "00", auth)
+    with pytest.raises(OSError, match="authentication failed"):
+        lance.LanceDataset.commit(dataset, tampered)
+
+    committed = lance.LanceDataset.commit(dataset, transaction)
+    assert _flag_rows(committed, field="value", name="reviewed") == [
+        (0, False),
+        (1, True),
+        (2, False),
+    ]

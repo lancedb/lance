@@ -1582,7 +1582,18 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.lance_schema
 
     def cell_flag_definitions(self) -> List[CellFlagDefinition]:
-        """Return field-scoped cell flags registered in this snapshot."""
+        """Return field-scoped cell flags registered in this snapshot.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"value": [1]}), "cell_flags")
+        >>> dataset.register_cell_flag("value", "reviewed")
+        {'flag_id': 0, 'field_id': 0, 'name': 'reviewed'}
+        >>> dataset.cell_flag_definitions()[0]["name"]
+        'reviewed'
+        """
         return self._ds.cell_flag_definitions()
 
     def register_cell_flag(
@@ -1611,11 +1622,39 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.register_cell_flag(field, name, initial_value)
 
     def rename_cell_flag(self, field: str, name: str, new_name: str) -> None:
-        """Rename a registered flag without changing its stable ID or state."""
+        """Rename a registered flag without changing its stable ID or state.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> import tempfile
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"value": [1]}), tempfile.mkdtemp()
+        ... )
+        >>> _ = dataset.register_cell_flag("value", "reviewed")
+        >>> dataset.rename_cell_flag("value", "reviewed", "verified")
+        >>> dataset.cell_flag_definitions()[0]["name"]
+        'verified'
+        """
         self._ds.rename_cell_flag(field, name, new_name)
 
     def drop_cell_flag(self, field: str, name: str) -> None:
-        """Drop a registered flag from the current snapshot."""
+        """Drop a registered flag from the current snapshot.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> import tempfile
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"value": [1]}), tempfile.mkdtemp()
+        ... )
+        >>> _ = dataset.register_cell_flag("value", "reviewed")
+        >>> dataset.drop_cell_flag("value", "reviewed")
+        >>> dataset.cell_flag_definitions()
+        []
+        """
         self._ds.drop_cell_flag(field, name)
 
     @property
@@ -2723,6 +2762,15 @@ class LanceDataset(pa.dataset.Dataset):
         0  1  a  d
         1  2  b  e
         2  3  c  f
+        >>> dataset.register_cell_flag("y", "reviewed")
+        {'flag_id': 0, 'field_id': 1, 'name': 'reviewed'}
+        >>> dataset.merge(
+        ...     pa.table({'x': [1], 'reviewer': ['alice']}),
+        ...     'x',
+        ...     cell_flags={'y': {'reviewed': True}},
+        ... )
+        >>> dataset.to_table(filter="cell_flag(y, 'reviewed')")["x"].to_pylist()
+        [1]
 
         See Also
         --------
@@ -5876,6 +5924,9 @@ class Transaction:
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
+    _cell_flag_transaction: Optional[Tuple[str, str]] = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
 
 
 class Tag(TypedDict):
@@ -7918,6 +7969,26 @@ def write_dataset(
     - Storage options provider will be created automatically for credential refresh
     - Initial storage options from describe_table() will be merged with
       any provided `storage_options`
+
+    Examples
+    --------
+    Set a registered flag explicitly for every newly appended row:
+
+    >>> import lance
+    >>> import pyarrow as pa
+    >>> dataset = lance.write_dataset(pa.table({"id": [1], "value": [10]}), "flags")
+    >>> dataset.register_cell_flag("value", "computed")
+    {'flag_id': 0, 'field_id': 1, 'name': 'computed'}
+    >>> dataset = lance.write_dataset(
+    ...     pa.table({"id": [2], "value": [20]}),
+    ...     dataset,
+    ...     mode="append",
+    ...     cell_flags={"value": {"computed": True}},
+    ... )
+    >>> dataset.to_table(
+    ...     columns={"computed": "cell_flag(value, 'computed')"}
+    ... )["computed"].to_pylist()
+    [False, True]
     """
     # Validate that user provides either uri OR (namespace_client + table_id), not both
     has_uri = uri is not None

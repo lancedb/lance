@@ -12,7 +12,6 @@
 
 use std::{borrow::Cow, ops::Deref};
 
-use bytes::Bytes;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
@@ -20,10 +19,11 @@ use lance_core::{
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DeletionFile, DeletionFileType, Manifest, RowIdMeta},
+    format::{CellFlagRoot, DeletionFile, DeletionFileType, Manifest, RowIdMeta},
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
+use roaring::RoaringBitmap;
 
 use crate::dataset::transaction::Transaction;
 
@@ -102,40 +102,102 @@ pub struct TransactionKey {
     pub version: u64,
 }
 
-/// Cache key for an immutable field-cell flag root or bitmap.
+/// Cache key for a validated immutable Cell Flag root in one snapshot.
 ///
 /// The cache is already namespaced by the destination dataset URI. The source
 /// URI is still part of the key because shallow clones may read immutable
 /// cell-flag objects from more than one external dataset base.
 #[derive(Debug)]
-pub struct CellFlagFileKey<'a> {
-    pub source_uri: &'a str,
-    pub path: &'a str,
+pub struct CellFlagRootKey {
+    pub version: u64,
+    pub source_uri: String,
+    pub path: String,
     pub size_bytes: u64,
+    pub inline_hash: Option<[u8; 32]>,
 }
 
-impl CacheKey for CellFlagFileKey<'_> {
-    type ValueType = Bytes;
+impl CacheKey for CellFlagRootKey {
+    type ValueType = CellFlagRoot;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "cell_flag/{}/{}/{}",
-            self.source_uri, self.path, self.size_bytes
+            "cell_flag/root/{}/{}/{}/{}",
+            self.version, self.source_uri, self.path, self.size_bytes
         ))
     }
 
     fn type_name() -> &'static str {
-        "CellFlagBytes"
+        "CellFlagRoot"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.cell-flag-file-key", 1)
+        CacheKeySchema::new("lance.dataset.cell-flag-root-key", 1)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_str(self.source_uri);
-        builder.write_str(self.path);
+        builder.write_u64(self.version);
+        builder.write_str(&self.source_uri);
+        builder.write_str(&self.path);
         builder.write_u64(self.size_bytes);
+        if let Some(inline_hash) = self.inline_hash {
+            builder.write_some();
+            builder.write_fixed_bytes(&inline_hash);
+        } else {
+            builder.write_none();
+        }
+    }
+}
+
+/// Cache key for a validated immutable partial Cell Flag bitmap.
+#[derive(Debug)]
+pub struct CellFlagBitmapKey {
+    pub version: u64,
+    pub source_uri: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub flag_id: u32,
+    pub fragment_id: u64,
+    pub physical_rows: u64,
+    pub inline_hash: Option<[u8; 32]>,
+}
+
+impl CacheKey for CellFlagBitmapKey {
+    type ValueType = RoaringBitmap;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "cell_flag/bitmap/{}/{}/{}/{}/{}/{}",
+            self.version,
+            self.source_uri,
+            self.path,
+            self.flag_id,
+            self.fragment_id,
+            self.size_bytes
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "CellFlagBitmap"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.cell-flag-bitmap-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_str(&self.source_uri);
+        builder.write_str(&self.path);
+        builder.write_u64(self.size_bytes);
+        builder.write_u32(self.flag_id);
+        builder.write_u64(self.fragment_id);
+        builder.write_u64(self.physical_rows);
+        if let Some(inline_hash) = self.inline_hash {
+            builder.write_some();
+            builder.write_fixed_bytes(&inline_hash);
+        } else {
+            builder.write_none();
+        }
     }
 }
 

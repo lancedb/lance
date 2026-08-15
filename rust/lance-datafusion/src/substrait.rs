@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::{execution::SessionState, logical_expr::Expr};
 
 use crate::aggregate::Aggregate;
@@ -35,6 +36,47 @@ use std::sync::Arc;
 /// ```
 pub const LANCE_FUNCTIONS_EXTENSION_URN: &str = "urn:lance:extension:functions";
 
+fn substrait_function_base_name(name: &str) -> &str {
+    name.split_once(':').map_or(name, |(base, _)| base)
+}
+
+fn is_reserved_cell_flag_name(name: &str) -> bool {
+    matches!(
+        substrait_function_base_name(name),
+        crate::udf::CELL_FLAG_NAME | crate::udf::CELL_FLAG_ID_NAME
+    )
+}
+
+fn expression_uses_lance_cell_flags(expr: &Expr) -> Result<bool> {
+    let mut found = false;
+    let mut error = None;
+    expr.apply(|node| {
+        let Expr::ScalarFunction(function) = node else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+        if !is_reserved_cell_flag_name(function.func.name()) {
+            return Ok(TreeNodeRecursion::Continue);
+        }
+        let is_lance = crate::udf::is_unbound_cell_flag_udf(function.func.as_ref())
+            || crate::udf::is_cell_flag_id_udf(function.func.as_ref())
+            || crate::udf::bound_cell_flag_flag_id(function.func.as_ref()).is_some();
+        if !is_lance {
+            error = Some(Error::invalid_input(format!(
+                "Scalar UDF name '{}' is reserved for Lance Cell Flags",
+                function.func.name()
+            )));
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        found = true;
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(Error::from)?;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(found)
+}
+
 fn validate_lance_function_extensions(
     extension_urns: &[datafusion_substrait::substrait::proto::extensions::SimpleExtensionUrn],
     extensions: &[datafusion_substrait::substrait::proto::extensions::SimpleExtensionDeclaration],
@@ -49,18 +91,14 @@ fn validate_lance_function_extensions(
         let Some(MappingType::ExtensionFunction(function)) = &extension.mapping_type else {
             continue;
         };
-        if function.name != crate::udf::CELL_FLAG_NAME
-            && function.name != crate::udf::CELL_FLAG_ID_NAME
-        {
+        if !is_reserved_cell_flag_name(&function.name) {
             continue;
         }
         let actual = urns.get(&function.extension_urn_reference).copied();
         if actual != Some(LANCE_FUNCTIONS_EXTENSION_URN) {
             return Err(Error::invalid_input(format!(
                 "Substrait function '{}' must reference Lance extension URN '{}', found {:?}",
-                crate::udf::CELL_FLAG_NAME,
-                LANCE_FUNCTIONS_EXTENSION_URN,
-                actual
+                function.name, LANCE_FUNCTIONS_EXTENSION_URN, actual
             )));
         }
     }
@@ -112,6 +150,7 @@ pub fn encode_substrait(
     use datafusion::logical_expr::ExprSchemable;
     use datafusion_common::DFSchema;
 
+    let has_lance_function = expression_uses_lance_cell_flags(&expr)?;
     let df_schema = Arc::new(DFSchema::try_from(schema)?);
     let output_type = expr.get_type(&df_schema)?;
     // Nullability doesn't matter
@@ -126,14 +165,6 @@ pub fn encode_substrait(
     use datafusion_substrait::substrait::proto::extensions::{
         SimpleExtensionUrn, simple_extension_declaration::MappingType,
     };
-    let has_lance_function = extended_expr.extensions.iter().any(|extension| {
-        matches!(
-            &extension.mapping_type,
-            Some(MappingType::ExtensionFunction(function))
-                if function.name == crate::udf::CELL_FLAG_NAME
-                    || function.name == crate::udf::CELL_FLAG_ID_NAME
-        )
-    });
     if has_lance_function {
         let anchor = extended_expr
             .extension_urns
@@ -148,8 +179,7 @@ pub fn encode_substrait(
         });
         for extension in &mut extended_expr.extensions {
             if let Some(MappingType::ExtensionFunction(function)) = &mut extension.mapping_type
-                && (function.name == crate::udf::CELL_FLAG_NAME
-                    || function.name == crate::udf::CELL_FLAG_ID_NAME)
+                && is_reserved_cell_flag_name(&function.name)
             {
                 function.extension_urn_reference = anchor;
             }
@@ -934,6 +964,47 @@ mod tests {
             .find(|extension| extension.urn == LANCE_FUNCTIONS_EXTENSION_URN)
             .unwrap();
         lance_urn.urn = "urn:example:not-lance".to_string();
+        for extension in &mut encoded.extensions {
+            if let Some(MappingType::ExtensionFunction(function)) = &mut extension.mapping_type
+                && function.name == crate::udf::CELL_FLAG_NAME
+            {
+                function.name.push_str(":any_any");
+            }
+        }
+
+        let error = parse_substrait(encoded.encode_to_vec().as_slice(), schema, &session_state())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must reference Lance extension URN")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_internal_cell_flag_compound_name_rejects_wrong_urn() {
+        let schema = Arc::new(Schema::empty());
+        let bytes = encode_substrait(
+            crate::udf::cell_flag_id(7),
+            schema.clone(),
+            &session_state(),
+        )
+        .unwrap();
+        let mut encoded = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        encoded
+            .extension_urns
+            .iter_mut()
+            .find(|extension| extension.urn == LANCE_FUNCTIONS_EXTENSION_URN)
+            .unwrap()
+            .urn = "urn:example:not-lance".to_string();
+        for extension in &mut encoded.extensions {
+            if let Some(MappingType::ExtensionFunction(function)) = &mut extension.mapping_type
+                && function.name == crate::udf::CELL_FLAG_ID_NAME
+            {
+                function.name.push_str(":u32");
+            }
+        }
 
         let error = parse_substrait(encoded.encode_to_vec().as_slice(), schema, &session_state())
             .await

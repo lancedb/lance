@@ -166,25 +166,81 @@ async fn resolve_row_ids(dataset: &Dataset, row_ids: Vec<u64>) -> Result<Vec<u64
         .collect()
 }
 
-async fn resolve_optional_row_ids(
+#[derive(Debug, Default)]
+struct OutputSourceRows {
+    row_ids: Vec<u64>,
+    inserted_positions: RoaringTreemap,
+}
+
+impl OutputSourceRows {
+    fn push(&mut self, source_row_id: Option<u64>) {
+        let position = self.row_ids.len() as u64;
+        match source_row_id {
+            Some(row_id) => self.row_ids.push(row_id),
+            None => {
+                self.row_ids.push(0);
+                self.inserted_positions.insert(position);
+            }
+        }
+    }
+
+    fn append(&mut self, other: Self) {
+        let offset = self.row_ids.len() as u64;
+        self.row_ids.extend(other.row_ids);
+        self.inserted_positions.extend(
+            other
+                .inserted_positions
+                .into_iter()
+                .map(|position| position + offset),
+        );
+    }
+
+    fn extend_matched(&mut self, row_ids: &[u64]) {
+        self.row_ids.extend_from_slice(row_ids);
+    }
+
+    fn extend_inserted(&mut self, count: usize) -> std::result::Result<(), DataFusionError> {
+        let start = u64::try_from(self.row_ids.len()).map_err(|_| {
+            DataFusionError::Execution("merge output row count does not fit in u64".to_string())
+        })?;
+        let end = start
+            .checked_add(u64::try_from(count).map_err(|_| {
+                DataFusionError::Execution(
+                    "merge inserted row count does not fit in u64".to_string(),
+                )
+            })?)
+            .ok_or_else(|| {
+                DataFusionError::Execution("merge output row count overflowed u64".to_string())
+            })?;
+        self.row_ids.resize(
+            usize::try_from(end).map_err(|_| {
+                DataFusionError::Execution(
+                    "merge output row count does not fit on this platform".to_string(),
+                )
+            })?,
+            0,
+        );
+        self.inserted_positions.insert_range(start..end);
+        Ok(())
+    }
+}
+
+async fn resolve_output_source_rows(
     dataset: &Dataset,
-    row_ids: Vec<Option<u64>>,
-) -> Result<Vec<Option<u64>>> {
+    mut rows: OutputSourceRows,
+) -> Result<OutputSourceRows> {
     let Some(index) = get_row_id_index(dataset).await? else {
-        return Ok(row_ids);
+        return Ok(rows);
     };
-    row_ids
-        .into_iter()
-        .map(|row_id| {
-            row_id
-                .map(|row_id| {
-                    index.get(row_id).map(Into::into).ok_or_else(|| {
-                        Error::internal(format!("Row ID {} is missing from the index", row_id))
-                    })
-                })
-                .transpose()
-        })
-        .collect()
+    for (position, row_id) in rows.row_ids.iter_mut().enumerate() {
+        if rows.inserted_positions.contains(position as u64) {
+            continue;
+        }
+        *row_id = index.get(*row_id).map(Into::into).ok_or_else(|| {
+            Error::internal(format!("Row ID {} is missing from the index", row_id))
+        })?;
+    }
+    Ok(rows)
 }
 
 fn cell_flag_row_changes(
@@ -2781,8 +2837,8 @@ impl MergeInsertJob {
                 .unwrap()
                 .into_inner()
                 .unwrap();
-            let output_source_row_addresses =
-                resolve_optional_row_ids(&self.dataset, output_source_row_ids).await?;
+            let output_source_rows =
+                resolve_output_source_rows(&self.dataset, output_source_row_ids).await?;
             let matched_values = self
                 .params
                 .matched_cell_flag_values
@@ -2799,7 +2855,8 @@ impl MergeInsertJob {
                 .dataset
                 .cell_flag_states_for_mapped_rows(
                     &new_fragments,
-                    &output_source_row_addresses,
+                    &output_source_rows.row_ids,
+                    &output_source_rows.inserted_positions,
                     &matched_values,
                     &inserted_values,
                 )
@@ -3127,8 +3184,8 @@ struct Merger {
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     // Matched target row IDs selected for explicit flag-only changes.
     matched_flag_row_ids: Arc<Mutex<Vec<u64>>>,
-    // Source row ID for each emitted output row; inserted rows use None.
-    output_source_row_ids: Arc<Mutex<Vec<Option<u64>>>>,
+    // Source row IDs plus a compressed set of positions occupied by inserted rows.
+    output_source_row_ids: Arc<Mutex<OutputSourceRows>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
     // User statistics for merging
@@ -3208,7 +3265,7 @@ impl Merger {
             deleted_rows: Arc::new(Mutex::new(Vec::new())),
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_stable_row_ids))),
             matched_flag_row_ids: Arc::new(Mutex::new(Vec::new())),
-            output_source_row_ids: Arc::new(Mutex::new(Vec::new())),
+            output_source_row_ids: Arc::new(Mutex::new(OutputSourceRows::default())),
             delete_expr,
             merge_stats: Arc::new(Mutex::new(MergeStats::default())),
             match_filter_expr,
@@ -3495,7 +3552,7 @@ impl Merger {
                         self.output_source_row_ids
                             .lock()
                             .unwrap()
-                            .extend(row_ids.values().iter().copied().map(Some));
+                            .extend_matched(row_ids.values());
                         if self.enable_stable_row_ids {
                             self.updating_row_ids
                                 .lock()
@@ -3560,7 +3617,7 @@ impl Merger {
             self.output_source_row_ids
                 .lock()
                 .unwrap()
-                .extend(std::iter::repeat_n(None, not_matched.num_rows()));
+                .extend_inserted(not_matched.num_rows())?;
             batches.push(Ok(not_matched));
         }
         match self.params.delete_not_matched_by_source {

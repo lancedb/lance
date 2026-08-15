@@ -6,7 +6,7 @@ An unrecorded flag value is `false`. Flag state is independent of Arrow values a
 
 ## Manifest registry
 
-Each manifest snapshot contains the complete current registry and the next ID to allocate:
+Each manifest snapshot contains the complete current registry and the next ID to allocate. The metadata is encoded under the reserved manifest config key `lance.cell_flags.v1`. Its value is the prefix `protobuf-base64:` followed by unpadded RFC 4648 base64 of:
 
 ```protobuf
 message CellFlagDefinition {
@@ -15,12 +15,14 @@ message CellFlagDefinition {
   string name = 3;
 }
 
-message Manifest {
-  repeated CellFlagDefinition cell_flag_definitions = 22;
-  repeated CellFlagState cell_flag_states = 23;
-  uint32 next_cell_flag_id = 24;
+message CellFlagManifest {
+  repeated CellFlagDefinition definitions = 1;
+  repeated CellFlagState states = 2;
+  uint32 next_flag_id = 3;
 }
 ```
+
+Using the existing config extension slot preserves the public generated `Manifest` API and lets readers that do not understand Cell Flags ignore the metadata while reading ordinary fields. Cell Flag-aware readers remove this reserved entry from user-visible dataset config and reject attempts to write it through the public config API.
 
 Definitions and state descriptors are sorted by `flag_id`. IDs are never reused, including after a definition is dropped. Renaming a field preserves its definitions because they bind to `field_id`. Dropping a field removes its definitions from the new snapshot; historical snapshots retain their own registry and state.
 
@@ -77,7 +79,7 @@ Append, update, merge, and merge-insert operations may carry explicit flag chang
 - Matched and inserted merge-insert actions have independent flag changes.
 - No value, NULL, omission, overlay coverage, or data-file rewrite infers state.
 
-The transaction protobuf records registry changes, existing-row address changes, exact state for newly written fragments, and field-ID transfers used by schema casts. These records are internal replay and conflict-detection material; they do not introduce arbitrary per-row keys or policy callbacks.
+The existing transaction-properties map carries two reserved entries containing the versioned Cell Flag transaction payload and its integrity digest. The payload protobuf records registry changes, existing-row address changes, exact state for newly written fragments, and field-ID transfers used by schema casts. These entries are internal replay and conflict-detection material, are hidden by language bindings, and do not introduce arbitrary per-row keys or policy callbacks.
 
 Concurrent registry edits conflict. Row changes use the existing mutation conflict machinery and the operation's read snapshot. Atomicity does not establish application-level freshness; systems that need freshness must validate their own source revision or read set.
 
@@ -91,4 +93,6 @@ Time travel and restore select the registry and roots of the chosen snapshot. Sh
 
 Cell Flags use writer feature bit `1 << 8`. It is set once a dataset allocates a flag ID and remains set after all current definitions are dropped so the monotonic allocator cannot be reset by an older writer.
 
-The bit is writer-only: older readers can continue reading ordinary field values, but cannot plan `cell_flag`. A writer that does not understand the bit must reject the dataset before mutation. Rollouts must upgrade every possible writer before registering the first flag.
+The bit is writer-only: older readers can continue reading ordinary field values, but cannot plan `cell_flag`. A writer that does not understand the bit must reject the dataset before mutation.
+
+This contract requires a two-stage rollout because a feature bit cannot retrofit a historical writer whose mutation paths did not all check unknown writer bits. First deploy a gate-only release that enforces the writer check at every mutation, clone, and restore entry point. After every possible writer has been upgraded, deploy or enable Cell Flag registration. Pre-gate writers are not part of the supported mixed-version set and must be removed before the first flag is registered. In the second stage, gate-aware older readers can still read ordinary fields while gate-aware writers that lack Cell Flag support reject mutation.

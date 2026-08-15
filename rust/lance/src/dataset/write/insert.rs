@@ -83,11 +83,10 @@ impl<'a> InsertBuilder<'a> {
     /// # use std::sync::Arc;
     /// # use lance::{Dataset, Result};
     /// # use lance::dataset::{CellFlagChange, InsertBuilder};
-    /// # async fn append(dataset: Arc<Dataset>) -> Result<()> {
-    /// InsertBuilder::new(dataset)
-    ///     .with_cell_flags([CellFlagChange::new("embedding", "computed", true)])
-    ///     .execute(Vec::new())
-    ///     .await?;
+    /// # fn append(dataset: Arc<Dataset>) -> Result<()> {
+    /// let builder = InsertBuilder::new(dataset)
+    ///     .with_cell_flags([CellFlagChange::new("embedding", "computed", true)]);
+    /// # let _ = builder;
     /// # Ok(())
     /// # }
     /// ```

@@ -132,6 +132,10 @@ different field.
 existing_dataset.register_cell_flag("thumbnail", "reviewed", initial_value=True)
 ```
 
+!!! warning
+
+    Before registering the first Cell Flag, deploy a Lance version that rejects unknown required-writer feature bits at every mutation, clone, and restore entry point to every process that can write the dataset. Historical pre-gate writers are not safe in a mixed-version fleet. After that rollout, readers without Cell Flag support may still read ordinary fields, while gate-aware writers without Cell Flag support reject mutation.
+
 For Lance file format `<= 2.1`, adding sub-columns under an existing `struct` is not supported.
 Starting with Lance file format `2.2`, schema-only add can also extend nested `struct` fields
 (including `struct` fields nested inside list types), for example by adding

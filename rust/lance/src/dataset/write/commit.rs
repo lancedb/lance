@@ -547,6 +547,27 @@ impl<'a> CommitBuilder<'a> {
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
+        let mut cell_flag_changes = crate::dataset::transaction::CellFlagTransaction::default();
+        for transaction in &transactions {
+            let Some(changes) = transaction.cell_flag_transaction()? else {
+                continue;
+            };
+            if !changes.registrations.is_empty()
+                || !changes.renames.is_empty()
+                || !changes.drops.is_empty()
+                || !changes.row_changes.is_empty()
+                || !changes.transfers.is_empty()
+            {
+                return Err(Error::not_supported_source(
+                    "Batch append transactions may only carry exact Cell Flag state for their new fragments"
+                        .into(),
+                ));
+            }
+            cell_flag_changes
+                .fragment_states
+                .extend(changes.fragment_states);
+        }
+
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::Append {
@@ -561,6 +582,11 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             tag: None,
             transaction_properties: None,
+        };
+        let merged = if cell_flag_changes.is_empty() {
+            merged
+        } else {
+            merged.with_cell_flag_transaction(cell_flag_changes)
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })

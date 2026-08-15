@@ -813,19 +813,27 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
         let read_version = ob.getattr("read_version")?.extract()?;
         let uuid = ob.getattr("uuid")?.extract()?;
         let operation = ob.getattr("operation")?.extract::<PyLance<Operation>>()?.0;
-        let transaction_properties = ob
+        let mut transaction_properties = ob
             .getattr("transaction_properties")?
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
-            .map(Arc::new);
-        if transaction_properties.as_ref().is_some_and(|properties| {
-            properties.contains_key("__lance_cell_flag_transaction")
-                || properties.contains_key("__lance_cell_flag_transaction_auth")
-        }) {
+            .unwrap_or_default();
+        if transaction_properties.contains_key("__lance_cell_flag_transaction")
+            || transaction_properties.contains_key("__lance_cell_flag_transaction_auth")
+        {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "cell flag transaction properties are reserved",
             ));
         }
+        let internal_cell_flag_transaction = ob
+            .getattr("_cell_flag_transaction")?
+            .extract::<Option<(String, String)>>()?;
+        if let Some((payload, auth)) = internal_cell_flag_transaction {
+            transaction_properties.insert("__lance_cell_flag_transaction".to_string(), payload);
+            transaction_properties.insert("__lance_cell_flag_transaction_auth".to_string(), auth);
+        }
+        let transaction_properties =
+            (!transaction_properties.is_empty()).then(|| Arc::new(transaction_properties));
         Ok(Self(Transaction {
             read_version,
             uuid,
@@ -858,8 +866,19 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
 
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let mut transaction_properties = transaction_properties_arc.as_ref().clone();
-            transaction_properties.remove("__lance_cell_flag_transaction");
-            transaction_properties.remove("__lance_cell_flag_transaction_auth");
+            let internal_payload = transaction_properties.remove("__lance_cell_flag_transaction");
+            let internal_auth = transaction_properties.remove("__lance_cell_flag_transaction_auth");
+            match (internal_payload, internal_auth) {
+                (Some(payload), Some(auth)) => {
+                    py_transaction.setattr("_cell_flag_transaction", (payload, auth))?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "internal cell flag transaction payload is incomplete",
+                    ));
+                }
+            }
             if !transaction_properties.is_empty() {
                 let py_dict = transaction_properties.into_pyobject(py)?;
                 py_transaction.setattr("transaction_properties", py_dict)?;

@@ -385,6 +385,17 @@ impl<'a> CleanupOperation<'a> {
 
     /// Execute cleanup by re-evaluating the current dataset state.
     pub async fn execute(&self) -> Result<RemovalStats> {
+        if !lance_table::feature_flags::can_write_dataset(
+            self.dataset.manifest.writer_feature_flags,
+        ) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "This dataset cannot be cleaned by this version of Lance. Please upgrade Lance to preserve its required writer features.\n Flags: {}",
+                    self.dataset.manifest.writer_feature_flags
+                )
+                .into(),
+            ));
+        }
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.dataset.uri);
         let cleanup = CleanupTask::new(self.dataset, self.policy.clone(), CleanupAction::Execute);
         Ok(cleanup.run().await?.stats)
@@ -636,39 +647,55 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn primary_cell_flag_paths(&self, manifest: &Manifest) -> Result<HashSet<Path>> {
-        let mut paths = HashSet::new();
-        for state in &manifest.cell_flag_states {
-            // Cleanup scans only this dataset's object store. Files owned by an
-            // external base are managed by that dataset's cleanup lifecycle.
-            if state.root.base_id.is_some() {
-                continue;
-            }
-            state.root.validate_root_path_for_flag(state.flag_id)?;
-            let root_path = Path::parse(&state.root.path)?;
-            paths.insert(root_path.clone());
-            let full_root_path =
-                Path::from_iter(self.dataset.base.parts().chain(root_path.parts()));
-            let root_bytes =
-                read_cell_flag_bytes(&self.dataset.object_store, &full_root_path, &state.root)
-                    .await?;
-            let root_proto = lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
-                .map_err(|error| {
-                    Error::invalid_input(format!(
-                        "Failed to decode cell flag root '{}': {}",
-                        state.root.path, error
-                    ))
-                })?;
-            let root = lance_table::format::CellFlagRoot::try_from(root_proto)?;
-            for fragment in root.fragments {
-                if let lance_table::format::CellFlagFragmentState::Partial(file) = fragment.state
-                    && file.base_id.is_none()
-                {
-                    file.validate_bitmap_path_for_fragment(state.flag_id, fragment.fragment_id)?;
-                    paths.insert(Path::parse(file.path)?);
+        let io_parallelism = self.dataset.object_store.io_parallelism().max(1);
+        let object_store = self.dataset.object_store.clone();
+        let dataset_base = self.dataset.base.clone();
+        let path_sets = stream::iter(manifest.cell_flag_states.clone())
+            .map(move |state| {
+                let object_store = object_store.clone();
+                let dataset_base = dataset_base.clone();
+                async move {
+                    let mut paths = HashSet::new();
+                    // Cleanup scans only this dataset's object store. Files owned by an
+                    // external base are managed by that dataset's cleanup lifecycle.
+                    if state.root.base_id.is_some() {
+                        return Ok::<_, Error>(paths);
+                    }
+                    state.root.validate_root_path_for_flag(state.flag_id)?;
+                    let root_path = Path::parse(&state.root.path)?;
+                    paths.insert(root_path.clone());
+                    let full_root_path =
+                        Path::from_iter(dataset_base.parts().chain(root_path.parts()));
+                    let root_bytes =
+                        read_cell_flag_bytes(&object_store, &full_root_path, &state.root).await?;
+                    let root_proto =
+                        lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
+                            .map_err(|error| {
+                                Error::invalid_input(format!(
+                                    "Failed to decode cell flag root '{}': {}",
+                                    state.root.path, error
+                                ))
+                            })?;
+                    let root = lance_table::format::CellFlagRoot::try_from(root_proto)?;
+                    for fragment in root.fragments {
+                        if let lance_table::format::CellFlagFragmentState::Partial(file) =
+                            fragment.state
+                            && file.base_id.is_none()
+                        {
+                            file.validate_bitmap_path_for_fragment(
+                                state.flag_id,
+                                fragment.fragment_id,
+                            )?;
+                            paths.insert(Path::parse(file.path)?);
+                        }
+                    }
+                    Ok(paths)
                 }
-            }
-        }
-        Ok(paths)
+            })
+            .buffer_unordered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(path_sets.into_iter().flatten().collect())
     }
 
     async fn branch_cell_flag_paths(
@@ -676,62 +703,84 @@ impl<'a> CleanupTask<'a> {
         manifest: &Manifest,
         branch_base: &Path,
     ) -> Result<HashSet<Path>> {
-        let mut paths = HashSet::new();
-        for state in &manifest.cell_flag_states {
-            state.root.validate_root_path_for_flag(state.flag_id)?;
-            let root_path = Path::parse(&state.root.path)?;
-            let (root_base, root_is_parent_owned) = match state.root.base_id {
-                None => (branch_base.clone(), false),
-                Some(root_base_id) => {
-                    let root_base = manifest.base_paths.get(&root_base_id).ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "Branch cell flag root '{}' references unknown base ID {}",
-                            state.root.path, root_base_id
-                        ))
-                    })?;
-                    if root_base.path != self.dataset.uri {
-                        // This cleanup owns only the parent dataset's object store.
-                        // Cell-flag objects in any other external base are
-                        // protected by that base's own cleanup lifecycle.
-                        continue;
+        let io_parallelism = self.dataset.object_store.io_parallelism().max(1);
+        let object_store = self.dataset.object_store.clone();
+        let dataset_uri = self.dataset.uri.clone();
+        let dataset_base = self.dataset.base.clone();
+        let branch_base = branch_base.clone();
+        let base_paths = manifest.base_paths.clone();
+        let path_sets = stream::iter(manifest.cell_flag_states.clone())
+            .map(move |state| {
+                let object_store = object_store.clone();
+                let dataset_uri = dataset_uri.clone();
+                let dataset_base = dataset_base.clone();
+                let branch_base = branch_base.clone();
+                let base_paths = base_paths.clone();
+                async move {
+                    let mut paths = HashSet::new();
+                    state.root.validate_root_path_for_flag(state.flag_id)?;
+                    let root_path = Path::parse(&state.root.path)?;
+                    let (root_base, root_is_parent_owned) = match state.root.base_id {
+                        None => (branch_base.clone(), false),
+                        Some(root_base_id) => {
+                            let root_base = base_paths.get(&root_base_id).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "Branch cell flag root '{}' references unknown base ID {}",
+                                    state.root.path, root_base_id
+                                ))
+                            })?;
+                            if root_base.path != dataset_uri {
+                                // This cleanup owns only the parent dataset's object store.
+                                // Cell-flag objects in any other external base are
+                                // protected by that base's own cleanup lifecycle.
+                                return Ok::<_, Error>(paths);
+                            }
+                            (dataset_base, true)
+                        }
+                    };
+                    if root_is_parent_owned {
+                        paths.insert(root_path.clone());
                     }
-                    (self.dataset.base.clone(), true)
+                    let full_root_path =
+                        Path::from_iter(root_base.parts().chain(root_path.parts()));
+                    let root_bytes =
+                        read_cell_flag_bytes(&object_store, &full_root_path, &state.root).await?;
+                    let root_proto =
+                        lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
+                            .map_err(|error| {
+                                Error::invalid_input(format!(
+                                    "Failed to decode branch cell flag root '{}': {}",
+                                    state.root.path, error
+                                ))
+                            })?;
+                    let root = lance_table::format::CellFlagRoot::try_from(root_proto)?;
+                    for fragment in root.fragments {
+                        let lance_table::format::CellFlagFragmentState::Partial(bitmap) =
+                            fragment.state
+                        else {
+                            continue;
+                        };
+                        bitmap.validate_bitmap_path_for_fragment(
+                            state.flag_id,
+                            fragment.fragment_id,
+                        )?;
+                        let bitmap_is_local = match bitmap.base_id {
+                            None => root_is_parent_owned,
+                            Some(base_id) => base_paths
+                                .get(&base_id)
+                                .is_some_and(|base| base.path == dataset_uri),
+                        };
+                        if bitmap_is_local {
+                            paths.insert(Path::parse(bitmap.path)?);
+                        }
+                    }
+                    Ok(paths)
                 }
-            };
-            if root_is_parent_owned {
-                paths.insert(root_path.clone());
-            }
-            let full_root_path = Path::from_iter(root_base.parts().chain(root_path.parts()));
-            let root_bytes =
-                read_cell_flag_bytes(&self.dataset.object_store, &full_root_path, &state.root)
-                    .await?;
-            let root_proto = lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
-                .map_err(|error| {
-                    Error::invalid_input(format!(
-                        "Failed to decode branch cell flag root '{}': {}",
-                        state.root.path, error
-                    ))
-                })?;
-            let root = lance_table::format::CellFlagRoot::try_from(root_proto)?;
-            for fragment in root.fragments {
-                let lance_table::format::CellFlagFragmentState::Partial(bitmap) = fragment.state
-                else {
-                    continue;
-                };
-                bitmap.validate_bitmap_path_for_fragment(state.flag_id, fragment.fragment_id)?;
-                let bitmap_is_local = match bitmap.base_id {
-                    None => root_is_parent_owned,
-                    Some(base_id) => manifest
-                        .base_paths
-                        .get(&base_id)
-                        .is_some_and(|base| base.path == self.dataset.uri),
-                };
-                if bitmap_is_local {
-                    paths.insert(Path::parse(bitmap.path)?);
-                }
-            }
-        }
-        Ok(paths)
+            })
+            .buffer_unordered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(path_sets.into_iter().flatten().collect())
     }
 
     #[instrument(

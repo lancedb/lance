@@ -348,10 +348,12 @@ async fn localize_deep_clone_cell_flags(
     base_path: &Path,
     manifest: &mut Manifest,
 ) -> Result<()> {
-    let mut normalized_roots = HashMap::new();
+    let mut normalized_roots: HashMap<String, (u64, Arc<Vec<u8>>)> = HashMap::new();
     for state in &mut manifest.cell_flag_states {
-        let size_bytes = if let Some(size_bytes) = normalized_roots.get(&state.root.path) {
-            *size_bytes
+        let (size_bytes, normalized_bytes) = if let Some((size_bytes, normalized_bytes)) =
+            normalized_roots.get(&state.root.path)
+        {
+            (*size_bytes, normalized_bytes.clone())
         } else {
             state.root.validate_root_path_for_flag(state.flag_id)?;
             let relative = Path::parse(state.root.path.as_str())?;
@@ -376,29 +378,16 @@ async fn localize_deep_clone_cell_flags(
                     bitmap.base_id = None;
                 }
             }
-            let normalized = root.encode_to_vec();
-            object_store.put(&path, &normalized).await?;
+            let normalized = Arc::new(root.encode_to_vec());
+            object_store.put(&path, normalized.as_ref()).await?;
             let size_bytes = normalized.len() as u64;
-            normalized_roots.insert(state.root.path.clone(), size_bytes);
-            size_bytes
+            normalized_roots.insert(state.root.path.clone(), (size_bytes, normalized.clone()));
+            (size_bytes, normalized)
         };
         state.root.base_id = None;
         state.root.size_bytes = size_bytes;
         if state.root.inline_bytes.is_some() {
-            let relative = Path::parse(state.root.path.as_str())?;
-            let path = Path::from_iter(base_path.parts().chain(relative.parts()));
-            let known_size = usize::try_from(size_bytes).map_err(|_| {
-                Error::invalid_input(format!(
-                    "Deep-cloned cell flag root '{}' size {} does not fit on this platform",
-                    state.root.path, size_bytes
-                ))
-            })?;
-            let bytes = object_store
-                .open_with_size(&path, known_size)
-                .await?
-                .get_all()
-                .await?;
-            state.root.inline_bytes = Some(bytes.to_vec());
+            state.root.inline_bytes = Some(normalized_bytes.as_ref().clone());
         }
     }
     Ok(())
@@ -451,6 +440,15 @@ async fn do_commit_new_dataset(
             &Session::default(),
         )
         .await?;
+        if !lance_table::feature_flags::can_write_dataset(source_manifest.writer_feature_flags) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "This source dataset cannot be cloned by this version of Lance. Please upgrade Lance to preserve its required writer features.\n Flags: {}",
+                    source_manifest.writer_feature_flags
+                )
+                .into(),
+            ));
+        }
 
         if *is_shallow {
             let new_base_id = source_manifest
@@ -1149,6 +1147,13 @@ pub(crate) async fn do_commit_detached_transaction(
 
         manifest.version = random_version;
 
+        // Legacy manifests can omit fragment cardinalities. Cell Flag
+        // initialization and remapping need those cardinalities, so complete
+        // the ordinary manifest migration before applying the flag delta.
+        // recompute_stats is always false so far because detached manifests are newer than
+        // the old stats bug.
+        migrate_manifest(dataset, &mut manifest, /*recompute_stats=*/ false).await?;
+
         crate::dataset::cell_flag::apply_cell_flag_transaction(
             dataset,
             object_store,
@@ -1157,9 +1162,6 @@ pub(crate) async fn do_commit_detached_transaction(
         )
         .await?;
 
-        // recompute_stats is always false so far because detached manifests are newer than
-        // the old stats bug.
-        migrate_manifest(dataset, &mut manifest, /*recompute_stats=*/ false).await?;
         // fix_schema and check_storage_version are just for sanity-checking and consistency
         fix_schema(&mut manifest)?;
         check_storage_version(&mut manifest)?;
@@ -1537,14 +1539,6 @@ pub(crate) async fn commit_transaction(
 
         manifest.version = target_version;
 
-        crate::dataset::cell_flag::apply_cell_flag_transaction(
-            &dataset,
-            object_store,
-            &mut manifest,
-            &transaction,
-        )
-        .await?;
-
         let previous_writer_version = &dataset.manifest.writer_version;
         // The versions of Lance prior to when we started writing the writer version
         // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
@@ -1553,6 +1547,14 @@ pub(crate) async fn commit_transaction(
         let recompute_stats = previous_writer_version.is_none();
 
         migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
+
+        crate::dataset::cell_flag::apply_cell_flag_transaction(
+            &dataset,
+            object_store,
+            &mut manifest,
+            &transaction,
+        )
+        .await?;
 
         fix_schema(&mut manifest)?;
 

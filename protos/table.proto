@@ -221,18 +221,21 @@ message Manifest {
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
 
-  // Cell flag definitions registered in this snapshot, sorted by flag_id.
-  // Names are unique within one stable schema field ID.
-  repeated CellFlagDefinition cell_flag_definitions = 22;
-
-  // Snapshot-level Boolean state for registered cell flags, sorted by flag_id.
-  // A registered flag with no entry is false for every row.
-  repeated CellFlagState cell_flag_states = 23;
-
-  // The next flag ID to allocate. IDs are never reused after a definition is
-  // dropped, so historical snapshots retain unambiguous identities.
-  uint32 next_cell_flag_id = 24;
 } // Manifest
+
+// Opaque Cell Flag metadata stored under Lance's reserved manifest config key.
+// Keeping the extension in an existing map preserves the public generated
+// Manifest struct while the writer feature bit protects mutation semantics.
+message CellFlagManifest {
+  // Definitions registered in this snapshot, sorted by flag_id.
+  repeated CellFlagDefinition definitions = 1;
+
+  // Snapshot-level state, sorted by flag_id. Absence means false for every row.
+  repeated CellFlagState states = 2;
+
+  // The next flag ID to allocate. IDs are never reused after definition drop.
+  uint32 next_flag_id = 3;
+}
 
 // Stable schema-level identity for one field-scoped Boolean cell flag.
 message CellFlagDefinition {

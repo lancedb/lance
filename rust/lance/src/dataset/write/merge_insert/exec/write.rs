@@ -32,8 +32,9 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, cell_flag_row_changes,
-    create_duplicate_row_error, format_key_values_on_columns, resolve_target_bases,
+    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, OutputSourceRows, SourceDedupeBehavior,
+    cell_flag_row_changes, create_duplicate_row_error, format_key_values_on_columns,
+    resolve_target_bases,
 };
 use crate::{
     Dataset,
@@ -73,10 +74,10 @@ struct MergeState {
     /// How to handle duplicate source rows
     source_dedupe_behavior: SourceDedupeBehavior,
     /// Source row addresses in the exact order emitted by the streaming writer.
-    written_source_row_addrs: Vec<Option<u64>>,
+    written_source_row_addrs: OutputSourceRows,
     /// Stable-row-id writes emit every update before every insert.
-    updated_source_row_addrs: Vec<Option<u64>>,
-    inserted_source_row_addrs: Vec<Option<u64>>,
+    updated_source_row_addrs: OutputSourceRows,
+    inserted_source_row_addrs: OutputSourceRows,
     /// Matched rows changed only by an explicit flag action.
     matched_flag_row_addrs: RoaringTreemap,
     /// Avoid row-mapping overhead for datasets that do not use Cell Flags.
@@ -102,9 +103,9 @@ impl MergeState {
             processed_insert_keys: InsertedKeyTracker::default(),
             on_columns,
             source_dedupe_behavior,
-            written_source_row_addrs: Vec::new(),
-            updated_source_row_addrs: Vec::new(),
-            inserted_source_row_addrs: Vec::new(),
+            written_source_row_addrs: OutputSourceRows::default(),
+            updated_source_row_addrs: OutputSourceRows::default(),
+            inserted_source_row_addrs: OutputSourceRows::default(),
             matched_flag_row_addrs: RoaringTreemap::new(),
             capture_cell_flag_sources,
         }
@@ -1083,7 +1084,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             } else {
                 let output_source_row_addrs = if merge_state.stable_row_ids {
                     let mut source_row_addrs = merge_state.updated_source_row_addrs;
-                    source_row_addrs.extend(merge_state.inserted_source_row_addrs);
+                    source_row_addrs.append(merge_state.inserted_source_row_addrs);
                     source_row_addrs
                 } else {
                     merge_state.written_source_row_addrs
@@ -1101,7 +1102,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 let fragment_states = match dataset
                     .cell_flag_states_for_mapped_rows(
                         &new_fragments,
-                        &output_source_row_addrs,
+                        &output_source_row_addrs.row_ids,
+                        &output_source_row_addrs.inserted_positions,
                         &matched_values,
                         &inserted_values,
                     )

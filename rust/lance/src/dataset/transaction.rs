@@ -21,6 +21,8 @@ use crate::index::mem_wal::{
     load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
 };
 use crate::utils::temporal::timestamp_to_nanos;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
@@ -269,8 +271,12 @@ pub struct Transaction {
 
 const CELL_FLAG_TRANSACTION_PROPERTY: &str = "__lance_cell_flag_transaction";
 const CELL_FLAG_TRANSACTION_AUTH_PROPERTY: &str = "__lance_cell_flag_transaction_auth";
-static CELL_FLAG_TRANSACTION_AUTH_KEY: LazyLock<[u8; 32]> =
-    LazyLock::new(|| *blake3::hash(Uuid::new_v4().as_bytes()).as_bytes());
+static CELL_FLAG_TRANSACTION_AUTH_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
+    blake3::derive_key(
+        "lance cell flag transaction integrity v1",
+        b"reserved transaction-properties transport",
+    )
+});
 
 /// Register one stable field-scoped Boolean flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,36 +362,16 @@ pub(crate) struct CellFlagConflictScope {
 
 fn encode_cell_flag_transaction(value: &CellFlagTransaction) -> String {
     let bytes = pb::transaction::CellFlagTransaction::from(value).encode_to_vec();
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
+    STANDARD_NO_PAD.encode(bytes)
 }
 
 fn decode_cell_flag_transaction(value: &str) -> Result<CellFlagTransaction> {
-    if !value.len().is_multiple_of(2) {
-        return Err(Error::invalid_input(
-            "Internal cell flag transaction has an odd-length encoding",
-        ));
-    }
-    let nibble = |byte: u8| -> Result<u8> {
-        match byte {
-            b'0'..=b'9' => Ok(byte - b'0'),
-            b'a'..=b'f' => Ok(byte - b'a' + 10),
-            b'A'..=b'F' => Ok(byte - b'A' + 10),
-            _ => Err(Error::invalid_input(
-                "Internal cell flag transaction is not hexadecimal",
-            )),
-        }
-    };
-    let bytes = value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
-        .collect::<Result<Vec<_>>>()?;
+    let bytes = STANDARD_NO_PAD.decode(value).map_err(|error| {
+        Error::invalid_input(format!(
+            "Internal cell flag transaction is not valid base64: {}",
+            error
+        ))
+    })?;
     let proto =
         pb::transaction::CellFlagTransaction::decode(bytes.as_slice()).map_err(|error| {
             Error::invalid_input(format!(
@@ -396,17 +382,57 @@ fn decode_cell_flag_transaction(value: &str) -> Result<CellFlagTransaction> {
     proto.try_into()
 }
 
-fn cell_flag_transaction_auth(transaction: &Transaction, encoded: &str) -> String {
+fn cell_flag_transaction_auth_hash(transaction: &Transaction, encoded: &str) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new_keyed(&CELL_FLAG_TRANSACTION_AUTH_KEY);
     hasher.update(&transaction.read_version.to_le_bytes());
     hasher.update(&(transaction.uuid.len() as u64).to_le_bytes());
     hasher.update(transaction.uuid.as_bytes());
-    let operation = format!("{:?}", transaction.operation);
-    hasher.update(&(operation.len() as u64).to_le_bytes());
-    hasher.update(operation.as_bytes());
+    let operation_kind = match &transaction.operation {
+        Operation::Append { .. } => b"Append".as_slice(),
+        Operation::Delete { .. } => b"Delete".as_slice(),
+        Operation::Overwrite { .. } => b"Overwrite".as_slice(),
+        Operation::CreateIndex { .. } => b"CreateIndex".as_slice(),
+        Operation::Rewrite { .. } => b"Rewrite".as_slice(),
+        Operation::Merge { .. } => b"Merge".as_slice(),
+        Operation::Restore { version } => {
+            hasher.update(&version.to_le_bytes());
+            b"Restore".as_slice()
+        }
+        Operation::ReserveFragments { num_fragments } => {
+            hasher.update(&num_fragments.to_le_bytes());
+            b"ReserveFragments".as_slice()
+        }
+        Operation::Update { .. } => b"Update".as_slice(),
+        Operation::Project { .. } => b"Project".as_slice(),
+        Operation::UpdateConfig { .. } => b"UpdateConfig".as_slice(),
+        Operation::DataReplacement { .. } => b"DataReplacement".as_slice(),
+        Operation::DataOverlay { .. } => b"DataOverlay".as_slice(),
+        Operation::Clone {
+            is_shallow,
+            ref_version,
+            ref_path,
+            ..
+        } => {
+            hasher.update(&[*is_shallow as u8]);
+            hasher.update(&ref_version.to_le_bytes());
+            hasher.update(&(ref_path.len() as u64).to_le_bytes());
+            hasher.update(ref_path.as_bytes());
+            b"Clone".as_slice()
+        }
+        Operation::UpdateMemWalState { .. } => b"UpdateMemWalState".as_slice(),
+        Operation::UpdateBases { .. } => b"UpdateBases".as_slice(),
+    };
+    hasher.update(&(operation_kind.len() as u64).to_le_bytes());
+    hasher.update(operation_kind);
     hasher.update(&(encoded.len() as u64).to_le_bytes());
     hasher.update(encoded.as_bytes());
-    hasher.finalize().to_hex().to_string()
+    hasher.finalize()
+}
+
+fn cell_flag_transaction_auth(transaction: &Transaction, encoded: &str) -> String {
+    cell_flag_transaction_auth_hash(transaction, encoded)
+        .to_hex()
+        .to_string()
 }
 
 impl From<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
@@ -2214,8 +2240,9 @@ impl Transaction {
         match (encoded, auth) {
             (None, None) => Ok(None),
             (Some(encoded), Some(auth)) => {
-                let expected = cell_flag_transaction_auth(self, encoded);
-                if auth != &expected {
+                let supplied = blake3::Hash::from_hex(auth).ok();
+                let expected = cell_flag_transaction_auth_hash(self, encoded);
+                if supplied.as_ref() != Some(&expected) {
                     return Err(Error::invalid_input(
                         "Internal cell flag transaction authentication failed",
                     ));
@@ -4752,15 +4779,6 @@ impl TryFrom<pb::Transaction> for Transaction {
                 ));
             }
         };
-        let mut transaction_properties = message.transaction_properties;
-        transaction_properties.remove(CELL_FLAG_TRANSACTION_PROPERTY);
-        transaction_properties.remove(CELL_FLAG_TRANSACTION_AUTH_PROPERTY);
-        let cell_flag_transaction = message
-            .cell_flag_transaction
-            .map(CellFlagTransaction::try_from)
-            .transpose()?
-            .filter(|changes| !changes.is_empty());
-
         let transaction = Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
@@ -4770,17 +4788,14 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(message.tag.clone())
             },
-            transaction_properties: if transaction_properties.is_empty() {
+            transaction_properties: if message.transaction_properties.is_empty() {
                 None
             } else {
-                Some(Arc::new(transaction_properties))
+                Some(Arc::new(message.transaction_properties))
             },
         };
-        Ok(if let Some(changes) = cell_flag_transaction {
-            transaction.with_cell_flag_transaction(changes)
-        } else {
-            transaction
-        })
+        transaction.cell_flag_transaction()?;
+        Ok(transaction)
     }
 }
 
@@ -4850,14 +4865,6 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
 
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
-        let cell_flag_transaction = value
-            .cell_flag_transaction()
-            // Commit entry points validate this reserved extension. Keep the
-            // legacy infallible conversion panic-free for direct callers.
-            .ok()
-            .flatten()
-            .as_ref()
-            .map(Into::into);
         let operation = match &value.operation {
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
@@ -5081,20 +5088,17 @@ impl From<&Transaction> for pb::Transaction {
             }
         };
 
-        let mut transaction_properties = value
+        let transaction_properties = value
             .transaction_properties
             .as_ref()
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
-        transaction_properties.remove(CELL_FLAG_TRANSACTION_PROPERTY);
-        transaction_properties.remove(CELL_FLAG_TRANSACTION_AUTH_PROPERTY);
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
-            cell_flag_transaction,
         }
     }
 }
@@ -6829,7 +6833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cell_flag_transaction_round_trip_is_not_a_user_property() {
+    fn test_cell_flag_transaction_round_trip_uses_reserved_properties() {
         let changes = CellFlagTransaction {
             registrations: vec![CellFlagRegistration {
                 flag_id: 11,
@@ -6860,11 +6864,15 @@ mod tests {
         let tx = Transaction::new_from_version(1, Operation::ReserveFragments { num_fragments: 1 })
             .with_cell_flag_transaction(changes.clone());
         let proto = pb::Transaction::from(&tx);
-        assert!(proto.cell_flag_transaction.is_some());
         assert!(
-            !proto
+            proto
                 .transaction_properties
                 .contains_key(CELL_FLAG_TRANSACTION_PROPERTY)
+        );
+        assert!(
+            proto
+                .transaction_properties
+                .contains_key(CELL_FLAG_TRANSACTION_AUTH_PROPERTY)
         );
 
         let decoded = Transaction::try_from(proto).unwrap();
@@ -6895,12 +6903,7 @@ mod tests {
         user_proto
             .transaction_properties
             .insert(CELL_FLAG_TRANSACTION_PROPERTY.to_string(), encoded);
-        let decoded_user_transaction = Transaction::try_from(user_proto).unwrap();
-        assert_eq!(
-            decoded_user_transaction.cell_flag_transaction().unwrap(),
-            None
-        );
-        assert!(decoded_user_transaction.transaction_properties.is_none());
+        assert!(Transaction::try_from(user_proto).is_err());
     }
 
     #[test]
@@ -6912,7 +6915,7 @@ mod tests {
             tag: None,
             transaction_properties: Some(Arc::new(HashMap::from([(
                 CELL_FLAG_TRANSACTION_PROPERTY.to_string(),
-                "not-hex".to_string(),
+                "not-base64".to_string(),
             )]))),
         };
         assert!(transaction.validate_internal_extensions().is_err());
@@ -6921,9 +6924,8 @@ mod tests {
             pb::Transaction::from(&transaction)
         }))
         .expect("infallible protobuf conversion must not panic");
-        assert!(proto.cell_flag_transaction.is_none());
         assert!(
-            !proto
+            proto
                 .transaction_properties
                 .contains_key(CELL_FLAG_TRANSACTION_PROPERTY)
         );
@@ -6968,7 +6970,6 @@ mod tests {
             uuid: "test".to_string(),
             tag: String::new(),
             transaction_properties: HashMap::new(),
-            cell_flag_transaction: None,
             operation: Some(pb::transaction::Operation::Update(
                 pb::transaction::Update {
                     removed_fragment_ids: vec![],
@@ -7018,7 +7019,6 @@ mod tests {
             uuid: "test".to_string(),
             tag: String::new(),
             transaction_properties: HashMap::new(),
-            cell_flag_transaction: None,
             operation: Some(pb::transaction::Operation::Update(
                 pb::transaction::Update {
                     removed_fragment_ids: vec![],

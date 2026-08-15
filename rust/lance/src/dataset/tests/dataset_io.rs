@@ -1284,6 +1284,101 @@ async fn test_write_manifest(
 }
 
 #[tokio::test]
+async fn test_writer_only_unknown_feature_allows_reads_and_rejects_writes() {
+    use lance_table::feature_flags::FLAG_UNKNOWN;
+
+    let test_dir = TempStdDir::default();
+    let source_path = test_dir.join("source");
+    let source_uri = source_path.to_str().unwrap();
+    let clone_path = test_dir.join("clone");
+    let clone_uri = clone_path.to_str().unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+        source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let latest = dataset
+        .commit_handler
+        .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+        .await
+        .unwrap();
+    let mut manifest = read_manifest(dataset.object_store.as_ref(), &latest.path, None)
+        .await
+        .unwrap();
+    manifest.version += 1;
+    manifest.writer_feature_flags |= FLAG_UNKNOWN;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            timestamp: None,
+            use_stable_row_ids: false,
+            use_legacy_format: None,
+            storage_format: None,
+            disable_transaction_file: false,
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut gated = Dataset::open(source_uri).await.unwrap();
+    assert_eq!(gated.count_rows(None).await.unwrap(), 3);
+
+    let append_error = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        source_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(append_error, Error::NotSupported { .. }));
+
+    let delete_error = gated.delete("id = 1").await.unwrap_err();
+    assert!(matches!(delete_error, Error::NotSupported { .. }));
+
+    let project_error = gated.drop_columns(&["value"]).await.unwrap_err();
+    assert!(matches!(project_error, Error::NotSupported { .. }));
+
+    let version = gated.version().version;
+    let clone_error = gated
+        .shallow_clone(clone_uri, version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(clone_error, Error::NotSupported { .. }));
+
+    let cleanup_error = gated
+        .cleanup(crate::dataset::cleanup::CleanupPolicy::default())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(matches!(cleanup_error, Error::NotSupported { .. }));
+}
+
+#[tokio::test]
 async fn test_rle_v2_v23_write_and_append() {
     let test_uri = TempStrDir::default();
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(

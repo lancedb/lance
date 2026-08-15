@@ -359,6 +359,11 @@ impl TryFrom<pb::CellFlagRoot> for CellFlagRoot {
     type Error = Error;
 
     fn try_from(value: pb::CellFlagRoot) -> Result<Self> {
+        if value.fragments.is_empty() {
+            return Err(Error::invalid_input(
+                "Cell flag root must contain at least one non-empty fragment state",
+            ));
+        }
         let mut fragments = Vec::with_capacity(value.fragments.len());
         let mut previous = None;
         for fragment in value.fragments {
@@ -452,6 +457,13 @@ mod tests {
 
     #[test]
     fn root_round_trip_and_validation() {
+        assert!(
+            CellFlagRoot::try_from(pb::CellFlagRoot {
+                fragments: Vec::new()
+            })
+            .is_err()
+        );
+
         let root = CellFlagRoot {
             fragments: vec![
                 CellFlagFragment {

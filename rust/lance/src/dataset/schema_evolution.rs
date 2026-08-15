@@ -9,7 +9,9 @@ use std::{
 use super::fragment::FileFragment;
 use super::{
     Dataset,
-    transaction::{CellFlagFieldTransfer, CellFlagTransaction, Operation, Transaction},
+    transaction::{
+        CellFlagDrop, CellFlagFieldTransfer, CellFlagTransaction, Operation, Transaction,
+    },
     write::cleanup_data_fragments,
 };
 use crate::index::DatasetIndexExt;
@@ -1017,6 +1019,15 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         ));
     }
 
+    let dropped_flags = dataset
+        .cell_flag_definitions()
+        .iter()
+        .filter(|definition| new_schema.field_by_id(definition.field_id).is_none())
+        .map(|definition| CellFlagDrop {
+            flag_id: definition.flag_id,
+        })
+        .collect::<Vec<_>>();
+
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::Project {
@@ -1025,6 +1036,14 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         },
         /*blob_op= */ None,
     );
+    let transaction = if dropped_flags.is_empty() {
+        transaction
+    } else {
+        transaction.with_cell_flag_transaction(CellFlagTransaction {
+            drops: dropped_flags,
+            ..Default::default()
+        })
+    };
 
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())

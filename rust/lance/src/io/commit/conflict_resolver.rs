@@ -79,6 +79,10 @@ fn cell_flag_replacing_fragment_ids(operation: &Operation) -> HashSet<u64> {
             .flat_map(|group| group.old_fragments.iter().map(|fragment| fragment.id))
             .collect(),
         Operation::Update {
+            update_mode: Some(UpdateMode::RewriteColumns),
+            ..
+        } => HashSet::new(),
+        Operation::Update {
             updated_fragments,
             removed_fragment_ids,
             new_fragments,
@@ -1807,6 +1811,34 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_delete_update(mut self, dataset: &Dataset) -> Result<Transaction> {
+        let is_flag_only_update = matches!(
+            &self.transaction.operation,
+            Operation::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                new_fragments,
+                fields_modified,
+                ..
+            } if updated_fragments.is_empty()
+                && removed_fragment_ids.is_empty()
+                && new_fragments.is_empty()
+                && fields_modified.is_empty()
+        ) && self
+            .transaction
+            .cell_flag_transaction()?
+            .is_some_and(|changes| !changes.row_changes.is_empty());
+
+        // Flag-only updates use affected rows for OCC precision, not as a
+        // deletion intent. A concurrent deletion file preserves physical row
+        // addresses, so rebasing only needs to advance the read version. The
+        // Cell Flag delta is reconciled against the actual head later.
+        if is_flag_only_update {
+            return Ok(Transaction {
+                read_version: dataset.manifest.version,
+                ..self.transaction
+            });
+        }
+
         if self
             .initial_fragments
             .iter()
@@ -2543,24 +2575,38 @@ mod tests {
             },
         );
 
-        for replacement in [rewrite, rewrite_columns] {
-            let mut invalidation_rebase =
-                TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
-                    .await
-                    .unwrap();
-            assert!(matches!(
-                invalidation_rebase.check_txn(&replacement, dataset.manifest.version + 1),
-                Err(Error::RetryableCommitConflict { .. })
-            ));
-
-            let mut replacement_rebase = TransactionRebase::try_new(&dataset, replacement, None)
+        let mut invalidation_rebase =
+            TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
                 .await
                 .unwrap();
-            assert!(matches!(
-                replacement_rebase.check_txn(&invalidation, dataset.manifest.version + 1),
-                Err(Error::RetryableCommitConflict { .. })
-            ));
-        }
+        assert!(matches!(
+            invalidation_rebase.check_txn(&rewrite, dataset.manifest.version + 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
+
+        let mut rewrite_rebase = TransactionRebase::try_new(&dataset, rewrite, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            rewrite_rebase.check_txn(&invalidation, dataset.manifest.version + 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
+
+        let mut invalidation_rebase =
+            TransactionRebase::try_new(&dataset, invalidation.clone(), Some(&affected_rows))
+                .await
+                .unwrap();
+        invalidation_rebase
+            .check_txn(&rewrite_columns, dataset.manifest.version + 1)
+            .unwrap();
+
+        let mut rewrite_columns_rebase =
+            TransactionRebase::try_new(&dataset, rewrite_columns, None)
+                .await
+                .unwrap();
+        rewrite_columns_rebase
+            .check_txn(&invalidation, dataset.manifest.version + 1)
+            .unwrap();
 
         let flag_change = |flag_id, row_address| {
             Transaction::new_from_version(dataset.manifest.version, invalidation.operation.clone())

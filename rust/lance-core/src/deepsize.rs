@@ -97,6 +97,14 @@ impl DeepSizeOf for bytes::Bytes {
     }
 }
 
+impl DeepSizeOf for roaring::RoaringBitmap {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        // The portable representation closely tracks the container payload and
+        // avoids iterating every selected value merely to size a cache entry.
+        self.serialized_size()
+    }
+}
+
 impl DeepSizeOf for AtomicU64 {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         0

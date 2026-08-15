@@ -110,6 +110,7 @@ lance-bitpacking = { version = "=11.0.0-beta.12", path = "./rust/compression/bit
 bitpacking = "0.9"
 bitvec = "1"
 blake3 = "1.8.5"
+base64 = "0.22"
 bytemuck = { version = "1", default-features = false, features = [
     "extern_crate_alloc",
 ] }

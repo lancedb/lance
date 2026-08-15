@@ -33,10 +33,6 @@ message Transaction {
   // __lance_commit_message is a reserved key
   map<string, string> transaction_properties = 4;
 
-  // Explicit cell flag registry and row-state changes atomically committed with
-  // the operation. This is independent of Arrow values and Data Overlay coverage.
-  CellFlagTransaction cell_flag_transaction = 5;
-
   message CellFlagTransaction {
     message Registration {
       uint32 flag_id = 1;

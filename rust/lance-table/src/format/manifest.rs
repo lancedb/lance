@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
@@ -29,6 +31,65 @@ use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
 
 const MAX_INLINE_CELL_FLAG_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ENCODED_CELL_FLAG_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const CELL_FLAG_MANIFEST_CONFIG_KEY: &str = "lance.cell_flags.v1";
+const CELL_FLAG_MANIFEST_ENCODING_PREFIX: &str = "protobuf-base64:";
+
+fn decode_cell_flag_manifest(
+    config: &mut HashMap<String, String>,
+) -> Result<Option<pb::CellFlagManifest>> {
+    let Some(encoded) = config.remove(CELL_FLAG_MANIFEST_CONFIG_KEY) else {
+        return Ok(None);
+    };
+    let payload = encoded
+        .strip_prefix(CELL_FLAG_MANIFEST_ENCODING_PREFIX)
+        .ok_or_else(|| {
+            Error::invalid_input("Cell Flag manifest metadata has an unknown encoding")
+        })?;
+    if payload.len() > MAX_ENCODED_CELL_FLAG_MANIFEST_BYTES {
+        return Err(Error::invalid_input(format!(
+            "Encoded Cell Flag manifest metadata is {} bytes, maximum is {}",
+            payload.len(),
+            MAX_ENCODED_CELL_FLAG_MANIFEST_BYTES
+        )));
+    }
+    let bytes = STANDARD_NO_PAD.decode(payload).map_err(|error| {
+        Error::invalid_input(format!(
+            "Failed to decode Cell Flag manifest metadata: {}",
+            error
+        ))
+    })?;
+    let metadata = pb::CellFlagManifest::decode(bytes.as_slice()).map_err(|error| {
+        Error::invalid_input(format!(
+            "Failed to parse Cell Flag manifest metadata: {}",
+            error
+        ))
+    })?;
+    Ok(Some(metadata))
+}
+
+fn encode_cell_flag_manifest(manifest: &Manifest) -> Option<String> {
+    if manifest.next_cell_flag_id == 0
+        && manifest.cell_flag_definitions.is_empty()
+        && manifest.cell_flag_states.is_empty()
+    {
+        return None;
+    }
+    let metadata = pb::CellFlagManifest {
+        definitions: manifest
+            .cell_flag_definitions
+            .iter()
+            .map(Into::into)
+            .collect(),
+        states: manifest.cell_flag_states.iter().map(Into::into).collect(),
+        next_flag_id: manifest.next_cell_flag_id,
+    };
+    Some(format!(
+        "{}{}",
+        CELL_FLAG_MANIFEST_ENCODING_PREFIX,
+        STANDARD_NO_PAD.encode(metadata.encode_to_vec())
+    ))
+}
 
 /// Manifest of a dataset
 ///
@@ -917,7 +978,23 @@ impl From<BasePath> for pb::BasePath {
 impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
-    fn try_from(p: pb::Manifest) -> Result<Self> {
+    fn try_from(mut p: pb::Manifest) -> Result<Self> {
+        let cell_flag_metadata = decode_cell_flag_manifest(&mut p.config)?;
+        let has_cell_flag_metadata = cell_flag_metadata.is_some();
+        let pb::CellFlagManifest {
+            definitions: cell_flag_definitions,
+            states: cell_flag_states,
+            next_flag_id: next_cell_flag_id,
+        } = cell_flag_metadata.unwrap_or_default();
+        if has_cell_flag_metadata
+            && next_cell_flag_id == 0
+            && cell_flag_definitions.is_empty()
+            && cell_flag_states.is_empty()
+        {
+            return Err(Error::invalid_input(
+                "Cell Flag manifest metadata must not encode an empty registry",
+            ));
+        }
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -976,17 +1053,13 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let schema = Schema::try_from(fields_with_meta)?;
 
-        let has_cell_flag_metadata = p.next_cell_flag_id != 0
-            || !p.cell_flag_definitions.is_empty()
-            || !p.cell_flag_states.is_empty();
         if has_cell_flag_metadata && p.writer_feature_flags & FLAG_CELL_FLAGS == 0 {
             return Err(Error::invalid_input(
                 "Manifest contains cell flag metadata without the required writer feature flag",
             ));
         }
 
-        let mut cell_flag_definitions = p
-            .cell_flag_definitions
+        let mut cell_flag_definitions = cell_flag_definitions
             .into_iter()
             .map(CellFlagDefinition::try_from)
             .collect::<Result<Vec<_>>>()?;
@@ -1022,16 +1095,15 @@ impl TryFrom<pb::Manifest> for Manifest {
             .iter()
             .map(|definition| definition.flag_id)
             .max()
-            && p.next_cell_flag_id <= max_flag_id
+            && next_cell_flag_id <= max_flag_id
         {
             return Err(Error::invalid_input(format!(
                 "Manifest next_cell_flag_id {} must be greater than registered flag ID {}",
-                p.next_cell_flag_id, max_flag_id
+                next_cell_flag_id, max_flag_id
             )));
         }
 
-        let mut cell_flag_states = p
-            .cell_flag_states
+        let mut cell_flag_states = cell_flag_states
             .into_iter()
             .map(CellFlagState::try_from)
             .collect::<Result<Vec<_>>>()?;
@@ -1098,7 +1170,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .collect(),
             cell_flag_definitions,
             cell_flag_states,
-            next_cell_flag_id: p.next_cell_flag_id,
+            next_cell_flag_id,
         })
     }
 }
@@ -1116,6 +1188,10 @@ impl From<&Manifest> for pb::Manifest {
             })
         };
         let fields_with_meta: FieldsWithMeta = (&m.schema).into();
+        let mut config = m.config.clone();
+        if let Some(metadata) = encode_cell_flag_manifest(m) {
+            config.insert(CELL_FLAG_MANIFEST_CONFIG_KEY.to_string(), metadata);
+        }
         Self {
             fields: fields_with_meta.fields.0,
             schema_metadata: m
@@ -1154,7 +1230,7 @@ impl From<&Manifest> for pb::Manifest {
                     .to_manifest_string()
                     .to_string(),
             }),
-            config: m.config.clone(),
+            config,
             base_paths: m
                 .base_paths
                 .values()
@@ -1166,9 +1242,6 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
-            cell_flag_definitions: m.cell_flag_definitions.iter().map(Into::into).collect(),
-            cell_flag_states: m.cell_flag_states.iter().map(Into::into).collect(),
-            next_cell_flag_id: m.next_cell_flag_id,
         }
     }
 }

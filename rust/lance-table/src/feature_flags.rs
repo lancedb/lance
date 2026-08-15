@@ -3,6 +3,7 @@
 
 //! Feature flags
 
+use crate::format::CELL_FLAG_MANIFEST_CONFIG_KEY;
 use crate::format::Manifest;
 use lance_core::{Error, Result};
 
@@ -60,6 +61,12 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
+    if manifest.config.contains_key(CELL_FLAG_MANIFEST_CONFIG_KEY) {
+        return Err(Error::invalid_input(format!(
+            "Dataset config key '{}' is reserved for internal Cell Flag metadata",
+            CELL_FLAG_MANIFEST_CONFIG_KEY
+        )));
+    }
     // Carried across the reset. This bit is not derivable from the manifest --
     // it depends on the `__lance_mem_wal` index details, which a manifest only
     // points at -- and this function runs twice per commit: once in
@@ -520,6 +527,22 @@ mod tests {
         assert_ne!(
             manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
             0
+        );
+    }
+
+    #[test]
+    fn apply_feature_flags_rejects_internal_cell_flag_config_key() {
+        let mut manifest = empty_manifest();
+        manifest.config.insert(
+            CELL_FLAG_MANIFEST_CONFIG_KEY.to_string(),
+            "user-controlled".to_string(),
+        );
+
+        let error = apply_feature_flags(&mut manifest, false, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reserved for internal Cell Flag")
         );
     }
 
