@@ -118,6 +118,15 @@ pub async fn take(
         let fragments = dataset.get_fragments();
         row_offsets_to_row_addresses(&fragments, offsets).await?
     };
+    if let Some(position) = addrs
+        .iter()
+        .position(|address| *address == RowAddress::TOMBSTONE_ROW)
+    {
+        return Err(Error::invalid_input(format!(
+            "Row offset {} at position {} is out of bounds",
+            offsets[position], position
+        )));
+    }
 
     let builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),
@@ -830,7 +839,7 @@ mod test {
                     40,  // 40
                     125, // 125
                 ],
-                projection,
+                projection.clone(),
             )
             .await
             .unwrap();
@@ -851,6 +860,14 @@ mod test {
             .unwrap(),
             values
         );
+        for offsets in [vec![400], vec![0, 400]] {
+            let error = dataset
+                .take(&offsets, projection.clone())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Row offset 400"));
+            assert!(error.to_string().contains("out of bounds"));
+        }
     }
 
     #[rstest]
@@ -1065,7 +1082,7 @@ mod test {
             .unwrap();
         assert_eq!(by_row_id, values);
 
-        let empty = dataset.take(&[], projection).await.unwrap();
+        let empty = dataset.take(&[], projection.clone()).await.unwrap();
         assert_eq!(empty.num_rows(), 0);
         assert_eq!(
             empty
@@ -1075,6 +1092,14 @@ mod test {
                 .data_type(),
             &DataType::Boolean
         );
+        for offsets in [vec![6], vec![0, 6]] {
+            let error = dataset
+                .take(&offsets, projection.clone())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Row offset 6"));
+            assert!(error.to_string().contains("out of bounds"));
+        }
 
         let invalid_projection =
             ProjectionRequest::from_sql([("missing", "cell_flag(value, 'missing')")]);
