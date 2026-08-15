@@ -1370,11 +1370,15 @@ fn align_overwrite_field_ids(
         parent_id: i32,
         next_field_id: &mut i64,
     ) -> Result<()> {
+        let current_fields_by_name = current_fields
+            .iter()
+            .map(|field| (field.name.as_str(), field))
+            .collect::<HashMap<_, _>>();
         for new_field in new_fields {
-            let current_field = current_fields.iter().find(|current_field| {
-                current_field.name == new_field.name
-                    && current_field.logical_type == new_field.logical_type
-            });
+            let current_field = current_fields_by_name
+                .get(new_field.name.as_str())
+                .copied()
+                .filter(|current_field| current_field.logical_type == new_field.logical_type);
             new_field.id = if let Some(current_field) = current_field {
                 current_field.id
             } else {

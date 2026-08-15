@@ -3780,17 +3780,20 @@ impl Dataset {
             None,
         );
         if !cell_flag_values.is_empty() && !matched_row_addresses.is_empty() {
-            transaction = transaction.with_cell_flag_transaction(CellFlagTransaction {
-                row_changes: cell_flag_values
-                    .into_iter()
-                    .map(|(flag_id, value)| CellFlagRowChange {
-                        flag_id,
-                        value,
-                        row_addresses: matched_row_addresses.clone(),
-                    })
-                    .collect(),
-                ..Default::default()
-            });
+            transaction = transaction.with_cell_flag_transaction_for_dataset(
+                CellFlagTransaction {
+                    row_changes: cell_flag_values
+                        .into_iter()
+                        .map(|(flag_id, value)| CellFlagRowChange {
+                            flag_id,
+                            value,
+                            row_addresses: matched_row_addresses.clone(),
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                self,
+            );
         }
 
         self.apply_commit(transaction, &Default::default(), &Default::default())

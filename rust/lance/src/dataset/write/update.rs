@@ -624,10 +624,13 @@ impl UpdateJob {
                 updated_fragment_offsets: None,
             };
             let transaction = Transaction::new(dataset.manifest.version, operation, None)
-                .with_cell_flag_transaction(CellFlagTransaction {
-                    row_changes,
-                    ..Default::default()
-                });
+                .with_cell_flag_transaction_for_dataset(
+                    CellFlagTransaction {
+                        row_changes,
+                        ..Default::default()
+                    },
+                    dataset.as_ref(),
+                );
             let new_dataset = CommitBuilder::new(dataset)
                 .with_affected_rows(update_data.affected_rows)
                 .execute(transaction)
@@ -680,10 +683,13 @@ impl UpdateJob {
 
         let mut transaction = Transaction::new(dataset.manifest.version, operation, None);
         if has_cell_flags {
-            transaction = transaction.with_cell_flag_transaction(CellFlagTransaction {
-                fragment_states,
-                ..Default::default()
-            });
+            transaction = transaction.with_cell_flag_transaction_for_dataset(
+                CellFlagTransaction {
+                    fragment_states,
+                    ..Default::default()
+                },
+                dataset.as_ref(),
+            );
         }
 
         let new_dataset = CommitBuilder::new(dataset)

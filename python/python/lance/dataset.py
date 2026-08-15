@@ -5924,7 +5924,7 @@ class Transaction:
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
-    _cell_flag_transaction: Optional[Tuple[str, str]] = dataclasses.field(
+    _cell_flag_transaction: Optional[Tuple[str, str, str]] = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
 

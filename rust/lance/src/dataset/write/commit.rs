@@ -362,6 +362,10 @@ impl<'a> CommitBuilder<'a> {
             ));
         }
 
+        if let Some(dataset) = dest.dataset() {
+            transaction.validate_cell_flag_dataset(dataset)?;
+        }
+
         // Validate the operation before proceeding with the commit
         // This ensures that operations like Merge have proper validation for data integrity
         if let Some(dataset) = dest.dataset() {
@@ -413,6 +417,16 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
+        let derived_affected_rows = if self.affected_rows.is_none() {
+            transaction.cell_flag_affected_rows()?
+        } else {
+            None
+        };
+        let affected_rows = self
+            .affected_rows
+            .as_ref()
+            .or(derived_affected_rows.as_ref());
+
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
@@ -440,7 +454,7 @@ impl<'a> CommitBuilder<'a> {
                     &self.commit_config,
                     self.retry_timeout,
                     manifest_naming_scheme,
-                    self.affected_rows.as_ref(),
+                    affected_rows,
                 )
                 .await?
             }
@@ -552,6 +566,13 @@ impl<'a> CommitBuilder<'a> {
             let Some(changes) = transaction.cell_flag_transaction()? else {
                 continue;
             };
+            if cell_flag_changes.dataset_identity.is_empty() {
+                cell_flag_changes.dataset_identity = changes.dataset_identity.clone();
+            } else if cell_flag_changes.dataset_identity != changes.dataset_identity {
+                return Err(Error::invalid_input(
+                    "Batch append transactions belong to different datasets",
+                ));
+            }
             if !changes.registrations.is_empty()
                 || !changes.renames.is_empty()
                 || !changes.drops.is_empty()

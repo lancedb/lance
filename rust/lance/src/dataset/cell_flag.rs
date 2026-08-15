@@ -189,6 +189,16 @@ fn decode_cell_flag_bitmap(
 }
 
 impl Dataset {
+    pub(crate) fn cell_flag_transaction_identity(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&(self.object_store.store_prefix.len() as u64).to_le_bytes());
+        hasher.update(self.object_store.store_prefix.as_bytes());
+        let base = self.base.to_string();
+        hasher.update(&(base.len() as u64).to_le_bytes());
+        hasher.update(base.as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
     /// Return the flag definitions registered in this snapshot.
     ///
     /// ```no_run
@@ -255,15 +265,18 @@ impl Dataset {
             },
             None,
         )
-        .with_cell_flag_transaction(CellFlagTransaction {
-            registrations: vec![CellFlagRegistration {
-                flag_id: definition.flag_id,
-                field_id: definition.field_id,
-                name: definition.name.clone(),
-                initial_value,
-            }],
-            ..Default::default()
-        });
+        .with_cell_flag_transaction_for_dataset(
+            CellFlagTransaction {
+                registrations: vec![CellFlagRegistration {
+                    flag_id: definition.flag_id,
+                    field_id: definition.field_id,
+                    name: definition.name.clone(),
+                    initial_value,
+                }],
+                ..Default::default()
+            },
+            self,
+        );
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
         Ok(definition)
@@ -310,13 +323,16 @@ impl Dataset {
             },
             None,
         )
-        .with_cell_flag_transaction(CellFlagTransaction {
-            renames: vec![CellFlagRename {
-                flag_id,
-                name: new_name,
-            }],
-            ..Default::default()
-        });
+        .with_cell_flag_transaction_for_dataset(
+            CellFlagTransaction {
+                renames: vec![CellFlagRename {
+                    flag_id,
+                    name: new_name,
+                }],
+                ..Default::default()
+            },
+            self,
+        );
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await
     }
@@ -346,10 +362,13 @@ impl Dataset {
             },
             None,
         )
-        .with_cell_flag_transaction(CellFlagTransaction {
-            drops: vec![CellFlagDrop { flag_id }],
-            ..Default::default()
-        });
+        .with_cell_flag_transaction_for_dataset(
+            CellFlagTransaction {
+                drops: vec![CellFlagDrop { flag_id }],
+                ..Default::default()
+            },
+            self,
+        );
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await
     }
@@ -1497,14 +1516,26 @@ pub async fn apply_cell_flag_transaction(
     manifest: &mut lance_table::format::Manifest,
     transaction: &Transaction,
 ) -> Result<()> {
+    let changes = transaction.cell_flag_transaction()?.unwrap_or_default();
+    if !changes.is_empty() {
+        let expected_identity = current.cell_flag_transaction_identity();
+        if changes.dataset_identity != expected_identity {
+            return Err(Error::incompatible_transaction_source(
+                "Cell flag transaction belongs to a different dataset".into(),
+            ));
+        }
+    }
     if matches!(
         transaction.operation,
         Operation::Restore { .. } | Operation::Clone { .. }
     ) {
+        if !changes.is_empty() {
+            return Err(Error::invalid_input(
+                "Restore and clone transactions cannot carry cell flag changes",
+            ));
+        }
         return Ok(());
     }
-
-    let changes = transaction.cell_flag_transaction()?.unwrap_or_default();
     if changes.is_empty() && current.manifest.cell_flag_definitions.is_empty() {
         manifest.cell_flag_definitions.clear();
         manifest.cell_flag_states.clear();
@@ -1512,13 +1543,8 @@ pub async fn apply_cell_flag_transaction(
         return Ok(());
     }
     if changes.is_empty() && matches!(transaction.operation, Operation::Append { .. }) {
-        manifest
-            .cell_flag_definitions
-            .clone_from(&current.manifest.cell_flag_definitions);
-        manifest
-            .cell_flag_states
-            .clone_from(&current.manifest.cell_flag_states);
-        manifest.next_cell_flag_id = current.manifest.next_cell_flag_id;
+        // Append manifest construction already inherits the immutable registry
+        // and roots. New fragment state is false by absence.
         return Ok(());
     }
     let final_field_ids: HashSet<i32> = manifest.schema.field_ids().into_iter().collect();

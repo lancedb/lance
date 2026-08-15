@@ -1175,7 +1175,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let transaction = if cell_flag_transaction.is_empty() {
                 transaction
             } else {
-                transaction.with_cell_flag_transaction(cell_flag_transaction)
+                transaction
+                    .with_cell_flag_transaction_for_dataset(cell_flag_transaction, dataset.as_ref())
             };
 
             // Step 6: Store transaction, merge stats, and affected rows for later retrieval

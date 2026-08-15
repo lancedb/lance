@@ -2827,7 +2827,7 @@ pub async fn commit_compaction(
         },
     )
     .transaction_properties(options.transaction_properties.clone())
-    .cell_flag_transaction(cell_flag_changes)
+    .cell_flag_transaction(cell_flag_changes, dataset.cell_flag_transaction_identity())
     .build();
 
     if let Err(e) = dataset

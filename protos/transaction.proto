@@ -86,6 +86,10 @@ message Transaction {
     repeated RowChange row_changes = 4;
     repeated FragmentState fragment_states = 5;
     repeated Transfer transfers = 6;
+    // Hash of the source object-store identity and dataset base path. This
+    // prevents an operation-local flag delta from being replayed into another
+    // dataset with coincidentally matching versions and flag IDs.
+    string dataset_identity = 7;
   }
 
   // Add new rows to the dataset.

@@ -12,8 +12,8 @@
 //! For more details please refer to the
 //! [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 
-use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
+use super::{Dataset, ManifestWriteConfig};
 use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::index_results_are_row_addrs;
@@ -34,6 +34,7 @@ use lance_file::{datatypes::Fields, version::ConcreteFileVersion};
 use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME};
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::feature_flags::{
     FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
@@ -271,9 +272,10 @@ pub struct Transaction {
 
 const CELL_FLAG_TRANSACTION_PROPERTY: &str = "__lance_cell_flag_transaction";
 const CELL_FLAG_TRANSACTION_AUTH_PROPERTY: &str = "__lance_cell_flag_transaction_auth";
+const CELL_FLAG_TRANSACTION_OPERATION_PROPERTY: &str = "__lance_cell_flag_transaction_operation";
 static CELL_FLAG_TRANSACTION_AUTH_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
     blake3::derive_key(
-        "lance cell flag transaction integrity v1",
+        "lance cell flag transaction integrity v2",
         b"reserved transaction-properties transport",
     )
 });
@@ -340,6 +342,7 @@ pub(crate) struct CellFlagTransaction {
     pub row_changes: Vec<CellFlagRowChange>,
     pub fragment_states: Vec<CellFlagFragmentState>,
     pub transfers: Vec<CellFlagFieldTransfer>,
+    pub dataset_identity: String,
 }
 
 impl CellFlagTransaction {
@@ -390,55 +393,44 @@ fn decode_cell_flag_transaction(value: &str) -> Result<CellFlagTransaction> {
     proto.try_into()
 }
 
-fn cell_flag_transaction_auth_hash(transaction: &Transaction, encoded: &str) -> blake3::Hash {
+fn encode_cell_flag_transaction_operation(transaction: &Transaction) -> String {
+    let mut proto = pb::Transaction::from(transaction);
+    proto.transaction_properties.clear();
+    STANDARD_NO_PAD.encode(proto.encode_to_vec())
+}
+
+fn decode_cell_flag_transaction_operation(value: &str) -> Result<pb::Transaction> {
+    let bytes = STANDARD_NO_PAD.decode(value).map_err(|error| {
+        Error::invalid_input(format!(
+            "Internal cell flag transaction operation is not valid base64: {}",
+            error
+        ))
+    })?;
+    let proto = pb::Transaction::decode(bytes.as_slice()).map_err(|error| {
+        Error::invalid_input(format!(
+            "Failed to decode internal cell flag transaction operation: {}",
+            error
+        ))
+    })?;
+    if !proto.transaction_properties.is_empty() {
+        return Err(Error::invalid_input(
+            "Internal cell flag transaction operation contains properties",
+        ));
+    }
+    Ok(proto)
+}
+
+fn cell_flag_transaction_auth_hash(encoded: &str, operation: &str) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new_keyed(&CELL_FLAG_TRANSACTION_AUTH_KEY);
-    hasher.update(&transaction.read_version.to_le_bytes());
-    hasher.update(&(transaction.uuid.len() as u64).to_le_bytes());
-    hasher.update(transaction.uuid.as_bytes());
-    let operation_kind = match &transaction.operation {
-        Operation::Append { .. } => b"Append".as_slice(),
-        Operation::Delete { .. } => b"Delete".as_slice(),
-        Operation::Overwrite { .. } => b"Overwrite".as_slice(),
-        Operation::CreateIndex { .. } => b"CreateIndex".as_slice(),
-        Operation::Rewrite { .. } => b"Rewrite".as_slice(),
-        Operation::Merge { .. } => b"Merge".as_slice(),
-        Operation::Restore { version } => {
-            hasher.update(&version.to_le_bytes());
-            b"Restore".as_slice()
-        }
-        Operation::ReserveFragments { num_fragments } => {
-            hasher.update(&num_fragments.to_le_bytes());
-            b"ReserveFragments".as_slice()
-        }
-        Operation::Update { .. } => b"Update".as_slice(),
-        Operation::Project { .. } => b"Project".as_slice(),
-        Operation::UpdateConfig { .. } => b"UpdateConfig".as_slice(),
-        Operation::DataReplacement { .. } => b"DataReplacement".as_slice(),
-        Operation::DataOverlay { .. } => b"DataOverlay".as_slice(),
-        Operation::Clone {
-            is_shallow,
-            ref_version,
-            ref_path,
-            ..
-        } => {
-            hasher.update(&[*is_shallow as u8]);
-            hasher.update(&ref_version.to_le_bytes());
-            hasher.update(&(ref_path.len() as u64).to_le_bytes());
-            hasher.update(ref_path.as_bytes());
-            b"Clone".as_slice()
-        }
-        Operation::UpdateMemWalState { .. } => b"UpdateMemWalState".as_slice(),
-        Operation::UpdateBases { .. } => b"UpdateBases".as_slice(),
-    };
-    hasher.update(&(operation_kind.len() as u64).to_le_bytes());
-    hasher.update(operation_kind);
     hasher.update(&(encoded.len() as u64).to_le_bytes());
     hasher.update(encoded.as_bytes());
+    hasher.update(&(operation.len() as u64).to_le_bytes());
+    hasher.update(operation.as_bytes());
     hasher.finalize()
 }
 
-fn cell_flag_transaction_auth(transaction: &Transaction, encoded: &str) -> String {
-    cell_flag_transaction_auth_hash(transaction, encoded)
+fn cell_flag_transaction_auth(encoded: &str, operation: &str) -> String {
+    cell_flag_transaction_auth_hash(encoded, operation)
         .to_hex()
         .to_string()
 }
@@ -521,6 +513,7 @@ impl From<&CellFlagTransaction> for pb::transaction::CellFlagTransaction {
                     target_field_id: transfer.target_field_id,
                 })
                 .collect(),
+            dataset_identity: value.dataset_identity.clone(),
         }
     }
 }
@@ -655,6 +648,7 @@ impl TryFrom<pb::transaction::CellFlagTransaction> for CellFlagTransaction {
             row_changes,
             fragment_states,
             transfers,
+            dataset_identity: value.dataset_identity,
         })
     }
 }
@@ -2187,15 +2181,21 @@ impl TransactionBuilder {
             let mut properties = properties.as_ref().clone();
             properties.remove(CELL_FLAG_TRANSACTION_PROPERTY);
             properties.remove(CELL_FLAG_TRANSACTION_AUTH_PROPERTY);
+            properties.remove(CELL_FLAG_TRANSACTION_OPERATION_PROPERTY);
             Arc::new(properties)
         });
         self
     }
 
-    pub(crate) fn cell_flag_transaction(mut self, changes: CellFlagTransaction) -> Self {
+    pub(crate) fn cell_flag_transaction(
+        mut self,
+        mut changes: CellFlagTransaction,
+        dataset_identity: String,
+    ) -> Self {
         if changes.is_empty() {
             return self;
         }
+        changes.dataset_identity = dataset_identity;
         // Keep the uncommon flag payload off the builder's inline size.
         // TransactionBuilder is retained across several write futures, and the
         // Vec headers in this payload otherwise push those futures over
@@ -2224,18 +2224,32 @@ impl TransactionBuilder {
 }
 
 impl Transaction {
+    pub(crate) fn with_cell_flag_transaction_for_dataset(
+        self,
+        mut changes: CellFlagTransaction,
+        dataset: &Dataset,
+    ) -> Self {
+        changes.dataset_identity = dataset.cell_flag_transaction_identity();
+        self.with_cell_flag_transaction(changes)
+    }
+
     pub(crate) fn with_cell_flag_transaction(mut self, changes: CellFlagTransaction) -> Self {
         if changes.is_empty() {
             return self;
         }
         let encoded = encode_cell_flag_transaction(&changes);
-        let auth = cell_flag_transaction_auth(&self, &encoded);
+        let operation = encode_cell_flag_transaction_operation(&self);
+        let auth = cell_flag_transaction_auth(&encoded, &operation);
         let properties = self
             .transaction_properties
             .get_or_insert_with(|| Arc::new(HashMap::new()));
         let properties = Arc::make_mut(properties);
         properties.insert(CELL_FLAG_TRANSACTION_PROPERTY.to_string(), encoded);
         properties.insert(CELL_FLAG_TRANSACTION_AUTH_PROPERTY.to_string(), auth);
+        properties.insert(
+            CELL_FLAG_TRANSACTION_OPERATION_PROPERTY.to_string(),
+            operation,
+        );
         self
     }
 
@@ -2245,22 +2259,57 @@ impl Transaction {
         };
         let encoded = properties.get(CELL_FLAG_TRANSACTION_PROPERTY);
         let auth = properties.get(CELL_FLAG_TRANSACTION_AUTH_PROPERTY);
-        match (encoded, auth) {
-            (None, None) => Ok(None),
-            (Some(encoded), Some(auth)) => {
+        let operation = properties.get(CELL_FLAG_TRANSACTION_OPERATION_PROPERTY);
+        match (encoded, auth, operation) {
+            (None, None, None) => Ok(None),
+            (Some(encoded), Some(auth), Some(operation)) => {
                 let supplied = blake3::Hash::from_hex(auth).ok();
-                let expected = cell_flag_transaction_auth_hash(self, encoded);
+                let expected = cell_flag_transaction_auth_hash(encoded, operation);
                 if supplied.as_ref() != Some(&expected) {
                     return Err(Error::invalid_input(
                         "Internal cell flag transaction authentication failed",
                     ));
                 }
+                let original = decode_cell_flag_transaction_operation(operation)?;
+                let mut current = pb::Transaction::from(self);
+                current.transaction_properties.clear();
+                if original != current {
+                    return Err(Error::invalid_input(
+                        "Internal cell flag transaction operation does not match the public transaction",
+                    ));
+                }
                 decode_cell_flag_transaction(encoded).map(Some)
             }
             _ => Err(Error::invalid_input(
-                "Internal cell flag transaction payload and authentication must both be present",
+                "Internal cell flag transaction payload, operation, and authentication must all be present",
             )),
         }
+    }
+
+    pub(crate) fn validate_cell_flag_dataset(&self, dataset: &Dataset) -> Result<()> {
+        let Some(changes) = self.cell_flag_transaction()? else {
+            return Ok(());
+        };
+        if !changes.is_empty()
+            && changes.dataset_identity != dataset.cell_flag_transaction_identity()
+        {
+            return Err(Error::incompatible_transaction_source(
+                "Cell flag transaction belongs to a different dataset".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cell_flag_affected_rows(&self) -> Result<Option<RowAddrTreeMap>> {
+        let Some(changes) = self.cell_flag_transaction()? else {
+            return Ok(None);
+        };
+        let affected_rows = changes
+            .row_changes
+            .iter()
+            .flat_map(|change| change.row_addresses.iter())
+            .collect::<RowAddrTreeMap>();
+        Ok((!affected_rows.is_empty()).then_some(affected_rows))
     }
 
     pub(crate) fn cell_flag_conflict_scope(&self) -> Result<CellFlagConflictScope> {
@@ -6868,6 +6917,7 @@ mod tests {
                 source_field_id: 7,
                 target_field_id: 9,
             }],
+            dataset_identity: "dataset-a".to_string(),
         };
         let tx = Transaction::new_from_version(1, Operation::ReserveFragments { num_fragments: 1 })
             .with_cell_flag_transaction(changes.clone());
@@ -6881,6 +6931,11 @@ mod tests {
             proto
                 .transaction_properties
                 .contains_key(CELL_FLAG_TRANSACTION_AUTH_PROPERTY)
+        );
+        assert!(
+            proto
+                .transaction_properties
+                .contains_key(CELL_FLAG_TRANSACTION_OPERATION_PROPERTY)
         );
 
         let decoded = Transaction::try_from(proto).unwrap();

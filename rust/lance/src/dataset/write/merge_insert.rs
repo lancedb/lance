@@ -2923,7 +2923,7 @@ impl MergeInsertJob {
             .unwrap();
 
         let transaction = Transaction::new(self.dataset.manifest.version, operation, None)
-            .with_cell_flag_transaction(cell_flag_changes);
+            .with_cell_flag_transaction_for_dataset(cell_flag_changes, self.dataset.as_ref());
 
         Ok(UncommittedMergeInsert {
             transaction,

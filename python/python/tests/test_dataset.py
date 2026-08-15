@@ -6609,6 +6609,7 @@ def test_cell_flag_public_api(tmp_path: Path):
     for reserved_key in (
         "__lance_cell_flag_transaction",
         "__lance_cell_flag_transaction_auth",
+        "__lance_cell_flag_transaction_operation",
     ):
         forged = lance.Transaction(
             dataset.version,
@@ -6787,14 +6788,46 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     assert transaction._cell_flag_transaction is not None
 
     tampered = copy.deepcopy(transaction)
-    payload, auth = tampered._cell_flag_transaction
-    tampered._cell_flag_transaction = (payload + "00", auth)
+    payload, operation, auth = tampered._cell_flag_transaction
+    tampered._cell_flag_transaction = (payload + "00", operation, auth)
     with pytest.raises(OSError, match="authentication failed"):
         lance.LanceDataset.commit(dataset, tampered)
+
+    retargeted = copy.deepcopy(transaction)
+    retargeted.operation.fields_modified = [1]
+    with pytest.raises(OSError, match="does not match the public transaction"):
+        lance.LanceDataset.commit(dataset, retargeted)
+
+    replay = lance.write_dataset(
+        pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
+        tmp_path / "replay",
+    )
+    replay.register_cell_flag("value", "reviewed")
+    with pytest.raises(OSError, match="different dataset"):
+        lance.LanceDataset.commit(replay, transaction)
 
     committed = lance.LanceDataset.commit(dataset, transaction)
     assert _flag_rows(committed, field="value", name="reviewed") == [
         (0, False),
+        (1, True),
+        (2, False),
+    ]
+
+    concurrent_uri = tmp_path / "concurrent"
+    concurrent = lance.write_dataset(
+        pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
+        concurrent_uri,
+    )
+    concurrent.register_cell_flag("value", "reviewed")
+    stale = lance.dataset(concurrent_uri)
+    transaction, _ = (
+        stale.merge_insert(on="id")
+        .set_matched_cell_flag("value", "reviewed", True)
+        .execute_uncommitted(pa.table({"id": [1]}))
+    )
+    concurrent.delete("id = 0")
+    committed = lance.LanceDataset.commit(concurrent_uri, transaction, max_retries=0)
+    assert _flag_rows(committed, field="value", name="reviewed") == [
         (1, True),
         (2, False),
     ]

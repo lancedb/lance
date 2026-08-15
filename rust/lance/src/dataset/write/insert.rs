@@ -344,10 +344,13 @@ impl<'a> InsertBuilder<'a> {
             };
             let fragment_states =
                 dataset.cell_flag_states_for_new_fragments(fragments, cell_flag_values)?;
-            transaction = transaction.with_cell_flag_transaction(CellFlagTransaction {
-                fragment_states,
-                ..Default::default()
-            });
+            transaction = transaction.with_cell_flag_transaction_for_dataset(
+                CellFlagTransaction {
+                    fragment_states,
+                    ..Default::default()
+                },
+                dataset,
+            );
         }
 
         Ok(transaction)

@@ -820,6 +820,7 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             .unwrap_or_default();
         if transaction_properties.contains_key("__lance_cell_flag_transaction")
             || transaction_properties.contains_key("__lance_cell_flag_transaction_auth")
+            || transaction_properties.contains_key("__lance_cell_flag_transaction_operation")
         {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "cell flag transaction properties are reserved",
@@ -827,9 +828,13 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
         }
         let internal_cell_flag_transaction = ob
             .getattr("_cell_flag_transaction")?
-            .extract::<Option<(String, String)>>()?;
-        if let Some((payload, auth)) = internal_cell_flag_transaction {
+            .extract::<Option<(String, String, String)>>()?;
+        if let Some((payload, operation, auth)) = internal_cell_flag_transaction {
             transaction_properties.insert("__lance_cell_flag_transaction".to_string(), payload);
+            transaction_properties.insert(
+                "__lance_cell_flag_transaction_operation".to_string(),
+                operation,
+            );
             transaction_properties.insert("__lance_cell_flag_transaction_auth".to_string(), auth);
         }
         let transaction_properties =
@@ -867,12 +872,14 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let mut transaction_properties = transaction_properties_arc.as_ref().clone();
             let internal_payload = transaction_properties.remove("__lance_cell_flag_transaction");
+            let internal_operation =
+                transaction_properties.remove("__lance_cell_flag_transaction_operation");
             let internal_auth = transaction_properties.remove("__lance_cell_flag_transaction_auth");
-            match (internal_payload, internal_auth) {
-                (Some(payload), Some(auth)) => {
-                    py_transaction.setattr("_cell_flag_transaction", (payload, auth))?;
+            match (internal_payload, internal_operation, internal_auth) {
+                (Some(payload), Some(operation), Some(auth)) => {
+                    py_transaction.setattr("_cell_flag_transaction", (payload, operation, auth))?;
                 }
-                (None, None) => {}
+                (None, None, None) => {}
                 _ => {
                     return Err(PyValueError::new_err(
                         "internal cell flag transaction payload is incomplete",
