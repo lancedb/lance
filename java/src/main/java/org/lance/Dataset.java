@@ -36,6 +36,7 @@ import org.lance.memwal.ShardWriter;
 import org.lance.memwal.ShardWriterConfig;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
+import org.lance.merge.UncommittedMergeInsertResult;
 import org.lance.namespace.LanceNamespace;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
@@ -2167,6 +2168,29 @@ public class Dataset implements Closeable {
   }
 
   private native MergeInsertResult nativeMergeInsert(
+      MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
+
+  /**
+   * Perform an uncommitted merge insert operation.
+   *
+   * <p>Executes merge insert logic without committing the resulting transaction to the dataset.
+   * Callers can inspect or customize the resulting {@link Transaction} before committing it via
+   * {@link CommitBuilder} or {@link #commitTransaction(Transaction)}.
+   *
+   * @param mergeInsert merge insert options
+   * @param source ArrowArrayStream source data
+   * @return UncommittedMergeInsertResult containing the dataset, uncommitted Transaction, and
+   *     stats.
+   */
+  public UncommittedMergeInsertResult mergeInsertUncommitted(
+      MergeInsertParams mergeInsert, ArrowArrayStream source) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeMergeInsertUncommitted(mergeInsert, source.memoryAddress());
+    }
+  }
+
+  private native UncommittedMergeInsertResult nativeMergeInsertUncommitted(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
   /**

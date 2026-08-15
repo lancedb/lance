@@ -5,14 +5,17 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::import_vec_to_rust;
 use crate::traits::{FromJString, IntoJava};
+use crate::transaction::convert_to_java_transaction;
 use crate::{Error, JNIEnvExt, block_on};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use lance::dataset::scanner::ExprFilter;
+use lance::dataset::transaction::Transaction;
 use lance::dataset::{
-    MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeStats, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
 use lance_index::mem_wal::CompactedSsTable;
@@ -33,47 +36,69 @@ pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsertUncommitted<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,    // Dataset object
+    jparam: JObject,      // MergeInsertParams object
+    batch_address: jlong, // ArrowArrayStream address for source
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        inner_merge_insert_uncommitted(&mut env, jdataset, jparam, batch_address)
+    )
+}
+
+fn create_merge_insert_job(
+    env: &mut JNIEnv,
+    jdataset: &JObject,
+    jparam: &JObject,
+) -> Result<MergeInsertJob> {
+    let on = extract_on(env, jparam)?;
+    let when_matched = extract_when_matched(env, jparam)?;
+    let when_not_matched = extract_when_not_matached(env, jparam)?;
+
+    let when_not_matched_by_source_str = extract_when_not_matched_by_source_str(env, jparam)?;
+    let when_not_matched_by_source_delete_expr =
+        extract_when_not_matched_by_source_delete_expr(env, jparam)?;
+
+    let conflict_retries = extract_conflict_retries(env, jparam)?;
+    let retry_timeout_ms = extract_retry_timeout_ms(env, jparam)?;
+    let skip_auto_cleanup = extract_skip_auto_cleanup(env, jparam)?;
+    let use_index = extract_use_index(env, jparam)?;
+    let compacted_sstables = extract_compacted_sstables(env, jparam)?;
+
+    let dataset = unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)? };
+
+    let when_not_matched_by_source = extract_when_not_matched_by_source(
+        dataset.inner.schema(),
+        when_not_matched_by_source_str.as_str(),
+        when_not_matched_by_source_delete_expr,
+    )?;
+
+    let merge_insert_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?
+        .when_matched(when_matched)
+        .when_not_matched(when_not_matched)
+        .when_not_matched_by_source(when_not_matched_by_source)
+        .conflict_retries(conflict_retries)
+        .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
+        .skip_auto_cleanup(skip_auto_cleanup)
+        .use_index(use_index)
+        .mark_sstables_as_compacted(compacted_sstables)
+        .try_build()?;
+
+    Ok(merge_insert_job)
+}
+
 fn inner_merge_insert<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
     jparam: JObject,
     batch_address: jlong,
 ) -> Result<JObject<'local>> {
-    let on = extract_on(env, &jparam)?;
-    let when_matched = extract_when_matched(env, &jparam)?;
-    let when_not_matched = extract_when_not_matached(env, &jparam)?;
-
-    let when_not_matched_by_source_str = extract_when_not_matched_by_source_str(env, &jparam)?;
-    let when_not_matched_by_source_delete_expr =
-        extract_when_not_matched_by_source_delete_expr(env, &jparam)?;
-
-    let conflict_retries = extract_conflict_retries(env, &jparam)?;
-    let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
-    let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
-    let use_index = extract_use_index(env, &jparam)?;
-    let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
+    let merge_insert_job = create_merge_insert_job(env, &jdataset, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
-        let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
-
-        let when_not_matched_by_source = extract_when_not_matched_by_source(
-            dataset.inner.schema(),
-            when_not_matched_by_source_str.as_str(),
-            when_not_matched_by_source_delete_expr,
-        )?;
-
-        let merge_insert_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?
-            .when_matched(when_matched)
-            .when_not_matched(when_not_matched)
-            .when_not_matched_by_source(when_not_matched_by_source)
-            .conflict_retries(conflict_retries)
-            .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
-            .skip_auto_cleanup(skip_auto_cleanup)
-            .use_index(use_index)
-            .mark_sstables_as_compacted(compacted_sstables)
-            .try_build()?;
-
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
         let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
 
@@ -87,6 +112,24 @@ fn inner_merge_insert<'local>(
         merge_stats,
     )
     .into_java(env)
+}
+
+fn inner_merge_insert_uncommitted<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jparam: JObject,
+    batch_address: jlong,
+) -> Result<JObject<'local>> {
+    let merge_insert_job = create_merge_insert_job(env, &jdataset, &jparam)?;
+
+    let uncommitted = unsafe {
+        let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
+        let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
+
+        block_on(async move { merge_insert_job.execute_uncommitted(source_stream).await })?
+    };
+
+    UncommittedMergeResult(&jdataset, uncommitted.transaction, uncommitted.stats).into_java(env)
 }
 
 fn extract_on<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<Vec<String>> {
@@ -266,6 +309,9 @@ const MERGE_STATS_CONSTRUCTOR_SIG: &str = "(JJJIJJ)V";
 const MERGE_RESULT_CLASS: &str = "org/lance/merge/MergeInsertResult";
 const MERGE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/Dataset;Lorg/lance/merge/MergeInsertStats;)V";
+const UNCOMMITTED_MERGE_RESULT_CLASS: &str = "org/lance/merge/UncommittedMergeInsertResult";
+const UNCOMMITTED_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
+    "(Lorg/lance/Dataset;Lorg/lance/Transaction;Lorg/lance/merge/MergeInsertStats;)V";
 
 impl IntoJava for MergeStats {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -294,6 +340,24 @@ impl IntoJava for MergeResult {
             MERGE_RESULT_CLASS,
             MERGE_RESULT_CONSTRUCTOR_SIG,
             &[JValueGen::Object(&jdataset), JValueGen::Object(&jstats)],
+        )?)
+    }
+}
+
+struct UncommittedMergeResult<'a>(&'a JObject<'a>, Transaction, MergeStats);
+
+impl IntoJava for UncommittedMergeResult<'_> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let jtransaction = convert_to_java_transaction(env, self.1)?;
+        let jstats = self.2.into_java(env)?;
+        Ok(env.new_object(
+            UNCOMMITTED_MERGE_RESULT_CLASS,
+            UNCOMMITTED_MERGE_RESULT_CONSTRUCTOR_SIG,
+            &[
+                JValueGen::Object(self.0),
+                JValueGen::Object(&jtransaction),
+                JValueGen::Object(&jstats),
+            ],
         )?)
     }
 }

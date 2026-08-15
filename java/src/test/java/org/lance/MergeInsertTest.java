@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
+import org.lance.merge.UncommittedMergeInsertResult;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -294,6 +295,98 @@ public class MergeInsertTest {
             "{0=Source 0, 1=Source 1, 2=Source 2, 3=Person 3, 4=Person 4, 7=Source 7, 8=Source 8, 9=Source 9}",
             readAll(result.dataset()).toString(),
             "merge insert with useIndex=false should produce correct upsert results");
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInsertUncommitted_InsertAllAndCommit() throws Exception {
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        long originalVersion = dataset.version();
+        UncommittedMergeInsertResult result =
+            dataset.mergeInsertUncommitted(
+                new MergeInsertParams(Collections.singletonList("id")), sourceStream);
+
+        // Verify result getters
+        Assertions.assertNotNull(result.dataset());
+        Assertions.assertNotNull(result.getDataset());
+        Assertions.assertNotNull(result.transaction());
+        Assertions.assertNotNull(result.getTransaction());
+        Assertions.assertNotNull(result.stats());
+        Assertions.assertNotNull(result.getStats());
+
+        // Verify stats
+        Assertions.assertEquals(3, result.stats().numInsertedRows());
+        Assertions.assertEquals(0, result.stats().numUpdatedRows());
+        Assertions.assertEquals(0, result.stats().numDeletedRows());
+        Assertions.assertEquals(1, result.stats().numAttempts());
+        Assertions.assertTrue(result.stats().bytesWritten() > 0);
+        Assertions.assertTrue(result.stats().numFilesWritten() > 0);
+
+        // Original dataset should not be modified
+        Assertions.assertEquals(originalVersion, dataset.version());
+        Assertions.assertEquals(
+            "{0=Person 0, 1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4}",
+            readAll(dataset).toString());
+
+        // Transaction can be inspected and committed via CommitBuilder
+        try (Transaction txn = result.transaction()) {
+          Assertions.assertEquals(originalVersion, txn.readVersion());
+          Assertions.assertNotNull(txn.uuid());
+          Assertions.assertNotNull(txn.operation());
+
+          try (Dataset committed = new CommitBuilder(result.dataset()).execute(txn)) {
+            Assertions.assertEquals(originalVersion + 1, committed.version());
+            Assertions.assertEquals(
+                "{0=Person 0, 1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4, 7=Source 7,"
+                    + " 8=Source 8, 9=Source 9}",
+                readAll(committed).toString());
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInsertUncommitted_MatchedUpdateAndCommit() throws Exception {
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        long originalVersion = dataset.version();
+        UncommittedMergeInsertResult result =
+            dataset.mergeInsertUncommitted(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing),
+                sourceStream);
+
+        Assertions.assertEquals(0, result.stats().numInsertedRows());
+        Assertions.assertEquals(3, result.stats().numUpdatedRows());
+        Assertions.assertEquals(0, result.stats().numDeletedRows());
+
+        // Commit via dataset.commitTransaction
+        try (Transaction txn = result.transaction()) {
+          try (Dataset committed = dataset.commitTransaction(txn)) {
+            Assertions.assertEquals(originalVersion + 1, committed.version());
+            Assertions.assertEquals(
+                "{0=Source 0, 1=Source 1, 2=Source 2, 3=Person 3, 4=Person 4}",
+                readAll(committed).toString());
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testMergeInsertUncommitted_AutoCloseable() throws Exception {
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        try (UncommittedMergeInsertResult result =
+            dataset.mergeInsertUncommitted(
+                new MergeInsertParams(Collections.singletonList("id")), sourceStream)) {
+          Assertions.assertNotNull(result.transaction());
+          Assertions.assertEquals(3, result.stats().numInsertedRows());
+        }
       }
     }
   }
