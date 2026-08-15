@@ -334,16 +334,17 @@ impl<'a> InsertBuilder<'a> {
         .transaction_properties(context.params.transaction_properties.clone())
         .build();
 
-        if let Some(dataset) = context.dest.dataset()
-            && !cell_flag_values.is_empty()
-        {
+        if let Some(dataset) = context.dest.dataset() {
             let (Operation::Append { fragments } | Operation::Overwrite { fragments, .. }) =
                 &transaction.operation
             else {
                 unreachable!("insert only creates append or overwrite operations");
             };
-            let fragment_states =
-                dataset.cell_flag_states_for_new_fragments(fragments, cell_flag_values)?;
+            let fragment_states = if cell_flag_values.is_empty() {
+                Vec::new()
+            } else {
+                dataset.cell_flag_states_for_new_fragments(fragments, cell_flag_values)?
+            };
             transaction = transaction.with_cell_flag_transaction_for_dataset(
                 CellFlagTransaction {
                     fragment_states,

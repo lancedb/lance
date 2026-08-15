@@ -2674,6 +2674,7 @@ pub async fn commit_compaction(
         RoaringBitmap::new()
     };
     let mut any_group_indexed = false;
+    let materialized_cell_flag_fragments = dataset.materialized_cell_flag_fragment_ids().await?;
 
     for task in completed_tasks {
         let source_fragment_ids = task
@@ -2681,10 +2682,7 @@ pub async fn commit_compaction(
             .iter()
             .map(|fragment| fragment.id)
             .collect::<HashSet<_>>();
-        if dataset
-            .cell_flag_rewrite_required(&source_fragment_ids, &HashMap::new(), &HashMap::new())
-            .await?
-        {
+        if !source_fragment_ids.is_disjoint(&materialized_cell_flag_fragments) {
             let source_row_addresses = compaction_source_row_addresses(dataset, &task).await?;
             cell_flag_changes.fragment_states.extend(
                 dataset
@@ -2819,7 +2817,7 @@ pub async fn commit_compaction(
         None
     };
 
-    let transaction = TransactionBuilder::new(
+    let transaction_builder = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
         // mode the caller may open a fresh dataset at a later version (V+N), but
@@ -2834,9 +2832,15 @@ pub async fn commit_compaction(
             frag_reuse_index,
         },
     )
-    .transaction_properties(options.transaction_properties.clone())
-    .cell_flag_transaction(cell_flag_changes, dataset.cell_flag_transaction_identity())
-    .build();
+    .transaction_properties(options.transaction_properties.clone());
+    let transaction_builder =
+        if cell_flag_changes.is_empty() && dataset.manifest.next_cell_flag_id == 0 {
+            transaction_builder
+        } else {
+            transaction_builder
+                .cell_flag_transaction(cell_flag_changes, dataset.cell_flag_transaction_identity())
+        };
+    let transaction = transaction_builder.build();
 
     if let Err(e) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())

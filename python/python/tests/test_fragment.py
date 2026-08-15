@@ -1321,6 +1321,41 @@ def test_row_id_sequence_preserves_ids_in_manual_update(tmp_path: Path):
     }
 
 
+def test_manual_row_rewrite_without_cell_flag_state_fails_closed(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"id": [1, 2, 3, 4], "v": [10, 20, 30, 40]}),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+    dataset.register_cell_flag("v", "reviewed")
+    dataset.update(where="id = 2", cell_flags={"v": {"reviewed": True}})
+    version_before = dataset.version
+
+    updated_fragment = dataset.get_fragments()[0].delete("id = 2")
+    (new_fragment,) = write_fragments(pa.table({"id": [2], "v": [99]}), tmp_path)
+    with pytest.raises(OSError, match="Cell Flag attestation"):
+        LanceDataset.commit(
+            tmp_path,
+            LanceOperation.Update(
+                removed_fragment_ids=[],
+                updated_fragments=[updated_fragment],
+                new_fragments=[new_fragment],
+                fields_modified=[],
+            ),
+            read_version=version_before,
+        )
+
+    reopened = lance.dataset(tmp_path)
+    assert reopened.version == version_before
+    assert reopened.to_table(
+        columns={"id": "id", "v": "v", "reviewed": "cell_flag(v, 'reviewed')"}
+    ).sort_by("id").to_pydict() == {
+        "id": [1, 2, 3, 4],
+        "v": [10, 20, 30, 40],
+        "reviewed": [False, True, False, False],
+    }
+
+
 def test_row_id_sequence_reads_back_fragment_metadata(tmp_path: Path):
     dataset = write_dataset(
         pa.table({"a": range(10)}),

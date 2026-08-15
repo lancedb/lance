@@ -981,13 +981,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             .iter()
             .filter_map(|name| self.dataset.schema().field(name).map(|f| f.id))
             .collect();
-        let capture_cell_flag_sources = !self.dataset.manifest.cell_flag_states.is_empty()
-            || !self.params.matched_cell_flag_values.is_empty()
-            || self
-                .params
-                .inserted_cell_flag_values
-                .iter()
-                .any(|(_, value)| *value);
+        let capture_cell_flag_sources = self
+            .params
+            .capture_cell_flag_sources(!self.dataset.manifest.cell_flag_states.is_empty());
         let merge_state = Arc::new(Mutex::new(MergeState::new(
             MergeInsertMetrics::new(&self.metrics, partition),
             self.dataset.manifest.uses_stable_row_ids(),
@@ -1178,13 +1174,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             };
 
             // Step 5: Create and store the transaction
-            let transaction = Transaction::new(dataset.manifest.version, operation, None);
-            let transaction = if cell_flag_transaction.is_empty() {
-                transaction
-            } else {
-                transaction
-                    .with_cell_flag_transaction_for_dataset(cell_flag_transaction, dataset.as_ref())
-            };
+            let transaction = Transaction::new(dataset.manifest.version, operation, None)
+                .with_cell_flag_transaction_for_dataset(cell_flag_transaction, dataset.as_ref());
 
             // Step 6: Store transaction, merge stats, and affected rows for later retrieval
             {

@@ -279,7 +279,7 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
-        let transaction = transaction.with_cell_flag_affected_rows(self.affected_rows.clone())?;
+        let mut transaction = transaction;
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -414,7 +414,8 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
-        let derived_affected_rows = transaction.cell_flag_commit_affected_rows(dest.dataset())?;
+        let cell_flag_scope = transaction.cell_flag_commit_affected_rows(dest.dataset())?;
+        let derived_affected_rows = &cell_flag_scope.affected_rows;
         if let (Some(supplied), Some(recorded)) =
             (self.affected_rows.as_ref(), derived_affected_rows.as_ref())
             && supplied != recorded
@@ -422,6 +423,21 @@ impl<'a> CommitBuilder<'a> {
             return Err(Error::invalid_input(
                 "Commit affected rows do not match the Cell Flag transaction rewrite or deletion scope",
             ));
+        }
+        if transaction.cell_flag_rewrite_requires_affected_rows()
+            && cell_flag_scope.has_changes
+            && derived_affected_rows.is_none()
+            && self.affected_rows.is_none()
+        {
+            return Err(Error::invalid_input(
+                "Cell Flag update with existing-row rewrites requires the complete affected-row set",
+            ));
+        }
+        if derived_affected_rows.is_none()
+            && self.affected_rows.is_some()
+            && cell_flag_scope.has_changes
+        {
+            transaction = transaction.with_cell_flag_affected_rows(self.affected_rows.clone())?;
         }
         let affected_rows = self
             .affected_rows
@@ -563,10 +579,16 @@ impl<'a> CommitBuilder<'a> {
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
         let mut cell_flag_changes = crate::dataset::transaction::CellFlagTransaction::default();
+        let mut transactions_with_cell_flag_sidecar = 0_usize;
         for transaction in &transactions {
-            let Some(changes) = transaction.cell_flag_transaction()? else {
+            let changes = transaction.cell_flag_transaction()?;
+            if let Some(dataset) = self.dest.dataset() {
+                transaction.validate_cell_flag_attestation_presence(dataset, changes.is_some())?;
+            }
+            let Some(changes) = changes else {
                 continue;
             };
+            transactions_with_cell_flag_sidecar += 1;
             if cell_flag_changes.dataset_identity.is_empty() {
                 cell_flag_changes.dataset_identity = changes.dataset_identity.clone();
             } else if cell_flag_changes.dataset_identity != changes.dataset_identity {
@@ -589,6 +611,13 @@ impl<'a> CommitBuilder<'a> {
                 .fragment_states
                 .extend(changes.fragment_states);
         }
+        if transactions_with_cell_flag_sidecar != 0
+            && transactions_with_cell_flag_sidecar != transactions.len()
+        {
+            return Err(Error::invalid_input(
+                "Batch append transactions must either all carry Cell Flag attestations or all omit them",
+            ));
+        }
 
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
@@ -605,11 +634,12 @@ impl<'a> CommitBuilder<'a> {
             tag: None,
             transaction_properties: None,
         };
-        let merged = if cell_flag_changes.is_empty() {
-            merged
-        } else {
-            merged.with_cell_flag_transaction(cell_flag_changes)
-        };
+        let merged =
+            if cell_flag_changes.is_empty() && cell_flag_changes.dataset_identity.is_empty() {
+                merged
+            } else {
+                merged.with_cell_flag_transaction(cell_flag_changes)
+            };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
     }

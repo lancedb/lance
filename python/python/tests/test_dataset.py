@@ -6825,13 +6825,18 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
 
     empty = copy.deepcopy(transaction)
     empty._cell_flag_transaction = ""
-    with pytest.raises(OSError, match="contains no changes"):
+    with pytest.raises(OSError, match="operation commitment"):
         lance.LanceDataset.commit(dataset, empty)
 
     retargeted = copy.deepcopy(transaction)
     retargeted.operation.fields_modified = [1]
     with pytest.raises(OSError, match="does not match the public transaction"):
         lance.LanceDataset.commit(dataset, retargeted)
+
+    uuid_retargeted = copy.deepcopy(transaction)
+    uuid_retargeted.uuid = str(uuid.uuid4())
+    with pytest.raises(OSError, match="does not match the public transaction"):
+        lance.LanceDataset.commit(dataset, uuid_retargeted)
 
     append_transaction = lance.fragment.write_fragments(
         pa.table({"id": [3], "value": pa.array([13], pa.int32())}),

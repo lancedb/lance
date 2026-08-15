@@ -694,16 +694,14 @@ impl UpdateJob {
             updated_fragment_offsets: None,
         };
 
-        let mut transaction = Transaction::new(dataset.manifest.version, operation, None);
-        if needs_cell_flag_mapping {
-            transaction = transaction.with_cell_flag_transaction_for_dataset(
+        let transaction = Transaction::new(dataset.manifest.version, operation, None)
+            .with_cell_flag_transaction_for_dataset(
                 CellFlagTransaction {
                     fragment_states,
                     ..Default::default()
                 },
                 dataset.as_ref(),
             );
-        }
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)
@@ -943,6 +941,18 @@ mod tests {
         let result = job.commit_impl(dataset, data).await.unwrap();
         assert_eq!(result.rows_updated, 1);
         assert!(result.new_dataset.manifest.cell_flag_states.is_empty());
+        let committed = result
+            .new_dataset
+            .read_transaction()
+            .await
+            .unwrap()
+            .expect("update transaction");
+        let attestation = committed
+            .cell_flag_transaction()
+            .unwrap()
+            .expect("active Cell Flag registry requires an attestation");
+        assert!(attestation.is_empty());
+        assert!(attestation.affected_rows.is_none());
     }
 
     #[rstest]

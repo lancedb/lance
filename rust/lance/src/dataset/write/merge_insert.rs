@@ -593,6 +593,18 @@ struct MergeInsertParams {
     inserted_cell_flag_values: BTreeMap<u32, bool>,
 }
 
+impl MergeInsertParams {
+    fn capture_cell_flag_sources(&self, has_materialized_flags: bool) -> bool {
+        (has_materialized_flags
+            && matches!(
+                &self.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            ))
+            || !self.matched_cell_flag_values.is_empty()
+            || self.inserted_cell_flag_values.values().any(|value| *value)
+    }
+}
+
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
 /// part of a single transaction.
 #[derive(Clone)]
@@ -2622,13 +2634,9 @@ impl MergeInsertJob {
             },
         );
         let joined = self.create_joined_stream(source).await?;
-        let capture_cell_flag_sources = !self.dataset.manifest.cell_flag_states.is_empty()
-            || !self.params.matched_cell_flag_values.is_empty()
-            || self
-                .params
-                .inserted_cell_flag_values
-                .iter()
-                .any(|(_, value)| *value);
+        let capture_cell_flag_sources = self
+            .params
+            .capture_cell_flag_sources(!self.dataset.manifest.cell_flag_states.is_empty());
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
@@ -3757,6 +3765,15 @@ mod tests {
         let params = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
             .unwrap()
             .params;
+        assert!(!params.capture_cell_flag_sources(true));
+        let mut updating_params = params.clone();
+        updating_params.when_matched = WhenMatched::UpdateAll;
+        assert!(updating_params.capture_cell_flag_sources(true));
+        let mut explicit_flag_params = params.clone();
+        explicit_flag_params
+            .inserted_cell_flag_values
+            .insert(0, true);
+        assert!(explicit_flag_params.capture_cell_flag_sources(false));
         let merger = Merger::try_new(params.clone(), schema.clone(), false, false, false).unwrap();
 
         merger.record_matched_output_sources(&[10, 11]);

@@ -973,17 +973,13 @@ pub(super) async fn alter_columns(
         )
     };
 
-    let transaction = if cell_flag_transfers.is_empty() {
-        transaction
-    } else {
-        transaction.with_cell_flag_transaction_for_dataset(
-            CellFlagTransaction {
-                transfers: cell_flag_transfers,
-                ..Default::default()
-            },
-            dataset,
-        )
-    };
+    let transaction = transaction.with_cell_flag_transaction_for_dataset(
+        CellFlagTransaction {
+            transfers: cell_flag_transfers,
+            ..Default::default()
+        },
+        dataset,
+    );
 
     // TODO: adjust the indices here for the new schema
 
@@ -1039,17 +1035,13 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         },
         /*blob_op= */ None,
     );
-    let transaction = if dropped_flags.is_empty() {
-        transaction
-    } else {
-        transaction.with_cell_flag_transaction_for_dataset(
-            CellFlagTransaction {
-                drops: dropped_flags,
-                ..Default::default()
-            },
-            dataset,
-        )
-    };
+    let transaction = transaction.with_cell_flag_transaction_for_dataset(
+        CellFlagTransaction {
+            drops: dropped_flags,
+            ..Default::default()
+        },
+        dataset,
+    );
 
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())

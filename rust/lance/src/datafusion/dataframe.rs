@@ -539,14 +539,22 @@ impl BindCellFlags {
                 .collect::<datafusion::common::Result<Vec<_>>>()?;
 
             if required_by_parent && matches!(plan, LogicalPlan::Projection(_)) {
+                let mut row_address_columns = Vec::new();
                 for input in &inputs {
                     for index in 0..input.schema().fields().len() {
                         let qualified_field = input.schema().qualified_field(index);
                         if qualified_field.1.name() == lance_core::ROW_ADDR {
-                            expressions.push(Expr::Column(Column::from(qualified_field)));
+                            row_address_columns.push(Column::from(qualified_field));
                         }
                     }
                 }
+                if row_address_columns.len() != 1 {
+                    return Err(DataFusionError::Plan(format!(
+                        "cell_flag cannot trace physical row identity through a projection with {} candidate _rowaddr columns",
+                        row_address_columns.len()
+                    )));
+                }
+                expressions.push(Expr::Column(row_address_columns.pop().unwrap()));
             }
             plan.with_new_exprs(expressions, inputs)?
         };
@@ -1029,5 +1037,25 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(self_join_ids, vec![1, 4, 7]);
+
+        let derived_self_join = manual_context
+            .sql(
+                "SELECT j.bid FROM (\
+                   SELECT b.id AS bid, b.embedding \
+                   FROM items a CROSS JOIN items b\
+                 ) j \
+                 WHERE cell_flag(j.embedding, 'computed') ORDER BY j.bid",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            derived_self_join
+                .to_string()
+                .contains("cannot trace physical row identity through a projection"),
+            "{derived_self_join}"
+        );
     }
 }
