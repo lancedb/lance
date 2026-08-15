@@ -360,6 +360,14 @@ pub(crate) struct CellFlagConflictScope {
     pub changes_registry: bool,
 }
 
+impl CellFlagConflictScope {
+    pub fn is_empty(&self) -> bool {
+        self.row_fragment_ids.is_empty()
+            && self.row_addresses_by_flag.is_empty()
+            && !self.changes_registry
+    }
+}
+
 fn encode_cell_flag_transaction(value: &CellFlagTransaction) -> String {
     let bytes = pb::transaction::CellFlagTransaction::from(value).encode_to_vec();
     STANDARD_NO_PAD.encode(bytes)

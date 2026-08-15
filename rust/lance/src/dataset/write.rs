@@ -11,7 +11,7 @@ use lance_arrow::{
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
     BLOB_V2_EXT_NAME,
 };
-use lance_core::datatypes::{NullabilityComparison, OnMissing, OnTypeMismatch};
+use lance_core::datatypes::{Field, NullabilityComparison, OnMissing, OnTypeMismatch};
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
 };
@@ -1324,7 +1324,7 @@ pub async fn write_fragments_internal(
 
 pub(super) fn prepare_write_schema(
     dataset: Option<&Dataset>,
-    normalized_converted_schema: Schema,
+    mut normalized_converted_schema: Schema,
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
 ) -> Result<Schema> {
@@ -1344,10 +1344,67 @@ pub(super) fn prepare_write_schema(
             OnMissing::Error,
             OnTypeMismatch::Error,
         )?
+    } else if let Some(dataset) = dataset
+        && matches!(params.mode, WriteMode::Overwrite)
+    {
+        align_overwrite_field_ids(
+            &mut normalized_converted_schema,
+            dataset.schema(),
+            dataset.manifest.max_field_id(),
+        )?;
+        normalized_converted_schema
     } else {
         normalized_converted_schema
     };
     Ok(schema)
+}
+
+fn align_overwrite_field_ids(
+    new_schema: &mut Schema,
+    current_schema: &Schema,
+    max_existing_field_id: i32,
+) -> Result<()> {
+    fn align_fields(
+        new_fields: &mut [Field],
+        current_fields: &[Field],
+        parent_id: i32,
+        next_field_id: &mut i64,
+    ) -> Result<()> {
+        for new_field in new_fields {
+            let current_field = current_fields.iter().find(|current_field| {
+                current_field.name == new_field.name
+                    && current_field.logical_type == new_field.logical_type
+            });
+            new_field.id = if let Some(current_field) = current_field {
+                current_field.id
+            } else {
+                let field_id = i32::try_from(*next_field_id).map_err(|_| {
+                    Error::invalid_input("The dataset has exhausted the stable field ID space")
+                })?;
+                *next_field_id += 1;
+                field_id
+            };
+            new_field.parent_id = parent_id;
+            let current_children = current_field
+                .map(|current_field| current_field.children.as_slice())
+                .unwrap_or_default();
+            align_fields(
+                &mut new_field.children,
+                current_children,
+                new_field.id,
+                next_field_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    let mut next_field_id = i64::from(max_existing_field_id) + 1;
+    align_fields(
+        &mut new_schema.fields,
+        &current_schema.fields,
+        -1,
+        &mut next_field_id,
+    )
 }
 
 pub(super) fn validate_legacy_blob_write_schema(

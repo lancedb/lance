@@ -522,8 +522,12 @@ impl UpdateJob {
 
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
-        let source_row_addresses = removed_row_ids.ordered_row_addrs(row_id_index.as_deref());
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        let source_row_addresses = if self.dataset.cell_flag_definitions().is_empty() {
+            Vec::new()
+        } else {
+            removed_row_ids.ordered_row_addrs(row_id_index.as_deref())
+        };
         let deletions_result = self.apply_deletions(&row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
             Ok(v) => v,
@@ -645,13 +649,18 @@ impl UpdateJob {
             }
         }
 
-        let fragment_states = dataset
-            .cell_flag_states_for_rewritten_rows(
-                &update_data.new_fragments,
-                &update_data.source_row_addresses,
-                self.cell_flag_values.as_ref(),
-            )
-            .await?;
+        let has_cell_flags = !dataset.cell_flag_definitions().is_empty();
+        let fragment_states = if has_cell_flags {
+            dataset
+                .cell_flag_states_for_rewritten_rows(
+                    &update_data.new_fragments,
+                    &update_data.source_row_addresses,
+                    self.cell_flag_values.as_ref(),
+                )
+                .await?
+        } else {
+            Vec::new()
+        };
 
         // Commit updated and new fragments
         let operation = Operation::Update {
@@ -669,11 +678,13 @@ impl UpdateJob {
             updated_fragment_offsets: None,
         };
 
-        let transaction = Transaction::new(dataset.manifest.version, operation, None)
-            .with_cell_flag_transaction(CellFlagTransaction {
+        let mut transaction = Transaction::new(dataset.manifest.version, operation, None);
+        if has_cell_flags {
+            transaction = transaction.with_cell_flag_transaction(CellFlagTransaction {
                 fragment_states,
                 ..Default::default()
             });
+        }
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)
@@ -882,6 +893,29 @@ mod tests {
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn update_without_cell_flags_skips_source_address_mapping(
+        #[case] enable_stable_row_ids: bool,
+    ) {
+        let (dataset, _test_dir) =
+            make_test_dataset(LanceFileVersion::Legacy, enable_stable_row_ids).await;
+        let job = UpdateBuilder::new(dataset.clone())
+            .update_where("id = 1")
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let data = job.clone().execute_impl().await.unwrap();
+        assert!(data.source_row_addresses.is_empty());
+        let result = job.commit_impl(dataset, data).await.unwrap();
+        assert_eq!(result.rows_updated, 1);
     }
 
     #[rstest]

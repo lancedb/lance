@@ -3721,37 +3721,52 @@ impl Dataset {
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
-        let updated_fragments = stream::iter(self.get_fragments())
-            .then(|f| {
-                let joiner = joiner.clone();
-                async move {
-                    let fragment_id = f.id();
-                    f.merge_with_matches(left_on, &joiner).await.map(
-                        |(fragment, matched_offsets)| {
-                            (fragment.metadata, fragment_id, matched_offsets)
-                        },
-                    )
-                }
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
         let mut matched_row_addresses = RoaringTreemap::new();
-        let updated_fragments = updated_fragments
-            .into_iter()
-            .map(|(fragment, fragment_id, matched_offsets)| {
-                let fragment_id = u32::try_from(fragment_id).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "Fragment id {} does not fit RowAddress fragment id",
-                        fragment_id
-                    ))
-                })?;
-                for row_offset in matched_offsets {
-                    matched_row_addresses
-                        .insert(RowAddress::new_from_parts(fragment_id, row_offset).into());
-                }
-                Ok(fragment)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let updated_fragments = if cell_flag_values.is_empty() {
+            stream::iter(self.get_fragments())
+                .then(|fragment| {
+                    let joiner = joiner.clone();
+                    async move {
+                        fragment
+                            .merge(left_on, &joiner)
+                            .await
+                            .map(|fragment| fragment.metadata)
+                    }
+                })
+                .try_collect::<Vec<_>>()
+                .await?
+        } else {
+            let updated_fragments = stream::iter(self.get_fragments())
+                .then(|fragment| {
+                    let joiner = joiner.clone();
+                    async move {
+                        let fragment_id = fragment.id();
+                        fragment.merge_with_matches(left_on, &joiner).await.map(
+                            |(fragment, matched_offsets)| {
+                                (fragment.metadata, fragment_id, matched_offsets)
+                            },
+                        )
+                    }
+                })
+                .try_collect::<Vec<_>>()
+                .await?;
+            updated_fragments
+                .into_iter()
+                .map(|(fragment, fragment_id, matched_offsets)| {
+                    let fragment_id = u32::try_from(fragment_id).map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Fragment id {} does not fit RowAddress fragment id",
+                            fragment_id
+                        ))
+                    })?;
+                    for row_offset in matched_offsets {
+                        matched_row_addresses
+                            .insert(RowAddress::new_from_parts(fragment_id, row_offset).into());
+                    }
+                    Ok(fragment)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
 
         let preserves_nullability =
             !schema_evolution::merge_introduces_required_field(self.schema(), &new_schema);

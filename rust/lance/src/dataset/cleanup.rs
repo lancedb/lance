@@ -436,6 +436,7 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn run(self) -> Result<CleanupRunResult> {
+        self.ensure_latest_writer_capabilities().await?;
         let mut final_result = CleanupRunResult::default();
         let candidate_file_limit = self.action.candidate_file_limit();
         // First check if we need to clean referenced branches
@@ -506,6 +507,24 @@ impl<'a> CleanupTask<'a> {
             candidate_file_limit,
         );
         Ok(final_result)
+    }
+
+    async fn ensure_latest_writer_capabilities(&self) -> Result<()> {
+        if !self.action.deletes_files() {
+            return Ok(());
+        }
+        let mut latest = self.dataset.clone();
+        latest.checkout_latest().await?;
+        if !lance_table::feature_flags::can_write_dataset(latest.manifest.writer_feature_flags) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "This dataset cannot be cleaned by this version of Lance. Please upgrade Lance to preserve its required writer features.\n Flags: {}",
+                    latest.manifest.writer_feature_flags
+                )
+                .into(),
+            ));
+        }
+        Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -934,6 +953,9 @@ impl<'a> CleanupTask<'a> {
         });
 
         if deletes_files {
+            // Recheck the authoritative head immediately before deletion. A cleanup
+            // operation can outlive the Dataset snapshot from which it was created.
+            self.ensure_latest_writer_capabilities().await?;
             let paths_to_delete: BoxStream<Result<Path>> =
                 if let Some(rate) = self.policy.delete_rate_limit {
                     let duration =

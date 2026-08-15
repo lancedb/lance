@@ -349,26 +349,28 @@ impl<'a> TransactionRebase<'a> {
 
         let our_cell_flags = self.transaction.cell_flag_conflict_scope()?;
         let their_cell_flags = other_transaction.cell_flag_conflict_scope()?;
-        let our_cell_flag_replacements = cell_flag_replacing_fragment_ids(ours);
-        let their_cell_flag_replacements = cell_flag_replacing_fragment_ids(theirs);
-        if cell_flag_row_changes_conflict(&our_cell_flags, &their_cell_flags)
-            || !our_cell_flags
-                .row_fragment_ids
-                .is_disjoint(&their_cell_flag_replacements)
-            || !their_cell_flags
-                .row_fragment_ids
-                .is_disjoint(&our_cell_flag_replacements)
-            || (our_cell_flags.changes_registry && their_cell_flags.changes_registry)
-            || (our_cell_flags.changes_registry
-                && (supplies_values(theirs)
-                    || !their_cell_flag_replacements.is_empty()
-                    || !their_cell_flags.row_fragment_ids.is_empty()))
-            || (their_cell_flags.changes_registry
-                && (supplies_values(ours)
-                    || !our_cell_flag_replacements.is_empty()
-                    || !our_cell_flags.row_fragment_ids.is_empty()))
-        {
-            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        if !our_cell_flags.is_empty() || !their_cell_flags.is_empty() {
+            let our_cell_flag_replacements = cell_flag_replacing_fragment_ids(ours);
+            let their_cell_flag_replacements = cell_flag_replacing_fragment_ids(theirs);
+            if cell_flag_row_changes_conflict(&our_cell_flags, &their_cell_flags)
+                || !our_cell_flags
+                    .row_fragment_ids
+                    .is_disjoint(&their_cell_flag_replacements)
+                || !their_cell_flags
+                    .row_fragment_ids
+                    .is_disjoint(&our_cell_flag_replacements)
+                || (our_cell_flags.changes_registry && their_cell_flags.changes_registry)
+                || (our_cell_flags.changes_registry
+                    && (supplies_values(theirs)
+                        || !their_cell_flag_replacements.is_empty()
+                        || !their_cell_flags.row_fragment_ids.is_empty()))
+                || (their_cell_flags.changes_registry
+                    && (supplies_values(ours)
+                        || !our_cell_flag_replacements.is_empty()
+                        || !our_cell_flags.row_fragment_ids.is_empty()))
+            {
+                return Err(self.retryable_conflict_err(other_transaction, other_version));
+            }
         }
 
         let op = &self.transaction.operation;

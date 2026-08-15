@@ -1342,6 +1342,13 @@ async fn test_writer_only_unknown_feature_allows_reads_and_rejects_writes() {
     .await
     .unwrap();
 
+    let stale_cleanup_error = dataset
+        .cleanup(crate::dataset::cleanup::CleanupPolicy::default())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_cleanup_error, Error::NotSupported { .. }));
+
     let mut gated = Dataset::open(source_uri).await.unwrap();
     assert_eq!(gated.count_rows(None).await.unwrap(), 3);
 

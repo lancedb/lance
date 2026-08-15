@@ -1505,6 +1505,22 @@ pub async fn apply_cell_flag_transaction(
     }
 
     let changes = transaction.cell_flag_transaction()?.unwrap_or_default();
+    if changes.is_empty() && current.manifest.cell_flag_definitions.is_empty() {
+        manifest.cell_flag_definitions.clear();
+        manifest.cell_flag_states.clear();
+        manifest.next_cell_flag_id = current.manifest.next_cell_flag_id;
+        return Ok(());
+    }
+    if changes.is_empty() && matches!(transaction.operation, Operation::Append { .. }) {
+        manifest
+            .cell_flag_definitions
+            .clone_from(&current.manifest.cell_flag_definitions);
+        manifest
+            .cell_flag_states
+            .clone_from(&current.manifest.cell_flag_states);
+        manifest.next_cell_flag_id = current.manifest.next_cell_flag_id;
+        return Ok(());
+    }
     let final_field_ids: HashSet<i32> = manifest.schema.field_ids().into_iter().collect();
 
     let mut definitions = current.manifest.cell_flag_definitions.clone();
@@ -2475,6 +2491,78 @@ mod tests {
             flagged_ids(&dataset, "value", FLAG_NAME).await?,
             vec![30, 31]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overwrite_preserves_only_matching_field_identities() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 2).await?;
+        let definition = dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
+
+        let reordered_schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let reordered = RecordBatch::try_new(
+            reordered_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(20), None])),
+                Arc::new(Int32Array::from(vec![2, 3])),
+            ],
+        )?;
+        dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(reordered)], reordered_schema),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        assert_eq!(
+            dataset.cell_flag_definitions(),
+            std::slice::from_ref(&definition)
+        );
+        assert_eq!(
+            dataset.schema().field("value").unwrap().id,
+            definition.field_id
+        );
+        assert_ne!(
+            dataset.schema().field("id").unwrap().id,
+            definition.field_id
+        );
+        assert!(flagged_ids(&dataset, "value", FLAG_NAME).await?.is_empty());
+
+        let replacement_schema = Arc::new(Schema::new(vec![
+            Field::new("other_id", DataType::Int32, false),
+            Field::new("unrelated", DataType::Int32, true),
+        ]));
+        let replacement = RecordBatch::try_new(
+            replacement_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(Int32Array::from(vec![Some(40), None])),
+            ],
+        )?;
+        dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(replacement)], replacement_schema),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        assert!(dataset.cell_flag_definitions().is_empty());
+        let replacement_definition = dataset
+            .register_cell_flag("unrelated", FLAG_NAME, false)
+            .await?;
+        assert!(replacement_definition.flag_id > definition.flag_id);
         Ok(())
     }
 

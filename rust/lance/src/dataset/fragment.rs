@@ -1929,10 +1929,18 @@ impl FileFragment {
         Ok((new_fragment, new_schema))
     }
 
-    pub(crate) async fn merge(self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        self.merge_with_matches(join_column, joiner)
-            .await
-            .map(|(fragment, _)| fragment)
+    pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
+        let mut updater = self.updater(Some(&[join_column]), None, None, None).await?;
+
+        while let Some(batch) = updater.next().await? {
+            let batch = joiner
+                .collect(&self.dataset, batch[join_column].clone())
+                .await?;
+            updater.update(batch).await?;
+        }
+
+        self.metadata = updater.finish().await?;
+        Ok(self)
     }
 
     pub(crate) async fn merge_with_matches(

@@ -6633,6 +6633,30 @@ def test_cell_flag_public_api(tmp_path: Path):
         dataset.update(where="id = 0", cell_flags={"embedding": {"computed": 1}})
 
 
+def test_cell_flag_overwrite_preserves_field_identity(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "tracked": [10, 20]}), tmp_path
+    )
+    definition = dataset.register_cell_flag("tracked", "computed")
+
+    dataset = lance.write_dataset(
+        pa.table({"tracked": [30, 40], "id": [3, 4]}),
+        dataset,
+        mode="overwrite",
+    )
+    assert dataset.cell_flag_definitions() == [definition]
+    assert dataset.to_table(columns={"flag": "cell_flag(tracked, 'computed')"})[
+        "flag"
+    ].to_pylist() == [False, False]
+
+    dataset = lance.write_dataset(
+        pa.table({"other_id": [5], "unrelated": [50]}),
+        dataset,
+        mode="overwrite",
+    )
+    assert dataset.cell_flag_definitions() == []
+
+
 def test_cell_flag_alter_and_rowid_merge(tmp_path: Path):
     dataset = lance.write_dataset(
         pa.table({"id": range(6), "embedding": pa.array(range(10, 16), pa.int32())}),

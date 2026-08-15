@@ -1209,9 +1209,26 @@ pub struct ScalarIndexInfo {
     /// Indices that omit `fragment_bitmap` (legacy or unsupported) simply
     /// don't appear here and so report coverage as unknown.
     fragment_bitmaps: HashMap<(String, String), RoaringBitmap>,
-    /// Physical row counts used to bound snapshot-native full-fragment
-    /// selections before they enter row-mask boolean algebra.
-    fragment_physical_rows: HashMap<u32, u32>,
+    /// Snapshot fragments retained at O(1) cost so physical row counts can be
+    /// indexed lazily only when a full Cell Flag selection needs bounds.
+    fragments: Arc<Vec<Fragment>>,
+    /// Lazily populated physical row counts for snapshot-native selections.
+    fragment_physical_rows: OnceLock<HashMap<u32, u32>>,
+}
+
+impl ScalarIndexInfo {
+    fn fragment_physical_rows(&self) -> &HashMap<u32, u32> {
+        self.fragment_physical_rows.get_or_init(|| {
+            self.fragments
+                .iter()
+                .filter_map(|fragment| {
+                    let fragment_id = u32::try_from(fragment.id).ok()?;
+                    let physical_rows = u32::try_from(fragment.physical_rows?).ok()?;
+                    Some((fragment_id, physical_rows))
+                })
+                .collect()
+        })
+    }
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
@@ -1248,7 +1265,7 @@ impl IndexInformationProvider for ScalarIndexInfo {
                     // deletion block list from it would therefore materialize all 2^32 row
                     // offsets. Bound the query mask to the fragment's real address space while
                     // retaining the compact Full representation in Cell Flag storage.
-                    let physical_rows = *self.fragment_physical_rows.get(fragment_id)?;
+                    let physical_rows = *self.fragment_physical_rows().get(fragment_id)?;
                     if physical_rows > 0 {
                         let mut bitmap = RoaringBitmap::new();
                         bitmap.insert_range(0..physical_rows);
@@ -3228,19 +3245,11 @@ impl DatasetIndexInternalExt for Dataset {
             .into_iter()
             .filter_map(|(k, v)| v.map(|bm| (k, bm)))
             .collect();
-        let fragment_physical_rows = self
-            .fragments()
-            .iter()
-            .filter_map(|fragment| {
-                let fragment_id = u32::try_from(fragment.id).ok()?;
-                let physical_rows = u32::try_from(fragment.physical_rows?).ok()?;
-                Some((fragment_id, physical_rows))
-            })
-            .collect::<HashMap<_, _>>();
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
             fragment_bitmaps,
-            fragment_physical_rows,
+            fragments: self.manifest.fragments.clone(),
+            fragment_physical_rows: OnceLock::new(),
         })
     }
 
