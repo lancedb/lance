@@ -1188,39 +1188,64 @@ pub async fn load_cell_flag_fragments(
     let Some(root) = dataset.load_cell_flag_root_shared(flag_id).await? else {
         return Ok(HashMap::new());
     };
+    let fragments = select_cell_flag_fragments(&root, selected_fragment_ids.as_deref());
     let io_parallelism = dataset.object_store.io_parallelism().max(1);
-    futures::stream::iter(root.fragments.iter().cloned())
-        .map(|fragment| {
-            let selected_fragment_ids = selected_fragment_ids.clone();
-            async move {
-                let fragment_id = u32::try_from(fragment.fragment_id).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "Cell flag fragment ID {} does not fit in a row address",
-                        fragment.fragment_id
-                    ))
-                })?;
-                if selected_fragment_ids
-                    .as_ref()
-                    .is_some_and(|selected| !selected.contains(&fragment_id))
-                {
-                    return Ok::<Option<(u32, FlagFragment)>, Error>(None);
+    futures::stream::iter(fragments)
+        .map(|fragment| async move {
+            let fragment_id = u32::try_from(fragment.fragment_id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "Cell flag fragment ID {} does not fit in a row address",
+                    fragment.fragment_id
+                ))
+            })?;
+            let state = match &fragment.state {
+                CellFlagFragmentState::All => FlagFragment::All,
+                CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
+                    let bitmap = dataset
+                        .load_cell_flag_bitmap_shared(flag_id, &fragment)
+                        .await?;
+                    FlagFragment::Partial(bitmap)
                 }
-                let state = match &fragment.state {
-                    CellFlagFragmentState::All => FlagFragment::All,
-                    CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
-                        let bitmap = dataset
-                            .load_cell_flag_bitmap_shared(flag_id, &fragment)
-                            .await?;
-                        FlagFragment::Partial(bitmap)
-                    }
-                };
-                Ok(Some((fragment_id, state)))
-            }
+            };
+            Ok::<(u32, FlagFragment), Error>((fragment_id, state))
         })
         .buffer_unordered(io_parallelism)
-        .try_filter_map(|entry| async move { Ok(entry) })
         .try_collect::<HashMap<_, _>>()
         .await
+}
+
+fn select_cell_flag_fragments(
+    root: &CellFlagRoot,
+    selected_fragment_ids: Option<&HashSet<u32>>,
+) -> Vec<CellFlagFragment> {
+    let Some(selected_fragment_ids) = selected_fragment_ids else {
+        return root.fragments.clone();
+    };
+    if selected_fragment_ids.is_empty() {
+        return Vec::new();
+    }
+
+    if selected_fragment_ids.len().saturating_mul(8) <= root.fragments.len() {
+        selected_fragment_ids
+            .iter()
+            .filter_map(|fragment_id| {
+                root.fragments
+                    .binary_search_by_key(&u64::from(*fragment_id), |entry| entry.fragment_id)
+                    .ok()
+                    .map(|position| root.fragments[position].clone())
+            })
+            .collect()
+    } else {
+        root.fragments
+            .iter()
+            .filter(|entry| {
+                u32::try_from(entry.fragment_id)
+                    .ok()
+                    .is_some_and(|fragment_id| selected_fragment_ids.contains(&fragment_id))
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(feature = "substrait")]
@@ -2091,6 +2116,29 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const FLAG_NAME: &str = "lancedb.computed";
+
+    #[test]
+    fn sparse_fragment_selection_uses_sorted_root_entries() {
+        let root = CellFlagRoot {
+            fragments: (0..100)
+                .map(|fragment_id| CellFlagFragment {
+                    fragment_id,
+                    physical_rows: 1,
+                    state: CellFlagFragmentState::All,
+                })
+                .collect(),
+        };
+        let selected = HashSet::from([1, 99, 101]);
+
+        let fragments = select_cell_flag_fragments(&root, Some(&selected));
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.fragment_id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([1, 99])
+        );
+    }
 
     async fn dataset_with_rows(
         directory: &TempStrDir,
@@ -3266,7 +3314,6 @@ mod tests {
             inserted_rows_filter: None,
             updated_fragment_offsets: None,
         };
-        let recorded_rows = RowAddrTreeMap::from_iter([0_u64]);
         let transaction = Transaction::new(dataset.manifest.version, operation, None)
             .with_cell_flag_transaction_for_dataset(
                 CellFlagTransaction {
@@ -3275,7 +3322,7 @@ mod tests {
                         value: true,
                         row_addresses: roaring::RoaringTreemap::from_iter([0_u64]),
                     }],
-                    affected_rows: Some(recorded_rows),
+                    affected_rows: None,
                     ..Default::default()
                 },
                 &dataset,

@@ -982,11 +982,11 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             .filter_map(|name| self.dataset.schema().field(name).map(|f| f.id))
             .collect();
         let capture_cell_flag_sources = !self.dataset.manifest.cell_flag_states.is_empty()
+            || !self.params.matched_cell_flag_values.is_empty()
             || self
                 .params
-                .matched_cell_flag_values
+                .inserted_cell_flag_values
                 .iter()
-                .chain(&self.params.inserted_cell_flag_values)
                 .any(|(_, value)| *value);
         let merge_state = Arc::new(Mutex::new(MergeState::new(
             MergeInsertMetrics::new(&self.metrics, partition),

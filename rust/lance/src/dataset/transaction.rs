@@ -348,6 +348,13 @@ impl CellFlagTransaction {
             && self.fragment_states.is_empty()
             && self.transfers.is_empty()
     }
+
+    pub(crate) fn row_change_rows(&self) -> RowAddrTreeMap {
+        self.row_changes
+            .iter()
+            .flat_map(|change| change.row_addresses.iter())
+            .collect()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -536,7 +543,7 @@ fn update_operation_digest(hasher: &mut blake3::Hasher, value: &[u8]) {
 }
 
 fn cell_flag_operation_digest(transaction: &Transaction) -> [u8; 32] {
-    let mut proto = pb::Transaction::from(transaction);
+    let mut proto = transaction_to_proto(transaction, false);
     let map_entries = canonicalize_cell_flag_operation_proto(&mut proto);
     let mut hasher = blake3::Hasher::new();
     update_operation_digest(&mut hasher, b"lance-cell-flag-operation-v1");
@@ -2437,13 +2444,7 @@ impl Transaction {
                 && !changes.row_changes.is_empty()
         );
         changes.affected_rows = if is_flag_only {
-            Some(
-                changes
-                    .row_changes
-                    .iter()
-                    .flat_map(|change| change.row_addresses.iter())
-                    .collect(),
-            )
+            None
         } else {
             affected_rows.filter(|rows| !rows.is_empty())
         };
@@ -2509,14 +2510,9 @@ impl Transaction {
                 && new_fragments.is_empty()
                 && fields_modified.is_empty();
             if is_flag_only {
-                let flag_rows = changes
-                    .row_changes
-                    .iter()
-                    .flat_map(|change| change.row_addresses.iter())
-                    .collect::<RowAddrTreeMap>();
-                if changes.affected_rows.as_ref() != Some(&flag_rows) {
+                if changes.affected_rows.is_some() {
                     return Err(Error::invalid_input(
-                        "Flag-only update affected rows must exactly match its Cell Flag row changes",
+                        "Flag-only update affected rows are derived from its Cell Flag row changes and must not be serialized",
                     ));
                 }
             } else if (!updated_fragments.is_empty() || !removed_fragment_ids.is_empty())
@@ -2530,18 +2526,35 @@ impl Transaction {
         Ok(())
     }
 
-    pub(crate) fn validate_cell_flag_dataset(&self, dataset: &Dataset) -> Result<()> {
-        let Some(changes) = self.cell_flag_transaction()? else {
-            return Ok(());
-        };
-        dataset.validate_cell_flag_transaction_identity(&changes)
-    }
-
-    pub(crate) fn cell_flag_affected_rows(&self) -> Result<Option<RowAddrTreeMap>> {
+    pub(crate) fn cell_flag_commit_affected_rows(
+        &self,
+        dataset: Option<&Dataset>,
+    ) -> Result<Option<RowAddrTreeMap>> {
         let Some(changes) = self.cell_flag_transaction()? else {
             return Ok(None);
         };
-        Ok(changes.affected_rows)
+        if let Some(dataset) = dataset {
+            dataset.validate_cell_flag_transaction_identity(&changes)?;
+        }
+        let is_flag_only = matches!(
+            &self.operation,
+            Operation::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                new_fragments,
+                fields_modified,
+                ..
+            } if updated_fragments.is_empty()
+                && removed_fragment_ids.is_empty()
+                && new_fragments.is_empty()
+                && fields_modified.is_empty()
+                && !changes.row_changes.is_empty()
+        );
+        Ok(if is_flag_only {
+            Some(changes.row_change_rows())
+        } else {
+            changes.affected_rows
+        })
     }
 
     pub(crate) fn cell_flag_conflict_scope(&self) -> Result<CellFlagConflictScope> {
@@ -5204,227 +5217,230 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     }
 }
 
-impl From<&Transaction> for pb::Transaction {
-    fn from(value: &Transaction) -> Self {
-        let operation = match &value.operation {
-            Operation::Append { fragments } => {
-                pb::transaction::Operation::Append(pb::transaction::Append {
-                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                })
-            }
-            Operation::Clone {
-                is_shallow,
-                ref_name,
-                ref_version,
-                ref_path,
-                branch_name,
-            } => pb::transaction::Operation::Clone(pb::transaction::Clone {
-                is_shallow: *is_shallow,
-                ref_name: ref_name.clone(),
-                ref_version: *ref_version,
-                ref_path: ref_path.clone(),
-                branch_name: branch_name.clone(),
-            }),
-            Operation::Delete {
-                updated_fragments,
-                deleted_fragment_ids,
-                predicate,
-            } => pb::transaction::Operation::Delete(pb::transaction::Delete {
-                updated_fragments: updated_fragments
-                    .iter()
-                    .map(pb::DataFragment::from)
-                    .collect(),
-                deleted_fragment_ids: deleted_fragment_ids.clone(),
-                predicate: predicate.clone(),
-            }),
-            Operation::Overwrite {
-                fragments,
-                schema,
-                config_upsert_values,
-                initial_bases,
-            } => pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
+fn transaction_to_proto(
+    value: &Transaction,
+    include_cell_flag_transaction: bool,
+) -> pb::Transaction {
+    let operation = match &value.operation {
+        Operation::Append { fragments } => {
+            pb::transaction::Operation::Append(pb::transaction::Append {
                 fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                schema: Fields::from(schema).0,
-                schema_metadata: schema_metadata_to_proto(&schema.metadata),
-                config_upsert_values: config_upsert_values.clone().unwrap_or(Default::default()),
-                initial_bases: initial_bases
-                    .as_ref()
-                    .map(|paths| {
-                        paths
-                            .iter()
-                            .cloned()
-                            .map(|bp: BasePath| -> pb::BasePath { bp.into() })
-                            .collect::<Vec<pb::BasePath>>()
-                    })
-                    .unwrap_or_default(),
-            }),
-            Operation::ReserveFragments { num_fragments } => {
-                pb::transaction::Operation::ReserveFragments(pb::transaction::ReserveFragments {
-                    num_fragments: *num_fragments,
-                })
-            }
-            Operation::Rewrite {
-                groups,
-                rewritten_indices,
-                frag_reuse_index: _,
-            } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
-                groups: groups
-                    .iter()
-                    .map(pb::transaction::rewrite::RewriteGroup::from)
-                    .collect(),
-                rewritten_indices: rewritten_indices
-                    .iter()
-                    .map(|rewritten| rewritten.into())
-                    .collect(),
-                ..Default::default()
-            }),
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
-                removed_indices: removed_indices
-                    .iter()
-                    .map(pb::IndexMetadata::from)
-                    .collect(),
-            }),
-            Operation::Merge {
-                fragments,
-                schema,
-                preserves_nullability,
-            } => pb::transaction::Operation::Merge(pb::transaction::Merge {
-                fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                schema: Fields::from(schema).0,
-                schema_metadata: schema_metadata_to_proto(&schema.metadata),
-                preserves_nullability: *preserves_nullability,
-            }),
-            Operation::Restore { version } => {
-                pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
-            }
-            Operation::Update {
-                removed_fragment_ids,
-                updated_fragments,
-                new_fragments,
-                fields_modified,
-                compacted_sstables,
-                fields_for_preserving_frag_bitmap,
-                update_mode,
-                inserted_rows_filter,
-                updated_fragment_offsets,
-            } => pb::transaction::Operation::Update(pb::transaction::Update {
-                removed_fragment_ids: removed_fragment_ids.clone(),
-                updated_fragments: updated_fragments
-                    .iter()
-                    .map(pb::DataFragment::from)
-                    .collect(),
-                new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
-                fields_modified: fields_modified.clone(),
-                compacted_sstables: compacted_sstables
-                    .iter()
-                    .map(pb::CompactedSsTable::from)
-                    .collect(),
-                fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
-                update_mode: update_mode
-                    .as_ref()
-                    .map(|mode| match mode {
-                        UpdateMode::RewriteRows => 0,
-                        UpdateMode::RewriteColumns => 1,
-                    })
-                    .unwrap_or(0),
-                inserted_rows: inserted_rows_filter.as_ref().map(|ik| ik.into()),
-                // Field 9: no longer written; kept empty for forward compat.
-                updated_fragment_offsets: HashMap::new(),
-                // Field 10: RoaringBitmap bytes.
-                updated_fragment_offset_bitmaps: updated_fragment_offsets
-                    .as_ref()
-                    .map(|UpdatedFragmentOffsets(m)| {
-                        m.iter()
-                            .filter(|(_, b)| !b.is_empty())
-                            .map(|(frag_id, b)| {
-                                let mut buf = Vec::new();
-                                b.serialize_into(&mut buf)
-                                    .expect("RoaringBitmap serialization cannot fail");
-                                (*frag_id, buf)
-                            })
-                            .collect::<HashMap<_, _>>()
-                    })
-                    .unwrap_or_default(),
-            }),
-            Operation::Project {
-                schema,
-                preserves_nullability,
-            } => pb::transaction::Operation::Project(pb::transaction::Project {
-                schema: Fields::from(schema).0,
-                preserves_nullability: *preserves_nullability,
-            }),
-            Operation::UpdateConfig {
-                config_updates,
-                table_metadata_updates,
-                schema_metadata_updates,
-                field_metadata_updates,
-            } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
-                config_updates: config_updates
-                    .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
-                table_metadata_updates: table_metadata_updates
-                    .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
-                schema_metadata_updates: schema_metadata_updates
-                    .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
-                field_metadata_updates: field_metadata_updates
-                    .iter()
-                    .map(|(field_id, update_map)| {
-                        (*field_id, pb::transaction::UpdateMap::from(update_map))
-                    })
-                    .collect(),
-                // Leave old fields empty - we only write new-style fields
-                upsert_values: Default::default(),
-                delete_keys: Default::default(),
-                schema_metadata: Default::default(),
-                field_metadata: Default::default(),
-            }),
-            Operation::DataReplacement { replacements } => {
-                pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
-                    replacements: replacements
-                        .iter()
-                        .map(pb::transaction::DataReplacementGroup::from)
-                        .collect(),
-                })
-            }
-            Operation::DataOverlay { groups } => {
-                pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
-                    groups: groups
-                        .iter()
-                        .map(pb::transaction::DataOverlayGroup::from)
-                        .collect(),
-                })
-            }
-            Operation::UpdateMemWalState {
-                compacted_sstables,
-                require_index_catchup,
-            } => {
-                pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
-                    compacted_sstables: compacted_sstables
-                        .iter()
-                        .map(pb::CompactedSsTable::from)
-                        .collect::<Vec<_>>(),
-                    // Written only when requesting activation, so an ordinary
-                    // progress update stays byte-identical to before.
-                    require_index_catchup: require_index_catchup.then_some(true),
-                })
-            }
-            Operation::UpdateBases { new_bases } => {
-                pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
-                    new_bases: new_bases
+            })
+        }
+        Operation::Clone {
+            is_shallow,
+            ref_name,
+            ref_version,
+            ref_path,
+            branch_name,
+        } => pb::transaction::Operation::Clone(pb::transaction::Clone {
+            is_shallow: *is_shallow,
+            ref_name: ref_name.clone(),
+            ref_version: *ref_version,
+            ref_path: ref_path.clone(),
+            branch_name: branch_name.clone(),
+        }),
+        Operation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            predicate,
+        } => pb::transaction::Operation::Delete(pb::transaction::Delete {
+            updated_fragments: updated_fragments
+                .iter()
+                .map(pb::DataFragment::from)
+                .collect(),
+            deleted_fragment_ids: deleted_fragment_ids.clone(),
+            predicate: predicate.clone(),
+        }),
+        Operation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values,
+            initial_bases,
+        } => pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
+            fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+            schema: Fields::from(schema).0,
+            schema_metadata: schema_metadata_to_proto(&schema.metadata),
+            config_upsert_values: config_upsert_values.clone().unwrap_or(Default::default()),
+            initial_bases: initial_bases
+                .as_ref()
+                .map(|paths| {
+                    paths
                         .iter()
                         .cloned()
                         .map(|bp: BasePath| -> pb::BasePath { bp.into() })
-                        .collect::<Vec<pb::BasePath>>(),
+                        .collect::<Vec<pb::BasePath>>()
                 })
-            }
-        };
+                .unwrap_or_default(),
+        }),
+        Operation::ReserveFragments { num_fragments } => {
+            pb::transaction::Operation::ReserveFragments(pb::transaction::ReserveFragments {
+                num_fragments: *num_fragments,
+            })
+        }
+        Operation::Rewrite {
+            groups,
+            rewritten_indices,
+            frag_reuse_index: _,
+        } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
+            groups: groups
+                .iter()
+                .map(pb::transaction::rewrite::RewriteGroup::from)
+                .collect(),
+            rewritten_indices: rewritten_indices
+                .iter()
+                .map(|rewritten| rewritten.into())
+                .collect(),
+            ..Default::default()
+        }),
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
+            new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
+            removed_indices: removed_indices
+                .iter()
+                .map(pb::IndexMetadata::from)
+                .collect(),
+        }),
+        Operation::Merge {
+            fragments,
+            schema,
+            preserves_nullability,
+        } => pb::transaction::Operation::Merge(pb::transaction::Merge {
+            fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+            schema: Fields::from(schema).0,
+            schema_metadata: schema_metadata_to_proto(&schema.metadata),
+            preserves_nullability: *preserves_nullability,
+        }),
+        Operation::Restore { version } => {
+            pb::transaction::Operation::Restore(pb::transaction::Restore { version: *version })
+        }
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            fields_modified,
+            compacted_sstables,
+            fields_for_preserving_frag_bitmap,
+            update_mode,
+            inserted_rows_filter,
+            updated_fragment_offsets,
+        } => pb::transaction::Operation::Update(pb::transaction::Update {
+            removed_fragment_ids: removed_fragment_ids.clone(),
+            updated_fragments: updated_fragments
+                .iter()
+                .map(pb::DataFragment::from)
+                .collect(),
+            new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
+            fields_modified: fields_modified.clone(),
+            compacted_sstables: compacted_sstables
+                .iter()
+                .map(pb::CompactedSsTable::from)
+                .collect(),
+            fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
+            update_mode: update_mode
+                .as_ref()
+                .map(|mode| match mode {
+                    UpdateMode::RewriteRows => 0,
+                    UpdateMode::RewriteColumns => 1,
+                })
+                .unwrap_or(0),
+            inserted_rows: inserted_rows_filter.as_ref().map(|ik| ik.into()),
+            // Field 9: no longer written; kept empty for forward compat.
+            updated_fragment_offsets: HashMap::new(),
+            // Field 10: RoaringBitmap bytes.
+            updated_fragment_offset_bitmaps: updated_fragment_offsets
+                .as_ref()
+                .map(|UpdatedFragmentOffsets(m)| {
+                    m.iter()
+                        .filter(|(_, b)| !b.is_empty())
+                        .map(|(frag_id, b)| {
+                            let mut buf = Vec::new();
+                            b.serialize_into(&mut buf)
+                                .expect("RoaringBitmap serialization cannot fail");
+                            (*frag_id, buf)
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default(),
+        }),
+        Operation::Project {
+            schema,
+            preserves_nullability,
+        } => pb::transaction::Operation::Project(pb::transaction::Project {
+            schema: Fields::from(schema).0,
+            preserves_nullability: *preserves_nullability,
+        }),
+        Operation::UpdateConfig {
+            config_updates,
+            table_metadata_updates,
+            schema_metadata_updates,
+            field_metadata_updates,
+        } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
+            config_updates: config_updates
+                .as_ref()
+                .map(pb::transaction::UpdateMap::from),
+            table_metadata_updates: table_metadata_updates
+                .as_ref()
+                .map(pb::transaction::UpdateMap::from),
+            schema_metadata_updates: schema_metadata_updates
+                .as_ref()
+                .map(pb::transaction::UpdateMap::from),
+            field_metadata_updates: field_metadata_updates
+                .iter()
+                .map(|(field_id, update_map)| {
+                    (*field_id, pb::transaction::UpdateMap::from(update_map))
+                })
+                .collect(),
+            // Leave old fields empty - we only write new-style fields
+            upsert_values: Default::default(),
+            delete_keys: Default::default(),
+            schema_metadata: Default::default(),
+            field_metadata: Default::default(),
+        }),
+        Operation::DataReplacement { replacements } => {
+            pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
+                replacements: replacements
+                    .iter()
+                    .map(pb::transaction::DataReplacementGroup::from)
+                    .collect(),
+            })
+        }
+        Operation::DataOverlay { groups } => {
+            pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
+                groups: groups
+                    .iter()
+                    .map(pb::transaction::DataOverlayGroup::from)
+                    .collect(),
+            })
+        }
+        Operation::UpdateMemWalState {
+            compacted_sstables,
+            require_index_catchup,
+        } => {
+            pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
+                compacted_sstables: compacted_sstables
+                    .iter()
+                    .map(pb::CompactedSsTable::from)
+                    .collect::<Vec<_>>(),
+                // Written only when requesting activation, so an ordinary
+                // progress update stays byte-identical to before.
+                require_index_catchup: require_index_catchup.then_some(true),
+            })
+        }
+        Operation::UpdateBases { new_bases } => {
+            pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
+                new_bases: new_bases
+                    .iter()
+                    .cloned()
+                    .map(|bp: BasePath| -> pb::BasePath { bp.into() })
+                    .collect::<Vec<pb::BasePath>>(),
+            })
+        }
+    };
 
+    let (transaction_properties, cell_flag_transaction) = if include_cell_flag_transaction {
         let mut transaction_properties = value
             .transaction_properties
             .as_ref()
@@ -5437,14 +5453,23 @@ impl From<&Transaction> for pb::Transaction {
         if cell_flag_transaction.is_some() {
             transaction_properties.remove(CELL_FLAG_TRANSACTION_PROPERTY);
         }
-        Self {
-            read_version: value.read_version,
-            uuid: value.uuid.clone(),
-            operation: Some(operation),
-            tag: value.tag.clone().unwrap_or("".to_string()),
-            transaction_properties,
-            cell_flag_transaction,
-        }
+        (transaction_properties, cell_flag_transaction)
+    } else {
+        (HashMap::new(), None)
+    };
+    pb::Transaction {
+        read_version: value.read_version,
+        uuid: value.uuid.clone(),
+        operation: Some(operation),
+        tag: value.tag.clone().unwrap_or("".to_string()),
+        transaction_properties,
+        cell_flag_transaction,
+    }
+}
+
+impl From<&Transaction> for pb::Transaction {
+    fn from(value: &Transaction) -> Self {
+        transaction_to_proto(value, true)
     }
 }
 
@@ -7215,7 +7240,7 @@ mod tests {
             1,
             Operation::Update {
                 removed_fragment_ids: Vec::new(),
-                updated_fragments: Vec::new(),
+                updated_fragments: vec![Fragment::new(2)],
                 new_fragments: Vec::new(),
                 fields_modified: Vec::new(),
                 compacted_sstables: Vec::new(),
@@ -7261,6 +7286,48 @@ mod tests {
             .transaction_properties
             .insert(CELL_FLAG_TRANSACTION_PROPERTY.to_string(), encoded);
         assert!(Transaction::try_from(user_proto).is_err());
+    }
+
+    #[test]
+    fn flag_only_transaction_derives_affected_rows_without_serializing_them() {
+        let row_addresses = roaring::RoaringTreemap::from_iter([3_u64, (2_u64 << 32) | 4]);
+        let transaction = Transaction::new_from_version(
+            1,
+            Operation::Update {
+                removed_fragment_ids: Vec::new(),
+                updated_fragments: Vec::new(),
+                new_fragments: Vec::new(),
+                fields_modified: Vec::new(),
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: Vec::new(),
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+        )
+        .with_cell_flag_transaction(CellFlagTransaction {
+            row_changes: vec![CellFlagRowChange {
+                flag_id: 11,
+                value: false,
+                row_addresses: row_addresses.clone(),
+            }],
+            dataset_identity: Uuid::new_v4().to_string(),
+            ..Default::default()
+        });
+
+        let proto = pb::Transaction::from(&transaction);
+        assert!(
+            proto
+                .cell_flag_transaction
+                .as_ref()
+                .expect("typed sidecar")
+                .affected_rows
+                .is_empty()
+        );
+        assert_eq!(
+            transaction.cell_flag_commit_affected_rows(None).unwrap(),
+            Some(RowAddrTreeMap::from(row_addresses))
+        );
     }
 
     #[test]

@@ -1110,7 +1110,6 @@ if TYPE_CHECKING:
         *,
         return_transaction: Literal[False] = False,
         mode: str = "append",
-        cell_flags: Optional[CellFlagChanges] = None,
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
@@ -1184,7 +1183,9 @@ def write_fragments(
         Explicit Cell Flag values for every row written by this operation,
         grouped as ``{field: {flag_name: bool}}``. The flags must already be
         registered on the destination dataset. Omitting a flag writes false by
-        absence and never infers state from field values, including NULL.
+        absence and never infers state from field values, including NULL. This
+        option requires ``return_transaction=True`` so the returned value can
+        carry the flag state atomically with the fragment metadata.
     max_rows_per_file : int, default 1024 * 1024
         The maximum number of rows per data file.
     max_rows_per_group : int, default 1024
@@ -1319,6 +1320,10 @@ def write_fragments(
             "Both 'namespace_client' and 'table_id' must be provided together."
         )
 
+    normalized_cell_flags = _normalize_cell_flags(cell_flags)
+    if normalized_cell_flags and not return_transaction:
+        raise ValueError("cell_flags requires return_transaction=True")
+
     reader = _coerce_reader(data, schema)
 
     if isinstance(dataset_uri, Path):
@@ -1354,7 +1359,7 @@ def write_fragments(
         dataset_uri,
         reader,
         mode=mode,
-        cell_flags=_normalize_cell_flags(cell_flags),
+        cell_flags=normalized_cell_flags,
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,

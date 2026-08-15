@@ -2623,11 +2623,11 @@ impl MergeInsertJob {
         );
         let joined = self.create_joined_stream(source).await?;
         let capture_cell_flag_sources = !self.dataset.manifest.cell_flag_states.is_empty()
+            || !self.params.matched_cell_flag_values.is_empty()
             || self
                 .params
-                .matched_cell_flag_values
+                .inserted_cell_flag_values
                 .iter()
-                .chain(&self.params.inserted_cell_flag_values)
                 .any(|(_, value)| *value);
         let merger = Merger::try_new(
             self.params.clone(),

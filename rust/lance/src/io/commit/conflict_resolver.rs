@@ -7,7 +7,9 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{DataOverlayGroup, Operation, Transaction, UpdateMode},
+    dataset::transaction::{
+        CellFlagTransaction, DataOverlayGroup, Operation, Transaction, UpdateMode,
+    },
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
@@ -102,8 +104,19 @@ fn cell_flag_replacing_fragment_ids(operation: &Operation) -> HashSet<u64> {
 }
 
 fn is_flag_only_update(transaction: &Transaction) -> Result<bool> {
-    Ok(matches!(
+    let cell_flag_transaction = transaction.cell_flag_transaction()?;
+    Ok(is_flag_only_update_with_changes(
         &transaction.operation,
+        cell_flag_transaction.as_ref(),
+    ))
+}
+
+fn is_flag_only_update_with_changes(
+    operation: &Operation,
+    cell_flag_transaction: Option<&CellFlagTransaction>,
+) -> bool {
+    matches!(
+        operation,
         Operation::Update {
             updated_fragments,
             removed_fragment_ids,
@@ -114,9 +127,7 @@ fn is_flag_only_update(transaction: &Transaction) -> Result<bool> {
             && removed_fragment_ids.is_empty()
             && new_fragments.is_empty()
             && fields_modified.is_empty()
-    ) && transaction
-        .cell_flag_transaction()?
-        .is_some_and(|changes| !changes.row_changes.is_empty()))
+    ) && cell_flag_transaction.is_some_and(|changes| !changes.row_changes.is_empty())
 }
 
 fn cell_flag_row_changes_conflict(
@@ -1823,7 +1834,8 @@ impl<'a> TransactionRebase<'a> {
         let cell_flag_transaction = self.transaction.cell_flag_transaction()?;
         let transaction = match &self.transaction.operation {
             Operation::Delete { .. } | Operation::Update { .. } => {
-                self.finish_delete_update(dataset).await
+                self.finish_delete_update(dataset, cell_flag_transaction.as_ref())
+                    .await
             }
             Operation::CreateIndex { .. } => self.finish_create_index(dataset).await,
             Operation::Rewrite { .. } => self.finish_rewrite(dataset).await,
@@ -1847,8 +1859,13 @@ impl<'a> TransactionRebase<'a> {
         })
     }
 
-    async fn finish_delete_update(mut self, dataset: &Dataset) -> Result<Transaction> {
-        let is_flag_only_update = is_flag_only_update(&self.transaction)?;
+    async fn finish_delete_update(
+        mut self,
+        dataset: &Dataset,
+        cell_flag_transaction: Option<&CellFlagTransaction>,
+    ) -> Result<Transaction> {
+        let is_flag_only_update =
+            is_flag_only_update_with_changes(&self.transaction.operation, cell_flag_transaction);
 
         // Flag-only updates use affected rows for OCC precision, not as a
         // deletion intent. Concurrent deletion files preserve physical row
@@ -1860,11 +1877,9 @@ impl<'a> TransactionRebase<'a> {
                 .iter()
                 .any(|(_, (_, needs_check))| *needs_check)
             {
-                let affected_rows = self.affected_rows.as_ref().ok_or_else(|| {
-                    crate::Error::internal(
-                        "A flag-only update needs row-level conflict data to rebase",
-                    )
-                })?;
+                let affected_rows = cell_flag_transaction
+                    .expect("a flag-only update has Cell Flag changes")
+                    .row_change_rows();
                 let fragments_to_check = self
                     .initial_fragments
                     .iter()
@@ -1889,7 +1904,7 @@ impl<'a> TransactionRebase<'a> {
                 for (fragment_id, deletions) in current_deletions {
                     deleted_rows.insert_bitmap(fragment_id as u32, deletions);
                 }
-                let conflicting_rows = deleted_rows & (*affected_rows).clone();
+                let conflicting_rows = deleted_rows & affected_rows;
                 if conflicting_rows.len().map(|len| len > 0).unwrap_or(true) {
                     let row_addresses = conflicting_rows
                         .row_addrs()
@@ -1919,7 +1934,7 @@ impl<'a> TransactionRebase<'a> {
             .iter()
             .any(|(_, (_, needs_rewrite))| *needs_rewrite)
         {
-            if let Some(affected_rows) = self.affected_rows {
+            {
                 // Then we do the rebase
 
                 // 1. Load the deletion files that need a rewrite.
@@ -1971,7 +1986,16 @@ impl<'a> TransactionRebase<'a> {
                     existing_deletions
                         .insert_bitmap(fragment_id as u32, deletion_vec.as_ref().into());
                 }
-                let conflicting_rows = existing_deletions.clone() & affected_rows.clone();
+                let mut conflict_scope = self.affected_rows.cloned().unwrap_or_default();
+                if let Some(changes) = cell_flag_transaction {
+                    conflict_scope |= changes.row_change_rows();
+                }
+                if conflict_scope.len().is_some_and(|len| len == 0) {
+                    return Err(crate::Error::internal(
+                        "An update that needs rebasing has no row-level conflict scope",
+                    ));
+                }
+                let conflicting_rows = existing_deletions.clone() & conflict_scope;
                 if conflicting_rows.len().map(|v| v > 0).unwrap_or(true) {
                     let sample_addressed = conflicting_rows
                         .row_addrs()
@@ -1987,6 +2011,12 @@ impl<'a> TransactionRebase<'a> {
                         .into()));
                 }
 
+                let Some(affected_rows) = self.affected_rows else {
+                    return Ok(Transaction {
+                        read_version: dataset.manifest.version,
+                        ..self.transaction
+                    });
+                };
                 let merged = existing_deletions.clone() | affected_rows.clone();
 
                 let mut new_deleted_frag_ids = Vec::new();
@@ -2061,11 +2091,6 @@ impl<'a> TransactionRebase<'a> {
                     read_version: dataset.manifest.version,
                     ..self.transaction
                 })
-            } else {
-                // We shouldn't hit this.
-                Err(crate::Error::internal(
-                    "We have a transaction that needs to be rebased, but we don't have any affected rows.",
-                ))
             }
         } else {
             Ok(Transaction {
@@ -2622,7 +2647,6 @@ mod tests {
                 row_addresses: roaring::RoaringTreemap::from_iter([1_u64]),
             }],
             dataset_identity: Uuid::new_v4().to_string(),
-            affected_rows: Some(affected_rows.clone()),
             ..Default::default()
         });
         let rewrite = Transaction::new_from_version(
@@ -2721,7 +2745,6 @@ mod tests {
                         row_addresses: roaring::RoaringTreemap::from_iter([row_address]),
                     }],
                     dataset_identity: transaction_dataset_id.clone(),
-                    affected_rows: Some(RowAddrTreeMap::from_iter([row_address])),
                     ..Default::default()
                 })
         };

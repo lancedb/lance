@@ -6917,11 +6917,54 @@ def test_cell_flag_uncommitted_merge_insert_rebase_keeps_delete_scope(tmp_path: 
     assert _flag_rows(committed, field="value", name="reviewed") == [(1, True)]
 
 
+def test_cell_flag_uncommitted_explicit_clear_conflicts_with_set(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"id": [1, 2], "value": [10, 20]}), tmp_path)
+    dataset.register_cell_flag("value", "reviewed")
+    stale = lance.dataset(tmp_path)
+    transaction, _ = (
+        stale.merge_insert(on="id")
+        .set_matched_cell_flag("value", "reviewed", False)
+        .execute_uncommitted(pa.table({"id": [1]}))
+    )
+    assert transaction._cell_flag_transaction is not None
+
+    dataset.update(where="id = 1", cell_flags={"value": {"reviewed": True}})
+    with pytest.raises(OSError, match="Retryable commit conflict"):
+        lance.LanceDataset.commit(tmp_path, transaction, max_retries=0)
+
+
+def test_cell_flag_mixed_merge_insert_conflicts_with_matched_row_delete(
+    tmp_path: Path,
+):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}), tmp_path
+    )
+    dataset.register_cell_flag("value", "reviewed")
+    stale = lance.dataset(tmp_path)
+    transaction, _ = (
+        stale.merge_insert(on="id")
+        .when_not_matched_by_source_delete("id = 2")
+        .set_matched_cell_flag("value", "reviewed", True)
+        .execute_uncommitted(pa.table({"id": [1]}))
+    )
+
+    dataset.delete("id = 1")
+    with pytest.raises(OSError, match="Retryable commit conflict"):
+        lance.LanceDataset.commit(tmp_path, transaction, max_retries=0)
+
+
 def test_cell_flag_distributed_append_and_batch_commit(tmp_path: Path):
     dataset = lance.write_dataset(
         pa.table({"id": [0], "value": pa.array([0], pa.int32())}), tmp_path
     )
     dataset.register_cell_flag("value", "reviewed")
+
+    with pytest.raises(ValueError, match="requires return_transaction=True"):
+        lance.fragment.write_fragments(
+            pa.table({"id": [1], "value": pa.array([None], pa.int32())}),
+            dataset,
+            cell_flags={"value": {"reviewed": True}},
+        )
 
     first = lance.fragment.write_fragments(
         pa.table({"id": [1], "value": pa.array([None], pa.int32())}),

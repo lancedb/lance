@@ -629,7 +629,6 @@ impl UpdateJob {
                 .with_cell_flag_transaction_for_dataset(
                     CellFlagTransaction {
                         row_changes,
-                        affected_rows: Some(update_data.affected_rows.clone()),
                         ..Default::default()
                     },
                     dataset.as_ref(),

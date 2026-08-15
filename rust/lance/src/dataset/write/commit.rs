@@ -362,10 +362,6 @@ impl<'a> CommitBuilder<'a> {
             ));
         }
 
-        if let Some(dataset) = dest.dataset() {
-            transaction.validate_cell_flag_dataset(dataset)?;
-        }
-
         // Validate the operation before proceeding with the commit
         // This ensures that operations like Merge have proper validation for data integrity
         if let Some(dataset) = dest.dataset() {
@@ -417,7 +413,7 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
-        let derived_affected_rows = transaction.cell_flag_affected_rows()?;
+        let derived_affected_rows = transaction.cell_flag_commit_affected_rows(dest.dataset())?;
         if let (Some(supplied), Some(recorded)) =
             (self.affected_rows.as_ref(), derived_affected_rows.as_ref())
             && supplied != recorded
