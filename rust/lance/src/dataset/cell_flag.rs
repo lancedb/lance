@@ -190,13 +190,33 @@ fn decode_cell_flag_bitmap(
 
 impl Dataset {
     pub(crate) fn cell_flag_transaction_identity(&self) -> String {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&(self.object_store.store_prefix.len() as u64).to_le_bytes());
-        hasher.update(self.object_store.store_prefix.as_bytes());
-        let base = self.base.to_string();
-        hasher.update(&(base.len() as u64).to_le_bytes());
-        hasher.update(base.as_bytes());
-        hasher.finalize().to_hex().to_string()
+        self.manifest
+            .cell_flag_dataset_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string())
+    }
+
+    pub(crate) fn validate_cell_flag_transaction_identity(
+        &self,
+        changes: &CellFlagTransaction,
+    ) -> Result<()> {
+        match self.manifest.cell_flag_dataset_id.as_deref() {
+            Some(dataset_id) if changes.dataset_identity == dataset_id => Ok(()),
+            Some(_) => Err(Error::incompatible_transaction_source(
+                "Cell flag transaction belongs to a different dataset incarnation".into(),
+            )),
+            None if self.manifest.next_cell_flag_id == 0
+                && self.manifest.cell_flag_definitions.is_empty()
+                && self.manifest.cell_flag_states.is_empty()
+                && !changes.registrations.is_empty() =>
+            {
+                Ok(())
+            }
+            None => Err(Error::incompatible_transaction_source(
+                "Cell flag transaction cannot target a dataset without a Cell Flag incarnation"
+                    .into(),
+            )),
+        }
     }
 
     /// Return the flag definitions registered in this snapshot.
@@ -485,7 +505,6 @@ impl Dataset {
         let path = self.cell_flag_path(&descriptor.root)?;
         let source_uri = self.cell_flag_source_uri(&descriptor.root)?;
         let key = CellFlagRootKey {
-            version: self.manifest.version,
             source_uri: source_uri.to_string(),
             path: descriptor.root.path.clone(),
             size_bytes: descriptor.root.size_bytes,
@@ -593,7 +612,6 @@ impl Dataset {
                 let path = self.cell_flag_path(file)?;
                 let source_uri = self.cell_flag_source_uri(file)?;
                 let key = CellFlagBitmapKey {
-                    version: self.manifest.version,
                     source_uri: source_uri.to_string(),
                     path: file.path.clone(),
                     size_bytes: file.size_bytes,
@@ -612,7 +630,6 @@ impl Dataset {
             }
             CellFlagFragmentState::InlinePartial(bytes) => {
                 let key = CellFlagBitmapKey {
-                    version: self.manifest.version,
                     source_uri: self.uri.clone(),
                     path: "inline".to_string(),
                     size_bytes: bytes.len() as u64,
@@ -791,25 +808,22 @@ impl Dataset {
                     flag_id
                 )));
             }
-            let state = if value {
-                CellFlagFragmentValue::All
-            } else {
-                CellFlagFragmentValue::None
-            };
+            if !value {
+                continue;
+            }
             for fragment in new_fragments {
                 states.push(TransactionCellFlagFragmentState {
                     fragment_path: fragment_path(fragment)?.to_string(),
                     flag_id,
-                    state: state.clone(),
+                    state: CellFlagFragmentValue::All,
                 });
             }
         }
         Ok(states)
     }
 
-    /// Build exact states for newly inserted fragments. Every registered flag
-    /// is represented so a surrounding rewrite transaction can distinguish
-    /// inserted rows (false by default) from rows whose state must be remapped.
+    /// Build state for explicitly true flags on newly inserted fragments.
+    /// False is represented by absence.
     pub(crate) fn exact_cell_flag_states_for_inserted_fragments(
         &self,
         new_fragments: &[lance_table::format::Fragment],
@@ -823,19 +837,16 @@ impl Dataset {
                 )));
             }
         }
-        let mut states =
-            Vec::with_capacity(new_fragments.len() * self.cell_flag_definitions().len());
-        for definition in self.cell_flag_definitions() {
-            let state = if changes.get(&definition.flag_id).copied().unwrap_or(false) {
-                CellFlagFragmentValue::All
-            } else {
-                CellFlagFragmentValue::None
-            };
+        let mut states = Vec::with_capacity(new_fragments.len() * changes.len());
+        for (&flag_id, &value) in changes {
+            if !value {
+                continue;
+            }
             for fragment in new_fragments {
                 states.push(TransactionCellFlagFragmentState {
                     fragment_path: fragment_path(fragment)?.to_string(),
-                    flag_id: definition.flag_id,
-                    state: state.clone(),
+                    flag_id,
+                    state: CellFlagFragmentValue::All,
                 });
             }
         }
@@ -909,6 +920,11 @@ impl Dataset {
         let mut states = Vec::new();
         for definition in &self.manifest.cell_flag_definitions {
             let flag_id = definition.flag_id;
+            let produces_true = matched_changes.get(&flag_id) == Some(&true)
+                || inserted_changes.get(&flag_id) == Some(&true);
+            if self.cell_flag_state(flag_id).is_none() && !produces_true {
+                continue;
+            }
             let root = self
                 .load_cell_flag_root(flag_id)
                 .await?
@@ -1518,12 +1534,7 @@ pub async fn apply_cell_flag_transaction(
 ) -> Result<()> {
     let changes = transaction.cell_flag_transaction()?.unwrap_or_default();
     if !changes.is_empty() {
-        let expected_identity = current.cell_flag_transaction_identity();
-        if changes.dataset_identity != expected_identity {
-            return Err(Error::incompatible_transaction_source(
-                "Cell flag transaction belongs to a different dataset".into(),
-            ));
-        }
+        current.validate_cell_flag_transaction_identity(&changes)?;
     }
     if matches!(
         transaction.operation,
@@ -1534,12 +1545,22 @@ pub async fn apply_cell_flag_transaction(
                 "Restore and clone transactions cannot carry cell flag changes",
             ));
         }
+        manifest.cell_flag_dataset_id = match &transaction.operation {
+            Operation::Clone { .. } if manifest.next_cell_flag_id > 0 => {
+                Some(Uuid::new_v4().hyphenated().to_string())
+            }
+            _ => current.manifest.cell_flag_dataset_id.clone(),
+        };
         return Ok(());
+    }
+    if current.manifest.cell_flag_dataset_id.is_none() && !changes.is_empty() {
+        manifest.cell_flag_dataset_id = Some(changes.dataset_identity.clone());
     }
     if changes.is_empty() && current.manifest.cell_flag_definitions.is_empty() {
         manifest.cell_flag_definitions.clear();
         manifest.cell_flag_states.clear();
         manifest.next_cell_flag_id = current.manifest.next_cell_flag_id;
+        manifest.cell_flag_dataset_id = current.manifest.cell_flag_dataset_id.clone();
         return Ok(());
     }
     if changes.is_empty() && matches!(transaction.operation, Operation::Append { .. }) {
@@ -1823,30 +1844,13 @@ pub async fn apply_cell_flag_transaction(
             ))
         })?;
         for definition in &definitions {
-            if !overrides.contains_key(&(definition.flag_id, fragment.id)) {
+            if current.cell_flag_state(definition.flag_id).is_some()
+                && !overrides.contains_key(&(definition.flag_id, fragment.id))
+            {
                 return Err(Error::invalid_input(format!(
                     "Physical row rewrite must supply exact state for cell flag ID {}, new fragment '{}'",
                     definition.flag_id, path
                 )));
-            }
-        }
-    }
-
-    let allows_false_new_fragments = matches!(
-        transaction.operation,
-        Operation::Append { .. } | Operation::Overwrite { .. }
-    );
-    if !allows_false_new_fragments {
-        for fragment_id in final_fragment_ids.difference(&current_fragment_ids) {
-            for definition in &definitions {
-                if !registration_initial_values.contains_key(&definition.flag_id)
-                    && !overrides.contains_key(&(definition.flag_id, *fragment_id))
-                {
-                    return Err(Error::invalid_input(format!(
-                        "Operation {} introduced fragment {} without exact state for cell flag ID {}",
-                        transaction.operation, fragment_id, definition.flag_id
-                    )));
-                }
             }
         }
     }
@@ -2074,10 +2078,12 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_select::RowAddrTreeMap;
 
     use super::*;
     use crate::dataset::cleanup::CleanupPolicyBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::transaction::CellFlagRowChange;
     use crate::dataset::write::merge_insert::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use crate::dataset::{
         ColumnAlteration, CommitBuilder, InsertBuilder, UpdateBuilder, WriteMode, WriteParams,
@@ -2377,6 +2383,10 @@ mod tests {
             .cell_flag_state(definition.flag_id)
             .expect("explicitly set rows create a root")
             .clone();
+        let cached_root_before = dataset
+            .load_cell_flag_root_shared(definition.flag_id)
+            .await?
+            .expect("explicitly set rows create a root");
 
         let default_false = RecordBatch::try_new(
             schema.clone(),
@@ -2398,6 +2408,11 @@ mod tests {
             dataset.cell_flag_state(definition.flag_id),
             Some(&root_before_false_appends)
         );
+        let cached_root_after = dataset
+            .load_cell_flag_root_shared(definition.flag_id)
+            .await?
+            .expect("ordinary append preserves the root");
+        assert!(Arc::ptr_eq(&cached_root_before, &cached_root_after));
 
         let explicitly_cleared = RecordBatch::try_new(
             schema.clone(),
@@ -3234,6 +3249,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_rejects_mismatched_cell_flag_affected_rows() -> Result<()> {
+        let directory = TempStrDir::default();
+        let mut dataset = dataset_with_rows(&directory, 8).await?;
+        let definition = dataset
+            .register_cell_flag("value", FLAG_NAME, false)
+            .await?;
+        let operation = Operation::Update {
+            removed_fragment_ids: Vec::new(),
+            updated_fragments: Vec::new(),
+            new_fragments: Vec::new(),
+            fields_modified: Vec::new(),
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: Vec::new(),
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let recorded_rows = RowAddrTreeMap::from_iter([0_u64]);
+        let transaction = Transaction::new(dataset.manifest.version, operation, None)
+            .with_cell_flag_transaction_for_dataset(
+                CellFlagTransaction {
+                    row_changes: vec![CellFlagRowChange {
+                        flag_id: definition.flag_id,
+                        value: true,
+                        row_addresses: roaring::RoaringTreemap::from_iter([0_u64]),
+                    }],
+                    affected_rows: Some(recorded_rows),
+                    ..Default::default()
+                },
+                &dataset,
+            );
+
+        let error = CommitBuilder::new(Arc::new(dataset))
+            .with_affected_rows(RowAddrTreeMap::from_iter([1_u64]))
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("do not match the Cell Flag transaction")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn clone_and_cleanup_preserve_snapshot_owned_flag_state() -> Result<()> {
         let source_directory = TempStrDir::default();
         let shallow_directory = TempStrDir::default();
@@ -3267,6 +3328,12 @@ mod tests {
         let deep = dataset
             .deep_clone(deep_directory.as_ref(), "flagged", None)
             .await?;
+        let source_dataset_id = dataset.manifest.cell_flag_dataset_id.as_ref().unwrap();
+        let shallow_dataset_id = shallow.manifest.cell_flag_dataset_id.as_ref().unwrap();
+        let deep_dataset_id = deep.manifest.cell_flag_dataset_id.as_ref().unwrap();
+        assert_ne!(source_dataset_id, shallow_dataset_id);
+        assert_ne!(source_dataset_id, deep_dataset_id);
+        assert_ne!(shallow_dataset_id, deep_dataset_id);
         assert_eq!(flagged_ids(&shallow, "value", FLAG_NAME).await?, vec![1, 3]);
         assert_eq!(flagged_ids(&deep, "value", FLAG_NAME).await?, vec![1, 3]);
         assert!(

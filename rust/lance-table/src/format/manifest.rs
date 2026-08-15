@@ -18,6 +18,7 @@ use prost_types::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use super::{CellFlagDefinition, CellFlagState, Fragment};
 use crate::feature_flags::{FLAG_CELL_FLAGS, FLAG_MEM_WAL_INDEX_CATCHUP};
@@ -83,6 +84,7 @@ fn cell_flag_manifest_proto(manifest: &Manifest) -> Option<pb::CellFlagManifest>
             .collect(),
         states: manifest.cell_flag_states.iter().map(Into::into).collect(),
         next_flag_id: manifest.next_cell_flag_id,
+        dataset_id: manifest.cell_flag_dataset_id.clone().unwrap_or_default(),
     })
 }
 
@@ -99,6 +101,12 @@ pub fn validate_cell_flag_manifest_metadata(manifest: &Manifest) -> Result<()> {
     let Some(metadata) = cell_flag_manifest_proto(manifest) else {
         return Ok(());
     };
+    Uuid::parse_str(&metadata.dataset_id).map_err(|error| {
+        Error::invalid_input(format!(
+            "Cell Flag manifest dataset ID '{}' is invalid: {}",
+            metadata.dataset_id, error
+        ))
+    })?;
     let payload_len = base64::encoded_len(metadata.encoded_len(), false)
         .ok_or_else(|| Error::invalid_input("Encoded Cell Flag manifest metadata size overflow"))?;
     if payload_len > MAX_ENCODED_CELL_FLAG_MANIFEST_BYTES {
@@ -198,6 +206,9 @@ pub struct Manifest {
 
     /// Next stable flag ID. IDs remain consumed after their definition is dropped.
     pub next_cell_flag_id: u32,
+
+    /// Stable random identity of the dataset incarnation that owns Cell Flags.
+    pub cell_flag_dataset_id: Option<String>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -296,6 +307,7 @@ impl Manifest {
             cell_flag_definitions: Vec::new(),
             cell_flag_states: Vec::new(),
             next_cell_flag_id: 0,
+            cell_flag_dataset_id: None,
         }
     }
 
@@ -330,6 +342,7 @@ impl Manifest {
             cell_flag_definitions: previous.cell_flag_definitions.clone(),
             cell_flag_states: previous.cell_flag_states.clone(),
             next_cell_flag_id: previous.next_cell_flag_id,
+            cell_flag_dataset_id: previous.cell_flag_dataset_id.clone(),
         }
     }
 
@@ -410,6 +423,7 @@ impl Manifest {
             cell_flag_definitions: self.cell_flag_definitions.clone(),
             cell_flag_states,
             next_cell_flag_id: self.next_cell_flag_id,
+            cell_flag_dataset_id: self.cell_flag_dataset_id.clone(),
         }
     }
 
@@ -1004,6 +1018,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             definitions: cell_flag_definitions,
             states: cell_flag_states,
             next_flag_id: next_cell_flag_id,
+            dataset_id: cell_flag_dataset_id,
         } = cell_flag_metadata.unwrap_or_default();
         if has_cell_flag_metadata
             && next_cell_flag_id == 0
@@ -1014,6 +1029,17 @@ impl TryFrom<pb::Manifest> for Manifest {
                 "Cell Flag manifest metadata must not encode an empty registry",
             ));
         }
+        let cell_flag_dataset_id = if has_cell_flag_metadata {
+            Uuid::parse_str(&cell_flag_dataset_id).map_err(|error| {
+                Error::invalid_input(format!(
+                    "Cell Flag manifest dataset ID '{}' is invalid: {}",
+                    cell_flag_dataset_id, error
+                ))
+            })?;
+            Some(cell_flag_dataset_id)
+        } else {
+            None
+        };
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -1195,6 +1221,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             cell_flag_definitions,
             cell_flag_states,
             next_cell_flag_id,
+            cell_flag_dataset_id,
         })
     }
 }
@@ -1362,6 +1389,7 @@ mod tests {
             name: "reviewed".to_string(),
         }];
         manifest.next_cell_flag_id = 1;
+        manifest.cell_flag_dataset_id = Some(Uuid::new_v4().to_string());
         apply_feature_flags(&mut manifest, false, false).unwrap();
         let mut encoded = pb::Manifest::from(&manifest);
         encoded.writer_feature_flags &= !FLAG_CELL_FLAGS;

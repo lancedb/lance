@@ -46,6 +46,7 @@ from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
     from .dataset import (
+        CellFlagChanges,
         ColumnOrdering,
         DatasetBasePath,
         LanceDataset,
@@ -1081,6 +1082,7 @@ if TYPE_CHECKING:
         *,
         return_transaction: Literal[True],
         mode: str = "append",
+        cell_flags: Optional[CellFlagChanges] = None,
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
@@ -1108,6 +1110,7 @@ if TYPE_CHECKING:
         *,
         return_transaction: Literal[False] = False,
         mode: str = "append",
+        cell_flags: Optional[CellFlagChanges] = None,
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
@@ -1135,6 +1138,7 @@ def write_fragments(
     *,
     return_transaction: bool = False,
     mode: str = "append",
+    cell_flags: Optional[CellFlagChanges] = None,
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
@@ -1176,6 +1180,11 @@ def write_fragments(
         The write mode. If "append" is specified, the data will be checked
         against the existing dataset's schema. Otherwise, pass "create" or
         "overwrite" to assign new field ids to the schema.
+    cell_flags : mapping, optional
+        Explicit Cell Flag values for every row written by this operation,
+        grouped as ``{field: {flag_name: bool}}``. The flags must already be
+        registered on the destination dataset. Omitting a flag writes false by
+        absence and never infers state from field values, including NULL.
     max_rows_per_file : int, default 1024 * 1024
         The maximum number of rows per data file.
     max_rows_per_group : int, default 1024
@@ -1264,6 +1273,26 @@ def write_fragments(
         A session to reuse across operations. The session holds shared caches
         (metadata and index) and the object store registry.
 
+    Examples
+    --------
+    Explicit flag state stays attached to the distributed append transaction:
+
+    >>> import tempfile
+    >>> import pyarrow as pa
+    >>> import lance
+    >>> uri = tempfile.mkdtemp()
+    >>> dataset = lance.write_dataset(pa.table({"id": [0]}), uri)
+    >>> _ = dataset.register_cell_flag("id", "reviewed")
+    >>> transaction = write_fragments(
+    ...     pa.table({"id": [1]}),
+    ...     dataset,
+    ...     return_transaction=True,
+    ...     cell_flags={"id": {"reviewed": True}},
+    ... )
+    >>> committed = lance.LanceDataset.commit(dataset, transaction)
+    >>> committed.count_rows("cell_flag(id, 'reviewed')")
+    1
+
     Returns
     -------
     List[FragmentMetadata] | Transaction
@@ -1278,7 +1307,7 @@ def write_fragments(
             :meth:`LanceDataset.commit`.
 
     """
-    from .dataset import LanceDataset
+    from .dataset import LanceDataset, _normalize_cell_flags
 
     # Validate namespace_client and table_id are provided together
     if namespace_client is not None and table_id is None:
@@ -1325,6 +1354,7 @@ def write_fragments(
         dataset_uri,
         reader,
         mode=mode,
+        cell_flags=_normalize_cell_flags(cell_flags),
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,

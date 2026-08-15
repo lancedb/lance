@@ -417,11 +417,15 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
-        let derived_affected_rows = if self.affected_rows.is_none() {
-            transaction.cell_flag_affected_rows()?
-        } else {
-            None
-        };
+        let derived_affected_rows = transaction.cell_flag_affected_rows()?;
+        if let (Some(supplied), Some(recorded)) =
+            (self.affected_rows.as_ref(), derived_affected_rows.as_ref())
+            && supplied != recorded
+        {
+            return Err(Error::invalid_input(
+                "Commit affected rows do not match the Cell Flag transaction rewrite or deletion scope",
+            ));
+        }
         let affected_rows = self
             .affected_rows
             .as_ref()

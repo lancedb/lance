@@ -523,7 +523,9 @@ impl UpdateJob {
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-        let source_row_addresses = if self.dataset.cell_flag_definitions().is_empty() {
+        let needs_cell_flag_mapping = !self.dataset.manifest.cell_flag_states.is_empty()
+            || self.cell_flag_values.values().any(|value| *value);
+        let source_row_addresses = if !needs_cell_flag_mapping {
             Vec::new()
         } else {
             removed_row_ids.ordered_row_addrs(row_id_index.as_deref())
@@ -627,6 +629,7 @@ impl UpdateJob {
                 .with_cell_flag_transaction_for_dataset(
                     CellFlagTransaction {
                         row_changes,
+                        affected_rows: Some(update_data.affected_rows.clone()),
                         ..Default::default()
                     },
                     dataset.as_ref(),
@@ -652,8 +655,9 @@ impl UpdateJob {
             }
         }
 
-        let has_cell_flags = !dataset.cell_flag_definitions().is_empty();
-        let fragment_states = if has_cell_flags {
+        let needs_cell_flag_mapping = !dataset.manifest.cell_flag_states.is_empty()
+            || self.cell_flag_values.values().any(|value| *value);
+        let fragment_states = if needs_cell_flag_mapping {
             dataset
                 .cell_flag_states_for_rewritten_rows(
                     &update_data.new_fragments,
@@ -682,7 +686,7 @@ impl UpdateJob {
         };
 
         let mut transaction = Transaction::new(dataset.manifest.version, operation, None);
-        if has_cell_flags {
+        if needs_cell_flag_mapping {
             transaction = transaction.with_cell_flag_transaction_for_dataset(
                 CellFlagTransaction {
                     fragment_states,
@@ -905,11 +909,18 @@ mod tests {
     #[case(false)]
     #[case(true)]
     #[tokio::test]
-    async fn update_without_cell_flags_skips_source_address_mapping(
+    async fn update_without_materialized_cell_flags_skips_source_address_mapping(
         #[case] enable_stable_row_ids: bool,
     ) {
         let (dataset, _test_dir) =
             make_test_dataset(LanceFileVersion::Legacy, enable_stable_row_ids).await;
+        let mut dataset = Arc::try_unwrap(dataset).unwrap();
+        dataset
+            .register_cell_flag("name", "reviewed", false)
+            .await
+            .unwrap();
+        assert!(dataset.manifest.cell_flag_states.is_empty());
+        let dataset = Arc::new(dataset);
         let job = UpdateBuilder::new(dataset.clone())
             .update_where("id = 1")
             .unwrap()
@@ -922,6 +933,7 @@ mod tests {
         assert!(data.source_row_addresses.is_empty());
         let result = job.commit_impl(dataset, data).await.unwrap();
         assert_eq!(result.rows_updated, 1);
+        assert!(result.new_dataset.manifest.cell_flag_states.is_empty());
     }
 
     #[rstest]

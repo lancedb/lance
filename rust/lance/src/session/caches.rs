@@ -109,7 +109,6 @@ pub struct TransactionKey {
 /// cell-flag objects from more than one external dataset base.
 #[derive(Debug)]
 pub struct CellFlagRootKey {
-    pub version: u64,
     pub source_uri: String,
     pub path: String,
     pub size_bytes: u64,
@@ -121,8 +120,8 @@ impl CacheKey for CellFlagRootKey {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "cell_flag/root/{}/{}/{}/{}",
-            self.version, self.source_uri, self.path, self.size_bytes
+            "cell_flag/root/{}/{}/{}",
+            self.source_uri, self.path, self.size_bytes
         ))
     }
 
@@ -131,11 +130,10 @@ impl CacheKey for CellFlagRootKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.cell-flag-root-key", 1)
+        CacheKeySchema::new("lance.dataset.cell-flag-root-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.version);
         builder.write_str(&self.source_uri);
         builder.write_str(&self.path);
         builder.write_u64(self.size_bytes);
@@ -151,7 +149,6 @@ impl CacheKey for CellFlagRootKey {
 /// Cache key for a validated immutable partial Cell Flag bitmap.
 #[derive(Debug)]
 pub struct CellFlagBitmapKey {
-    pub version: u64,
     pub source_uri: String,
     pub path: String,
     pub size_bytes: u64,
@@ -166,13 +163,8 @@ impl CacheKey for CellFlagBitmapKey {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "cell_flag/bitmap/{}/{}/{}/{}/{}/{}",
-            self.version,
-            self.source_uri,
-            self.path,
-            self.flag_id,
-            self.fragment_id,
-            self.size_bytes
+            "cell_flag/bitmap/{}/{}/{}/{}/{}",
+            self.source_uri, self.path, self.flag_id, self.fragment_id, self.size_bytes
         ))
     }
 
@@ -181,11 +173,10 @@ impl CacheKey for CellFlagBitmapKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.cell-flag-bitmap-key", 1)
+        CacheKeySchema::new("lance.dataset.cell-flag-bitmap-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.version);
         builder.write_str(&self.source_uri);
         builder.write_str(&self.path);
         builder.write_u64(self.size_bytes);

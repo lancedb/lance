@@ -6606,11 +6606,7 @@ def test_cell_flag_public_api(tmp_path: Path):
         for key in transaction.transaction_properties
     )
 
-    for reserved_key in (
-        "__lance_cell_flag_transaction",
-        "__lance_cell_flag_transaction_auth",
-        "__lance_cell_flag_transaction_operation",
-    ):
+    for reserved_key in ("__lance_cell_flag_transaction",):
         forged = lance.Transaction(
             dataset.version,
             lance.LanceOperation.Update(),
@@ -6768,9 +6764,10 @@ def test_cell_flag_merge_and_merge_insert_actions(tmp_path: Path):
 
 
 def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
+    dataset_uri = tmp_path / "dataset"
     dataset = lance.write_dataset(
         pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
-        tmp_path,
+        dataset_uri,
     )
     dataset.register_cell_flag("value", "reviewed")
 
@@ -6788,9 +6785,8 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     assert transaction._cell_flag_transaction is not None
 
     tampered = copy.deepcopy(transaction)
-    payload, operation, auth = tampered._cell_flag_transaction
-    tampered._cell_flag_transaction = (payload + "00", operation, auth)
-    with pytest.raises(OSError, match="authentication failed"):
+    tampered._cell_flag_transaction = "not-base64"
+    with pytest.raises(OSError, match="base64"):
         lance.LanceDataset.commit(dataset, tampered)
 
     retargeted = copy.deepcopy(transaction)
@@ -6805,6 +6801,26 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     replay.register_cell_flag("value", "reviewed")
     with pytest.raises(OSError, match="different dataset"):
         lance.LanceDataset.commit(replay, transaction)
+
+    recreated_uri = tmp_path / "recreated"
+    recreated = lance.write_dataset(
+        pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
+        recreated_uri,
+    )
+    recreated.register_cell_flag("value", "reviewed")
+    recreated_transaction, _ = (
+        recreated.merge_insert(on="id")
+        .set_matched_cell_flag("value", "reviewed", True)
+        .execute_uncommitted(pa.table({"id": [1]}))
+    )
+    recreated_uri.rename(tmp_path / "recreated-old")
+    replacement = lance.write_dataset(
+        pa.table({"id": range(3), "value": pa.array(range(10, 13), pa.int32())}),
+        recreated_uri,
+    )
+    replacement.register_cell_flag("value", "reviewed")
+    with pytest.raises(OSError, match="different dataset incarnation"):
+        lance.LanceDataset.commit(replacement, recreated_transaction)
 
     committed = lance.LanceDataset.commit(dataset, transaction)
     assert _flag_rows(committed, field="value", name="reviewed") == [
@@ -6828,6 +6844,99 @@ def test_cell_flag_uncommitted_transaction_round_trip(tmp_path: Path):
     concurrent.delete("id = 0")
     committed = lance.LanceDataset.commit(concurrent_uri, transaction, max_retries=0)
     assert _flag_rows(committed, field="value", name="reviewed") == [
+        (1, True),
+        (2, False),
+    ]
+
+
+def test_cell_flag_uncommitted_merge_insert_preserves_update_metadata(tmp_path: Path):
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int32(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int32(), nullable=False),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}, schema=schema),
+        tmp_path,
+    )
+    dataset.initialize_mem_wal()
+    dataset.register_cell_flag("value", "reviewed")
+    shard_id = str(uuid.uuid4())
+
+    transaction, stats = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .set_matched_cell_flag("value", "reviewed", True)
+        .set_inserted_cell_flag("value", "reviewed", True)
+        .mark_sstables_as_compacted(
+            [lance.CompactedSsTable(shard_id=shard_id, generation=7)]
+        )
+        .execute_uncommitted(
+            pa.table({"id": [1, 4], "value": [100, 400]}, schema=schema)
+        )
+    )
+    assert stats == {
+        "num_inserted_rows": 1,
+        "num_updated_rows": 1,
+        "num_deleted_rows": 0,
+    }
+    assert transaction.operation._inserted_rows_filter is not None
+    assert transaction.operation._compacted_sstables == [(shard_id, 7)]
+
+    committed = lance.LanceDataset.commit(dataset, transaction)
+    assert _flag_rows(committed, field="value", name="reviewed") == [
+        (1, True),
+        (2, False),
+        (3, False),
+        (4, True),
+    ]
+
+
+def test_cell_flag_uncommitted_merge_insert_rebase_keeps_delete_scope(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}), tmp_path
+    )
+    dataset.register_cell_flag("value", "reviewed")
+    stale = lance.dataset(tmp_path)
+    transaction, _ = (
+        stale.merge_insert(on="id")
+        .when_not_matched_by_source_delete("id = 2")
+        .set_matched_cell_flag("value", "reviewed", True)
+        .execute_uncommitted(pa.table({"id": [1]}))
+    )
+
+    dataset.delete("id = 3")
+    committed = lance.LanceDataset.commit(tmp_path, transaction, max_retries=0)
+    assert _flag_rows(committed, field="value", name="reviewed") == [(1, True)]
+
+
+def test_cell_flag_distributed_append_and_batch_commit(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": [0], "value": pa.array([0], pa.int32())}), tmp_path
+    )
+    dataset.register_cell_flag("value", "reviewed")
+
+    first = lance.fragment.write_fragments(
+        pa.table({"id": [1], "value": pa.array([None], pa.int32())}),
+        dataset,
+        return_transaction=True,
+        cell_flags={"value": {"reviewed": True}},
+    )
+    second = lance.fragment.write_fragments(
+        pa.table({"id": [2], "value": pa.array([2], pa.int32())}),
+        dataset,
+        return_transaction=True,
+    )
+    result = lance.LanceDataset.commit_batch(dataset, [first, second])
+    assert _flag_rows(result["dataset"], field="value", name="reviewed") == [
+        (0, False),
         (1, True),
         (2, False),
     ]

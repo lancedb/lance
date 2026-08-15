@@ -2883,9 +2883,10 @@ impl Scanner {
             expressions.extend(aggregate.aggregates.iter());
         }
 
+        let limit_fragments = self.cell_flag_limit_fragments();
+        let selected_fragments = limit_fragments.as_deref().or(self.fragments.as_deref());
         let Some(bindings) =
-            CellFlagExprBindings::try_new(&self.dataset, &expressions, self.fragments.as_deref())
-                .await?
+            CellFlagExprBindings::try_new(&self.dataset, &expressions, selected_fragments).await?
         else {
             return Ok(());
         };
@@ -2918,6 +2919,38 @@ impl Scanner {
             );
         }
         Ok(())
+    }
+
+    fn cell_flag_limit_fragments(&self) -> Option<Vec<Fragment>> {
+        let limit = usize::try_from(self.limit?).ok()?;
+        if !self.filter.is_none()
+            || self.ordering.is_some()
+            || self.nearest.is_some()
+            || self.full_text_query.is_some()
+            || self.aggregate.is_some()
+            || !self.ordered
+            || self.include_deleted_rows
+            || self.dataset.manifest.uses_stable_row_ids()
+        {
+            return None;
+        }
+        let offset = usize::try_from(self.offset.unwrap_or(0)).ok()?;
+        let end = offset.checked_add(limit)?;
+        let fragments = self
+            .fragments
+            .as_deref()
+            .unwrap_or(self.dataset.fragments());
+        let mut selected = Vec::new();
+        let mut rows = 0usize;
+        for fragment in fragments {
+            if rows >= end {
+                break;
+            }
+            let fragment_rows = fragment.num_rows()?;
+            rows = rows.checked_add(fragment_rows)?;
+            selected.push(fragment.clone());
+        }
+        Some(selected)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -6926,8 +6959,9 @@ mod test {
     use crate::dataset::WriteMode;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
-    use crate::dataset::{NewColumnTransform, WriteParams};
+    use crate::dataset::{DatasetBuilder, NewColumnTransform, UpdateBuilder, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
+    use crate::session::Session;
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
@@ -6945,6 +6979,110 @@ mod test {
 
         scanner.filter_expr(cell_flag(col("i"), "computed"));
         assert!(scanner.references_cell_flag().unwrap());
+    }
+
+    #[tokio::test]
+    async fn cell_flag_limit_binding_covers_only_scanned_fragment_prefix() {
+        let dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.limit(Some(1), None).unwrap();
+        let fragments = scanner.cell_flag_limit_fragments().unwrap();
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        scanner.limit(Some(1), Some(5)).unwrap();
+        let fragments = scanner.cell_flag_limit_fragments().unwrap();
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        scanner.filter("i > 0").unwrap();
+        assert!(scanner.cell_flag_limit_fragments().is_none());
+    }
+
+    #[tokio::test]
+    async fn cell_flag_limit_binding_loads_only_scanned_fragment_bitmaps() {
+        let test_uri = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset(&test_uri, FragmentCount::from(3), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let definition = dataset
+            .register_cell_flag("i", "computed", false)
+            .await
+            .unwrap();
+        dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i % 2 = 0")
+            .unwrap()
+            .set_cell_flag("i", "computed", true)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        let root = dataset
+            .load_cell_flag_root(definition.flag_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.fragments.len(), 3);
+        assert!(root.fragments.iter().all(|fragment| matches!(
+            fragment.state,
+            lance_table::format::CellFlagFragmentState::Partial(_)
+        )));
+
+        async fn planning_iops(uri: &str, limit: Option<i64>) -> u64 {
+            let dataset = DatasetBuilder::from_uri(uri)
+                .with_session(Arc::new(Session::default()))
+                .load()
+                .await
+                .unwrap();
+            let _ = dataset.object_store.as_ref().io_stats_incremental();
+            let mut scanner = dataset.scan();
+            scanner
+                .project_with_transform(&[("computed", "cell_flag(i, 'computed')")])
+                .unwrap();
+            scanner.limit(limit, None).unwrap();
+            scanner.create_plan().await.unwrap();
+            dataset
+                .object_store
+                .as_ref()
+                .io_stats_incremental()
+                .read_iops
+        }
+
+        let limited_iops = planning_iops(test_uri.as_ref(), Some(1)).await;
+        let full_iops = planning_iops(test_uri.as_ref(), None).await;
+        assert!(
+            full_iops > limited_iops,
+            "full planning I/O {full_iops} must exceed limited planning I/O {limited_iops}"
+        );
     }
 
     #[test]

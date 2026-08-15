@@ -69,6 +69,7 @@ use log;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
+use uuid::Uuid;
 
 pub mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
@@ -526,6 +527,9 @@ async fn do_commit_new_dataset(
             transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
         (manifest, indices)
     };
+    if matches!(&transaction.operation, Operation::Clone { .. }) && manifest.next_cell_flag_id > 0 {
+        manifest.cell_flag_dataset_id = Some(Uuid::new_v4().hyphenated().to_string());
+    }
 
     let result = write_manifest_file(
         object_store,

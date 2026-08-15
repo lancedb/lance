@@ -29,8 +29,8 @@ message Transaction {
   // Optional version tag.
   string tag = 3;
 
-  // Optional properties for the transaction
-  // __lance_commit_message is a reserved key
+  // Optional properties for the transaction.
+  // __lance_commit_message is a reserved key.
   map<string, string> transaction_properties = 4;
 
   message CellFlagTransaction {
@@ -86,11 +86,23 @@ message Transaction {
     repeated RowChange row_changes = 4;
     repeated FragmentState fragment_states = 5;
     repeated Transfer transfers = 6;
-    // Hash of the source object-store identity and dataset base path. This
-    // prevents an operation-local flag delta from being replayed into another
-    // dataset with coincidentally matching versions and flag IDs.
+    // Stable random identity of the dataset incarnation that produced this
+    // transaction.
     string dataset_identity = 7;
+
+    // Complete existing-row rewrite or deletion scope in physical row-address
+    // space. This is present when conflict rebasing needs rows that the flag
+    // changes alone do not name.
+    bytes affected_rows = 8;
+
+    // BLAKE3 commitment to the public transaction fields, excluding this
+    // sidecar and transaction_properties.
+    bytes operation_digest = 9;
   }
+
+  // Typed, operation-local Cell Flag changes. This is internal format state,
+  // not an application-defined transaction property.
+  CellFlagTransaction cell_flag_transaction = 5;
 
   // Add new rows to the dataset.
   message Append {

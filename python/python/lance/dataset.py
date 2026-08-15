@@ -5924,7 +5924,7 @@ class Transaction:
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
-    _cell_flag_transaction: Optional[Tuple[str, str, str]] = dataclasses.field(
+    _cell_flag_transaction: Optional[str] = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
 
@@ -6269,6 +6269,12 @@ class LanceOperation:
         )
         update_mode: str = ""
         updated_fragment_offsets: Optional[Dict[int, bytes]] = None
+        _compacted_sstables: List[Tuple[str, int]] = dataclasses.field(
+            default_factory=list, init=False, repr=False, compare=False
+        )
+        _inserted_rows_filter: Optional[bytes] = dataclasses.field(
+            default=None, init=False, repr=False, compare=False
+        )
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)

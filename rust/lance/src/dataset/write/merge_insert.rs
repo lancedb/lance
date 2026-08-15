@@ -130,7 +130,7 @@ use lance_datafusion::{
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::CompactedSsTable;
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
@@ -2432,7 +2432,10 @@ impl MergeInsertJob {
             let transaction = full_exec.transaction().ok_or_else(|| {
                 Error::internal("Transaction not available - execution may not have completed")
             })?;
-            let affected_rows = full_exec.affected_rows().map(RowAddrTreeMap::from);
+            let affected_rows = full_exec
+                .affected_rows()
+                .map(RowAddrTreeMap::from)
+                .filter(|rows| !rows.is_empty());
             let inserted_rows_filter = full_exec.inserted_rows_filter();
             (stats, transaction, affected_rows, inserted_rows_filter)
         } else if let Some(delete_exec) = plan.downcast_ref::<exec::DeleteOnlyMergeInsertExec>() {
@@ -2442,7 +2445,10 @@ impl MergeInsertJob {
             let transaction = delete_exec.transaction().ok_or_else(|| {
                 Error::internal("Transaction not available - execution may not have completed")
             })?;
-            let affected_rows = delete_exec.affected_rows().map(RowAddrTreeMap::from);
+            let affected_rows = delete_exec
+                .affected_rows()
+                .map(RowAddrTreeMap::from)
+                .filter(|rows| !rows.is_empty());
             (stats, transaction, affected_rows, None)
         } else {
             return Err(Error::internal(
@@ -2586,6 +2592,7 @@ impl MergeInsertJob {
         if can_use_fast_path {
             let (transaction, stats, affected_rows, inserted_rows_filter) =
                 self.execute_uncommitted_v2(provider).await?;
+            let transaction = transaction.with_cell_flag_affected_rows(affected_rows.clone())?;
             return Ok(UncommittedMergeInsert {
                 transaction,
                 affected_rows,
@@ -2615,7 +2622,13 @@ impl MergeInsertJob {
             },
         );
         let joined = self.create_joined_stream(source).await?;
-        let capture_cell_flag_sources = !self.dataset.cell_flag_definitions().is_empty();
+        let capture_cell_flag_sources = !self.dataset.manifest.cell_flag_states.is_empty()
+            || self
+                .params
+                .matched_cell_flag_values
+                .iter()
+                .chain(&self.params.inserted_cell_flag_values)
+                .any(|(_, value)| *value);
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
@@ -2751,9 +2764,7 @@ impl MergeInsertJob {
                 updated_fragment_offsets: (!offsets.is_empty())
                     .then_some(UpdatedFragmentOffsets(offsets)),
             };
-            let mut affected_row_addrs = updated_row_addrs;
-            affected_row_addrs |= matched_flag_row_addrs;
-            let affected_rows = Some(RowAddrTreeMap::from(affected_row_addrs));
+            let affected_rows = Some(RowAddrTreeMap::from(updated_row_addrs));
             (operation, affected_rows, cell_flag_changes)
         } else {
             let cleanup_bases = target_bases_info.clone();
@@ -2866,7 +2877,6 @@ impl MergeInsertJob {
             } else {
                 Vec::new()
             };
-            let mut flag_only_affected_rows = RoaringTreemap::new();
             let row_changes = if matches!(
                 self.params.when_matched,
                 WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
@@ -2880,7 +2890,6 @@ impl MergeInsertJob {
                 let matched_flag_row_addrs = RoaringTreemap::from_iter(
                     resolve_row_ids(&self.dataset, matched_flag_row_ids).await?,
                 );
-                flag_only_affected_rows |= &matched_flag_row_addrs;
                 cell_flag_row_changes(
                     &self.params.matched_cell_flag_values,
                     &matched_flag_row_addrs,
@@ -2911,9 +2920,8 @@ impl MergeInsertJob {
                 updated_fragment_offsets: None,
             };
 
-            let mut affected_row_addrs = removed_row_addrs;
-            affected_row_addrs |= flag_only_affected_rows;
-            let affected_rows = Some(RowAddrTreeMap::from(affected_row_addrs));
+            let affected_rows =
+                (!removed_row_addrs.is_empty()).then(|| RowAddrTreeMap::from(removed_row_addrs));
             (operation, affected_rows, cell_flag_changes)
         };
 
@@ -2922,8 +2930,10 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
+        let affected_rows = affected_rows.filter(|rows| !rows.is_empty());
         let transaction = Transaction::new(self.dataset.manifest.version, operation, None)
             .with_cell_flag_transaction_for_dataset(cell_flag_changes, self.dataset.as_ref());
+        let transaction = transaction.with_cell_flag_affected_rows(affected_rows.clone())?;
 
         Ok(UncommittedMergeInsert {
             transaction,

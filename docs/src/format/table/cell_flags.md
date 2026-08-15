@@ -19,12 +19,13 @@ message CellFlagManifest {
   repeated CellFlagDefinition definitions = 1;
   repeated CellFlagState states = 2;
   uint32 next_flag_id = 3;
+  string dataset_id = 4;
 }
 ```
 
 Using the existing config extension slot preserves the public generated `Manifest` API and lets readers that do not understand Cell Flags ignore the metadata while reading ordinary fields. Cell Flag-aware readers remove this reserved entry from user-visible dataset config and reject attempts to write it through the public config API.
 
-Definitions and state descriptors are sorted by `flag_id`. IDs are never reused, including after a definition is dropped. Renaming a field preserves its definitions because they bind to `field_id`. Dropping a field removes its definitions from the new snapshot; historical snapshots retain their own registry and state.
+Definitions and state descriptors are sorted by `flag_id`. IDs are never reused, including after a definition is dropped. `dataset_id` is a random UUID that identifies the dataset incarnation and prevents an uncommitted transaction from being replayed into a dataset recreated at the same URI. Renaming a field preserves its definitions because they bind to `field_id`. Dropping a field removes its definitions from the new snapshot; historical snapshots retain their own registry and state.
 
 Registering a flag initializes all current live rows explicitly to `false` by default or to a caller-supplied Boolean value. A mutation cannot create an unregistered name.
 
@@ -79,7 +80,7 @@ Append, update, merge, and merge-insert operations may carry explicit flag chang
 - Matched and inserted merge-insert actions have independent flag changes.
 - No value, NULL, omission, overlay coverage, or data-file rewrite infers state.
 
-The existing transaction-properties map carries two reserved entries containing the versioned Cell Flag transaction payload and its integrity digest. The payload protobuf records registry changes, existing-row address changes, exact state for newly written fragments, and field-ID transfers used by schema casts. These entries are internal replay and conflict-detection material, are hidden by language bindings, and do not introduce arbitrary per-row keys or policy callbacks.
+The transaction protobuf carries one typed `cell_flag_transaction` sidecar. It records the dataset incarnation, registry changes, existing-row address changes, exact state for newly written fragments, field-ID transfers used by schema casts, the operation's complete existing-row rewrite or deletion set when rebasing needs it, and a fixed-size commitment to the public operation fields. The sidecar is internal replay and conflict-detection material, is hidden by language bindings, and does not introduce arbitrary per-row keys or policy callbacks. It is not stored in the application-defined transaction-properties map.
 
 Concurrent registry edits conflict. Row changes use the existing mutation conflict machinery and the operation's read snapshot. Atomicity does not establish application-level freshness; systems that need freshness must validate their own source revision or read set.
 

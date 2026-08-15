@@ -129,9 +129,9 @@ const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
 type PyBlobBytes = Option<Py<PyBytes>>;
 
-type PyCellFlagChanges = HashMap<String, HashMap<String, bool>>;
+pub(crate) type PyCellFlagChanges = HashMap<String, HashMap<String, bool>>;
 
-fn parse_cell_flag_changes(value: Option<PyCellFlagChanges>) -> Vec<CellFlagChange> {
+pub(crate) fn parse_cell_flag_changes(value: Option<PyCellFlagChanges>) -> Vec<CellFlagChange> {
     let mut changes = value
         .into_iter()
         .flat_map(|fields| fields.into_iter())

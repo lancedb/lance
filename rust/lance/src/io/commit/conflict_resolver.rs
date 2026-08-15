@@ -2621,6 +2621,8 @@ mod tests {
                 value: false,
                 row_addresses: roaring::RoaringTreemap::from_iter([1_u64]),
             }],
+            dataset_identity: Uuid::new_v4().to_string(),
+            affected_rows: Some(affected_rows.clone()),
             ..Default::default()
         });
         let rewrite = Transaction::new_from_version(
@@ -2709,6 +2711,7 @@ mod tests {
             .check_txn(&invalidation, dataset.manifest.version + 1)
             .unwrap();
 
+        let transaction_dataset_id = Uuid::new_v4().to_string();
         let flag_change = |flag_id, row_address| {
             Transaction::new_from_version(dataset.manifest.version, invalidation.operation.clone())
                 .with_cell_flag_transaction(CellFlagTransaction {
@@ -2717,6 +2720,8 @@ mod tests {
                         value: true,
                         row_addresses: roaring::RoaringTreemap::from_iter([row_address]),
                     }],
+                    dataset_identity: transaction_dataset_id.clone(),
+                    affected_rows: Some(RowAddrTreeMap::from_iter([row_address])),
                     ..Default::default()
                 })
         };

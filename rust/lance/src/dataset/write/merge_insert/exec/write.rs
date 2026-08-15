@@ -981,13 +981,20 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             .iter()
             .filter_map(|name| self.dataset.schema().field(name).map(|f| f.id))
             .collect();
+        let capture_cell_flag_sources = !self.dataset.manifest.cell_flag_states.is_empty()
+            || self
+                .params
+                .matched_cell_flag_values
+                .iter()
+                .chain(&self.params.inserted_cell_flag_values)
+                .any(|(_, value)| *value);
         let merge_state = Arc::new(Mutex::new(MergeState::new(
             MergeInsertMetrics::new(&self.metrics, partition),
             self.dataset.manifest.uses_stable_row_ids(),
             self.params.on.clone(),
             field_ids,
             self.params.source_dedupe_behavior,
-            !self.dataset.manifest.cell_flag_definitions.is_empty(),
+            capture_cell_flag_sources,
         )));
         let write_data_stream =
             self.create_filtered_write_stream(input_stream, merge_state.clone())?;
@@ -1079,7 +1086,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 None
             };
 
-            let cell_flag_transaction = if dataset.cell_flag_definitions().is_empty() {
+            let cell_flag_transaction = if !merge_state.capture_cell_flag_sources {
                 CellFlagTransaction::default()
             } else {
                 let output_source_row_addrs = if merge_state.stable_row_ids {
@@ -1206,9 +1213,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     merge_stats_guard.replace(stats);
                 }
                 if let Ok(mut affected_rows_guard) = affected_rows_holder.lock() {
-                    let mut affected_rows = delete_row_addrs_clone;
-                    affected_rows |= matched_flag_row_addrs;
-                    affected_rows_guard.replace(affected_rows);
+                    affected_rows_guard.replace(delete_row_addrs_clone);
                 }
                 if let Ok(mut filter_guard) = inserted_rows_filter_holder.lock() {
                     *filter_guard = inserted_rows_filter;

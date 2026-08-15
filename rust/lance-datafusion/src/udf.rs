@@ -17,7 +17,7 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 pub mod json;
 
@@ -206,7 +206,7 @@ impl BoundCellFlagUdf {
 #[derive(Debug)]
 struct DeferredCellFlagState {
     binding_id: u64,
-    snapshot: OnceLock<Arc<CellFlagSnapshot>>,
+    snapshot: RwLock<Option<Arc<CellFlagSnapshot>>>,
 }
 
 /// A shared snapshot binding initialized by a Lance table provider while its
@@ -243,21 +243,31 @@ impl DeferredCellFlagBinding {
         fragments: HashMap<u32, FlagFragment>,
         covered_fragments: RoaringBitmap,
     ) -> DFResult<()> {
-        if self.state.snapshot.get().is_some() {
-            return Ok(());
-        }
-        self.state
-            .snapshot
-            .set(Arc::new(CellFlagSnapshot {
+        let mut snapshot = self.state.snapshot.write().map_err(|_| {
+            datafusion::error::DataFusionError::Internal(format!(
+                "cell_flag binding {} for flag ID {} was poisoned",
+                self.state.binding_id, self.flag_id
+            ))
+        })?;
+        if let Some(current) = snapshot.as_ref() {
+            if covered_fragments.is_subset(&current.covered_fragments) {
+                return Ok(());
+            }
+            let mut merged_fragments = current.fragments.as_ref().clone();
+            merged_fragments.extend(fragments);
+            let mut merged_coverage = current.covered_fragments.clone();
+            merged_coverage |= covered_fragments;
+            *snapshot = Some(Arc::new(CellFlagSnapshot {
+                fragments: Arc::new(merged_fragments),
+                covered_fragments: merged_coverage,
+            }));
+        } else {
+            *snapshot = Some(Arc::new(CellFlagSnapshot {
                 fragments: Arc::new(fragments),
                 covered_fragments,
-            }))
-            .map_err(|_| {
-                datafusion::error::DataFusionError::Internal(format!(
-                    "cell_flag binding {} for flag ID {} was initialized concurrently",
-                    self.state.binding_id, self.flag_id
-                ))
-            })
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -284,21 +294,35 @@ impl Hash for DeferredBoundCellFlagUdf {
 }
 
 impl DeferredBoundCellFlagUdf {
-    fn value(&self, row_address: u64) -> DFResult<bool> {
-        let snapshot = self.binding.state.snapshot.get().ok_or_else(|| {
+    fn snapshot(&self) -> DFResult<Arc<CellFlagSnapshot>> {
+        self.binding
+            .state
+            .snapshot
+            .read()
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "cell_flag binding {} for flag ID {} was poisoned",
+                    self.binding.state.binding_id, self.binding.flag_id
+                ))
+            })?
+            .clone()
+            .ok_or_else(|| {
             datafusion::error::DataFusionError::Execution(format!(
                 "cell_flag binding {} for flag ID {} was not initialized by its Lance table provider",
                 self.binding.state.binding_id, self.binding.flag_id
             ))
-        })?;
+        })
+    }
+
+    fn value(snapshot: &CellFlagSnapshot, row_address: u64) -> bool {
         let row_address = lance_core::utils::address::RowAddress::from(row_address);
         let fragment_id = row_address.fragment_id();
         let row_offset = row_address.row_offset();
-        Ok(match snapshot.fragments.get(&fragment_id) {
+        match snapshot.fragments.get(&fragment_id) {
             Some(FlagFragment::All) => true,
             Some(FlagFragment::Partial(bitmap)) => bitmap.contains(row_offset),
             None => false,
-        })
+        }
     }
 }
 
@@ -324,6 +348,7 @@ impl ScalarUDFImpl for DeferredBoundCellFlagUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let snapshot = self.snapshot()?;
         match &args.args[0] {
             ColumnarValue::Array(array) => {
                 let row_addresses =
@@ -339,7 +364,7 @@ impl ScalarUDFImpl for DeferredBoundCellFlagUdf {
                 let values = (0..row_addresses.len())
                     .map(|index| {
                         if row_addresses.is_valid(index) {
-                            self.value(row_addresses.value(index))
+                            Ok(Self::value(&snapshot, row_addresses.value(index)))
                         } else {
                             Ok(false)
                         }
@@ -351,7 +376,7 @@ impl ScalarUDFImpl for DeferredBoundCellFlagUdf {
             }
             ColumnarValue::Scalar(ScalarValue::UInt64(row_address)) => Ok(ColumnarValue::Scalar(
                 ScalarValue::Boolean(Some(match row_address {
-                    Some(value) => self.value(*value)?,
+                    Some(value) => Self::value(&snapshot, *value),
                     None => false,
                 })),
             )),
@@ -467,7 +492,7 @@ pub fn deferred_bound_cell_flag_udf(flag_id: u32) -> (ScalarUDF, DeferredCellFla
         flag_id,
         state: Arc::new(DeferredCellFlagState {
             binding_id: NEXT_CELL_FLAG_BINDING_ID.fetch_add(1, Ordering::Relaxed),
-            snapshot: OnceLock::new(),
+            snapshot: RwLock::new(None),
         }),
     };
     let udf = ScalarUDF::new_from_impl(DeferredBoundCellFlagUdf {
@@ -513,7 +538,7 @@ pub fn bound_cell_flag_snapshot(udf: &ScalarUDF) -> Option<BoundCellFlagSnapshot
         ));
     }
     let bound = udf.inner().downcast_ref::<DeferredBoundCellFlagUdf>()?;
-    let snapshot = bound.binding.state.snapshot.get()?;
+    let snapshot = bound.binding.state.snapshot.read().ok()?.clone()?;
     Some((
         bound.binding.flag_id,
         snapshot.fragments.clone(),

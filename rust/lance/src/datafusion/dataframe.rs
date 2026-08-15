@@ -32,6 +32,7 @@ use lance_datafusion::udf::{
     CELL_FLAG_ID_UDF, CELL_FLAG_UDF, DeferredCellFlagBinding, bound_cell_flag_flag_id,
     deferred_bound_cell_flag_udf, is_unbound_cell_flag_udf,
 };
+use lance_table::format::Fragment;
 
 use crate::{
     Dataset,
@@ -142,10 +143,26 @@ impl LanceTableProvider {
         Ok(self)
     }
 
-    async fn initialize_cell_flag_bindings(&self) -> datafusion::common::Result<()> {
+    async fn initialize_cell_flag_bindings(
+        &self,
+        selected_fragments: Option<&[Fragment]>,
+    ) -> datafusion::common::Result<()> {
         if self.cell_flag_bindings.is_empty() {
             return Ok(());
         }
+        let selected_fragment_ids = selected_fragments.map(|fragments| {
+            Arc::new(
+                fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect::<HashSet<_>>(),
+            )
+        });
+        let covered_fragments: roaring::RoaringBitmap = selected_fragments
+            .unwrap_or(self.dataset.fragments())
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect();
         let io_parallelism = self.dataset.object_store.io_parallelism().max(1);
         let bindings = self
             .cell_flag_bindings
@@ -153,22 +170,45 @@ impl LanceTableProvider {
             .cloned()
             .collect::<Vec<_>>();
         futures::stream::iter(bindings)
-            .map(|binding| async move {
-                let fragments = load_cell_flag_fragments(&self.dataset, binding.flag_id(), None)
+            .map(|binding| {
+                let selected_fragment_ids = selected_fragment_ids.clone();
+                let covered_fragments = covered_fragments.clone();
+                async move {
+                    let fragments = load_cell_flag_fragments(
+                        &self.dataset,
+                        binding.flag_id(),
+                        selected_fragment_ids,
+                    )
                     .await
                     .map_err(DataFusionError::from)?;
-                let covered_fragments = self
-                    .dataset
-                    .fragments()
-                    .iter()
-                    .map(|fragment| fragment.id as u32)
-                    .collect();
-                binding.initialize_with_coverage(fragments, covered_fragments)
+                    binding.initialize_with_coverage(fragments, covered_fragments)
+                }
             })
             .buffer_unordered(io_parallelism)
             .try_collect::<Vec<_>>()
             .await?;
         Ok(())
+    }
+
+    fn cell_flag_limit_fragments(
+        &self,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Option<Vec<Fragment>> {
+        let limit = limit?;
+        if !filters.is_empty() || !self.ordered || self.dataset.manifest.uses_stable_row_ids() {
+            return None;
+        }
+        let mut selected = Vec::new();
+        let mut rows = 0usize;
+        for fragment in self.dataset.fragments().iter() {
+            if rows >= limit {
+                break;
+            }
+            rows = rows.checked_add(fragment.num_rows()?)?;
+            selected.push(fragment.clone());
+        }
+        Some(selected)
     }
 }
 
@@ -189,7 +229,9 @@ impl TableProvider for LanceTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        self.initialize_cell_flag_bindings().await?;
+        let limit_fragments = self.cell_flag_limit_fragments(filters, limit);
+        self.initialize_cell_flag_bindings(limit_fragments.as_deref())
+            .await?;
         let mut scan = self.dataset.scan();
         if let Some(handling) = self.blob_handling.clone() {
             scan.blob_handling(handling);
@@ -653,6 +695,7 @@ impl SessionContextExt for SessionContext {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::{
@@ -661,11 +704,14 @@ mod tests {
         datatypes::{Int32Type, Int64Type},
     };
     use datafusion::{
+        datasource::TableProvider,
         functions_aggregate::count::count,
         prelude::{SessionContext, col},
     };
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datafusion::udf::cell_flag;
+    use lance_datafusion::udf::{
+        bound_cell_flag_snapshot, cell_flag, deferred_bound_cell_flag_udf,
+    };
     use lance_datagen::array;
 
     use crate::{
@@ -736,7 +782,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dataset
+        let definition = dataset
             .register_cell_flag("embedding", "computed", false)
             .await
             .unwrap();
@@ -755,6 +801,33 @@ mod tests {
         let dataset = Arc::new(result.new_dataset.as_ref().clone());
 
         let context = SessionContext::new();
+        let (deferred_udf, deferred_binding) = deferred_bound_cell_flag_udf(definition.flag_id);
+        let provider = LanceTableProvider::new(dataset.clone(), false, false)
+            .with_cell_flag_bindings(HashMap::from([(definition.flag_id, deferred_binding)]))
+            .unwrap();
+        provider
+            .scan(&context.state(), None, &[], Some(1))
+            .await
+            .unwrap();
+        let (_, _, limited_coverage) = bound_cell_flag_snapshot(&deferred_udf).unwrap();
+        assert_eq!(
+            limited_coverage.iter().collect::<Vec<_>>(),
+            vec![dataset.fragments().first().unwrap().id as u32]
+        );
+        provider
+            .scan(&context.state(), None, &[], None)
+            .await
+            .unwrap();
+        let (_, _, full_coverage) = bound_cell_flag_snapshot(&deferred_udf).unwrap();
+        assert_eq!(
+            full_coverage.iter().collect::<Vec<_>>(),
+            dataset
+                .fragments()
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<Vec<_>>()
+        );
+
         let projected = context
             .read_lance(dataset.clone(), false, false)
             .unwrap()

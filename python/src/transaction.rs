@@ -10,11 +10,14 @@ use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
+use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use lance::datatypes::Schema;
+use lance_index::mem_wal::CompactedSsTable;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
-use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata, pb};
+use prost::Message;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PySet;
+use pyo3::types::{PyBytes, PySet};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
@@ -438,15 +441,52 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .transpose()?
                     .map(UpdatedFragmentOffsets);
 
+                let compacted_sstables = ob
+                    .getattr("_compacted_sstables")
+                    .ok()
+                    .map(|value| value.extract::<Vec<(String, u64)>>())
+                    .transpose()?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(shard_id, generation)| {
+                        Uuid::parse_str(&shard_id)
+                            .map(|shard_id| CompactedSsTable::new(shard_id, generation))
+                            .map_err(|error| {
+                                PyValueError::new_err(format!(
+                                    "_compacted_sstables contains invalid shard UUID \
+                                     '{shard_id}': {error}"
+                                ))
+                            })
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+
+                let inserted_rows_filter = ob
+                    .getattr("_inserted_rows_filter")
+                    .ok()
+                    .map(|value| value.extract::<Option<Vec<u8>>>())
+                    .transpose()?
+                    .flatten()
+                    .map(|bytes| {
+                        let message = pb::transaction::KeyExistenceFilter::decode(bytes.as_slice())
+                            .map_err(|error| {
+                                PyValueError::new_err(format!(
+                                    "_inserted_rows_filter is invalid: {error}"
+                                ))
+                            })?;
+                        KeyExistenceFilter::try_from(&message)
+                            .map_err(|error| PyValueError::new_err(error.to_string()))
+                    })
+                    .transpose()?;
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    compacted_sstables: vec![],
+                    compacted_sstables,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
-                    inserted_rows_filter: None,
+                    inserted_rows_filter,
                     updated_fragment_offsets,
                 };
                 Ok(Self(op))
@@ -627,7 +667,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 updated_fragment_offsets,
-                ..
+                compacted_sstables,
+                inserted_rows_filter,
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
@@ -662,7 +703,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
-                cls.call1((
+                let operation = cls.call1((
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
@@ -670,7 +711,24 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     updated_fragment_offsets,
-                ))
+                ))?;
+                operation.setattr(
+                    "_compacted_sstables",
+                    compacted_sstables
+                        .iter()
+                        .map(|sstable| (sstable.shard_id.to_string(), sstable.generation))
+                        .collect::<Vec<_>>(),
+                )?;
+                operation.setattr(
+                    "_inserted_rows_filter",
+                    inserted_rows_filter.as_ref().map(|filter| {
+                        PyBytes::new(
+                            py,
+                            &pb::transaction::KeyExistenceFilter::from(filter).encode_to_vec(),
+                        )
+                    }),
+                )?;
+                Ok(operation)
             }
             Operation::DataReplacement { replacements } => {
                 let replacements = export_vec(py, replacements.as_slice())?;
@@ -818,24 +876,16 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .unwrap_or_default();
-        if transaction_properties.contains_key("__lance_cell_flag_transaction")
-            || transaction_properties.contains_key("__lance_cell_flag_transaction_auth")
-            || transaction_properties.contains_key("__lance_cell_flag_transaction_operation")
-        {
+        if transaction_properties.contains_key("__lance_cell_flag_transaction") {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "cell flag transaction properties are reserved",
             ));
         }
         let internal_cell_flag_transaction = ob
             .getattr("_cell_flag_transaction")?
-            .extract::<Option<(String, String, String)>>()?;
-        if let Some((payload, operation, auth)) = internal_cell_flag_transaction {
+            .extract::<Option<String>>()?;
+        if let Some(payload) = internal_cell_flag_transaction {
             transaction_properties.insert("__lance_cell_flag_transaction".to_string(), payload);
-            transaction_properties.insert(
-                "__lance_cell_flag_transaction_operation".to_string(),
-                operation,
-            );
-            transaction_properties.insert("__lance_cell_flag_transaction_auth".to_string(), auth);
         }
         let transaction_properties =
             (!transaction_properties.is_empty()).then(|| Arc::new(transaction_properties));
@@ -872,19 +922,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let mut transaction_properties = transaction_properties_arc.as_ref().clone();
             let internal_payload = transaction_properties.remove("__lance_cell_flag_transaction");
-            let internal_operation =
-                transaction_properties.remove("__lance_cell_flag_transaction_operation");
-            let internal_auth = transaction_properties.remove("__lance_cell_flag_transaction_auth");
-            match (internal_payload, internal_operation, internal_auth) {
-                (Some(payload), Some(operation), Some(auth)) => {
-                    py_transaction.setattr("_cell_flag_transaction", (payload, operation, auth))?;
-                }
-                (None, None, None) => {}
-                _ => {
-                    return Err(PyValueError::new_err(
-                        "internal cell flag transaction payload is incomplete",
-                    ));
-                }
+            if let Some(payload) = internal_payload {
+                py_transaction.setattr("_cell_flag_transaction", payload)?;
             }
             if !transaction_properties.is_empty() {
                 let py_dict = transaction_properties.into_pyobject(py)?;

@@ -37,7 +37,10 @@ use pyo3::types::PyTuple;
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
-use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
+use crate::dataset::{
+    PyCellFlagChanges, PyWriteDest, get_write_params, parse_cell_flag_changes,
+    transforms_from_python,
+};
 use crate::error::PythonErrorExt;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
@@ -477,11 +480,19 @@ fn do_write_fragments(
         Some(params) => get_write_params(params, &dest.table_root_uri()?)?.unwrap_or_default(),
         None => WriteParams::default(),
     };
+    let cell_flags = kwargs
+        .map(|params| params.get_item("cell_flags"))
+        .transpose()?
+        .flatten()
+        .filter(|value| !value.is_none())
+        .map(|value| value.extract::<PyCellFlagChanges>())
+        .transpose()?;
 
     rt().block_on(
         Some(reader.py()),
         InsertBuilder::new(dest.as_dest())
             .with_params(&params)
+            .with_cell_flags(parse_cell_flag_changes(cell_flags))
             .execute_uncommitted_stream(batches),
     )?
     .map_err(|err| PyIOError::new_err(err.to_string()))

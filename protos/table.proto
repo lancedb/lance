@@ -125,9 +125,6 @@ message Manifest {
   //   MemWAL SSTables still hold. Writers must refuse it too: one that does not
   //   maintain index_catchup can change an index without withdrawing the
   //   position recorded for it. Setting it is one-way.
-  // * 1 << 8: snapshot-level cell flag state is present. This is a writer-only
-  //   requirement: readers may ignore flags they do not query, but every writer
-  //   must preserve definitions and state across mutations and physical rewrites.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -138,6 +135,12 @@ message Manifest {
   //
   // The flag identities are the same as for reader_feature_flags, but the values of
   // reader_feature_flags and writer_feature_flags are not required to be identical.
+  //
+  // Writer-only flags:
+  // * 1 << 8: snapshot-level cell flag state is present. This bit is not set in
+  //   reader_feature_flags: readers may ignore flags they do not query, but every
+  //   writer must preserve definitions and state across mutations and physical
+  //   rewrites.
   uint64 writer_feature_flags = 10;
 
   // The highest fragment ID that has been used so far.
@@ -235,6 +238,10 @@ message CellFlagManifest {
 
   // The next flag ID to allocate. IDs are never reused after definition drop.
   uint32 next_flag_id = 3;
+
+  // Stable random identity of the dataset incarnation. It is created with the
+  // first flag registration and retained after all definitions are dropped.
+  string dataset_id = 4;
 }
 
 // Stable schema-level identity for one field-scoped Boolean cell flag.

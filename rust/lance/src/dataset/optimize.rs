@@ -2676,7 +2676,7 @@ pub async fn commit_compaction(
     let mut any_group_indexed = false;
 
     for task in completed_tasks {
-        if !dataset.manifest.cell_flag_definitions.is_empty() {
+        if !dataset.manifest.cell_flag_states.is_empty() {
             let source_row_addresses = compaction_source_row_addresses(dataset, &task).await?;
             cell_flag_changes.fragment_states.extend(
                 dataset
