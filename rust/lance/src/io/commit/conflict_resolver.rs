@@ -280,6 +280,14 @@ impl<'a> TransactionRebase<'a> {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
 
+        // Both planned from state the other replaced; rejecting here keeps
+        // the loser's data from landing.
+        if self.transaction.schema_metadata_updates.is_some()
+            && other_transaction.schema_metadata_updates.is_some()
+        {
+            return Err(self.incompatible_conflict_err(other_transaction, other_version));
+        }
+
         let op = &self.transaction.operation;
         match op {
             Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
@@ -4279,6 +4287,48 @@ mod tests {
             "Expected IncompatibleTransaction error for duplicate ID, got {:?}",
             result
         );
+    }
+
+    // Two transactions carrying a schema metadata update conflict whatever
+    // their operations; one on a single side does not.
+    #[tokio::test]
+    async fn test_schema_metadata_stamp_conflicts_with_another_stamp() {
+        let dataset = test_dataset(10, 2).await;
+
+        use crate::dataset::transaction::{TransactionBuilder, UpdateMap, UpdateMapEntry};
+
+        let stamp = |value: &str| UpdateMap {
+            update_entries: vec![UpdateMapEntry::from(("mv.source_version", value))],
+            replace: false,
+        };
+        let stamped_append = |value: &str| {
+            TransactionBuilder::new(1, Operation::Append { fragments: vec![] })
+                .schema_metadata_updates(stamp(value))
+                .build()
+        };
+
+        // Two stamped appends: one is rejected.
+        let mut resolver = TransactionRebase::try_new(&dataset, stamped_append("7"), None)
+            .await
+            .unwrap();
+        let err = resolver
+            .check_txn(&stamped_append("8"), 2)
+            .expect_err("two stamped transactions must conflict");
+        assert!(
+            matches!(err, Error::IncompatibleTransaction { .. }),
+            "{err:?}"
+        );
+
+        // One stamp only: still compatible.
+        let mut resolver = TransactionRebase::try_new(&dataset, stamped_append("7"), None)
+            .await
+            .unwrap();
+        resolver
+            .check_txn(
+                &Transaction::new_from_version(1, Operation::Append { fragments: vec![] }),
+                2,
+            )
+            .expect("an unstamped append must stay compatible");
     }
 
     #[tokio::test]

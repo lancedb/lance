@@ -549,6 +549,10 @@ impl<'a> CommitBuilder<'a> {
 
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            // Merging is for plain appends; a transaction carrying schema
+            // metadata is rejected before it reaches here (see
+            // `can_merge_transactions`).
+            schema_metadata_updates: None,
             operation: Operation::Append {
                 fragments: transactions
                     .iter()
@@ -623,6 +627,7 @@ mod tests {
 
     fn sample_transaction(read_version: u64) -> Transaction {
         Transaction {
+            schema_metadata_updates: None,
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::Append {
                 fragments: vec![sample_fragment()],
@@ -1087,6 +1092,7 @@ mod tests {
 
         // Attempting to commit update gives error
         let update_transaction = Transaction {
+            schema_metadata_updates: None,
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::Update {
                 updated_fragments: vec![],

@@ -5308,6 +5308,7 @@ mod tests {
             .await
             .unwrap();
         let transaction = Transaction {
+            schema_metadata_updates: None,
             read_version: dataset.manifest.version,
             uuid: Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::DataReplacement {
@@ -5491,6 +5492,7 @@ mod tests {
             .await
             .unwrap();
         let transaction = Transaction {
+            schema_metadata_updates: None,
             read_version: dataset.manifest.version,
             uuid: Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::DataReplacement {

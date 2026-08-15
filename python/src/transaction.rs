@@ -824,6 +824,8 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             operation,
             tag: None,
             transaction_properties,
+            // Not surfaced to Python: no binding writes one today.
+            schema_metadata_updates: None,
         }))
     }
 }

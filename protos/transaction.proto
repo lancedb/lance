@@ -396,6 +396,10 @@ message Transaction {
     DataOverlay data_overlay = 115;
   }
 
+  // A schema metadata update to write in the same commit as the operation
+  // above. Two transactions that both carry one conflict.
+  optional UpdateMap schema_metadata_updates = 5;
+
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
   reserved 200, 202;
   reserved "blob_append", "blob_overwrite";

@@ -263,6 +263,10 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// A schema metadata update to write in the same commit as
+    /// `operation`. Two transactions that both carry one conflict, so the
+    /// loser commits nothing.
+    pub schema_metadata_updates: Option<UpdateMap>,
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -1760,6 +1764,7 @@ pub struct TransactionBuilder {
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    schema_metadata_updates: Option<UpdateMap>,
 }
 
 impl TransactionBuilder {
@@ -1770,7 +1775,14 @@ impl TransactionBuilder {
             operation,
             tag: None,
             transaction_properties: None,
+            schema_metadata_updates: None,
         }
+    }
+
+    /// See [`Transaction::schema_metadata_updates`].
+    pub fn schema_metadata_updates(mut self, updates: UpdateMap) -> Self {
+        self.schema_metadata_updates = Some(updates);
+        self
     }
 
     pub fn uuid(mut self, uuid: String) -> Self {
@@ -1801,6 +1813,7 @@ impl TransactionBuilder {
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            schema_metadata_updates: self.schema_metadata_updates,
         }
     }
 }
@@ -3337,6 +3350,13 @@ impl Transaction {
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
 
+        // Same manifest as the operation: the two land together or not at all.
+        if let Some(schema_metadata_updates) = &self.schema_metadata_updates {
+            let mut schema_metadata = manifest.schema.metadata.clone();
+            apply_update_map(&mut schema_metadata, schema_metadata_updates);
+            manifest.schema.metadata = schema_metadata;
+        }
+
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
         }
@@ -4300,6 +4320,10 @@ impl TryFrom<pb::Transaction> for Transaction {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
             operation,
+            schema_metadata_updates: message
+                .schema_metadata_updates
+                .as_ref()
+                .map(UpdateMap::from),
             tag: if message.tag.is_empty() {
                 None
             } else {
@@ -4612,6 +4636,10 @@ impl From<&Transaction> for pb::Transaction {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
+            schema_metadata_updates: value
+                .schema_metadata_updates
+                .as_ref()
+                .map(pb::transaction::UpdateMap::from),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
         }
@@ -6351,6 +6379,7 @@ mod tests {
     fn test_proto_legacy_field_9_read() {
         // Simulate a manifest written by old Lance: only field 9, no field 10.
         let pb_tx = pb::Transaction {
+            schema_metadata_updates: None,
             read_version: 1,
             uuid: "test".to_string(),
             tag: String::new(),
@@ -6400,6 +6429,7 @@ mod tests {
             .unwrap();
 
         let pb_tx = pb::Transaction {
+            schema_metadata_updates: None,
             read_version: 1,
             uuid: "test".to_string(),
             tag: String::new(),
