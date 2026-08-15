@@ -6619,6 +6619,15 @@ def test_cell_flag_public_api(tmp_path: Path):
     dataset = lance.write_dataset(pa.table({"id": [5]}), dataset, mode="append")
     assert _flag_rows(dataset)[-2:] == [(4, True), (5, False)]
 
+    take_indices = [4, 0, 5, 1]
+    take_columns = {
+        "id": "id",
+        "computed": "cell_flag(embedding, 'computed')",
+    }
+    taken = dataset.take(take_indices, columns=take_columns)
+    expected = dataset.to_table(columns=take_columns).take(take_indices)
+    assert taken == expected
+
     with pytest.raises(ValueError, match="unknown flag"):
         dataset.to_table(columns={"flag": "cell_flag(id, 'missing')"})
     with pytest.raises(TypeError, match="must be a bool"):

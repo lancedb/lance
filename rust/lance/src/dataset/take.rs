@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeMap, collections::HashMap, collections::HashSet, ops::Range, pin::Pin,
+    sync::Arc,
+};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
@@ -26,6 +29,7 @@ use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 
 use super::ProjectionRequest;
+use super::cell_flag::{CellFlagExprBindings, expression_references_cell_flag};
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
 
 /// Convert a list of row offsets to a list of row addresses
@@ -397,13 +401,61 @@ async fn do_take_rows(
     to_logical_json_batch(projection.project_batch(batch).await?)
 }
 
-async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
+async fn bind_cell_flag_projection(builder: &mut TakeBuilder) -> Result<()> {
+    if builder.dataset.cell_flag_definitions().is_empty() {
+        return Ok(());
+    }
+    let mut references_cell_flag = false;
+    for output in &builder.projection.requested_output_expr {
+        if expression_references_cell_flag(&output.expr)? {
+            references_cell_flag = true;
+            break;
+        }
+    }
+    if !references_cell_flag {
+        return Ok(());
+    }
+    let mut projection = builder.projection.as_ref().clone();
+    let selected_fragment_ids = builder
+        .get_row_addrs()
+        .await?
+        .iter()
+        .map(|address| RowAddress::from(*address).fragment_id() as u64)
+        .collect::<HashSet<_>>();
+    let selected_fragments = builder
+        .dataset
+        .fragments()
+        .iter()
+        .filter(|fragment| selected_fragment_ids.contains(&fragment.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expressions = projection
+        .requested_output_expr
+        .iter()
+        .map(|output| &output.expr)
+        .collect::<Vec<_>>();
+    let Some(bindings) =
+        CellFlagExprBindings::try_new(&builder.dataset, &expressions, Some(&selected_fragments))
+            .await?
+    else {
+        return Ok(());
+    };
+    for output in &mut projection.requested_output_expr {
+        output.expr = bindings.bind(output.expr.clone(), &builder.dataset)?;
+    }
+    projection.rebuild_physical_projection(builder.dataset.clone())?;
+    builder.projection = Arc::new(projection);
+    Ok(())
+}
+
+async fn take_rows(mut builder: TakeBuilder) -> Result<RecordBatch> {
     if builder.is_empty() {
         return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
             builder.projection.output_schema()?,
         )));
     }
 
+    bind_cell_flag_projection(&mut builder).await?;
     let projection = builder.projection.clone();
 
     do_take_rows(builder, projection).await
@@ -620,7 +672,8 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 #[cfg(test)]
 mod test {
     use arrow_array::{
-        Int32Array, LargeBinaryArray, ListArray, RecordBatchIterator, StringArray, StructArray,
+        BooleanArray, Int32Array, LargeBinaryArray, ListArray, RecordBatchIterator, StringArray,
+        StructArray,
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Fields, Schema as ArrowSchema};
@@ -632,7 +685,7 @@ mod test {
     use rstest::rstest;
     use std::collections::HashMap;
 
-    use crate::dataset::{WriteParams, scanner::test_dataset::TestVectorDataset};
+    use crate::dataset::{UpdateBuilder, WriteParams, scanner::test_dataset::TestVectorDataset};
 
     use super::*;
 
@@ -907,6 +960,88 @@ mod test {
 
         let values2 = dataset.take_rows(&[10, 50, 100], projection).await.unwrap();
         assert_eq!(values, values2);
+    }
+
+    #[tokio::test]
+    async fn test_take_with_cell_flag_projection() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..6)),
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    None,
+                    Some(30),
+                    None,
+                    Some(50),
+                    Some(60),
+                ])),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, "memory://", None).await.unwrap();
+        dataset
+            .register_cell_flag("value", "reviewed", false)
+            .await
+            .unwrap();
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id IN (1, 3)")
+            .unwrap()
+            .set_cell_flag("value", "reviewed", true)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = result.new_dataset.as_ref();
+        let projection = ProjectionRequest::from_sql([
+            ("id", "id"),
+            ("reviewed", "cell_flag(value, 'reviewed')"),
+        ]);
+
+        let values = dataset.take(&[3, 0, 1], projection.clone()).await.unwrap();
+        assert_eq!(
+            values
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[3, 0, 1]
+        );
+        assert_eq!(
+            values
+                .column_by_name("reviewed")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap(),
+            &BooleanArray::from(vec![true, false, true])
+        );
+
+        let by_row_id = dataset
+            .take_rows(&[3, 0, 1], projection.clone())
+            .await
+            .unwrap();
+        assert_eq!(by_row_id, values);
+
+        let empty = dataset.take(&[], projection).await.unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_eq!(
+            empty
+                .schema()
+                .field_with_name("reviewed")
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
     }
 
     #[tokio::test]
