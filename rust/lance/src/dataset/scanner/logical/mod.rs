@@ -32,8 +32,9 @@
 //! source       the scan leaf, as a TableProvider
 //! rules        rule plumbing shared by every index type
 //! coverage     splitting a search across indexed and unindexed fragments
-//! scan_index   recording each scan's scalar index query on its source
+//! scan_index   recording on each scan how it finds its rows (index query, or a take)
 //! planner      stage 4: dispatch to each node's lowering
+//! row_offset   the `_rowoffset` column, whose node is the one that needs a prefetch
 //! take/        late materialization
 //! vector/      node, rerank, rules, planner   <- five entry points
 //! fts/         node, rules, planner, prefetch <- the same five
@@ -52,6 +53,7 @@ pub mod dataframe;
 pub(super) mod fts;
 pub(super) mod planner;
 pub(super) mod prepare;
+pub(super) mod row_offset;
 pub(super) mod rules;
 pub(super) mod scan_index;
 pub(super) mod source;
@@ -61,6 +63,7 @@ mod tests;
 pub(super) mod vector;
 
 pub use coverage::*;
+pub use row_offset::*;
 pub use rules::*;
 pub use scan_index::*;
 pub use take::*;
@@ -82,13 +85,12 @@ use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use lance_core::ROW_OFFSET;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::exec::{StrictBatchSizeExec, get_session_context};
 
 use self::context::ScanPlanningContext;
 use crate::dataset::Scanner;
-use crate::dataset::scanner::{ExprFilter, MaterializationStyle};
+use crate::dataset::scanner::MaterializationStyle;
 use crate::io::exec::get_physical_optimizer;
 use crate::{Error, Result};
 
@@ -258,6 +260,7 @@ fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRul
         // After the split, so the refine lands on the *indexed branch* of a partially-covered
         // search rather than above the union — the nesting the imperative path produces.
         Arc::new(ExpandVectorRefine::new(context.clone())),
+        Arc::new(ResolveRowOffsets::new(context.clone())),
     ]);
     rules
 }
@@ -283,6 +286,7 @@ fn optimizer_rules(
         // decides the scan's coverage — so the split runs here for scans and in the analyzer for
         // searches. Before `PushDownLimit`, so a limit is pushed into a union of branches rather
         // than duplicated onto each of them.
+        Arc::new(ResolveTake::new(context.clone())),
         Arc::new(ResolveScalarIndexQuery::new(context.clone())),
         Arc::new(SplitOnIndexCoverage::scans(context.clone())),
         Arc::new(PushDownLimit::new()),
@@ -347,7 +351,7 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
 
         // Read by the builder, the source, the context, or the session config.
         prefilter: _,
-        filter,
+        filter: _,
         full_text_query,
         batch_size: _,
         batch_readahead: _,
@@ -393,16 +397,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         ))
     };
 
-    if let Some(query) = nearest {
-        // A multivector column has its own physical path (`Scanner::multivec_ann`), which the
-        // lowering here does not reach — `plan_indexed_search` would quietly build a single-vector
-        // fanout over it instead.
-        let (vector_type, _) =
-            crate::index::vector::utils::get_vector_type(scanner.dataset.schema(), &query.column)?;
-        if matches!(vector_type, arrow_schema::DataType::List(_)) {
-            return unsupported("multivector search");
-        }
-    }
     if *include_deleted_rows && (nearest.is_some() || full_text_query.is_some()) {
         // The imperative path rejects these in `vector_search_source`/`fts_search_source` for the
         // same reason: a search returns row ids, and a deleted row does not have one.
@@ -410,26 +404,18 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
             "Cannot include deleted rows in a search".into(),
         ));
     }
-    // Two ways to ask for `_rowoffset`, and only one of them is a projection: the imperative path
-    // also accepts it in a predicate (`_rowoffset IN (5, 9)`), where it reaches the builder as a
-    // column the scan schema does not have and fails as `FieldNotFound` — which reads as a bug
-    // rather than a gap. Matched textually because parsing the predicate needs a schema this path
-    // has not built yet; over-rejecting a column merely *named* like this one is the safe
-    // direction for a guard.
-    let filters_on_row_offset = match &filter.expr_filter {
-        Some(ExprFilter::Sql(sql)) => sql.contains(ROW_OFFSET),
-        Some(ExprFilter::Datafusion(expr)) => expr.to_string().contains(ROW_OFFSET),
-        // Substrait conversion runs against the dataset schema, which has no metadata columns.
-        Some(ExprFilter::Substrait(_)) | None => false,
-    };
-    if projection_plan.must_add_row_offset || filters_on_row_offset {
-        return unsupported("_rowoffset");
-    }
     if projection_plan.has_output_cols() && projection_plan.physical_projection.is_empty() {
-        // `SELECT 1 AS foo` — output columns that read nothing. The imperative path rejects this at
-        // `scanner.rs:2846`; this path would otherwise fall into the leaf's "reading nothing is not
-        // a thing the reader can do" branch and quietly return row addresses instead.
-        return unsupported("a projection of only dynamic expressions");
+        // `SELECT 1 AS foo` — output columns that read nothing. Not a gap: the imperative path
+        // rejects this too (`scanner.rs:2846`), and for the same reason, so this states the same
+        // refusal rather than deferring it. Without the guard, the leaf's "reading nothing is not a
+        // thing the reader can do" branch would quietly return row addresses instead.
+        return Err(Error::not_supported_source(
+            format!(
+                "Scans must request at least one column.  Received only dynamic expressions: {:?}",
+                projection_plan.requested_output_expr
+            )
+            .into(),
+        ));
     }
     if !matches!(materialization_style, MaterializationStyle::Heuristic) {
         // The builder decides take placement itself and never consults `is_early_field`, so an

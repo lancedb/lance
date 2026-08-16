@@ -260,3 +260,92 @@ async fn test_paths_agree_on_a_grouped_aggregate() {
     );
     assert_eq!(expected, actual);
 }
+
+/// `SELECT 1 AS foo` reads nothing, and both paths refuse it rather than inventing a column.
+#[tokio::test]
+async fn test_both_paths_reject_a_projection_that_reads_nothing() {
+    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+        scan.project_with_transform(&[("foo", "1")])
+    }
+
+    let dataset = test_dataset().await;
+    let imperative = imperative_plan_for(&dataset, config)
+        .await
+        .expect_err("nothing to read");
+    let logical = logical_plan_for(&dataset, config)
+        .await
+        .expect_err("nothing to read");
+
+    for error in [&imperative, &logical] {
+        assert!(
+            matches!(error, crate::Error::NotSupported { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("at least one column"), "{error}");
+    }
+}
+
+/// A `_rowid` predicate names its rows, so the scan reads only those.
+#[tokio::test]
+async fn test_paths_agree_on_a_row_id_take() {
+    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+        scan.filter("_rowid IN (5, 10, 20)")?.with_row_id();
+        Ok(scan)
+    }
+
+    let dataset = test_dataset().await;
+    assert_paths_agree(&dataset, config).await.unwrap();
+
+    let plan = logical_plan_for(&dataset, config).await.unwrap();
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        !display.contains("full_filter=_rowid"),
+        "the take should have replaced the predicate: {display}"
+    );
+}
+
+/// The rest of a conjunction survives the rewrite as an ordinary filter.
+#[tokio::test]
+async fn test_paths_agree_on_a_row_id_take_with_a_remainder() {
+    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+        scan.filter("_rowid IN (5, 10, 20) AND i > 7")?
+            .with_row_id();
+        Ok(scan)
+    }
+
+    let dataset = test_dataset().await;
+    assert_paths_agree(&dataset, config).await.unwrap();
+}
+
+/// A `_rowaddr` predicate is a take too, once stage 2 has translated the addresses.
+#[tokio::test]
+async fn test_paths_agree_on_a_row_address_take() {
+    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+        scan.filter("_rowaddr IN (5, 10, 20)")?.with_row_address();
+        Ok(scan)
+    }
+
+    let dataset = test_dataset().await;
+    assert_paths_agree(&dataset, config).await.unwrap();
+}
+
+/// `_rowoffset` counts live rows from the start of the dataset, so a deleted row shifts it.
+#[tokio::test]
+#[rstest::rstest]
+#[case::projected(false)]
+#[case::taken(true)]
+async fn test_paths_agree_on_row_offsets(#[case] as_take: bool) {
+    let mut dataset = test_dataset().await;
+    dataset.delete("i = 3").await.unwrap();
+
+    let scan_config = config(move |scan: &mut crate::dataset::Scanner| {
+        scan.project(&["i", "_rowoffset"])?;
+        if as_take {
+            scan.filter("_rowoffset IN (5, 10, 20)")?;
+        }
+        Ok(scan)
+    });
+    assert_paths_agree(&dataset, scan_config).await.unwrap();
+}

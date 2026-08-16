@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Deriving each Lance scan's scalar index query and recording it on the scan's source.
+//! Recording on a Lance scan's source how it will find its rows: a scalar index query, or a row
+//! restriction that makes the read a take.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -10,10 +11,13 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::{provider_as_source, source_as_provider};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
+use datafusion::logical_expr::utils::conjunction;
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
+use lance_select::mask::RowAddrTreeMap;
 
 use super::context::ScanPlanningContext;
 use super::source::{LanceScanSource, ScanRestriction};
+use crate::dataset::scanner::TakeOperation;
 
 /// Derive each Lance scan's scalar index query and record it on the scan's source.
 ///
@@ -151,4 +155,73 @@ pub fn restricts_candidates(plan: &LogicalPlan) -> bool {
         }
     });
     restricts
+}
+
+/// Turn a predicate that names its rows into a direct take.
+///
+/// `_rowid IN (10, 20)` leaves nothing to search for: the ids *are* the selection. Recording them
+/// on the scan's source is the logical-layer version of `Scanner::take_source`, which assembles the
+/// same read by hand.
+///
+/// Row ids are resolved here; `_rowaddr` and `_rowoffset` name physical positions, and turning
+/// those into row ids reads row-id sequences and deletion vectors, so stage 2 does it and this
+/// looks the answer up.
+///
+/// Runs after `PushDownFilter`, so the predicate has reached the scan, and before
+/// [`ResolveScalarIndexQuery`] — a row restriction and a scalar index query compete for the same
+/// slot on the read, and this one wins.
+#[derive(Debug)]
+pub struct ResolveTake {
+    context: Arc<ScanPlanningContext>,
+}
+
+impl ResolveTake {
+    pub fn new(context: Arc<ScanPlanningContext>) -> Self {
+        Self { context }
+    }
+}
+
+impl OptimizerRule for ResolveTake {
+    fn name(&self) -> &str {
+        "resolve_take"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::TableScan(scan) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let restrictable = with_lance_source(&plan, |source| source.options().rows.is_none());
+        if restrictable != Some(true) || scan.filters.is_empty() {
+            return Ok(Transformed::no(plan));
+        }
+        let Some(predicate) = conjunction(unnormalize_cols(scan.filters.iter().cloned())) else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some((take, remainder)) = TakeOperation::try_from_expr(&predicate) else {
+            return Ok(Transformed::no(plan));
+        };
+        let rows = match &take {
+            TakeOperation::RowIds(ids) => Arc::new(RowAddrTreeMap::from_iter(ids.iter().copied())),
+            _ => match self.context.take_rows(&take) {
+                Some(rows) => rows.clone(),
+                // Stage 2 walked a different plan than this one, so leave the predicate alone
+                // rather than guess: reading every row and filtering is slower, not wrong.
+                None => return Ok(Transformed::no(plan)),
+            },
+        };
+        let mut scan = scan.clone();
+        scan.filters = remainder.into_iter().collect();
+        let restricted = LogicalPlan::TableScan(scan);
+        Ok(Transformed::yes(map_lance_scan(&restricted, |source| {
+            source.restricted_to(&ScanRestriction::Rows(rows.clone()))
+        })?))
+    }
 }

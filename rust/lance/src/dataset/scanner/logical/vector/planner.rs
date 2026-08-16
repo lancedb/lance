@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::expressions;
@@ -22,7 +23,9 @@ use super::super::{PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
 use crate::Result;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 
-use crate::io::exec::knn::{KnnBatchParams, QUERY_INDEX_COL, new_knn_exec};
+use crate::dataset::scanner::DEFAULT_XTR_OVERFETCH;
+use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::io::exec::knn::{KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL, new_knn_exec};
 use crate::io::exec::{KNNVectorDistanceExec, LanceFilterExec, PreFilterSource};
 
 use super::super::planner::sort_asc;
@@ -68,7 +71,13 @@ pub fn plan_indexed_search(
     let block = node
         .overlay_block()
         .map(|rows| RowAddrMask::from_block(rows.as_ref().clone()));
-    let fanout = new_knn_exec(node.dataset().clone(), segments, query, prefilter, block)?;
+    let (vector_type, _) = get_vector_type(node.dataset().schema(), &query.column)?;
+    let fanout = match vector_type {
+        // A multivector row holds many vectors, so one row is scored from several fanouts at once
+        // rather than one. Mirrors `Scanner::multivec_ann`.
+        DataType::List(_) => plan_multivector_fanout(node, segments, prefilter, block)?,
+        _ => new_knn_exec(node.dataset().clone(), segments, query, prefilter, block)?,
+    };
 
     // Over-fetch when refining: the extra candidates are what the exact re-rank chooses from.
     let fetch = query.k * query.refine_factor.unwrap_or(1) as usize;
@@ -83,6 +92,53 @@ pub fn plan_indexed_search(
         )
         .with_fetch(Some(fetch)),
     ))
+}
+
+/// Search each of a multivector query's vectors separately, then score rows across the results.
+///
+/// The per-vector searches deliberately over-fetch: XTR scores a row from whichever of its vectors
+/// were retrieved, so recall depends on each search reaching deep enough to find them.
+fn plan_multivector_fanout(
+    node: &VectorSearchNode,
+    segments: &[IndexMetadata],
+    prefilter: PreFilterSource,
+    block: Option<RowAddrMask>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let query = node.query();
+    let dim = get_vector_dim(node.dataset().schema(), &query.column)?;
+    let over_fetch = *DEFAULT_XTR_OVERFETCH;
+
+    let mut searches = Vec::with_capacity(query.key.len() / dim);
+    for offset in (0..query.key.len()).step_by(dim) {
+        let mut single = query.clone();
+        single.key = query.key.slice(offset, dim);
+        // XTR scores from the retrieved vectors themselves, so there is nothing to refine against
+        // — the factor is purely how deep each search goes.
+        single.refine_factor = Some(over_fetch);
+        let fanout = new_knn_exec(
+            node.dataset().clone(),
+            segments,
+            &single,
+            prefilter.clone(),
+            block.clone(),
+        )?;
+        searches.push(Arc::new(
+            SortExec::new(
+                [
+                    sort_asc(DIST_COL, fanout.as_ref())?,
+                    sort_asc(ROW_ID, fanout.as_ref())?,
+                ]
+                .into(),
+                fanout,
+            )
+            .with_fetch(Some(query.k * over_fetch as usize)),
+        ) as Arc<dyn ExecutionPlan>);
+    }
+
+    Ok(Arc::new(MultivectorScoringExec::try_new(
+        searches,
+        query.clone(),
+    )?))
 }
 
 /// Brute-force top-`k` by distance over the input. Mirrors `Scanner::flat_knn`, and is shared by

@@ -31,13 +31,16 @@ use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DocumentGranularity;
 
 use super::fts::{self, FtsIndexInfo};
+use super::row_offset::RowOffsetNode;
 use super::scan_index::with_lance_source;
 use super::{TakeSettings, VectorSearchNode};
 use crate::Result;
 use crate::dataset::Dataset;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
-use crate::dataset::rowids::translate_addr_treemap_to_row_ids;
+use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
+use crate::dataset::scanner::TakeOperation;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, ScalarIndexInfo};
+use crate::io::exec::RowOffsetMap;
 
 /// What a data overlay did to an index's entries.
 ///
@@ -171,6 +174,14 @@ pub struct ScanPlanningContext {
     /// consulted. Empty unless some fragment carries an overlay, which is what keeps this off the
     /// common path.
     index_staleness: HashMap<String, OverlayStaleness>,
+    /// Row selections for take-shaped predicates whose resolution needed I/O, keyed by the
+    /// predicate's values rather than its expression: the rules see it after `PushDownFilter` has
+    /// moved it, and the values are what survive that unchanged.
+    take_rows: HashMap<String, Arc<RowAddrTreeMap>>,
+    /// Fragment row counts and deletion vectors, loaded only when the plan asks for `_rowoffset`.
+    /// `AddRowOffsetExec::try_new` is the one physical constructor that does I/O; this is how it
+    /// stops being one.
+    row_offsets: Option<RowOffsetMap>,
 }
 
 impl ScanPlanningContext {
@@ -185,7 +196,15 @@ impl ScanPlanningContext {
     pub async fn collect(plan: &LogicalPlan) -> Result<Self> {
         let mut leaf = None;
         let mut searches: Vec<(String, Option<DistanceType>)> = Vec::new();
+        let mut needs_row_offsets = false;
+        let mut takes: Vec<TakeOperation> = Vec::new();
         plan.apply(|node| {
+            if let LogicalPlan::Extension(extension) = node
+                && extension.node.as_any().is::<RowOffsetNode>()
+            {
+                needs_row_offsets = true;
+            }
+            takes.extend(take_operations(node));
             if let LogicalPlan::Extension(extension) = node
                 && let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>()
             {
@@ -246,6 +265,11 @@ impl ScanPlanningContext {
 
         let scalar_indices = Arc::new(dataset.scalar_index_info().await?);
         let index_staleness = prefetch_index_staleness(&dataset, &fragments).await?;
+        let row_offsets = match needs_row_offsets {
+            true => Some(RowOffsetMap::load(dataset.clone()).await?),
+            false => None,
+        };
+        let take_rows = resolve_takes(&dataset, takes).await?;
 
         Ok(Self {
             fragments,
@@ -258,7 +282,18 @@ impl ScanPlanningContext {
             },
             scalar_indices,
             index_staleness,
+            row_offsets,
+            take_rows,
         })
+    }
+
+    pub fn row_offsets(&self) -> Option<&RowOffsetMap> {
+        self.row_offsets.as_ref()
+    }
+
+    /// The rows a take-shaped predicate selects, if resolving it needed I/O and stage 2 did it.
+    pub fn take_rows(&self, take: &TakeOperation) -> Option<&Arc<RowAddrTreeMap>> {
+        self.take_rows.get(&take_key(take))
     }
 
     pub fn scalar_indices(&self) -> &ScalarIndexInfo {
@@ -521,4 +556,53 @@ fn select_requested_segments(
         ));
     }
     Ok(selected)
+}
+
+/// The take-shaped predicates a plan node carries, if any.
+///
+/// Both positions are checked because stage 2 runs before `PushDownFilter`: a predicate written by
+/// the builder is a `Filter`, while one the DataFrame API pushed is already on the scan.
+fn take_operations(node: &LogicalPlan) -> Vec<TakeOperation> {
+    let predicates: Vec<_> = match node {
+        LogicalPlan::Filter(filter) => vec![filter.predicate.clone()],
+        LogicalPlan::TableScan(scan) => scan.filters.clone(),
+        _ => vec![],
+    };
+    predicates
+        .iter()
+        .filter_map(|predicate| Some(TakeOperation::try_from_expr(predicate)?.0))
+        .collect()
+}
+
+/// Identifies a take by what it selects, so the same take found at two points in planning agrees.
+pub fn take_key(take: &TakeOperation) -> String {
+    format!("{take:?}")
+}
+
+/// Turn `_rowaddr` takes into the row ids a read can be restricted to.
+///
+/// `TakeOperation::RowIds` is absent because it needs no translation — the rule handles it inline.
+/// `RowOffsets` is absent for a different reason: a `_rowoffset` predicate sits above the node that
+/// computes the column, so it never reaches the scan for the rule to rewrite.
+async fn resolve_takes(
+    dataset: &Arc<Dataset>,
+    takes: Vec<TakeOperation>,
+) -> Result<HashMap<String, Arc<RowAddrTreeMap>>> {
+    let mut resolved = HashMap::new();
+    for take in takes {
+        let key = take_key(&take);
+        if resolved.contains_key(&key) {
+            continue;
+        }
+        let TakeOperation::RowAddrs(addrs) = &take else {
+            continue;
+        };
+        let addrs = addrs.clone();
+        let row_ids = live_row_addrs_to_row_ids(dataset, addrs.into_iter().map(Some)).await?;
+        resolved.insert(
+            key,
+            Arc::new(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten())),
+        );
+    }
+    Ok(resolved)
 }

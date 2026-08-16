@@ -23,6 +23,18 @@ use crate::utils::test::assert_plan_node_equals;
 pub(super) trait ScanConfig: Fn(&mut Scanner) -> Result<&mut Scanner> {}
 impl<F: Fn(&mut Scanner) -> Result<&mut Scanner>> ScanConfig for F {}
 
+/// Pin a closure's lifetime to the `ScanConfig` bound.
+///
+/// Rust infers a single fixed lifetime for a closure argument unless something forces the
+/// higher-ranked form, and `impl ScanConfig` is not enough on its own. Wrapping the closure here is
+/// what makes it one; a plain `fn` item needs no wrapper.
+pub(super) fn config<F>(f: F) -> F
+where
+    F: for<'a> Fn(&'a mut Scanner) -> Result<&'a mut Scanner>,
+{
+    f
+}
+
 /// Sort a result batch by `_rowid` so two plans can be compared as sets.
 pub(super) fn sorted_by_row_id(batch: &RecordBatch) -> Result<RecordBatch> {
     use arrow::compute::{SortColumn, lexsort_to_indices, take};

@@ -25,6 +25,7 @@ use lance_index::vector::DIST_COL;
 
 use super::fts;
 use super::prepare::PreparedQueries;
+use super::row_offset::RowOffsetNode;
 use super::source::{LanceScanSource, ScanSourceOptions};
 use super::{LanceTakeNode, TakeSettings, VectorAccessPath, VectorRerankNode, VectorSearchNode};
 use crate::dataset::scanner::ColumnOrdering;
@@ -157,6 +158,14 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     } else {
         LogicalPlanBuilder::new(source)
     };
+
+    // A row's offset is derived from its address alone, so this can sit below the sort and limit
+    // that the imperative path puts it above — the values come out the same either way. It has to
+    // sit below a postfilter that reads it, which is the reason it is added here rather than there.
+    if scanner.projection_plan.must_add_row_offset {
+        builder =
+            LogicalPlanBuilder::new(extension(RowOffsetNode::try_new(builder.plan().clone())?));
+    }
 
     // Postfilters, innermost first: an FTS `query_filter` runs before the expression filter,
     // matching `FilterPlan::refine_filter`.

@@ -17,6 +17,7 @@ use datafusion::physical_plan::expressions;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_physical_expr::PhysicalSortExpr;
 
+use super::row_offset::{RowOffsetNode, plan_row_offset};
 use super::{LanceTakeNode, VectorRerankNode, VectorSearchNode};
 use super::{plan_flat_knn, plan_take, plan_vector_search};
 use crate::Result;
@@ -58,6 +59,9 @@ impl ExtensionPlanner for LanceExtensionPlanner {
         }
         if let Some(take) = node.as_any().downcast_ref::<LanceTakeNode>() {
             return Ok(Some(plan_take(take, input)?));
+        }
+        if let Some(offsets) = node.as_any().downcast_ref::<RowOffsetNode>() {
+            return Ok(Some(plan_row_offset(offsets, input)?));
         }
         Ok(None)
     }

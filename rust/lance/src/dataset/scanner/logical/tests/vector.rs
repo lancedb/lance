@@ -371,20 +371,35 @@ async fn test_search_without_a_metric_adopts_the_index_metric() {
     .unwrap();
 }
 
-/// A multivector column has its own physical path, which this one does not lower to.
-///
-/// Worth a test rather than a comment: nothing in the vector lowering inspects the column type, so
-/// without the guard a multivector search would build a single-vector fanout and return wrong rows.
+/// Without an index, a multivector row is scored the same way any other row is.
 #[tokio::test]
-async fn test_multivector_search_is_rejected() {
+async fn test_paths_agree_on_a_flat_multivector_search() {
     let dataset = multivector_dataset().await;
-    let mut scan = dataset.scan();
-    scan.nearest("vec", &query_vector(), 5).unwrap();
-
-    let err = super::super::create_plan(&scan)
+    let query = batch_query_vectors(2);
+    assert_paths_agree(&dataset, |scan| scan.nearest("vec", &query, 5))
         .await
-        .expect_err("multivector search is not supported yet");
-    assert!(err.to_string().contains("multivector"), "{err}");
+        .unwrap();
+}
+
+/// With an index, each query vector gets its own fanout and the row is scored across all of them.
+#[tokio::test]
+async fn test_paths_agree_on_an_indexed_multivector_search() {
+    use crate::index::DatasetIndexExt;
+    use crate::index::vector::VectorIndexParams;
+    use lance_index::IndexType;
+    use lance_linalg::distance::DistanceType;
+
+    let mut dataset = multivector_dataset().await;
+    let params = VectorIndexParams::ivf_pq(2, 8, 2, DistanceType::Cosine, 2);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let query = batch_query_vectors(2);
+    assert_paths_agree(&dataset, |scan| scan.nearest("vec", &query, 5))
+        .await
+        .unwrap();
 }
 
 /// `vec` is `List<FixedSizeList<Float32, DIM>>` — two vectors per row.
@@ -396,7 +411,8 @@ async fn multivector_dataset() -> crate::dataset::Dataset {
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
-    const ROWS: usize = 64;
+    // 256 rows of two vectors each: PQ needs 256 training vectors.
+    const ROWS: usize = 256;
     const VECTORS_PER_ROW: usize = 2;
 
     let item = Arc::new(Field::new("item", DataType::Float32, true));
