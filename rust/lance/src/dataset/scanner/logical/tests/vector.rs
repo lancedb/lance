@@ -370,3 +370,77 @@ async fn test_search_without_a_metric_adopts_the_index_metric() {
     .await
     .unwrap();
 }
+
+/// A multivector column has its own physical path, which this one does not lower to.
+///
+/// Worth a test rather than a comment: nothing in the vector lowering inspects the column type, so
+/// without the guard a multivector search would build a single-vector fanout and return wrong rows.
+#[tokio::test]
+async fn test_multivector_search_is_rejected() {
+    let dataset = multivector_dataset().await;
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query_vector(), 5).unwrap();
+
+    let err = super::super::create_plan(&scan)
+        .await
+        .expect_err("multivector search is not supported yet");
+    assert!(err.to_string().contains("multivector"), "{err}");
+}
+
+/// `vec` is `List<FixedSizeList<Float32, DIM>>` — two vectors per row.
+async fn multivector_dataset() -> crate::dataset::Dataset {
+    use arrow::buffer::OffsetBuffer;
+    use arrow_array::{
+        FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    const ROWS: usize = 64;
+    const VECTORS_PER_ROW: usize = 2;
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let vectors = FixedSizeListArray::try_new(
+        item.clone(),
+        DIM as i32,
+        Arc::new(Float32Array::from(
+            (0..ROWS * VECTORS_PER_ROW * DIM as usize)
+                .map(|value| value as f32 % 13.0)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    let element = Arc::new(Field::new(
+        "item",
+        DataType::FixedSizeList(item, DIM as i32),
+        true,
+    ));
+    let multivectors = ListArray::try_new(
+        element.clone(),
+        OffsetBuffer::from_lengths(std::iter::repeat_n(VECTORS_PER_ROW, ROWS)),
+        Arc::new(vectors),
+        None,
+    )
+    .unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i", DataType::Int32, false),
+        Field::new("vec", DataType::List(element), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from((0..ROWS as i32).collect::<Vec<_>>())),
+            Arc::new(multivectors),
+        ],
+    )
+    .unwrap();
+    crate::dataset::Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap()
+}

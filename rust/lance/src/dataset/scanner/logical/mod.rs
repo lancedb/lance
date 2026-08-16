@@ -393,6 +393,16 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
     if *is_batch_nearest {
         return unsupported("batch vector search");
     }
+    if let Some(query) = nearest {
+        // A multivector column has its own physical path (`Scanner::multivec_ann`), which the
+        // lowering here does not reach — `plan_indexed_search` would quietly build a single-vector
+        // fanout over it instead.
+        let (vector_type, _) =
+            crate::index::vector::utils::get_vector_type(scanner.dataset.schema(), &query.column)?;
+        if matches!(vector_type, arrow_schema::DataType::List(_)) {
+            return unsupported("multivector search");
+        }
+    }
     if *include_deleted_rows && (nearest.is_some() || full_text_query.is_some()) {
         // The imperative path rejects these in `vector_search_source`/`fts_search_source` for the
         // same reason: a search returns row ids, and a deleted row does not have one.
