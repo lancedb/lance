@@ -31,7 +31,7 @@ use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DocumentGranularity;
 
 use super::fts::{self, FtsIndexInfo};
-use super::nodes::{TakeSettings, VectorSearchNode};
+use super::{TakeSettings, VectorSearchNode};
 use crate::Result;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::translate_addr_treemap_to_row_ids;

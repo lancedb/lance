@@ -12,12 +12,11 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_index::scalar::inverted::query::{FtsQuery, FtsSearchParams};
 
-use super::super::nodes::{LanceTakeNode, TakeSettings};
+use super::super::{LanceTakeNode, TakeSettings};
+use super::*;
 use crate::dataset::Dataset;
 use crate::index::scalar::inverted::resolve_fts_field;
 use crate::{Error, Result};
-
-use super::*;
 
 /// Build the subtree for a full-text search source over `input`.
 ///

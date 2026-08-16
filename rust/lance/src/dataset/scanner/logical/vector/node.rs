@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Lance-specific logical plan nodes.
-//!
-//! Both nodes follow the shape of
-//! [`MergeInsertWriteNode`](crate::dataset::write::merge_insert::logical_plan), the only other
-//! `UserDefinedLogicalNodeCore` in the tree — including the hand-written `PartialEq`/`Hash`/
-//! `PartialOrd`, which are needed because `Arc<Dataset>` implements none of them.
+//! The vector search node: what the caller asked for, and how it will be answered.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -17,19 +12,16 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::common::plan_err;
 use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::logical_expr::{Expr, InvariantLevel, LogicalPlan, UserDefinedLogicalNodeCore};
-use lance_arrow::SchemaExt;
-use lance_core::datatypes::Projection;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::{ApproxMode, DIST_COL, Query};
 use lance_linalg::distance::DistanceType;
 use lance_select::mask::RowAddrTreeMap;
-use lance_table::format::{Fragment, IndexMetadata};
+use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::Dataset;
 use crate::index::vector::utils::{default_distance_type_for, get_vector_type};
-use crate::io::exec::TakeExec;
 
 /// What answer the caller will accept.
 ///
@@ -75,7 +67,7 @@ impl SearchAccuracy {
 }
 
 /// How a search will actually be computed. Filled in by
-/// [`ResolveVectorAccessPath`](super::rules::ResolveVectorAccessPath); `None` until then.
+/// [`ResolveVectorAccessPath`](ResolveVectorAccessPath); `None` until then.
 ///
 /// Keeping this on the node — rather than deciding it during lowering — is what lets the
 /// combined indexed/unindexed case be expressed as a rewrite over two ordinary search nodes
@@ -120,7 +112,7 @@ impl PartialOrd for VectorAccessPath {
 }
 
 /// Where the candidate restriction for an indexed search comes from. Decided by
-/// [`ResolvePrefilterSource`](super::rules::ResolvePrefilterSource).
+/// [`ResolvePrefilterSource`](ResolvePrefilterSource).
 ///
 /// This is the lowering artifact of a *prefilter*: a predicate positioned below the search.
 /// Nothing about it is visible in the logical result — a postfilter puts the same predicate
@@ -157,7 +149,7 @@ pub struct VectorSearchNode {
     prefilter: PrefilterSourceKind,
     /// Rows the index must not emit, because a data overlay committed after the index was built
     /// changed a value the index covers. Set by
-    /// [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage), which puts the same rows on a
+    /// [`SplitOnIndexCoverage`](SplitOnIndexCoverage), which puts the same rows on a
     /// brute-force branch so they are answered from their current values.
     overlay_block: Option<Arc<RowAddrTreeMap>>,
     schema: DFSchemaRef,
@@ -372,7 +364,7 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
     }
 
     /// What the child has to produce depends on the access path, which is why this is only
-    /// accurate after [`ResolveVectorAccessPath`](super::rules::ResolveVectorAccessPath) has run:
+    /// accurate after [`ResolveVectorAccessPath`](ResolveVectorAccessPath) has run:
     /// an indexed search reads vectors from the index and wants nothing but row ids from the
     /// child, while a brute-force search has to read the vectors itself.
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
@@ -389,310 +381,5 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             .map(|(idx, _)| idx)
             .collect();
         Some(vec![needed])
-    }
-}
-
-/// Score the input's rows by distance to the query vector and keep the nearest `k`.
-///
-/// The difference from [`VectorSearchNode`] is what it does to the schema, and that follows from
-/// where it sits: a search *is* the source, so it may narrow its output to `[_rowid, _distance]`,
-/// while this sits above one and has to carry the columns already in flight. It also has no
-/// access path — a filter over rows someone else chose is brute force by definition.
-#[derive(Debug, Clone)]
-pub struct VectorRerankNode {
-    input: LogicalPlan,
-    query: Query,
-    distance_type: DistanceType,
-    schema: DFSchemaRef,
-}
-
-impl VectorRerankNode {
-    pub fn try_new(input: LogicalPlan, dataset: &Dataset, mut query: Query) -> Result<Self> {
-        let distance_type = match query.metric_type {
-            Some(metric) => metric,
-            None => {
-                let (_, element_type) = get_vector_type(dataset.schema(), &query.column)?;
-                default_distance_type_for(&element_type)
-            }
-        };
-        query.metric_type = Some(distance_type);
-
-        // Mirrors `KNNVectorDistanceExec::try_new_batch`: an existing `_distance` is dropped so the
-        // new one lands last.
-        let mut arrow = input.schema().as_arrow().clone();
-        if arrow.column_with_name(DIST_COL).is_some() {
-            arrow = arrow.without_column(DIST_COL);
-        }
-        let arrow = arrow.try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))?;
-        Ok(Self {
-            input,
-            query,
-            distance_type,
-            schema: Arc::new(DFSchema::try_from(arrow)?),
-        })
-    }
-
-    pub fn query(&self) -> &Query {
-        &self.query
-    }
-
-    pub fn distance_type(&self) -> DistanceType {
-        self.distance_type
-    }
-}
-
-impl PartialEq for VectorRerankNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.input == other.input
-            && self.query.column == other.query.column
-            && self.query.k == other.query.k
-    }
-}
-
-impl Eq for VectorRerankNode {}
-
-impl Hash for VectorRerankNode {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.input.hash(state);
-        self.query.column.hash(state);
-        self.query.k.hash(state);
-    }
-}
-
-impl PartialOrd for VectorRerankNode {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.input.partial_cmp(&other.input)
-    }
-}
-
-impl UserDefinedLogicalNodeCore for VectorRerankNode {
-    fn name(&self) -> &str {
-        "VectorRerank"
-    }
-
-    fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![&self.input]
-    }
-
-    fn schema(&self) -> &DFSchemaRef {
-        &self.schema
-    }
-
-    fn expressions(&self) -> Vec<Expr> {
-        vec![]
-    }
-
-    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "VectorRerank: column={}, k={}, metric={}",
-            self.query.column, self.query.k, self.distance_type
-        )
-    }
-
-    fn with_exprs_and_inputs(
-        &self,
-        exprs: Vec<Expr>,
-        mut inputs: Vec<LogicalPlan>,
-    ) -> datafusion::common::Result<Self> {
-        if !exprs.is_empty() {
-            return Err(datafusion::common::DataFusionError::Internal(
-                "VectorRerank takes no expressions".into(),
-            ));
-        }
-        if inputs.len() != 1 {
-            return Err(datafusion::common::DataFusionError::Internal(format!(
-                "VectorRerank takes exactly one input, got {}",
-                inputs.len()
-            )));
-        }
-        Ok(Self {
-            input: inputs.remove(0),
-            query: self.query.clone(),
-            distance_type: self.distance_type,
-            schema: self.schema.clone(),
-        })
-    }
-
-    /// The vector column has to survive down to here, and every other input column is part of the
-    /// output, so nothing below may be pruned.
-    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
-        Some(vec![(0..self.input.schema().fields().len()).collect()])
-    }
-}
-
-/// The read settings every take in a plan has to honor, carried down from the `Scanner`.
-///
-/// A take is a read, so a fragment restriction applies to it: rows the search found outside the
-/// target fragments are dropped here. That is how `with_fragments` reaches a search whose index
-/// covers more fragments than the scan asked for.
-#[derive(Debug, Clone, Default)]
-pub struct TakeSettings {
-    pub fragments: Option<Arc<Vec<Fragment>>>,
-    pub batch_size: Option<u32>,
-}
-
-/// Late materialization: fetch `projection`'s columns for rows the input has already identified,
-/// keyed by `_rowid`.
-///
-/// The physical form is a row-stream `FilteredReadExec`, whose output is the input's columns
-/// followed by the newly fetched ones. That ordering is reproduced here with the same helper the
-/// physical node uses, so the logical and physical schemas cannot drift.
-#[derive(Debug, Clone)]
-pub struct LanceTakeNode {
-    input: LogicalPlan,
-    dataset: Arc<Dataset>,
-    projection: Projection,
-    settings: TakeSettings,
-    schema: DFSchemaRef,
-}
-
-impl LanceTakeNode {
-    pub fn try_new(
-        input: LogicalPlan,
-        dataset: Arc<Dataset>,
-        projection: Projection,
-        settings: TakeSettings,
-    ) -> Result<Self> {
-        let schema = Self::output_schema(&input, &dataset, &projection)?;
-        Ok(Self {
-            input,
-            dataset,
-            projection,
-            settings,
-            schema,
-        })
-    }
-
-    /// Whether a take is needed at all: if the input already carries every projected column,
-    /// the node is a no-op and the builder should skip it.
-    pub fn is_noop(input: &LogicalPlan, projection: &Projection) -> Result<bool> {
-        let input_schema = input.schema().as_arrow().clone();
-        let missing = projection
-            .clone()
-            .subtract_arrow_schema(&input_schema, lance_core::datatypes::OnMissing::Ignore)?;
-        Ok(!missing.has_data_fields() && !missing.with_row_id && !missing.with_row_addr)
-    }
-
-    pub fn dataset(&self) -> &Arc<Dataset> {
-        &self.dataset
-    }
-
-    pub fn projection(&self) -> &Projection {
-        &self.projection
-    }
-
-    pub fn settings(&self) -> &TakeSettings {
-        &self.settings
-    }
-
-    fn output_schema(
-        input: &LogicalPlan,
-        dataset: &Dataset,
-        projection: &Projection,
-    ) -> Result<DFSchemaRef> {
-        let input_schema = input.schema().as_arrow().clone();
-        let fields_to_read = projection
-            .clone()
-            .subtract_arrow_schema(&input_schema, lance_core::datatypes::OnMissing::Ignore)?;
-        let output =
-            TakeExec::calculate_output_schema(dataset.schema(), &input_schema, &fields_to_read);
-        Ok(Arc::new(DFSchema::try_from(ArrowSchema::from(&output))?))
-    }
-}
-
-impl PartialEq for LanceTakeNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.input == other.input
-            && self.dataset.base == other.dataset.base
-            && self.projection.field_ids == other.projection.field_ids
-    }
-}
-
-impl Eq for LanceTakeNode {}
-
-impl Hash for LanceTakeNode {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.input.hash(state);
-        self.dataset.base.hash(state);
-        let mut ids = self
-            .projection
-            .field_ids
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids.hash(state);
-    }
-}
-
-impl PartialOrd for LanceTakeNode {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.input.partial_cmp(&other.input)
-    }
-}
-
-impl UserDefinedLogicalNodeCore for LanceTakeNode {
-    fn name(&self) -> &str {
-        "LanceTake"
-    }
-
-    fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![&self.input]
-    }
-
-    fn schema(&self) -> &DFSchemaRef {
-        &self.schema
-    }
-
-    fn expressions(&self) -> Vec<Expr> {
-        vec![]
-    }
-
-    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut columns = self
-            .projection
-            .to_bare_schema()
-            .fields
-            .iter()
-            .map(|field| field.name.clone())
-            .collect::<Vec<_>>();
-        columns.sort();
-        write!(
-            f,
-            "LanceTake: columns=[{}] by={}",
-            columns.join(", "),
-            ROW_ID
-        )
-    }
-
-    fn with_exprs_and_inputs(
-        &self,
-        exprs: Vec<Expr>,
-        mut inputs: Vec<LogicalPlan>,
-    ) -> datafusion::common::Result<Self> {
-        if !exprs.is_empty() {
-            return Err(datafusion::common::DataFusionError::Internal(
-                "LanceTake takes no expressions".into(),
-            ));
-        }
-        if inputs.len() != 1 {
-            return Err(datafusion::common::DataFusionError::Internal(format!(
-                "LanceTake takes exactly one input, got {}",
-                inputs.len()
-            )));
-        }
-        Self::try_new(
-            inputs.remove(0),
-            self.dataset.clone(),
-            self.projection.clone(),
-            self.settings.clone(),
-        )
-        .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))
-    }
-
-    /// Every input column carries through to the output, so nothing below can be dropped.
-    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
-        Some(vec![(0..self.input.schema().fields().len()).collect()])
     }
 }

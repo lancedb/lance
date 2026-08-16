@@ -19,7 +19,7 @@ use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
-use super::super::nodes::PrefilterSourceKind;
+use super::super::PrefilterSourceKind;
 use crate::dataset::Dataset;
 use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_field};
 use crate::{Error, Result};
@@ -70,7 +70,7 @@ impl PartialOrd for FtsAccessPath {
 ///
 /// Output is `fts_schema(granularity)` — `[_rowid, _score]`, plus `_doc_index` for list-element
 /// granularity — no matter which access path it lowers to, so the two are interchangeable in
-/// exactly the way [`VectorSearchNode`](super::nodes::VectorSearchNode)'s two paths are.
+/// exactly the way [`VectorSearchNode`](super::super::VectorSearchNode)'s two paths are.
 #[derive(Debug, Clone)]
 pub struct FtsLeafNode {
     pub(super) input: LogicalPlan,
@@ -95,7 +95,7 @@ pub struct FtsLeafNode {
     /// would reshuffle it.
     pub(super) retains_input_order: bool,
     /// Rows the index must not emit, because a data overlay changed a value the index covers. Set
-    /// by [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage), which puts the same rows on
+    /// by [`SplitOnIndexCoverage`](SplitOnIndexCoverage), which puts the same rows on
     /// a flat branch so they are scored from their current text.
     pub(super) overlay_block: Option<Arc<RowAddrTreeMap>>,
     pub(super) schema: DFSchemaRef,
@@ -242,7 +242,7 @@ impl UserDefinedLogicalNodeCore for FtsLeafNode {
 
     /// An unresolved leaf is not executable. See [`VectorSearchNode::check_invariants`].
     ///
-    /// [`VectorSearchNode::check_invariants`]: super::nodes::VectorSearchNode
+    /// [`VectorSearchNode::check_invariants`]: super::super::VectorSearchNode
     fn check_invariants(&self, check: InvariantLevel) -> datafusion::common::Result<()> {
         if matches!(check, InvariantLevel::Executable) && self.resolution.is_none() {
             return plan_err!(

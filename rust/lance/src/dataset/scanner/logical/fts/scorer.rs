@@ -15,7 +15,7 @@ use lance_core::ROW_ID;
 use lance_index::scalar::inverted::query::{FtsQuery, FtsSearchParams};
 use lance_table::format::IndexMetadata;
 
-use super::super::nodes::PrefilterSourceKind;
+use super::super::PrefilterSourceKind;
 use crate::dataset::Dataset;
 
 /// A whole compound query answered by one posting-list scorer.

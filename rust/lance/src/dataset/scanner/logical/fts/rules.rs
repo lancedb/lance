@@ -14,11 +14,10 @@ use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::inverted::query::FtsQuery;
 use lance_select::mask::RowAddrTreeMap;
 
+use super::super::PrefilterSourceKind;
 use super::super::context::{OverlayStaleness, ScanPlanningContext};
-use super::super::nodes::PrefilterSourceKind;
-use super::super::rules::{IndexCoverage, SplittableSearch};
 use super::super::source::ScanRestriction;
-
+use super::super::{IndexCoverage, SplittableSearch};
 use super::*;
 
 // ---------------------------------------------------------------------------------------------
@@ -68,7 +67,7 @@ impl AnalyzerRule for ResolveFtsAccessPath {
         plan: LogicalPlan,
         _config: &ConfigOptions,
     ) -> datafusion::common::Result<LogicalPlan> {
-        super::super::rules::analyze_bottom_up(plan, |node| self.rewrite_node(node))
+        super::super::analyze_bottom_up(plan, |node| self.rewrite_node(node))
     }
 }
 
@@ -203,14 +202,14 @@ impl OptimizerRule for UseFtsCompoundScorer {
                 segments: index.segments.clone(),
                 // Computed here rather than read off the leaf: this rule may collapse the
                 // subtree before `ResolvePrefilterSource` has visited it.
-                prefilter: super::super::rules::prefilter_kind(&first.input),
+                prefilter: super::super::prefilter_kind(&first.input),
                 schema: compound.schema.clone(),
             }),
         })))
     }
 }
 
-/// The FTS half of [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage).
+/// The FTS half of [`SplitOnIndexCoverage`](SplitOnIndexCoverage).
 ///
 /// Structurally simpler than the vector half: there is no re-rank, because BM25 scores from the
 /// two branches are directly comparable. The merge is a stock `Union` + `Sort` + `Limit`, which is

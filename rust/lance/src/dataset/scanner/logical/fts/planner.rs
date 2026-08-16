@@ -22,7 +22,8 @@ use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_select::mask::RowAddrMask;
 use lance_table::format::Fragment;
 
-use super::super::nodes::PrefilterSourceKind;
+use super::super::PrefilterSourceKind;
+use super::*;
 use crate::dataset::{Dataset, Scanner};
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::fts::{
@@ -31,8 +32,6 @@ use crate::io::exec::fts::{
     build_boolean_query_children_with_schema,
 };
 use crate::{Error, Result};
-
-use super::*;
 
 // ---------------------------------------------------------------------------------------------
 // Stage 4: lowering

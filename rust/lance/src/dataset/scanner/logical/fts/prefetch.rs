@@ -16,11 +16,10 @@ use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
 use super::super::context::{OpaqueSegments, OverlayStaleness};
+use super::*;
 use crate::dataset::Dataset;
 use crate::index::scalar::inverted::load_segment_details;
 use crate::{Error, Result};
-
-use super::*;
 
 // ---------------------------------------------------------------------------------------------
 // Stage 2: prefetch

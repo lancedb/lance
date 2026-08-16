@@ -25,9 +25,9 @@ use lance_index::vector::DIST_COL;
 
 use super::context::take_settings;
 use super::fts;
-use super::nodes::{LanceTakeNode, VectorAccessPath, VectorRerankNode, VectorSearchNode};
 use super::prepare::PreparedQueries;
 use super::source::{LanceScanSource, ScanSourceOptions};
+use super::{LanceTakeNode, VectorAccessPath, VectorRerankNode, VectorSearchNode};
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::{Dataset, Scanner};
 use crate::{Error, Result};

@@ -81,7 +81,7 @@ pub struct ScanSourceOptions {
     ///
     /// `None` means nothing has resolved it yet and the leaf will do so itself. Filling this in is
     /// what makes the index decision part of the plan rather than a private detail of
-    /// [`TableProvider::scan`] — see [`ResolveScalarIndexQuery`](super::rules::ResolveScalarIndexQuery).
+    /// [`TableProvider::scan`] — see [`ResolveScalarIndexQuery`](ResolveScalarIndexQuery).
     pub filter_plan: Option<ExprFilterPlan>,
     /// Rows the scalar index result must not emit, because a data overlay invalidated its entries
     /// for them. The same rows are re-read on a sibling branch, restricted by
@@ -135,7 +135,7 @@ impl LanceScanSource {
 
     /// The same source narrowed to part of the dataset.
     ///
-    /// Used by [`SplitOnIndexCoverage`](super::rules::SplitOnIndexCoverage) to give the indexed
+    /// Used by [`SplitOnIndexCoverage`](SplitOnIndexCoverage) to give the indexed
     /// and brute-force branches disjoint row sets. The schema is unchanged, so a `TableScan`'s
     /// `projected_schema` stays valid across the swap.
     pub fn restricted_to(&self, restriction: &ScanRestriction) -> Self {

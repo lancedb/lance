@@ -20,17 +20,50 @@
 //! 4. **Optimize and lower**, analyzer then logical rules then physical.
 //!
 //! This path is off by default. See [`is_enabled`].
+//!
+//! # Layout
+//!
+//! The framework is split by stage; each index type keeps its own contribution together.
+//!
+//! ```text
+//! builder      stage 1: Scanner -> LogicalPlan
+//! prepare      stage 0: the async work that must precede the builder
+//! context      stage 2: the one prefetch every later stage reads from
+//! source       the scan leaf, as a TableProvider
+//! rules        rule plumbing shared by every index type
+//! coverage     splitting a search across indexed and unindexed fragments
+//! scan_index   recording each scan's scalar index query on its source
+//! planner      stage 4: dispatch to each node's lowering
+//! take/        late materialization
+//! vector/      node, rerank, rules, planner   <- five entry points
+//! fts/         node, rules, planner, prefetch <- the same five
+//! ```
+//!
+//! `vector/` and `fts/` are deliberately symmetrical. The design doc proposes that an index type
+//! could one day ship its own planning support; two index types reaching the framework through the
+//! same five entry points is what makes that a claim rather than a guess. Rule *ordering* stays
+//! here, in [`analyzer_rules`] and [`optimizer_rules`], because it is a whole-plan property that no
+//! single index can decide.
 
 pub(super) mod builder;
 pub(super) mod context;
+pub(super) mod coverage;
 pub(super) mod fts;
-pub(super) mod nodes;
 pub(super) mod planner;
 pub(super) mod prepare;
 pub(super) mod rules;
+pub(super) mod scan_index;
 pub(super) mod source;
+pub(super) mod take;
 #[cfg(test)]
 mod tests;
+pub(super) mod vector;
+
+pub use coverage::*;
+pub use rules::*;
+pub use scan_index::*;
+pub use take::*;
+pub use vector::*;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -185,17 +218,15 @@ fn planning_state(scanner: &Scanner) -> Arc<SessionState> {
 /// this stage's behavior without the change being visible here.
 fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
-    rules.push(Arc::new(rules::ResolveVectorAccessPath::new(
-        context.clone(),
-    )));
+    rules.push(Arc::new(ResolveVectorAccessPath::new(context.clone())));
     // The FTS rules are contributed as a block by the module that owns the FTS nodes, which is
     // the closest the spike gets to the doc's "each index plugin provides its own rules".
     rules.extend(fts::analyzer_rules(context));
     rules.extend::<Vec<Arc<dyn AnalyzerRule + Send + Sync>>>(vec![
-        Arc::new(rules::SplitOnIndexCoverage::searches(context.clone())),
+        Arc::new(SplitOnIndexCoverage::searches(context.clone())),
         // After the split, so the refine lands on the *indexed branch* of a partially-covered
         // search rather than above the union — the nesting the imperative path produces.
-        Arc::new(rules::ExpandVectorRefine::new(context.clone())),
+        Arc::new(ExpandVectorRefine::new(context.clone())),
     ]);
     rules
 }
@@ -221,12 +252,12 @@ fn optimizer_rules(
         // decides the scan's coverage — so the split runs here for scans and in the analyzer for
         // searches. Before `PushDownLimit`, so a limit is pushed into a union of branches rather
         // than duplicated onto each of them.
-        Arc::new(rules::ResolveScalarIndexQuery::new(context.clone())),
-        Arc::new(rules::SplitOnIndexCoverage::scans(context.clone())),
+        Arc::new(ResolveScalarIndexQuery::new(context.clone())),
+        Arc::new(SplitOnIndexCoverage::scans(context.clone())),
         Arc::new(PushDownLimit::new()),
         // Whether a predicate sits below the search is what makes it a prefilter, and pushdown is
         // what moves it there.
-        Arc::new(rules::ResolvePrefilterSource),
+        Arc::new(ResolvePrefilterSource),
         Arc::new(OptimizeProjections::new()),
     ]);
     rules
