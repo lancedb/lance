@@ -9,7 +9,7 @@
 
 use lance_file::version::LanceFileVersion;
 
-use crate::dataset::scanner::AggregateExpr;
+use crate::dataset::scanner::{AggregateExpr, MaterializationStyle};
 use rstest::rstest;
 
 use super::harness::*;
@@ -18,12 +18,36 @@ use super::harness::*;
 async fn test_filtered_scan_plan() {
     let dataset = test_dataset().await;
 
-    // The whole plan is a single LanceRead: DataFusion pushed both the projection and the
-    // predicate into the scan leaf, and the leaf claims exact filter pushdown, so no FilterExec
-    // and no ProjectionExec survive.
+    // DataFusion pushed both the projection and the predicate into the scan leaf, and the leaf
+    // claims exact filter pushdown, so no FilterExec survives above it. What the leaf lowers to is
+    // two reads rather than one: `s` is a string, so its width is unknown and the heuristic reads
+    // it late — only for the rows the filter kept.
     assert_logical_plan(
         &dataset,
         |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
+        "ProjectionExec: expr=[s@2 as s]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+    LanceRead: uri=..., projection=[i], num_fragments=2, range_before=None, range_after=None, \
+     row_id=true, row_addr=false, full_filter=i > Int32(10) AND i < Int32(20), \
+     refine_filter=i > Int32(10) AND i < Int32(20)",
+    )
+    .await
+    .unwrap();
+}
+
+/// Reading everything in one pass is what an explicitly early materialization asks for.
+#[tokio::test]
+async fn test_filtered_scan_plan_all_early() {
+    let dataset = test_dataset().await;
+
+    assert_logical_plan(
+        &dataset,
+        config(|scan| {
+            scan.project(&["s"])?
+                .filter("i > 10 and i < 20")?
+                .materialization_style(MaterializationStyle::AllEarly);
+            Ok(scan)
+        }),
         "LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, \
          row_id=false, row_addr=false, full_filter=i > Int32(10) AND i < Int32(20), \
          refine_filter=i > Int32(10) AND i < Int32(20)",
@@ -259,6 +283,81 @@ async fn test_paths_agree_on_a_grouped_aggregate() {
             .unwrap(),
     );
     assert_eq!(expected, actual);
+}
+
+/// Which columns the scan reads alongside the filter and which it takes afterwards is a cost
+/// decision: every style has to return the same rows.
+#[rstest]
+#[case::heuristic(MaterializationStyle::Heuristic)]
+#[case::all_early(MaterializationStyle::AllEarly)]
+#[case::all_late(MaterializationStyle::AllLate)]
+#[tokio::test]
+async fn test_paths_agree_on_materialization_style(
+    #[case] style: MaterializationStyle,
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)] version: LanceFileVersion,
+) {
+    let dataset = test_dataset_versioned(version).await;
+    let scan_config = config(move |scan: &mut crate::dataset::Scanner| {
+        scan.project(&["i", "s"])?
+            .filter("i > 10 and i < 20")?
+            .materialization_style(style.clone());
+        Ok(scan)
+    });
+    assert_paths_agree(&dataset, scan_config).await.unwrap();
+}
+
+/// `AllEarlyExcept` names the late columns by field id, so it also covers the case where only
+/// part of the projection is deferred.
+#[tokio::test]
+async fn test_paths_agree_on_all_early_except() {
+    let dataset = test_dataset().await;
+    let style = MaterializationStyle::all_early_except(&["s"], dataset.schema()).unwrap();
+    let scan_config = config(move |scan: &mut crate::dataset::Scanner| {
+        scan.project(&["i", "s"])?
+            .filter("i > 10 and i < 20")?
+            .materialization_style(style.clone());
+        Ok(scan)
+    });
+    assert_paths_agree(&dataset, scan_config).await.unwrap();
+}
+
+/// Late materialization is a cost decision, and equivalence cannot see cost. Assert the point of
+/// it directly: a selective filter over a wide column reads less when the column is taken
+/// afterwards than when it is read for every row.
+#[tokio::test]
+async fn test_late_materialization_reads_less() {
+    use crate::dataset::{Dataset, WriteParams};
+    use arrow::datatypes::Int32Type;
+    use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
+
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col("wide", array::rand_fixedbin(ByteCount::from(4096), false))
+        .into_reader_rows(RowCount::from(100), BatchCount::from(4));
+    let dataset = Dataset::write(data, "memory://", Some(WriteParams::default()))
+        .await
+        .unwrap();
+
+    async fn read_bytes(dataset: &Dataset, style: MaterializationStyle) -> u64 {
+        let scan_config = config(move |scan: &mut crate::dataset::Scanner| {
+            scan.project(&["wide"])?
+                .filter("i = 7")?
+                .materialization_style(style.clone());
+            Ok(scan)
+        });
+        let plan = logical_plan_for(dataset, scan_config).await.unwrap();
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        run(plan).await.unwrap();
+        dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes
+    }
+
+    let early = read_bytes(&dataset, MaterializationStyle::AllEarly).await;
+    let late = read_bytes(&dataset, MaterializationStyle::AllLate).await;
+    assert!(late < early, "late read {late} bytes, early read {early}");
 }
 
 /// `SELECT 1 AS foo` reads nothing, and both paths refuse it rather than inventing a column.

@@ -28,7 +28,7 @@ use super::prepare::PreparedQueries;
 use super::row_offset::RowOffsetNode;
 use super::source::{LanceScanSource, ScanSourceOptions};
 use super::{LanceTakeNode, TakeSettings, VectorAccessPath, VectorRerankNode, VectorSearchNode};
-use crate::dataset::scanner::ColumnOrdering;
+use crate::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use crate::dataset::{Dataset, Scanner};
 use crate::io::exec::knn::QUERY_INDEX_COL;
 use crate::{Error, Result};
@@ -416,6 +416,15 @@ pub(super) fn source_options(scanner: &Scanner) -> ScanSourceOptions {
         fragments: scanner.fragments.clone().map(Arc::new),
         index_expr_result_format: scanner.index_expr_result_format(),
         use_scalar_index: scanner.use_scalar_index,
+        // `MaterializationStyle` is documented as affecting plain scans only, and a search plan
+        // already takes its columns above the search. Splitting the read below it as well would
+        // add a take that fetches the same columns for strictly more rows.
+        materialization_style: match scanner.nearest.is_some() || scanner.full_text_query.is_some()
+        {
+            true => MaterializationStyle::AllEarly,
+            false => scanner.materialization_style.clone(),
+        },
+        blob_handling: scanner.blob_handling.clone(),
         fast_search: scanner.fast_search,
         index_segments: scanner.index_segments.clone().map(Arc::new),
         include_deleted_rows: scanner.include_deleted_rows,

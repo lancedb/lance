@@ -20,10 +20,10 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DataFusionError;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
-use lance_arrow::SchemaExt as ArrowSchemaExt;
-use lance_core::datatypes::{OnMissing, Projection};
+use datafusion::physical_plan::{ExecutionPlan, expressions};
+use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
+use lance_core::datatypes::{BlobHandling, Field as LanceField, OnMissing, Projection};
 use lance_core::{
     ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
@@ -33,6 +33,7 @@ use lance_select::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_select::result::{IndexExprResult, IndexExprResultWireFormat};
 use lance_table::format::Fragment;
 
+use crate::dataset::scanner::MaterializationStyle;
 use crate::dataset::{Dataset, Scanner};
 use crate::index::{DatasetIndexInternalExt, ScalarIndexInfo};
 use crate::io::exec::filtered_read::{
@@ -70,6 +71,12 @@ pub struct ScanSourceOptions {
     pub fragments: Option<Arc<Vec<Fragment>>>,
     pub index_expr_result_format: IndexExprResultWireFormat,
     pub use_scalar_index: bool,
+    /// Which columns are cheap enough to read alongside the filter, rather than take after it.
+    pub materialization_style: MaterializationStyle,
+    /// Whether blob columns come back as their full binary value or as a description of where it
+    /// lives. It changes both what the leaf reads and how wide the column is, so the
+    /// materialization decision reads it too.
+    pub blob_handling: BlobHandling,
     /// Answer from indices only: fragments a scalar index does not cover are skipped rather than
     /// scanned. Only meaningful alongside an index query.
     pub fast_search: bool,
@@ -124,6 +131,8 @@ impl std::fmt::Debug for ScanSourceOptions {
             .field("fragments", &self.fragments)
             .field("index_expr_result_format", &self.index_expr_result_format)
             .field("use_scalar_index", &self.use_scalar_index)
+            .field("materialization_style", &self.materialization_style)
+            .field("blob_handling", &self.blob_handling)
             .field("fast_search", &self.fast_search)
             .field("index_segments", &self.index_segments)
             .field("include_deleted_rows", &self.include_deleted_rows)
@@ -158,7 +167,14 @@ impl std::fmt::Debug for LanceScanSource {
 
 impl LanceScanSource {
     pub fn new(dataset: Arc<Dataset>, options: ScanSourceOptions) -> Result<Self> {
-        let base = ArrowSchema::from(dataset.schema());
+        // Blob handling changes a blob column's type — full binary value or a description of where
+        // it lives — so it belongs to the schema the plan is built against, not just to the read.
+        let base = ArrowSchema::from(
+            &dataset
+                .full_projection()
+                .with_blob_handling(options.blob_handling.clone())
+                .to_bare_schema(),
+        );
         let full_schema = base
             .try_with_column(ROW_ID_FIELD.clone())?
             .try_with_column(ROW_ADDR_FIELD.clone())?
@@ -260,11 +276,18 @@ impl LanceScanSource {
     ///
     /// `None` means "every column", matching DataFusion's convention.
     fn to_lance_projection(&self, projection: Option<&Vec<usize>>) -> Result<Projection> {
+        let blob_handling = self.options.blob_handling.clone();
         let Some(projection) = projection else {
-            return Ok(self.dataset.full_projection());
+            return Ok(self
+                .dataset
+                .full_projection()
+                .with_blob_handling(blob_handling));
         };
         let mut columns = Vec::with_capacity(projection.len());
-        let mut result = self.dataset.empty_projection();
+        let mut result = self
+            .dataset
+            .empty_projection()
+            .with_blob_handling(blob_handling);
         for idx in projection {
             if *idx == self.row_id_idx {
                 result = result.with_row_id();
@@ -279,6 +302,112 @@ impl LanceScanSource {
             }
         }
         result.union_columns(columns, OnMissing::Error)
+    }
+
+    /// Whether `field` is cheap enough to read alongside the filter rather than take after it.
+    ///
+    /// Mirrors `Scanner::is_early_field`, including the reasoning behind the heuristic's byte-width
+    /// thresholds, which is written out there.
+    fn is_early_field(&self, field: &LanceField) -> bool {
+        match &self.options.materialization_style {
+            MaterializationStyle::AllEarly => true,
+            MaterializationStyle::AllLate => false,
+            MaterializationStyle::AllEarlyExcept(cols) => !cols.contains(&(field.id as u32)),
+            MaterializationStyle::Heuristic => {
+                if field.is_blob() && self.options.blob_handling.returns_description(field) {
+                    // A description is an offset and a size, so it is cheap however wide the blob
+                    // it points at is.
+                    return true;
+                }
+                let byte_width = field.data_type().byte_width_opt();
+                match self.dataset.object_store.as_ref().is_cloud() {
+                    true => byte_width.is_some_and(|width| width < 1000),
+                    false => byte_width.is_some_and(|width| width < 10),
+                }
+            }
+        }
+    }
+
+    /// The columns to read alongside the filter, when taking the rest afterwards is cheaper than
+    /// reading everything in one pass.
+    ///
+    /// `None` means read everything in one pass, which is the answer whenever the split would buy
+    /// nothing: there is no refine filter for a take to skip rows against, or every requested
+    /// column is cheap enough to read anyway. Mirrors `Scanner::calc_eager_projection` and the part
+    /// of `Scanner::filtered_read_source` that decides whether to call it.
+    fn eager_projection(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        requested: &Projection,
+    ) -> Result<Option<Projection>> {
+        // The legacy builder's statistics-pushdown branch takes its projection off the `Scanner`
+        // and ignores the one it is handed, so narrowing here would add a take without narrowing
+        // the read. The imperative path hits the same wall from the other side: it computes an
+        // eager projection for v1 too, and the take it plans afterwards finds every column
+        // already there.
+        if !filter_plan.has_refine() || v1::is_legacy(&self.dataset) {
+            return Ok(None);
+        }
+        let eager = requested
+            .clone()
+            .subtract_predicate(|field| !self.is_early_field(field));
+        if !requested
+            .clone()
+            .subtract_projection(&eager)
+            .has_data_fields()
+        {
+            return Ok(None);
+        }
+        // A column the filter reads is loaded by the read whether or not it is projected, so
+        // deferring it would cost a take and save nothing.
+        let filter_schema = self
+            .dataset
+            .empty_projection()
+            .union_columns(filter_plan.all_columns(), OnMissing::Error)?
+            .into_schema();
+        Ok(Some(eager.union_schema(&filter_schema).with_row_id()))
+    }
+
+    /// Fetch the columns the eager read left behind, for the rows that survived the filter.
+    fn take_late(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        requested: &Projection,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut options = FilteredReadOptions::new(requested.clone().with_row_id());
+        if self.options.include_deleted_rows {
+            // Forwarded so the row-stream read rejects it: a deleted row carries a null row id,
+            // which the take would silently drop. `Scanner::take_current` does the same.
+            options = options.with_deleted_rows()?;
+        }
+        if let Some(batch_size) = self.options.batch_size {
+            options = options.with_batch_size(batch_size as u32);
+        }
+        if let Some(fragments) = &self.options.fragments {
+            options = options.with_fragments(fragments.clone());
+        }
+        let taken = Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            options,
+            Some(input),
+        )?);
+
+        // The take appends its columns to the ones the eager read carried, so its output is in
+        // neither the requested order nor the requested set. Restating both here is what keeps the
+        // leaf's promise to return exactly the projection it was asked for.
+        let schema = taken.schema();
+        let columns = requested
+            .to_schema()
+            .fields
+            .iter()
+            .map(|field| {
+                Ok((
+                    expressions::col(&field.name, schema.as_ref())?,
+                    field.name.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(ProjectionExec::try_new(columns, taken)?))
     }
 
     /// Split the pushed-down predicates into a scalar-index query plus a refine expression.
@@ -349,7 +478,18 @@ impl LanceScanSource {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut projection = self.to_lance_projection(projection)?;
+        let requested = self.to_lance_projection(projection)?;
+        let filter_plan = match self.options.filter_plan.clone() {
+            Some(filter_plan) => filter_plan,
+            None => self.build_filter_plan(filters).await?,
+        };
+
+        // Reading the wide columns for every row only to filter most of them away is the case late
+        // materialization exists for; when it applies, the read below is narrower than what the
+        // caller asked for and a take makes up the difference.
+        let late = self.eager_projection(&filter_plan, &requested)?;
+        let mut projection = late.clone().unwrap_or_else(|| requested.clone());
+
         // DataFusion asks for no columns when only the row count matters — `COUNT(*)`. Reading
         // nothing is not a thing the reader can do, so the row address stands in and is projected
         // away again below. Matches `Scanner::filtered_read_source`.
@@ -357,10 +497,6 @@ impl LanceScanSource {
         if counting_rows {
             projection.with_row_addr = true;
         }
-        let filter_plan = match self.options.filter_plan.clone() {
-            Some(filter_plan) => filter_plan,
-            None => self.build_filter_plan(filters).await?,
-        };
 
         if v1::is_legacy(&self.dataset) {
             let Some(scanner) = self.options.legacy_scanner.as_ref() else {
@@ -453,9 +589,10 @@ impl LanceScanSource {
             read_options,
             index_input,
         )?) as Arc<dyn ExecutionPlan>;
-        match counting_rows {
-            true => drop_all_columns(plan),
-            false => Ok(plan),
+        match (counting_rows, &late) {
+            (true, _) => drop_all_columns(plan),
+            (false, Some(_)) => self.take_late(plan, &requested),
+            (false, None) => Ok(plan),
         }
     }
 }

@@ -13,24 +13,6 @@ use crate::dataset::scanner::ColumnOrdering;
 use super::fts::*;
 use super::harness::*;
 
-/// A shape this path does not implement must fail loudly rather than fall back to the imperative
-/// one — a quiet fallback would make every equivalence test meaningless.
-#[tokio::test]
-async fn test_unsupported_shape_is_rejected() {
-    use crate::dataset::scanner::MaterializationStyle;
-
-    let dataset = test_dataset().await;
-    let mut scan = dataset.scan();
-    scan.materialization_style(MaterializationStyle::AllEarly);
-
-    let err = super::super::create_plan(&scan).await.unwrap_err();
-    assert!(
-        matches!(err, crate::Error::NotSupported { .. }),
-        "expected NotSupported, got {err:?}"
-    );
-    assert!(err.to_string().contains("materialization"), "{err}");
-}
-
 #[tokio::test]
 async fn test_paths_agree_on_ordering() {
     let dataset = test_dataset().await;

@@ -401,7 +401,7 @@ impl ColumnOrdering {
 ///
 /// This parameter only affects scans.  Vector search and full text search
 /// always use late materialization.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum MaterializationStyle {
     /// Heuristic-based materialization style
     ///

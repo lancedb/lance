@@ -21,6 +21,59 @@
 //!
 //! This path is off by default. See [`is_enabled`].
 //!
+//! # The pipeline
+//!
+//! ```text
+//! Scanner (the user's query, as builder state)
+//!    │
+//!    ├─ validate_options + ensure_supported
+//!    │     exhaustive destructure of Scanner: an option is read, rejected, or explained
+//!    │
+//!    ├─ 0. PreparedQueries::resolve ....................................  prepare   [async]
+//!    │     resolve the FTS column and document granularity, which stage 1's schemas need
+//!    │
+//!    ├─ 1. builder::build .............................................   builder   [sync]
+//!    │     Scanner state -> the naive LogicalPlan, index-unaware
+//!    │
+//!    ├─ 2. ScanPlanningContext::collect ...............................   context   [async]
+//!    │     walk the plan, prefetch every fact the rules will need
+//!    │     *** the only stage that does I/O ***
+//!    │
+//!    ├─ 3a. Analyzer::with_rules(analyzer_rules(&context)) ............             [sync]
+//!    │      the rewrites a correct plan requires; each runs exactly once
+//!    │
+//!    ├─ 3b. Optimizer::with_rules(optimizer_rules(&context)) ..........             [sync]
+//!    │      stock DataFusion rules, plus the mandatory rewrites that need to see
+//!    │      where PushDownFilter left the predicates; runs to a fixed point
+//!    │
+//!    └─ 4. DefaultPhysicalPlanner + LanceExtensionPlanner .............   planner   [async]
+//!          Lance nodes -> exec nodes, TableScan -> LanceScanSource::scan,
+//!          then the physical rules
+//!    ▼
+//! Arc<dyn ExecutionPlan>
+//! ```
+//!
+//! The staging answers one question: an `OptimizerRule` is synchronous, so how does it get at index
+//! metadata? It does not fetch it — stage 2 fetches everything up front and every rule holds an
+//! `Arc<ScanPlanningContext>`.
+//!
+//! Stage 4 *is* async — DataFusion's `ExtensionPlanner` and `TableProvider::scan` both are — so
+//! keeping I/O out of it is a choice rather than a language constraint. It is what lets the same
+//! decisions be made by synchronous rules in stage 3, where they are visible in the plan instead of
+//! buried in a constructor.
+//!
+//! # Invariants
+//!
+//! 1. **Stages 3 and 4 do no I/O.** Everything they need came from stage 2.
+//! 2. **An unplannable query fails loudly.** A silent fallback to the imperative path would make
+//!    every equivalence test meaningless.
+//! 3. **Analyzer rules need no idempotence guard; optimizer rules do.** The optimizer runs to a
+//!    fixed point, so a structural rewrite there has to recognize its own output.
+//! 4. **Nothing may move a predicate or a limit across a search node.** Under approximation that
+//!    changes the answer. Enforced by the rule list being pinned, and pinned by tests.
+//! 5. **Output order is a plan-level contract**, stated by the builder rather than inherited from
+//!    whichever physical operator happened to sort.
+//!
 //! # Layout
 //!
 //! The framework is split by stage; each index type keeps its own contribution together.
@@ -90,7 +143,6 @@ use lance_datafusion::exec::{StrictBatchSizeExec, get_session_context};
 
 use self::context::ScanPlanningContext;
 use crate::dataset::Scanner;
-use crate::dataset::scanner::MaterializationStyle;
 use crate::io::exec::get_physical_optimizer;
 use crate::{Error, Result};
 
@@ -104,8 +156,8 @@ pub fn is_enabled() -> bool {
 
 /// Plan a scan through the logical path.
 ///
-/// Returns [`Error::NotSupported`] for any query shape the spike does not cover, rather than
-/// silently falling back — a quiet fallback would make the equivalence tests meaningless.
+/// Rejects a query shape it cannot plan rather than silently falling back to the imperative path —
+/// a quiet fallback would make the equivalence tests meaningless.
 pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
     scanner.validate_options()?;
     ensure_supported(scanner)?;
@@ -321,7 +373,7 @@ fn physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync
     rules
 }
 
-/// Reject every query shape the spike has not implemented yet.
+/// Account for every `Scanner` option, rejecting the query shapes this path cannot plan.
 ///
 /// `Scanner` is destructured **exhaustively** — no `..` — so that adding a field to it fails to
 /// compile until someone decides what this path does with it. That is the point of the function:
@@ -332,7 +384,9 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
     let Scanner {
         dataset: _,
         projection_plan,
-        materialization_style,
+        // Read by the scan leaf, which decides there which columns it reads alongside the filter
+        // and which it takes afterwards.
+        materialization_style: _,
         // Carried on the search node as its query count, and expanded by `ExpandBatchSearch`.
         is_batch_nearest: _,
         include_deleted_rows,
@@ -370,11 +424,12 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         legacy_with_row_addr: _,
         autoproject_scoring_columns: _,
 
+        // Read by the scan leaf, which types blob columns by it and reads them accordingly.
+        blob_handling: _,
+
         // Folded into something this path does read, at the moment the caller sets it:
-        // `blob_handling` into `projection_plan.physical_projection` by `apply_blob_handling`,
         // `batch_size_bytes` into `resolved_file_reader_options`, and
         // `relational_algebra_version` into `index_expr_result_format`.
-        blob_handling: _,
         batch_size_bytes: _,
         relational_algebra_version: _,
 
@@ -390,12 +445,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         explicit_projection: _,
         nearest_query_count: _,
     } = scanner;
-
-    let unsupported = |what: &str| -> Result<()> {
-        Err(Error::not_supported_source(
-            format!("logical scan planner (spike): {what}").into(),
-        ))
-    };
 
     if *include_deleted_rows && (nearest.is_some() || full_text_query.is_some()) {
         // The imperative path rejects these in `vector_search_source`/`fts_search_source` for the
@@ -416,15 +465,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
             )
             .into(),
         ));
-    }
-    if !matches!(materialization_style, MaterializationStyle::Heuristic) {
-        // The builder decides take placement itself and never consults `is_early_field`, so an
-        // explicit materialization request would be dropped rather than honored. Note that the
-        // default is approximated rather than implemented: under `Heuristic` the imperative path
-        // reads narrow columns eagerly and takes wide ones after a refine filter, and this path
-        // reads everything in one pass. That is a performance gap on filtered scans over wide
-        // columns, not a correctness one — see the findings doc.
-        return unsupported("explicit materialization style");
     }
     Ok(())
 }
