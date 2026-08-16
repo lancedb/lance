@@ -2221,7 +2221,36 @@ impl FileFragment {
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
         let expected_rows = self.physical_rows().await? as u64;
+        let data_file = self.stage_column_file(data, schema, expected_rows).await?;
+        Ok(super::transaction::DataReplacementGroup(
+            self.id() as u64,
+            data_file,
+        ))
+    }
 
+    /// Stage a column data file covering `expected_rows` consecutive physical
+    /// rows of this fragment, without committing it.
+    ///
+    /// This is the writer behind [`Self::write_column`], exposed for callers
+    /// that produce a column in pieces rather than in one pass — a long-running
+    /// backfill checkpointing its progress, say. Each piece is staged
+    /// separately and the pieces are assembled later; only the assembled whole
+    /// may be committed, since every data file in a fragment must cover all of
+    /// its physical rows.
+    ///
+    /// `data` must produce exactly `expected_rows` rows, nulls included, in
+    /// physical order. That count is checked against what was written rather
+    /// than against the fragment, which is what allows a partial file; it is
+    /// the caller's responsibility that the pieces tile the fragment exactly.
+    ///
+    /// The returned [`DataFile`] is referenced by no manifest until it is
+    /// committed, so an abandoned one is left for garbage collection.
+    pub async fn stage_column_file(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        expected_rows: u64,
+    ) -> Result<DataFile> {
         // Readers take everything but the field id from the manifest, so a
         // staged field reusing an id is decoded as the manifest's version rather
         // than rejected. Compare full identity, not just the storage type.
@@ -2371,7 +2400,7 @@ impl FileFragment {
             let (num_rows, data_file) = writer.finish().await?;
             if num_rows as u64 != expected_rows {
                 return Err(Error::invalid_input(format!(
-                    "column data for fragment {} has {} rows but the fragment has {} physical rows",
+                    "column data for fragment {} has {} rows but {} were expected",
                     self.id(),
                     num_rows,
                     expected_rows
@@ -2382,10 +2411,7 @@ impl FileFragment {
         .await;
 
         match staged {
-            Ok(data_file) => Ok(super::transaction::DataReplacementGroup(
-                self.id() as u64,
-                data_file,
-            )),
+            Ok(data_file) => Ok(data_file),
             Err(err) => {
                 // The writer may still hold the file open (a buffered upload,
                 // an unflushed local handle); release it before deleting.
