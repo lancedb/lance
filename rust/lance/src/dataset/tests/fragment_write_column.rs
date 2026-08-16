@@ -431,7 +431,67 @@ async fn test_rejects_empty_stream() {
         .write_column(stream::iter(Vec::<Result<RecordBatch>>::new()), &schema)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("physical rows"), "got: {err}");
+    assert!(err.to_string().contains("were expected"), "got: {err}");
+    assert_eq!(count_files(&dataset).await, before);
+}
+
+/// Staging part of a fragment: the row-count gate checks what the caller
+/// promised rather than the fragment's width, which is what lets a long
+/// backfill checkpoint its progress instead of losing it all to one failure.
+/// The pieces stay uncommittable until something assembles them into full
+/// coverage.
+#[tokio::test]
+async fn test_stage_column_file_accepts_partial_coverage() {
+    let mut dataset = id_dataset_of(6, 1024).await;
+    declare_all_null(&mut dataset, "value").await;
+    let schema = declared_schema(&dataset, "value");
+    let fragment = only_fragment(&dataset);
+    let field = || ArrowField::new("value", DataType::Int32, true);
+
+    let head = batch_of(vec![field()], vec![ints(vec![1, 2])]);
+    let tail = batch_of(vec![field()], vec![ints(vec![3, 4, 5, 6])]);
+    let head = fragment
+        .stage_column_file(stream::iter([Ok(head)]), &schema, 2)
+        .await
+        .unwrap();
+    let tail = fragment
+        .stage_column_file(stream::iter([Ok(tail)]), &schema, 4)
+        .await
+        .unwrap();
+    assert_ne!(head.path, tail.path, "each piece is its own file");
+
+    // The whole-fragment entry point still refuses the same partial input,
+    // since every data file in a fragment must cover all of its rows.
+    let short = batch_of(vec![field()], vec![ints(vec![1, 2])]);
+    let err = fragment
+        .write_column(stream::iter([Ok(short)]), &schema)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("were expected"), "got: {err}");
+}
+
+/// The gate is the caller's own count, so a piece that does not produce what
+/// it promised is refused and leaves nothing behind -- otherwise a short file
+/// would sit in the data directory looking like valid coverage.
+#[tokio::test]
+async fn test_stage_column_file_rejects_a_wrong_count() {
+    let mut dataset = id_dataset_of(6, 1024).await;
+    declare_all_null(&mut dataset, "value").await;
+    let schema = declared_schema(&dataset, "value");
+
+    let before = count_files(&dataset).await;
+    let batch = batch_of(
+        vec![ArrowField::new("value", DataType::Int32, true)],
+        vec![ints(vec![1, 2])],
+    );
+    let err = only_fragment(&dataset)
+        .stage_column_file(stream::iter([Ok(batch)]), &schema, 3)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("has 2 rows but 3 were expected"),
+        "got: {err}"
+    );
     assert_eq!(count_files(&dataset).await, before);
 }
 
