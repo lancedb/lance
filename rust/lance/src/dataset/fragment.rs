@@ -3008,7 +3008,17 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_make_deletions_null(&mut self) -> &mut Self {
+    /// Return deleted rows as nulls instead of filtering them out.
+    ///
+    /// A read normally drops deleted rows, so the batches it yields no longer
+    /// line up with the fragment's physical offsets. A caller writing a
+    /// positionally aligned file — a column replacement, which must cover every
+    /// physical row including deleted ones — needs them kept, with a null row
+    /// id marking which they are.
+    ///
+    /// Requires the row id column; without it there is nothing to mark a
+    /// deleted row with.
+    pub fn with_make_deletions_null(&mut self) -> &mut Self {
         self.make_deletions_null = true;
         self
     }
