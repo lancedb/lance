@@ -308,7 +308,10 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         is_batch_nearest,
         aggregate,
         include_deleted_rows,
-        index_segments,
+
+        // Read by `ScanPlanningContext::collect`, which narrows the searched index to the
+        // segments it names.
+        index_segments: _,
 
         // Applied to the finished plan by `create_plan`, above every rule: it only reshapes
         // batches, so nothing in planning depends on it.
@@ -389,9 +392,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
     };
     if projection_plan.must_add_row_offset || filters_on_row_offset {
         return unsupported("_rowoffset");
-    }
-    if index_segments.is_some() {
-        return unsupported("index segment selection");
     }
     if projection_plan.has_output_cols() && projection_plan.physical_projection.is_empty() {
         // `SELECT 1 AS foo` — output columns that read nothing. The imperative path rejects this at

@@ -272,3 +272,101 @@ pub(super) async fn test_paths_agree_on_combined_knn_ann_prefilter() {
     .await
     .unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Index segment selection and metric resolution
+// ---------------------------------------------------------------------------------------------
+
+async fn index_segment_uuids(dataset: &Dataset) -> Vec<uuid::Uuid> {
+    use crate::index::DatasetIndexExt;
+
+    dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|index| index.uuid)
+        .collect()
+}
+
+#[tokio::test]
+async fn test_paths_agree_on_an_explicit_index_segment() {
+    let dataset = indexed_vector_dataset().await;
+    let segments = index_segment_uuids(&dataset).await;
+    let query = query_vector();
+
+    assert_paths_agree(&dataset, |scan| {
+        scan.nearest("vec", &query, 10)?
+            .minimum_nprobes(2)
+            .with_index_segments(segments.clone())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_unknown_index_segment_is_rejected() {
+    let dataset = indexed_vector_dataset().await;
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query_vector(), 10)
+        .unwrap()
+        .with_index_segments(vec![uuid::Uuid::nil()])
+        .unwrap();
+
+    let err = super::super::create_plan(&scan)
+        .await
+        .expect_err("an unknown segment must be rejected");
+    assert!(err.to_string().contains("unknown index segments"), "{err}");
+}
+
+/// Without an explicit segment list a metric mismatch falls back to brute force; with one it is an
+/// error, because the caller named segments that cannot answer the question they asked.
+#[tokio::test]
+async fn test_index_segment_with_a_conflicting_metric_is_rejected() {
+    use lance_linalg::distance::DistanceType;
+
+    let dataset = indexed_vector_dataset_with_metric(DistanceType::Cosine).await;
+    let segments = index_segment_uuids(&dataset).await;
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query_vector(), 10)
+        .unwrap()
+        .distance_metric(DistanceType::L2)
+        .with_index_segments(segments)
+        .unwrap();
+
+    let err = super::super::create_plan(&scan)
+        .await
+        .expect_err("a conflicting metric must be rejected");
+    assert!(err.to_string().contains("requested metric"), "{err}");
+}
+
+/// A search that names no metric adopts the index's rather than falling back to brute force on a
+/// mismatch with the element type's default.
+#[tokio::test]
+async fn test_search_without_a_metric_adopts_the_index_metric() {
+    use lance_linalg::distance::DistanceType;
+
+    let dataset = indexed_vector_dataset_with_metric(DistanceType::Cosine).await;
+    let query = query_vector();
+    let plan = logical_plan_for(&dataset, |scan| {
+        Ok(scan.nearest("vec", &query, 10)?.minimum_nprobes(2))
+    })
+    .await
+    .unwrap();
+
+    let display = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    );
+    assert!(
+        display.contains("ANNSubIndex"),
+        "search fell back to flat:\n{display}"
+    );
+    assert!(display.contains("metric=Cosine"), "{display}");
+
+    assert_paths_agree(&dataset, |scan| {
+        Ok(scan.nearest("vec", &query, 10)?.minimum_nprobes(2))
+    })
+    .await
+    .unwrap();
+}

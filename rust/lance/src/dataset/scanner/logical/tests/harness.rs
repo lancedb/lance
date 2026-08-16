@@ -224,13 +224,19 @@ pub(super) fn query_vector() -> arrow_array::Float32Array {
 
 /// A vector dataset with an IVF_PQ index covering every fragment.
 pub(super) async fn indexed_vector_dataset() -> Dataset {
+    indexed_vector_dataset_with_metric(lance_linalg::distance::DistanceType::L2).await
+}
+
+/// As [`indexed_vector_dataset`], but with the index built for a chosen metric.
+pub(super) async fn indexed_vector_dataset_with_metric(
+    metric: lance_linalg::distance::DistanceType,
+) -> Dataset {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use lance_index::IndexType;
-    use lance_linalg::distance::DistanceType;
 
     let mut dataset = vector_dataset().await;
-    let params = VectorIndexParams::ivf_pq(2, 8, 2, DistanceType::L2, 2);
+    let params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
     dataset
         .create_index(&["vec"], IndexType::Vector, None, &params, true)
         .await

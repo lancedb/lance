@@ -14,6 +14,7 @@ use datafusion::optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, Optimizer
 use datafusion::prelude::col;
 use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
+use lance_linalg::distance::DistanceType;
 
 use super::super::context::ScanPlanningContext;
 use super::super::fts::{FtsAccessPath, FtsLeafNode};
@@ -39,17 +40,22 @@ impl ResolveVectorAccessPath {
         Self { context }
     }
 
-    fn resolve(&self, search: &VectorSearchNode) -> VectorAccessPath {
+    /// Returns the access path, plus the metric to search with if the index's differs from the
+    /// search's current one.
+    fn resolve(&self, search: &VectorSearchNode) -> (VectorAccessPath, Option<DistanceType>) {
         if !search.accuracy().is_exact()
             && let Some(index) = self.context.vector_index(&search.query().column)
         {
-            if index.metric == search.distance_type() {
-                return VectorAccessPath::Index {
-                    // A delta segment covering none of the fragments this scan will touch has
-                    // nothing to contribute, so it is dropped from the fan-out rather than
-                    // searched and discarded.
-                    segments: self.context.reachable_segments(&index.segments),
-                };
+            if !search.distance_type_requested() || index.metric == search.distance_type() {
+                // A delta segment covering none of the fragments this scan will touch has nothing
+                // to contribute, so it is dropped from the fan-out rather than searched and
+                // discarded. If that leaves nothing, there is no index to search here at all.
+                let segments = self.context.reachable_segments(&index.segments);
+                if !segments.is_empty() {
+                    let adopted = (index.metric != search.distance_type()).then_some(index.metric);
+                    return (VectorAccessPath::Index { segments }, adopted);
+                }
+                return (VectorAccessPath::Flat, None);
             }
             log::warn!(
                 "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
@@ -57,7 +63,7 @@ impl ResolveVectorAccessPath {
                 index.metric,
             );
         }
-        VectorAccessPath::Flat
+        (VectorAccessPath::Flat, None)
     }
 }
 
@@ -82,7 +88,7 @@ impl ResolveVectorAccessPath {
         // `fast_search` means "answer from indices only". With no usable index there is nothing to
         // answer from, so the result is empty rather than a brute-force scan. The partially-indexed
         // case is the same rule applied to one branch, and lives in `SplitPartiallyIndexedSearch`.
-        let resolved = self.resolve(search);
+        let (resolved, adopted_metric) = self.resolve(search);
         if self.context.fast_search()
             && matches!(resolved, VectorAccessPath::Flat)
             && self.context.vector_index(&search.query().column).is_none()
@@ -95,7 +101,10 @@ impl ResolveVectorAccessPath {
             )));
         }
 
-        let resolved = search.clone().with_resolution(resolved);
+        let mut resolved = search.clone().with_resolution(resolved);
+        if let Some(metric) = adopted_metric {
+            resolved = resolved.with_distance_type(metric);
+        }
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(resolved),
         })))

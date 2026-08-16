@@ -16,7 +16,7 @@
 //! its doc comment describes the same contract for scalar indices. This generalizes it to vector
 //! indices rather than inventing a second mechanism.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -202,7 +202,7 @@ impl ScanPlanningContext {
                     continue;
                 }
                 if let Some(info) =
-                    load_vector_index(&dataset, &indices, &column, &fragments).await?
+                    load_vector_index(scanner, &indices, &column, &fragments).await?
                 {
                     vector.insert(column, info);
                 }
@@ -394,30 +394,49 @@ async fn prefetch_index_staleness(
 }
 
 async fn load_vector_index(
-    dataset: &Arc<Dataset>,
+    scanner: &Scanner,
     indices: &[IndexMetadata],
     column: &str,
     fragments: &[Fragment],
 ) -> Result<Option<VectorIndexInfo>> {
+    let dataset = &scanner.dataset;
     let Ok(field_id) = dataset.schema().field_id(column) else {
         return Ok(None);
     };
-    let Some(index) = indices
-        .iter()
-        .find(|index| index.fields.contains(&field_id))
-    else {
-        return Ok(None);
+
+    let segments = match scanner.index_segments.as_ref() {
+        Some(requested) => select_requested_segments(requested, indices, column, field_id)?,
+        None => {
+            let Some(index) = indices
+                .iter()
+                .find(|index| index.fields.contains(&field_id))
+            else {
+                return Ok(None);
+            };
+            dataset.load_indices_by_name(&index.name).await?.to_vec()
+        }
     };
 
-    let metric = match crate::index::vector::details::metric_type_from_index_metadata(index) {
+    let metric = match crate::index::vector::details::metric_type_from_index_metadata(&segments[0])
+    {
         Some(metric) => metric,
         None => dataset
-            .open_vector_index(column, &index.uuid, &NoOpMetricsCollector)
+            .open_vector_index(column, &segments[0].uuid, &NoOpMetricsCollector)
             .await?
             .metric_type(),
     };
+    if let Some(requested) = scanner.nearest.as_ref().and_then(|query| query.metric_type)
+        && scanner.index_segments.is_some()
+        && requested != metric
+    {
+        // Without an explicit segment list a metric mismatch falls back to brute force. With one
+        // it cannot: the caller named these segments, so silently not using them would answer a
+        // different question than the one asked.
+        return Err(crate::Error::invalid_input(format!(
+            "with_index_segments requested metric {requested:?} but the selected index segments use {metric:?}",
+        )));
+    }
 
-    let segments = dataset.load_indices_by_name(&index.name).await?.to_vec();
     let staleness =
         overlay_staleness(dataset, &segments, fragments, OpaqueSegments::Covering).await?;
     Ok(Some(VectorIndexInfo {
@@ -425,6 +444,54 @@ async fn load_vector_index(
         metric,
         staleness,
     }))
+}
+
+/// The segments `with_index_segments` named, validated against the index metadata.
+///
+/// Mirrors `Scanner::vector_search`: every named segment must exist, cover the queried column, and
+/// belong to the same logical index as the others. Narrowing to the fragments this scan reads
+/// happens later, in `ScanPlanningContext::reachable_segments`, which every search goes through.
+fn select_requested_segments(
+    requested: &[uuid::Uuid],
+    indices: &[IndexMetadata],
+    column: &str,
+    field_id: i32,
+) -> Result<Vec<IndexMetadata>> {
+    let wanted = requested.iter().copied().collect::<HashSet<_>>();
+    let selected = indices
+        .iter()
+        .filter(|index| wanted.contains(&index.uuid))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if selected.len() != wanted.len() {
+        let found = selected
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<HashSet<_>>();
+        let missing = wanted
+            .difference(&found)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        return Err(crate::Error::invalid_input(format!(
+            "with_index_segments referenced unknown index segments: {missing:?}",
+        )));
+    }
+    if selected
+        .iter()
+        .any(|index| !index.fields.contains(&field_id))
+    {
+        return Err(crate::Error::invalid_input(format!(
+            "with_index_segments contained a segment that does not belong to vector column '{column}'",
+        )));
+    }
+    let name = &selected[0].name;
+    if selected.iter().any(|index| &index.name != name) {
+        return Err(crate::Error::invalid_input(
+            "with_index_segments must reference segments from a single logical index".to_string(),
+        ));
+    }
+    Ok(selected)
 }
 
 /// Read settings a take must honor, lifted off the `Scanner`. `None` fragments means "all of

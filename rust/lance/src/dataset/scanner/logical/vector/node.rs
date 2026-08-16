@@ -145,6 +145,13 @@ pub struct VectorSearchNode {
     /// Resolved up front from the column's element type when the caller did not name one.
     /// Leaving it unresolved would force lowering to reach for the dataset schema again.
     distance_type: DistanceType,
+    /// Whether `distance_type` is what the caller asked for, or a default stood in for them.
+    ///
+    /// The difference decides what a metric mismatch means. A caller who named a metric and got an
+    /// index built with another one is asking a question that index cannot answer, so the search
+    /// falls back to brute force. A caller who named none is not asking for any particular metric,
+    /// so the index's own is adopted — which is what the imperative path does.
+    distance_type_requested: bool,
     resolution: Option<VectorAccessPath>,
     prefilter: PrefilterSourceKind,
     /// Rows the index must not emit, because a data overlay committed after the index was built
@@ -158,6 +165,7 @@ pub struct VectorSearchNode {
 impl VectorSearchNode {
     pub fn try_new(input: LogicalPlan, dataset: Arc<Dataset>, mut query: Query) -> Result<Self> {
         let accuracy = SearchAccuracy::from_query(&query);
+        let distance_type_requested = query.metric_type.is_some();
         let distance_type = match query.metric_type {
             Some(metric) => metric,
             None => {
@@ -178,6 +186,7 @@ impl VectorSearchNode {
             query,
             accuracy,
             distance_type,
+            distance_type_requested,
             resolution: None,
             prefilter: PrefilterSourceKind::default(),
             overlay_block: None,
@@ -188,6 +197,19 @@ impl VectorSearchNode {
     pub fn with_resolution(mut self, resolution: VectorAccessPath) -> Self {
         self.resolution = Some(resolution);
         self
+    }
+
+    /// Adopt an index's metric, for a search that did not name one.
+    ///
+    /// Written into the carried `Query` as well, because that is what the physical nodes read.
+    pub fn with_distance_type(mut self, distance_type: DistanceType) -> Self {
+        self.distance_type = distance_type;
+        self.query.metric_type = Some(distance_type);
+        self
+    }
+
+    pub fn distance_type_requested(&self) -> bool {
+        self.distance_type_requested
     }
 
     pub fn with_prefilter(mut self, prefilter: PrefilterSourceKind) -> Self {
@@ -356,6 +378,7 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             query: self.query.clone(),
             accuracy: self.accuracy.clone(),
             distance_type: self.distance_type,
+            distance_type_requested: self.distance_type_requested,
             resolution: self.resolution.clone(),
             prefilter: self.prefilter,
             overlay_block: self.overlay_block.clone(),
