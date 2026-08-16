@@ -5,21 +5,24 @@
 
 use std::sync::Arc;
 
+use datafusion::common::DataFusionError;
 use datafusion::common::tree_node::Transformed;
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::{
     EmptyRelation, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNodeCore,
 };
 use datafusion::optimizer::{AnalyzerRule, ApplyOrder, OptimizerConfig, OptimizerRule};
-use datafusion::prelude::col;
+use datafusion::prelude::{col, lit};
 use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
+use lance_index::vector::DIST_COL;
 use lance_linalg::distance::DistanceType;
 
 use super::super::context::ScanPlanningContext;
 use super::super::fts::{FtsAccessPath, FtsLeafNode};
 use super::super::{LanceTakeNode, PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
 use super::super::{analyze_bottom_up, restricts_candidates};
+use crate::io::exec::knn::QUERY_INDEX_COL;
 
 /// Decide whether each vector search uses its index or brute force.
 ///
@@ -284,5 +287,87 @@ impl ExpandVectorRefine {
                     .with_prefilter(PrefilterSourceKind::None),
             ),
         })))
+    }
+}
+
+/// Answer a batch of query vectors against an index by asking each one separately.
+///
+/// The index fanout searches one query vector at a time, so a batch of `n` becomes a union of `n`
+/// searches over the same input, each tagged with the `query_index` that identifies which query it
+/// answers:
+///
+/// ```text
+/// Union
+///   Projection [0 AS query_index, _rowid, _distance]
+///     VectorSearch{Index, key=queries[0]}
+///   Projection [1 AS query_index, _rowid, _distance]
+///     VectorSearch{Index, key=queries[1]}
+///   ...
+/// ```
+///
+/// Expanding here rather than in the planner means every later rule — partial index coverage,
+/// refine — sees ordinary single-query searches and needs to know nothing about batching. That is
+/// also what the imperative path does, by re-entering `vector_search` once per query vector.
+///
+/// A brute-force batch search is not expanded: `KNNVectorDistanceExec` scores all `n` queries in
+/// one pass over the rows, which is the whole reason to send them as a batch.
+#[derive(Debug, Default)]
+pub struct ExpandBatchSearch;
+
+impl AnalyzerRule for ExpandBatchSearch {
+    fn name(&self) -> &str {
+        "expand_batch_search"
+    }
+
+    fn analyze(
+        &self,
+        plan: LogicalPlan,
+        _config: &ConfigOptions,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        analyze_bottom_up(plan, Self::rewrite_node)
+    }
+}
+
+impl ExpandBatchSearch {
+    fn rewrite_node(plan: LogicalPlan) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Extension(extension) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() else {
+            return Ok(Transformed::no(plan));
+        };
+        if search.query_count() < 2
+            || !matches!(
+                search.access_path_resolution(),
+                Some(VectorAccessPath::Index { .. })
+            )
+        {
+            return Ok(Transformed::no(plan));
+        }
+
+        let mut branches = Vec::with_capacity(search.query_count());
+        for query_index in 0..search.query_count() {
+            let single = LogicalPlan::Extension(Extension {
+                node: Arc::new(search.single_query(query_index)?),
+            });
+            branches.push(
+                LogicalPlanBuilder::new(single)
+                    .project(vec![
+                        lit(query_index as i32).alias(QUERY_INDEX_COL),
+                        col(ROW_ID),
+                        col(DIST_COL),
+                    ])?
+                    .build()?,
+            );
+        }
+
+        let mut branches = branches.into_iter();
+        let mut unioned = LogicalPlanBuilder::new(branches.next().ok_or_else(|| {
+            DataFusionError::Internal("a batch search has at least two queries".into())
+        })?);
+        for branch in branches {
+            unioned = unioned.union(branch)?;
+        }
+        Ok(Transformed::yes(unioned.build()?))
     }
 }

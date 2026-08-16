@@ -52,6 +52,7 @@ impl ExtensionPlanner for LanceExtensionPlanner {
             return Ok(Some(plan_flat_knn(
                 rerank.query(),
                 rerank.distance_type(),
+                1,
                 input,
             )?));
         }

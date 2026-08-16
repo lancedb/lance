@@ -29,6 +29,7 @@ use super::source::{LanceScanSource, ScanSourceOptions};
 use super::{LanceTakeNode, TakeSettings, VectorAccessPath, VectorRerankNode, VectorSearchNode};
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::{Dataset, Scanner};
+use crate::io::exec::knn::QUERY_INDEX_COL;
 use crate::{Error, Result};
 
 /// Relation name for the scan leaf. Column references in filters and projections are
@@ -124,11 +125,15 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
                         .with_resolution(VectorAccessPath::Flat),
                 )
             }
-            None => extension(VectorSearchNode::try_new(
-                source,
-                scanner.dataset.clone(),
-                query.clone(),
-            )?),
+            None => {
+                let search =
+                    VectorSearchNode::try_new(source, scanner.dataset.clone(), query.clone())?;
+                extension(if scanner.is_batch_nearest {
+                    search.with_query_count(scanner.nearest_query_count)?
+                } else {
+                    search
+                })
+            }
         };
         let taken = with_take(
             LogicalPlanBuilder::new(searched),
@@ -140,10 +145,15 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
         // multi-partition input gets a plain coalesce and the order is lost. Stating the ordering
         // in the plan is the only way to hold the contract — inheriting it from whichever physical
         // operator happened to sort is what made the imperative path's version of this fragile.
-        taken.sort([
-            col(DIST_COL).sort(true, false),
-            col(ROW_ID).sort(true, false),
-        ])?
+        //
+        // A batch search interleaves every query's results, so they are grouped by query first.
+        let mut ordering = Vec::with_capacity(3);
+        if scanner.is_batch_nearest {
+            ordering.push(col(QUERY_INDEX_COL).sort(true, false));
+        }
+        ordering.push(col(DIST_COL).sort(true, false));
+        ordering.push(col(ROW_ID).sort(true, false));
+        taken.sort(ordering)?
     } else {
         LogicalPlanBuilder::new(source)
     };
@@ -347,6 +357,15 @@ fn output_exprs(scanner: &Scanner, prepared: &PreparedQueries) -> Result<Vec<Exp
         }
     }
 
+    // Batch nearest exposes the query discriminator as the *first* output column, which is what
+    // LanceDB's batch vector search reads it from.
+    if scanner.is_batch_nearest {
+        if !named(&exprs, QUERY_INDEX_COL) {
+            exprs.push(col(QUERY_INDEX_COL));
+        }
+        move_to_front(&mut exprs, QUERY_INDEX_COL);
+    }
+
     // `with_row_id`/`with_row_address` promise their column is *last*, so the scoring columns that
     // were just appended have to move ahead of it.
     if scanner.legacy_with_row_id {
@@ -356,6 +375,16 @@ fn output_exprs(scanner: &Scanner, prepared: &PreparedQueries) -> Result<Vec<Exp
         move_to_end(&mut exprs, ROW_ADDR);
     }
     Ok(exprs)
+}
+
+fn move_to_front(exprs: &mut Vec<Expr>, name: &str) {
+    if let Some(position) = exprs
+        .iter()
+        .position(|expr| expr.schema_name().to_string() == name)
+    {
+        let expr = exprs.remove(position);
+        exprs.insert(0, expr);
+    }
 }
 
 fn move_to_end(exprs: &mut Vec<Expr>, name: &str) {

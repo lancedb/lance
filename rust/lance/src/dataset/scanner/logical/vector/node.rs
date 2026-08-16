@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::dataset::Dataset;
 use crate::index::vector::utils::{default_distance_type_for, get_vector_type};
+use crate::io::exec::knn::query_index_field;
 
 /// What answer the caller will accept.
 ///
@@ -145,6 +146,11 @@ pub struct VectorSearchNode {
     /// Resolved up front from the column's element type when the caller did not name one.
     /// Leaving it unresolved would force lowering to reach for the dataset schema again.
     distance_type: DistanceType,
+    /// How many query vectors `query.key` holds end to end.
+    ///
+    /// More than one is a batch search: every query is answered against the same rows, and the
+    /// output gains a `_query_index` discriminator saying which query a row answers.
+    query_count: usize,
     /// Whether `distance_type` is what the caller asked for, or a default stood in for them.
     ///
     /// The difference decides what a metric mismatch means. A caller who named a metric and got an
@@ -176,21 +182,55 @@ impl VectorSearchNode {
         // Write the resolution back so the `Query` handed to the physical nodes is complete.
         // Leaving it `None` there makes them report `metric=default` in `EXPLAIN`.
         query.metric_type = Some(distance_type);
-        let schema = Arc::new(DFSchema::try_from(ArrowSchema::new(vec![
-            ROW_ID_FIELD.clone(),
-            ArrowField::new(DIST_COL, DataType::Float32, true),
-        ]))?);
+        let schema = Self::output_schema(1)?;
         Ok(Self {
             input,
             dataset,
             query,
             accuracy,
             distance_type,
+            query_count: 1,
             distance_type_requested,
             resolution: None,
             prefilter: PrefilterSourceKind::default(),
             overlay_block: None,
             schema,
+        })
+    }
+
+    /// The `[_rowid, _distance]` contract, plus the batch discriminator when there is one.
+    fn output_schema(query_count: usize) -> Result<DFSchemaRef> {
+        let mut fields = Vec::with_capacity(3);
+        if query_count > 1 {
+            fields.push(query_index_field());
+        }
+        fields.push(ROW_ID_FIELD.clone());
+        fields.push(ArrowField::new(DIST_COL, DataType::Float32, true));
+        Ok(Arc::new(DFSchema::try_from(ArrowSchema::new(fields))?))
+    }
+
+    /// Answer `count` query vectors at once, reading them end to end out of `query.key`.
+    pub fn with_query_count(mut self, count: usize) -> Result<Self> {
+        self.schema = Self::output_schema(count)?;
+        self.query_count = count;
+        Ok(self)
+    }
+
+    pub fn query_count(&self) -> usize {
+        self.query_count
+    }
+
+    /// The `i`th query vector's own single-query search, for a rewrite that answers them one at a
+    /// time. The input is shared: every query searches the same rows.
+    pub fn single_query(&self, index: usize) -> Result<Self> {
+        let dim = self.query.key.len() / self.query_count;
+        let mut query = self.query.clone();
+        query.key = self.query.key.slice(index * dim, dim);
+        Ok(Self {
+            query,
+            query_count: 1,
+            schema: Self::output_schema(1)?,
+            ..self.clone()
         })
     }
 
@@ -268,6 +308,7 @@ impl PartialEq for VectorSearchNode {
             && self.query.column == other.query.column
             && self.query.k == other.query.k
             && self.accuracy == other.accuracy
+            && self.query_count == other.query_count
             && self.resolution == other.resolution
             && self.prefilter == other.prefilter
             && self.overlay_block == other.overlay_block
@@ -282,6 +323,7 @@ impl Hash for VectorSearchNode {
         self.query.column.hash(state);
         self.query.k.hash(state);
         self.accuracy.hash(state);
+        self.query_count.hash(state);
         self.resolution.hash(state);
         self.prefilter.hash(state);
         // `RowAddrTreeMap` is not `Hash`, and the flag is the part that distinguishes plans: two
@@ -340,6 +382,9 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             "VectorSearch: column={}, k={}, metric={}, accuracy={:?}",
             self.query.column, self.query.k, self.distance_type, self.accuracy
         )?;
+        if self.query_count > 1 {
+            write!(f, ", queries={}", self.query_count)?;
+        }
         match &self.resolution {
             Some(VectorAccessPath::Flat) => write!(f, ", via=flat")?,
             Some(VectorAccessPath::Index { segments }) => {
@@ -378,6 +423,7 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             query: self.query.clone(),
             accuracy: self.accuracy.clone(),
             distance_type: self.distance_type,
+            query_count: self.query_count,
             distance_type_requested: self.distance_type_requested,
             resolution: self.resolution.clone(),
             prefilter: self.prefilter,

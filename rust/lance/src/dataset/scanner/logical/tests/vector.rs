@@ -444,3 +444,72 @@ async fn multivector_dataset() -> crate::dataset::Dataset {
     .await
     .unwrap()
 }
+
+/// A batch of query vectors, built the way the scanner's own batch tests build one.
+fn batch_query_vectors(count: usize) -> arrow_array::FixedSizeListArray {
+    use arrow_array::FixedSizeListArray;
+    use lance_arrow::FixedSizeListArrayExt;
+
+    let values = arrow_array::Float32Array::from(
+        (0..count)
+            .flat_map(|query| (0..DIM).map(move |v| (v + query as u32) as f32))
+            .collect::<Vec<_>>(),
+    );
+    FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap()
+}
+
+/// Brute force answers every query in one pass, so the batch stays a single node.
+#[tokio::test]
+async fn test_paths_agree_on_a_flat_batch_search() {
+    let dataset = vector_dataset().await;
+    let queries = batch_query_vectors(3);
+    assert_paths_agree(&dataset, |scan| scan.nearest("vec", &queries, 4))
+        .await
+        .unwrap();
+}
+
+/// The index fanout is single-query, so a batch becomes a union of one search per query.
+#[tokio::test]
+async fn test_paths_agree_on_an_indexed_batch_search() {
+    let dataset = indexed_vector_dataset().await;
+    let queries = batch_query_vectors(3);
+    assert_paths_agree(&dataset, |scan| scan.nearest("vec", &queries, 4))
+        .await
+        .unwrap();
+}
+
+/// A prefilter applies to every query in the batch.
+#[tokio::test]
+async fn test_paths_agree_on_a_prefiltered_batch_search() {
+    let dataset = indexed_vector_dataset().await;
+    let queries = batch_query_vectors(2);
+    assert_paths_agree(&dataset, |scan| {
+        scan.nearest("vec", &queries, 4)?
+            .filter("i < 500")?
+            .prefilter(true);
+        Ok(scan)
+    })
+    .await
+    .unwrap();
+}
+
+/// `query_index` leads the output and groups the results, whichever path answered them.
+#[tokio::test]
+async fn test_batch_search_groups_results_by_query() {
+    use arrow::datatypes::Int32Type;
+    use arrow_array::cast::AsArray;
+
+    let dataset = indexed_vector_dataset().await;
+    let queries = batch_query_vectors(3);
+    let plan = logical_plan_for(&dataset, |scan| scan.nearest("vec", &queries, 4))
+        .await
+        .unwrap();
+    let batch = run(plan).await.unwrap();
+
+    assert_eq!(batch.schema().field(0).name(), "query_index");
+    let indices = batch["query_index"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(indices, vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]);
+}

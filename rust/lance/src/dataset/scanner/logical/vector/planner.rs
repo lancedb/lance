@@ -20,7 +20,9 @@ use lance_table::format::IndexMetadata;
 
 use super::super::{PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
 use crate::Result;
-use crate::io::exec::knn::{KnnBatchParams, new_knn_exec};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+use crate::io::exec::knn::{KnnBatchParams, QUERY_INDEX_COL, new_knn_exec};
 use crate::io::exec::{KNNVectorDistanceExec, LanceFilterExec, PreFilterSource};
 
 use super::super::planner::sort_asc;
@@ -47,9 +49,12 @@ pub fn plan_vector_search(
         }
         // An unresolved node means the rule did not run; brute force is the answer that is
         // always correct, so it is the safe default rather than an error.
-        Some(VectorAccessPath::Flat) | None => {
-            plan_flat_knn(node.query(), node.distance_type(), input)?
-        }
+        Some(VectorAccessPath::Flat) | None => plan_flat_knn(
+            node.query(),
+            node.distance_type(),
+            node.query_count(),
+            input,
+        )?,
     };
     normalize_search_output(searched)
 }
@@ -86,22 +91,38 @@ pub fn plan_indexed_search(
 pub fn plan_flat_knn(
     query: &lance_index::vector::Query,
     distance_type: DistanceType,
+    query_count: usize,
     input: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    // A batch scores every query vector in one pass over the rows, so it has to see all of them:
+    // its top-`k` per query cannot be assembled from independent per-partition top-`k`s.
+    let is_batch = query_count > 1;
+    let input = match is_batch {
+        true => Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>,
+        false => input,
+    };
     let distances = Arc::new(KNNVectorDistanceExec::try_new_batch(
         input,
         &query.column,
         query.key.clone(),
         KnnBatchParams {
-            is_batch: false,
-            query_count: 1,
+            is_batch,
+            query_count,
             k: query.k,
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
             distance_type,
+            // The take above the search refetches whatever the user projected, so keeping the
+            // vector here would only widen the batches this node emits.
             retain_vector: false,
         },
     )?);
+
+    // The batch node applies the distance bounds and the per-query top-`k` itself, and drops rows
+    // with no vector on the way. There is nothing left for the tail below to do.
+    if is_batch {
+        return Ok(distances);
+    }
 
     let lower = query
         .lower_bound
@@ -131,20 +152,21 @@ pub fn plan_flat_knn(
     )?))
 }
 
-/// Trim whatever the access path carried down to the node's declared `[_rowid, _distance]`.
+/// Trim whatever the access path carried down to the node's declared output columns.
 pub fn normalize_search_output(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = plan.schema();
+    let mut columns = Vec::with_capacity(3);
+    // Only a batch search has this, and only the brute-force path produces it here — the indexed
+    // path gets it from the projection `ExpandBatchSearch` puts above each expanded search.
+    if schema.column_with_name(QUERY_INDEX_COL).is_some() {
+        columns.push(QUERY_INDEX_COL);
+    }
+    columns.extend([ROW_ID, DIST_COL]);
     Ok(Arc::new(ProjectionExec::try_new(
-        vec![
-            (
-                expressions::col(ROW_ID, schema.as_ref())?,
-                ROW_ID.to_string(),
-            ),
-            (
-                expressions::col(DIST_COL, schema.as_ref())?,
-                DIST_COL.to_string(),
-            ),
-        ],
+        columns
+            .into_iter()
+            .map(|name| Ok((expressions::col(name, schema.as_ref())?, name.to_string())))
+            .collect::<Result<Vec<_>>>()?,
         plan,
     )?))
 }

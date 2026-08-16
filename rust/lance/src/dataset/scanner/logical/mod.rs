@@ -252,6 +252,8 @@ fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRul
     // the closest the spike gets to the doc's "each index plugin provides its own rules".
     rules.extend(fts::analyzer_rules(context));
     rules.extend::<Vec<Arc<dyn AnalyzerRule + Send + Sync>>>(vec![
+        // Before the split and the refine, so both see plain single-query searches.
+        Arc::new(ExpandBatchSearch),
         Arc::new(SplitOnIndexCoverage::searches(context.clone())),
         // After the split, so the refine lands on the *indexed branch* of a partially-covered
         // search rather than above the union — the nesting the imperative path produces.
@@ -327,7 +329,8 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         dataset: _,
         projection_plan,
         materialization_style,
-        is_batch_nearest,
+        // Carried on the search node as its query count, and expanded by `ExpandBatchSearch`.
+        is_batch_nearest: _,
         include_deleted_rows,
 
         // Applied by the builder as a stock `Aggregate` node, which also replaces the output
@@ -376,9 +379,9 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         use_stats: _,
         ordered: _,
 
-        // Not plan-affecting. The callback is applied by `execute_plan` on the finished plan, and
-        // `explicit_projection` only gates a deprecation warning. `nearest_query_count` is
-        // meaningful only alongside `is_batch_nearest`, which is rejected.
+        // Not plan-affecting here. The callback is applied by `execute_plan` on the finished plan,
+        // `explicit_projection` only gates a deprecation warning, and `nearest_query_count` reaches
+        // the plan through the search node's query count.
         scan_stats_callback: _,
         explicit_projection: _,
         nearest_query_count: _,
@@ -390,9 +393,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         ))
     };
 
-    if *is_batch_nearest {
-        return unsupported("batch vector search");
-    }
     if let Some(query) = nearest {
         // A multivector column has its own physical path (`Scanner::multivec_ann`), which the
         // lowering here does not reach — `plan_indexed_search` would quietly build a single-vector
