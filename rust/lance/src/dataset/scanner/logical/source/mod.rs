@@ -21,6 +21,7 @@ use datafusion::common::DataFusionError;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
 use lance_arrow::SchemaExt as ArrowSchemaExt;
 use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::{
@@ -349,9 +350,11 @@ impl LanceScanSource {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut projection = self.to_lance_projection(projection)?;
-        if projection.is_empty() {
-            // Reading nothing is not a thing the reader can do; the row address is the cheapest
-            // stand-in. Matches `Scanner::filtered_read_source`.
+        // DataFusion asks for no columns when only the row count matters — `COUNT(*)`. Reading
+        // nothing is not a thing the reader can do, so the row address stands in and is projected
+        // away again below. Matches `Scanner::filtered_read_source`.
+        let counting_rows = projection.is_empty();
+        if counting_rows {
             projection.with_row_addr = true;
         }
         let filter_plan = match self.options.filter_plan.clone() {
@@ -378,7 +381,7 @@ impl LanceScanSource {
                 Some(limit) if !filter_plan.has_any_filter() => Some(0..limit as u64),
                 _ => None,
             };
-            return v1::scan(
+            let plan = v1::scan(
                 scanner,
                 &filter_plan,
                 projection,
@@ -386,7 +389,11 @@ impl LanceScanSource {
                 self.options.fragments.clone(),
                 scan_range,
             )
-            .await;
+            .await?;
+            return match counting_rows {
+                true => drop_all_columns(plan),
+                false => Ok(plan),
+            };
         }
 
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
@@ -441,12 +448,22 @@ impl LanceScanSource {
             }),
         };
 
-        Ok(Arc::new(FilteredReadExec::try_new(
+        let plan = Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
             read_options,
             index_input,
-        )?))
+        )?) as Arc<dyn ExecutionPlan>;
+        match counting_rows {
+            true => drop_all_columns(plan),
+            false => Ok(plan),
+        }
     }
+}
+
+/// A plan with the same rows and no columns.
+fn drop_all_columns(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    let no_columns: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = vec![];
+    Ok(Arc::new(ProjectionExec::try_new(no_columns, plan)?))
 }
 
 #[async_trait]

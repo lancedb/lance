@@ -171,6 +171,25 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
         }
     }
 
+    // An aggregate replaces the output projection rather than sitting above it, and `validate_options`
+    // has already rejected a limit, offset or ordering alongside one. The columns it reads are found
+    // by projection pushdown, which is what the imperative path's `agg_projection` does by hand.
+    if let Some(aggregate) = &scanner.aggregate {
+        let aggregate = builder.aggregate(
+            aggregate
+                .group_by
+                .iter()
+                .map(unqualified)
+                .collect::<Vec<_>>(),
+            aggregate
+                .aggregates
+                .iter()
+                .map(unqualified)
+                .collect::<Vec<_>>(),
+        )?;
+        return Ok(aggregate.build()?);
+    }
+
     // Sort below limit/offset, matching the imperative path: the limit takes the first rows of the
     // ordering, not an arbitrary subset that is then ordered.
     if let Some(ordering) = &scanner.ordering {
@@ -186,6 +205,16 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
 
     builder = builder.project(output_exprs(scanner, prepared)?)?;
     Ok(builder.build()?)
+}
+
+/// Pin an aggregate expression's output name to the unqualified one.
+///
+/// Resolving `sum(i)` against the scan relation would otherwise name the result `sum(lance.i)`,
+/// leaking this module's relation name into the user's output schema. The imperative path names
+/// these from the expression as written, so this keeps the two agreeing.
+fn unqualified(expr: &Expr) -> Expr {
+    let name = expr.schema_name().to_string();
+    expr.clone().alias(name)
 }
 
 /// Read settings a take must honor, lifted off the `Scanner`. `None` fragments means "all of

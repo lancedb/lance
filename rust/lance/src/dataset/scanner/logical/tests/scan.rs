@@ -8,6 +8,8 @@
 //! `FilteredReadExec` — so it needs its own coverage of the same shapes, not just the default.
 
 use lance_file::version::LanceFileVersion;
+
+use crate::dataset::scanner::AggregateExpr;
 use rstest::rstest;
 
 use super::harness::*;
@@ -202,4 +204,59 @@ async fn test_strict_batch_size() {
     let (last, rest) = sizes.split_last().expect("plan produced no batches");
     assert!(rest.iter().all(|size| *size == 32), "{sizes:?}");
     assert!(*last <= 32, "{sizes:?}");
+}
+
+/// Aggregates are stock DataFusion nodes, so the whole of `COUNT(*)` and `SUM` comes from the
+/// builder emitting an `Aggregate` and letting projection pushdown find its columns.
+#[rstest]
+#[case::count_star(AggregateExpr::builder().count_star().build())]
+#[case::sum(AggregateExpr::builder().sum("i").build())]
+#[tokio::test]
+async fn test_paths_agree_on_aggregates(#[case] aggregate: AggregateExpr) {
+    let dataset = test_dataset().await;
+    assert_paths_agree(&dataset, move |scan| {
+        scan.aggregate(aggregate.clone())?.filter("i > 10")
+    })
+    .await
+    .unwrap();
+}
+
+/// A grouped aggregate, compared as a set: neither path promises an order for hash aggregation.
+#[tokio::test]
+async fn test_paths_agree_on_a_grouped_aggregate() {
+    use arrow::compute::{SortColumn, lexsort_to_indices, take};
+
+    let dataset = test_dataset().await;
+    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+        scan.aggregate(AggregateExpr::builder().group_by("s").count_star().build())?
+            .filter("i > 10")
+    }
+    let by_group = |batch: arrow_array::RecordBatch| {
+        let indices = lexsort_to_indices(
+            &[SortColumn {
+                values: batch.column(0).clone(),
+                options: None,
+            }],
+            None,
+        )
+        .unwrap();
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| take(column.as_ref(), &indices, None).unwrap())
+            .collect::<Vec<_>>();
+        arrow_array::RecordBatch::try_new(batch.schema(), columns).unwrap()
+    };
+
+    let expected = by_group(
+        run(imperative_plan_for(&dataset, config).await.unwrap())
+            .await
+            .unwrap(),
+    );
+    let actual = by_group(
+        run(logical_plan_for(&dataset, config).await.unwrap())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(expected, actual);
 }

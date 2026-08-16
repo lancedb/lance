@@ -328,8 +328,11 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         projection_plan,
         materialization_style,
         is_batch_nearest,
-        aggregate,
         include_deleted_rows,
+
+        // Applied by the builder as a stock `Aggregate` node, which also replaces the output
+        // projection. `validate_options` has already rejected limit/offset/ordering alongside it.
+        aggregate: _,
 
         // Read by `ScanPlanningContext::collect`, which narrows the searched index to the
         // segments it names.
@@ -389,9 +392,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
 
     if *is_batch_nearest {
         return unsupported("batch vector search");
-    }
-    if aggregate.is_some() {
-        return unsupported("aggregates");
     }
     if *include_deleted_rows && (nearest.is_some() || full_text_query.is_some()) {
         // The imperative path rejects these in `vector_search_source`/`fts_search_source` for the
