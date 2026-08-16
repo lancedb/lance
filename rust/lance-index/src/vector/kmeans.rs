@@ -331,6 +331,28 @@ where
     phantom_data: std::marker::PhantomData<T>,
 }
 
+// Keep the thread-local centroid accumulators from adding hundreds of MiB to
+// large IVF training jobs. One accumulator is always allowed because the
+// centroid output itself already requires that much memory.
+const MAX_CENTROID_ACCUMULATOR_BYTES: usize = 64 * 1024 * 1024;
+
+fn centroid_accumulator_count<T>(
+    num_vectors: usize,
+    centroid_len: usize,
+    available_parallelism: usize,
+) -> usize {
+    let accumulator_bytes = centroid_len.saturating_mul(std::mem::size_of::<T>());
+    let memory_limited_parallelism = MAX_CENTROID_ACCUMULATOR_BYTES
+        .checked_div(accumulator_bytes)
+        .unwrap_or(1)
+        .max(1);
+
+    available_parallelism
+        .min(memory_limited_parallelism)
+        .min(num_vectors)
+        .max(1)
+}
+
 impl<T: ArrowNumericType> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
 where
     T::Native: Float + Dot + L2 + MulAssign + DivAssign + AddAssign + FromPrimitive + Sync,
@@ -399,34 +421,52 @@ where
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
-        let mut centroids = vec![T::Native::zero(); k * dimension];
+        let num_vectors = data.len() / dimension;
+        let centroid_len = k * dimension;
+        let available_parallelism = if k < 16 {
+            1
+        } else {
+            get_num_compute_intensive_cpus()
+        };
+        let accumulator_count = centroid_accumulator_count::<T::Native>(
+            num_vectors,
+            centroid_len,
+            available_parallelism,
+        );
+        let vectors_per_chunk = num_vectors.div_ceil(accumulator_count);
 
-        let mut num_cpus = get_num_compute_intensive_cpus();
-        if k < num_cpus || k < 16 {
-            num_cpus = 1;
-        }
-        let chunk_size = k / num_cpus;
-
-        centroids
-            .par_chunks_mut(dimension * chunk_size)
-            .enumerate()
-            .with_max_len(1)
-            .for_each(|(i, centroids)| {
-                let start = i * chunk_size;
-                let end = ((i + 1) * chunk_size).min(k);
+        // Each worker scans a disjoint portion of the input once and writes to
+        // a private centroid buffer. This changes the input-read complexity
+        // from O(num_vectors * workers) to O(num_vectors) without contention.
+        let mut accumulators = data
+            .par_chunks(vectors_per_chunk * dimension)
+            .zip(membership.par_chunks(vectors_per_chunk))
+            .map(|(data, membership)| {
+                let mut local_centroids = vec![T::Native::zero(); centroid_len];
                 data.chunks(dimension)
-                    .zip(membership.iter())
+                    .zip(membership)
                     .filter_map(|(vector, cluster_id)| {
                         cluster_id.map(|cluster_id| (vector, cluster_id as usize))
                     })
                     .for_each(|(vector, cluster_id)| {
-                        if start <= cluster_id && cluster_id < end {
-                            let local_id = cluster_id - start;
-                            let centroid =
-                                &mut centroids[local_id * dimension..(local_id + 1) * dimension];
-                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                        }
+                        let start = cluster_id * dimension;
+                        let centroid = &mut local_centroids[start..start + dimension];
+                        centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
                     });
+                local_centroids
+            })
+            .collect::<Vec<_>>();
+
+        let mut centroids = accumulators
+            .pop()
+            .unwrap_or_else(|| vec![T::Native::zero(); centroid_len]);
+        centroids
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, centroid)| {
+                accumulators
+                    .iter()
+                    .for_each(|local_centroids| *centroid += local_centroids[idx]);
             });
 
         centroids
@@ -1553,7 +1593,7 @@ mod tests {
     use std::iter::repeat_n;
 
     use arrow_array::Float16Array;
-    use arrow_array::types::Float16Type;
+    use arrow_array::types::{Float16Type, Float32Type, Float64Type};
     use half::f16;
     use lance_arrow::*;
     use lance_testing::datagen::generate_random_array;
@@ -1613,6 +1653,107 @@ mod tests {
         assert_ne!(
             first.centroids.as_primitive::<Float32Type>().values(),
             second.centroids.as_primitive::<Float32Type>().values(),
+        );
+    }
+
+    #[test]
+    fn test_recompute_float_centroids() {
+        let membership = [Some(0), Some(1), None, Some(0), Some(1)];
+
+        let mut cluster_sizes = [2, 2];
+        let kmeans = KMeansAlgoFloat::<Float16Type>::to_kmeans(
+            &[
+                f16::from_f32(1.0),
+                f16::from_f32(3.0),
+                f16::from_f32(2.0),
+                f16::from_f32(4.0),
+                f16::from_f32(100.0),
+                f16::from_f32(100.0),
+                f16::from_f32(3.0),
+                f16::from_f32(5.0),
+                f16::from_f32(4.0),
+                f16::from_f32(6.0),
+            ],
+            2,
+            2,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+        assert_eq!(
+            kmeans.centroids.as_primitive::<Float16Type>().values(),
+            &[
+                f16::from_f32(2.0),
+                f16::from_f32(4.0),
+                f16::from_f32(3.0),
+                f16::from_f32(5.0),
+            ]
+        );
+
+        let mut cluster_sizes = [2, 2];
+        let kmeans = KMeansAlgoFloat::<Float32Type>::to_kmeans(
+            &[1.0, 3.0, 2.0, 4.0, 100.0, 100.0, 3.0, 5.0, 4.0, 6.0],
+            2,
+            2,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+        assert_eq!(
+            kmeans.centroids.as_primitive::<Float32Type>().values(),
+            &[2.0, 4.0, 3.0, 5.0]
+        );
+
+        let mut cluster_sizes = [2, 2];
+        let kmeans = KMeansAlgoFloat::<Float64Type>::to_kmeans(
+            &[1.0, 3.0, 2.0, 4.0, 100.0, 100.0, 3.0, 5.0, 4.0, 6.0],
+            2,
+            2,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+        assert_eq!(
+            kmeans.centroids.as_primitive::<Float64Type>().values(),
+            &[2.0, 4.0, 3.0, 5.0]
+        );
+    }
+
+    #[test]
+    fn test_recompute_centroids_splits_empty_cluster() {
+        let data = [1.0, 3.0, 3.0, 5.0, 5.0, 7.0, 10.0, 12.0];
+        let membership = [Some(0), Some(0), Some(0), Some(1)];
+        let mut cluster_sizes = [3, 1, 0];
+        let kmeans = KMeansAlgoFloat::<Float32Type>::to_kmeans(
+            &data,
+            2,
+            3,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+
+        assert!(cluster_sizes.iter().all(|size| *size > 0));
+        assert!(
+            kmeans
+                .centroids
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+    }
+
+    #[test]
+    fn test_centroid_accumulator_count_respects_memory_limit() {
+        assert_eq!(centroid_accumulator_count::<f32>(1_000_000, 1024, 16), 16);
+        assert_eq!(
+            centroid_accumulator_count::<f32>(1_000_000, 16 * 1024 * 1024, 16),
+            1
         );
     }
 
