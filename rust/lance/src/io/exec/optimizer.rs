@@ -149,8 +149,51 @@ impl PhysicalOptimizerRule for CoalesceTake {
     }
 }
 
+/// One rewrite of `proj`, or `None` if it is already as simple as it gets.
+///
+/// Two rewrites, in the order they compose. A column-only projection over another projection folds
+/// into it — selecting, reordering, or renaming a projection's columns is just another projection
+/// over the same input. Requiring the outer node to be columns and nothing else is what keeps that
+/// safe: substituting into any other expression could duplicate work the inner projection does
+/// once. What is left may then turn out to restate its input exactly, in which case it goes.
+fn simplify_projection(proj: &ProjectionExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+    let input = proj.input();
+    if let Some(inner) = input.downcast_ref::<ProjectionExec>() {
+        let mut exprs = Vec::with_capacity(proj.expr().len());
+        let mut foldable = true;
+        for proj_expr in proj.expr() {
+            let Some(source) = proj_expr
+                .expr
+                .downcast_ref::<Column>()
+                .and_then(|column| inner.expr().get(column.index()))
+            else {
+                foldable = false;
+                break;
+            };
+            exprs.push((source.expr.clone(), proj_expr.alias.clone()));
+        }
+        if foldable {
+            let merged = ProjectionExec::try_new(exprs, inner.input().clone())?;
+            return Ok(Some(Arc::new(merged)));
+        }
+    }
+
+    if input.schema() == proj.schema()
+        && proj.expr().iter().enumerate().all(|(index, proj_expr)| {
+            match proj_expr.expr.downcast_ref::<Column>() {
+                // no renaming, no reordering
+                Some(column) => column.index() == index && column.name() == proj_expr.alias,
+                None => false,
+            }
+        })
+    {
+        return Ok(Some(input.clone()));
+    }
+    Ok(None)
+}
+
 /// Rule that eliminates [ProjectionExec] nodes that projects all columns
-/// from its input with no additional expressions.
+/// from its input with no additional expressions, and merges the ones that stack.
 #[derive(Debug)]
 pub struct SimplifyProjection;
 
@@ -162,34 +205,22 @@ impl PhysicalOptimizerRule for SimplifyProjection {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(plan
             .transform_down(|plan| {
-                if let Some(proj) = plan.downcast_ref::<ProjectionExec>() {
-                    let children = proj.children();
-                    if children.len() != 1 {
-                        return Ok(Transformed::no(plan));
-                    }
-
-                    let input = children[0];
-
-                    // TODO: we could try to coalesce consecutive projections, something for later
-                    // For now, we just keep things simple and only remove NoOp projections
-
-                    // output has different schema, projection needed
-                    if input.schema() != proj.schema() {
-                        return Ok(Transformed::no(plan));
-                    }
-
-                    if proj.expr().iter().enumerate().all(|(index, proj_expr)| {
-                        if let Some(expr) = proj_expr.expr.downcast_ref::<Column>() {
-                            // no renaming, no reordering
-                            expr.index() == index && expr.name() == proj_expr.alias
-                        } else {
-                            false
-                        }
-                    }) {
-                        return Ok(Transformed::yes(input.clone()));
-                    }
+                // Looping rather than leaning on `Transformed::yes` to revisit: `transform_down`
+                // descends into the replacement's children without re-examining the replacement
+                // itself, so a fold whose result is a no-op would otherwise survive.
+                let mut current = plan;
+                let mut simplified = false;
+                while let Some(proj) = current.downcast_ref::<ProjectionExec>() {
+                    let Some(next) = simplify_projection(proj)? else {
+                        break;
+                    };
+                    current = next;
+                    simplified = true;
                 }
-                Ok(Transformed::no(plan))
+                Ok(match simplified {
+                    true => Transformed::yes(current),
+                    false => Transformed::no(current),
+                })
             })?
             .data)
     }
