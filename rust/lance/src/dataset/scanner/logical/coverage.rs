@@ -33,7 +33,7 @@ use super::{analyze_bottom_up, map_lance_scan, restrict_scan, with_lance_source}
 /// `Scanner::new_filtered_read`, `knn_combined`, and `plan_flat_match_query` splits on row
 /// coverage. Both produce a brute-force branch reading exactly the rows in the hole, and the only
 /// difference is how that branch's scan is narrowed — which is what [`ScanRestriction`] carries.
-pub(super) enum IndexCoverage {
+pub enum IndexCoverage {
     /// The index answers for every row the scan will touch. Also the answer when coverage cannot
     /// be determined: an index that will not say what it covers is used as-is, which is what the
     /// imperative path does too.

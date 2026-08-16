@@ -11,6 +11,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
 use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array, gen_batch};
+use lance_file::version::LanceFileVersion;
 
 use crate::Result;
 use crate::dataset::{Dataset, Scanner};
@@ -164,6 +165,14 @@ pub(super) fn tagged(
 }
 
 pub(super) async fn test_dataset() -> Dataset {
+    test_dataset_versioned(LanceFileVersion::Stable).await
+}
+
+/// The `i`/`s` fixture, written at a chosen storage version.
+///
+/// Legacy (v1) storage is the one thing that changes the shape of the scan leaf, so the plain-scan
+/// equivalence cases run against both versions rather than only the default.
+pub(super) async fn test_dataset_versioned(version: LanceFileVersion) -> Dataset {
     use crate::dataset::WriteParams;
     use arrow::datatypes::Int32Type;
 
@@ -176,6 +185,7 @@ pub(super) async fn test_dataset() -> Dataset {
         "memory://",
         Some(WriteParams {
             max_rows_per_file: 100,
+            data_storage_version: Some(version),
             ..Default::default()
         }),
     )

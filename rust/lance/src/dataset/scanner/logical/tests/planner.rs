@@ -8,16 +8,8 @@ use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
 use lance_datagen::{Dimension, array, gen_batch};
 
 use crate::Result;
-use crate::dataset::Scanner;
 use crate::dataset::scanner::ColumnOrdering;
 
-/// A scanner-configuring closure. Generic rather than a `fn` pointer so a case can close over
-/// its query vector or filter string, and taken by reference internally because every oracle
-/// applies it twice — once per path.
-trait ScanConfig: Fn(&mut Scanner) -> Result<&mut Scanner> {}
-impl<F: Fn(&mut Scanner) -> Result<&mut Scanner>> ScanConfig for F {}
-
-/// Sort a result batch by `_rowid` so two plans can be compared as sets.
 use super::fts::*;
 use super::harness::*;
 
@@ -46,8 +38,8 @@ async fn test_paths_agree_on_ordering() {
     .unwrap();
 }
 
-/// A limit must take the first rows *of the orderingwhich is only true if the sort is below the
-/// limit. It also blocks the scan-range pushdown a bare limit would get.
+/// A limit must take the first rows *of the ordering*, which is only true if the sort is below
+/// the limit. It also blocks the scan-range pushdown a bare limit would get.
 #[tokio::test]
 async fn test_paths_agree_on_ordering_with_limit() {
     let dataset = test_dataset().await;

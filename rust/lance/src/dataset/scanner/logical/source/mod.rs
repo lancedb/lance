@@ -10,6 +10,8 @@
 //!
 //! [`LanceTableProvider`]: crate::datafusion::LanceTableProvider
 
+pub mod v1;
+
 use std::sync::Arc;
 
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
@@ -30,14 +32,14 @@ use lance_select::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_select::result::{IndexExprResult, IndexExprResultWireFormat};
 use lance_table::format::Fragment;
 
-use crate::Result;
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, Scanner};
 use crate::index::{DatasetIndexInternalExt, ScalarIndexInfo};
 use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::scalar_index::ScalarIndexExec;
 use crate::io::exec::{FilterPlan as ExprFilterPlan, Planner};
+use crate::{Error, Result};
 
 /// How a branch's scan is narrowed to the rows that branch is responsible for.
 ///
@@ -57,7 +59,7 @@ pub enum ScanRestriction {
 ///
 /// Captured up front so the provider does not hold a `Scanner` reference: DataFusion owns the
 /// provider for the life of the plan, well past the borrow the builder runs under.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScanSourceOptions {
     pub batch_size: Option<usize>,
     pub batch_readahead: usize,
@@ -87,6 +89,37 @@ pub struct ScanSourceOptions {
     /// for them. The same rows are re-read on a sibling branch, restricted by
     /// [`ScanRestriction::Rows`].
     pub overlay_block: Option<Arc<RowAddrTreeMap>>,
+    /// The scanner this plan came from, captured only for legacy (v1) datasets.
+    ///
+    /// The legacy scan builder reads its options straight off `&Scanner` and is frozen, so the v1
+    /// leaf hands it one rather than changing its signature. `None` on current storage, where
+    /// nothing needs it. See [`v1`].
+    ///
+    /// Omitted from `Debug`: `Scanner` does not implement it, and the leaf's debug output is about
+    /// what the leaf will read, not how the query got here.
+    pub legacy_scanner: Option<Arc<Scanner>>,
+}
+
+impl std::fmt::Debug for ScanSourceOptions {
+    /// `Scanner` has no `Debug`, and what the leaf will read is what matters here, so the captured
+    /// legacy scanner is reported only as present or absent.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanSourceOptions")
+            .field("batch_size", &self.batch_size)
+            .field("batch_readahead", &self.batch_readahead)
+            .field("fragment_readahead", &self.fragment_readahead)
+            .field("io_buffer_size", &self.io_buffer_size)
+            .field("file_reader_options", &self.file_reader_options)
+            .field("fragments", &self.fragments)
+            .field("index_expr_result_format", &self.index_expr_result_format)
+            .field("use_scalar_index", &self.use_scalar_index)
+            .field("fast_search", &self.fast_search)
+            .field("rows", &self.rows)
+            .field("filter_plan", &self.filter_plan)
+            .field("overlay_block", &self.overlay_block)
+            .field("legacy", &self.legacy_scanner.is_some())
+            .finish()
+    }
 }
 
 pub struct LanceScanSource {
@@ -302,6 +335,35 @@ impl LanceScanSource {
             None => self.build_filter_plan(filters).await?,
         };
 
+        if v1::is_legacy(&self.dataset) {
+            let Some(scanner) = self.options.legacy_scanner.as_ref() else {
+                return Err(Error::internal(
+                    "a legacy (v1) scan reached the leaf without the scanner it needs".to_string(),
+                ));
+            };
+            // Both of these come from a data overlay, and no writer can put one on a v1 dataset:
+            // `lance_file::versions::create_writer` refuses `V1`. Reaching here means a split rule
+            // produced a branch for a dataset that cannot have the coverage gap it is filling.
+            if self.options.rows.is_some() || self.options.overlay_block.is_some() {
+                return Err(Error::internal(
+                    "a legacy (v1) scan was restricted by a data overlay, which v1 cannot have"
+                        .to_string(),
+                ));
+            }
+            let scan_range = match limit {
+                Some(limit) if !filter_plan.has_any_filter() => Some(0..limit as u64),
+                _ => None,
+            };
+            return v1::scan(
+                scanner,
+                &filter_plan,
+                projection,
+                self.options.fragments.clone(),
+                scan_range,
+            )
+            .await;
+        }
+
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
             .with_projection(projection)
@@ -381,15 +443,16 @@ impl TableProvider for LanceScanSource {
             .map_err(DataFusionError::from)
     }
 
-    /// `FilteredReadExec` applies the predicate itself, so DataFusion never needs to re-check it.
+    /// The leaf applies the predicate itself, so DataFusion never needs to re-check it.
+    ///
+    /// True on both storage versions, though for different reasons: `FilteredReadExec` always
+    /// applies it, while on v1 [`v1::scan`] tops the legacy plan with a filter in the one case
+    /// where the legacy builder would not have applied it.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|_| TableProviderFilterPushDown::Exact)
-            .collect())
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 }
 

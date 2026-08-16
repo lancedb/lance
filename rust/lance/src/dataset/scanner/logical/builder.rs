@@ -345,5 +345,7 @@ fn source_options(scanner: &Scanner) -> ScanSourceOptions {
         rows: None,
         filter_plan: None,
         overlay_block: None,
+        legacy_scanner: super::source::v1::is_legacy(&scanner.dataset)
+            .then(|| Arc::new(scanner.clone())),
     }
 }

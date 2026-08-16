@@ -347,7 +347,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
     if dataset.manifest().data_storage_format.lance_file_format() == ConcreteFileVersion::V1 {
         // The legacy read path is a frozen compatibility surface; the spike targets current
         // storage only.
-        return unsupported("legacy (v1) storage format");
     }
     if *is_batch_nearest {
         return unsupported("batch vector search");

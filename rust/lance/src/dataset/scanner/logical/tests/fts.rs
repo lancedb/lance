@@ -6,19 +6,8 @@
 use arrow_array::RecordBatch;
 use std::sync::Arc;
 
-use lance_datafusion::exec::execute_plan;
-use lance_datagen::BatchCount;
-
-use crate::Result;
 use crate::dataset::{Dataset, Scanner};
 
-/// A scanner-configuring closure. Generic rather than a `fn` pointer so a case can close over
-/// its query vector or filter string, and taken by reference internally because every oracle
-/// applies it twice — once per path.
-trait ScanConfig: Fn(&mut Scanner) -> Result<&mut Scanner> {}
-impl<F: Fn(&mut Scanner) -> Result<&mut Scanner>> ScanConfig for F {}
-
-/// Sort a result batch by `_rowid` so two plans can be compared as sets.
 use super::harness::*;
 
 // ---------------------------------------------------------------------------------------------
