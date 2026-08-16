@@ -348,9 +348,19 @@ impl LanceScanSource {
         if !filter_plan.has_refine() || v1::is_legacy(&self.dataset) {
             return Ok(None);
         }
+        // A column the filter reads is loaded by the read whether or not it is projected, so
+        // deferring it would cost a take and save nothing. This is why the emptiness check below
+        // has to come after the union rather than before it: a wide column the filter also reads
+        // would otherwise look deferrable and leave the take with nothing to fetch.
+        let filter_schema = self
+            .dataset
+            .empty_projection()
+            .union_columns(filter_plan.all_columns(), OnMissing::Error)?
+            .into_schema();
         let eager = requested
             .clone()
-            .subtract_predicate(|field| !self.is_early_field(field));
+            .subtract_predicate(|field| !self.is_early_field(field))
+            .union_schema(&filter_schema);
         if !requested
             .clone()
             .subtract_projection(&eager)
@@ -358,14 +368,7 @@ impl LanceScanSource {
         {
             return Ok(None);
         }
-        // A column the filter reads is loaded by the read whether or not it is projected, so
-        // deferring it would cost a take and save nothing.
-        let filter_schema = self
-            .dataset
-            .empty_projection()
-            .union_columns(filter_plan.all_columns(), OnMissing::Error)?
-            .into_schema();
-        Ok(Some(eager.union_schema(&filter_schema).with_row_id()))
+        Ok(Some(eager.with_row_id()))
     }
 
     /// Fetch the columns the eager read left behind, for the rows that survived the filter.

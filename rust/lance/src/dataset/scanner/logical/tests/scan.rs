@@ -306,6 +306,30 @@ async fn test_paths_agree_on_materialization_style(
     assert_paths_agree(&dataset, scan_config).await.unwrap();
 }
 
+/// A wide column the filter also reads is not deferrable: the filtered pass has to load it either
+/// way, so the read stays a single pass and there is no take.
+#[tokio::test]
+async fn test_a_filtered_column_is_never_late() {
+    let dataset = test_dataset().await;
+    let scan_config = config(|scan: &mut crate::dataset::Scanner| {
+        scan.project(&["s"])?
+            .filter("s IS NOT NULL")?
+            .materialization_style(MaterializationStyle::AllLate);
+        Ok(scan)
+    });
+    assert_paths_agree(&dataset, &scan_config).await.unwrap();
+
+    let plan = logical_plan_for(&dataset, &scan_config).await.unwrap();
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert_eq!(
+        display.matches("LanceRead").count(),
+        1,
+        "expected a single read: {display}"
+    );
+}
+
 /// `AllEarlyExcept` names the late columns by field id, so it also covers the case where only
 /// part of the projection is deferred.
 #[tokio::test]
