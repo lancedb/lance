@@ -80,7 +80,7 @@ impl IndexCoverage {
 /// The trait is the seam that lets [`SplitOnIndexCoverage`] be one rule: what counts as coverage,
 /// and how the branches merge back together, are per-index-kind decisions, while the split itself
 /// is not.
-pub(super) trait SplittableSearch {
+pub trait SplittableSearch {
     /// `false` when this node is already brute force, or is already the output of a split.
     fn is_splittable(&self) -> bool;
     fn coverage(&self, context: &ScanPlanningContext) -> IndexCoverage;
