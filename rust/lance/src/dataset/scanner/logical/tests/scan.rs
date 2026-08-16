@@ -137,3 +137,69 @@ async fn test_paths_agree_on_row_id_projection(#[case] version: LanceFileVersion
     .await
     .unwrap();
 }
+
+/// A dataset with deletions, so `include_deleted_rows` has something to surface.
+async fn deleted_rows_dataset(version: LanceFileVersion) -> crate::dataset::Dataset {
+    let mut dataset = test_dataset_versioned(version).await;
+    dataset.delete("i % 7 = 0").await.unwrap();
+    dataset
+}
+
+#[rstest]
+#[case::v1(LanceFileVersion::Legacy)]
+#[case::stable(LanceFileVersion::Stable)]
+#[tokio::test]
+async fn test_paths_agree_on_include_deleted_rows(#[case] version: LanceFileVersion) {
+    let dataset = deleted_rows_dataset(version).await;
+    assert_paths_agree(&dataset, |scan| {
+        scan.include_deleted_rows();
+        Ok(scan.project(&["i"])?.with_row_id())
+    })
+    .await
+    .unwrap();
+}
+
+/// Deleted rows carry a null row id, so a search — which returns row ids — cannot include them.
+/// Both paths reject it; this asserts the logical one does so for the same reason.
+#[tokio::test]
+async fn test_include_deleted_rows_is_rejected_for_a_search() {
+    let dataset = vector_dataset().await;
+    let mut scan = dataset.scan();
+    scan.with_row_id().include_deleted_rows();
+    scan.nearest("vec", &query_vector(), 5).unwrap();
+
+    for plan in [
+        super::super::create_plan(&scan).await,
+        scan.create_plan().await,
+    ] {
+        let err = plan.expect_err("a search cannot include deleted rows");
+        assert!(err.to_string().contains("deleted rows"), "{err}");
+    }
+}
+
+/// Every batch but the last carries exactly the requested number of rows.
+#[tokio::test]
+async fn test_strict_batch_size() {
+    use futures::TryStreamExt;
+    use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
+
+    let dataset = test_dataset().await;
+    let plan = logical_plan_for(&dataset, |scan| {
+        scan.batch_size(32).strict_batch_size(true);
+        scan.project(&["i"])
+    })
+    .await
+    .unwrap();
+
+    let batches = execute_plan(plan, LanceExecutionOptions::default())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    let sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
+    assert_eq!(sizes.iter().sum::<usize>(), 200);
+    let (last, rest) = sizes.split_last().expect("plan produced no batches");
+    assert!(rest.iter().all(|size| *size == 32), "{sizes:?}");
+    assert!(*last <= 32, "{sizes:?}");
+}

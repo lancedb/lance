@@ -72,6 +72,11 @@ pub struct ScanSourceOptions {
     /// Answer from indices only: fragments a scalar index does not cover are skipped rather than
     /// scanned. Only meaningful alongside an index query.
     pub fast_search: bool,
+    /// Emit deleted rows too, carrying a null row id.
+    ///
+    /// A branch of a coverage split keeps this, and should: the branches read disjoint fragment
+    /// sets, so between them they still emit every deleted row exactly once.
+    pub include_deleted_rows: bool,
     /// Read only these rows, from [`ScanRestriction::Rows`].
     ///
     /// The row set arrives through the same leaf slot a scalar-index result would, so a scan
@@ -114,6 +119,7 @@ impl std::fmt::Debug for ScanSourceOptions {
             .field("index_expr_result_format", &self.index_expr_result_format)
             .field("use_scalar_index", &self.use_scalar_index)
             .field("fast_search", &self.fast_search)
+            .field("include_deleted_rows", &self.include_deleted_rows)
             .field("rows", &self.rows)
             .field("filter_plan", &self.filter_plan)
             .field("overlay_block", &self.overlay_block)
@@ -358,6 +364,7 @@ impl LanceScanSource {
                 scanner,
                 &filter_plan,
                 projection,
+                self.options.include_deleted_rows,
                 self.options.fragments.clone(),
                 scan_range,
             )
@@ -388,6 +395,9 @@ impl LanceScanSource {
         }
         if self.options.fast_search && filter_plan.has_index_query() {
             read_options = read_options.with_only_indexed_fragments();
+        }
+        if self.options.include_deleted_rows {
+            read_options = read_options.with_deleted_rows()?;
         }
         if let Some(limit) = limit
             && !filter_plan.has_any_filter()

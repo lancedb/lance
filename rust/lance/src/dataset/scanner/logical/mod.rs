@@ -81,8 +81,7 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use lance_core::ROW_OFFSET;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_datafusion::exec::get_session_context;
-use lance_file::version::ConcreteFileVersion;
+use lance_datafusion::exec::{StrictBatchSizeExec, get_session_context};
 
 use self::context::ScanPlanningContext;
 use crate::dataset::Scanner;
@@ -141,7 +140,23 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
     )])
     .create_physical_plan(&optimized, state.as_ref())
     .await?;
-    Ok(plan)
+
+    Ok(apply_strict_batch_size(scanner, plan))
+}
+
+/// Rechunk the finished plan's output to an exact batch size, if the caller asked for one.
+///
+/// Above every rule rather than inside the plan, because it is not a planning decision: the node
+/// delegates its `PlanProperties` to its input and only reshapes batches, so no rule has anything
+/// to say about it.
+fn apply_strict_batch_size(
+    scanner: &Scanner,
+    plan: Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
+    if !scanner.strict_batch_size {
+        return plan;
+    }
+    Arc::new(StrictBatchSizeExec::new(plan, scanner.get_batch_size()))
 }
 
 /// The query-independent half of planning state, built once and shared.
@@ -287,19 +302,22 @@ fn physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync
 /// this module, rejected here, or carries a comment saying why it cannot affect the plan.
 fn ensure_supported(scanner: &Scanner) -> Result<()> {
     let Scanner {
-        dataset,
+        dataset: _,
         projection_plan,
         materialization_style,
         is_batch_nearest,
         aggregate,
         include_deleted_rows,
-        strict_batch_size,
         index_segments,
+
+        // Applied to the finished plan by `create_plan`, above every rule: it only reshapes
+        // batches, so nothing in planning depends on it.
+        strict_batch_size: _,
 
         // Read by the builder, the source, the context, or the session config.
         prefilter: _,
         filter,
-        full_text_query: _,
+        full_text_query,
         batch_size: _,
         batch_readahead: _,
         fragment_readahead: _,
@@ -307,7 +325,7 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         limit: _,
         offset: _,
         ordering: _,
-        nearest: _,
+        nearest,
         use_scalar_index: _,
         fragments: _,
         fast_search: _,
@@ -325,8 +343,8 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         batch_size_bytes: _,
         relational_algebra_version: _,
 
-        // Read only by `legacy_filtered_read` and `scan_fragments`, which are the V1 path this
-        // function rejects below.
+        // Read only by `legacy_filtered_read` and `scan_fragments`, which the v1 leaf hands the
+        // whole scanner to.
         use_stats: _,
         ordered: _,
 
@@ -344,18 +362,18 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         ))
     };
 
-    if dataset.manifest().data_storage_format.lance_file_format() == ConcreteFileVersion::V1 {
-        // The legacy read path is a frozen compatibility surface; the spike targets current
-        // storage only.
-    }
     if *is_batch_nearest {
         return unsupported("batch vector search");
     }
     if aggregate.is_some() {
         return unsupported("aggregates");
     }
-    if *include_deleted_rows {
-        return unsupported("include_deleted_rows");
+    if *include_deleted_rows && (nearest.is_some() || full_text_query.is_some()) {
+        // The imperative path rejects these in `vector_search_source`/`fts_search_source` for the
+        // same reason: a search returns row ids, and a deleted row does not have one.
+        return Err(Error::invalid_input_source(
+            "Cannot include deleted rows in a search".into(),
+        ));
     }
     // Two ways to ask for `_rowoffset`, and only one of them is a projection: the imperative path
     // also accepts it in a predicate (`_rowoffset IN (5, 9)`), where it reaches the builder as a
@@ -371,9 +389,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
     };
     if projection_plan.must_add_row_offset || filters_on_row_offset {
         return unsupported("_rowoffset");
-    }
-    if *strict_batch_size {
-        return unsupported("strict_batch_size");
     }
     if index_segments.is_some() {
         return unsupported("index segment selection");

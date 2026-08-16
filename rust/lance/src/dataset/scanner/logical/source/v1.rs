@@ -52,6 +52,7 @@ pub async fn scan(
     scanner: &Scanner,
     filter_plan: &ExprFilterPlan,
     projection: Projection,
+    include_deleted_rows: bool,
     fragments: Option<Arc<Vec<Fragment>>>,
     scan_range: Option<Range<u64>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -73,9 +74,7 @@ pub async fn scan(
         scanner,
         filter_plan,
         read_projection,
-        // The logical path never asks the leaf for tombstones; `include_deleted_rows` is a
-        // whole-query option and the builder handles it above the leaf.
-        false,
+        include_deleted_rows,
         fragments,
         scan_range,
         // Prefilter-ness is operator ordering in this path, so the leaf has nothing to say about
