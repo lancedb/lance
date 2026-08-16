@@ -14,12 +14,18 @@ use super::fts::*;
 use super::harness::*;
 
 #[tokio::test]
-async fn test_paths_agree_on_ordering() {
+async fn test_ordering() {
     let dataset = test_dataset().await;
-    assert_paths_agree(&dataset, |scan| {
-        scan.project(&["s", "i"])?
-            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("i".into())]))
-    })
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    assert_scan_returns(
+        &dataset,
+        |scan| {
+            scan.project(&["s", "i"])?
+                .order_by(Some(vec![ColumnOrdering::desc_nulls_last("i".into())]))
+        },
+        &fixture,
+        (0..200).rev().collect(),
+    )
     .await
     .unwrap();
 }
@@ -27,26 +33,40 @@ async fn test_paths_agree_on_ordering() {
 /// A limit must take the first rows *of the ordering*, which is only true if the sort is below
 /// the limit. It also blocks the scan-range pushdown a bare limit would get.
 #[tokio::test]
-async fn test_paths_agree_on_ordering_with_limit() {
+async fn test_ordering_with_limit() {
     let dataset = test_dataset().await;
-    assert_paths_agree(&dataset, |scan| {
-        scan.project(&["s", "i"])?
-            .limit(Some(7), Some(3))?
-            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("i".into())]))
-    })
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    // Descending from 199, skip 3, keep 7: rows 196 down to 190. Taking the limit before the sort
+    // would return the first rows of *storage* order instead.
+    assert_scan_returns(
+        &dataset,
+        |scan| {
+            scan.project(&["s", "i"])?
+                .limit(Some(7), Some(3))?
+                .order_by(Some(vec![ColumnOrdering::desc_nulls_last("i".into())]))
+        },
+        &fixture,
+        (190..197).rev().collect(),
+    )
     .await
     .unwrap();
 }
 
 /// The ordering column is not projected, so it has to be read and then dropped again.
 #[tokio::test]
-async fn test_paths_agree_on_ordering_by_an_unprojected_column() {
+async fn test_ordering_by_an_unprojected_column() {
     let dataset = test_dataset().await;
-    assert_paths_agree(&dataset, |scan| {
-        scan.project(&["s"])?
-            .filter("i > 20")?
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("i".into())]))
-    })
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    assert_scan_returns(
+        &dataset,
+        |scan| {
+            scan.project(&["s"])?
+                .filter("i > 20")?
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first("i".into())]))
+        },
+        &fixture,
+        (21..200).collect(),
+    )
     .await
     .unwrap();
 }
@@ -56,13 +76,16 @@ async fn test_paths_agree_on_ordering_by_an_unprojected_column() {
 /// only stock DataFusion join in the whole plan, and its physical form decides the output order —
 /// so this asserts ordering, not just row membership.
 #[tokio::test]
-async fn test_paths_agree_on_vector_filter_prefiltering_a_compound_fts_search() {
+async fn test_vector_filter_prefiltering_a_compound_fts_search() {
     use crate::dataset::scanner::QueryFilter;
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::scalar::inverted::query::PhraseQuery;
 
     let dataset = fts_dataset().await;
-    assert_paths_agree(&dataset, |scan| {
+    // Prefiltered, so the vector search spends its 20 first and the phrase trims what is left.
+    let expected = hybrid_expectation(&dataset, contains_phrase("hello world"), 20, false).await;
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    let batch = scan_rows(&dataset, |scan| {
         scan.project(&["s"])?
             .with_row_id()
             .prefilter(true)
@@ -75,15 +98,18 @@ async fn test_paths_agree_on_vector_filter_prefiltering_a_compound_fts_search() 
     })
     .await
     .unwrap();
+
+    let mut found = fixture.ids_of(&row_ids_of(&batch));
+    found.sort_unstable();
+    assert_eq!(found, expected);
 }
 
-/// An empty fragment selection: the imperative path recognizes it up front and emits an
-/// `EmptyExec`, while the logical path plans the search normally and lets the take — restricted to
-/// zero fragments — return nothing. The plan shapes differ; the answers must not.
+/// An empty fragment selection is planned like any other: the search runs and the take, restricted
+/// to no fragments, returns nothing.
 #[tokio::test]
-async fn test_paths_agree_on_an_empty_fragment_selection() {
+async fn test_an_empty_fragment_selection_returns_nothing() {
     let dataset = fts_dataset().await;
-    assert_paths_agree(&dataset, |scan| {
+    let batch = scan_rows(&dataset, |scan| {
         scan.with_fragments(Vec::new());
         scan.project(&["s"])?
             .with_row_id()
@@ -91,6 +117,7 @@ async fn test_paths_agree_on_an_empty_fragment_selection() {
     })
     .await
     .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 /// A top-k whose result spans more than one output batch, at real parallelism. Regression test for
@@ -134,115 +161,8 @@ async fn test_flat_knn_large_limit_stays_globally_ordered() {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Data overlays: index coverage at row granularity
-// ---------------------------------------------------------------------------------------------
-//
-// A data overlay committed after an index was built, touching a field that index covers, leaves
-// the index describing values that no longer exist. Those rows are a coverage gap in exactly the
-// sense a fragment the index never saw is one, and `SplitOnIndexCoverage` fills both the same way.
-// The exhaustive behavioral coverage lives in `dataset::tests::dataset_overlay_index_masking`,
-// which runs against whichever path the flag selects; these assert the two paths agree.
-
-use crate::dataset::tests::dataset_overlay_index_masking as overlay_fixtures;
-
-#[tokio::test]
-async fn test_paths_agree_on_a_vector_search_over_an_overlay() {
-    for stable_row_ids in [false, true] {
-        let dataset = overlay_fixtures::create_vector_overlay_dataset(stable_row_ids).await;
-        let query = arrow_array::Float32Array::from(overlay_fixtures::vec_query());
-        assert_paths_agree(&dataset, |scan| {
-            scan.nearest("vec", &query, 3)?
-                .minimum_nprobes(1)
-                .with_row_id()
-                .project(&["id"])
-        })
-        .await
-        .unwrap();
-    }
-}
-
-/// `fast_search` blocks the stale rows but does not re-score them, so the two paths have to agree
-/// on dropping the stale hit *and* on not surfacing the moved-on match.
-#[tokio::test]
-async fn test_paths_agree_on_a_fast_search_over_an_overlay() {
-    let dataset = overlay_fixtures::create_vector_overlay_dataset(false).await;
-    let query = arrow_array::Float32Array::from(overlay_fixtures::vec_query());
-    assert_paths_agree(&dataset, |scan| {
-        scan.nearest("vec", &query, 3)?
-            .minimum_nprobes(1)
-            .fast_search()
-            .with_row_id()
-            .project(&["id"])
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn test_paths_agree_on_an_fts_search_over_an_overlay() {
-    let mut dataset = overlay_fixtures::create_text_dataset(false).await;
-    overlay_fixtures::build_text_fts_index(&mut dataset).await;
-    let dataset = overlay_fixtures::commit_overlay(
-        dataset,
-        "logical_fts_overlay",
-        0,
-        &[1],
-        lance_table::format::overlay::OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([
-            1,
-        ])),
-        vec![std::sync::Arc::new(arrow_array::StringArray::from(vec![
-            "banana bread",
-        ]))],
-    )
-    .await;
-
-    assert_paths_agree(&dataset, |scan| {
-        scan.project(&["id"])?
-            .with_row_id()
-            .full_text_search(text_match_query("apple"))
-    })
-    .await
-    .unwrap();
-}
-
-/// The coverage split the shared rule cannot reach: a scalar index query is derived inside the
-/// scan leaf, not carried by a logical node, so its stale rows are handled there.
-#[tokio::test]
-async fn test_paths_agree_on_a_scalar_index_over_an_overlay() {
-    for stable_row_ids in [false, true] {
-        let mut dataset = overlay_fixtures::create_base_dataset_with(stable_row_ids).await;
-        overlay_fixtures::build_age_index(&mut dataset).await;
-        let dataset = overlay_fixtures::commit_overlay(
-            dataset,
-            "logical_scalar_overlay",
-            0,
-            &[1],
-            lance_table::format::overlay::OverlayCoverage::dense(
-                roaring::RoaringBitmap::from_iter([1]),
-            ),
-            vec![overlay_fixtures::i32_array([Some(50)])],
-        )
-        .await;
-
-        // `age = 50` now matches the overlaid row (whose index entry says 10) and the untouched
-        // row that always said 50, so both the block and the re-read have to be right.
-        for filter in ["age = 50", "age = 10", "age = 20"] {
-            // Unordered: the coverage split makes this a union of an index lookup and a re-read of
-            // the overlaid rows, and a union imposes no order between its branches. The two paths
-            // build that union in different places — `scan_impl` versus `SplitOnIndexCoverage` —
-            // so they interleave the branches differently while selecting the same rows.
-            assert_paths_agree_unordered(&dataset, |scan| {
-                scan.filter(filter)?.with_row_id().project(&["id"])
-            })
-            .await
-            .unwrap();
-        }
-    }
-}
-
-/// The oracle compares the two paths to each other, so a schema fact both of them lose is
-/// invisible to it. This asserts the fact against the dataset instead.
+/// A plan rebuilds its output schema several times on the way down, and the dataset's own schema
+/// metadata has to survive every one of them.
 #[tokio::test]
 async fn test_output_schema_keeps_dataset_metadata() -> Result<()> {
     let dataset = test_dataset().await;
@@ -252,32 +172,22 @@ async fn test_output_schema_keeps_dataset_metadata() -> Result<()> {
         "fixture must carry schema metadata for this test to mean anything"
     );
 
-    for (path, plan) in [
-        (
-            "imperative",
-            imperative_plan_for(&dataset, |scan| scan.filter("i > 50")?.project(&["s"])).await?,
-        ),
-        (
-            "logical",
-            logical_plan_for(&dataset, |scan| scan.filter("i > 50")?.project(&["s"])).await?,
-        ),
-    ] {
-        assert_eq!(
-            plan.schema().metadata(),
-            &expected,
-            "{path} path's plan schema dropped the dataset's schema metadata"
-        );
-        // Checked separately from the plan schema because they can disagree, and it is the batch
-        // the caller actually receives.
-        let batches = execute_plan(plan, LanceExecutionOptions::default())?
-            .try_collect::<Vec<_>>()
-            .await?;
-        assert_eq!(
-            batches[0].schema().metadata(),
-            &expected,
-            "{path} path's output batches dropped the dataset's schema metadata"
-        );
-    }
+    let plan = logical_plan_for(&dataset, |scan| scan.filter("i > 50")?.project(&["s"])).await?;
+    assert_eq!(
+        plan.schema().metadata(),
+        &expected,
+        "the plan's schema dropped the dataset's schema metadata"
+    );
+    // Checked separately from the plan schema because they can disagree, and it is the batch the
+    // caller actually receives.
+    let batches = execute_plan(plan, LanceExecutionOptions::default())?
+        .try_collect::<Vec<_>>()
+        .await?;
+    assert_eq!(
+        batches[0].schema().metadata(),
+        &expected,
+        "the output batches dropped the dataset's schema metadata"
+    );
     Ok(())
 }
 

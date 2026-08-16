@@ -17,11 +17,12 @@ use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
 use lance_index::vector::DIST_COL;
 use lance_linalg::distance::DistanceType;
+use lance_table::format::IndexMetadata;
 
 use super::super::context::ScanPlanningContext;
 use super::super::fts::{FtsAccessPath, FtsLeafNode};
 use super::super::{LanceTakeNode, PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
-use super::super::{analyze_bottom_up, restricts_candidates};
+use super::super::{analyze_bottom_up, restricts_candidates, scalar_index_prefilter};
 use crate::io::exec::knn::QUERY_INDEX_COL;
 
 /// Decide whether each vector search uses its index or brute force.
@@ -138,8 +139,23 @@ impl AnalyzerRule for ResolveVectorAccessPath {
 /// It must run after `PushDownFilter`, so that the predicate has reached its final position, and
 /// after `ResolveVectorAccessPath`, since only an indexed search has a prefilter source at all —
 /// a brute-force search just scans the already-filtered child.
-#[derive(Debug, Default)]
-pub struct ResolvePrefilterSource;
+#[derive(Debug)]
+pub struct ResolvePrefilterSource {
+    context: Arc<ScanPlanningContext>,
+}
+
+impl ResolvePrefilterSource {
+    pub fn new(context: Arc<ScanPlanningContext>) -> Self {
+        Self { context }
+    }
+
+    /// The candidate source for a search whose index covers `segments`.
+    fn kind_for(&self, input: &LogicalPlan, segments: &[IndexMetadata]) -> PrefilterSourceKind {
+        let required = self.context.segment_coverage(segments);
+        scalar_index_prefilter(input, &required, &self.context)
+            .unwrap_or_else(|| prefilter_kind(input))
+    }
+}
 
 impl OptimizerRule for ResolvePrefilterSource {
     fn name(&self) -> &str {
@@ -159,14 +175,11 @@ impl OptimizerRule for ResolvePrefilterSource {
             return Ok(Transformed::no(plan));
         };
         if let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() {
-            if !matches!(
-                search.access_path_resolution(),
-                Some(VectorAccessPath::Index { .. })
-            ) {
+            let Some(VectorAccessPath::Index { segments }) = search.access_path_resolution() else {
                 return Ok(Transformed::no(plan));
-            }
-            let kind = prefilter_kind(search.input());
-            if kind == search.prefilter() {
+            };
+            let kind = self.kind_for(search.input(), segments);
+            if &kind == search.prefilter() {
                 return Ok(Transformed::no(plan));
             }
             return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
@@ -174,11 +187,11 @@ impl OptimizerRule for ResolvePrefilterSource {
             })));
         }
         if let Some(leaf) = extension.node.as_any().downcast_ref::<FtsLeafNode>() {
-            if !matches!(leaf.resolution(), Some(FtsAccessPath::Index { .. })) {
+            let Some(FtsAccessPath::Index { segments }) = leaf.resolution() else {
                 return Ok(Transformed::no(plan));
-            }
-            let kind = prefilter_kind(leaf.input());
-            if kind == leaf.prefilter() {
+            };
+            let kind = self.kind_for(leaf.input(), segments);
+            if &kind == leaf.prefilter() {
                 return Ok(Transformed::no(plan));
             }
             return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
@@ -336,7 +349,7 @@ impl ExpandBatchSearch {
         let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>() else {
             return Ok(Transformed::no(plan));
         };
-        if search.query_count() < 2
+        if search.batch_queries().is_none()
             || !matches!(
                 search.access_path_resolution(),
                 Some(VectorAccessPath::Index { .. })
@@ -363,7 +376,7 @@ impl ExpandBatchSearch {
 
         let mut branches = branches.into_iter();
         let mut unioned = LogicalPlanBuilder::new(branches.next().ok_or_else(|| {
-            DataFusionError::Internal("a batch search has at least two queries".into())
+            DataFusionError::Internal("a batch search has at least one query".into())
         })?);
         for branch in branches {
             unioned = unioned.union(branch)?;

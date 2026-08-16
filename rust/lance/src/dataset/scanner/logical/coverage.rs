@@ -315,12 +315,15 @@ impl SplittableSearch for VectorSearchNode {
             OverlayStaleness::None | OverlayStaleness::Unknown => None,
         };
 
-        let (Some(unindexed), Some(indexed)) = (
+        let (Some(mut unindexed), Some(indexed)) = (
             context.unindexed_fragments(column),
             context.indexed_fragments(column),
         ) else {
             return IndexCoverage::Complete;
         };
+        if !context.fills_vector_coverage_gaps() {
+            unindexed.clear();
+        }
         if indexed.is_empty() {
             return IndexCoverage::Unusable;
         }

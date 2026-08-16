@@ -18,9 +18,12 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_physical_expr::PhysicalSortExpr;
 
 use super::row_offset::{RowOffsetNode, plan_row_offset};
-use super::{LanceTakeNode, VectorRerankNode, VectorSearchNode};
+use super::{LanceTakeNode, PrefilterSourceKind, VectorRerankNode, VectorSearchNode};
 use super::{plan_flat_knn, plan_take, plan_vector_search};
 use crate::Result;
+use crate::dataset::Dataset;
+use crate::io::exec::PreFilterSource;
+use crate::io::exec::scalar_index::ScalarIndexExec;
 
 #[derive(Debug, Default)]
 pub struct LanceExtensionPlanner;
@@ -53,7 +56,7 @@ impl ExtensionPlanner for LanceExtensionPlanner {
             return Ok(Some(plan_flat_knn(
                 rerank.query(),
                 rerank.distance_type(),
-                1,
+                None,
                 input,
             )?));
         }
@@ -64,6 +67,29 @@ impl ExtensionPlanner for LanceExtensionPlanner {
             return Ok(Some(plan_row_offset(offsets, input)?));
         }
         Ok(None)
+    }
+}
+
+/// Lower a search's candidate restriction.
+///
+/// `input` is the child plan. It is only read for [`PrefilterSourceKind::ChildRowIds`]; the other
+/// two answer without it, and the child is planned but never executed.
+pub fn plan_prefilter_source(
+    kind: &PrefilterSourceKind,
+    dataset: &Arc<Dataset>,
+    input: Arc<dyn ExecutionPlan>,
+) -> PreFilterSource {
+    match kind {
+        PrefilterSourceKind::None => PreFilterSource::None,
+        PrefilterSourceKind::ChildRowIds => PreFilterSource::FilteredRowIds(input),
+        PrefilterSourceKind::ScalarIndexQuery {
+            query,
+            result_format,
+        } => PreFilterSource::ScalarIndexQuery(Arc::new(ScalarIndexExec::new(
+            dataset.clone(),
+            query.as_ref().clone(),
+            *result_format,
+        ))),
     }
 }
 

@@ -82,7 +82,7 @@ impl UserDefinedLogicalNodeCore for FtsCompoundScorerNode {
             self.params.limit
         )?;
         if self.prefilter != PrefilterSourceKind::None {
-            write!(f, ", prefilter={:?}", self.prefilter)?;
+            write!(f, ", prefilter={}", self.prefilter)?;
         }
         Ok(())
     }

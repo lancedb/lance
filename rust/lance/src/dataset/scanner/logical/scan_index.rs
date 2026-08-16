@@ -9,14 +9,16 @@ use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::{provider_as_source, source_as_provider};
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{Extension, Filter, LogicalPlan};
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use lance_select::mask::RowAddrTreeMap;
+use roaring::RoaringBitmap;
 
-use super::context::ScanPlanningContext;
+use super::context::{OverlayStaleness, ScanPlanningContext};
 use super::source::{LanceScanSource, ScanRestriction};
+use super::{PrefilterSourceKind, RowOffsetNode};
 use crate::dataset::scanner::TakeOperation;
 
 /// Derive each Lance scan's scalar index query and record it on the scan's source.
@@ -140,6 +142,62 @@ pub fn restrict_scan(
         .data)
 }
 
+/// The index lookup that can stand in for a search's whole prefilter subtree, if this one can.
+///
+/// A prefilter is normally a read that materializes the row ids the predicate selects. When the
+/// predicate is answered exactly by a scalar index, the lookup already *is* that row set, so the
+/// search can consume it directly and the read never happens. Mirrors the `ScalarIndexExec`
+/// branch of `Scanner::prefilter_source`.
+///
+/// `required_fragments` are the fragments the search itself can return a row from: a candidate
+/// set that cannot speak for one of them would silently drop rows the search would have found.
+pub fn scalar_index_prefilter(
+    input: &LogicalPlan,
+    required_fragments: &RoaringBitmap,
+    context: &ScanPlanningContext,
+) -> Option<PrefilterSourceKind> {
+    with_lance_source(input, |source| {
+        let options = source.options();
+        // The lookup reads the whole dataset, so a narrowing of the scan it replaces is lost with
+        // the scan. Which narrowings matter differs:
+        //
+        // * A caller's `with_fragments` is enforced by this read and nothing else, so dropping it
+        //   would let rows from other fragments through.
+        // * A row restriction singles out rows whose index entries are not to be trusted, which is
+        //   the opposite of what a lookup would answer.
+        // * A restriction a coverage split added is neither: it narrows the read to what this
+        //   branch is responsible for, and the branch's index can only emit rows from there
+        //   anyway, so a wider allow list adds nothing.
+        if context.take_settings().fragments.is_some()
+            || options.rows.is_some()
+            || options.overlay_block.is_some()
+        {
+            return None;
+        }
+        let filter_plan = source.filter_plan()?;
+        if !filter_plan.is_exact_index_search() {
+            return None;
+        }
+        let query = filter_plan.index_query.clone()?;
+        // Stale entries would reach the search as candidates whose indexed values no longer hold.
+        // The read this replaces is what masks them out, so keep it.
+        if !matches!(
+            context.index_query_staleness(&query),
+            OverlayStaleness::None
+        ) {
+            return None;
+        }
+        let covered = context.index_query_coverage(&query)?;
+        if !context.fast_search() && !required_fragments.is_subset(&covered) {
+            return None;
+        }
+        Some(PrefilterSourceKind::ScalarIndexQuery {
+            query: Arc::new(query),
+            result_format: options.index_expr_result_format,
+        })
+    })?
+}
+
 pub fn restricts_candidates(plan: &LogicalPlan) -> bool {
     let mut restricts = false;
     let _ = plan.apply(|node| {
@@ -195,6 +253,38 @@ impl OptimizerRule for ResolveTake {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        match &plan {
+            LogicalPlan::TableScan(_) => self.restrict_scan(plan),
+            // A `_rowoffset` predicate never reaches the scan: the column is computed by the node
+            // above it, and `PushDownFilter` does not push through an extension. Matching that pair
+            // is what lets those predicates become takes too.
+            LogicalPlan::Filter(_) => self.restrict_below_row_offsets(plan),
+            _ => Ok(Transformed::no(plan)),
+        }
+    }
+}
+
+impl ResolveTake {
+    /// The row ids a take selects, or `None` when the plan cannot be rewritten.
+    ///
+    /// Only row ids are resolved here. `_rowaddr` and `_rowoffset` name physical positions, and
+    /// translating those reads row-id sequences and deletion vectors, so stage 2 did it and this
+    /// looks the answer up. A miss means stage 2 walked a different plan than this one, so the
+    /// predicate is left alone rather than guessed at: reading every row and filtering is slower,
+    /// not wrong.
+    fn rows_for(&self, take: &TakeOperation) -> Option<Arc<RowAddrTreeMap>> {
+        match take {
+            TakeOperation::RowIds(ids) => {
+                Some(Arc::new(RowAddrTreeMap::from_iter(ids.iter().copied())))
+            }
+            _ => self.context.take_rows(take).cloned(),
+        }
+    }
+
+    fn restrict_scan(
+        &self,
+        plan: LogicalPlan,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
         let LogicalPlan::TableScan(scan) = &plan else {
             return Ok(Transformed::no(plan));
         };
@@ -208,14 +298,8 @@ impl OptimizerRule for ResolveTake {
         let Some((take, remainder)) = TakeOperation::try_from_expr(&predicate) else {
             return Ok(Transformed::no(plan));
         };
-        let rows = match &take {
-            TakeOperation::RowIds(ids) => Arc::new(RowAddrTreeMap::from_iter(ids.iter().copied())),
-            _ => match self.context.take_rows(&take) {
-                Some(rows) => rows.clone(),
-                // Stage 2 walked a different plan than this one, so leave the predicate alone
-                // rather than guess: reading every row and filtering is slower, not wrong.
-                None => return Ok(Transformed::no(plan)),
-            },
+        let Some(rows) = self.rows_for(&take) else {
+            return Ok(Transformed::no(plan));
         };
         let mut scan = scan.clone();
         scan.filters = remainder.into_iter().collect();
@@ -223,5 +307,51 @@ impl OptimizerRule for ResolveTake {
         Ok(Transformed::yes(map_lance_scan(&restricted, |source| {
             source.restricted_to(&ScanRestriction::Rows(rows.clone()))
         })?))
+    }
+
+    /// [`Self::restrict_scan`] for a predicate stranded above a [`RowOffsetNode`].
+    fn restrict_below_row_offsets(
+        &self,
+        plan: LogicalPlan,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Filter(filter) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let LogicalPlan::Extension(offsets) = filter.input.as_ref() else {
+            return Ok(Transformed::no(plan));
+        };
+        if offsets
+            .node
+            .as_any()
+            .downcast_ref::<RowOffsetNode>()
+            .is_none()
+        {
+            return Ok(Transformed::no(plan));
+        }
+        let [scan] = offsets.node.inputs()[..] else {
+            return Ok(Transformed::no(plan));
+        };
+        let restrictable = with_lance_source(scan, |source| source.options().rows.is_none());
+        if restrictable != Some(true) {
+            return Ok(Transformed::no(plan));
+        }
+        let Some((take, remainder)) = TakeOperation::try_from_expr(&filter.predicate) else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some(rows) = self.rows_for(&take) else {
+            return Ok(Transformed::no(plan));
+        };
+        let restricted = map_lance_scan(scan, |source| {
+            source.restricted_to(&ScanRestriction::Rows(rows.clone()))
+        })?;
+        let offsets = LogicalPlan::Extension(Extension {
+            node: offsets
+                .node
+                .with_exprs_and_inputs(vec![], vec![restricted])?,
+        });
+        Ok(Transformed::yes(match remainder {
+            Some(remainder) => LogicalPlan::Filter(Filter::try_new(remainder, Arc::new(offsets))?),
+            None => offsets,
+        }))
     }
 }

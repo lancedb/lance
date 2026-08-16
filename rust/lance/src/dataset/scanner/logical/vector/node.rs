@@ -12,10 +12,13 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::common::plan_err;
 use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::logical_expr::{Expr, InvariantLevel, LogicalPlan, UserDefinedLogicalNodeCore};
+use lance_core::datatypes::parse_field_path;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::vector::{ApproxMode, DIST_COL, Query};
 use lance_linalg::distance::DistanceType;
 use lance_select::mask::RowAddrTreeMap;
+use lance_select::result::IndexExprResultWireFormat;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -118,13 +121,65 @@ impl PartialOrd for VectorAccessPath {
 /// This is the lowering artifact of a *prefilter*: a predicate positioned below the search.
 /// Nothing about it is visible in the logical result — a postfilter puts the same predicate
 /// above the search instead, and never produces one of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum PrefilterSourceKind {
     /// Nothing below the search restricts the candidates.
     #[default]
     None,
     /// The child's row ids are the candidate set.
     ChildRowIds,
+    /// A scalar index answers the predicate outright, so the candidates come from the index
+    /// lookup and the child plan is never read.
+    ///
+    /// Only correct when the lookup is exact and covers every fragment the search can return a
+    /// row from; [`ResolvePrefilterSource`](ResolvePrefilterSource) is where those conditions are
+    /// checked.
+    ScalarIndexQuery {
+        query: Arc<ScalarIndexExpr>,
+        result_format: IndexExprResultWireFormat,
+    },
+}
+
+impl PrefilterSourceKind {
+    /// Which of the three it is. `ScalarIndexExpr` is neither `Eq` nor `Hash`, and it is derived
+    /// from the child plan, so two otherwise-equal nodes cannot disagree about it.
+    fn identity(&self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::ChildRowIds => 1,
+            Self::ScalarIndexQuery { .. } => 2,
+        }
+    }
+}
+
+impl PartialEq for PrefilterSourceKind {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for PrefilterSourceKind {}
+
+impl Hash for PrefilterSourceKind {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
+    }
+}
+
+impl PartialOrd for PrefilterSourceKind {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.identity().partial_cmp(&other.identity())
+    }
+}
+
+impl fmt::Display for PrefilterSourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::ChildRowIds => write!(f, "ChildRowIds"),
+            Self::ScalarIndexQuery { .. } => write!(f, "ScalarIndexQuery"),
+        }
+    }
 }
 
 /// Nearest-neighbor search over the input's rows.
@@ -146,11 +201,13 @@ pub struct VectorSearchNode {
     /// Resolved up front from the column's element type when the caller did not name one.
     /// Leaving it unresolved would force lowering to reach for the dataset schema again.
     distance_type: DistanceType,
-    /// How many query vectors `query.key` holds end to end.
+    /// How many query vectors `query.key` holds end to end, when the caller sent a batch.
     ///
-    /// More than one is a batch search: every query is answered against the same rows, and the
-    /// output gains a `_query_index` discriminator saying which query a row answers.
-    query_count: usize,
+    /// `None` is an ordinary single-vector search. `Some(n)` is a batch search: every query is
+    /// answered against the same rows, and the output gains a `query_index` discriminator saying
+    /// which query a row answers. `Some(1)` is a batch of one — still batch-shaped, because that
+    /// is the output the caller asked for.
+    batch_queries: Option<usize>,
     /// Whether `distance_type` is what the caller asked for, or a default stood in for them.
     ///
     /// The difference decides what a metric mismatch means. A caller who named a metric and got an
@@ -182,14 +239,14 @@ impl VectorSearchNode {
         // Write the resolution back so the `Query` handed to the physical nodes is complete.
         // Leaving it `None` there makes them report `metric=default` in `EXPLAIN`.
         query.metric_type = Some(distance_type);
-        let schema = Self::output_schema(1)?;
+        let schema = Self::output_schema(None)?;
         Ok(Self {
             input,
             dataset,
             query,
             accuracy,
             distance_type,
-            query_count: 1,
+            batch_queries: None,
             distance_type_requested,
             resolution: None,
             prefilter: PrefilterSourceKind::default(),
@@ -199,9 +256,9 @@ impl VectorSearchNode {
     }
 
     /// The `[_rowid, _distance]` contract, plus the batch discriminator when there is one.
-    fn output_schema(query_count: usize) -> Result<DFSchemaRef> {
+    fn output_schema(batch_queries: Option<usize>) -> Result<DFSchemaRef> {
         let mut fields = Vec::with_capacity(3);
-        if query_count > 1 {
+        if batch_queries.is_some() {
             fields.push(query_index_field());
         }
         fields.push(ROW_ID_FIELD.clone());
@@ -209,27 +266,34 @@ impl VectorSearchNode {
         Ok(Arc::new(DFSchema::try_from(ArrowSchema::new(fields))?))
     }
 
-    /// Answer `count` query vectors at once, reading them end to end out of `query.key`.
-    pub fn with_query_count(mut self, count: usize) -> Result<Self> {
-        self.schema = Self::output_schema(count)?;
-        self.query_count = count;
+    /// Answer `count` query vectors at once, reading them end to end out of `query.key`, and emit
+    /// batch-shaped output.
+    pub fn with_batch_queries(mut self, count: usize) -> Result<Self> {
+        self.schema = Self::output_schema(Some(count))?;
+        self.batch_queries = Some(count);
         Ok(self)
     }
 
+    /// `Some(n)` when this is a batch of `n` query vectors, `None` for a single-vector search.
+    pub fn batch_queries(&self) -> Option<usize> {
+        self.batch_queries
+    }
+
+    /// How many query vectors `query.key` holds — one, unless this is a batch.
     pub fn query_count(&self) -> usize {
-        self.query_count
+        self.batch_queries.unwrap_or(1)
     }
 
     /// The `i`th query vector's own single-query search, for a rewrite that answers them one at a
     /// time. The input is shared: every query searches the same rows.
     pub fn single_query(&self, index: usize) -> Result<Self> {
-        let dim = self.query.key.len() / self.query_count;
+        let dim = self.query.key.len() / self.query_count();
         let mut query = self.query.clone();
         query.key = self.query.key.slice(index * dim, dim);
         Ok(Self {
             query,
-            query_count: 1,
-            schema: Self::output_schema(1)?,
+            batch_queries: None,
+            schema: Self::output_schema(None)?,
             ..self.clone()
         })
     }
@@ -257,8 +321,8 @@ impl VectorSearchNode {
         self
     }
 
-    pub fn prefilter(&self) -> PrefilterSourceKind {
-        self.prefilter
+    pub fn prefilter(&self) -> &PrefilterSourceKind {
+        &self.prefilter
     }
 
     pub fn with_overlay_block(mut self, block: Option<Arc<RowAddrTreeMap>>) -> Self {
@@ -308,7 +372,7 @@ impl PartialEq for VectorSearchNode {
             && self.query.column == other.query.column
             && self.query.k == other.query.k
             && self.accuracy == other.accuracy
-            && self.query_count == other.query_count
+            && self.batch_queries == other.batch_queries
             && self.resolution == other.resolution
             && self.prefilter == other.prefilter
             && self.overlay_block == other.overlay_block
@@ -323,7 +387,7 @@ impl Hash for VectorSearchNode {
         self.query.column.hash(state);
         self.query.k.hash(state);
         self.accuracy.hash(state);
-        self.query_count.hash(state);
+        self.batch_queries.hash(state);
         self.resolution.hash(state);
         self.prefilter.hash(state);
         // `RowAddrTreeMap` is not `Hash`, and the flag is the part that distinguishes plans: two
@@ -382,8 +446,8 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             "VectorSearch: column={}, k={}, metric={}, accuracy={:?}",
             self.query.column, self.query.k, self.distance_type, self.accuracy
         )?;
-        if self.query_count > 1 {
-            write!(f, ", queries={}", self.query_count)?;
+        if let Some(count) = self.batch_queries {
+            write!(f, ", queries={}", count)?;
         }
         match &self.resolution {
             Some(VectorAccessPath::Flat) => write!(f, ", via=flat")?,
@@ -393,7 +457,7 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             None => {}
         }
         if self.prefilter != PrefilterSourceKind::None {
-            write!(f, ", prefilter={:?}", self.prefilter)?;
+            write!(f, ", prefilter={}", self.prefilter)?;
         }
         if self.overlay_block.is_some() {
             write!(f, ", overlay_block")?;
@@ -423,10 +487,10 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             query: self.query.clone(),
             accuracy: self.accuracy.clone(),
             distance_type: self.distance_type,
-            query_count: self.query_count,
+            batch_queries: self.batch_queries,
             distance_type_requested: self.distance_type_requested,
             resolution: self.resolution.clone(),
-            prefilter: self.prefilter,
+            prefilter: self.prefilter.clone(),
             overlay_block: self.overlay_block.clone(),
             schema: self.schema.clone(),
         })
@@ -438,6 +502,12 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
     /// child, while a brute-force search has to read the vectors itself.
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         let reads_vectors = !matches!(self.resolution, Some(VectorAccessPath::Index { .. }));
+        // The child's schema holds top-level columns, so a nested vector column like
+        // `payload.vec` has to be asked for by its root or the child reads nothing.
+        let vector_root = parse_field_path(&self.query.column)
+            .ok()
+            .and_then(|parts| parts.first().cloned())
+            .unwrap_or_else(|| self.query.column.clone());
         let needed = self
             .input
             .schema()
@@ -445,7 +515,7 @@ impl UserDefinedLogicalNodeCore for VectorSearchNode {
             .iter()
             .enumerate()
             .filter(|(_, field)| {
-                field.name() == ROW_ID || (reads_vectors && field.name() == &self.query.column)
+                field.name() == ROW_ID || (reads_vectors && field.name() == &vector_root)
             })
             .map(|(idx, _)| idx)
             .collect();

@@ -28,6 +28,7 @@ pub fn build_source(
     query: &FullTextSearchQuery,
     limit: Option<usize>,
 ) -> Result<LogicalPlan> {
+    validate_query_contract(&query.query)?;
     let mut params = query.params();
     if params.limit.is_none() {
         params = params.with_limit(limit);
@@ -110,6 +111,55 @@ fn build_query(
                 },
                 granularity,
             )?))
+        }
+    }
+}
+
+/// Reject queries whose scoring parameters have no meaning, before anything plans them.
+///
+/// A boost is a multiplier on a BM25 score, so a negative or non-finite one produces a ranking that
+/// no downstream node can make sense of. Checking here rather than at execution keeps the error at
+/// the API boundary, where the caller can still see which query it came from.
+fn validate_query_contract(query: &FtsQuery) -> Result<()> {
+    fn validate_multiplier(name: &str, value: f32) -> Result<()> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(())
+        } else {
+            Err(Error::invalid_input(format!(
+                "{name} must be finite and non-negative, got {value}"
+            )))
+        }
+    }
+
+    match query {
+        FtsQuery::Match(query) => validate_multiplier("MatchQuery boost", query.boost),
+        FtsQuery::Phrase(_) => Ok(()),
+        FtsQuery::Boost(query) => {
+            validate_multiplier("BoostQuery negative_boost", query.negative_boost)?;
+            validate_query_contract(&query.positive)?;
+            validate_query_contract(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &query.match_queries {
+                validate_multiplier("MultiMatchQuery boost", match_query.boost)?;
+            }
+            Ok(())
+        }
+        FtsQuery::Boolean(query) => {
+            if query.should.is_empty() && query.must.is_empty() {
+                return Err(Error::invalid_input(
+                    "boolean query must have at least one should/must query",
+                ));
+            }
+            for child in query
+                .should
+                .iter()
+                .chain(&query.must)
+                .chain(&query.must_not)
+            {
+                validate_query_contract(child)?;
+            }
+            Ok(())
         }
     }
 }
@@ -287,4 +337,33 @@ pub fn dedupe_rows(input: LogicalPlan) -> Result<LogicalPlan> {
     Ok(LogicalPlanBuilder::new(input)
         .aggregate(vec![datafusion::prelude::col(ROW_ID)], Vec::<Expr>::new())?
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use lance_index::scalar::inverted::query::{BooleanQuery, BoostQuery, MatchQuery, Occur};
+
+    use super::*;
+
+    #[test]
+    fn test_fts_query_contract_rejects_invalid_values() {
+        let negative_match = FtsQuery::Match(MatchQuery::new("hello".to_string()).with_boost(-1.0));
+        let error = validate_query_contract(&negative_match).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("finite and non-negative"));
+
+        let empty_boolean = FtsQuery::Boolean(BooleanQuery::new(Vec::<(Occur, FtsQuery)>::new()));
+        let error = validate_query_contract(&empty_boolean).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("at least one should/must query"));
+
+        let infinite_boost = FtsQuery::Boost(BoostQuery::new(
+            MatchQuery::new("hello".to_string()).into(),
+            MatchQuery::new("world".to_string()).into(),
+            Some(f32::INFINITY),
+        ));
+        let error = validate_query_contract(&infinite_boost).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("BoostQuery negative_boost"));
+    }
 }

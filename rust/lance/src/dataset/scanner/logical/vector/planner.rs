@@ -19,7 +19,7 @@ use lance_select::mask::RowAddrMask;
 
 use lance_table::format::IndexMetadata;
 
-use super::super::{PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
+use super::super::{VectorAccessPath, VectorSearchNode};
 use crate::Result;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 
@@ -28,7 +28,7 @@ use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::io::exec::knn::{KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL, new_knn_exec};
 use crate::io::exec::{KNNVectorDistanceExec, LanceFilterExec, PreFilterSource};
 
-use super::super::planner::sort_asc;
+use super::super::planner::{plan_prefilter_source, sort_asc};
 
 /// Lower a vector search along whichever access path the rules chose.
 ///
@@ -42,12 +42,9 @@ pub fn plan_vector_search(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let searched = match node.access_path_resolution() {
         Some(VectorAccessPath::Index { segments }) => {
-            let prefilter = match node.prefilter() {
-                PrefilterSourceKind::None => PreFilterSource::None,
-                // The child is already a `_rowid`-only read carrying the predicate — see
-                // `VectorSearchNode::necessary_children_exprs`.
-                PrefilterSourceKind::ChildRowIds => PreFilterSource::FilteredRowIds(input),
-            };
+            // The child is already a `_rowid`-only read carrying the predicate — see
+            // `VectorSearchNode::necessary_children_exprs`.
+            let prefilter = plan_prefilter_source(node.prefilter(), node.dataset(), input);
             plan_indexed_search(node, segments, prefilter)?
         }
         // An unresolved node means the rule did not run; brute force is the answer that is
@@ -55,7 +52,7 @@ pub fn plan_vector_search(
         Some(VectorAccessPath::Flat) | None => plan_flat_knn(
             node.query(),
             node.distance_type(),
-            node.query_count(),
+            node.batch_queries(),
             input,
         )?,
     };
@@ -147,12 +144,12 @@ fn plan_multivector_fanout(
 pub fn plan_flat_knn(
     query: &lance_index::vector::Query,
     distance_type: DistanceType,
-    query_count: usize,
+    batch_queries: Option<usize>,
     input: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     // A batch scores every query vector in one pass over the rows, so it has to see all of them:
     // its top-`k` per query cannot be assembled from independent per-partition top-`k`s.
-    let is_batch = query_count > 1;
+    let is_batch = batch_queries.is_some();
     let input = match is_batch {
         true => Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>,
         false => input,
@@ -163,7 +160,7 @@ pub fn plan_flat_knn(
         query.key.clone(),
         KnnBatchParams {
             is_batch,
-            query_count,
+            query_count: batch_queries.unwrap_or(1),
             k: query.k,
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,

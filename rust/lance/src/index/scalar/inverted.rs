@@ -914,6 +914,10 @@ pub async fn load_segments(
 /// Returns `None` when no FTS index is available or when any physical segment
 /// has unknown coverage. In either case, callers must not use the result for
 /// pruning.
+///
+/// Planning reads coverage from `ScanPlanningContext` instead, which already holds the segments;
+/// this remains as the independent computation tests check that against.
+#[cfg(test)]
 pub(crate) async fn fts_index_fragment_bitmap(
     dataset: &Dataset,
     column: &str,

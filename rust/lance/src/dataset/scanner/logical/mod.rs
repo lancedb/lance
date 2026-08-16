@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! **Spike.** A logical-plan read path for the scanner.
+//! The read path: a query becomes a DataFusion [`LogicalPlan`], a curated rule set rewrites it,
+//! and an `ExtensionPlanner` lowers it.
 //!
-//! [`Scanner::create_plan`](crate::dataset::Scanner::create_plan) builds physical plans directly.
-//! This module is a prototype of the alternative: assemble the query as a DataFusion
-//! [`LogicalPlan`], run a curated rule set over it, and lower it with an `ExtensionPlanner`.
+//! [`Scanner::create_plan`](crate::dataset::Scanner::create_plan) is a thin wrapper over
+//! [`create_plan`] here.
 //!
 //! Planning is staged so that the parts which must be synchronous can be:
 //!
@@ -18,8 +18,6 @@
 //!    I/O to obtain. Rewrites that must happen for the plan to be *correct* are `AnalyzerRule`s;
 //!    only rewrites that are optional are `OptimizerRule`s.
 //! 4. **Optimize and lower**, analyzer then logical rules then physical.
-//!
-//! This path is off by default. See [`is_enabled`].
 //!
 //! # The pipeline
 //!
@@ -143,16 +141,8 @@ use lance_datafusion::exec::{StrictBatchSizeExec, get_session_context};
 
 use self::context::ScanPlanningContext;
 use crate::dataset::Scanner;
-use crate::io::exec::get_physical_optimizer;
+use crate::io::exec::{SimplifyProjection, get_physical_optimizer};
 use crate::{Error, Result};
-
-/// Environment switch for the prototype path. Off unless explicitly set to `1`.
-///
-/// An env var (rather than a `Scanner` field) keeps the spike from touching the public builder
-/// API; where the switch belongs long-term is an open question.
-pub fn is_enabled() -> bool {
-    std::env::var("LANCE_LOGICAL_SCAN_PLANNER").is_ok_and(|value| value == "1")
-}
 
 /// Plan a scan through the logical path.
 ///
@@ -344,7 +334,7 @@ fn optimizer_rules(
         Arc::new(PushDownLimit::new()),
         // Whether a predicate sits below the search is what makes it a prefilter, and pushdown is
         // what moves it there.
-        Arc::new(ResolvePrefilterSource),
+        Arc::new(ResolvePrefilterSource::new(context.clone())),
         Arc::new(OptimizeProjections::new()),
     ]);
     rules
@@ -370,6 +360,9 @@ fn physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync
         vec![Arc::new(JoinSelection::new())];
     rules.extend(get_physical_optimizer().rules);
     rules.push(Arc::new(EnforceSorting::new()));
+    // Again, because dropping the restatement leaves the projections it separated adjacent: the
+    // search's own output-order fixup and the one the user's projection asked for.
+    rules.push(Arc::new(SimplifyProjection));
     rules
 }
 
@@ -453,15 +446,23 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
             "Cannot include deleted rows in a search".into(),
         ));
     }
-    if projection_plan.has_output_cols() && projection_plan.physical_projection.is_empty() {
+    if nearest.is_none()
+        && full_text_query.is_none()
+        && projection_plan.has_output_cols()
+        && projection_plan.physical_projection.is_empty()
+    {
         // `SELECT 1 AS foo` — output columns that read nothing. Not a gap: the imperative path
         // rejects this too (`scanner.rs:2846`), and for the same reason, so this states the same
         // refusal rather than deferring it. Without the guard, the leaf's "reading nothing is not a
-        // thing the reader can do" branch would quietly return row addresses instead.
+        // thing the reader can do" branch would quietly return row addresses instead. A search is
+        // exempt because it generates columns of its own, so `_distance` alone is a real query.
+        //
+        // Resolving the output against an empty schema first is what distinguishes the two ways to
+        // land here: `SELECT 1` is unsupported, while `SELECT does_not_exist` is a missing column.
+        let output_expr = scanner.calculate_final_projection(&arrow_schema::Schema::empty())?;
         return Err(Error::not_supported_source(
             format!(
-                "Scans must request at least one column.  Received only dynamic expressions: {:?}",
-                projection_plan.requested_output_expr
+                "Scans must request at least one column.  Received only dynamic expressions: {output_expr:?}"
             )
             .into(),
         ));

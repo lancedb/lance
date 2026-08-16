@@ -22,10 +22,9 @@ use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_select::mask::RowAddrMask;
 use lance_table::format::Fragment;
 
-use super::super::PrefilterSourceKind;
+use super::super::planner::plan_prefilter_source;
 use super::*;
 use crate::dataset::{Dataset, Scanner};
-use crate::io::exec::PreFilterSource;
 use crate::io::exec::fts::{
     BoolSlot, BooleanQueryExec, BoostQueryExec, CompoundQueryExec, FlatMatchFilterExec,
     FlatMatchQueryExec, FtsDocumentExec, MatchQueryExec, PhraseQueryExec,
@@ -57,17 +56,10 @@ pub fn plan_extension(
     None
 }
 
-fn prefilter_source(kind: PrefilterSourceKind, input: Arc<dyn ExecutionPlan>) -> PreFilterSource {
-    match kind {
-        PrefilterSourceKind::None => PreFilterSource::None,
-        PrefilterSourceKind::ChildRowIds => PreFilterSource::FilteredRowIds(input),
-    }
-}
-
 fn plan_leaf(node: &FtsLeafNode, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
     match &node.resolution {
         Some(FtsAccessPath::Index { segments }) => {
-            let prefilter = prefilter_source(node.prefilter, input);
+            let prefilter = plan_prefilter_source(&node.prefilter, &node.dataset, input);
             let block = node
                 .overlay_block
                 .as_ref()
@@ -85,6 +77,9 @@ fn plan_leaf(node: &FtsLeafNode, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dy
                     if let Some(block) = block {
                         exec = exec.with_overlay_block(block);
                     }
+                    if let Some(scorer) = &node.shared_scorer {
+                        exec = exec.with_shared_scorer(scorer.clone());
+                    }
                     Arc::new(exec)
                 }
                 FtsQuery::Phrase(query) => {
@@ -98,6 +93,9 @@ fn plan_leaf(node: &FtsLeafNode, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dy
                     );
                     if let Some(block) = block {
                         exec = exec.with_overlay_block(block);
+                    }
+                    if let Some(scorer) = &node.shared_scorer {
+                        exec = exec.with_shared_scorer(scorer.clone());
                     }
                     Arc::new(exec)
                 }
@@ -149,14 +147,19 @@ fn plan_flat_leaf(
         ensure_column_alias(input, &node.dataset, &document_column)?
     };
 
-    let scored = Arc::new(FlatMatchQueryExec::new_with_document_granularity(
+    let mut flat = FlatMatchQueryExec::new_with_document_granularity(
         node.dataset.clone(),
         query,
         params,
         input,
         node.granularity,
         document_column,
-    )) as Arc<dyn ExecutionPlan>;
+    );
+    // The flat branch is the producer: it is the one that can see both halves of the corpus.
+    if let Some(scorer) = &node.shared_scorer {
+        flat = flat.with_shared_scorer(scorer.clone());
+    }
+    let scored = Arc::new(flat) as Arc<dyn ExecutionPlan>;
 
     // `combine_fts_leaf_plans` sorts a flat-only leaf when the search is bounded; the index path
     // gets its top-k from the posting lists instead.
@@ -287,7 +290,7 @@ fn plan_compound_scorer(
         node.dataset.clone(),
         node.query.clone(),
         node.params.clone(),
-        prefilter_source(node.prefilter, input),
+        plan_prefilter_source(&node.prefilter, &node.dataset, input),
         node.segments.clone(),
     )))
 }

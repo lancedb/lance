@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Benchmarks comparing the imperative scan planner against the logical-plan prototype.
+//! Benchmarks for the scan planner, over a spread of query shapes.
 //!
-//! Both paths are called directly rather than through `LANCE_LOGICAL_SCAN_PLANNER`, so the two
-//! appear in one process and criterion can put them side by side.
+//! Three groups, because planning and execution cost move independently:
 //!
-//! Three questions, which is why there are three groups:
-//!
-//! * `plan/` — is going through a logical plan, a rule loop and a physical planner more expensive
-//!   than hand-building the exec tree? This is the cost the prototype adds, measured alone.
-//! * `scan/` and `search/` — does the resulting plan execute at the same speed? Planning is a
-//!   fixed cost per query; execution is what a real workload pays.
+//! * `plan/` — building the logical plan, running the rules and lowering to exec nodes, measured
+//!   on its own. A fixed cost every query pays before it reads a row.
+//! * `scan/` and `search/` — executing the resulting plan, split by whether the shape's cost is
+//!   dominated by reading rows or by the index search.
 //!
 //! ```text
 //! cargo bench -p lance --bench logical_scan_planner
@@ -25,7 +22,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::WriteParams;
-use lance::dataset::scanner::{Scanner, logical};
+use lance::dataset::scanner::Scanner;
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_core::utils::tempfile::TempStrDir;
@@ -151,19 +148,12 @@ fn is_search(shape: &str) -> bool {
     shape.starts_with("ann")
 }
 
-async fn plan(
-    scanner: &Scanner,
-    use_logical: bool,
-) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
-    if use_logical {
-        logical::create_plan(scanner).await.unwrap()
-    } else {
-        scanner.create_plan().await.unwrap()
-    }
+async fn plan(scanner: &Scanner) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    scanner.create_plan().await.unwrap()
 }
 
-async fn plan_and_execute(scanner: &Scanner, use_logical: bool) -> usize {
-    let plan = plan(scanner, use_logical).await;
+async fn plan_and_execute(scanner: &Scanner) -> usize {
+    let plan = plan(scanner).await;
     execute_plan(plan, LanceExecutionOptions::default())
         .unwrap()
         .try_fold(0, |rows, batch| async move { Ok(rows + batch.num_rows()) })
@@ -179,16 +169,12 @@ fn bench_planning(c: &mut Criterion) {
     let mut group = c.benchmark_group("plan");
     for (shape, configure) in shapes() {
         let scanner = configure(dataset);
-        // Plan once per path before measuring: both read index metadata on their first call and
-        // cache it on the dataset, and that one-time cost would otherwise land in whichever path
-        // criterion warmed up first.
-        for use_logical in [false, true] {
-            rt.block_on(plan(&scanner, use_logical));
-            let path = if use_logical { "logical" } else { "imperative" };
-            group.bench_function(BenchmarkId::new(path, shape), |b| {
-                b.iter(|| rt.block_on(plan(&scanner, use_logical)))
-            });
-        }
+        // Plan once before measuring: the first call reads index metadata and caches it on the
+        // dataset, and that one-time cost would otherwise land in whichever shape ran first.
+        rt.block_on(plan(&scanner));
+        group.bench_function(BenchmarkId::new("plan", shape), |b| {
+            b.iter(|| rt.block_on(plan(&scanner)))
+        });
     }
     group.finish();
 }
@@ -205,16 +191,12 @@ fn bench_execution(c: &mut Criterion) {
                 continue;
             }
             let scanner = configure(dataset);
-            for use_logical in [false, true] {
-                let path = if use_logical { "logical" } else { "imperative" };
-                // Assert the two paths agree on row count before timing them. A path that returns
-                // fewer rows would otherwise look like a speedup.
-                let rows = rt.block_on(plan_and_execute(&scanner, use_logical));
-                assert!(rows > 0, "{path}/{shape} returned no rows");
-                group.bench_function(BenchmarkId::new(path, shape), |b| {
-                    b.iter(|| rt.block_on(plan_and_execute(&scanner, use_logical)))
-                });
-            }
+            // A shape that returns nothing measures an empty plan, not the work it is named for.
+            let rows = rt.block_on(plan_and_execute(&scanner));
+            assert!(rows > 0, "{shape} returned no rows");
+            group.bench_function(BenchmarkId::new("execute", shape), |b| {
+                b.iter(|| rt.block_on(plan_and_execute(&scanner)))
+            });
         }
         group.finish();
     }

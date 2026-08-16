@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use datafusion::common::plan_err;
 use datafusion::common::tree_node::Transformed;
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder};
@@ -19,6 +20,7 @@ use super::super::context::{OverlayStaleness, ScanPlanningContext};
 use super::super::source::ScanRestriction;
 use super::super::{IndexCoverage, SplittableSearch};
 use super::*;
+use crate::io::exec::fts::SharedFtsScorer;
 
 // ---------------------------------------------------------------------------------------------
 // Stage 3: rules
@@ -293,6 +295,14 @@ impl SplittableSearch for FtsLeafNode {
         flat: LogicalPlan,
         _context: &ScanPlanningContext,
     ) -> datafusion::common::Result<LogicalPlan> {
+        // This merge ranks the two branches' scores against each other, which is only meaningful
+        // once they agree on the corpus they scored against — see `FtsLeafNode::shared_scorer`.
+        // Linking them here rather than in the branch constructors is not incidental: this is the
+        // only point at which one caller holds both halves.
+        let (indexed, flat) = match self.granularity.is_list_element() {
+            true => share_corpus_statistics(indexed, flat)?,
+            false => (indexed, flat),
+        };
         let mut merged = LogicalPlanBuilder::new(indexed)
             .union(flat)?
             .sort(vec![datafusion::prelude::col(SCORE_COL).sort(false, false)])?;
@@ -301,6 +311,33 @@ impl SplittableSearch for FtsLeafNode {
         }
         merged.build()
     }
+}
+
+/// Point both branches of a split leaf at one rendezvous for corpus statistics.
+fn share_corpus_statistics(
+    indexed: LogicalPlan,
+    flat: LogicalPlan,
+) -> datafusion::common::Result<(LogicalPlan, LogicalPlan)> {
+    let leaf = |plan: &LogicalPlan| match plan {
+        LogicalPlan::Extension(extension) => extension
+            .node
+            .as_any()
+            .downcast_ref::<FtsLeafNode>()
+            .cloned(),
+        _ => None,
+    };
+    let (Some(indexed_leaf), Some(flat_leaf)) = (leaf(&indexed), leaf(&flat)) else {
+        return plan_err!("a split FTS leaf's branches must both be FTS leaves");
+    };
+    let scorer = Arc::new(SharedFtsScorer::new());
+    Ok((
+        LogicalPlan::Extension(Extension {
+            node: Arc::new(indexed_leaf.with_shared_scorer(Some(scorer.clone()))),
+        }),
+        LogicalPlan::Extension(Extension {
+            node: Arc::new(flat_leaf.with_shared_scorer(Some(scorer))),
+        }),
+    ))
 }
 
 fn supports_compound_scorer(query: &FtsQuery) -> bool {

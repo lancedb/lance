@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::super::PrefilterSourceKind;
 use crate::dataset::Dataset;
 use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_field};
+use crate::io::exec::fts::SharedFtsScorer;
 use crate::{Error, Result};
 
 // ---------------------------------------------------------------------------------------------
@@ -84,9 +85,6 @@ pub struct FtsLeafNode {
     pub(super) field: ResolvedFtsField,
     pub(super) resolution: Option<FtsAccessPath>,
     pub(super) prefilter: PrefilterSourceKind,
-    /// Set by [`SplitPartiallyIndexedFts`] on the branch it restricts to indexed fragments, for
-    /// the same reason the vector path needs it: without it the rule re-splits its own output on
-    /// DataFusion's next optimizer pass.
     /// Whether the input's row order is the answer's row order.
     ///
     /// A bounded flat leaf normally has to sort by score to produce the global top-k. When the
@@ -98,6 +96,18 @@ pub struct FtsLeafNode {
     /// by [`SplitOnIndexCoverage`](SplitOnIndexCoverage), which puts the same rows on
     /// a flat branch so they are scored from their current text.
     pub(super) overlay_block: Option<Arc<RowAddrTreeMap>>,
+    /// The rendezvous through which the two branches of a split leaf agree on corpus statistics.
+    ///
+    /// A BM25 score is only meaningful relative to a corpus, so scores from an index that saw part
+    /// of the data and a flat scan that saw the rest are not comparable — and the merge above them
+    /// ranks the two together. The flat branch, which can see both halves, computes the combined
+    /// statistics and publishes them here; the indexed branch waits for them instead of using its
+    /// own. It is an execution-time object living in a logical node because only the rule that
+    /// created both branches knows they are two halves of one search.
+    ///
+    /// Only list-element granularity needs it: whole-document scores already share the index's
+    /// corpus-wide statistics.
+    pub(super) shared_scorer: Option<Arc<SharedFtsScorer>>,
     pub(super) schema: DFSchemaRef,
 }
 
@@ -138,6 +148,7 @@ impl FtsLeafNode {
             prefilter: PrefilterSourceKind::default(),
             retains_input_order: false,
             overlay_block: None,
+            shared_scorer: None,
             schema,
         })
     }
@@ -162,8 +173,8 @@ impl FtsLeafNode {
         self.resolution.as_ref()
     }
 
-    pub fn prefilter(&self) -> PrefilterSourceKind {
-        self.prefilter
+    pub fn prefilter(&self) -> &PrefilterSourceKind {
+        &self.prefilter
     }
 
     pub fn with_input(mut self, input: LogicalPlan) -> Self {
@@ -188,6 +199,11 @@ impl FtsLeafNode {
 
     pub fn with_overlay_block(mut self, block: Option<Arc<RowAddrTreeMap>>) -> Self {
         self.overlay_block = block;
+        self
+    }
+
+    pub fn with_shared_scorer(mut self, scorer: Option<Arc<SharedFtsScorer>>) -> Self {
+        self.shared_scorer = scorer;
         self
     }
 
@@ -279,7 +295,7 @@ impl UserDefinedLogicalNodeCore for FtsLeafNode {
             None => {}
         }
         if self.prefilter != PrefilterSourceKind::None {
-            write!(f, ", prefilter={:?}", self.prefilter)?;
+            write!(f, ", prefilter={}", self.prefilter)?;
         }
         if self.overlay_block.is_some() {
             write!(f, ", overlay_block")?;

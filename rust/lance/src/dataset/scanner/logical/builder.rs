@@ -19,7 +19,7 @@ use datafusion::logical_expr::{
 };
 
 use datafusion::prelude::col;
-use lance_core::{ROW_ADDR, ROW_ID, datatypes::OnMissing};
+use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET, datatypes::OnMissing};
 use lance_index::scalar::inverted::{DOC_INDEX_COL, SCORE_COL};
 use lance_index::vector::DIST_COL;
 
@@ -47,8 +47,18 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     let has_search = scanner.nearest.is_some() || prepared.full_text.is_some();
     let prefilter = scanner.prefilter && has_search;
 
+    // `_rowoffset` is computed above the scan rather than read from it, so a predicate on it only
+    // binds once that node is in place. A postfilter is covered below, where the node already goes;
+    // a prefilter sits on the scan itself, so it has to be covered here.
+    let filter_reads_row_offset = filter
+        .as_ref()
+        .is_some_and(|filter| filter.column_refs().iter().any(|c| c.name == ROW_OFFSET));
+
     let mut source = scan.clone();
     if prefilter && let Some(filter) = filter.clone() {
+        if filter_reads_row_offset {
+            source = extension(RowOffsetNode::try_new(source)?);
+        }
         source = LogicalPlanBuilder::new(source).filter(filter)?.build()?;
     }
 
@@ -97,11 +107,22 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
             }
             None => fts::build_source(source, &scanner.dataset, query, search_limit(scanner))?,
         };
+        // Relevance order is the result's order, and it has to be restated above the take for the
+        // same reason a vector search's distance order does — see the comment below. Without it,
+        // `EnforceSorting` is entitled to drop whichever sort the FTS operators happened to
+        // produce, because nothing above them asks for an ordering.
+        //
+        // Row id breaks ties, so that two queries differing only in their limit agree on which of
+        // two equally relevant rows comes first.
         with_take(
             LogicalPlanBuilder::new(searched),
             scanner,
             &postfilter_columns,
         )?
+        .sort(vec![
+            col(SCORE_COL).sort(false, false),
+            col(ROW_ID).sort(true, false),
+        ])?
     } else if let Some(query) = &scanner.nearest {
         let searched = match prepared.fts_filter.as_ref().filter(|_| prefilter) {
             // An FTS query used as a filter produces the candidate rows, whose vectors are then
@@ -130,7 +151,7 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
                 let search =
                     VectorSearchNode::try_new(source, scanner.dataset.clone(), query.clone())?;
                 extension(if scanner.is_batch_nearest {
-                    search.with_query_count(scanner.nearest_query_count)?
+                    search.with_batch_queries(scanner.nearest_query_count)?
                 } else {
                     search
                 })
@@ -162,7 +183,9 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     // A row's offset is derived from its address alone, so this can sit below the sort and limit
     // that the imperative path puts it above — the values come out the same either way. It has to
     // sit below a postfilter that reads it, which is the reason it is added here rather than there.
-    if scanner.projection_plan.must_add_row_offset {
+    if (scanner.projection_plan.must_add_row_offset || filter_reads_row_offset)
+        && !(prefilter && filter_reads_row_offset)
+    {
         builder =
             LogicalPlanBuilder::new(extension(RowOffsetNode::try_new(builder.plan().clone())?));
     }

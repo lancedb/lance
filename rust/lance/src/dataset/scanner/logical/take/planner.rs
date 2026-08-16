@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Stage 4: lowering the take node to a `FilteredReadExec` in take mode.
+//! Stage 4: lowering the take node to a read keyed by the rows the input found.
 
 use std::sync::Arc;
 
@@ -9,6 +9,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use lance_core::ROW_ID;
 
 use super::super::LanceTakeNode;
+use super::super::source::v1;
 use crate::Result;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 
@@ -16,6 +17,16 @@ pub fn plan_take(
     node: &LanceTakeNode,
     input: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    // Both forms emit the input's columns followed by the fetched ones, which is why the node's
+    // schema holds either way. See [`v1::take`] for why v1 needs its own.
+    if v1::is_legacy(node.dataset()) {
+        return v1::take(
+            node.dataset(),
+            input,
+            node.projection().clone(),
+            node.settings().batch_size,
+        );
+    }
     let options = take_options(node, input.schema().as_ref());
     Ok(Arc::new(FilteredReadExec::try_new(
         node.dataset().clone(),

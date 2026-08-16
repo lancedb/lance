@@ -21,13 +21,14 @@ use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::LogicalPlan;
+use lance_core::utils::address::RowAddress;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_linalg::distance::DistanceType;
 use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
-use lance_index::scalar::expression::ScalarIndexExpr;
+use lance_index::scalar::expression::{IndexInformationProvider, ScalarIndexExpr};
 use lance_index::scalar::inverted::DocumentGranularity;
 
 use super::fts::{self, FtsIndexInfo};
@@ -35,10 +36,10 @@ use super::row_offset::RowOffsetNode;
 use super::scan_index::with_lance_source;
 use super::{TakeSettings, VectorSearchNode};
 use crate::Result;
-use crate::dataset::Dataset;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::scanner::TakeOperation;
+use crate::dataset::{Dataset, row_offsets_to_row_addresses};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, ScalarIndexInfo};
 use crate::io::exec::RowOffsetMap;
 
@@ -159,6 +160,12 @@ pub struct ScanPlanningContext {
     fragments: Arc<Vec<Fragment>>,
     vector: HashMap<String, VectorIndexInfo>,
     fts: HashMap<(String, DocumentGranularity), FtsIndexInfo>,
+    /// Whether `Scanner::with_index_segments` pinned which segments a search may use.
+    ///
+    /// It makes the caller's chosen segments the whole answer: rows they do not cover are out of
+    /// scope rather than a coverage gap, so no brute-force branch fills it. Mirrors
+    /// `Scanner::knn_combined`.
+    segments_pinned: bool,
     /// `Scanner::fast_search`: skip rows no index covers. A rule needs it to know whether to
     /// build the flat branch at all, and it is not derivable from the plan.
     fast_search: bool,
@@ -276,6 +283,7 @@ impl ScanPlanningContext {
             vector,
             fts,
             fast_search: options.fast_search,
+            segments_pinned: options.index_segments.is_some(),
             take_settings: TakeSettings {
                 fragments: options.fragments.clone(),
                 batch_size: options.batch_size.map(|size| size as u32),
@@ -342,12 +350,55 @@ impl ScanPlanningContext {
         }
     }
 
+    /// The fragments these index segments can return a row from, limited to what this scan reads.
+    ///
+    /// A segment with no fragment bitmap could have indexed anything, so the answer widens to
+    /// every fragment. Mirrors `Scanner::get_indexed_frags`.
+    pub fn segment_coverage(&self, segments: &[IndexMetadata]) -> RoaringBitmap {
+        let scanned = RoaringBitmap::from_iter(self.fragments.iter().map(|f| f.id as u32));
+        let mut covered = RoaringBitmap::new();
+        for segment in segments {
+            let Some(bitmap) = segment.fragment_bitmap.as_ref() else {
+                return scanned;
+            };
+            covered |= bitmap;
+        }
+        covered & scanned
+    }
+
+    /// The fragments a scalar index query can answer for, or `None` if some index in it cannot
+    /// say which fragments it covers.
+    ///
+    /// Mirrors `Scanner::fragments_covered_by_index_query`, intersecting for `Or` as well as
+    /// `And`: an `Or` is only answerable where *both* sides are, since a fragment one side cannot
+    /// speak for could still contain a matching row.
+    pub fn index_query_coverage(&self, query: &ScalarIndexExpr) -> Option<RoaringBitmap> {
+        match query {
+            ScalarIndexExpr::Not(inner) => self.index_query_coverage(inner),
+            ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
+                Some(self.index_query_coverage(lhs)? & self.index_query_coverage(rhs)?)
+            }
+            ScalarIndexExpr::Query(search) => self
+                .scalar_indices
+                .fragment_bitmap(&search.column, &search.index_name),
+        }
+    }
+
     pub fn vector_index(&self, column: &str) -> Option<&VectorIndexInfo> {
         self.vector.get(column)
     }
 
     pub fn fast_search(&self) -> bool {
         self.fast_search
+    }
+
+    /// Whether a vector index's coverage gap should be filled by a brute-force branch.
+    ///
+    /// Pinned segments are the whole answer, so rows they miss are out of scope — unless the
+    /// caller also named fragments, which asks for those fragments' rows however they have to be
+    /// found. Mirrors `Scanner::knn_combined`.
+    pub fn fills_vector_coverage_gaps(&self) -> bool {
+        !self.segments_pinned || self.take_settings.fragments.is_some()
     }
 
     pub fn take_settings(&self) -> &TakeSettings {
@@ -579,11 +630,9 @@ pub fn take_key(take: &TakeOperation) -> String {
     format!("{take:?}")
 }
 
-/// Turn `_rowaddr` takes into the row ids a read can be restricted to.
+/// Turn `_rowaddr` and `_rowoffset` takes into the row ids a read can be restricted to.
 ///
 /// `TakeOperation::RowIds` is absent because it needs no translation — the rule handles it inline.
-/// `RowOffsets` is absent for a different reason: a `_rowoffset` predicate sits above the node that
-/// computes the column, so it never reaches the scan for the rule to rewrite.
 async fn resolve_takes(
     dataset: &Arc<Dataset>,
     takes: Vec<TakeOperation>,
@@ -594,10 +643,18 @@ async fn resolve_takes(
         if resolved.contains_key(&key) {
             continue;
         }
-        let TakeOperation::RowAddrs(addrs) = &take else {
-            continue;
+        let addrs = match &take {
+            TakeOperation::RowIds(_) => continue,
+            TakeOperation::RowAddrs(addrs) => addrs.clone(),
+            TakeOperation::RowOffsets(offsets) => {
+                let mut addrs =
+                    row_offsets_to_row_addresses(&dataset.get_fragments(), offsets).await?;
+                // An offset can only name a live row, so a tombstone means the offset ran past
+                // the end of the dataset. Mirrors `Scanner::take_source`.
+                addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
+                addrs
+            }
         };
-        let addrs = addrs.clone();
         let row_ids = live_row_addrs_to_row_ids(dataset, addrs.into_iter().map(Some)).await?;
         resolved.insert(
             key,

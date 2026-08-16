@@ -80,11 +80,13 @@ async fn test_filtered_scan_plan_v1() {
 #[case::v1(LanceFileVersion::Legacy)]
 #[case::stable(LanceFileVersion::Stable)]
 #[tokio::test]
-async fn test_paths_agree_on_filtered_scan(#[case] version: LanceFileVersion) {
+async fn test_filtered_scan_returns_the_matching_rows(#[case] version: LanceFileVersion) {
     let dataset = test_dataset_versioned(version).await;
-    assert_paths_agree(&dataset, |scan| {
-        scan.project(&["s"])?.filter("i > 10 and i < 20")
-    })
+    assert_scan_keeps(
+        &dataset,
+        |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
+        |i| i > 10 && i < 20,
+    )
     .await
     .unwrap();
 }
@@ -93,20 +95,29 @@ async fn test_paths_agree_on_filtered_scan(#[case] version: LanceFileVersion) {
 #[case::v1(LanceFileVersion::Legacy)]
 #[case::stable(LanceFileVersion::Stable)]
 #[tokio::test]
-async fn test_paths_agree_on_full_scan(#[case] version: LanceFileVersion) {
+async fn test_full_scan_returns_every_row(#[case] version: LanceFileVersion) {
     let dataset = test_dataset_versioned(version).await;
-    assert_paths_agree(&dataset, |scan| Ok(scan)).await.unwrap();
+    assert_scan_keeps(&dataset, |scan| Ok(scan), |_| true)
+        .await
+        .unwrap();
 }
 
 #[rstest]
 #[case::v1(LanceFileVersion::Legacy)]
 #[case::stable(LanceFileVersion::Stable)]
 #[tokio::test]
-async fn test_paths_agree_on_limit(#[case] version: LanceFileVersion) {
+async fn test_limit_skips_then_truncates(#[case] version: LanceFileVersion) {
     let dataset = test_dataset_versioned(version).await;
-    assert_paths_agree(&dataset, |scan| scan.limit(Some(10), Some(5)))
-        .await
-        .unwrap();
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    // Offset 5, limit 10: the rows are in storage order, so this is `i` 5 through 14.
+    assert_scan_returns(
+        &dataset,
+        |scan| scan.limit(Some(10), Some(5)),
+        &fixture,
+        (5..15).collect(),
+    )
+    .await
+    .unwrap();
 }
 
 /// The legacy branch that does *not* apply the predicate.
@@ -115,19 +126,23 @@ async fn test_paths_agree_on_limit(#[case] version: LanceFileVersion) {
 /// the plain fragment scan and has to apply the predicate itself. Without that, this query would
 /// return every row.
 #[tokio::test]
-async fn test_paths_agree_on_a_v1_scan_that_cannot_push_down() {
+async fn test_a_v1_scan_that_cannot_push_down_still_filters() {
     let dataset = test_dataset_versioned(LanceFileVersion::Legacy).await;
-    assert_paths_agree(&dataset, |scan| {
-        scan.batch_size(16);
-        scan.project(&["s"])?.filter("i > 10 and i < 20")
-    })
+    assert_scan_keeps(
+        &dataset,
+        |scan| {
+            scan.batch_size(16);
+            scan.project(&["s"])?.filter("i > 10 and i < 20")
+        },
+        |i| i > 10 && i < 20,
+    )
     .await
     .unwrap();
 }
 
 /// The legacy branch that reaches the predicate through a scalar index.
 #[tokio::test]
-async fn test_paths_agree_on_a_v1_scalar_indexed_scan() {
+async fn test_a_v1_scalar_indexed_scan_returns_the_matching_rows() {
     use crate::index::DatasetIndexExt;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
@@ -144,9 +159,11 @@ async fn test_paths_agree_on_a_v1_scalar_indexed_scan() {
         .await
         .unwrap();
 
-    assert_paths_agree(&dataset, |scan| {
-        scan.project(&["s"])?.filter("i > 10 and i < 20")
-    })
+    assert_scan_keeps(
+        &dataset,
+        |scan| scan.project(&["s"])?.filter("i > 10 and i < 20"),
+        |i| i > 10 && i < 20,
+    )
     .await
     .unwrap();
 }
@@ -155,11 +172,13 @@ async fn test_paths_agree_on_a_v1_scalar_indexed_scan() {
 #[case::v1(LanceFileVersion::Legacy)]
 #[case::stable(LanceFileVersion::Stable)]
 #[tokio::test]
-async fn test_paths_agree_on_row_id_projection(#[case] version: LanceFileVersion) {
+async fn test_row_id_projection(#[case] version: LanceFileVersion) {
     let dataset = test_dataset_versioned(version).await;
-    assert_paths_agree(&dataset, |scan| {
-        scan.project(&["i"])?.with_row_id().filter("i % 3 = 0")
-    })
+    assert_scan_keeps(
+        &dataset,
+        |scan| scan.project(&["i"])?.with_row_id().filter("i % 3 = 0"),
+        |i| i % 3 == 0,
+    )
     .await
     .unwrap();
 }
@@ -175,18 +194,34 @@ async fn deleted_rows_dataset(version: LanceFileVersion) -> crate::dataset::Data
 #[case::v1(LanceFileVersion::Legacy)]
 #[case::stable(LanceFileVersion::Stable)]
 #[tokio::test]
-async fn test_paths_agree_on_include_deleted_rows(#[case] version: LanceFileVersion) {
+async fn test_include_deleted_rows_surfaces_them_with_a_null_row_id(
+    #[case] version: LanceFileVersion,
+) {
+    use arrow::datatypes::Int32Type;
+    use arrow_array::cast::AsArray;
+
     let dataset = deleted_rows_dataset(version).await;
-    assert_paths_agree(&dataset, |scan| {
+    let batch = scan_rows(&dataset, |scan| {
         scan.include_deleted_rows();
         Ok(scan.project(&["i"])?.with_row_id())
     })
     .await
     .unwrap();
+
+    // Every row is back, deleted ones included, and a null row id is what marks them: a deleted
+    // row has no stable identity to hand out.
+    let ids = batch["i"].as_primitive::<Int32Type>().values();
+    assert_eq!(ids, &(0..200).collect::<Vec<i32>>());
+    let deleted = batch[lance_core::ROW_ID]
+        .nulls()
+        .expect("deleted rows must have a null row id");
+    for (id, live) in ids.iter().zip(deleted.iter()) {
+        assert_eq!(live, id % 7 != 0, "row {id} has the wrong liveness");
+    }
 }
 
-/// Deleted rows carry a null row id, so a search — which returns row ids — cannot include them.
-/// Both paths reject it; this asserts the logical one does so for the same reason.
+/// Deleted rows carry a null row id, and a search answers in row ids, so the two cannot be
+/// combined.
 #[tokio::test]
 async fn test_include_deleted_rows_is_rejected_for_a_search() {
     let dataset = vector_dataset().await;
@@ -194,13 +229,10 @@ async fn test_include_deleted_rows_is_rejected_for_a_search() {
     scan.with_row_id().include_deleted_rows();
     scan.nearest("vec", &query_vector(), 5).unwrap();
 
-    for plan in [
-        super::super::create_plan(&scan).await,
-        scan.create_plan().await,
-    ] {
-        let err = plan.expect_err("a search cannot include deleted rows");
-        assert!(err.to_string().contains("deleted rows"), "{err}");
-    }
+    let err = super::super::create_plan(&scan)
+        .await
+        .expect_err("a search cannot include deleted rows");
+    assert!(err.to_string().contains("deleted rows"), "{err}");
 }
 
 /// Every batch but the last carries exactly the requested number of rows.
@@ -233,56 +265,62 @@ async fn test_strict_batch_size() {
 /// Aggregates are stock DataFusion nodes, so the whole of `COUNT(*)` and `SUM` comes from the
 /// builder emitting an `Aggregate` and letting projection pushdown find its columns.
 #[rstest]
-#[case::count_star(AggregateExpr::builder().count_star().build())]
-#[case::sum(AggregateExpr::builder().sum("i").build())]
+// `i` is 0..199, so `i > 10` keeps 189 rows summing to 11 + 12 + ... + 199.
+#[case::count_star(AggregateExpr::builder().count_star().build(), 189)]
+#[case::sum(AggregateExpr::builder().sum("i").build(), (11..200i64).sum())]
 #[tokio::test]
-async fn test_paths_agree_on_aggregates(#[case] aggregate: AggregateExpr) {
+async fn test_aggregates(#[case] aggregate: AggregateExpr, #[case] expected: i64) {
+    use arrow::datatypes::Int64Type;
+    use arrow_array::cast::AsArray;
+
     let dataset = test_dataset().await;
-    assert_paths_agree(&dataset, move |scan| {
+    let plan = logical_plan_for(&dataset, move |scan| {
         scan.aggregate(aggregate.clone())?.filter("i > 10")
     })
     .await
     .unwrap();
+    let batch = run(plan).await.unwrap();
+
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch.column(0).as_primitive::<Int64Type>().value(0),
+        expected
+    );
 }
 
-/// A grouped aggregate, compared as a set: neither path promises an order for hash aggregation.
+/// A grouped aggregate. Hash aggregation promises no order, so this asserts the groups as a set.
 #[tokio::test]
-async fn test_paths_agree_on_a_grouped_aggregate() {
-    use arrow::compute::{SortColumn, lexsort_to_indices, take};
+async fn test_a_grouped_aggregate() {
+    use arrow::datatypes::Int64Type;
+    use arrow_array::cast::AsArray;
+    use std::collections::HashMap;
 
     let dataset = test_dataset().await;
-    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
+    let plan = logical_plan_for(&dataset, |scan| {
         scan.aggregate(AggregateExpr::builder().group_by("s").count_star().build())?
             .filter("i > 10")
-    }
-    let by_group = |batch: arrow_array::RecordBatch| {
-        let indices = lexsort_to_indices(
-            &[SortColumn {
-                values: batch.column(0).clone(),
-                options: None,
-            }],
-            None,
-        )
-        .unwrap();
-        let columns = batch
-            .columns()
-            .iter()
-            .map(|column| take(column.as_ref(), &indices, None).unwrap())
-            .collect::<Vec<_>>();
-        arrow_array::RecordBatch::try_new(batch.schema(), columns).unwrap()
-    };
+    })
+    .await
+    .unwrap();
+    let batch = run(plan).await.unwrap();
 
-    let expected = by_group(
-        run(imperative_plan_for(&dataset, config).await.unwrap())
-            .await
-            .unwrap(),
-    );
-    let actual = by_group(
-        run(logical_plan_for(&dataset, config).await.unwrap())
-            .await
-            .unwrap(),
-    );
-    assert_eq!(expected, actual);
+    let mut counted: HashMap<String, i64> = HashMap::new();
+    let groups = batch.column(0).as_string::<i32>();
+    let counts = batch.column(1).as_primitive::<Int64Type>();
+    for row in 0..batch.num_rows() {
+        counted.insert(groups.value(row).to_string(), counts.value(row));
+    }
+
+    // The fixture's `s` values are random, so how many groups there are is a property of the data
+    // rather than of the query: count them the same way the aggregate should have.
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    let mut expected: HashMap<String, i64> = HashMap::new();
+    for (id, text) in fixture.ids().iter().zip(fixture.strings("s")) {
+        if *id > 10 {
+            *expected.entry(text).or_default() += 1;
+        }
+    }
+    assert_eq!(counted, expected);
 }
 
 /// Which columns the scan reads alongside the filter and which it takes afterwards is a cost
@@ -292,7 +330,7 @@ async fn test_paths_agree_on_a_grouped_aggregate() {
 #[case::all_early(MaterializationStyle::AllEarly)]
 #[case::all_late(MaterializationStyle::AllLate)]
 #[tokio::test]
-async fn test_paths_agree_on_materialization_style(
+async fn test_materialization_style(
     #[case] style: MaterializationStyle,
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)] version: LanceFileVersion,
 ) {
@@ -303,7 +341,9 @@ async fn test_paths_agree_on_materialization_style(
             .materialization_style(style.clone());
         Ok(scan)
     });
-    assert_paths_agree(&dataset, scan_config).await.unwrap();
+    assert_scan_keeps(&dataset, scan_config, |i| i > 10 && i < 20)
+        .await
+        .unwrap();
 }
 
 /// A wide column the filter also reads is not deferrable: the filtered pass has to load it either
@@ -317,7 +357,9 @@ async fn test_a_filtered_column_is_never_late() {
             .materialization_style(MaterializationStyle::AllLate);
         Ok(scan)
     });
-    assert_paths_agree(&dataset, &scan_config).await.unwrap();
+    assert_scan_keeps(&dataset, &scan_config, |_| true)
+        .await
+        .unwrap();
 
     let plan = logical_plan_for(&dataset, &scan_config).await.unwrap();
     let display = datafusion::physical_plan::displayable(plan.as_ref())
@@ -333,7 +375,7 @@ async fn test_a_filtered_column_is_never_late() {
 /// `AllEarlyExcept` names the late columns by field id, so it also covers the case where only
 /// part of the projection is deferred.
 #[tokio::test]
-async fn test_paths_agree_on_all_early_except() {
+async fn test_all_early_except() {
     let dataset = test_dataset().await;
     let style = MaterializationStyle::all_early_except(&["s"], dataset.schema()).unwrap();
     let scan_config = config(move |scan: &mut crate::dataset::Scanner| {
@@ -342,7 +384,9 @@ async fn test_paths_agree_on_all_early_except() {
             .materialization_style(style.clone());
         Ok(scan)
     });
-    assert_paths_agree(&dataset, scan_config).await.unwrap();
+    assert_scan_keeps(&dataset, scan_config, |i| i > 10 && i < 20)
+        .await
+        .unwrap();
 }
 
 /// Late materialization is a cost decision, and equivalence cannot see cost. Assert the point of
@@ -384,40 +428,38 @@ async fn test_late_materialization_reads_less() {
     assert!(late < early, "late read {late} bytes, early read {early}");
 }
 
-/// `SELECT 1 AS foo` reads nothing, and both paths refuse it rather than inventing a column.
+/// `SELECT 1 AS foo` reads nothing, and is refused rather than answered with an invented column.
 #[tokio::test]
-async fn test_both_paths_reject_a_projection_that_reads_nothing() {
-    fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
-        scan.project_with_transform(&[("foo", "1")])
-    }
-
+async fn test_a_projection_that_reads_nothing_is_rejected() {
     let dataset = test_dataset().await;
-    let imperative = imperative_plan_for(&dataset, config)
-        .await
-        .expect_err("nothing to read");
-    let logical = logical_plan_for(&dataset, config)
-        .await
-        .expect_err("nothing to read");
+    let error = logical_plan_for(&dataset, |scan| {
+        scan.project_with_transform(&[("foo", "1")])
+    })
+    .await
+    .expect_err("nothing to read");
 
-    for error in [&imperative, &logical] {
-        assert!(
-            matches!(error, crate::Error::NotSupported { .. }),
-            "{error:?}"
-        );
-        assert!(error.to_string().contains("at least one column"), "{error}");
-    }
+    assert!(
+        matches!(error, crate::Error::NotSupported { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("at least one column"), "{error}");
 }
 
 /// A `_rowid` predicate names its rows, so the scan reads only those.
 #[tokio::test]
-async fn test_paths_agree_on_a_row_id_take() {
+async fn test_a_row_id_take() {
     fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
         scan.filter("_rowid IN (5, 10, 20)")?.with_row_id();
         Ok(scan)
     }
 
     let dataset = test_dataset().await;
-    assert_paths_agree(&dataset, config).await.unwrap();
+    // Without stable row ids a row id is its address, so these name rows 5, 10 and 20 of the first
+    // fragment — whose `i` values are the same numbers.
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    assert_scan_returns(&dataset, config, &fixture, vec![5, 10, 20])
+        .await
+        .unwrap();
 
     let plan = logical_plan_for(&dataset, config).await.unwrap();
     let display = datafusion::physical_plan::displayable(plan.as_ref())
@@ -431,7 +473,7 @@ async fn test_paths_agree_on_a_row_id_take() {
 
 /// The rest of a conjunction survives the rewrite as an ordinary filter.
 #[tokio::test]
-async fn test_paths_agree_on_a_row_id_take_with_a_remainder() {
+async fn test_a_row_id_take_with_a_remainder() {
     fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
         scan.filter("_rowid IN (5, 10, 20) AND i > 7")?
             .with_row_id();
@@ -439,19 +481,25 @@ async fn test_paths_agree_on_a_row_id_take_with_a_remainder() {
     }
 
     let dataset = test_dataset().await;
-    assert_paths_agree(&dataset, config).await.unwrap();
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    assert_scan_returns(&dataset, config, &fixture, vec![10, 20])
+        .await
+        .unwrap();
 }
 
 /// A `_rowaddr` predicate is a take too, once stage 2 has translated the addresses.
 #[tokio::test]
-async fn test_paths_agree_on_a_row_address_take() {
+async fn test_a_row_address_take() {
     fn config(scan: &mut crate::dataset::Scanner) -> crate::Result<&mut crate::dataset::Scanner> {
         scan.filter("_rowaddr IN (5, 10, 20)")?.with_row_address();
         Ok(scan)
     }
 
     let dataset = test_dataset().await;
-    assert_paths_agree(&dataset, config).await.unwrap();
+    let fixture = Fixture::read(&dataset).await.unwrap();
+    assert_scan_returns(&dataset, config, &fixture, vec![5, 10, 20])
+        .await
+        .unwrap();
 }
 
 /// `_rowoffset` counts live rows from the start of the dataset, so a deleted row shifts it.
@@ -459,7 +507,10 @@ async fn test_paths_agree_on_a_row_address_take() {
 #[rstest::rstest]
 #[case::projected(false)]
 #[case::taken(true)]
-async fn test_paths_agree_on_row_offsets(#[case] as_take: bool) {
+async fn test_row_offsets(#[case] as_take: bool) {
+    use arrow::datatypes::UInt64Type;
+    use arrow_array::cast::AsArray;
+
     let mut dataset = test_dataset().await;
     dataset.delete("i = 3").await.unwrap();
 
@@ -470,5 +521,25 @@ async fn test_paths_agree_on_row_offsets(#[case] as_take: bool) {
         }
         Ok(scan)
     });
-    assert_paths_agree(&dataset, scan_config).await.unwrap();
+    let batch = scan_rows(&dataset, scan_config).await.unwrap();
+
+    // Offsets count live rows, so deleting `i = 3` shifts every row after it down by one.
+    let offsets = batch[lance_core::ROW_OFFSET]
+        .as_primitive::<UInt64Type>()
+        .values();
+    let ids = batch["i"]
+        .as_primitive::<arrow::datatypes::Int32Type>()
+        .values();
+    let expected_id = |offset: u64| if offset < 3 { offset } else { offset + 1 } as i32;
+    for (offset, id) in offsets.iter().zip(ids) {
+        assert_eq!(
+            *id,
+            expected_id(*offset),
+            "offset {offset} names the wrong row"
+        );
+    }
+    match as_take {
+        true => assert_eq!(offsets, &[5, 10, 20]),
+        false => assert_eq!(offsets, &(0..199).collect::<Vec<u64>>()),
+    }
 }

@@ -12,6 +12,7 @@
 
 pub mod v1;
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
@@ -20,6 +21,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DataFusionError;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, expressions};
 use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
@@ -175,14 +177,17 @@ impl LanceScanSource {
                 .with_blob_handling(options.blob_handling.clone())
                 .to_bare_schema(),
         );
+        // System columns go in the order `Projection::to_schema` appends them, because that is the
+        // order the read emits. A provider that advertises a different one hands DataFusion
+        // projection indices that name the wrong column.
         let full_schema = base
             .try_with_column(ROW_ID_FIELD.clone())?
             .try_with_column(ROW_ADDR_FIELD.clone())?
-            .try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone())?
-            .try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())?;
-        let updated_version_idx = full_schema.fields.len() - 1;
-        let created_version_idx = updated_version_idx - 1;
-        let row_addr_idx = created_version_idx - 1;
+            .try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone())?
+            .try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone())?;
+        let created_version_idx = full_schema.fields.len() - 1;
+        let updated_version_idx = created_version_idx - 1;
+        let row_addr_idx = updated_version_idx - 1;
         let row_id_idx = row_addr_idx - 1;
         Ok(Self {
             dataset,
@@ -340,12 +345,21 @@ impl LanceScanSource {
         filter_plan: &ExprFilterPlan,
         requested: &Projection,
     ) -> Result<Option<Projection>> {
-        // The legacy builder's statistics-pushdown branch takes its projection off the `Scanner`
-        // and ignores the one it is handed, so narrowing here would add a take without narrowing
-        // the read. The imperative path hits the same wall from the other side: it computes an
-        // eager projection for v1 too, and the take it plans afterwards finds every column
-        // already there.
-        if !filter_plan.has_refine() || v1::is_legacy(&self.dataset) {
+        if !filter_plan.has_refine() {
+            return Ok(None);
+        }
+        // The one legacy branch that ignores the projection it is handed cannot be narrowed; see
+        // `v1::uses_statistics_pushdown`. The imperative path hits the same wall from the other
+        // side — it computes an eager projection for v1 too, and the take it plans afterwards
+        // finds every column already there.
+        if let Some(scanner) = self.options.legacy_scanner.as_ref()
+            && v1::uses_statistics_pushdown(
+                scanner,
+                filter_plan,
+                requested,
+                self.options.fragments.as_ref(),
+            )?
+        {
             return Ok(None);
         }
         // A column the filter reads is loaded by the read whether or not it is projected, so
@@ -361,9 +375,14 @@ impl LanceScanSource {
             .clone()
             .subtract_predicate(|field| !self.is_early_field(field))
             .union_schema(&filter_schema);
+        // Compare what the two reads would emit, not which field ids they carry. A blob column
+        // read as a description emits one column no matter how many storage fields sit under it,
+        // so an id-level difference can name columns that never reach the output and leave the
+        // take with nothing to fetch. This is the same comparison the take itself makes.
+        let eager_schema = ArrowSchema::from(&eager.to_schema());
         if !requested
             .clone()
-            .subtract_projection(&eager)
+            .subtract_arrow_schema(&eager_schema, OnMissing::Ignore)?
             .has_data_fields()
         {
             return Ok(None);
@@ -377,23 +396,34 @@ impl LanceScanSource {
         input: Arc<dyn ExecutionPlan>,
         requested: &Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut options = FilteredReadOptions::new(requested.clone().with_row_id());
-        if self.options.include_deleted_rows {
-            // Forwarded so the row-stream read rejects it: a deleted row carries a null row id,
-            // which the take would silently drop. `Scanner::take_current` does the same.
-            options = options.with_deleted_rows()?;
-        }
-        if let Some(batch_size) = self.options.batch_size {
-            options = options.with_batch_size(batch_size as u32);
-        }
-        if let Some(fragments) = &self.options.fragments {
-            options = options.with_fragments(fragments.clone());
-        }
-        let taken = Arc::new(FilteredReadExec::try_new(
-            self.dataset.clone(),
-            options,
-            Some(input),
-        )?);
+        let taken = match v1::is_legacy(&self.dataset) {
+            true => v1::take(
+                &self.dataset,
+                input,
+                requested.clone(),
+                self.options.batch_size.map(|size| size as u32),
+            )?,
+            false => {
+                let mut options = FilteredReadOptions::new(requested.clone().with_row_id());
+                if self.options.include_deleted_rows {
+                    // Forwarded so the row-stream read rejects it: a deleted row carries a null
+                    // row id, which the take would silently drop. `Scanner::take_current` does
+                    // the same.
+                    options = options.with_deleted_rows()?;
+                }
+                if let Some(batch_size) = self.options.batch_size {
+                    options = options.with_batch_size(batch_size as u32);
+                }
+                if let Some(fragments) = &self.options.fragments {
+                    options = options.with_fragments(fragments.clone());
+                }
+                Arc::new(FilteredReadExec::try_new(
+                    self.dataset.clone(),
+                    options,
+                    Some(input),
+                )?) as Arc<dyn ExecutionPlan>
+            }
+        };
 
         // The take appends its columns to the ones the eager read carried, so its output is in
         // neither the requested order nor the requested set. Restating both here is what keeps the
@@ -475,6 +505,28 @@ impl LanceScanSource {
             .unwrap_or_else(|| self.dataset.fragments())
     }
 
+    /// How much of the fragment sequence a pushed-down limit lets the read stop after.
+    ///
+    /// `limit` is what DataFusion pushed into the scan, so it already carries any offset above it.
+    /// Mirrors `Scanner::get_scan_range`, including both of its refusals: a range is a count of
+    /// physical positions, so it cannot describe a limit that applies after a filter, and on a
+    /// stable-row-id dataset those positions can be tombstones whose live replacements sit in later
+    /// fragments — spending the range on them would skip rows the limit should have returned.
+    fn scan_range(&self, limit: Option<usize>, filter_plan: &ExprFilterPlan) -> Option<Range<u64>> {
+        let limit = limit?;
+        if filter_plan.has_any_filter() || self.dataset.manifest.uses_stable_row_ids() {
+            return None;
+        }
+        // Clamping keeps the range honest about the read it describes; an over-long one reads the
+        // same rows but claims otherwise in every plan that prints it.
+        let rows = self
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.num_rows())
+            .sum::<Option<usize>>();
+        Some(0..rows.map_or(limit, |rows| limit.min(rows)) as u64)
+    }
+
     async fn scan_impl(
         &self,
         projection: Option<&Vec<usize>>,
@@ -482,6 +534,14 @@ impl LanceScanSource {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let requested = self.to_lance_projection(projection)?;
+        // A read of no fragments is a read of no rows. Saying so here rather than building one
+        // keeps a branch a coverage split could not avoid producing — and a scan of a dataset that
+        // has no data yet — from costing an operator. Mirrors the `EmptyExec` short-circuits in
+        // `Scanner::plan_fts`.
+        if self.fragments().is_empty() {
+            let schema = ArrowSchema::from(&requested.to_schema());
+            return Ok(Arc::new(EmptyExec::new(Arc::new(schema))));
+        }
         let filter_plan = match self.options.filter_plan.clone() {
             Some(filter_plan) => filter_plan,
             None => self.build_filter_plan(filters).await?,
@@ -494,12 +554,19 @@ impl LanceScanSource {
         let mut projection = late.clone().unwrap_or_else(|| requested.clone());
 
         // DataFusion asks for no columns when only the row count matters — `COUNT(*)`. Reading
-        // nothing is not a thing the reader can do, so the row address stands in and is projected
-        // away again below. Matches `Scanner::filtered_read_source`.
+        // nothing is not a thing the reader can do, so an identity column stands in and is
+        // projected away again below. Matches `Scanner::filtered_read_source`, except on v1: the
+        // legacy scan reads `with_row_addr` off the `Scanner` rather than the projection it is
+        // handed, so the row id is the column that actually gets through there.
         let counting_rows = projection.is_empty();
         if counting_rows {
-            projection.with_row_addr = true;
+            match v1::is_legacy(&self.dataset) {
+                true => projection.with_row_id = true,
+                false => projection.with_row_addr = true,
+            }
         }
+
+        let scan_range = self.scan_range(limit, &filter_plan);
 
         if v1::is_legacy(&self.dataset) {
             let Some(scanner) = self.options.legacy_scanner.as_ref() else {
@@ -516,10 +583,6 @@ impl LanceScanSource {
                         .to_string(),
                 ));
             }
-            let scan_range = match limit {
-                Some(limit) if !filter_plan.has_any_filter() => Some(0..limit as u64),
-                _ => None,
-            };
             let plan = v1::scan(
                 scanner,
                 &filter_plan,
@@ -529,9 +592,10 @@ impl LanceScanSource {
                 scan_range,
             )
             .await?;
-            return match counting_rows {
-                true => drop_all_columns(plan),
-                false => Ok(plan),
+            return match (counting_rows, &late) {
+                (true, _) => drop_all_columns(plan),
+                (false, Some(_)) => self.take_late(plan, &requested),
+                (false, None) => Ok(plan),
             };
         }
 
@@ -563,10 +627,8 @@ impl LanceScanSource {
         if self.options.include_deleted_rows {
             read_options = read_options.with_deleted_rows()?;
         }
-        if let Some(limit) = limit
-            && !filter_plan.has_any_filter()
-        {
-            read_options = read_options.with_scan_range_before_filter(0..limit as u64)?;
+        if let Some(scan_range) = scan_range {
+            read_options = read_options.with_scan_range_before_filter(scan_range)?;
         }
 
         if let Some(rows) = &self.options.overlay_block {

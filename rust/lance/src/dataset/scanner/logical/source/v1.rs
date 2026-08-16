@@ -23,6 +23,8 @@ use arrow_schema::Schema as ArrowSchema;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::ExecutionPlan;
+#[allow(deprecated)]
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use lance_arrow::SchemaExt as ArrowSchemaExt;
 use lance_core::datatypes::{OnMissing, Projection};
@@ -30,13 +32,113 @@ use lance_file::version::ConcreteFileVersion;
 use lance_table::format::Fragment;
 
 use crate::dataset::Scanner;
+use crate::dataset::scanner::{BATCH_SIZE_FALLBACK, get_default_batch_size};
 use crate::dataset::versions;
-use crate::io::exec::{FilterPlan as ExprFilterPlan, LanceFilterExec, Planner};
+use crate::io::exec::{FilterPlan as ExprFilterPlan, LanceFilterExec, Planner, TakeExec};
 use crate::{Error, Result};
 
 /// Whether the scan leaf must go through the legacy builder for this dataset.
 pub fn is_legacy(dataset: &crate::Dataset) -> bool {
     dataset.manifest().data_storage_format.lance_file_format() == ConcreteFileVersion::V1
+}
+
+/// Whether the legacy builder's statistics-pushdown branch is the one it will take.
+///
+/// Mirrors the branch condition in
+/// [`legacy_filtered_read`](crate::dataset::Scanner::legacy_filtered_read), with `is_prefilter`
+/// pinned to `false` the way [`scan`] calls it. Says nothing about whether that branch answers the
+/// right question — see [`pushdown_covers`].
+fn takes_statistics_pushdown(scanner: &Scanner, filter_plan: &ExprFilterPlan) -> bool {
+    !filter_plan.has_index_query()
+        && filter_plan.has_refine()
+        && scanner.batch_size.is_none()
+        && scanner.use_stats
+        && !scanner.filter_references_version_columns(filter_plan)
+}
+
+/// Whether `pushdown_scan` would read what this scan asked for.
+///
+/// It is the one legacy branch that ignores both arguments the leaf cares about: it takes its
+/// columns and its fragment list straight off the `Scanner`. So it only answers the right question
+/// where the two agree — the plan's root scan, reading what the caller configured. Every narrowing
+/// the rules introduce afterwards is invisible to it: a coverage split's fragment subset, an
+/// identity column a search node needs, a late-materialized projection. Where they disagree,
+/// [`scan`] turns the branch off rather than let it answer for a different read.
+fn pushdown_covers(
+    scanner: &Scanner,
+    projection: &Projection,
+    fragments: Option<&Arc<Vec<Fragment>>>,
+) -> Result<bool> {
+    if let Some(fragments) = fragments {
+        let configured = scanner
+            .fragments
+            .as_deref()
+            .unwrap_or_else(|| scanner.dataset.fragments());
+        if !fragments
+            .iter()
+            .map(|f| f.id)
+            .eq(configured.iter().map(|f| f.id))
+        {
+            return Ok(false);
+        }
+    }
+    // `ScanConfig` carries no version-column flags, so the branch cannot emit those however the
+    // scanner is projected.
+    let mut emitted = scanner.projection_plan.physical_projection.clone();
+    emitted.with_row_last_updated_at_version = false;
+    emitted.with_row_created_at_version = false;
+
+    let missing = projection
+        .clone()
+        .subtract_arrow_schema(&ArrowSchema::from(&emitted.to_schema()), OnMissing::Ignore)?;
+    Ok(!missing.has_data_fields()
+        && !missing.with_row_id
+        && !missing.with_row_addr
+        && !missing.with_row_last_updated_at_version
+        && !missing.with_row_created_at_version)
+}
+
+/// Whether a read of `projection` will go through the legacy statistics-pushdown branch.
+///
+/// Late materialization has to ask, because that branch reads the `Scanner`'s columns whatever it
+/// is handed: narrowing the projection under it would save nothing and cost a take that finds every
+/// column already there.
+pub fn uses_statistics_pushdown(
+    scanner: &Scanner,
+    filter_plan: &ExprFilterPlan,
+    projection: &Projection,
+    fragments: Option<&Arc<Vec<Fragment>>>,
+) -> Result<bool> {
+    Ok(takes_statistics_pushdown(scanner, filter_plan)
+        && pushdown_covers(scanner, projection, fragments)?)
+}
+
+/// Fetch `projection`'s columns for the rows `input` has already identified.
+///
+/// `FilteredReadExec` refuses a row-stream read on legacy files, so every take on v1 comes here
+/// instead — the scan leaf's late materialization as well as the plan's own take nodes. Mirrors
+/// `Scanner::take_legacy`, including the coalesce: `TakeExec` issues one read per batch, so small
+/// batches out of a search would each become their own round trip.
+#[allow(deprecated)]
+pub fn take(
+    dataset: &Arc<crate::Dataset>,
+    input: Arc<dyn ExecutionPlan>,
+    projection: Projection,
+    batch_size: Option<u32>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let batch_size = get_default_batch_size().unwrap_or_else(|| {
+        batch_size.map(|size| size as usize).unwrap_or_else(|| {
+            std::cmp::max(
+                dataset.object_store.as_ref().block_size() / 4,
+                BATCH_SIZE_FALLBACK,
+            )
+        })
+    });
+    let coalesced = Arc::new(CoalesceBatchesExec::new(input.clone(), batch_size));
+    match TakeExec::try_new(dataset.clone(), coalesced, projection)? {
+        Some(take) => Ok(Arc::new(take)),
+        None => Ok(input),
+    }
 }
 
 /// Build a v1 scan through the frozen legacy path.
@@ -57,6 +159,22 @@ pub async fn scan(
     scan_range: Option<Range<u64>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let output_schema: ArrowSchema = (&projection.to_schema()).into();
+
+    // Nothing in the legacy builder's signature turns the pushdown branch off, so when it would
+    // answer for a different read than the one asked for, take away the field its condition reads.
+    // The fragment scan it falls back to honors both arguments. Asked before the union below,
+    // because that union is for the branch this one is not.
+    let restated;
+    let scanner = if takes_statistics_pushdown(scanner, filter_plan)
+        && !pushdown_covers(scanner, &projection, fragments.as_ref())?
+    {
+        let mut without_stats = scanner.clone();
+        without_stats.use_stats = false;
+        restated = without_stats;
+        &restated
+    } else {
+        scanner
+    };
 
     // The branch that does not apply the refine predicate also does not read its columns, so ask
     // for them up front. Where a branch was going to read them anyway this is a no-op, and where
