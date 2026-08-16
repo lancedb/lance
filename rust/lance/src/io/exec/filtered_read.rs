@@ -75,6 +75,19 @@ fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef
     Arc::new(schema)
 }
 
+/// Restamp a batch with the schema-level metadata this node declares it emits.
+///
+/// A fragment reader builds its batches from the projected field list alone, so they arrive
+/// without the dataset's schema metadata even though `output_schema` carries it. A caller that
+/// ends in a projection re-stamps the metadata on the way out and never sees the difference; a
+/// caller that hands this node's output straight to the user does.
+fn align_output_metadata(batch: RecordBatch, output_schema: &SchemaRef) -> Result<RecordBatch> {
+    if batch.schema_ref().metadata() == output_schema.metadata() {
+        return Ok(batch);
+    }
+    Ok(batch.with_metadata(output_schema.metadata().clone())?)
+}
+
 #[derive(Debug)]
 pub struct EvaluatedIndex {
     index_result: IndexExprResult,
@@ -1302,15 +1315,16 @@ impl FilteredReadStream {
                     }
                 });
                 let partition_metrics_clone = partition_metrics.clone();
+                let emitted_schema = output_schema.clone();
                 let base_batch_stream =
                     futures_stream
                         .try_buffered(num_threads)
                         .try_filter_map(move |batch| {
-                            std::future::ready(Ok(if batch.num_rows() == 0 {
-                                None
+                            std::future::ready(if batch.num_rows() == 0 {
+                                Ok(None)
                             } else {
-                                Some(batch)
-                            }))
+                                align_output_metadata(batch, &emitted_schema).map(Some)
+                            })
                         });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
@@ -1383,12 +1397,15 @@ impl FilteredReadStream {
                         .instrument(tracing::debug_span!("filtered_read_task"))
                     }
                 })
-                .try_filter_map(move |batch| {
-                    std::future::ready(Ok(if batch.num_rows() == 0 {
-                        None
-                    } else {
-                        Some(batch)
-                    }))
+                .try_filter_map({
+                    let emitted_schema = output_schema.clone();
+                    move |batch| {
+                        std::future::ready(if batch.num_rows() == 0 {
+                            Ok(None)
+                        } else {
+                            align_output_metadata(batch, &emitted_schema).map(Some)
+                        })
+                    }
                 })
                 .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
@@ -4244,6 +4261,59 @@ mod tests {
             panic!("Expected an InvalidInput error when given an empty projection");
         };
         assert!(source.to_string().contains("no columns were selected"));
+    }
+
+    #[rstest::rstest]
+    #[case::one_partition(FilteredReadThreadingMode::OnePartitionMultipleThreads(2))]
+    #[case::multiple_partitions(FilteredReadThreadingMode::MultiplePartitions(2))]
+    #[test_log::test(tokio::test)]
+    async fn test_emitted_batches_carry_schema_metadata(
+        #[case] threading_mode: FilteredReadThreadingMode,
+    ) {
+        // Fragment readers build batches from the projected field list, which carries no
+        // schema-level metadata, so this node has to restamp what `output_schema` declares.
+        // Callers ending in a projection never notice; callers reading this node's output
+        // directly do.
+        let metadata =
+            std::collections::HashMap::from([("owner".to_string(), "lance".to_string())]);
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Int32,
+                false,
+            )],
+            metadata.clone(),
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from((0..100).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Arc::new(Dataset::write(reader, "memory://", None).await.unwrap());
+        assert_eq!(dataset.schema().metadata, metadata);
+
+        // Both `get_stream` branches build their batches independently.
+        let options =
+            FilteredReadOptions::basic_full_read(&dataset).with_threading_mode(threading_mode);
+        let plan = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        assert_eq!(plan.schema().metadata(), &metadata);
+
+        let num_partitions = match threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
+            FilteredReadThreadingMode::MultiplePartitions(n) => n,
+        };
+        let mut num_batches = 0;
+        for partition in 0..num_partitions {
+            let stream = plan
+                .execute(partition, Arc::new(TaskContext::default()))
+                .unwrap();
+            for batch in stream.try_collect::<Vec<_>>().await.unwrap() {
+                assert_eq!(batch.schema_ref().metadata(), &metadata);
+                num_batches += 1;
+            }
+        }
+        assert!(num_batches > 0, "expected at least one non-empty batch");
     }
 
     #[test_log::test(tokio::test)]
