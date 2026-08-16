@@ -6,4 +6,5 @@
 pub(crate) mod dataframe;
 pub(crate) mod logical_plan;
 
-pub use dataframe::LanceTableProvider;
+pub use crate::dataset::scanner::logical::dataframe::{LanceContextExt, LanceDataFrameExt};
+pub use dataframe::{LanceTableProvider, SessionContextExt};

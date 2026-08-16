@@ -23,11 +23,10 @@ use lance_core::{ROW_ADDR, ROW_ID, datatypes::OnMissing};
 use lance_index::scalar::inverted::{DOC_INDEX_COL, SCORE_COL};
 use lance_index::vector::DIST_COL;
 
-use super::context::take_settings;
 use super::fts;
 use super::prepare::PreparedQueries;
 use super::source::{LanceScanSource, ScanSourceOptions};
-use super::{LanceTakeNode, VectorAccessPath, VectorRerankNode, VectorSearchNode};
+use super::{LanceTakeNode, TakeSettings, VectorAccessPath, VectorRerankNode, VectorSearchNode};
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::{Dataset, Scanner};
 use crate::{Error, Result};
@@ -189,6 +188,15 @@ pub fn build(scanner: &Scanner, prepared: &PreparedQueries) -> Result<LogicalPla
     Ok(builder.build()?)
 }
 
+/// Read settings a take must honor, lifted off the `Scanner`. `None` fragments means "all of
+/// them", which is a different plan from an explicit list of every fragment.
+fn take_settings(scanner: &Scanner) -> TakeSettings {
+    TakeSettings {
+        fragments: scanner.fragments.clone().map(Arc::new),
+        batch_size: scanner.batch_size.map(|size| size as u32),
+    }
+}
+
 fn scan_leaf(scanner: &Scanner) -> Result<LogicalPlan> {
     let source = LanceScanSource::new(scanner.dataset.clone(), source_options(scanner))?;
     Ok(
@@ -263,7 +271,7 @@ fn ordering_exprs(ordering: &[ColumnOrdering], dataset: &Dataset) -> Result<Vec<
         .collect()
 }
 
-fn extension(node: impl UserDefinedLogicalNodeCore) -> LogicalPlan {
+pub(super) fn extension(node: impl UserDefinedLogicalNodeCore) -> LogicalPlan {
     LogicalPlan::Extension(Extension {
         node: Arc::new(node),
     })
@@ -331,7 +339,7 @@ fn move_to_end(exprs: &mut Vec<Expr>, name: &str) {
     }
 }
 
-fn source_options(scanner: &Scanner) -> ScanSourceOptions {
+pub(super) fn source_options(scanner: &Scanner) -> ScanSourceOptions {
     ScanSourceOptions {
         batch_size: scanner.batch_size,
         batch_readahead: scanner.batch_readahead,
@@ -342,6 +350,7 @@ fn source_options(scanner: &Scanner) -> ScanSourceOptions {
         index_expr_result_format: scanner.index_expr_result_format(),
         use_scalar_index: scanner.use_scalar_index,
         fast_search: scanner.fast_search,
+        index_segments: scanner.index_segments.clone().map(Arc::new),
         include_deleted_rows: scanner.include_deleted_rows,
         rows: None,
         filter_plan: None,

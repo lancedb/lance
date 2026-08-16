@@ -72,6 +72,11 @@ pub struct ScanSourceOptions {
     /// Answer from indices only: fragments a scalar index does not cover are skipped rather than
     /// scanned. Only meaningful alongside an index query.
     pub fast_search: bool,
+    /// The exact vector index segments a search may use, from `Scanner::with_index_segments`.
+    ///
+    /// The leaf itself never reads this — it is here because the leaf is where stage 2 recovers
+    /// the scan-wide settings that are not otherwise expressed in the plan.
+    pub index_segments: Option<Arc<Vec<uuid::Uuid>>>,
     /// Emit deleted rows too, carrying a null row id.
     ///
     /// A branch of a coverage split keeps this, and should: the branches read disjoint fragment
@@ -119,6 +124,7 @@ impl std::fmt::Debug for ScanSourceOptions {
             .field("index_expr_result_format", &self.index_expr_result_format)
             .field("use_scalar_index", &self.use_scalar_index)
             .field("fast_search", &self.fast_search)
+            .field("index_segments", &self.index_segments)
             .field("include_deleted_rows", &self.include_deleted_rows)
             .field("rows", &self.rows)
             .field("filter_plan", &self.filter_plan)
@@ -170,6 +176,18 @@ impl LanceScanSource {
             created_version_idx,
             updated_version_idx,
         })
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// The scan-wide settings this leaf was built with.
+    ///
+    /// Stage 2 reads them from here rather than from the `Scanner`, which is what lets stages 2
+    /// through 4 run against any plan whose leaf is a Lance scan.
+    pub fn options(&self) -> &ScanSourceOptions {
+        &self.options
     }
 
     /// The same source narrowed to part of the dataset.

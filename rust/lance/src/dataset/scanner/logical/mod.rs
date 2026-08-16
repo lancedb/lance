@@ -48,6 +48,7 @@
 pub(super) mod builder;
 pub(super) mod context;
 pub(super) mod coverage;
+pub mod dataframe;
 pub(super) mod fts;
 pub(super) mod planner;
 pub(super) mod prepare;
@@ -69,6 +70,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::optimize_projections::OptimizeProjections;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::push_down_limit::PushDownLimit;
@@ -117,9 +119,20 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
         return Ok(Arc::new(EmptyExec::new(schema)));
     }
 
-    let context = Arc::new(ScanPlanningContext::collect(scanner, &logical_plan).await?);
+    let plan = lower(logical_plan, planning_state(scanner)).await?;
+    Ok(apply_strict_batch_size(scanner, plan))
+}
 
-    let state = planning_state(scanner);
+/// Stages 2 through 4: prefetch, optimize, lower.
+///
+/// Separate from [`create_plan`] because nothing here reads the `Scanner` — the plan is the only
+/// input. Any plan whose leaf is a [`LanceScanSource`](source::LanceScanSource) can go through it,
+/// which is how [`dataframe`] plans a query DataFusion built.
+pub async fn lower(
+    logical_plan: LogicalPlan,
+    state: Arc<SessionState>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let context = Arc::new(ScanPlanningContext::collect(&logical_plan).await?);
 
     // Run the two logical stages directly rather than through `SessionState::optimize`, because the
     // rule lists are the one part of planning that genuinely varies per query — each Lance rule
@@ -136,13 +149,13 @@ pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
         |_, _| {},
     )?;
 
-    let plan = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
-        planner::LanceExtensionPlanner,
-    )])
-    .create_physical_plan(&optimized, state.as_ref())
-    .await?;
-
-    Ok(apply_strict_batch_size(scanner, plan))
+    Ok(
+        DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+            planner::LanceExtensionPlanner,
+        )])
+        .create_physical_plan(&optimized, state.as_ref())
+        .await?,
+    )
 }
 
 /// Rechunk the finished plan's output to an exact batch size, if the caller asked for one.

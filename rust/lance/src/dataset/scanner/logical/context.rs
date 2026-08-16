@@ -31,11 +31,12 @@ use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DocumentGranularity;
 
 use super::fts::{self, FtsIndexInfo};
+use super::scan_index::with_lance_source;
 use super::{TakeSettings, VectorSearchNode};
 use crate::Result;
+use crate::dataset::Dataset;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::translate_addr_treemap_to_row_ids;
-use crate::dataset::{Dataset, Scanner};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, ScalarIndexInfo};
 
 /// What a data overlay did to an index's entries.
@@ -176,33 +177,57 @@ impl ScanPlanningContext {
     /// Walk the unoptimized plan for what it will need, then fetch all of it.
     ///
     /// This is the only `async fn` in stages 2 through 4 that is allowed to do I/O.
-    pub async fn collect(scanner: &Scanner, plan: &LogicalPlan) -> Result<Self> {
-        let dataset = scanner.dataset.clone();
-        let mut searched_columns = Vec::new();
+    ///
+    /// Everything comes from the plan — the dataset and the scan-wide settings from its leaf, the
+    /// searched columns from its extension nodes. Nothing reads the `Scanner`, so any plan built
+    /// over a [`LanceScanSource`](super::source::LanceScanSource) can be planned this way, not just
+    /// one the scanner's builder produced.
+    pub async fn collect(plan: &LogicalPlan) -> Result<Self> {
+        let mut leaf = None;
+        let mut searches: Vec<(String, Option<DistanceType>)> = Vec::new();
         plan.apply(|node| {
             if let LogicalPlan::Extension(extension) = node
                 && let Some(search) = extension.node.as_any().downcast_ref::<VectorSearchNode>()
             {
-                searched_columns.push(search.query().column.clone());
+                let requested = search
+                    .distance_type_requested()
+                    .then(|| search.distance_type());
+                searches.push((search.query().column.clone(), requested));
+            }
+            if leaf.is_none() {
+                leaf = with_lance_source(node, |source| {
+                    (source.dataset().clone(), source.options().clone())
+                });
             }
             Ok(TreeNodeRecursion::Continue)
         })?;
+        let Some((dataset, options)) = leaf else {
+            return Err(crate::Error::internal(
+                "a Lance scan plan reached stage 2 without a Lance scan leaf".to_string(),
+            ));
+        };
 
-        let fragments = scanner
+        let fragments = options
             .fragments
             .clone()
-            .map(Arc::new)
             .unwrap_or_else(|| dataset.fragments().clone());
 
-        let mut vector = HashMap::with_capacity(searched_columns.len());
-        if !searched_columns.is_empty() {
+        let mut vector = HashMap::with_capacity(searches.len());
+        if !searches.is_empty() {
             let indices = dataset.load_indices().await?;
-            for column in searched_columns {
+            for (column, requested_metric) in searches {
                 if vector.contains_key(&column) {
                     continue;
                 }
-                if let Some(info) =
-                    load_vector_index(scanner, &indices, &column, &fragments).await?
+                if let Some(info) = load_vector_index(
+                    &dataset,
+                    options.index_segments.as_deref(),
+                    requested_metric,
+                    &indices,
+                    &column,
+                    &fragments,
+                )
+                .await?
                 {
                     vector.insert(column, info);
                 }
@@ -226,8 +251,11 @@ impl ScanPlanningContext {
             fragments,
             vector,
             fts,
-            fast_search: scanner.fast_search,
-            take_settings: take_settings(scanner),
+            fast_search: options.fast_search,
+            take_settings: TakeSettings {
+                fragments: options.fragments.clone(),
+                batch_size: options.batch_size.map(|size| size as u32),
+            },
             scalar_indices,
             index_staleness,
         })
@@ -394,17 +422,18 @@ async fn prefetch_index_staleness(
 }
 
 async fn load_vector_index(
-    scanner: &Scanner,
+    dataset: &Dataset,
+    index_segments: Option<&Vec<uuid::Uuid>>,
+    requested_metric: Option<DistanceType>,
     indices: &[IndexMetadata],
     column: &str,
     fragments: &[Fragment],
 ) -> Result<Option<VectorIndexInfo>> {
-    let dataset = &scanner.dataset;
     let Ok(field_id) = dataset.schema().field_id(column) else {
         return Ok(None);
     };
 
-    let segments = match scanner.index_segments.as_ref() {
+    let segments = match index_segments {
         Some(requested) => select_requested_segments(requested, indices, column, field_id)?,
         None => {
             let Some(index) = indices
@@ -425,8 +454,8 @@ async fn load_vector_index(
             .await?
             .metric_type(),
     };
-    if let Some(requested) = scanner.nearest.as_ref().and_then(|query| query.metric_type)
-        && scanner.index_segments.is_some()
+    if let Some(requested) = requested_metric
+        && index_segments.is_some()
         && requested != metric
     {
         // Without an explicit segment list a metric mismatch falls back to brute force. With one
@@ -492,13 +521,4 @@ fn select_requested_segments(
         ));
     }
     Ok(selected)
-}
-
-/// Read settings a take must honor, lifted off the `Scanner`. `None` fragments means "all of
-/// them", which is a different plan from an explicit list of every fragment.
-pub fn take_settings(scanner: &Scanner) -> TakeSettings {
-    TakeSettings {
-        fragments: scanner.fragments.clone().map(Arc::new),
-        batch_size: scanner.batch_size.map(|size| size as u32),
-    }
 }
