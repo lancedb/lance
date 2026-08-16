@@ -17,21 +17,21 @@ pub(super) async fn test_flat_knn_plan() {
     // `optimize_projections` reaching through the extension node via `necessary_children_exprs`;
     // `i` and `s` are fetched afterwards by the take.
     //
-    // The outer `SortExec` restates the distance ordering above the take. It survives because
-    // `FilteredReadExec` advertises no output ordering, so DataFusion cannot see that the take
-    // already emits rows in the order the top-k produced them.
+    // There is exactly one sort, and it is the top-k. The builder also restates the distance
+    // ordering above the take — a logical `Sort` is the only way to say "this is the result's
+    // order" — and `EnforceSorting` drops it, because the take advertises that it preserved the
+    // ordering it was given.
     assert_logical_plan(
         &dataset,
         |scan| scan.nearest("vec", &query_vector(), 5),
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@1 as _distance]
-  SortExec: expr=[_distance@1 ASC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
-    LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
-      ProjectionExec: expr=[_rowid@1 as _rowid, _distance@2 as _distance]
-        FilterExec: _distance@2 IS NOT NULL
-          SortExec: TopK(fetch=5), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST], preserve_partitioning=[false]
-            KNNVectorDistance: metric=l2
-              LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-              row_id=true, row_addr=false, full_filter=--, refine_filter=--",
+  LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
+    ProjectionExec: expr=[_rowid@1 as _rowid, _distance@2 as _distance]
+      FilterExec: _distance@2 IS NOT NULL
+        SortExec: TopK(fetch=5), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST], preserve_partitioning=[false]
+          KNNVectorDistance: metric=l2
+            LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
+            row_id=true, row_addr=false, full_filter=--, refine_filter=--",
     )
     .await
     .unwrap();

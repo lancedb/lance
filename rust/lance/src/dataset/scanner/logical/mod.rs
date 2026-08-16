@@ -75,6 +75,7 @@ use datafusion::optimizer::push_down_limit::PushDownLimit;
 use datafusion::optimizer::simplify_expressions::SimplifyExpressions;
 use datafusion::optimizer::{Analyzer, AnalyzerRule, Optimizer, OptimizerRule};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -283,13 +284,21 @@ fn optimizer_rules(
 ///
 /// `get_physical_optimizer` is tuned for the imperative path, where every node is constructed with
 /// its final configuration already chosen. A plan lowered from stock logical nodes is not like
-/// that: `DefaultPhysicalPlanner` emits a `HashJoinExec` with `PartitionMode::Auto`, which panics
-/// at `execute()` unless `JoinSelection` resolves it. It runs first so the Lance rules see a
-/// fully-resolved plan, the same way they do today.
+/// that, and two stock rules earn their place because of it:
+///
+/// * `JoinSelection` — `DefaultPhysicalPlanner` emits a `HashJoinExec` with `PartitionMode::Auto`,
+///   which panics at `execute()` unless something resolves it. It runs first so the Lance rules see
+///   a fully-resolved plan, the same way they do today.
+/// * `EnforceSorting` — the builder restates a search's ordering above the take, because a logical
+///   `Sort` is the only way to say "this order is the result's order". Whether the take preserved
+///   it is a physical fact, so only a physical rule can drop the restatement. It runs last, after
+///   `EnforceDistribution` has settled partitioning, which is what decides whether an ordering
+///   survives a merge.
 fn physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
         vec![Arc::new(JoinSelection::new())];
     rules.extend(get_physical_optimizer().rules);
+    rules.push(Arc::new(EnforceSorting::new()));
     rules
 }
 
