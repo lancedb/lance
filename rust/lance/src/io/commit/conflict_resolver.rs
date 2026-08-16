@@ -258,7 +258,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateBases { .. } => {
+            | Operation::UpdateBases { .. }
+            // An action set can modify fragments, but check_action_txn rejects
+            // any concurrency before the rebase state is consulted, so there is
+            // nothing to collect yet.
+            | Operation::UserOperation(_) => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
                 let read_fragments = is_create_index.then(|| dataset.fragments().as_ref().clone());
@@ -700,7 +704,22 @@ impl<'a> TransactionRebase<'a> {
             Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
+            Operation::UserOperation(_) => self.check_action_txn(other_transaction, other_version),
         }
+    }
+
+    /// Whether an action-based transaction conflicts with `other_transaction`.
+    ///
+    /// Reached from both directions: when the transaction being committed is
+    /// action-based, and when a concurrent one is.
+    fn check_action_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        // Conservative until action footprints land: an action-based
+        // transaction on either side means retry against the newer version.
+        Err(self.retryable_conflict_err(other_transaction, other_version))
     }
 
     fn check_delete_txn(
@@ -710,6 +729,11 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::Delete { .. } = &self.transaction.operation {
             match &other_transaction.operation {
+                // A concurrent action-based transaction is compared by action
+                // footprint rather than by operation pair.
+                Operation::UserOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
@@ -868,6 +892,11 @@ impl<'a> TransactionRebase<'a> {
             }
 
             match &other_transaction.operation {
+                // A concurrent action-based transaction is compared by action
+                // footprint rather than by operation pair.
+                Operation::UserOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
@@ -1081,6 +1110,11 @@ impl<'a> TransactionRebase<'a> {
         {
             let self_is_tagged_trim = is_tagged_trim_operation(new_indices, removed_indices);
             match &other_transaction.operation {
+                // A concurrent action-based transaction is compared by action
+                // footprint rather than by operation pair.
+                Operation::UserOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 // An overlay committed after this index's version is newer than
@@ -1555,6 +1589,11 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A concurrent action-based transaction is compared by action
+                // footprint rather than by operation pair.
+                Operation::UserOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
                 Operation::Append { .. }
@@ -1817,6 +1856,9 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A concurrent action-based transaction is compared by action
+            // footprint rather than by operation pair.
+            Operation::UserOperation(_) => self.check_action_txn(other_transaction, other_version),
             Operation::Overwrite { .. } => {
                 if self
                     .transaction
@@ -1870,6 +1912,9 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A concurrent action-based transaction is compared by action
+            // footprint rather than by operation pair.
+            Operation::UserOperation(_) => self.check_action_txn(other_transaction, other_version),
             // Append is not compatible with any operation that completely
             // overwrites the schema.
             Operation::Overwrite { .. }
@@ -1904,6 +1949,11 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::DataReplacement { replacements } = &self.transaction.operation {
             match &other_transaction.operation {
+                // A concurrent action-based transaction is compared by action
+                // footprint rather than by operation pair.
+                Operation::UserOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -2085,6 +2135,9 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A concurrent action-based transaction is compared by action
+            // footprint rather than by operation pair.
+            Operation::UserOperation(_) => self.check_action_txn(other_transaction, other_version),
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
@@ -2187,6 +2240,9 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A concurrent action-based transaction is compared by action
+            // footprint rather than by operation pair.
+            Operation::UserOperation(_) => self.check_action_txn(other_transaction, other_version),
             // See the MemWAL exception in check_create_index_txn.
             Operation::CreateIndex { new_indices, .. } => {
                 if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
@@ -2228,6 +2284,9 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A concurrent action-based transaction is compared by action
+            // footprint rather than by operation pair.
+            Operation::UserOperation(_) => self.check_action_txn(other_transaction, other_version),
             Operation::Append { .. }
             | Operation::Delete { .. }
             | Operation::Overwrite { .. }
@@ -2259,6 +2318,9 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A concurrent action-based transaction is compared by action
+            // footprint rather than by operation pair.
+            Operation::UserOperation(_) => self.check_action_txn(other_transaction, other_version),
             Operation::Overwrite { .. } | Operation::Restore { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
@@ -2289,6 +2351,9 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A concurrent action-based transaction is compared by action
+            // footprint rather than by operation pair.
+            Operation::UserOperation(_) => self.check_action_txn(other_transaction, other_version),
             // Project is compatible with anything that doesn't change the schema
             Operation::Append { .. }
             | Operation::Update { .. }
@@ -2329,6 +2394,11 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A concurrent action-based transaction is compared by action
+                // footprint rather than by operation pair.
+                Operation::UserOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::Overwrite { .. } => {
                     // Updates to schema metadata or field metadata conflict with any kind
                     // of overwrite.
@@ -2396,6 +2466,11 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A concurrent action-based transaction is compared by action
+                // footprint rather than by operation pair.
+                Operation::UserOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
                     ..
@@ -2573,7 +2648,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::UpdateBases { .. } => Ok(self.transaction),
+            | Operation::UpdateBases { .. }
+            // Rebasing an action set (relocating its minted ids onto the newer
+            // version) is not implemented yet; check_action_txn rejects before
+            // this is reached.
+            | Operation::UserOperation(_) => Ok(self.transaction),
             Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
                  and cannot be committed by this version",
@@ -6380,7 +6459,8 @@ mod tests {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
+            | Operation::UpdateMemWalState { .. }
+            | Operation::UserOperation(_) => Box::new(std::iter::empty()),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
