@@ -113,6 +113,42 @@ impl EvaluatedIndex {
             std::mem::take(&mut self.index_result.lower).also_block(block_list.clone());
         self
     }
+
+    /// Whether planning can require full metadata from `fragment`.
+    ///
+    /// The upper mask contains every row that might match. For address-style row ids its high
+    /// 32 bits identify the fragment directly. Stable row ids need the fragment's row-id
+    /// sequence to make the same decision, but this still avoids opening deletion metadata,
+    /// row counts, and data files for non-candidate fragments.
+    async fn needs_fragment_metadata(
+        &self,
+        dataset: &Dataset,
+        fragment: &Fragment,
+        only_indexed_fragments: bool,
+    ) -> Result<bool> {
+        let fragment_id = fragment.id as u32;
+        if !self.applicable_fragments.contains(fragment_id) {
+            return Ok(!only_indexed_fragments);
+        }
+        let Some(candidate_rows) = self.index_result.upper.allow_list() else {
+            // A block-list may select rows from every fragment.
+            return Ok(true);
+        };
+        if candidate_rows.iter().next().is_none() {
+            return Ok(false);
+        }
+        if dataset.manifest.uses_stable_row_ids() {
+            let row_ids = load_row_id_sequence(dataset, fragment).await?;
+            return Ok(!row_ids
+                .mask_to_offset_ranges(&self.index_result.upper)
+                .is_empty());
+        }
+        Ok(match candidate_rows.get(&fragment_id) {
+            Some(RowAddrSelection::Full) => true,
+            Some(RowAddrSelection::Partial(rows)) => !rows.is_empty(),
+            None => false,
+        })
+    }
 }
 
 /// A fragment along with ranges of row offsets to read
@@ -2159,20 +2195,54 @@ impl FilteredReadExec {
                     .unwrap_or_else(|| dataset.fragments().clone());
 
                 let with_deleted_rows = options.with_deleted_rows;
+                // A range before filtering is expressed in dataset/fragment order. Planning it
+                // needs every preceding fragment's logical row count, including fragments that
+                // the index later eliminates. Without that range, discard covered non-candidate
+                // fragments before opening their full metadata.
+                let needs_fragment_offsets = options.scan_range_before_filter.is_some();
+                let only_indexed_fragments = options.only_indexed_fragments;
                 let frag_futs = fragments
                     .iter()
-                    .map(|frag| {
-                        Result::Ok(FilteredReadStream::load_fragment(
-                            dataset.clone(),
-                            frag.clone(),
-                            with_deleted_rows,
-                        ))
+                    .map(|fragment| {
+                        let dataset = dataset.clone();
+                        let evaluated_index = evaluated_index.clone();
+                        let fragment = fragment.clone();
+                        async move {
+                            let needs_metadata = if needs_fragment_offsets {
+                                true
+                            } else if let Some(index) = evaluated_index {
+                                index
+                                    .needs_fragment_metadata(
+                                        dataset.as_ref(),
+                                        &fragment,
+                                        only_indexed_fragments,
+                                    )
+                                    .await?
+                            } else {
+                                !only_indexed_fragments
+                            };
+                            if needs_metadata {
+                                Ok::<_, Error>(Some(
+                                    FilteredReadStream::load_fragment(
+                                        dataset,
+                                        fragment,
+                                        with_deleted_rows,
+                                    )
+                                    .await?,
+                                ))
+                            } else {
+                                Ok::<_, Error>(None)
+                            }
+                        }
                     })
                     .collect::<Vec<_>>();
                 let loaded_fragments = futures::stream::iter(frag_futs)
-                    .try_buffered(io_parallelism)
-                    .try_collect::<Vec<_>>()
-                    .await?;
+                    .buffered(io_parallelism)
+                    .try_collect::<Vec<Option<_>>>()
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
 
                 // Plan the scan; the metadata loaded here drops when planning
                 // finishes — stream construction rebuilds I/O-free handles
@@ -3443,6 +3513,227 @@ mod tests {
         Arc::new(UInt32Array::from_iter_values(
             ranges.into_iter().flat_map(|r| r.into_iter()),
         ))
+    }
+
+    async fn metadata_pruning_dataset(uses_stable_row_ids: bool) -> (TempStrDir, Arc<Dataset>) {
+        let tmp_path = TempStrDir::default();
+        let dataset = Arc::new(
+            gen_batch()
+                .col("value", array::step::<UInt32Type>())
+                .into_dataset_with_params(
+                    tmp_path.as_str(),
+                    FragmentCount::from(4),
+                    FragmentRowCount::from(10),
+                    Some(WriteParams {
+                        max_rows_per_file: 10,
+                        enable_stable_row_ids: uses_stable_row_ids,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            dataset.manifest().uses_stable_row_ids(),
+            uses_stable_row_ids
+        );
+        (tmp_path, dataset)
+    }
+
+    fn index_result_input(
+        result: IndexExprResult,
+        fragments: &[Fragment],
+    ) -> Arc<dyn ExecutionPlan> {
+        let covered: RoaringBitmap = fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        index_result_input_with_coverage(result, &covered)
+    }
+
+    fn index_result_input_with_coverage(
+        result: IndexExprResult,
+        covered: &RoaringBitmap,
+    ) -> Arc<dyn ExecutionPlan> {
+        let batch = result
+            .serialize(covered, IndexExprResultWireFormat::default())
+            .unwrap();
+        let schema = batch.schema();
+        let index_stream = futures::stream::once(async move { Ok(batch) });
+        Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            index_stream,
+        ))))
+    }
+
+    /// An exact empty index result should finish without opening metadata for any covered
+    /// fragment. The invalid file paths are sentinels that make an attempted open fail, turning
+    /// the metadata-I/O behavior into a deterministic regression assertion.
+    #[rstest]
+    #[case::address(false)]
+    #[case::stable(true)]
+    #[tokio::test]
+    async fn test_exact_empty_index_skips_fragment_metadata(#[case] uses_stable_row_ids: bool) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+
+        let mut fragments = dataset.fragments().as_ref().clone();
+        for fragment in &mut fragments {
+            fragment.physical_rows = None;
+            fragment.files[0].path = "must-not-open.lance".to_string();
+            if uses_stable_row_ids {
+                fragment.row_id_meta = None;
+            }
+        }
+        let index_input = index_result_input(
+            IndexExprResult::exact(RowAddrMask::allow_nothing()),
+            &fragments,
+        );
+
+        let options =
+            FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(fragments));
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(batches.is_empty());
+    }
+
+    /// A sparse non-empty result should only open full metadata for candidate fragments. Stable
+    /// row ids still need the inline row-id sequence to route candidates, but must not open the
+    /// data file or deletion metadata of non-candidate fragments.
+    #[rstest]
+    #[case::address(false)]
+    #[case::stable(true)]
+    #[tokio::test]
+    async fn test_sparse_index_skips_non_candidate_fragment_metadata(
+        #[case] uses_stable_row_ids: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+
+        let mut fragments = dataset.fragments().as_ref().clone();
+        for fragment in fragments.iter_mut().skip(1) {
+            fragment.physical_rows = None;
+            fragment.files[0].path = "must-not-open.lance".to_string();
+        }
+        // The initial stable row ids are 0..40, so row id 3 and address (0, 3) select the same
+        // physical row in their respective modes.
+        let candidate = if uses_stable_row_ids {
+            3
+        } else {
+            RowAddress::new_from_parts(0, 3).into()
+        };
+        let candidates = RowAddrTreeMap::from_iter([candidate]);
+        let index_input = index_result_input(
+            IndexExprResult::exact(RowAddrMask::from_allowed(candidates)),
+            &fragments,
+        );
+
+        let options =
+            FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(fragments));
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        assert_eq!(batch["value"].as_primitive::<UInt32Type>().values(), &[3]);
+    }
+
+    /// Pruning must use the upper bound of an inexact result. The lower bound alone contains row
+    /// 3, while row 13 is only a possible match in the upper bound and must still be read.
+    #[rstest]
+    #[case::address(false)]
+    #[case::stable(true)]
+    #[tokio::test]
+    async fn test_refined_index_prunes_from_upper_bound(#[case] uses_stable_row_ids: bool) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+
+        let mut fragments = dataset.fragments().as_ref().clone();
+        for fragment in fragments.iter_mut().skip(2) {
+            fragment.physical_rows = None;
+            fragment.files[0].path = "must-not-open.lance".to_string();
+        }
+        let candidate = |fragment_id, offset, stable_row_id| {
+            if uses_stable_row_ids {
+                stable_row_id
+            } else {
+                RowAddress::new_from_parts(fragment_id, offset).into()
+            }
+        };
+        let definite_row = candidate(0, 3, 3);
+        let possible_row = candidate(1, 3, 13);
+        let result = IndexExprResult::new(
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([definite_row])),
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([definite_row, possible_row])),
+        );
+        let index_input = index_result_input(result, &fragments);
+
+        let options =
+            FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(fragments));
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        assert_eq!(
+            batch["value"].as_primitive::<UInt32Type>().values(),
+            &[3, 13]
+        );
+    }
+
+    /// An empty result only eliminates fragments covered by the index. Uncovered fragments must
+    /// still be scanned for a complete query, while fast search intentionally omits them.
+    #[rstest]
+    #[case::address_complete(false, false)]
+    #[case::address_fast(false, true)]
+    #[case::stable_complete(true, false)]
+    #[case::stable_fast(true, true)]
+    #[tokio::test]
+    async fn test_empty_index_preserves_uncovered_fragments(
+        #[case] uses_stable_row_ids: bool,
+        #[case] only_indexed_fragments: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+
+        let mut fragments = dataset.fragments().as_ref().clone();
+        let covered: RoaringBitmap = fragments
+            .iter()
+            .take(3)
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        for fragment in fragments.iter_mut().take(3) {
+            fragment.physical_rows = None;
+            fragment.files[0].path = "must-not-open.lance".to_string();
+            if uses_stable_row_ids {
+                fragment.row_id_meta = None;
+            }
+        }
+        let index_input = index_result_input_with_coverage(
+            IndexExprResult::exact(RowAddrMask::allow_nothing()),
+            &covered,
+        );
+
+        let mut options =
+            FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(fragments));
+        if only_indexed_fragments {
+            options = options.with_only_indexed_fragments();
+        }
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        let expected = if only_indexed_fragments {
+            UInt32Array::from(Vec::<u32>::new())
+        } else {
+            UInt32Array::from((30..40).collect::<Vec<_>>())
+        };
+        assert_eq!(batch["value"].as_ref(), &expected);
     }
 
     /// Take-shaped masked reads consolidate their tiny per-fragment batches;
