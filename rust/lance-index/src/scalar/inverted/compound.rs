@@ -2035,6 +2035,7 @@ impl<'a> BooleanScorer<'a> {
                     as BoxScorer<'a>,
             )
         };
+        let metrics = if prohibited.is_some() { metrics } else { None };
         Ok(Self {
             driver,
             optional,
@@ -2050,6 +2051,40 @@ impl<'a> BooleanScorer<'a> {
             metrics,
             work: BooleanWork::default(),
         })
+    }
+
+    fn accept_driver_doc_without_prohibited(&mut self) -> Result<bool> {
+        debug_assert!(self.prohibited.is_none());
+        let Some(current) = self.driver.doc() else {
+            return Ok(false);
+        };
+        if !self.driver.matches()? {
+            return Ok(false);
+        }
+        self.optional_matches = if let Some(optional) = &mut self.optional {
+            optional.advance(current)? == Some(current) && optional.matches()?
+        } else {
+            false
+        };
+        self.current = Some(current);
+        Ok(true)
+    }
+
+    fn next_accepted_without_prohibited(&mut self, target: Option<u64>) -> Result<Option<u64>> {
+        debug_assert!(self.prohibited.is_none());
+        let mut doc = match target {
+            Some(target) => self.driver.advance(target)?,
+            None => self.driver.next()?,
+        };
+        while doc.is_some() {
+            if self.accept_driver_doc_without_prohibited()? {
+                return Ok(self.current);
+            }
+            doc = self.driver.next()?;
+        }
+        self.current = None;
+        self.optional_matches = false;
+        Ok(None)
     }
 
     fn set_current(&mut self, current: Option<u64>) {
@@ -2139,14 +2174,22 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn next(&mut self) -> Result<Option<u64>> {
-        self.position(None)
+        if self.prohibited.is_none() {
+            self.next_accepted_without_prohibited(None)
+        } else {
+            self.position(None)
+        }
     }
 
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
-        self.position(Some(target))
+        if self.prohibited.is_none() {
+            self.next_accepted_without_prohibited(Some(target))
+        } else {
+            self.position(Some(target))
+        }
     }
 
     fn cost(&self) -> usize {
@@ -2154,6 +2197,20 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn score(&mut self) -> Result<f32> {
+        if self.prohibited.is_none() {
+            if self.current.is_none() {
+                return Err(Error::internal(
+                    "Boolean FTS scorer is not positioned on a document",
+                ));
+            }
+            let mut score = self.driver.score()?;
+            if self.optional_matches
+                && let Some(optional) = &mut self.optional
+            {
+                score += optional.score()?;
+            }
+            return checked_score(score, "BooleanQuery scorer");
+        }
         let current = self
             .current
             .ok_or_else(|| Error::internal("Boolean FTS scorer is not positioned on a document"))?;
@@ -2210,13 +2267,15 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
-        if min_score.is_nan() {
-            return Err(Error::invalid_input(
-                "minimum competitive FTS score cannot be NaN",
-            ));
-        }
-        if min_score > self.min_competitive_score {
-            self.min_competitive_score = min_score;
+        if self.prohibited.is_some() {
+            if min_score.is_nan() {
+                return Err(Error::invalid_input(
+                    "minimum competitive FTS score cannot be NaN",
+                ));
+            }
+            if min_score > self.min_competitive_score {
+                self.min_competitive_score = min_score;
+            }
         }
         // When SHOULD is also present, a global sibling bound is required to
         // translate the parent threshold safely. The combined block bound still
@@ -2228,6 +2287,9 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn matches(&mut self) -> Result<bool> {
+        if self.prohibited.is_none() {
+            return Ok(self.current.is_some());
+        }
         let Some(score) = self.ensure_positive_score()? else {
             return Ok(false);
         };
@@ -2255,8 +2317,12 @@ impl Drop for BooleanScorer<'_> {
         let Some(metrics) = self.metrics else {
             return;
         };
-        metrics.record_compound_positive_survivors(self.work.positive_survivors);
-        metrics.record_compound_must_not_probes(self.work.must_not_probes);
+        if self.work.positive_survivors > 0 {
+            metrics.record_compound_positive_survivors(self.work.positive_survivors);
+        }
+        if self.work.must_not_probes > 0 {
+            metrics.record_compound_must_not_probes(self.work.must_not_probes);
+        }
     }
 }
 
@@ -2986,6 +3052,7 @@ mod tests {
 
     #[derive(Default)]
     struct BooleanMetrics {
+        reports: AtomicUsize,
         positive_survivors: AtomicUsize,
         must_not_probes: AtomicUsize,
     }
@@ -2998,11 +3065,13 @@ mod tests {
         fn record_comparisons(&self, _num_comparisons: usize) {}
 
         fn record_compound_positive_survivors(&self, num_candidates: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
             self.positive_survivors
                 .fetch_add(num_candidates, AtomicOrdering::Relaxed);
         }
 
         fn record_compound_must_not_probes(&self, num_probes: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
             self.must_not_probes
                 .fetch_add(num_probes, AtomicOrdering::Relaxed);
         }
@@ -3207,6 +3276,7 @@ mod tests {
     struct ScorerWork {
         advances: AtomicUsize,
         confirmations: AtomicUsize,
+        scores: AtomicUsize,
         shallow_advances: AtomicUsize,
         bounds: AtomicUsize,
     }
@@ -3246,6 +3316,7 @@ mod tests {
         }
 
         fn score(&mut self) -> Result<f32> {
+            self.work.scores.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.score()
         }
 
@@ -3634,6 +3705,7 @@ mod tests {
         assert_eq!(results, rows(&[(99, 100.0)]));
         assert_eq!(probes, 1);
         assert_eq!(prohibited_confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 2);
         assert_eq!(metrics.positive_survivors.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(metrics.must_not_probes.load(AtomicOrdering::Relaxed), 1);
         assert!(
@@ -3677,6 +3749,94 @@ mod tests {
         );
         assert_eq!(positive_confirmations.load(AtomicOrdering::Relaxed), 2);
         assert_eq!(prohibited_approximations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn boolean_without_must_not_keeps_confirmed_iteration_and_skips_metrics() {
+        let metrics = BooleanMetrics::default();
+        let (positive, positive_approximations, positive_confirmations) =
+            two_phase(&[(0, 1.0), (1, 2.0)], vec![1], Some(1.0));
+        let (positive, positive_work) = instrumented(positive);
+        {
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                Vec::new(),
+                vec![positive],
+                Vec::new(),
+                Some(&metrics),
+            )
+            .unwrap();
+
+            assert_eq!(scorer.next().unwrap(), Some(1));
+            assert_eq!(positive_work.scores.load(AtomicOrdering::Relaxed), 0);
+            assert!(scorer.matches().unwrap());
+            assert_eq!(positive_work.scores.load(AtomicOrdering::Relaxed), 0);
+            assert_eq!(scorer.score().unwrap(), 2.0);
+            assert_eq!(positive_work.scores.load(AtomicOrdering::Relaxed), 1);
+            assert_eq!(scorer.next().unwrap(), None);
+        }
+
+        assert_eq!(positive_approximations.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(positive_confirmations.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn boolean_without_must_not_positions_signed_optional_after_confirmation() {
+        let (required, _, required_confirmations) =
+            two_phase(&[(0, 1.0), (1, 2.0)], vec![1], Some(1.0));
+        let signed_optional = Box::new(
+            BoostScorer::try_new(
+                materialized(&[(0, 4.0), (1, 4.0)]),
+                materialized(&[(0, 1.0), (1, 1.0)]),
+                0.5,
+            )
+            .unwrap(),
+        );
+        let (signed_optional, optional_work) = instrumented(signed_optional);
+        let mut scorer =
+            BooleanScorer::try_new(vec![signed_optional], vec![required], Vec::new()).unwrap();
+
+        assert_eq!(
+            TopKCollector::new(1).collect(&mut scorer).unwrap(),
+            rows(&[(1, 5.5)])
+        );
+        assert_eq!(required_confirmations.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(optional_work.advances.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn outer_boolean_without_must_not_preserves_inner_delayed_probes() {
+        let metrics = BooleanMetrics::default();
+        let (prohibited, prohibited_approximations, prohibited_confirmations) =
+            two_phase(&[(0, 0.0), (1, 0.0)], Vec::new(), Some(1.0));
+        let inner = BooleanScorer::try_new_with_metrics(
+            Vec::new(),
+            vec![materialized(&[(0, 1.0), (1, 50.0)])],
+            vec![prohibited],
+            Some(&metrics),
+        )
+        .unwrap();
+        let results = {
+            let mut outer = BooleanScorer::try_new_with_metrics(
+                Vec::new(),
+                vec![Box::new(inner)],
+                Vec::new(),
+                Some(&metrics),
+            )
+            .unwrap();
+            let competitive_score = Arc::new(CompetitiveScore::default());
+            competitive_score.raise(50.0);
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut outer)
+                .unwrap()
+        };
+
+        assert_eq!(results, rows(&[(1, 50.0)]));
+        assert_eq!(prohibited_approximations.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(prohibited_confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(metrics.positive_survivors.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(metrics.must_not_probes.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]
