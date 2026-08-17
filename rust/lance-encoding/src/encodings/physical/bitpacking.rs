@@ -110,8 +110,8 @@ impl InlineBitpacking {
             let bit_width = bit_widths_array.value(i) as usize;
             output.push(T::from_usize(bit_width).unwrap());
             let output_len = output.len();
+            output.resize(output_len + *packed_chunk_size, T::from_usize(0).unwrap());
             unsafe {
-                output.set_len(output_len + *packed_chunk_size);
                 BitPacking::unchecked_pack(
                     bit_width,
                     &data_buffer[start_elem..][..ELEMS_PER_CHUNK as usize],
@@ -137,8 +137,11 @@ impl InlineBitpacking {
         let bit_width = bit_widths_array.value(bit_widths_array.len() - 1) as usize;
         output.push(T::from_usize(bit_width).unwrap());
         let output_len = output.len();
+        output.resize(
+            output_len + packed_chunk_sizes[bit_widths_array.len() - 1],
+            T::from_usize(0).unwrap(),
+        );
         unsafe {
-            output.set_len(output_len + packed_chunk_sizes[bit_widths_array.len() - 1]);
             BitPacking::unchecked_pack(
                 bit_width,
                 &last_chunk,
@@ -368,12 +371,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     let last_chunk_is_runt = data_buffer.len() % ELEMS_PER_CHUNK as usize != 0;
     let words_per_chunk = (ELEMS_PER_CHUNK as usize * compressed_bits_per_value)
         .div_ceil(data.bits_per_value as usize);
-    #[allow(clippy::uninit_vec)]
-    let mut output: Vec<T> = Vec::with_capacity(num_chunks * words_per_chunk);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        output.set_len(num_chunks * words_per_chunk);
-    }
+    let mut output: Vec<T> = vec![T::from_usize(0).unwrap(); num_chunks * words_per_chunk];
 
     let num_whole_chunks = if last_chunk_is_runt {
         num_chunks - 1
@@ -401,10 +399,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     }
 
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
-    // Safety: output ensures to have those values.
-    unsafe {
-        output.set_len(num_whole_chunks * words_per_chunk);
-    }
+    output.truncate(num_whole_chunks * words_per_chunk);
     let remaining_items = data_buffer.len() - last_chunk_start;
 
     let uncompressed_bits = data.bits_per_value as usize;
@@ -419,9 +414,8 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
         let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
         last_chunk[..remaining_items].copy_from_slice(&data_buffer[last_chunk_start..]);
         let start = output.len();
+        output.resize(start + words_per_chunk, T::from_usize(0).unwrap());
         unsafe {
-            // Capacity reserves a full chunk for each block; extend the visible length and fill it immediately.
-            output.set_len(start + words_per_chunk);
             BitPacking::unchecked_pack(
                 compressed_bits_per_value,
                 &last_chunk,
@@ -457,13 +451,10 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     let tail_is_raw = tail_values > 0 && compressed_words.len() == expected_new_len;
 
     let extra_tail_capacity = ELEMS_PER_CHUNK as usize;
-    #[allow(clippy::uninit_vec)]
     let mut decompressed: Vec<T> =
         Vec::with_capacity(num_values.saturating_add(extra_tail_capacity));
     let chunk_value_len = num_whole_chunks * ELEMS_PER_CHUNK as usize;
-    unsafe {
-        decompressed.set_len(chunk_value_len);
-    }
+    decompressed.resize(chunk_value_len, T::from_usize(0).unwrap());
 
     for chunk_idx in 0..num_whole_chunks {
         let input_start = chunk_idx * words_per_chunk;
@@ -488,9 +479,10 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
         } else {
             let tail_start = expected_full_words;
             let output_start = decompressed.len();
-            unsafe {
-                decompressed.set_len(output_start + ELEMS_PER_CHUNK as usize);
-            }
+            decompressed.resize(
+                output_start + ELEMS_PER_CHUNK as usize,
+                T::from_usize(0).unwrap(),
+            );
             unsafe {
                 BitPacking::unchecked_unpack(
                     compressed_bits_per_value,
