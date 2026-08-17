@@ -306,7 +306,7 @@ impl Mul for i32x8 {
     fn mul(self, rhs: Self) -> Self::Output {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_mul_epi32(self.0, rhs.0))
+            Self(_mm256_mullo_epi32(self.0, rhs.0))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -329,5 +329,23 @@ mod tests {
     #[test]
     fn test_slice_conversion_rejects_short_input() {
         assert!(std::panic::catch_unwind(|| i32x8::from(&[0; 7][..])).is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mul_is_lane_wise_on_x86() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let lhs = i32x8::from(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let rhs = i32x8::from(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let product = lhs * rhs;
+        let mut actual = [0; 8];
+        unsafe {
+            product.store_unaligned(actual.as_mut_ptr());
+        }
+
+        assert_eq!(actual, [1, 4, 9, 16, 25, 36, 49, 64]);
     }
 }
