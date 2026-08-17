@@ -2107,14 +2107,25 @@ impl<'a> BooleanScorer<'a> {
         // With no finite floor, every finite positive score is competitive.
         // Probe after positive confirmation and score only documents that are
         // not prohibited, avoiding wasted scoring when exclusions are dense.
-        self.set_current(Some(current));
-        self.positive_checked_doc = Some(current);
-        self.positive_survivor_doc = Some(current);
         self.work.positive_survivors += 1;
-        if !self.ensure_not_prohibited()? {
+        self.work.must_not_probes += 1;
+        let prohibited_matches = {
+            let prohibited = self
+                .prohibited
+                .as_mut()
+                .expect("unbounded MUST_NOT path requires a prohibited scorer");
+            prohibited.advance(current)? == Some(current) && prohibited.matches()?
+        };
+        if prohibited_matches {
             return Ok(false);
         }
 
+        // Only returned documents need repeat-call caches. Rejected documents
+        // remain internal to this loop and are never observable by a caller.
+        self.set_current(Some(current));
+        self.positive_checked_doc = Some(current);
+        self.positive_survivor_doc = Some(current);
+        self.prohibited_checked_doc = Some(current);
         self.optional_matches = if let Some(optional) = &mut self.optional {
             optional.advance(current)? == Some(current) && optional.matches()?
         } else {
