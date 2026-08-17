@@ -931,20 +931,14 @@ impl<'a> RabitDistCalculator<'a> {
     /// Fill `dists[0..n]` with exact per-row binary distances computed
     /// directly from the f32 dist table — the fallback when the quantized
     /// reconstruction scale would be non-finite ([`DistTableDequant::Exact`]).
-    #[allow(clippy::uninit_vec)]
     fn fill_exact_binary_distances(&self, n: usize, code_len: usize, dists: &mut Vec<f32>) {
         dists.clear();
-        dists.reserve(n);
-        // SAFETY: the loop initializes every element in [0, n).
-        unsafe {
-            dists.set_len(n);
-        }
+        dists.resize(n, 0.0);
         dists.iter_mut().enumerate().for_each(|(id, dist)| {
             *dist = compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table);
         });
     }
 
-    #[allow(clippy::uninit_vec)]
     fn binary_distances_with_scratch(
         &self,
         n: usize,
@@ -978,11 +972,7 @@ impl<'a> RabitDistCalculator<'a> {
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
         quantized_dists.clear();
-        quantized_dists.reserve(simd_len);
-        // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
-        unsafe {
-            quantized_dists.set_len(simd_len);
-        }
+        quantized_dists.resize(simd_len, 0);
         simd::dist_table::sum_4bit_dist_table(
             simd_len,
             code_len,
@@ -995,12 +985,7 @@ impl<'a> RabitDistCalculator<'a> {
         let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
         let sum_min = num_tables as f32 * qmin;
         dists.clear();
-        dists.reserve(n);
-        // SAFETY: the SIMD section below writes [0, simd_len), and the
-        // remainder section writes [simd_len, n).
-        unsafe {
-            dists.set_len(n);
-        }
+        dists.resize(n, 0.0);
         let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
         simd_dists
             .iter_mut()
@@ -1024,7 +1009,6 @@ impl<'a> RabitDistCalculator<'a> {
         simd_len
     }
 
-    #[allow(clippy::uninit_vec)]
     fn binary_distances_hacc_with_scratch(
         &self,
         n: usize,
@@ -1048,11 +1032,7 @@ impl<'a> RabitDistCalculator<'a> {
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
         quantized_dists.clear();
-        quantized_dists.reserve(simd_len);
-        // SAFETY: sum_4bit_hacc_dist_table overwrites each element in the batch range.
-        unsafe {
-            quantized_dists.set_len(simd_len);
-        }
+        quantized_dists.resize(simd_len, 0);
         simd::dist_table::sum_4bit_hacc_dist_table(
             simd_len,
             code_len,
@@ -1065,12 +1045,7 @@ impl<'a> RabitDistCalculator<'a> {
         let num_tables = quantized_dist_table.len() / SEGMENT_NUM_CODES;
         let sum_min = num_tables as f32 * qmin;
         dists.clear();
-        dists.reserve(n);
-        // SAFETY: the batch section writes [0, simd_len), and the
-        // remainder section writes [simd_len, n).
-        unsafe {
-            dists.set_len(n);
-        }
+        dists.resize(n, 0.0);
         let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
         simd_dists
             .iter_mut()
@@ -1102,7 +1077,6 @@ impl<'a> RabitDistCalculator<'a> {
         }
     }
 
-    #[allow(clippy::uninit_vec)]
     fn one_bit_distances_with_scratch(
         &self,
         n: usize,
@@ -1131,7 +1105,6 @@ impl<'a> RabitDistCalculator<'a> {
         });
     }
 
-    #[allow(clippy::uninit_vec)]
     fn apply_raw_query_multi_bit_distances(
         &self,
         simd_len: usize,
@@ -1164,11 +1137,7 @@ impl<'a> RabitDistCalculator<'a> {
                         quantized_dists_table,
                     );
                     quantized_dists.clear();
-                    quantized_dists.reserve(fastscan_len);
-                    // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
-                    unsafe {
-                        quantized_dists.set_len(fastscan_len);
-                    }
+                    quantized_dists.resize(fastscan_len, 0);
                     simd::dist_table::sum_4bit_dist_table(
                         fastscan_len,
                         fastscan_code_len,
@@ -1827,7 +1796,6 @@ impl DistCalculator for RabitDistCalculator<'_> {
     }
 
     #[inline(always)]
-    #[allow(clippy::uninit_vec)]
     fn distance_all_with_scratch(
         &self,
         _: usize,
