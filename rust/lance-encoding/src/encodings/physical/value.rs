@@ -6,6 +6,7 @@ use arrow_buffer::{BooleanBufferBuilder, bit_util};
 use crate::buffer::LanceBuffer;
 use crate::compression::{
     BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
+    require_block_payload,
 };
 use crate::data::{
     BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock, NullableDataBlock,
@@ -458,15 +459,17 @@ impl ValueEncoder {
 }
 
 impl BlockCompressor for ValueEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let data = match data {
-            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
-            _ => unimplemented!(
-                "Cannot compress block of type {} with ValueEncoder",
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(format!(
+                "ValueEncoder cannot compress a {} block",
                 data.name()
-            ),
+            )));
         };
-        Ok(data)
+        Ok((
+            Some(fixed_width.data),
+            ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+        ))
     }
 }
 
@@ -575,7 +578,8 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Flat block")?;
         let block = self.buffer_to_block(data, num_values);
         assert_eq!(block.num_values(), num_values);
         Ok(block)
