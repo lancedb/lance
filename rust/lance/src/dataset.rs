@@ -3083,9 +3083,9 @@ impl Dataset {
                     fragment.id
                 ))
             })? as u64;
-            let end = next_row_id.checked_add(physical_rows).ok_or_else(|| {
-                Error::internal("Row ID overflow during stable row ID migration")
-            })?;
+            let end = next_row_id
+                .checked_add(physical_rows)
+                .ok_or_else(|| Error::internal("Row ID overflow during stable row ID migration"))?;
             let sequence = RowIdSequence::from(next_row_id..end);
             fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
             next_row_id = end;
