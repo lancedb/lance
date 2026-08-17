@@ -1,0 +1,431 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! A logical-plan read path for the scanner.
+//!
+//! [`Scanner::create_plan`](crate::dataset::Scanner::create_plan) builds physical plans directly.
+//! This module is the alternative: assemble the query as a DataFusion [`LogicalPlan`], run a
+//! curated rule set over it, and lower it with an `ExtensionPlanner`.
+//!
+//! Planning is staged so that the parts which must be synchronous can be:
+//!
+//! 1. **Build** the naive logical plan from `Scanner` state. Sync, no I/O.
+//! 2. **Collect** a [`ScanPlanningContext`](context::ScanPlanningContext) by walking that plan and
+//!    prefetching everything the later stages need — index metadata, plus the manifest's fragment
+//!    metadata, which is already in memory. This is the only stage that does I/O.
+//! 3. **Derive** the Lance-owned rules from the context. Each rule holds an
+//!    `Arc<ScanPlanningContext>`, which is how a synchronous rule gets at information that took
+//!    I/O to obtain. Rewrites that must happen for the plan to be *correct* are `AnalyzerRule`s;
+//!    only rewrites that are optional are `OptimizerRule`s.
+//! 4. **Optimize and lower**, analyzer then logical rules then physical.
+//!
+//! This path is off by default. See [`is_enabled`].
+//!
+//! # The pipeline
+//!
+//! ```text
+//! Scanner (the user's query, as builder state)
+//!    │
+//!    ├─ validate_options + ensure_supported
+//!    │     exhaustive destructure of Scanner: an option is read, rejected, or explained
+//!    │
+//!    ├─ 1. builder::build .............................................   builder   [sync]
+//!    │     Scanner state -> the naive LogicalPlan, index-unaware
+//!    │
+//!    ├─ 2. ScanPlanningContext::collect ...............................   context   [async]
+//!    │     walk the plan, prefetch every fact the rules will need
+//!    │     *** the only stage that does I/O ***
+//!    │
+//!    ├─ 3a. Analyzer::with_rules(analyzer_rules(&context)) ............             [sync]
+//!    │      the rewrites a correct plan requires; each runs exactly once
+//!    │
+//!    ├─ 3b. Optimizer::with_rules(optimizer_rules(&context)) ..........             [sync]
+//!    │      stock DataFusion rules, plus the mandatory rewrites that need to see
+//!    │      where PushDownFilter left the predicates; runs to a fixed point
+//!    │
+//!    └─ 4. DefaultPhysicalPlanner + LanceExtensionPlanner .............   planner   [async]
+//!          Lance nodes -> exec nodes, TableScan -> LanceScanSource::scan,
+//!          then the physical rules
+//!    ▼
+//! Arc<dyn ExecutionPlan>
+//! ```
+//!
+//! The staging answers one question: an `OptimizerRule` is synchronous, so how does it get at index
+//! metadata? It does not fetch it — stage 2 fetches everything up front and every rule holds an
+//! `Arc<ScanPlanningContext>`.
+//!
+//! Stage 4 *is* async — DataFusion's `ExtensionPlanner` and `TableProvider::scan` both are — so
+//! keeping I/O out of it is a choice rather than a language constraint. It is what lets the same
+//! decisions be made by synchronous rules in stage 3, where they are visible in the plan instead of
+//! buried in a constructor.
+//!
+//! # Invariants
+//!
+//! 1. **Stages 3 and 4 do no I/O.** Everything they need came from stage 2.
+//! 2. **An unplannable query fails loudly.** A silent fallback to the imperative path would make
+//!    every equivalence test meaningless.
+//! 3. **Analyzer rules need no idempotence guard; optimizer rules do.** The optimizer runs to a
+//!    fixed point, so a structural rewrite there has to recognize its own output.
+//!
+//! # Layout
+//!
+//! The framework is split by stage.
+//!
+//! ```text
+//! builder      stage 1: Scanner -> LogicalPlan
+//! context      stage 2: the one prefetch every later stage reads from
+//! source       the scan leaf, as a TableProvider
+//! scan_index   recording on each scan how it finds its rows
+//! planner      stage 4: dispatch to each node's lowering
+//! ```
+//!
+//! Rule *ordering* stays here, in [`analyzer_rules`] and [`optimizer_rules`], because it is a
+//! whole-plan property that no single index type can decide.
+
+pub(super) mod builder;
+pub(super) mod context;
+pub(super) mod planner;
+pub(super) mod scan_index;
+pub(super) mod source;
+#[cfg(test)]
+mod tests;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::optimizer::optimize_projections::OptimizeProjections;
+use datafusion::optimizer::push_down_filter::PushDownFilter;
+use datafusion::optimizer::push_down_limit::PushDownLimit;
+use datafusion::optimizer::simplify_expressions::SimplifyExpressions;
+use datafusion::optimizer::{Analyzer, AnalyzerRule, Optimizer, OptimizerRule};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
+use datafusion::physical_optimizer::join_selection::JoinSelection;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use lance_core::ROW_OFFSET;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_datafusion::exec::{StrictBatchSizeExec, get_session_context};
+
+use self::context::ScanPlanningContext;
+use crate::dataset::Scanner;
+use crate::io::exec::{SimplifyProjection, get_physical_optimizer};
+use crate::{Error, Result};
+
+/// Environment switch for the new path. Off unless explicitly set to `1`.
+///
+/// An env var (rather than a `Scanner` field) keeps this from touching the public builder API
+/// while both paths coexist; the flag and the imperative path go away together.
+pub fn is_enabled() -> bool {
+    std::env::var("LANCE_LOGICAL_SCAN_PLANNER").is_ok_and(|value| value == "1")
+}
+
+/// Plan a scan through the logical path.
+///
+/// Rejects a query shape it cannot plan rather than silently falling back to the imperative path —
+/// a quiet fallback would make the equivalence tests meaningless.
+pub async fn create_plan(scanner: &Scanner) -> Result<Arc<dyn ExecutionPlan>> {
+    scanner.validate_options()?;
+    ensure_supported(scanner)?;
+
+    let logical_plan = builder::build(scanner)?;
+
+    if scanner.fragments.as_ref().is_some_and(Vec::is_empty) {
+        // An explicit empty fragment list means the scan reads nothing, whatever the query on top
+        // of it is. Stating that once here rather than per query kind also skips stage 2: there is
+        // no point loading index metadata to plan a scan over no data.
+        let schema = Arc::new(logical_plan.schema().as_arrow().clone());
+        return Ok(Arc::new(EmptyExec::new(schema)));
+    }
+
+    let plan = lower(logical_plan, planning_state(scanner)).await?;
+    Ok(apply_strict_batch_size(scanner, plan))
+}
+
+/// Stages 2 through 4: prefetch, optimize, lower.
+///
+/// Separate from [`create_plan`] because nothing here reads the `Scanner` — the plan is the only
+/// input. Any plan whose leaf is a [`LanceScanSource`](source::LanceScanSource) can go through it.
+pub async fn lower(
+    logical_plan: LogicalPlan,
+    state: Arc<SessionState>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let context = Arc::new(ScanPlanningContext::collect(&logical_plan).await?);
+
+    // Run the two logical stages directly rather than through `SessionState::optimize`, because the
+    // rule lists are the one part of planning that genuinely varies per query — each Lance rule
+    // holds the `ScanPlanningContext` above — and registering them on a `SessionState` would drag
+    // the rest of the state into varying with them. See [`planning_state`].
+    let analyzed = Analyzer::with_rules(analyzer_rules(&context)).execute_and_check(
+        logical_plan,
+        state.config_options(),
+        |_, _| {},
+    )?;
+    let optimized = Optimizer::with_rules(optimizer_rules(&context)).optimize(
+        analyzed,
+        state.as_ref(),
+        |_, _| {},
+    )?;
+
+    Ok(
+        DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+            planner::LanceExtensionPlanner,
+        )])
+        .create_physical_plan(&optimized, state.as_ref())
+        .await?,
+    )
+}
+
+/// Rechunk the finished plan's output to an exact batch size, if the caller asked for one.
+///
+/// Above every rule rather than inside the plan, because it is not a planning decision: the node
+/// delegates its `PlanProperties` to its input and only reshapes batches, so no rule has anything
+/// to say about it.
+fn apply_strict_batch_size(
+    scanner: &Scanner,
+    plan: Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
+    if !scanner.strict_batch_size {
+        return plan;
+    }
+    Arc::new(StrictBatchSizeExec::new(plan, scanner.get_batch_size()))
+}
+
+/// The query-independent half of planning state, built once and shared.
+///
+/// Built from the same session `execute_plan` will run this plan on, so that lowering sees the
+/// runtime it will actually execute against. `DefaultPhysicalPlanner` consults the config when it
+/// builds sorts and joins — `sort_spill_reservation_bytes` in particular — and a bare
+/// `SessionConfig::new()` here made the resulting plans hold more concurrently in the shared
+/// `FairSpillPool` than the imperative path's, which showed up as intermittent
+/// `ResourcesExhausted` under parallel test load.
+///
+/// Cached because building it is not cheap and nothing in it depends on the query:
+/// `with_default_features()` re-populates DataFusion's entire catalog of scalar, aggregate, window,
+/// and table functions, plus file formats and expression planners, none of which a scan consults.
+/// Measured at roughly 37 µs — against an imperative plan-build of 27 µs for the same query, so
+/// paying it per query doubled the cost of planning a trivial scan.
+///
+/// Only the *rule lists* vary per query, and they are a handful of `Arc`s; [`create_plan`] applies
+/// them with a standalone [`Analyzer`] and [`Optimizer`] instead of registering them here.
+fn planning_state(scanner: &Scanner) -> Arc<SessionState> {
+    /// Keyed by the session this state derives from and the parallelism it was built for.
+    type StateCache = Mutex<HashMap<(String, usize), Arc<SessionState>>>;
+
+    let session = get_session_context(&scanner.execution_options());
+    let target_partitions = scanner
+        .target_parallelism
+        .unwrap_or_else(get_num_compute_intensive_cpus);
+    // The session id identifies the cached `SessionContext` this state derives from, so it stands in
+    // for every execution option without this module having to know what they are.
+    let key = (session.session_id(), target_partitions);
+
+    static CACHE: OnceLock<StateCache> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(state) = cache.get(&key) {
+        return state.clone();
+    }
+
+    let state = Arc::new(
+        SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(
+                session
+                    .copied_config()
+                    .with_target_partitions(target_partitions),
+            )
+            .with_runtime_env(session.runtime_env())
+            .with_physical_optimizer_rules(physical_optimizer_rules())
+            .build(),
+    );
+
+    // The key space is (execution options) × (requested parallelism), both of which take a handful
+    // of distinct values in practice — `get_session_context` caps its own side at 4. Clearing on
+    // overflow rather than evicting an entry keeps this to one line; a workload that actually
+    // thrashed it would be better served by a real LRU.
+    const MAX_ENTRIES: usize = 8;
+    if cache.len() >= MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, state.clone());
+    state
+}
+
+/// The rewrites that must happen for the plan to be *correct*, in the stage that guarantees each
+/// runs exactly once and then checks `InvariantLevel::Executable`.
+///
+/// Unlike [`optimizer_rules`], this list is *not* pinned: it starts from whatever
+/// `Analyzer::new()` provides, because `TypeCoercion` in particular has to run over the predicates
+/// the builder produced before anything duplicates them onto two branches, and reimplementing that
+/// to pin it would be worse than inheriting it. The cost is that a DataFusion upgrade can change
+/// this stage's behavior without the change being visible here.
+fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    let _ = context;
+    Analyzer::new().rules
+}
+
+/// The curated logical rule set: a pinned subset of DataFusion's rules plus the Lance-owned ones
+/// derived from the planning context.
+///
+/// Pinned rather than inherited from `with_default_features()` so that a DataFusion upgrade cannot
+/// silently change what runs — the same discipline `get_physical_optimizer` already applies on the
+/// physical side. Anything that could move a predicate or limit *across* a search node is
+/// deliberately absent.
+fn optimizer_rules(
+    context: &Arc<ScanPlanningContext>,
+) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+    vec![
+        Arc::new(SimplifyExpressions::new()),
+        Arc::new(PushDownFilter::new()),
+        Arc::new(PushDownLimit::new()),
+        // After `PushDownFilter`, so the predicate it reads has reached the scan.
+        Arc::new(scan_index::ResolveScalarIndexQuery::new(context.clone())),
+        Arc::new(OptimizeProjections::new()),
+    ]
+}
+
+/// The physical rule set: Lance's own rules, plus the stock DataFusion rules that hand-built
+/// physical plans never needed.
+///
+/// `get_physical_optimizer` is tuned for the imperative path, where every node is constructed with
+/// its final configuration already chosen. A plan lowered from stock logical nodes is not like
+/// that, and two stock rules earn their place because of it:
+///
+/// * `JoinSelection` — `DefaultPhysicalPlanner` emits a `HashJoinExec` with `PartitionMode::Auto`,
+///   which panics at `execute()` unless something resolves it. It runs first so the Lance rules see
+///   a fully-resolved plan, the same way they do today.
+/// * `EnforceSorting` — a logical `Sort` is the only way to say "this order is the result's
+///   order", so the builder states it whether or not the plan below already produces it. Whether
+///   it does is a physical fact, so only a physical rule can drop the redundant sort. It runs
+///   last, after `EnforceDistribution` has settled partitioning, which is what decides whether an
+///   ordering survives a merge.
+fn physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
+        vec![Arc::new(JoinSelection::new())];
+    rules.extend(get_physical_optimizer().rules);
+    rules.push(Arc::new(EnforceSorting::new()));
+    // Again, because dropping a sort can leave the projections it separated adjacent.
+    rules.push(Arc::new(SimplifyProjection));
+    rules
+}
+
+/// Account for every `Scanner` option, rejecting the query shapes this path cannot plan.
+///
+/// `Scanner` is destructured **exhaustively** — no `..` — so that adding a field to it fails to
+/// compile until someone decides what this path does with it. That is the point of the function:
+/// an option this path silently ignores is worse than one it rejects, because it returns different
+/// rows with no signal that anything was dropped. Every binding below is either read somewhere in
+/// this module, rejected here, or carries a comment saying why it cannot affect the plan.
+fn ensure_supported(scanner: &Scanner) -> Result<()> {
+    let Scanner {
+        dataset: _,
+        projection_plan,
+        // Read by the scan leaf, which decides there which columns it reads alongside the filter
+        // and which it takes afterwards.
+        materialization_style: _,
+        // Read by the scan leaf.
+        include_deleted_rows: _,
+
+        // Applied by the builder as a stock `Aggregate` node, which also replaces the output
+        // projection. `validate_options` has already rejected limit/offset/ordering alongside it.
+        aggregate: _,
+
+        // Applied to the finished plan by `create_plan`, above every rule: it only reshapes
+        // batches, so nothing in planning depends on it.
+        strict_batch_size: _,
+
+        // Read by the builder, the source, the context, or the session config.
+        filter: _,
+        batch_size: _,
+        batch_readahead: _,
+        fragment_readahead: _,
+        io_buffer_size: _,
+        limit: _,
+        offset: _,
+        ordering: _,
+        use_scalar_index: _,
+        fragments: _,
+        fast_search: _,
+        file_reader_options: _,
+        target_parallelism: _,
+        legacy_with_row_id: _,
+        legacy_with_row_addr: _,
+
+        // Read by the scan leaf, which types blob columns by it and reads them accordingly.
+        blob_handling: _,
+
+        // Folded into something this path does read, at the moment the caller sets it:
+        // `batch_size_bytes` into `resolved_file_reader_options`, and
+        // `relational_algebra_version` into `index_expr_result_format`.
+        batch_size_bytes: _,
+        relational_algebra_version: _,
+
+        // Read only by `legacy_filtered_read` and `scan_fragments`, which the v1 leaf hands the
+        // whole scanner to.
+        use_stats: _,
+        ordered: _,
+
+        // Not plan-affecting here. The callback is applied by `execute_plan` on the finished plan,
+        // and `explicit_projection` only gates a deprecation warning.
+        scan_stats_callback: _,
+        explicit_projection: _,
+
+        // Search options. Every one of them is inert once the search itself is rejected below.
+        nearest,
+        full_text_query,
+        prefilter: _,
+        is_batch_nearest: _,
+        nearest_query_count: _,
+        index_segments: _,
+        autoproject_scoring_columns: _,
+    } = scanner;
+
+    if nearest.is_some() || full_text_query.is_some() {
+        return Err(Error::not_supported_source(
+            "The logical scan planner cannot plan a search yet".into(),
+        ));
+    }
+    if reads_row_offset(scanner)? {
+        // `_rowoffset` is computed above the scan rather than read from it, so producing it needs a
+        // node this path does not have yet.
+        return Err(Error::not_supported_source(
+            "The logical scan planner cannot produce _rowoffset yet".into(),
+        ));
+    }
+    if projection_plan.has_output_cols() && projection_plan.physical_projection.is_empty() {
+        // `SELECT 1 AS foo` — output columns that read nothing. Not a gap: the imperative path
+        // rejects this too (`scanner.rs:2846`), and for the same reason, so this states the same
+        // refusal rather than deferring it. Without the guard, the leaf's "reading nothing is not a
+        // thing the reader can do" branch would quietly return row addresses instead.
+        //
+        // Resolving the output against an empty schema first is what distinguishes the two ways to
+        // land here: `SELECT 1` is unsupported, while `SELECT does_not_exist` is a missing column.
+        let output_expr = scanner.calculate_final_projection(&arrow_schema::Schema::empty())?;
+        return Err(Error::not_supported_source(
+            format!(
+                "Scans must request at least one column.  Received only dynamic expressions: {output_expr:?}"
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reads_row_offset(scanner: &Scanner) -> Result<bool> {
+    let names_it = |expr: &datafusion::logical_expr::Expr| {
+        expr.column_refs().iter().any(|col| col.name == ROW_OFFSET)
+    };
+    Ok(scanner
+        .projection_plan
+        .requested_output_expr
+        .iter()
+        .any(|output| names_it(&output.expr))
+        || scanner.get_expr_filter()?.as_ref().is_some_and(names_it))
+}
