@@ -16,6 +16,8 @@ package org.lance;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.operation.Append;
+import org.lance.operation.Update;
+import org.lance.test.JniTestHelper;
 import org.lance.update.UpdateParams;
 import org.lance.update.UpdateResult;
 
@@ -169,6 +171,39 @@ public class UpdateTest {
       for (String name : readNames(newDataset)) {
         Assertions.assertEquals("retried", name);
       }
+    }
+  }
+
+  @Test
+  public void testFlagOnlyUpdateAndNativeUpdateTransactionRoundTrip() {
+    CellFlagDefinition definition = dataset.registerCellFlag("name", "reviewed", false);
+    Assertions.assertEquals(0, definition.flagId());
+    Assertions.assertEquals("reviewed", dataset.cellFlagDefinitions().get(0).name());
+
+    UpdateResult result =
+        dataset.update(
+            UpdateParams.forCellFlags(new CellFlagChange("name", "reviewed", true))
+                .withWhere("id < 2"));
+    Assertions.assertEquals(2, result.getNumRowsUpdated());
+    try (Dataset newDataset = result.getDataset();
+        Transaction transaction = newDataset.readTransaction().orElseThrow()) {
+      Assertions.assertEquals(2, newDataset.countRows("cell_flag(name, 'reviewed')"));
+      Assertions.assertInstanceOf(Update.class, transaction.operation());
+      JniTestHelper.validateTransaction(newDataset, transaction);
+
+      try (Transaction rebuilt = new Transaction.Builder(transaction).build()) {
+        JniTestHelper.validateTransaction(newDataset, rebuilt);
+      }
+      try (Transaction edited = new Transaction.Builder(transaction).tag("changed").build()) {
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> JniTestHelper.validateTransaction(newDataset, edited));
+      }
+
+      newDataset.renameCellFlag("name", "reviewed", "verified");
+      Assertions.assertEquals("verified", newDataset.cellFlagDefinitions().get(0).name());
+      newDataset.dropCellFlag("name", "verified");
+      Assertions.assertTrue(newDataset.cellFlagDefinitions().isEmpty());
     }
   }
 

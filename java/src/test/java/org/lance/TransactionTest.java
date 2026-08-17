@@ -33,6 +33,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -42,6 +43,61 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TransactionTest {
+
+  @Test
+  public void testRebuiltTransactionReleasesSharedOperationOnce() {
+    AtomicInteger releases = new AtomicInteger();
+    Operation operation =
+        new Operation() {
+          @Override
+          public String name() {
+            return "Test";
+          }
+
+          @Override
+          public void release() {
+            releases.incrementAndGet();
+          }
+        };
+    Transaction original = new Transaction.Builder().operation(operation).build();
+    Transaction rebuilt = new Transaction.Builder(original).build();
+
+    rebuilt.close();
+    original.close();
+
+    assertEquals(1, releases.get());
+  }
+
+  @Test
+  public void testReplacingInheritedOperationHasIndependentOwnership() {
+    AtomicInteger originalReleases = new AtomicInteger();
+    AtomicInteger replacementReleases = new AtomicInteger();
+    Operation originalOperation = countingOperation("Original", originalReleases);
+    Operation replacementOperation = countingOperation("Replacement", replacementReleases);
+    Transaction original = new Transaction.Builder().operation(originalOperation).build();
+    Transaction replacement =
+        new Transaction.Builder(original).operation(replacementOperation).build();
+
+    replacement.close();
+    original.close();
+
+    assertEquals(1, originalReleases.get());
+    assertEquals(1, replacementReleases.get());
+  }
+
+  private static Operation countingOperation(String name, AtomicInteger releases) {
+    return new Operation() {
+      @Override
+      public String name() {
+        return name;
+      }
+
+      @Override
+      public void release() {
+        releases.incrementAndGet();
+      }
+    };
+  }
 
   @Test
   public void testValidInternalPayloadRoundTrip(@TempDir Path tempDir) {

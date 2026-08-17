@@ -45,6 +45,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
     Error, Result,
+    deepsize::DeepSizeOf,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
         AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, TRACE_DATASET_EVENTS,
@@ -305,7 +306,20 @@ struct CleanupCellFlagRootKey {
 
 struct CleanupIoContext {
     permits: Arc<Semaphore>,
+    byte_permits: Arc<Semaphore>,
     cell_flag_roots: Cache<CleanupCellFlagRootKey, Arc<CellFlagRoot>>,
+}
+
+const CELL_FLAG_CLEANUP_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const CELL_FLAG_CLEANUP_MEMORY_PERMIT_BYTES: usize = 1024 * 1024;
+const CELL_FLAG_CLEANUP_MEMORY_PERMITS: usize =
+    CELL_FLAG_CLEANUP_MEMORY_BUDGET_BYTES / CELL_FLAG_CLEANUP_MEMORY_PERMIT_BYTES;
+
+fn cleanup_cell_flag_memory_weight(size_bytes: usize) -> u32 {
+    size_bytes
+        .max(1)
+        .div_ceil(CELL_FLAG_CLEANUP_MEMORY_PERMIT_BYTES)
+        .min(CELL_FLAG_CLEANUP_MEMORY_PERMITS) as u32
 }
 
 impl Debug for CleanupIoContext {
@@ -313,16 +327,33 @@ impl Debug for CleanupIoContext {
         formatter
             .debug_struct("CleanupIoContext")
             .field("available_permits", &self.permits.available_permits())
+            .field(
+                "available_byte_permits",
+                &self.byte_permits.available_permits(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl CleanupIoContext {
     fn new(io_parallelism: usize, max_cached_roots: usize) -> Self {
+        let minimum_entry_weight = CELL_FLAG_CLEANUP_MEMORY_PERMITS
+            .div_ceil(max_cached_roots.max(1))
+            .max(1) as u32;
         Self {
             permits: Arc::new(Semaphore::new(io_parallelism.max(1))),
+            byte_permits: Arc::new(Semaphore::new(CELL_FLAG_CLEANUP_MEMORY_PERMITS)),
             cell_flag_roots: Cache::builder()
-                .max_capacity(max_cached_roots.max(1) as u64)
+                .max_capacity(CELL_FLAG_CLEANUP_MEMORY_PERMITS as u64)
+                .weigher(
+                    move |key: &CleanupCellFlagRootKey, root: &Arc<CellFlagRoot>| {
+                        cleanup_cell_flag_memory_weight(
+                            root.deep_size_of()
+                                .max(usize::try_from(key.size_bytes).unwrap_or(usize::MAX)),
+                        )
+                        .max(minimum_entry_weight)
+                    },
+                )
                 .build(),
         }
     }
@@ -356,12 +387,22 @@ impl CleanupIoContext {
         let full_path = full_path.clone();
         let file = file.clone();
         let permits = self.permits.clone();
+        let byte_permits = self.byte_permits.clone();
         self.cell_flag_roots
             .try_get_with(key, async move {
                 let _permit = permits
                     .acquire_owned()
                     .await
                     .map_err(|_| Error::internal("Cleanup I/O semaphore closed".to_string()))?;
+                let memory_weight = cleanup_cell_flag_memory_weight(
+                    usize::try_from(file.size_bytes).unwrap_or(usize::MAX),
+                );
+                let _byte_permit = byte_permits
+                    .acquire_many_owned(memory_weight)
+                    .await
+                    .map_err(|_| {
+                        Error::internal("Cleanup I/O byte semaphore closed".to_string())
+                    })?;
                 let root_bytes = read_cell_flag_bytes(&object_store, &full_path, &file).await?;
                 let root_proto = lance_table::format::pb::CellFlagRoot::decode(root_bytes.as_ref())
                     .map_err(|error| {
@@ -501,6 +542,7 @@ impl<'a> CleanupTask<'a> {
             HashSet::new(),
             track_removed_manifests,
             include_referenced_branches,
+            None,
         )
     }
 
@@ -511,6 +553,7 @@ impl<'a> CleanupTask<'a> {
         ignored_manifests: HashSet<Path>,
         track_removed_manifests: bool,
         include_referenced_branches: bool,
+        io_context: Option<Arc<CleanupIoContext>>,
     ) -> Self {
         let io_parallelism = dataset.object_store.io_parallelism().max(1);
         let max_cached_roots = dataset.manifest.cell_flag_states.len().max(io_parallelism);
@@ -522,7 +565,9 @@ impl<'a> CleanupTask<'a> {
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
-            io_context: Arc::new(CleanupIoContext::new(io_parallelism, max_cached_roots)),
+            io_context: io_context.unwrap_or_else(|| {
+                Arc::new(CleanupIoContext::new(io_parallelism, max_cached_roots))
+            }),
         }
     }
 
@@ -624,9 +669,16 @@ impl<'a> CleanupTask<'a> {
         tagged_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
-        self.dataset
+        let attached = self.dataset.commit_handler.list_manifest_locations(
+            &self.dataset.base,
+            &self.dataset.object_store,
+            false,
+        );
+        let detached = self
+            .dataset
             .commit_handler
-            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
+            .list_detached_manifest_locations(&self.dataset.base, &self.dataset.object_store);
+        stream::select(attached, detached)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)
@@ -1436,6 +1488,7 @@ impl<'a> CleanupTask<'a> {
                             branch_dataset.manifest.as_ref(),
                             action,
                             ignored_manifests,
+                            Some(self.io_context.clone()),
                         )
                         .await?
                         {
@@ -1770,11 +1823,15 @@ pub async fn cleanup_cascade_branch(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    Ok(
-        cleanup_cascade_branch_run(dataset, manifest, CleanupAction::Execute, HashSet::new())
-            .await?
-            .map(|result| result.stats),
+    Ok(cleanup_cascade_branch_run(
+        dataset,
+        manifest,
+        CleanupAction::Execute,
+        HashSet::new(),
+        None,
     )
+    .await?
+    .map(|result| result.stats))
 }
 
 async fn cleanup_cascade_branch_run(
@@ -1782,6 +1839,7 @@ async fn cleanup_cascade_branch_run(
     manifest: &Manifest,
     action: CleanupAction,
     ignored_manifests: HashSet<Path>,
+    io_context: Option<Arc<CleanupIoContext>>,
 ) -> Result<Option<CleanupRunResult>> {
     let policy = build_cleanup_policy(dataset, manifest).await?;
     if let Some(mut policy) = policy {
@@ -1797,6 +1855,7 @@ async fn cleanup_cascade_branch_run(
             ignored_manifests,
             true,
             false,
+            io_context,
         );
         Ok(Some(cleanup.run().await?))
     } else {
@@ -1931,8 +1990,8 @@ mod tests {
     use crate::{
         dataset::transaction::{Operation, Transaction},
         dataset::{
-            AutoCleanupParams, ReadParams, UpdateBuilder, WriteMode, WriteParams,
-            builder::DatasetBuilder,
+            AutoCleanupParams, CellFlagChange, CommitBuilder, InsertBuilder, ReadParams,
+            UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder,
         },
         index::vector::VectorIndexParams,
     };
@@ -2094,6 +2153,114 @@ mod tests {
             },
         );
         assert!(Arc::ptr_eq(&task.io_context, &task.clone().io_context));
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_cell_flags_referenced_by_detached_manifest() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let initial = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3])).unwrap();
+        fixture
+            .create_with_data(RecordBatchIterator::new(
+                vec![Ok(initial.clone())],
+                initial.schema(),
+            ))
+            .await
+            .unwrap();
+
+        let mut dataset = *fixture.open().await.unwrap();
+        dataset
+            .register_cell_flag("i", "computed", false)
+            .await
+            .unwrap();
+        let appended = arrow_array::record_batch!(("i", Int32, [4, 5, 6, 7])).unwrap();
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&params)
+            .with_cell_flags([CellFlagChange::new("i", "computed", true)])
+            .execute_uncommitted(vec![appended])
+            .await
+            .unwrap();
+        CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_detached(true)
+            .execute(transaction)
+            .await
+            .unwrap();
+        let detached_version = dataset.list_detached_manifests().await.unwrap()[0].version;
+
+        cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now() + TimeDelta::minutes(1))
+                .delete_unverified(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let detached = dataset.checkout_version(detached_version).await.unwrap();
+        let flag_id = detached.cell_flag_definitions()[0].flag_id;
+        detached
+            .validate_cell_flag_root_object(flag_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            detached
+                .count_rows(Some("cell_flag(i, 'computed')".to_string()))
+                .await
+                .unwrap(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_cleanup_inherits_parent_io_context() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3])).unwrap();
+        fixture
+            .create_with_data(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                batch.schema(),
+            ))
+            .await
+            .unwrap();
+        let dataset = *fixture.open().await.unwrap();
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
+        manifest.config.insert(
+            "lance.auto_cleanup.older_than".to_string(),
+            "0s".to_string(),
+        );
+
+        let context = Arc::new(CleanupIoContext::new(1, 1));
+        let held_permit = context.acquire().await.unwrap();
+        let cleanup = cleanup_cascade_branch_run(
+            &dataset,
+            &manifest,
+            CleanupAction::Explain {
+                max_candidate_files: 1,
+            },
+            HashSet::new(),
+            Some(context),
+        );
+        tokio::pin!(cleanup);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut cleanup)
+                .await
+                .is_err()
+        );
+        drop(held_permit);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), cleanup)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
     }
 
     impl MockDatasetFixture {

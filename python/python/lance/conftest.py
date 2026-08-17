@@ -17,5 +17,8 @@ def doctest_setup(monkeypatch, tmpdir):
     monkeypatch.setitem(os.environ, "NO_COLOR", "1")
     # Explicitly set the column width
     monkeypatch.setitem(os.environ, "COLUMNS", "80")
+    # Public Cell Flag examples exercise the post-rollout API. Keep the
+    # production writer gate intact and enable it only in the doctest process.
+    monkeypatch.setitem(os.environ, "LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED", "1")
     # Work in a temporary directory
     monkeypatch.chdir(tmpdir)

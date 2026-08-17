@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
+use crate::cell_flag::extract_cell_flag_changes_from_method;
 use crate::error::Result;
 use crate::traits::IntoJava;
 use crate::utils::to_rust_map;
@@ -30,6 +31,7 @@ fn inner_update<'local>(
     let where_clause = extract_where(env, &jparam)?;
     let conflict_retries = extract_conflict_retries(env, &jparam)?;
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
+    let cell_flag_changes = extract_cell_flag_changes_from_method(env, &jparam, "cellFlagChanges")?;
 
     // Clone the inner Dataset out of the `get_rust_field` guard and drop the
     // guard before running the long-lived async update. Otherwise the guard
@@ -50,6 +52,9 @@ fn inner_update<'local>(
 
     for (column, expr) in &updates {
         builder = builder.set(column, expr)?;
+    }
+    for change in cell_flag_changes {
+        builder = builder.set_cell_flag(change.field(), change.name(), change.value())?;
     }
 
     let job = builder.build()?;

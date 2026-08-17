@@ -13,11 +13,16 @@
  */
 package org.lance.update;
 
+import org.lance.CellFlagChange;
+
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -46,6 +51,7 @@ public class UpdateParams {
   private static final long DEFAULT_RETRY_TIMEOUT_MS = 30_000L;
 
   private final Map<String, String> updates;
+  private final List<CellFlagChange> cellFlagChanges = new ArrayList<>();
   private Optional<String> whereClause = Optional.empty();
   private int conflictRetries = DEFAULT_CONFLICT_RETRIES;
   private long retryTimeoutMs = DEFAULT_RETRY_TIMEOUT_MS;
@@ -54,6 +60,25 @@ public class UpdateParams {
     Preconditions.checkNotNull(updates, "updates must not be null");
     Preconditions.checkArgument(!updates.isEmpty(), "updates must not be empty");
     this.updates = new HashMap<>(updates);
+  }
+
+  /** Create a flag-only update. */
+  public static UpdateParams forCellFlags(CellFlagChange... changes) {
+    Preconditions.checkNotNull(changes, "changes must not be null");
+    Preconditions.checkArgument(changes.length > 0, "changes must not be empty");
+    UpdateParams params = new UpdateParams();
+    params.cellFlagChanges.addAll(Arrays.asList(changes));
+    return params;
+  }
+
+  private UpdateParams() {
+    this.updates = new HashMap<>();
+  }
+
+  /** Add a Cell Flag change to rows selected by this update. */
+  public UpdateParams withCellFlag(CellFlagChange change) {
+    this.cellFlagChanges.add(Preconditions.checkNotNull(change, "change must not be null"));
+    return this;
   }
 
   /**
@@ -110,6 +135,10 @@ public class UpdateParams {
     return Collections.unmodifiableMap(updates);
   }
 
+  public List<CellFlagChange> cellFlagChanges() {
+    return Collections.unmodifiableList(cellFlagChanges);
+  }
+
   public Optional<String> whereClause() {
     return whereClause;
   }
@@ -126,6 +155,7 @@ public class UpdateParams {
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("updates", updates)
+        .add("cellFlagChanges", cellFlagChanges)
         .add("whereClause", whereClause.orElse(null))
         .add("conflictRetries", conflictRetries)
         .add("retryTimeoutMs", retryTimeoutMs)

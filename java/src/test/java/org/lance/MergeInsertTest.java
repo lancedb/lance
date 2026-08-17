@@ -25,6 +25,8 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -79,6 +81,60 @@ public class MergeInsertTest {
             readAll(result.dataset()).toString());
       }
     }
+  }
+
+  @Test
+  public void testMergeInsertAppliesMatchedAndInsertedCellFlags() throws Exception {
+    dataset.registerCellFlag("name", "reviewed", false);
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
+        ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+      MergeInsertParams params =
+          new MergeInsertParams(Collections.singletonList("id"))
+              .withMatchedUpdateAll()
+              .withMatchedCellFlag(new CellFlagChange("name", "reviewed", true))
+              .withInsertedCellFlag(new CellFlagChange("name", "reviewed", true));
+      MergeInsertResult result = dataset.mergeInsert(params, sourceStream);
+      try (Dataset merged = result.dataset()) {
+        Assertions.assertEquals(6, merged.countRows("cell_flag(name, 'reviewed')"));
+      }
+    }
+  }
+
+  @Test
+  public void testAppendWithCellFlags() throws Exception {
+    dataset.registerCellFlag("name", "reviewed", false);
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
+        ArrowArrayStream sourceStream = convertToStream(source, allocator);
+        Dataset appended =
+            dataset.appendWithCellFlags(
+                sourceStream,
+                Collections.singletonList(new CellFlagChange("name", "reviewed", true)))) {
+      Assertions.assertEquals(6, appended.countRows("cell_flag(name, 'reviewed')"));
+      Assertions.assertEquals(11, appended.countRows());
+    }
+  }
+
+  @Test
+  public void testMergeWithCellFlags() throws Exception {
+    dataset.registerCellFlag("name", "reviewed", false);
+    Schema sourceSchema =
+        new Schema(Collections.singletonList(Field.notNullable("id", new ArrowType.Int(32, true))));
+    try (VectorSchemaRoot source = VectorSchemaRoot.create(sourceSchema, allocator)) {
+      source.allocateNew();
+      IntVector idVector = (IntVector) source.getVector("id");
+      idVector.setSafe(0, 0);
+      idVector.setSafe(1, 2);
+      idVector.setSafe(2, 7);
+      source.setRowCount(3);
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        dataset.mergeWithCellFlags(
+            sourceStream,
+            "id",
+            "id",
+            Collections.singletonList(new CellFlagChange("name", "reviewed", true)));
+      }
+    }
+    Assertions.assertEquals(2, dataset.countRows("cell_flag(name, 'reviewed')"));
   }
 
   @Test

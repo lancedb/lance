@@ -13,12 +13,14 @@
  */
 package org.lance.merge;
 
+import org.lance.CellFlagChange;
 import org.lance.memwal.CompactedSsTable;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -40,6 +42,8 @@ public class MergeInsertParams {
   private boolean skipAutoCleanup = false;
   private boolean useIndex = true;
   private List<CompactedSsTable> compactedSstables = Collections.emptyList();
+  private final List<CellFlagChange> matchedCellFlagChanges = new ArrayList<>();
+  private final List<CellFlagChange> insertedCellFlagChanges = new ArrayList<>();
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -115,6 +119,18 @@ public class MergeInsertParams {
    */
   public MergeInsertParams withMatchedFail() {
     this.whenMatched = WhenMatched.Fail;
+    return this;
+  }
+
+  /** Set a registered Cell Flag on matched target rows. */
+  public MergeInsertParams withMatchedCellFlag(CellFlagChange change) {
+    matchedCellFlagChanges.add(Preconditions.checkNotNull(change, "change must not be null"));
+    return this;
+  }
+
+  /** Set a registered Cell Flag on rows inserted by the not-matched action. */
+  public MergeInsertParams withInsertedCellFlag(CellFlagChange change) {
+    insertedCellFlagChanges.add(Preconditions.checkNotNull(change, "change must not be null"));
     return this;
   }
 
@@ -273,6 +289,14 @@ public class MergeInsertParams {
     return compactedSstables;
   }
 
+  public List<CellFlagChange> matchedCellFlagChanges() {
+    return Collections.unmodifiableList(matchedCellFlagChanges);
+  }
+
+  public List<CellFlagChange> insertedCellFlagChanges() {
+    return Collections.unmodifiableList(insertedCellFlagChanges);
+  }
+
   public WhenMatched whenMatched() {
     return whenMatched;
   }
@@ -330,6 +354,8 @@ public class MergeInsertParams {
     return MoreObjects.toStringHelper(this)
         .add("on", on)
         .add("whenMatched", whenMatched)
+        .add("matchedCellFlagChanges", matchedCellFlagChanges)
+        .add("insertedCellFlagChanges", insertedCellFlagChanges)
         .add("whenMatchedUpdateExpr", whenMatchedUpdateExpr.orElse(null))
         .add("whenNotMatched", whenNotMatched)
         .add("whenNotMatchedBySource", whenNotMatchedBySource)

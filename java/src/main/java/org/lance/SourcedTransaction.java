@@ -48,6 +48,17 @@ public class SourcedTransaction implements AutoCloseable {
     this.dataset = dataset;
   }
 
+  /**
+   * Pair an existing transaction with its source dataset without rebuilding it.
+   *
+   * <p>This preserves opaque internal transaction metadata such as Cell Flag changes.
+   */
+  public static SourcedTransaction from(Dataset dataset, Transaction transaction) {
+    Preconditions.checkNotNull(dataset, "dataset must not be null");
+    Preconditions.checkNotNull(transaction, "transaction must not be null");
+    return new SourcedTransaction(transaction, dataset);
+  }
+
   /** Returns the underlying {@link Transaction}. */
   public Transaction transaction() {
     return transaction;

@@ -2138,6 +2138,115 @@ public class Dataset implements Closeable {
   private native DatasetDelta nativeBuildDelta(
       Optional<Long> comparedAgainst, Optional<Long> beginVersion, Optional<Long> endVersion);
 
+  /** Returns the Cell Flags registered in this snapshot. */
+  public List<CellFlagDefinition> cellFlagDefinitions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeCellFlagDefinitions();
+    }
+  }
+
+  private native List<CellFlagDefinition> nativeCellFlagDefinitions();
+
+  /**
+   * Register a field-scoped Boolean Cell Flag and initialize all existing rows.
+   *
+   * <p>The first registration requires {@code LANCE_ASSUME_CELL_FLAG_WRITER_GATE_DEPLOYED} after
+   * every possible writer has deployed the compatibility gate.
+   */
+  public CellFlagDefinition registerCellFlag(String field, String name, boolean initialValue) {
+    Preconditions.checkNotNull(field, "field must not be null");
+    Preconditions.checkNotNull(name, "name must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeRegisterCellFlag(field, name, initialValue);
+    }
+  }
+
+  private native CellFlagDefinition nativeRegisterCellFlag(
+      String field, String name, boolean initialValue);
+
+  /** Rename a registered Cell Flag without changing its stable ID or row state. */
+  public void renameCellFlag(String field, String name, String newName) {
+    Preconditions.checkNotNull(field, "field must not be null");
+    Preconditions.checkNotNull(name, "name must not be null");
+    Preconditions.checkNotNull(newName, "newName must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeRenameCellFlag(field, name, newName);
+    }
+  }
+
+  private native void nativeRenameCellFlag(String field, String name, String newName);
+
+  /** Drop a registered Cell Flag from the current snapshot. */
+  public void dropCellFlag(String field, String name) {
+    Preconditions.checkNotNull(field, "field must not be null");
+    Preconditions.checkNotNull(name, "name must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDropCellFlag(field, name);
+    }
+  }
+
+  private native void nativeDropCellFlag(String field, String name);
+
+  /**
+   * Append rows and atomically apply explicit registered Cell Flag values to every appended row.
+   * Unmentioned flags are false for new rows.
+   */
+  public Dataset appendWithCellFlags(
+      ArrowArrayStream source, List<CellFlagChange> cellFlagChanges) {
+    Preconditions.checkNotNull(source, "source must not be null");
+    Preconditions.checkNotNull(cellFlagChanges, "cellFlagChanges must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Dataset newDataset = nativeAppendWithCellFlags(source.memoryAddress(), cellFlagChanges);
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+      return newDataset;
+    }
+  }
+
+  private native Dataset nativeAppendWithCellFlags(
+      long arrowStreamMemoryAddress, List<CellFlagChange> cellFlagChanges);
+
+  /**
+   * Left-merge source columns and atomically apply explicit registered Cell Flag values to matched
+   * target rows. Unmatched rows and unmentioned flags retain their existing state.
+   *
+   * <pre>{@code
+   * dataset.mergeWithCellFlags(
+   *     source,
+   *     "id",
+   *     "id",
+   *     Collections.singletonList(new CellFlagChange("embedding", "computed", true)));
+   * }</pre>
+   */
+  public void mergeWithCellFlags(
+      ArrowArrayStream source,
+      String leftOn,
+      String rightOn,
+      List<CellFlagChange> cellFlagChanges) {
+    Preconditions.checkNotNull(source, "source must not be null");
+    Preconditions.checkNotNull(leftOn, "leftOn must not be null");
+    Preconditions.checkNotNull(rightOn, "rightOn must not be null");
+    Preconditions.checkNotNull(cellFlagChanges, "cellFlagChanges must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMergeWithCellFlags(source.memoryAddress(), leftOn, rightOn, cellFlagChanges);
+    }
+  }
+
+  private native void nativeMergeWithCellFlags(
+      long arrowStreamMemoryAddress,
+      String leftOn,
+      String rightOn,
+      List<CellFlagChange> cellFlagChanges);
+
   /**
    * Merge source data with the existing target data.
    *

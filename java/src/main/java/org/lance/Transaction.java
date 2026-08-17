@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A pure data container representing a Lance transaction.
@@ -39,6 +40,7 @@ public class Transaction implements AutoCloseable {
   private final Optional<String> tag;
   private final Optional<Map<String, String>> transactionProperties;
   private final String cellFlagTransactionPayload;
+  private final AtomicBoolean operationReleased;
 
   /**
    * Constructor used by JNI when reading transactions from native code.
@@ -57,12 +59,31 @@ public class Transaction implements AutoCloseable {
       String tag,
       Map<String, String> transactionProperties,
       String cellFlagTransactionPayload) {
+    this(
+        readVersion,
+        uuid,
+        operation,
+        tag,
+        transactionProperties,
+        cellFlagTransactionPayload,
+        new AtomicBoolean());
+  }
+
+  private Transaction(
+      long readVersion,
+      String uuid,
+      Operation operation,
+      String tag,
+      Map<String, String> transactionProperties,
+      String cellFlagTransactionPayload,
+      AtomicBoolean operationReleased) {
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
     this.tag = Optional.ofNullable(tag);
     this.transactionProperties = Optional.ofNullable(transactionProperties);
     this.cellFlagTransactionPayload = cellFlagTransactionPayload;
+    this.operationReleased = operationReleased;
   }
 
   /**
@@ -100,7 +121,9 @@ public class Transaction implements AutoCloseable {
   /** Release native resources held by the operation (e.g. Arrow C schemas). */
   @Override
   public void close() {
-    operation.release();
+    if (operationReleased.compareAndSet(false, true)) {
+      operation.release();
+    }
   }
 
   @Override
@@ -140,11 +163,33 @@ public class Transaction implements AutoCloseable {
     private String uuid;
     private long readVersion;
     private Operation operation;
+    private boolean inheritedOperation;
     private String tag;
     private Map<String, String> transactionProperties;
+    private String cellFlagTransactionPayload;
+    private AtomicBoolean operationReleased = new AtomicBoolean();
 
     public Builder() {
       this.uuid = UUID.randomUUID().toString();
+    }
+
+    /**
+     * Create a builder initialized from an existing transaction.
+     *
+     * <p>Opaque internal metadata is preserved automatically. It cannot be read or supplied by
+     * applications, which prevents an otherwise valid Cell Flag transaction from becoming a public
+     * no-op when its tag, properties, read version, or operation is edited.
+     */
+    public Builder(Transaction transaction) {
+      Preconditions.checkNotNull(transaction, "transaction must not be null");
+      this.uuid = transaction.uuid;
+      this.readVersion = transaction.readVersion;
+      this.operation = transaction.operation;
+      this.inheritedOperation = true;
+      this.tag = transaction.tag.orElse(null);
+      this.transactionProperties = transaction.transactionProperties.orElse(null);
+      this.cellFlagTransactionPayload = transaction.cellFlagTransactionPayload;
+      this.operationReleased = transaction.operationReleased;
     }
 
     public Builder readVersion(long readVersion) {
@@ -158,11 +203,15 @@ public class Transaction implements AutoCloseable {
     }
 
     public Builder operation(Operation operation) {
-      if (this.operation != null) {
+      if (this.operation != null && !inheritedOperation) {
         throw new IllegalStateException(
             String.format("Operation %s has been set", this.operation.name()));
       }
+      if (inheritedOperation) {
+        operationReleased = new AtomicBoolean();
+      }
       this.operation = operation;
+      this.inheritedOperation = false;
       return this;
     }
 
@@ -184,7 +233,14 @@ public class Transaction implements AutoCloseable {
 
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
-      return new Transaction(readVersion, uuid, operation, tag, transactionProperties, null);
+      return new Transaction(
+          readVersion,
+          uuid,
+          operation,
+          tag,
+          transactionProperties,
+          cellFlagTransactionPayload,
+          operationReleased);
     }
   }
 }

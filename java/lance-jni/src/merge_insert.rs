@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
+use crate::cell_flag::extract_cell_flag_changes_from_method;
 use crate::error::Result;
 use crate::traits::import_vec_to_rust;
 use crate::traits::{FromJString, IntoJava};
@@ -53,6 +54,10 @@ fn inner_merge_insert<'local>(
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
     let use_index = extract_use_index(env, &jparam)?;
     let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
+    let matched_cell_flag_changes =
+        extract_cell_flag_changes_from_method(env, &jparam, "matchedCellFlagChanges")?;
+    let inserted_cell_flag_changes =
+        extract_cell_flag_changes_from_method(env, &jparam, "insertedCellFlagChanges")?;
 
     let (new_ds, merge_stats) = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -63,16 +68,23 @@ fn inner_merge_insert<'local>(
             when_not_matched_by_source_delete_expr,
         )?;
 
-        let merge_insert_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?
+        let mut builder = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?;
+        builder
             .when_matched(when_matched)
             .when_not_matched(when_not_matched)
             .when_not_matched_by_source(when_not_matched_by_source)
             .conflict_retries(conflict_retries)
-            .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
+            .retry_timeout(Duration::from_millis(retry_timeout_ms))
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
-            .mark_sstables_as_compacted(compacted_sstables)
-            .try_build()?;
+            .mark_sstables_as_compacted(compacted_sstables);
+        for change in matched_cell_flag_changes {
+            builder.set_matched_cell_flag(change.field(), change.name(), change.value())?;
+        }
+        for change in inserted_cell_flag_changes {
+            builder.set_inserted_cell_flag(change.field(), change.name(), change.value())?;
+        }
+        let merge_insert_job = builder.try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
         let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;

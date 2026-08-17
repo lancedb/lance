@@ -21,11 +21,12 @@ use lance_datafusion::udf::{
 use lance_datafusion::udf::{bound_cell_flag_flag_id, cell_flag_id};
 use lance_table::format::{
     CellFlagDefinition, CellFlagFile, CellFlagFragment, CellFlagFragmentState, CellFlagRoot,
-    CellFlagState, pb,
+    CellFlagState, Manifest, pb,
 };
 use object_store::path::Path;
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::Dataset;
@@ -59,6 +60,24 @@ const MAX_INLINE_CELL_FLAG_ROOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INLINE_CELL_FLAG_ROOT_COPY_BYTES: usize = 64 * 1024;
 /// Bound total root copies retained in one manifest across all tracked fields.
 const MAX_INLINE_CELL_FLAG_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+const CELL_FLAG_QUERY_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const CELL_FLAG_QUERY_MEMORY_PERMIT_BYTES: usize = 1024 * 1024;
+const CELL_FLAG_QUERY_MEMORY_PERMITS: usize =
+    CELL_FLAG_QUERY_MEMORY_BUDGET_BYTES / CELL_FLAG_QUERY_MEMORY_PERMIT_BYTES;
+
+fn cell_flag_query_memory_weight(fragment: &CellFlagFragment) -> u32 {
+    let size_bytes = match &fragment.state {
+        CellFlagFragmentState::All => 0,
+        CellFlagFragmentState::Partial(file) => {
+            usize::try_from(file.size_bytes).unwrap_or(usize::MAX)
+        }
+        CellFlagFragmentState::InlinePartial(bytes) => bytes.len(),
+    };
+    size_bytes
+        .max(1)
+        .div_ceil(CELL_FLAG_QUERY_MEMORY_PERMIT_BYTES)
+        .min(CELL_FLAG_QUERY_MEMORY_PERMITS) as u32
+}
 
 /// An explicit Boolean change to a registered field-scoped cell flag.
 ///
@@ -190,37 +209,41 @@ fn decode_cell_flag_bitmap(
     Ok(bitmap)
 }
 
+pub fn cell_flag_manifest_identity(manifest: &Manifest) -> String {
+    fn update(hasher: &mut blake3::Hasher, value: &[u8]) {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    update(&mut hasher, b"lance-cell-flag-dataset-v1");
+    update(&mut hasher, &manifest.version.to_le_bytes());
+    update(&mut hasher, &manifest.timestamp_nanos.to_le_bytes());
+    update(
+        &mut hasher,
+        manifest
+            .transaction_file
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    for fragment in manifest.fragments.iter() {
+        update(&mut hasher, &fragment.id.to_le_bytes());
+        for file in &fragment.files {
+            update(&mut hasher, file.path.as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).hyphenated().to_string()
+}
+
 impl Dataset {
     fn cell_flag_bootstrap_identity(&self) -> String {
-        fn update(hasher: &mut blake3::Hasher, value: &[u8]) {
-            hasher.update(&(value.len() as u64).to_le_bytes());
-            hasher.update(value);
-        }
-
-        let mut hasher = blake3::Hasher::new();
-        update(&mut hasher, b"lance-cell-flag-dataset-v1");
-        update(&mut hasher, &self.manifest.version.to_le_bytes());
-        update(&mut hasher, &self.manifest.timestamp_nanos.to_le_bytes());
-        update(
-            &mut hasher,
-            self.manifest
-                .transaction_file
-                .as_deref()
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        for fragment in self.manifest.fragments.iter() {
-            update(&mut hasher, &fragment.id.to_le_bytes());
-            for file in &fragment.files {
-                update(&mut hasher, file.path.as_bytes());
-            }
-        }
-        let digest = hasher.finalize();
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest.as_bytes()[..16]);
-        bytes[6] = (bytes[6] & 0x0f) | 0x80;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        Uuid::from_bytes(bytes).hyphenated().to_string()
+        cell_flag_manifest_identity(&self.manifest)
     }
 
     pub(crate) fn cell_flag_transaction_identity(&self) -> String {
@@ -1317,24 +1340,35 @@ pub async fn load_cell_flag_fragments(
     };
     let fragments = select_cell_flag_fragments(&root, selected_fragment_ids.as_deref());
     let io_parallelism = dataset.object_store.io_parallelism().max(1);
+    let memory_permits = Arc::new(Semaphore::new(CELL_FLAG_QUERY_MEMORY_PERMITS));
     futures::stream::iter(fragments)
-        .map(|fragment| async move {
-            let fragment_id = u32::try_from(fragment.fragment_id).map_err(|_| {
-                Error::invalid_input(format!(
-                    "Cell flag fragment ID {} does not fit in a row address",
-                    fragment.fragment_id
-                ))
-            })?;
-            let state = match &fragment.state {
-                CellFlagFragmentState::All => FlagFragment::All,
-                CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
-                    let bitmap = dataset
-                        .load_cell_flag_bitmap_shared(flag_id, &fragment)
-                        .await?;
-                    FlagFragment::Partial(bitmap)
-                }
-            };
-            Ok::<(u32, FlagFragment), Error>((fragment_id, state))
+        .map(|fragment| {
+            let memory_permits = memory_permits.clone();
+            async move {
+                let fragment_id = u32::try_from(fragment.fragment_id).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Cell flag fragment ID {} does not fit in a row address",
+                        fragment.fragment_id
+                    ))
+                })?;
+                let state = match &fragment.state {
+                    CellFlagFragmentState::All => FlagFragment::All,
+                    CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
+                        let memory_weight = cell_flag_query_memory_weight(&fragment);
+                        let _memory_permit = memory_permits
+                            .acquire_many_owned(memory_weight)
+                            .await
+                            .map_err(|_| {
+                                Error::internal("Cell Flag query byte semaphore closed".to_string())
+                            })?;
+                        let bitmap = dataset
+                            .load_cell_flag_bitmap_shared(flag_id, &fragment)
+                            .await?;
+                        FlagFragment::Partial(bitmap)
+                    }
+                };
+                Ok::<(u32, FlagFragment), Error>((fragment_id, state))
+            }
         })
         .buffer_unordered(io_parallelism)
         .try_collect::<HashMap<_, _>>()
@@ -1618,13 +1652,20 @@ async fn materialize_fragment_bitmap(
             );
             Ok(bitmap)
         }
-        CellFlagFragmentState::Partial(_) | CellFlagFragmentState::InlinePartial(_) => {
-            current.load_cell_flag_bitmap(flag_id, entry).await
+        CellFlagFragmentState::Partial(file) => {
+            file.validate_bitmap_path_for_fragment(flag_id, entry.fragment_id)?;
+            let path = current.cell_flag_path(file)?;
+            let store = current.object_store(file.base_id).await?;
+            let bytes = read_cell_flag_bytes(&store, &path, file).await?;
+            decode_cell_flag_bitmap(&bytes, &file.path, flag_id, entry)
+        }
+        CellFlagFragmentState::InlinePartial(bytes) => {
+            decode_cell_flag_bitmap(bytes, "inline root entry", flag_id, entry)
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PendingRowChanges {
     set: RoaringBitmap,
     clear: RoaringBitmap,
@@ -1718,7 +1759,7 @@ pub async fn apply_cell_flag_transaction(
         }
         manifest.cell_flag_dataset_id = match &transaction.operation {
             Operation::Clone { .. } if manifest.next_cell_flag_id > 0 => {
-                Some(Uuid::new_v4().hyphenated().to_string())
+                Some(cell_flag_manifest_identity(manifest))
             }
             _ => current.manifest.cell_flag_dataset_id.clone(),
         };
@@ -2202,55 +2243,63 @@ pub async fn apply_cell_flag_transaction(
                 .unwrap_or_default()
             };
 
-        for ((override_flag_id, fragment_id), value) in &overrides {
-            if *override_flag_id != flag_id {
-                continue;
-            }
+        let mut flag_overrides = Vec::new();
+        for ((_, fragment_id), value) in overrides
+            .iter()
+            .filter(|((override_flag_id, _), _)| *override_flag_id == flag_id)
+        {
             let fragment = final_fragments.get(fragment_id).ok_or_else(|| {
                 Error::internal(format!("Final fragment {} is missing", fragment_id))
             })?;
             let physical_rows = fragment_physical_rows(fragment)?;
             validate_fragment_value(flag_id, *fragment_id, physical_rows, value)?;
-            match value {
-                CellFlagFragmentValue::None => {
-                    states.remove(fragment_id);
-                }
-                CellFlagFragmentValue::All => {
-                    states.insert(
-                        *fragment_id,
-                        CellFlagFragment {
-                            fragment_id: *fragment_id,
-                            physical_rows,
-                            state: CellFlagFragmentState::All,
-                        },
-                    );
-                }
-                CellFlagFragmentValue::Partial(bitmap) => {
-                    let state = current
-                        .write_cell_flag_bitmap(
-                            write_store,
-                            flag_id,
-                            *fragment_id,
-                            physical_rows,
-                            bitmap,
-                        )
-                        .await?;
-                    states.insert(
-                        *fragment_id,
-                        CellFlagFragment {
-                            fragment_id: *fragment_id,
+            flag_overrides.push((*fragment_id, physical_rows, (*value).clone()));
+        }
+        let io_parallelism = write_store.io_parallelism().max(1);
+        let override_states = futures::stream::iter(flag_overrides)
+            .map(|(fragment_id, physical_rows, value)| async move {
+                let fragment = match value {
+                    CellFlagFragmentValue::None => None,
+                    CellFlagFragmentValue::All => Some(CellFlagFragment {
+                        fragment_id,
+                        physical_rows,
+                        state: CellFlagFragmentState::All,
+                    }),
+                    CellFlagFragmentValue::Partial(bitmap) => {
+                        let state = current
+                            .write_cell_flag_bitmap(
+                                write_store,
+                                flag_id,
+                                fragment_id,
+                                physical_rows,
+                                &bitmap,
+                            )
+                            .await?;
+                        Some(CellFlagFragment {
+                            fragment_id,
                             physical_rows,
                             state,
-                        },
-                    );
-                }
+                        })
+                    }
+                };
+                Ok::<_, Error>((fragment_id, fragment))
+            })
+            .buffer_unordered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        for (fragment_id, fragment) in override_states {
+            if let Some(fragment) = fragment {
+                states.insert(fragment_id, fragment);
+            } else {
+                states.remove(&fragment_id);
             }
         }
 
-        for ((change_flag_id, fragment_id), change) in &pending_changes {
-            if *change_flag_id != flag_id {
-                continue;
-            }
+        let mut flag_changes = Vec::new();
+        for ((_, fragment_id), change) in pending_changes
+            .iter()
+            .filter(|((change_flag_id, _), _)| *change_flag_id == flag_id)
+        {
             let fragment = final_fragments.get(fragment_id).ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Cell flag change for flag ID {} references fragment {} that is not in the new snapshot",
@@ -2270,44 +2319,60 @@ pub async fn apply_cell_flag_transaction(
                     flag_id, fragment_id
                 )));
             }
-            let mut bitmap = materialize_fragment_bitmap(
-                current,
-                flag_id,
+            flag_changes.push((
                 *fragment_id,
-                states.get(fragment_id),
-            )
-            .await?;
-            bitmap |= &change.set;
-            bitmap -= &change.clear;
-            if bitmap.is_empty() {
-                states.remove(fragment_id);
-            } else if bitmap.len() == physical_rows {
-                states.insert(
-                    *fragment_id,
-                    CellFlagFragment {
-                        fragment_id: *fragment_id,
-                        physical_rows,
-                        state: CellFlagFragmentState::All,
-                    },
-                );
-            } else {
-                let state = current
-                    .write_cell_flag_bitmap(
-                        write_store,
+                physical_rows,
+                (*change).clone(),
+                states.get(fragment_id).cloned(),
+            ));
+        }
+        let changed_states = futures::stream::iter(flag_changes)
+            .map(
+                |(fragment_id, physical_rows, change, previous_state)| async move {
+                    let mut bitmap = materialize_fragment_bitmap(
+                        current,
                         flag_id,
-                        *fragment_id,
-                        physical_rows,
-                        &bitmap,
+                        fragment_id,
+                        previous_state.as_ref(),
                     )
                     .await?;
-                states.insert(
-                    *fragment_id,
-                    CellFlagFragment {
-                        fragment_id: *fragment_id,
-                        physical_rows,
-                        state,
-                    },
-                );
+                    bitmap |= &change.set;
+                    bitmap -= &change.clear;
+                    let fragment = if bitmap.is_empty() {
+                        None
+                    } else if bitmap.len() == physical_rows {
+                        Some(CellFlagFragment {
+                            fragment_id,
+                            physical_rows,
+                            state: CellFlagFragmentState::All,
+                        })
+                    } else {
+                        let state = current
+                            .write_cell_flag_bitmap(
+                                write_store,
+                                flag_id,
+                                fragment_id,
+                                physical_rows,
+                                &bitmap,
+                            )
+                            .await?;
+                        Some(CellFlagFragment {
+                            fragment_id,
+                            physical_rows,
+                            state,
+                        })
+                    };
+                    Ok::<_, Error>((fragment_id, fragment))
+                },
+            )
+            .buffer_unordered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        for (fragment_id, fragment) in changed_states {
+            if let Some(fragment) = fragment {
+                states.insert(fragment_id, fragment);
+            } else {
+                states.remove(&fragment_id);
             }
         }
 
@@ -3931,6 +3996,24 @@ mod tests {
         assert_ne!(source_dataset_id, shallow_dataset_id);
         assert_ne!(source_dataset_id, deep_dataset_id);
         assert_ne!(shallow_dataset_id, deep_dataset_id);
+        assert_eq!(
+            shallow_dataset_id,
+            &cell_flag_manifest_identity(&shallow.manifest)
+        );
+        assert_eq!(
+            deep_dataset_id,
+            &cell_flag_manifest_identity(&deep.manifest)
+        );
+        assert_eq!(
+            Uuid::parse_str(shallow_dataset_id)
+                .unwrap()
+                .get_version_num(),
+            8
+        );
+        assert_eq!(
+            Uuid::parse_str(deep_dataset_id).unwrap().get_version_num(),
+            8
+        );
         assert_eq!(flagged_ids(&shallow, "value", FLAG_NAME).await?, vec![1, 3]);
         assert_eq!(flagged_ids(&deep, "value", FLAG_NAME).await?, vec![1, 3]);
         assert!(
