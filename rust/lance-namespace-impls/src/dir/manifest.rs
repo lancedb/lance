@@ -4697,14 +4697,16 @@ mod tests {
             .await
             .unwrap();
 
-        let error = manifest_ns
-            .register_table(RegisterTableRequest {
+        let error = LanceNamespace::register_table(
+            &manifest_ns,
+            RegisterTableRequest {
                 id: Some(vec!["table".to_string()]),
                 location,
                 ..Default::default()
-            })
-            .await
-            .unwrap_err();
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("physically deleted"));
     }
 
