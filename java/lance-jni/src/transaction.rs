@@ -1030,6 +1030,9 @@ fn convert_to_rust_transaction(
     allocator: Option<&JObject>,
     dataset: Option<&mut BlockingDataset>,
 ) -> Result<Transaction> {
+    // Transaction.close() uses the same monitor. Hold it until every exported
+    // ArrowSchema has been imported so Java cannot release a schema pointer in flight.
+    let _transaction_guard = env.lock_obj(&java_transaction)?;
     let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
     let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
     let op = env

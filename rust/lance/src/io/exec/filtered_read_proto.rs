@@ -215,33 +215,34 @@ async fn fr_options_from_proto(
                 )
             })?)?;
 
+        let has_refine_filter = proto.refine_filter_substrait.is_some();
+        let has_full_filter = proto.full_filter_substrait.is_some();
+        let mut expressions = Vec::with_capacity(2);
         if let Some(bytes) = &proto.refine_filter_substrait {
-            let expression = parse_substrait(bytes, filter_schema.clone(), state).await?;
-            options.refine_filter = Some(
-                crate::dataset::cell_flag::bind_cell_flag_expression(
-                    dataset,
-                    expression,
-                    options
-                        .fragments
-                        .as_ref()
-                        .map(|fragments| fragments.as_slice()),
-                )
-                .await?,
-            );
+            expressions.push(parse_substrait(bytes, filter_schema.clone(), state).await?);
         }
         if let Some(bytes) = &proto.full_filter_substrait {
-            let expression = parse_substrait(bytes, filter_schema, state).await?;
-            options.full_filter = Some(
-                crate::dataset::cell_flag::bind_cell_flag_expression(
-                    dataset,
-                    expression,
-                    options
-                        .fragments
-                        .as_ref()
-                        .map(|fragments| fragments.as_slice()),
-                )
-                .await?,
-            );
+            expressions.push(parse_substrait(bytes, filter_schema, state).await?);
+        }
+        let expressions = crate::dataset::cell_flag::bind_cell_flag_expressions(
+            dataset,
+            expressions,
+            options
+                .fragments
+                .as_ref()
+                .map(|fragments| fragments.as_slice()),
+        )
+        .await?;
+        let mut expressions = expressions.into_iter();
+        if has_refine_filter {
+            options.refine_filter = Some(expressions.next().ok_or_else(|| {
+                Error::internal("Missing bound refine filter expression".to_string())
+            })?);
+        }
+        if has_full_filter {
+            options.full_filter = Some(expressions.next().ok_or_else(|| {
+                Error::internal("Missing bound full filter expression".to_string())
+            })?);
         }
     }
 
@@ -342,13 +343,15 @@ async fn plan_from_proto(
             })?)?;
 
         // Decode each unique expression once, then share via Arc.
-        let mut decoded: Vec<Arc<Expr>> = Vec::with_capacity(proto.filter_expressions.len());
+        let mut decoded = Vec::with_capacity(proto.filter_expressions.len());
         for bytes in &proto.filter_expressions {
-            let expr = parse_substrait(bytes, filter_schema.clone(), state).await?;
-            let expr =
-                crate::dataset::cell_flag::bind_cell_flag_expression(dataset, expr, None).await?;
-            decoded.push(Arc::new(expr));
+            decoded.push(parse_substrait(bytes, filter_schema.clone(), state).await?);
         }
+        let decoded = crate::dataset::cell_flag::bind_cell_flag_expressions(dataset, decoded, None)
+            .await?
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>();
 
         for (frag_id, expr_id) in &proto.fragment_filter_ids {
             let expr = decoded.get(*expr_id as usize).ok_or_else(|| {
@@ -749,10 +752,16 @@ mod tests {
         let filter_schema = Arc::new(ArrowSchema::empty());
 
         let public_expression = cell_flag(datafusion_expr::col("x"), "computed");
-        let bound_expression =
-            crate::dataset::cell_flag::bind_cell_flag_expression(&dataset, public_expression, None)
-                .await
-                .unwrap();
+        let bound_expression = crate::dataset::cell_flag::bind_cell_flag_expressions(
+            &dataset,
+            vec![public_expression],
+            None,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
         let mut options = FilteredReadOptions::basic_full_read(&dataset);
         options.projection = options.projection.with_row_addr();
         options.full_filter = Some(bound_expression);
@@ -772,6 +781,46 @@ mod tests {
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             98
         );
+    }
+
+    #[tokio::test]
+    async fn test_filtered_read_options_bind_cell_flags_with_one_budget() {
+        let mut dataset = make_test_dataset().await.as_ref().clone();
+        dataset
+            .register_cell_flag("x", "computed", true)
+            .await
+            .unwrap();
+        dataset
+            .register_cell_flag("x", "reviewed", false)
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let context = SessionContext::new();
+        lance_datafusion::udf::register_functions(&context);
+        let state = context.state();
+        let filter_schema = Arc::new(ArrowSchema::empty());
+        let expressions = crate::dataset::cell_flag::bind_cell_flag_expressions(
+            &dataset,
+            vec![
+                cell_flag(datafusion_expr::col("x"), "computed"),
+                cell_flag(datafusion_expr::col("x"), "reviewed"),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        let mut expressions = expressions.into_iter();
+        let mut options = FilteredReadOptions::basic_full_read(&dataset);
+        options.refine_filter = expressions.next();
+        options.full_filter = expressions.next();
+
+        let proto = fr_options_to_proto(&options, &dataset, &filter_schema, &state).unwrap();
+        let decoded = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap();
+
+        assert!(decoded.refine_filter.is_some());
+        assert!(decoded.full_filter.is_some());
     }
 
     #[tokio::test]
@@ -950,12 +999,15 @@ mod tests {
         lance_datafusion::udf::register_functions(&context);
         let state = context.state();
 
-        let expression = crate::dataset::cell_flag::bind_cell_flag_expression(
+        let expression = crate::dataset::cell_flag::bind_cell_flag_expressions(
             &dataset,
-            cell_flag(datafusion_expr::col("x"), "computed"),
+            vec![cell_flag(datafusion_expr::col("x"), "computed")],
             None,
         )
         .await
+        .unwrap()
+        .into_iter()
+        .next()
         .unwrap();
         let mut rows = RowAddrTreeMap::new();
         let mut filters = HashMap::new();

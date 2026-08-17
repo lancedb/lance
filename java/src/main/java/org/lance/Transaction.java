@@ -148,7 +148,7 @@ public class Transaction implements AutoCloseable {
 
   /** Release native resources held by the operation (e.g. Arrow C schemas). */
   @Override
-  public void close() {
+  public synchronized void close() {
     if (closed.compareAndSet(false, true)) {
       operationLease.release();
     }

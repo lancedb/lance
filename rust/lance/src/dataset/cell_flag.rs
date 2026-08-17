@@ -24,7 +24,7 @@ use lance_table::format::{
     CellFlagDefinition, CellFlagFile, CellFlagFragment, CellFlagFragmentState, CellFlagRoot,
     CellFlagState, Manifest, pb,
 };
-use object_store::path::Path;
+use object_store::{GetOptions, path::Path};
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use tokio::sync::Semaphore;
@@ -212,11 +212,29 @@ pub async fn read_cell_flag_bytes(
             file.path, file.size_bytes
         ))
     })?;
-    let reader = store.open_with_size(path, known_size).await?;
-    let bytes = reader.get_all().await?;
-    if bytes.len() != known_size {
+    // A bounded GET caps the response body while its metadata still reports the
+    // full object size, so a forged descriptor cannot trigger an unbounded read.
+    let result = store
+        .inner
+        .get_opts(
+            path,
+            GetOptions {
+                range: Some((0..file.size_bytes).into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let actual_size = result.meta.size;
+    if actual_size != file.size_bytes {
         return Err(Error::invalid_input(format!(
             "Cell flag file '{}' has size {}, expected {}",
+            file.path, actual_size, file.size_bytes
+        )));
+    }
+    let bytes = result.bytes().await?;
+    if bytes.len() != known_size {
+        return Err(Error::invalid_input(format!(
+            "Cell flag file '{}' range read returned size {}, expected {}",
             file.path,
             bytes.len(),
             file.size_bytes
@@ -904,15 +922,15 @@ impl Dataset {
                 entry.state = CellFlagFragmentState::Partial(file);
             }
         }
-        let bytes = pb::CellFlagRoot::from(&root).encode_to_vec();
-        if bytes.len() as u64 > MAX_CELL_FLAG_FILE_BYTES {
+        let proto_root = pb::CellFlagRoot::from(&root);
+        let encoded_size = proto_root.encoded_len();
+        if encoded_size as u64 > MAX_CELL_FLAG_FILE_BYTES {
             return Err(Error::internal(format!(
                 "Cell flag root for flag ID {} has encoded size {}, maximum is {}",
-                flag_id,
-                bytes.len(),
-                MAX_CELL_FLAG_FILE_BYTES
+                flag_id, encoded_size, MAX_CELL_FLAG_FILE_BYTES
             )));
         }
+        let bytes = proto_root.encode_to_vec();
         let relative = Path::from(CELL_FLAGS_DIR)
             .join(CELL_FLAG_ROOTS_DIR)
             .join(flag_id.to_string())
@@ -1509,17 +1527,21 @@ pub fn unbind_cell_flag_expression(dataset: &Dataset, expression: Expr) -> Resul
 }
 
 #[cfg(feature = "substrait")]
-pub async fn bind_cell_flag_expression(
+pub async fn bind_cell_flag_expressions(
     dataset: &Dataset,
-    expression: Expr,
+    expressions: Vec<Expr>,
     selected_fragments: Option<&[lance_table::format::Fragment]>,
-) -> Result<Expr> {
+) -> Result<Vec<Expr>> {
+    let expression_refs = expressions.iter().collect::<Vec<_>>();
     let Some(bindings) =
-        CellFlagExprBindings::try_new(dataset, &[&expression], selected_fragments).await?
+        CellFlagExprBindings::try_new(dataset, &expression_refs, selected_fragments).await?
     else {
-        return Ok(expression);
+        return Ok(expressions);
     };
-    bindings.bind(expression, dataset)
+    expressions
+        .into_iter()
+        .map(|expression| bindings.bind(expression, dataset))
+        .collect()
 }
 
 /// Snapshot bindings shared by every cell flag expression in one scanner.
@@ -2605,6 +2627,29 @@ mod tests {
             }),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn external_cell_flag_read_rejects_actual_size_mismatch() -> Result<()> {
+        let directory = TempStrDir::default();
+        let dataset = dataset_with_rows(&directory, 2).await?;
+        let relative = Path::from(CELL_FLAGS_DIR).join("size-mismatch.root");
+        let full_path = Path::from_iter(dataset.base.parts().chain(relative.parts()));
+        dataset.object_store.put(&full_path, b"12").await?;
+        let file = CellFlagFile {
+            path: relative.to_string(),
+            size_bytes: 1,
+            base_id: None,
+            inline_bytes: None,
+        };
+
+        let error = read_cell_flag_bytes(&dataset.object_store, &full_path, &file)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("has size 2, expected 1"));
+        Ok(())
     }
 
     async fn flag_rows(dataset: &Dataset, field: &str, name: &str) -> Result<Vec<(i32, bool)>> {
