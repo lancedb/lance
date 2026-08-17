@@ -22,7 +22,6 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-use lance_core::assume_eq;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
 // Named tiers are only matched on x86_64, or by the fp16 kernels on the other
@@ -30,6 +29,8 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(any(feature = "fp16kernels", target_arch = "x86_64"))]
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
+
+use crate::distance::{assert_batch_layout, assert_equal_lengths};
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -64,12 +65,14 @@ pub trait L2: Num {
         y: &'a [Self],
         dimension: usize,
     ) -> impl Iterator<Item = f32> + 'a {
+        assert_batch_layout(x.len(), y.len(), dimension);
         y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
     }
 }
 
 #[inline]
 pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
+    assert_equal_lengths(from.len(), to.len());
     T::l2(from, to)
 }
 
@@ -82,6 +85,7 @@ pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
 /// index an explicit f32 API.
 #[inline]
 pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
+    assert_equal_lengths(x.len(), y.len());
     #[cfg(target_arch = "x86_64")]
     {
         if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
@@ -119,6 +123,7 @@ unsafe fn l2_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
 /// Calculate L2 distance between two uint8 slices.
 #[inline]
 pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
+    assert_equal_lengths(key.len(), target.len());
     key.iter()
         .zip(target.iter())
         .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
@@ -139,6 +144,7 @@ pub fn l2_scalar<
     from: &[T],
     to: &[T],
 ) -> Output {
+    assert_equal_lengths(from.len(), to.len());
     let x_chunks = from.chunks_exact(LANES);
     let y_chunks = to.chunks_exact(LANES);
 
@@ -170,6 +176,7 @@ pub fn l2_scalar<
 impl L2 for u8 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         super::l2_u8::l2_u8(x, y) as f32
     }
 }
@@ -197,6 +204,7 @@ mod bf16_kernel {
 impl L2 for bf16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -253,6 +261,7 @@ mod kernel {
 impl L2 for f16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -289,6 +298,7 @@ impl L2 for f16 {
 impl L2 for f32 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 or AVX-512 inner kernel on capable hosts, or a portable
@@ -301,6 +311,7 @@ impl L2 for f32 {
         y: &'a [Self],
         dimension: usize,
     ) -> impl Iterator<Item = Self> + 'a {
+        assert_batch_layout(x.len(), y.len(), dimension);
         // Exactly one arm compiles; see `Dot::dot_batch` for f32.
         #[cfg(all(
             target_arch = "x86_64",
@@ -498,6 +509,7 @@ fn l2_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
 impl L2 for f64 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         l2_f64_simd(x, y)
     }
 }
@@ -927,6 +939,7 @@ impl L2Prepared {
 /// Compute L2 distance between two vectors.
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
+    assert_equal_lengths(from.len(), to.len());
     l2(from, to)
 }
 
@@ -946,8 +959,7 @@ pub fn l2_distance_batch<'a, T: L2>(
     to: &'a [T],
     dimension: usize,
 ) -> impl Iterator<Item = f32> + 'a {
-    assume_eq!(from.len(), dimension);
-    assume_eq!(to.len() % dimension, 0);
+    assert_batch_layout(from.len(), to.len(), dimension);
 
     T::l2_batch(from, to, dimension)
 }
@@ -1022,6 +1034,22 @@ mod tests {
     use approx::assert_relative_eq;
     use num_traits::ToPrimitive;
     use proptest::prelude::*;
+
+    #[test]
+    fn test_l2_rejects_mismatched_lengths() {
+        let short = [1.0_f32];
+        let long = [1.0_f32, 2.0];
+
+        assert!(std::panic::catch_unwind(|| l2(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_f32(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| f32::l2(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch(&short, &long, 2)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch(&long, &[1.0_f32; 3], 2)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch::<f32>(&[], &[], 0)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_uint_scalar(&[1, 2], &[1])).is_err());
+        assert!(std::panic::catch_unwind(|| l2_scalar::<u8, f32, 16>(&[1, 2], &[1])).is_err());
+    }
 
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
