@@ -23,6 +23,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A pure data container representing a Lance transaction.
@@ -40,7 +41,34 @@ public class Transaction implements AutoCloseable {
   private final Optional<String> tag;
   private final Optional<Map<String, String>> transactionProperties;
   private final String cellFlagTransactionPayload;
-  private final AtomicBoolean operationReleased;
+  private final OperationLease operationLease;
+  private final AtomicBoolean closed = new AtomicBoolean();
+
+  private static final class OperationLease {
+    private final Operation operation;
+    private final AtomicInteger references = new AtomicInteger(1);
+
+    private OperationLease(Operation operation) {
+      this.operation = operation;
+    }
+
+    private OperationLease retain() {
+      int current = references.get();
+      while (current > 0) {
+        if (references.compareAndSet(current, current + 1)) {
+          return this;
+        }
+        current = references.get();
+      }
+      throw new IllegalStateException("Transaction operation has already been released");
+    }
+
+    private void release() {
+      if (references.decrementAndGet() == 0) {
+        operation.release();
+      }
+    }
+  }
 
   /**
    * Constructor used by JNI when reading transactions from native code.
@@ -66,7 +94,7 @@ public class Transaction implements AutoCloseable {
         tag,
         transactionProperties,
         cellFlagTransactionPayload,
-        new AtomicBoolean());
+        new OperationLease(operation));
   }
 
   private Transaction(
@@ -76,14 +104,14 @@ public class Transaction implements AutoCloseable {
       String tag,
       Map<String, String> transactionProperties,
       String cellFlagTransactionPayload,
-      AtomicBoolean operationReleased) {
+      OperationLease operationLease) {
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
     this.tag = Optional.ofNullable(tag);
     this.transactionProperties = Optional.ofNullable(transactionProperties);
     this.cellFlagTransactionPayload = cellFlagTransactionPayload;
-    this.operationReleased = operationReleased;
+    this.operationLease = operationLease;
   }
 
   /**
@@ -121,8 +149,8 @@ public class Transaction implements AutoCloseable {
   /** Release native resources held by the operation (e.g. Arrow C schemas). */
   @Override
   public void close() {
-    if (operationReleased.compareAndSet(false, true)) {
-      operation.release();
+    if (closed.compareAndSet(false, true)) {
+      operationLease.release();
     }
   }
 
@@ -167,7 +195,8 @@ public class Transaction implements AutoCloseable {
     private String tag;
     private Map<String, String> transactionProperties;
     private String cellFlagTransactionPayload;
-    private AtomicBoolean operationReleased = new AtomicBoolean();
+    private OperationLease operationLease;
+    private boolean built;
 
     public Builder() {
       this.uuid = UUID.randomUUID().toString();
@@ -189,7 +218,7 @@ public class Transaction implements AutoCloseable {
       this.tag = transaction.tag.orElse(null);
       this.transactionProperties = transaction.transactionProperties.orElse(null);
       this.cellFlagTransactionPayload = transaction.cellFlagTransactionPayload;
-      this.operationReleased = transaction.operationReleased;
+      this.operationLease = transaction.operationLease;
     }
 
     public Builder readVersion(long readVersion) {
@@ -208,7 +237,7 @@ public class Transaction implements AutoCloseable {
             String.format("Operation %s has been set", this.operation.name()));
       }
       if (inheritedOperation) {
-        operationReleased = new AtomicBoolean();
+        operationLease = null;
       }
       this.operation = operation;
       this.inheritedOperation = false;
@@ -232,7 +261,11 @@ public class Transaction implements AutoCloseable {
     }
 
     public Transaction build() {
+      Preconditions.checkState(!built, "TransactionBuilder has already built a transaction");
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
+      built = true;
+      OperationLease lease =
+          inheritedOperation ? operationLease.retain() : new OperationLease(operation);
       return new Transaction(
           readVersion,
           uuid,
@@ -240,7 +273,7 @@ public class Transaction implements AutoCloseable {
           tag,
           transactionProperties,
           cellFlagTransactionPayload,
-          operationReleased);
+          lease);
     }
   }
 }

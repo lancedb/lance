@@ -18,6 +18,8 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -33,7 +35,7 @@ import java.util.Objects;
  */
 public abstract class SchemaOperation implements Operation {
   private final Schema schema;
-  private ArrowSchema cSchema;
+  private final List<ArrowSchema> cSchemas = new ArrayList<>();
 
   protected SchemaOperation(Schema schema) {
     this.schema = schema;
@@ -49,18 +51,23 @@ public abstract class SchemaOperation implements Operation {
    * @param allocator the buffer allocator
    * @return the schema address
    */
-  public long exportSchema(BufferAllocator allocator) {
-    if (cSchema == null) {
-      this.cSchema = ArrowSchema.allocateNew(allocator);
+  public synchronized long exportSchema(BufferAllocator allocator) {
+    ArrowSchema cSchema = ArrowSchema.allocateNew(allocator);
+    try {
       Data.exportSchema(allocator, schema, null, cSchema);
+      cSchemas.add(cSchema);
+      return cSchema.memoryAddress();
+    } catch (RuntimeException | Error error) {
+      cSchema.close();
+      throw error;
     }
-    return cSchema.memoryAddress();
   }
 
-  public void release() {
-    if (cSchema != null) {
+  public synchronized void release() {
+    for (ArrowSchema cSchema : cSchemas) {
       cSchema.close();
     }
+    cSchemas.clear();
   }
 
   @Override

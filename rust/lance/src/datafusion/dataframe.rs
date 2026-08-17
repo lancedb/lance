@@ -173,15 +173,18 @@ impl LanceTableProvider {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let query_memory_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         futures::stream::iter(bindings)
             .map(|binding| {
                 let selected_fragment_ids = selected_fragment_ids.clone();
                 let covered_fragments = covered_fragments.clone();
+                let query_memory_bytes = query_memory_bytes.clone();
                 async move {
                     let fragments = load_cell_flag_fragments(
                         &self.dataset,
                         binding.flag_id(),
                         selected_fragment_ids,
+                        &query_memory_bytes,
                     )
                     .await
                     .map_err(DataFusionError::from)?;

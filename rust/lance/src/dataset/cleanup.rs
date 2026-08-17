@@ -39,7 +39,6 @@ use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
-use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
@@ -1407,19 +1406,19 @@ impl<'a> CleanupTask<'a> {
         // Use a concurrent set to identify branches eligible for cleanup.
         // The filter below preserves the original (branch_name, version) tuples.
         let referenced_branches: DashSet<String> = DashSet::new();
-        let tasks: Vec<_> = children
-            .iter()
+        stream::iter(children.clone())
             .map(|(branch_name, referenced_version)| {
                 let dataset = &self.dataset;
                 let policy = &self.policy;
                 let referenced_branches = &referenced_branches;
 
                 async move {
+                    let _permit = self.io_context.acquire().await?;
                     let manifest_location = dataset
                         .commit_handler
                         .resolve_version_location(
                             &dataset.base,
-                            *referenced_version,
+                            referenced_version,
                             &dataset.object_store.inner,
                         )
                         .await?;
@@ -1434,14 +1433,14 @@ impl<'a> CleanupTask<'a> {
                     if let Ok(manifest) = manifest
                         && policy.should_clean(&manifest)
                     {
-                        referenced_branches.insert(branch_name.clone());
+                        referenced_branches.insert(branch_name);
                     }
                     Ok::<(), Error>(())
                 }
             })
-            .collect();
-
-        try_join_all(tasks).await?;
+            .buffer_unordered(self.dataset.object_store.io_parallelism().max(1))
+            .try_collect::<Vec<_>>()
+            .await?;
 
         // Filter children to only include branches that should be cleaned.
         // The DashSet contains branch names found eligible during concurrent scan.
@@ -1477,10 +1476,12 @@ impl<'a> CleanupTask<'a> {
                 let final_result = &final_result;
                 async move {
                     for branch in branch_chain {
-                        let branch_dataset = self
-                            .dataset
-                            .checkout_version((branch.as_str(), None))
-                            .await?;
+                        let branch_dataset = {
+                            let _permit = self.io_context.acquire().await?;
+                            self.dataset
+                                .checkout_version((branch.as_str(), None))
+                                .await?
+                        };
                         let ignored_manifests =
                             final_result.lock().unwrap().removed_manifests.clone();
                         if let Some(result) = cleanup_cascade_branch_run(
@@ -1502,7 +1503,10 @@ impl<'a> CleanupTask<'a> {
                 }
             })
             .collect();
-        try_join_all(tasks).await?;
+        stream::iter(tasks)
+            .buffer_unordered(self.dataset.object_store.io_parallelism().max(1))
+            .try_collect::<Vec<_>>()
+            .await?;
         Ok(final_result.into_inner().unwrap())
     }
 

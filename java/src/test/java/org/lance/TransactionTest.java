@@ -21,6 +21,7 @@ import org.lance.operation.Append;
 import org.lance.operation.CreateIndex;
 import org.lance.operation.Operation;
 import org.lance.operation.Overwrite;
+import org.lance.operation.Project;
 import org.lance.test.JniTestHelper;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -63,9 +64,29 @@ public class TransactionTest {
     Transaction rebuilt = new Transaction.Builder(original).build();
 
     rebuilt.close();
+    assertEquals(0, releases.get());
     original.close();
 
     assertEquals(1, releases.get());
+  }
+
+  @Test
+  public void testClosingRebuiltSchemaTransactionKeepsOriginalUsable(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("schema-alias").toString());
+      try (Dataset dataset = testDataset.createEmptyDataset();
+          Transaction original =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(Project.builder().schema(testDataset.getSchema()).build())
+                  .build()) {
+        try (Transaction rebuilt = new Transaction.Builder(original).build()) {
+          JniTestHelper.validateTransaction(dataset, rebuilt);
+        }
+        JniTestHelper.validateTransaction(dataset, original);
+      }
+    }
   }
 
   @Test
