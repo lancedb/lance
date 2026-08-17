@@ -6364,14 +6364,6 @@ impl PrimitiveStructuralEncoder {
                         variable.bits_per_offset
                     ))
                 }
-                DataBlock::Struct(struct_data_block)
-                    if !struct_data_block.has_variable_width_child() =>
-                {
-                    Some(
-                        "Full-zip packed struct requires at least one variable-width child"
-                            .to_string(),
-                    )
-                }
                 DataBlock::Dictionary(_) => {
                     Some("Full-zip does not encode dictionary data blocks directly".to_string())
                 }
