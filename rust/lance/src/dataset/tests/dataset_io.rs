@@ -547,6 +547,16 @@ impl WrappingObjectStore for CountingObjectStoreWrapper {
         self.wraps.fetch_add(1, Ordering::Relaxed);
         original
     }
+
+    // Passes requests straight through, so a listing may keep going around it. Only `wrap` is
+    // counted, since the count is what the caching assertions are written against.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
 }
 
 impl CountingObjectStoreWrapper {
