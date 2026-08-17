@@ -47,6 +47,11 @@ use uuid::Uuid;
 
 use super::util::{manifest_filename, parse_bit_reversed_filename, shard_manifest_path};
 
+// Prefixing the protobuf with field tag zero makes the record undecodable by
+// older readers, which fail closed instead of mapping a new enum value to
+// Active. New readers strip the envelope and restore `Dropped` explicitly.
+const DROPPED_MANIFEST_PREFIX: &[u8] = b"\0LANCE_DROPPED\0";
+
 /// Version hint file structure.
 #[derive(Debug, Serialize, Deserialize)]
 struct VersionHint {
@@ -119,10 +124,18 @@ impl ShardManifestStore {
             .await
             .map_err(|e| Error::io(format!("Failed to read manifest bytes: {}", e)))?;
 
+        let (bytes, dropped) = match bytes.strip_prefix(DROPPED_MANIFEST_PREFIX) {
+            Some(bytes) => (bytes, true),
+            None => (bytes.as_ref(), false),
+        };
         let pb_manifest = pb::ShardManifest::decode(bytes)
             .map_err(|e| Error::io(format!("Failed to decode manifest protobuf: {}", e)))?;
 
-        ShardManifest::try_from(pb_manifest)
+        let mut manifest = ShardManifest::try_from(pb_manifest)?;
+        if dropped {
+            manifest.status = ShardStatus::Dropped;
+        }
+        Ok(manifest)
     }
 
     /// Write an initial manifest for a newly-created shard.
@@ -181,6 +194,14 @@ impl ShardManifestStore {
 
         let pb_manifest = pb::ShardManifest::from(manifest);
         let bytes = pb_manifest.encode_to_vec();
+        let bytes = if manifest.status == ShardStatus::Dropped {
+            let mut enveloped = Vec::with_capacity(DROPPED_MANIFEST_PREFIX.len() + bytes.len());
+            enveloped.extend_from_slice(DROPPED_MANIFEST_PREFIX);
+            enveloped.extend_from_slice(&bytes);
+            enveloped
+        } else {
+            bytes
+        };
 
         self.object_store
             .put_if_absent(&path, Bytes::from(bytes).into())
@@ -778,6 +799,23 @@ mod tests {
             ..reclaimed
         };
         manifest_store.write(&dropped).await.unwrap();
+        let raw_path = manifest_store
+            .manifest_dir
+            .clone()
+            .join(manifest_filename(dropped.version).as_str());
+        let raw = manifest_store
+            .object_store
+            .inner
+            .get(&raw_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(
+            pb::ShardManifest::decode(raw).is_err(),
+            "an older protobuf-only reader must fail closed on a dropped fence"
+        );
         let err = manifest_store.claim_epoch(0).await.unwrap_err();
         assert!(
             err.to_string().contains("dropped"),

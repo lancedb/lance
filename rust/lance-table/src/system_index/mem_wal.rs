@@ -163,7 +163,10 @@ impl ShardStatus {
         match self {
             Self::Active => 0,
             Self::Sealed => 1,
-            Self::Dropped => 2,
+            // Committed drops use a fail-closed envelope around a SEALED
+            // protobuf; see ShardManifestStore. Never emit a new enum value
+            // that an older reader would interpret as Active.
+            Self::Dropped => 1,
         }
     }
 
@@ -172,8 +175,8 @@ impl ShardStatus {
     fn from_i32(v: i32) -> Self {
         match v {
             1 => Self::Sealed,
-            2 => Self::Dropped,
-            _ => Self::Active,
+            // Unknown non-zero values are lifecycle fences, never Active.
+            _ => Self::Sealed,
         }
     }
 }

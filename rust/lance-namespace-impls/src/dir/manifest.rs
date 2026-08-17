@@ -804,8 +804,7 @@ struct TombstoneTableMutation {
     expected_location: String,
     tombstone_object_id: String,
     deleted: bool,
-    tombstone_exists: bool,
-    owns_existing_tombstone: bool,
+    existing_tombstone_id: Option<String>,
     drop_epoch: u64,
     saw_drop_epoch: bool,
     next_drop_epoch: Option<String>,
@@ -813,7 +812,7 @@ struct TombstoneTableMutation {
 
 enum TombstoneTableResult {
     Owned(String),
-    Existing,
+    Existing(String),
     Missing,
 }
 
@@ -884,8 +883,7 @@ impl ManifestStreamMutation for TombstoneTableMutation {
                 .as_deref()
                 .is_some_and(|location| manifest_locations_match(location, &self.expected_location))
         {
-            self.tombstone_exists = true;
-            self.owns_existing_tombstone = row.object_id == self.tombstone_object_id;
+            self.existing_tombstone_id = Some(row.object_id.clone());
         } else if row.object_type == ObjectType::Table
             && row.location.as_deref().is_some_and(|location| {
                 manifest_locations_overlap(location, &self.expected_location)
@@ -917,7 +915,7 @@ impl ManifestStreamMutation for TombstoneTableMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
-        if self.deleted && !self.tombstone_exists {
+        if self.deleted && self.existing_tombstone_id.is_none() {
             output.append(index_data, self.tombstone_row())?;
         }
         if self.deleted {
@@ -952,12 +950,12 @@ impl ManifestStreamMutation for TombstoneTableMutation {
             CopyOnWriteMutation::updated(TombstoneTableResult::Owned(
                 self.tombstone_object_id.clone(),
             ))
-        } else if self.owns_existing_tombstone {
+        } else if self.existing_tombstone_id.as_deref() == Some(self.tombstone_object_id.as_str()) {
             CopyOnWriteMutation::unchanged(TombstoneTableResult::Owned(
                 self.tombstone_object_id.clone(),
             ))
-        } else if self.tombstone_exists {
-            CopyOnWriteMutation::unchanged(TombstoneTableResult::Existing)
+        } else if let Some(tombstone_id) = &self.existing_tombstone_id {
+            CopyOnWriteMutation::unchanged(TombstoneTableResult::Existing(tombstone_id.clone()))
         } else {
             CopyOnWriteMutation::unchanged(TombstoneTableResult::Missing)
         }
@@ -3195,8 +3193,7 @@ impl ManifestNamespace {
                 expected_location: expected_location.clone(),
                 tombstone_object_id: tombstone_object_id.clone(),
                 deleted: false,
-                tombstone_exists: false,
-                owns_existing_tombstone: false,
+                existing_tombstone_id: None,
                 drop_epoch: 0,
                 saw_drop_epoch: false,
                 next_drop_epoch: None,
@@ -4153,7 +4150,7 @@ impl LanceNamespace for ManifestNamespace {
                         .await?
                     {
                         TombstoneTableResult::Owned(tombstone_id) => Some(tombstone_id),
-                        TombstoneTableResult::Existing | TombstoneTableResult::Missing => None,
+                        TombstoneTableResult::Existing(_) | TombstoneTableResult::Missing => None,
                     }
                 } else if self
                     .delete_from_manifest_if_location(&object_id, Some(&info.location), true)
@@ -4733,7 +4730,7 @@ impl LanceNamespace for ManifestNamespace {
                 .await?;
             let tombstone_id = match tombstone_result {
                 TombstoneTableResult::Owned(tombstone_id) => Some(tombstone_id),
-                TombstoneTableResult::Existing => None,
+                TombstoneTableResult::Existing(tombstone_id) => Some(tombstone_id),
                 TombstoneTableResult::Missing => {
                     return Err(NamespaceError::ConcurrentModification {
                         message: format!(
@@ -6140,12 +6137,13 @@ mod tests {
         else {
             panic!("first tombstone must own cleanup");
         };
+        let retry = manifest_ns
+            .tombstone_table_in_manifest("table", "generation.lance")
+            .await
+            .unwrap();
         assert!(matches!(
-            manifest_ns
-                .tombstone_table_in_manifest("table", "generation.lance")
-                .await
-                .unwrap(),
-            TombstoneTableResult::Existing
+            &retry,
+            TombstoneTableResult::Existing(existing) if existing == &tombstone_id
         ));
         assert_eq!(
             manifest_ns.list_drop_tombstones().await.unwrap(),
