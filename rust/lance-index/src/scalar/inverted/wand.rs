@@ -2943,6 +2943,26 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
     }
+
+    /// Return the next matching document without evaluating scores or score
+    /// bounds. Prohibited clauses only need membership; phrase positions stay
+    /// as a separate two-phase confirmation on the cursor.
+    fn next_membership(&mut self) -> Option<DocInfo> {
+        if self.operator == Operator::And {
+            return self.next_and_membership_candidate();
+        }
+
+        debug_assert_eq!(self.threshold, 0.0);
+        debug_assert!(self.tail.is_empty());
+        loop {
+            let target = self.head_doc()?;
+            self.move_head_doc_to_lead(target);
+            if let Some(doc) = self.lead.first().and_then(|posting| posting.doc()) {
+                return Some(doc);
+            }
+        }
+    }
+
     fn next_and_candidate(&mut self) -> Option<DocInfo> {
         if self.lead.len() < self.num_terms {
             return None;
@@ -3006,6 +3026,44 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 continue;
             }
 
+            self.and_last_doc = Some(doc);
+            return Some(lead_doc);
+        }
+    }
+
+    fn next_and_membership_candidate(&mut self) -> Option<DocInfo> {
+        if self.lead.len() < self.num_terms {
+            return None;
+        }
+        if let Some(last_doc) = self.and_last_doc
+            && self
+                .lead
+                .first()
+                .and_then(|posting| posting.doc())
+                .map(|doc| doc.doc_id())
+                == Some(last_doc)
+        {
+            self.lead[0].next(last_doc.saturating_add(1));
+        }
+
+        'advance_head: loop {
+            let doc = self
+                .lead
+                .first()
+                .and_then(|posting| posting.doc())?
+                .doc_id();
+            for posting in self.lead.iter_mut().skip(1) {
+                if posting.doc()?.doc_id() < doc {
+                    posting.next(doc);
+                }
+                let next = posting.doc()?.doc_id();
+                if next > doc {
+                    self.lead[0].next(next);
+                    continue 'advance_head;
+                }
+            }
+
+            let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
             self.and_last_doc = Some(doc);
             return Some(lead_doc);
         }
@@ -4368,6 +4426,7 @@ impl<'a> PositionCursor<'a> {
 /// which owns the only competitive score for the whole scorer tree.
 pub(super) struct WandCursor<'a, D: WandDocuments> {
     wand: Wand<'a, Arc<MemBM25Scorer>, D>,
+    mode: WandCursorMode,
     phrase_slop: Option<u32>,
     wand_factor: f32,
     cost: usize,
@@ -4382,6 +4441,12 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     metrics: &'a dyn MetricsCollector,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WandCursorMode {
+    Scoring,
+    Membership,
+}
+
 impl<'a, D: WandDocuments> WandCursor<'a, D> {
     pub(super) fn new(
         operator: Operator,
@@ -4390,6 +4455,45 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         scorer: Arc<MemBM25Scorer>,
         params: &FtsSearchParams,
         metrics: &'a dyn MetricsCollector,
+    ) -> Self {
+        Self::new_with_mode(
+            operator,
+            postings,
+            documents,
+            scorer,
+            params,
+            metrics,
+            WandCursorMode::Scoring,
+        )
+    }
+
+    pub(super) fn new_membership(
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Self {
+        Self::new_with_mode(
+            operator,
+            postings,
+            documents,
+            scorer,
+            params,
+            metrics,
+            WandCursorMode::Membership,
+        )
+    }
+
+    fn new_with_mode(
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+        mode: WandCursorMode,
     ) -> Self {
         let cost = match operator {
             Operator::And => postings.iter().map(PostingIterator::cost).min(),
@@ -4403,6 +4507,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         .unwrap_or_default();
         Self {
             wand: Wand::new(operator, postings.into_iter(), documents, scorer),
+            mode,
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
             cost,
@@ -4442,6 +4547,13 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     fn position_next(&mut self) -> Result<Option<u64>> {
+        match self.mode {
+            WandCursorMode::Scoring => self.position_next_scoring(),
+            WandCursorMode::Membership => self.position_next_membership(),
+        }
+    }
+
+    fn position_next_scoring(&mut self) -> Result<Option<u64>> {
         loop {
             let Some((doc, mut score)) = self.wand.next()? else {
                 self.clear_current();
@@ -4473,6 +4585,29 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         }
     }
 
+    fn position_next_membership(&mut self) -> Result<Option<u64>> {
+        loop {
+            let Some(doc) = self.wand.next_membership() else {
+                self.clear_current();
+                self.record_metrics();
+                return Ok(None);
+            };
+            self.comparisons += 1;
+            let doc_id = doc.doc_id();
+            let Some(document_key) = self.wand.documents.document_key(&doc) else {
+                if self.wand.operator == Operator::Or {
+                    self.wand.push_back_leads(doc_id.saturating_add(1));
+                }
+                continue;
+            };
+            self.current_doc = Some(doc);
+            self.current_document_key = Some(document_key);
+            self.confirmation = self.phrase_slop.is_none().then_some(true);
+            self.shallow = None;
+            return Ok(Some(doc_id));
+        }
+    }
+
     pub(super) fn next(&mut self) -> Result<Option<u64>> {
         if let Some(doc) = self.current_doc
             && self.wand.operator == Operator::Or
@@ -4497,12 +4632,20 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     pub(super) fn global_score_upper_bound(&self) -> Option<f32> {
+        if self.mode == WandCursorMode::Membership {
+            return None;
+        }
         *self
             .global_score_upper_bound
             .get_or_init(|| self.wand.compound_global_score_upper_bound())
     }
 
     pub(super) fn current_score(&self) -> Result<f32> {
+        if self.mode == WandCursorMode::Membership {
+            return Err(Error::internal(
+                "score requested from a membership-only posting FTS scorer",
+            ));
+        }
         self.current_doc
             .map(|_| self.current_score)
             .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))
@@ -4528,12 +4671,20 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     pub(super) fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        if self.mode == WandCursorMode::Membership {
+            return Ok(TERMINATED_DOC_ID);
+        }
         let (up_to, upper) = self.wand.compound_shallow_bound(target);
         self.shallow = Some((target, up_to, upper));
         Ok(up_to)
     }
 
     pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
+        if self.mode == WandCursorMode::Membership {
+            return Err(Error::internal(
+                "score bound requested from a membership-only posting FTS scorer",
+            ));
+        }
         let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
             Error::internal("score bound requires advance_shallow on the posting FTS scorer")
         })?;
@@ -4550,6 +4701,9 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             return Err(Error::invalid_input(
                 "minimum competitive FTS score cannot be NaN",
             ));
+        }
+        if self.mode == WandCursorMode::Membership {
+            return Ok(());
         }
         let threshold = next_down_f32(min_score) * self.wand_factor;
         if threshold > self.wand.threshold {
@@ -4964,6 +5118,107 @@ mod tests {
             self.scored.fetch_add(1, Ordering::Relaxed);
             freq as f32 / doc_tokens as f32
         }
+    }
+
+    #[rstest]
+    fn membership_disjunction_merges_docs_without_scoring(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        for row_id in 0..6 {
+            docs.append(row_id, 8);
+        }
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("alpha"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(vec![0, 2, 4], 1.0, None, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("beta"),
+                1,
+                1,
+                1.0,
+                generate_posting_list(vec![1, 2, 5], 1.0, None, is_compressed),
+                docs.len(),
+            ),
+        ];
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new(
+            Operator::Or,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+        );
+
+        let mut actual = Vec::new();
+        while let Some(doc) = wand.next_membership() {
+            actual.push(doc.doc_id());
+            wand.push_back_leads(doc.doc_id().saturating_add(1));
+        }
+
+        assert_eq!(actual, vec![0, 1, 2, 4, 5]);
+        assert_eq!(scored.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    fn membership_phrase_confirms_positions_without_scoring(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 8);
+        docs.append(1, 8);
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("alpha"),
+                0,
+                0,
+                1.0,
+                generate_posting_list_with_positions(
+                    vec![0, 1],
+                    vec![vec![3], vec![10]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("beta"),
+                1,
+                1,
+                1.0,
+                generate_posting_list_with_positions(
+                    vec![0, 1],
+                    vec![vec![1], vec![11]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+        );
+
+        let first = wand.next_membership().unwrap();
+        assert_eq!(first.doc_id(), 0);
+        assert!(!wand.check_positions(0).unwrap());
+        let second = wand.next_membership().unwrap();
+        assert_eq!(second.doc_id(), 1);
+        assert!(wand.check_positions(0).unwrap());
+        assert!(wand.next_membership().is_none());
+        assert_eq!(scored.load(Ordering::Relaxed), 0);
     }
 
     #[derive(Default)]

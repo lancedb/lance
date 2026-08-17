@@ -2407,6 +2407,12 @@ enum LeafQuery {
     Phrase(PhraseQuery),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafScoreMode {
+    Scoring,
+    Membership,
+}
+
 impl LeafQuery {
     fn terms(&self) -> &str {
         match self {
@@ -2439,25 +2445,42 @@ impl LeafQuery {
     }
 }
 
-fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>) -> Result<()> {
+fn collect_leaf_queries(
+    query: &FtsQuery,
+    score_mode: LeafScoreMode,
+    leaves: &mut Vec<(LeafQuery, LeafScoreMode)>,
+) -> Result<()> {
     match query {
-        FtsQuery::Match(query) => leaves.push(LeafQuery::Match(query.clone())),
-        FtsQuery::Phrase(query) => leaves.push(LeafQuery::Phrase(query.clone())),
+        FtsQuery::Match(query) => leaves.push((LeafQuery::Match(query.clone()), score_mode)),
+        FtsQuery::Phrase(query) => leaves.push((LeafQuery::Phrase(query.clone()), score_mode)),
         FtsQuery::Boost(query) => {
-            collect_leaf_queries(&query.positive, leaves)?;
-            collect_leaf_queries(&query.negative, leaves)?;
+            collect_leaf_queries(&query.positive, score_mode, leaves)?;
+            collect_leaf_queries(&query.negative, score_mode, leaves)?;
         }
         FtsQuery::MultiMatch(query) => {
-            leaves.extend(query.match_queries.iter().cloned().map(LeafQuery::Match));
+            leaves.extend(
+                query
+                    .match_queries
+                    .iter()
+                    .cloned()
+                    .map(|query| (LeafQuery::Match(query), score_mode)),
+            );
         }
         FtsQuery::Boolean(query) => {
-            for child in query
-                .should
-                .iter()
-                .chain(&query.must)
-                .chain(&query.must_not)
-            {
-                collect_leaf_queries(child, leaves)?;
+            for child in query.should.iter().chain(&query.must) {
+                collect_leaf_queries(child, score_mode, leaves)?;
+            }
+            for child in &query.must_not {
+                // Prohibited leaves never contribute a score. Start with the
+                // direct shapes covered by the current compound execution
+                // plan; complex nested exclusions retain the scoring cursor
+                // until the whole subtree can carry this mode explicitly.
+                let child_mode = if matches!(child, FtsQuery::Match(_) | FtsQuery::Phrase(_)) {
+                    LeafScoreMode::Membership
+                } else {
+                    LeafScoreMode::Scoring
+                };
+                collect_leaf_queries(child, child_mode, leaves)?;
             }
         }
     }
@@ -2469,6 +2492,7 @@ struct PreparedLeaf {
     params: Arc<FtsSearchParams>,
     operator: Operator,
     scorer: Arc<MemBM25Scorer>,
+    score_mode: LeafScoreMode,
 }
 
 fn tokenize_leaf(index: &InvertedIndex, leaf: &LeafQuery, params: &FtsSearchParams) -> Tokens {
@@ -2533,7 +2557,7 @@ async fn prepare_compound_query(
         .first()
         .ok_or_else(|| Error::invalid_input("compound FTS requires at least one index segment"))?;
     let mut leaf_queries = Vec::new();
-    collect_leaf_queries(query, &mut leaf_queries)?;
+    collect_leaf_queries(query, LeafScoreMode::Scoring, &mut leaf_queries)?;
     let mut num_plan_leaves = 0;
     let plan = CompoundScorerPlan::from_query(query, &mut num_plan_leaves)?;
     if num_plan_leaves != leaf_queries.len() {
@@ -2544,21 +2568,31 @@ async fn prepare_compound_query(
     }
 
     let mut leaves = Vec::with_capacity(leaf_queries.len());
-    for leaf in leaf_queries {
+    let mut membership_scorer = None;
+    for (leaf, score_mode) in leaf_queries {
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
-        let scorer = match &base_scorer {
-            Some(scorer) => scorer.clone(),
-            None => Arc::new(
-                build_global_bm25_scorer(indices, &tokens, &effective_params, Some(metrics))
-                    .await?,
-            ),
+        let scorer = match score_mode {
+            LeafScoreMode::Membership => membership_scorer
+                .get_or_insert_with(|| {
+                    // Posting loading still carries a scorer, but membership
+                    // cursors never observe its weights or score bounds.
+                    Arc::new(MemBM25Scorer::new(1, 1, Default::default()))
+                })
+                .clone(),
+            LeafScoreMode::Scoring => match &base_scorer {
+                Some(scorer) => scorer.clone(),
+                None => Arc::new(
+                    build_global_bm25_scorer(indices, &tokens, &effective_params, Some(metrics))
+                        .await?,
+                ),
+            },
         };
         let mut tokens_by_segment = Vec::with_capacity(indices.len());
         for index in indices {
             let expanded_tokens =
                 expanded_leaf_tokens(index, &tokens, &effective_params, leaf.operator())?;
-            if base_scorer.is_some() {
+            if score_mode == LeafScoreMode::Scoring && base_scorer.is_some() {
                 validate_injected_scorer_tokens(&scorer, &expanded_tokens)?;
             }
             tokens_by_segment.push(Arc::new(expanded_tokens));
@@ -2568,6 +2602,7 @@ async fn prepare_compound_query(
             params: Arc::new(effective_params),
             operator: leaf.operator(),
             scorer,
+            score_mode,
         });
     }
     Ok((plan, leaves))
@@ -2578,6 +2613,7 @@ struct LoadedLeaf {
     params: Arc<FtsSearchParams>,
     operator: Operator,
     scorer: Arc<MemBM25Scorer>,
+    score_mode: LeafScoreMode,
 }
 
 enum LoadedDocuments {
@@ -2611,6 +2647,7 @@ async fn load_compound_partition(
         let tokens = leaf.tokens_by_segment[segment_ordinal].clone();
         let params = leaf.params.clone();
         let scorer = leaf.scorer.clone();
+        let score_mode = leaf.score_mode;
         let metrics = metrics.clone();
         let operator = leaf.operator;
         async move {
@@ -2624,7 +2661,7 @@ async fn load_compound_partition(
                         operator,
                         scorer.as_ref(),
                         metrics.as_ref(),
-                        true,
+                        score_mode == LeafScoreMode::Scoring,
                     )
                     .await?
                     .postings
@@ -2634,6 +2671,7 @@ async fn load_compound_partition(
                 params,
                 operator,
                 scorer,
+                score_mode,
             })
         }
     });
@@ -2723,6 +2761,15 @@ where
         .map(|leaf| {
             let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
                 Box::new(EmptyScorer)
+            } else if leaf.score_mode == LeafScoreMode::Membership {
+                Box::new(WandCursor::new_membership(
+                    leaf.operator,
+                    leaf.postings,
+                    documents,
+                    leaf.scorer,
+                    leaf.params.as_ref(),
+                    metrics,
+                ))
             } else {
                 Box::new(WandCursor::new(
                     leaf.operator,
@@ -3064,6 +3111,7 @@ mod tests {
     use rand::{Rng, SeedableRng, rngs::SmallRng};
 
     use super::*;
+    use crate::scalar::inverted::query::{BooleanQuery, Occur};
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
         values
@@ -3074,6 +3122,40 @@ mod tests {
 
     fn materialized(values: &[(u64, f32)]) -> Box<dyn ComposableScorer> {
         Box::new(MaterializedScorer::try_new(rows(values)).unwrap())
+    }
+
+    #[test]
+    fn direct_prohibited_leaves_use_membership_mode() {
+        let query = FtsQuery::Boolean(BooleanQuery::new([
+            (
+                Occur::Must,
+                FtsQuery::Match(MatchQuery::new(String::from("required"))),
+            ),
+            (
+                Occur::MustNot,
+                FtsQuery::Match(MatchQuery::new(String::from("excluded"))),
+            ),
+            (
+                Occur::MustNot,
+                FtsQuery::Phrase(PhraseQuery::new(String::from("excluded phrase"))),
+            ),
+        ]));
+        let mut leaves = Vec::new();
+
+        collect_leaf_queries(&query, LeafScoreMode::Scoring, &mut leaves).unwrap();
+
+        assert!(matches!(
+            &leaves[0],
+            (LeafQuery::Match(_), LeafScoreMode::Scoring)
+        ));
+        assert!(matches!(
+            &leaves[1],
+            (LeafQuery::Match(_), LeafScoreMode::Membership)
+        ));
+        assert!(matches!(
+            &leaves[2],
+            (LeafQuery::Phrase(_), LeafScoreMode::Membership)
+        ));
     }
 
     fn should_maxscore<'a>(
