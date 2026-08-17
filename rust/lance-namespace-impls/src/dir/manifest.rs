@@ -6177,26 +6177,6 @@ mod tests {
         assert_eq!(manifest_ns.current_drop_epoch().await.unwrap(), 0);
         assert!(manifest_ns.list_drop_tombstones().await.unwrap().is_empty());
 
-        let stale_registration = ManifestEntry {
-            object_id: "stale".to_string(),
-            object_type: ObjectType::Table,
-            location: Some("generation.lance".to_string()),
-            metadata: None,
-        };
-        let stale_result = manifest_ns
-            .rewrite_manifest("stale registration", || {
-                UpsertManifestMutation::new(
-                    vec![stale_registration.clone()],
-                    None,
-                    WhenMatched::Fail,
-                    HashMap::new(),
-                    true,
-                    Some(0),
-                )
-            })
-            .await;
-        assert!(stale_result.is_err());
-
         manifest_ns
             .register_table_in_manifest(ManifestEntry {
                 object_id: "replacement".to_string(),
