@@ -35,6 +35,7 @@ import java.util.Objects;
  */
 public abstract class SchemaOperation implements Operation {
   private final Schema schema;
+  private final Map<Long, ArrowSchema> exportedSchemas = new HashMap<>();
   private final Map<Long, ArrowSchema> inFlightSchemas = new HashMap<>();
 
   protected SchemaOperation(Schema schema) {
@@ -52,11 +53,20 @@ public abstract class SchemaOperation implements Operation {
    * @return the schema address
    */
   public synchronized long exportSchema(BufferAllocator allocator) {
+    return exportSchema(allocator, exportedSchemas);
+  }
+
+  /** Export a schema whose holder must remain live until JNI has imported it. */
+  private synchronized long exportSchemaForJni(BufferAllocator allocator) {
+    return exportSchema(allocator, inFlightSchemas);
+  }
+
+  private long exportSchema(BufferAllocator allocator, Map<Long, ArrowSchema> schemas) {
     ArrowSchema cSchema = ArrowSchema.allocateNew(allocator);
     try {
       Data.exportSchema(allocator, schema, null, cSchema);
       long address = cSchema.memoryAddress();
-      inFlightSchemas.put(address, cSchema);
+      schemas.put(address, cSchema);
       return address;
     } catch (RuntimeException | Error error) {
       cSchema.close();
@@ -74,7 +84,12 @@ public abstract class SchemaOperation implements Operation {
   }
 
   public synchronized void release() {
-    // In-flight holders are released only by finishSchemaExport after JNI imports them.
+    for (ArrowSchema cSchema : exportedSchemas.values()) {
+      cSchema.release();
+      cSchema.close();
+    }
+    exportedSchemas.clear();
+    // JNI-claimed holders are released only by finishSchemaExport after JNI imports them.
   }
 
   @Override

@@ -411,6 +411,68 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_validateTransaction(
     );
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_test_JniTestHelper_validateSchemaHandoffWhileClosingTransaction(
+    mut env: JNIEnv,
+    _class: JObject,
+    java_dataset: JObject,
+    java_transaction: JObject,
+    transaction_to_close: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_validate_schema_handoff_while_closing_transaction(
+            &mut env,
+            java_dataset,
+            java_transaction,
+            transaction_to_close,
+        )
+    );
+}
+
+fn inner_validate_schema_handoff_while_closing_transaction(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    java_transaction: JObject,
+    transaction_to_close: JObject,
+) -> Result<()> {
+    let java_allocator = env
+        .call_method(
+            &java_dataset,
+            "allocator",
+            "()Lorg/apache/arrow/memory/BufferAllocator;",
+            &[],
+        )?
+        .l()?;
+    let mut dataset = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        BlockingDataset::new(dataset_guard.inner.clone())
+    };
+    let _transaction_guard = env.lock_obj(&java_transaction)?;
+    let read_version = env.get_u64_from_method(&java_transaction, "readVersion")?;
+    let java_operation = env
+        .call_method(
+            &java_transaction,
+            "operation",
+            "()Lorg/lance/operation/Operation;",
+            &[],
+        )?
+        .l()?;
+    convert_schema_from_operation_with(
+        env,
+        &java_operation,
+        &java_allocator,
+        Some(&mut dataset),
+        read_version,
+        |env| {
+            env.call_method(&transaction_to_close, "close", "()V", &[])?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 fn inner_validate_transaction(
     env: &mut JNIEnv,
     java_dataset: JObject,
@@ -1097,14 +1159,33 @@ fn convert_schema_from_operation(
     dataset: Option<&mut BlockingDataset>,
     read_version: u64,
 ) -> Result<LanceSchema> {
+    convert_schema_from_operation_with(
+        env,
+        java_operation,
+        java_allocator,
+        dataset,
+        read_version,
+        |_| Ok(()),
+    )
+}
+
+fn convert_schema_from_operation_with(
+    env: &mut JNIEnv,
+    java_operation: &JObject,
+    java_allocator: &JObject,
+    dataset: Option<&mut BlockingDataset>,
+    read_version: u64,
+    after_export: impl FnOnce(&mut JNIEnv) -> Result<()>,
+) -> Result<LanceSchema> {
     let schema_ptr = env
         .call_method(
             java_operation,
-            "exportSchema",
+            "exportSchemaForJni",
             "(Lorg/apache/arrow/memory/BufferAllocator;)J",
             &[JValue::Object(java_allocator)],
         )?
         .j()?;
+    after_export(env)?;
     let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     env.call_method(

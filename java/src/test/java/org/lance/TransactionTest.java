@@ -128,10 +128,22 @@ public class TransactionTest {
                   .readVersion(dataset.version())
                   .operation(operation)
                   .build()) {
-        JniTestHelper.validateTransaction(dataset, first);
-        second.close();
+        JniTestHelper.validateSchemaHandoffWhileClosingTransaction(dataset, first, second);
         JniTestHelper.validateTransaction(dataset, first);
       }
+    }
+  }
+
+  @Test
+  public void testSchemaOperationReleaseCleansPublicExports() {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      Project operation = Project.builder().schema(new Schema(Collections.emptyList())).build();
+      operation.exportSchema(allocator);
+
+      operation.release();
+      operation.release();
+
+      assertEquals(0, allocator.getAllocatedMemory());
     }
   }
 

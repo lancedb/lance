@@ -65,4 +65,7 @@ public class JniTestHelper {
       Dataset dataset, String field, String name);
 
   public static native void validateTransaction(Dataset dataset, Transaction transaction);
+
+  public static native void validateSchemaHandoffWhileClosingTransaction(
+      Dataset dataset, Transaction transaction, Transaction transactionToClose);
 }
