@@ -103,6 +103,14 @@ static BASE_OBJECTS_VALUE_FIELD: LazyLock<Field> = LazyLock::new(|| {
 const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
 const MANIFEST_INDEX_BATCH_SIZE: usize = 8192;
 
+fn manifest_locations_match(left: &str, right: &str) -> bool {
+    left.split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .eq(right
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != "."))
+}
+
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectType {
@@ -512,7 +520,7 @@ impl ManifestStreamMutation for UpsertManifestMutation {
             && self
                 .expected_locations
                 .values()
-                .any(|expected_location| expected_location == location)
+                .any(|expected_location| manifest_locations_match(expected_location, location))
         {
             return Err(NamespaceError::ConcurrentModification {
                 message: format!(
@@ -584,11 +592,12 @@ impl ManifestStreamMutation for UpsertManifestMutation {
 struct DeleteObjectMutation {
     object_id: String,
     expected_location: Option<String>,
+    require_exclusive_location: bool,
     deleted: bool,
 }
 
 impl ManifestStreamMutation for DeleteObjectMutation {
-    type Output = ();
+    type Output = bool;
 
     fn process_existing_row(
         &mut self,
@@ -614,8 +623,12 @@ impl ManifestStreamMutation for DeleteObjectMutation {
             return Ok(());
         }
 
-        if let Some(expected_location) = self.expected_location.as_deref()
-            && row.location.as_deref() == Some(expected_location)
+        if self.require_exclusive_location
+            && let Some(expected_location) = self.expected_location.as_deref()
+            && row
+                .location
+                .as_deref()
+                .is_some_and(|location| manifest_locations_match(location, expected_location))
         {
             return Err(NamespaceError::ConcurrentModification {
                 message: format!(
@@ -648,20 +661,20 @@ impl ManifestStreamMutation for DeleteObjectMutation {
 
     fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
         if self.deleted {
-            CopyOnWriteMutation::updated(())
+            CopyOnWriteMutation::updated(true)
         } else {
-            CopyOnWriteMutation::unchanged(())
+            CopyOnWriteMutation::unchanged(false)
         }
     }
 
     fn conflict_resolution(&self) -> ConflictResolution<Self::Output> {
-        if self.expected_location.is_some() {
+        if self.require_exclusive_location {
             ConflictResolution::Retry
         } else {
             // If a concurrent writer already removed the object, the delete is satisfied.
             ConflictResolution::SucceedIfAbsent {
                 object_id: self.object_id.clone(),
-                output: (),
+                output: false,
             }
         }
     }
@@ -1082,6 +1095,35 @@ impl ManifestNamespace {
             .clone()
             .join(location.trim_matches('/'))
             .join(DEREGISTERED_TABLE_MARKER)
+    }
+
+    async fn put_deregistered_table_marker(&self, location: &str) -> Result<bool> {
+        let marker_path = self.deregistered_table_marker_path(location);
+        match super::put_marker_file_atomic(
+            &self.object_store,
+            &marker_path,
+            &format!("deregistration marker at {location}"),
+        )
+        .await
+        {
+            Ok(()) => Ok(true),
+            Err(super::MarkerFileError::AlreadyExists { .. }) => Ok(false),
+            Err(super::MarkerFileError::Other { message }) => {
+                Err(NamespaceError::Internal { message }.into())
+            }
+        }
+    }
+
+    async fn remove_deregistered_table_marker(&self, location: &str) {
+        let marker_path = self.deregistered_table_marker_path(location);
+        if let Err(error) = self.object_store.delete(&marker_path).await
+            && !error.is_not_found()
+        {
+            log::warn!(
+                "Failed to remove uncommitted deregistration marker at '{}': {error}",
+                marker_path
+            );
+        }
     }
 
     fn table_locations_match(left: &str, right: &str) -> bool {
@@ -2503,19 +2545,23 @@ impl ManifestNamespace {
 
     /// Delete an entry from the manifest table
     pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
-        self.delete_from_manifest_if_location(object_id, None).await
+        self.delete_from_manifest_if_location(object_id, None, false)
+            .await
+            .map(|_| ())
     }
 
     async fn delete_from_manifest_if_location(
         &self,
         object_id: &str,
         expected_location: Option<&str>,
-    ) -> Result<()> {
+        require_exclusive_location: bool,
+    ) -> Result<bool> {
         let object_id = object_id.to_string();
         let expected_location = expected_location.map(str::to_string);
         self.rewrite_manifest("Failed to delete from manifest", || DeleteObjectMutation {
             object_id: object_id.clone(),
             expected_location: expected_location.clone(),
+            require_exclusive_location,
             deleted: false,
         })
         .await
@@ -3274,16 +3320,17 @@ impl LanceNamespace for ManifestNamespace {
                     .as_ref()
                     .expect("an overwrite has an existing table")
                     .location;
-                self.object_store
-                    .put(
-                        &self.deregistered_table_marker_path(previous_location),
-                        b"deregistered",
-                    )
+                let marker_created = self
+                    .put_deregistered_table_marker(previous_location)
                     .await?;
                 if let Err(error) = self
                     .replace_manifest_table_location(entry, previous_location)
                     .await
                 {
+                    if marker_created {
+                        self.remove_deregistered_table_marker(previous_location)
+                            .await;
+                    }
                     let new_table_path = self.base_path.clone().join(dir_name.as_str());
                     if let Err(cleanup_error) =
                         self.object_store.remove_dir_all(new_table_path).await
@@ -3379,17 +3426,24 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 self.ensure_manifest_writable().await?;
-                self.object_store
-                    .put(
-                        &self.deregistered_table_marker_path(&info.location),
-                        b"deregistered",
-                    )
-                    .await?;
+                let marker_created = self.put_deregistered_table_marker(&info.location).await?;
 
                 // Delete from manifest first
-                self.delete_from_manifest_if_location(&object_id, Some(&info.location))
+                let owns_manifest_deletion = self
+                    .delete_from_manifest_if_location(&object_id, Some(&info.location), true)
                     .boxed()
                     .await?;
+
+                if !owns_manifest_deletion {
+                    if marker_created {
+                        self.remove_deregistered_table_marker(&info.location).await;
+                    }
+                    return Ok(DropTableResponse {
+                        id: request.id.clone(),
+                        location: Some(Self::construct_full_uri(&self.root, &info.location)?),
+                        ..Default::default()
+                    });
+                }
 
                 // Delete physical data directory using the dir_name from manifest
                 let table_path = self.base_path.clone().join(info.location.as_str());
@@ -3910,21 +3964,30 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
-        if expected_location.is_some() {
+        let marker_created = if expected_location.is_some() {
             self.ensure_manifest_writable().await?;
-            self.object_store
-                .put(
-                    &self.deregistered_table_marker_path(&manifest_location),
-                    b"deregistered",
-                )
-                .await?;
-        }
+            Some(
+                self.put_deregistered_table_marker(&manifest_location)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         // Randomized table locations are checked again inside every rewrite attempt,
         // so a concurrent replacement cannot be deleted by a stale deregistration.
-        self.delete_from_manifest_if_location(&object_id, Some(&manifest_location))
+        let owns_manifest_deletion = self
+            .delete_from_manifest_if_location(
+                &object_id,
+                Some(&manifest_location),
+                expected_location.is_some(),
+            )
             .boxed()
             .await?;
+        if !owns_manifest_deletion && marker_created == Some(true) {
+            self.remove_deregistered_table_marker(&manifest_location)
+                .await;
+        }
 
         Ok(DeregisterTableResponse {
             id: request.id.clone(),
@@ -4264,7 +4327,7 @@ mod tests {
     }
 
     impl ManifestStreamMutation for ConcurrentDeleteBeforeCommitMutation {
-        type Output = ();
+        type Output = bool;
 
         fn process_existing_row(
             &mut self,
@@ -4301,7 +4364,7 @@ mod tests {
         fn conflict_resolution(&self) -> ConflictResolution<Self::Output> {
             ConflictResolution::SucceedIfAbsent {
                 object_id: self.target.clone(),
-                output: (),
+                output: false,
             }
         }
     }
@@ -4667,7 +4730,7 @@ mod tests {
             .unwrap();
 
         let error = manifest_ns
-            .delete_from_manifest_if_location("table", Some("old-generation.lance"))
+            .delete_from_manifest_if_location("table", Some("old-generation.lance"), true)
             .await
             .unwrap_err();
 
@@ -5069,6 +5132,7 @@ mod tests {
                     inner: DeleteObjectMutation {
                         object_id: "table".to_string(),
                         expected_location: None,
+                        require_exclusive_location: false,
                         deleted: false,
                     },
                     root: temp_path.to_string(),
@@ -5099,7 +5163,7 @@ mod tests {
                     ManifestEntry {
                         object_id: "alias".to_string(),
                         object_type: ObjectType::Table,
-                        location: Some("shared.lance".to_string()),
+                        location: Some("shared.lance/".to_string()),
                         metadata: None,
                     },
                 ],
@@ -5109,12 +5173,82 @@ mod tests {
             .unwrap();
 
         let result = manifest_ns
-            .delete_from_manifest_if_location("table", Some("shared.lance"))
+            .delete_from_manifest_if_location("table", Some("shared.lance"), true)
             .await;
 
         assert!(result.is_err(), "shared location must not be deregistered");
         assert!(manifest_ns.manifest_contains_object("table").await.unwrap());
         assert!(manifest_ns.manifest_contains_object("alias").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_nonexclusive_deregister_allows_alias() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace_with_retries(temp_path, false, Some(0)).await;
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![
+                    ManifestEntry {
+                        object_id: "table".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("shared.lance".to_string()),
+                        metadata: None,
+                    },
+                    ManifestEntry {
+                        object_id: "alias".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("shared.lance/".to_string()),
+                        metadata: None,
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let deleted = manifest_ns
+            .delete_from_manifest_if_location("table", Some("shared.lance"), false)
+            .await
+            .unwrap();
+
+        assert!(deleted);
+        assert!(!manifest_ns.manifest_contains_object("table").await.unwrap());
+        assert!(manifest_ns.manifest_contains_object("alias").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_conditional_delete_reports_ownership() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace_with_retries(temp_path, false, Some(0)).await;
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("table.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            manifest_ns
+                .delete_from_manifest_if_location("table", Some("table.lance"), true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !manifest_ns
+                .delete_from_manifest_if_location("table", Some("table.lance"), true)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5135,7 +5269,7 @@ mod tests {
                     ManifestEntry {
                         object_id: "alias".to_string(),
                         object_type: ObjectType::Table,
-                        location: Some("shared.lance".to_string()),
+                        location: Some("shared.lance/".to_string()),
                         metadata: None,
                     },
                 ],
