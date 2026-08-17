@@ -29,7 +29,9 @@ use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
 use lance_index::scalar::expression::{IndexInformationProvider, ScalarIndexExpr};
+use lance_index::scalar::inverted::DocumentGranularity;
 
+use super::fts::{self, FtsIndexInfo};
 use super::scan_index::with_lance_source;
 use super::{TakeSettings, VectorSearchNode};
 use crate::Result;
@@ -52,6 +54,22 @@ pub enum OverlayStaleness {
     None,
     /// Exactly these rows' entries are stale; the rest of the index is current.
     Rows(Arc<RowAddrTreeMap>),
+    /// An overlay touched an indexed field of a segment that cannot say which rows it indexed, so
+    /// no entry can be trusted.
+    Unknown,
+}
+
+/// How to treat a segment that does not record which fragments it indexed.
+///
+/// Legacy segments predate `fragment_bitmap`, and the two index kinds make different calls here —
+/// which is why it is a parameter rather than a policy baked into the helper.
+pub enum OpaqueSegments {
+    /// Assume the segment indexed every fragment, so its stale rows are the overlaid ones. Safe
+    /// for a vector index: blocking a row address works no matter which segment produced it.
+    Covering,
+    /// Refuse to trust the index at all. An inverted segment's scores depend on the whole indexed
+    /// document set, so "which rows did you index" is not a question the FTS path can leave open.
+    Opaque,
 }
 
 /// The rows whose entries in `segments` an overlay has invalidated, in the domain index results
@@ -64,6 +82,7 @@ pub async fn overlay_staleness(
     dataset: &Dataset,
     segments: &[IndexMetadata],
     fragments: &[Fragment],
+    opaque: OpaqueSegments,
 ) -> Result<OverlayStaleness> {
     // Overlays are rare; this is the check that keeps the whole mechanism off the common path.
     let overlaid = overlaid_fragments(fragments);
@@ -73,6 +92,19 @@ pub async fn overlay_staleness(
 
     let mut stale: HashMap<u32, RoaringBitmap> = HashMap::new();
     for segment in segments {
+        if segment.fragment_bitmap.is_none() && matches!(opaque, OpaqueSegments::Opaque) {
+            let mut opaque_stale = HashMap::new();
+            collect_overlay_stale_rows_for_segment(
+                segment,
+                &overlaid,
+                &mut opaque_stale,
+                dataset.schema(),
+            )?;
+            if !opaque_stale.is_empty() {
+                return Ok(OverlayStaleness::Unknown);
+            }
+            continue;
+        }
         collect_overlay_stale_rows_for_segment(segment, &overlaid, &mut stale, dataset.schema())?;
     }
     if stale.is_empty() {
@@ -125,6 +157,7 @@ pub struct ScanPlanningContext {
     /// derivations below be honest about doing no I/O.
     fragments: Arc<Vec<Fragment>>,
     vector: HashMap<String, VectorIndexInfo>,
+    fts: HashMap<(String, DocumentGranularity), FtsIndexInfo>,
     /// Whether `Scanner::with_index_segments` pinned which segments a search may use.
     ///
     /// It makes the caller's chosen segments the whole answer: rows they do not cover are out of
@@ -215,6 +248,16 @@ impl ScanPlanningContext {
             }
         }
 
+        let target_fragments =
+            RoaringBitmap::from_iter(fragments.iter().map(|fragment| fragment.id as u32));
+        let fts = fts::prefetch(
+            &dataset,
+            &fts::collect_requests(plan),
+            &target_fragments,
+            &fragments,
+        )
+        .await?;
+
         let scalar_indices = Arc::new(dataset.scalar_index_info().await?);
         let index_staleness = prefetch_index_staleness(&dataset, &fragments).await?;
         let take_rows = resolve_takes(&dataset, takes).await?;
@@ -222,6 +265,7 @@ impl ScanPlanningContext {
         Ok(Self {
             fragments,
             vector,
+            fts,
             fast_search: options.fast_search,
             segments_pinned: options.index_segments.is_some(),
             take_settings: TakeSettings {
@@ -273,6 +317,7 @@ impl ScanPlanningContext {
                             stale |= rows.as_ref().clone();
                             found = true;
                         }
+                        Some(OverlayStaleness::Unknown) => return OverlayStaleness::Unknown,
                         Some(OverlayStaleness::None) | None => {}
                     }
                 }
@@ -357,6 +402,32 @@ impl ScanPlanningContext {
             .collect()
     }
 
+    pub fn fts_index(
+        &self,
+        column: &str,
+        granularity: DocumentGranularity,
+    ) -> Option<&FtsIndexInfo> {
+        self.fts.get(&(column.to_string(), granularity))
+    }
+
+    /// Fragments the FTS index on `column` does not cover — the same synchronous bitmap
+    /// arithmetic the vector path uses, over the same manifest fragment list.
+    pub fn fts_unindexed_fragments(
+        &self,
+        column: &str,
+        granularity: DocumentGranularity,
+    ) -> Option<Vec<Fragment>> {
+        fts::partition_fragments(self.fts_index(column, granularity)?, &self.fragments, false)
+    }
+
+    pub fn fts_indexed_fragments(
+        &self,
+        column: &str,
+        granularity: DocumentGranularity,
+    ) -> Option<Vec<Fragment>> {
+        fts::partition_fragments(self.fts_index(column, granularity)?, &self.fragments, true)
+    }
+
     /// Fragments the given vector index does not cover — synchronous, because it is just the
     /// index's fragment bitmap subtracted from the manifest's fragment list.
     ///
@@ -409,7 +480,7 @@ async fn prefetch_index_staleness(
     for (name, segments) in segments {
         staleness.insert(
             name,
-            overlay_staleness(dataset, &segments, fragments).await?,
+            overlay_staleness(dataset, &segments, fragments, OpaqueSegments::Covering).await?,
         );
     }
     Ok(staleness)
@@ -460,7 +531,8 @@ async fn load_vector_index(
         )));
     }
 
-    let staleness = overlay_staleness(dataset, &segments, fragments).await?;
+    let staleness =
+        overlay_staleness(dataset, &segments, fragments, OpaqueSegments::Covering).await?;
     Ok(Some(VectorIndexInfo {
         segments,
         metric,

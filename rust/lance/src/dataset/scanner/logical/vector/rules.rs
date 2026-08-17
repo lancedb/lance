@@ -20,6 +20,7 @@ use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 
 use super::super::context::ScanPlanningContext;
+use super::super::fts::{FtsAccessPath, FtsLeafNode};
 use super::super::{LanceTakeNode, PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
 use super::super::{analyze_bottom_up, restricts_candidates, scalar_index_prefilter};
 use crate::io::exec::knn::QUERY_INDEX_COL;
@@ -183,6 +184,18 @@ impl OptimizerRule for ResolvePrefilterSource {
             }
             return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
                 node: Arc::new(search.clone().with_prefilter(kind)),
+            })));
+        }
+        if let Some(leaf) = extension.node.as_any().downcast_ref::<FtsLeafNode>() {
+            let Some(FtsAccessPath::Index { segments }) = leaf.resolution() else {
+                return Ok(Transformed::no(plan));
+            };
+            let kind = self.kind_for(leaf.input(), segments);
+            if &kind == leaf.prefilter() {
+                return Ok(Transformed::no(plan));
+            }
+            return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+                node: Arc::new(leaf.clone().with_prefilter(kind)),
             })));
         }
         Ok(Transformed::no(plan))

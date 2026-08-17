@@ -88,17 +88,20 @@
 //! scan_index   recording on each scan how it finds its rows (index query, or a take)
 //! planner      stage 4: dispatch to each node's lowering
 //! take/        late materialization
-//! vector/      node, rerank, rules, planner
+//! vector/      node, rerank, rules, planner   <- five entry points
+//! fts/         node, rules, planner, prefetch <- the same five
 //! ```
 //!
-//! The design doc proposes that an index type could one day ship its own planning support, so
-//! `vector/` reaches the framework through a fixed set of entry points rather than reaching into
-//! it. Rule *ordering* stays here, in [`analyzer_rules`] and [`optimizer_rules`], because it is a
-//! whole-plan property that no single index can decide.
+//! `vector/` and `fts/` are deliberately symmetrical. The design doc proposes that an index type
+//! could one day ship its own planning support; two index types reaching the framework through the
+//! same five entry points is what makes that a claim rather than a guess. Rule *ordering* stays
+//! here, in [`analyzer_rules`] and [`optimizer_rules`], because it is a whole-plan property that no
+//! single index can decide.
 
 pub(super) mod builder;
 pub(super) mod context;
 pub(super) mod coverage;
+pub(super) mod fts;
 pub(super) mod planner;
 pub(super) mod prepare;
 pub(super) mod rules;
@@ -305,8 +308,11 @@ fn planning_state(scanner: &Scanner) -> Arc<SessionState> {
 /// this stage's behavior without the change being visible here.
 fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
+    rules.push(Arc::new(ResolveVectorAccessPath::new(context.clone())));
+    // The FTS rules are contributed as a block by the module that owns the FTS nodes, which is
+    // the closest the spike gets to the doc's "each index plugin provides its own rules".
+    rules.extend(fts::analyzer_rules(context));
     rules.extend::<Vec<Arc<dyn AnalyzerRule + Send + Sync>>>(vec![
-        Arc::new(ResolveVectorAccessPath::new(context.clone())),
         // Before the split and the refine, so both see plain single-query searches.
         Arc::new(ExpandBatchSearch),
         Arc::new(SplitOnIndexCoverage::searches(context.clone())),
@@ -327,7 +333,8 @@ fn analyzer_rules(context: &Arc<ScanPlanningContext>) -> Vec<Arc<dyn AnalyzerRul
 fn optimizer_rules(
     context: &Arc<ScanPlanningContext>,
 ) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-    vec![
+    let mut rules = fts::optimizer_rules(context);
+    rules.extend::<Vec<Arc<dyn OptimizerRule + Send + Sync>>>(vec![
         Arc::new(SimplifyExpressions::new()),
         Arc::new(PushDownFilter::new()),
         // The rest of this list is mandatory work that could not run in the analyzer, because each
@@ -345,7 +352,8 @@ fn optimizer_rules(
         // what moves it there.
         Arc::new(ResolvePrefilterSource::new(context.clone())),
         Arc::new(OptimizeProjections::new()),
-    ]
+    ]);
+    rules
 }
 
 /// The physical rule set: Lance's own rules, plus the stock DataFusion rules that hand-built
@@ -407,6 +415,7 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         // Read by the builder, the source, the context, or the session config.
         prefilter: _,
         filter: _,
+        full_text_query,
         batch_size: _,
         batch_readahead: _,
         fragment_readahead: _,
@@ -415,7 +424,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         offset: _,
         ordering: _,
         nearest,
-        full_text_query,
         use_scalar_index: _,
         fragments: _,
         fast_search: _,
@@ -447,11 +455,6 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         nearest_query_count: _,
     } = scanner;
 
-    if full_text_query.is_some() {
-        return Err(Error::not_supported_source(
-            "The logical scan planner cannot plan a full-text search yet".into(),
-        ));
-    }
     if reads_row_offset(scanner)? {
         // `_rowoffset` is computed above the scan rather than read from it, so producing it needs a
         // node this path does not have yet.
@@ -459,7 +462,7 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
             "The logical scan planner cannot produce _rowoffset yet".into(),
         ));
     }
-    if *include_deleted_rows && nearest.is_some() {
+    if *include_deleted_rows && (nearest.is_some() || full_text_query.is_some()) {
         // The imperative path rejects these in `vector_search_source`/`fts_search_source` for the
         // same reason: a search returns row ids, and a deleted row does not have one.
         return Err(Error::invalid_input_source(
@@ -467,6 +470,7 @@ fn ensure_supported(scanner: &Scanner) -> Result<()> {
         ));
     }
     if nearest.is_none()
+        && full_text_query.is_none()
         && projection_plan.has_output_cols()
         && projection_plan.physical_projection.is_empty()
     {

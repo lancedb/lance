@@ -20,6 +20,7 @@ use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::Fragment;
 
 use super::context::{OverlayStaleness, ScanPlanningContext};
+use super::fts::FtsLeafNode;
 use super::source::ScanRestriction;
 use super::{LanceTakeNode, PrefilterSourceKind, VectorAccessPath, VectorSearchNode};
 use super::{analyze_bottom_up, map_lance_scan, restrict_scan, with_lance_source};
@@ -27,7 +28,7 @@ use super::{analyze_bottom_up, map_lance_scan, restrict_scan, with_lance_source}
 /// What an index does not answer for, among the rows a scan will touch.
 ///
 /// The whole point of this type is that fragment-level and row-level coverage are the same
-/// statement. `SplitPartiallyIndexedSearch` in the imperative path
+/// statement. `SplitPartiallyIndexedSearch` and `SplitPartiallyIndexedFts` in the imperative path
 /// split on fragment coverage; the overlay stale-row handling threaded through
 /// `Scanner::new_filtered_read`, `knn_combined`, and `plan_flat_match_query` splits on row
 /// coverage. Both produce a brute-force branch reading exactly the rows in the hole, and the only
@@ -117,6 +118,9 @@ pub fn splittable(plan: &LogicalPlan) -> Option<&dyn SplittableSearch> {
     let node = extension.node.as_any();
     if let Some(search) = node.downcast_ref::<VectorSearchNode>() {
         return Some(search);
+    }
+    if let Some(leaf) = node.downcast_ref::<FtsLeafNode>() {
+        return Some(leaf);
     }
     None
 }
@@ -308,7 +312,7 @@ impl SplittableSearch for VectorSearchNode {
         // and re-scoring works regardless — the vector path never has to give up on the index.
         let stale = match staleness {
             OverlayStaleness::Rows(rows) => Some(rows.clone()),
-            OverlayStaleness::None => None,
+            OverlayStaleness::None | OverlayStaleness::Unknown => None,
         };
 
         let (Some(mut unindexed), Some(indexed)) = (
@@ -440,7 +444,7 @@ impl ScanCoverage {
             }),
             // A scalar index answers by row address whatever segment produced the entry, so there
             // is no case where blocking cannot express the hole.
-            OverlayStaleness::None => None,
+            OverlayStaleness::None | OverlayStaleness::Unknown => None,
         }
     }
 }

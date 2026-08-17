@@ -6,6 +6,7 @@
 //! Most of these are equivalence tests: they build the same query through both the imperative and
 //! the logical path and compare the rows. See [`harness`] for that oracle.
 
+mod fts;
 mod harness;
 mod planner;
 mod scan;
