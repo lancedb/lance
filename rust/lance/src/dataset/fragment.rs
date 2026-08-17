@@ -6171,6 +6171,82 @@ mod tests {
         }
     }
 
+    /// A deletion vector naming a row the fragment does not have leaves the restorer
+    /// with rows it can never account for, so `Updater::next` has to refuse at the end
+    /// of the stream rather than let a data file short of those rows be written.
+    ///
+    /// `write_deletions` rejects an over-long vector, so the file is written directly
+    /// to get a fragment into this state.
+    #[tokio::test]
+    async fn test_updater_rejects_deletion_vector_past_end_of_fragment() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = create_dataset(test_uri, LanceFileVersion::Stable).await;
+
+        // Point a fragment's deletion file at a row it does not have. 200 rows are
+        // spread over several 40-row fragments, so 10_000 is past the end of any of
+        // them. Pick a fragment whose id is not zero, so the assertion below cannot
+        // pass on a message that dropped the id entirely.
+        let deletion_vector: DeletionVector = [10_000].into_iter().collect();
+        let fragment_index = 1;
+        let fragment_id = dataset.manifest.fragments[fragment_index].id;
+        assert_ne!(fragment_id, 0, "need a non-zero fragment id");
+        let deletion_file = write_deletion_file(
+            &dataset.base,
+            fragment_id,
+            dataset.version().version,
+            &deletion_vector,
+            dataset.object_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let mut fragments = dataset.manifest.fragments.as_ref().clone();
+        fragments[fragment_index].deletion_file = deletion_file;
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest.fragments = Arc::new(fragments);
+        dataset.manifest = Arc::new(manifest);
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            true,
+        )]));
+        let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+        let mut updater = fragment
+            .updater(Some(&["i"]), None, None, None)
+            .await
+            .unwrap();
+
+        // Every live row is handed back, so the loop only ends when next() gives up.
+        let err = loop {
+            match updater.next().await {
+                Ok(Some(batch)) => {
+                    let input_col = batch.column_by_name("i").unwrap();
+                    let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
+                    let batch = RecordBatch::try_new(
+                        new_schema.clone(),
+                        vec![Arc::new(result_col) as ArrayRef],
+                    )
+                    .unwrap();
+                    updater.update(batch).await.unwrap();
+                }
+                Ok(None) => panic!("expected next() to refuse the unaccounted-for row"),
+                Err(err) => break err,
+            }
+        };
+
+        assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("unaccounted for"),
+            "expected the stream-ended wording, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("fragment {fragment_id}")),
+            "message should name the fragment: {message}"
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_merge_fragment(
