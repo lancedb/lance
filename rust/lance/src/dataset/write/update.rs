@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
@@ -295,6 +295,7 @@ impl UpdateBuilder {
             cell_flag_values: Arc::new(self.cell_flag_values),
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
+            retry_started_at: None,
         })
     }
 }
@@ -325,6 +326,7 @@ pub struct UpdateJob {
     cell_flag_values: Arc<HashMap<u32, bool>>,
     conflict_retries: u32,
     retry_timeout: Duration,
+    retry_started_at: Option<Instant>,
 }
 
 impl UpdateJob {
@@ -333,12 +335,18 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         affected_rows: RowAddrTreeMap,
     ) -> CommitBuilder<'static> {
+        let retry_timeout = self
+            .retry_started_at
+            .map_or(self.retry_timeout, |started_at| {
+                self.retry_timeout.saturating_sub(started_at.elapsed())
+            });
         CommitBuilder::new(dataset)
             .with_affected_rows(affected_rows)
-            .with_retry_timeout(self.retry_timeout)
+            .with_retry_timeout(retry_timeout)
     }
 
-    pub async fn execute(self) -> Result<UpdateResult> {
+    pub async fn execute(mut self) -> Result<UpdateResult> {
+        self.retry_started_at = Some(Instant::now());
         let dataset = self.dataset.clone();
         let config = RetryConfig {
             max_retries: self.conflict_retries,
@@ -923,21 +931,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_retry_timeout_is_forwarded_to_commit_builder() {
+    async fn update_remaining_retry_timeout_is_forwarded_to_commit_builder() {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy, false).await;
         let retry_timeout = Duration::from_secs(300);
-        let job = UpdateBuilder::new(dataset.clone())
+        let mut job = UpdateBuilder::new(dataset.clone())
             .set("id", "id + 1")
             .unwrap()
             .retry_timeout(retry_timeout)
             .build()
             .unwrap();
+        job.retry_started_at = Instant::now().checked_sub(Duration::from_secs(240));
 
         let commit_builder = job.commit_builder(dataset, RowAddrTreeMap::new());
-        assert_eq!(
-            commit_builder.retry_timeout_for_test(),
-            retry_timeout,
-            "the inner commit retry budget must match the update retry budget"
+        let remaining = commit_builder.retry_timeout_for_test();
+        assert!(
+            remaining <= Duration::from_secs(60) && remaining > Duration::from_secs(59),
+            "the inner commit must receive only the update retry budget remaining after execution; got {remaining:?}"
         );
     }
 
