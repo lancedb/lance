@@ -4,15 +4,12 @@
 use std::sync::Arc;
 use std::vec;
 
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::CommitBuilder;
 use crate::dataset::InsertBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
-use lance_table::format::{IndexMetadata, RowIdMeta};
-use lance_table::rowids::{RowIdSequence, write_row_ids};
+use lance_table::format::IndexMetadata;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
@@ -701,67 +698,6 @@ async fn test_migrate_to_stable_row_ids_with_deletions() {
 
     // next_row_id must equal physical_rows (10), not logical rows (7).
     assert_eq!(dataset.manifest.next_row_id, 10);
-
-    dataset.validate().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_migrate_to_stable_row_ids_resumes_partial_attempt() {
-    // Create a 2-fragment dataset (10 rows each).
-    let mut dataset = make_simple_dataset("memory://migrate_resume", 10).await;
-    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
-    let batch2 = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int64Array::from_iter_values(10..20))],
-    )
-    .unwrap();
-    dataset = InsertBuilder::new(Arc::new(dataset))
-        .with_params(&WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        })
-        .execute(vec![batch2])
-        .await
-        .unwrap();
-    assert_eq!(dataset.get_fragments().len(), 2);
-
-    // Simulate a partial migration: assign row IDs only to the first fragment
-    // and commit via Merge.  Because FLAG_STABLE_ROW_IDS is not set, the
-    // mixed state (one fragment with row_id_meta, one without) is accepted.
-    let mut fragments = dataset.manifest.fragments.as_ref().clone();
-    let f0_rows = fragments[0].physical_rows.unwrap() as u64;
-    let seq = RowIdSequence::from(0..f0_rows);
-    fragments[0].row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&seq).into()));
-
-    let partial_txn = Transaction::new(
-        dataset.manifest.version,
-        Operation::Merge {
-            fragments,
-            schema: dataset.manifest.schema.clone(),
-            preserves_nullability: true,
-        },
-        None,
-    );
-    dataset = CommitBuilder::new(Arc::new(dataset))
-        .with_max_retries(0)
-        .execute(partial_txn)
-        .await
-        .unwrap();
-
-    // Confirm the partial state: F0 has row IDs, F1 does not, flag not set.
-    assert!(dataset.manifest.fragments[0].row_id_meta.is_some());
-    assert!(dataset.manifest.fragments[1].row_id_meta.is_none());
-    assert!(!dataset.manifest.uses_stable_row_ids());
-
-    // Run the migration.  It should pick up the high-water mark from F0 (10)
-    // and assign IDs [10, 20) to F1, yielding next_row_id = 20.
-    dataset.migrate_to_stable_row_ids().await.unwrap();
-
-    assert!(dataset.manifest.uses_stable_row_ids());
-    for frag in dataset.manifest.fragments.iter() {
-        assert!(frag.row_id_meta.is_some(), "fragment {} missing row_id_meta", frag.id);
-    }
-    assert_eq!(dataset.manifest.next_row_id, 20);
 
     dataset.validate().await.unwrap();
 }

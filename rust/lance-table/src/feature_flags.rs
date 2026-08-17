@@ -98,11 +98,11 @@ pub fn apply_feature_flags(
     }
 
     // Set stable row IDs flag only when explicitly requested or when it was
-    // already set on the manifest before the reset above. Auto-detection from
-    // fragment content is intentionally removed: the migration path assigns
-    // row_id_meta to all fragments in a first commit *without* yet activating
-    // the flag, and a second commit activates it explicitly via
-    // `enable_stable_row_id`. Auto-detection would activate the flag too early.
+    // already set on the manifest before the reset above. The carry-through
+    // (`had_stable_row_ids`) is a safety net: subsequent commits on an already-
+    // migrated table inherit `use_stable_row_ids = true` from the dataset, which
+    // sets `enable_stable_row_id`; the carry catches any path that forgets to
+    // propagate the flag and prevents accidentally downgrading the table.
     if enable_stable_row_id || had_stable_row_ids {
         if !manifest
             .fragments

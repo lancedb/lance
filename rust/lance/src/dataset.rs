@@ -131,7 +131,7 @@ use lance_table::feature_flags::{
     apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
-use lance_table::rowids::{RowIdSequence, read_row_ids, write_row_ids};
+use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -3072,44 +3072,24 @@ impl Dataset {
     }
 
     /// Assign stable row ID sequences to fragments that do not yet have them.
-    ///
-    /// Returns the high-water mark `next_row_id` to be stored in the manifest
-    /// after all fragments have been assigned.
+    /// Assigns a contiguous `RowIdSequence` to every fragment starting from row
+    /// ID 0 and returns the resulting `next_row_id` high-water mark.
     fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment]) -> Result<u64> {
-        // Step 1: Find the high-water mark from fragments that already have row IDs.
         let mut next_row_id = 0u64;
-        for fragment in fragments.iter() {
-            if let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta {
-                let sequence = read_row_ids(data)?;
-                if let Some(max_id) = sequence.iter().max() {
-                    next_row_id = next_row_id.max(
-                        max_id
-                            .checked_add(1)
-                            .ok_or_else(|| Error::internal("Row ID overflow during migration"))?,
-                    );
-                }
-            }
-        }
-
-        // Step 2: Assign IDs to fragments that do not have them yet.
         for fragment in fragments.iter_mut() {
-            if fragment.row_id_meta.is_none() {
-                let physical_rows = fragment.physical_rows.ok_or_else(|| {
-                    Error::internal(format!(
-                        "Fragment {} is missing physical_rows; cannot assign stable row IDs",
-                        fragment.id
-                    ))
-                })? as u64;
-                let end = next_row_id.checked_add(physical_rows).ok_or_else(|| {
-                    Error::internal("Row ID overflow during stable row ID migration")
-                })?;
-                let sequence = RowIdSequence::from(next_row_id..end);
-                let serialized = write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
-                next_row_id = end;
-            }
+            let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                Error::internal(format!(
+                    "Fragment {} is missing physical_rows; cannot assign stable row IDs",
+                    fragment.id
+                ))
+            })? as u64;
+            let end = next_row_id.checked_add(physical_rows).ok_or_else(|| {
+                Error::internal("Row ID overflow during stable row ID migration")
+            })?;
+            let sequence = RowIdSequence::from(next_row_id..end);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+            next_row_id = end;
         }
-
         Ok(next_row_id)
     }
 
@@ -3119,29 +3099,25 @@ impl Dataset {
     /// stable across compaction operations. This enables more efficient updates
     /// to secondary indices.
     ///
-    /// This performs two commits:
-    /// 1. Assigns a row ID sequence to every fragment via a merge operation.
-    /// 2. Updates the table metadata to activate the stable row ID feature flag.
+    /// A single Merge commit assigns row ID sequences to all fragments and
+    /// activates the stable row ID feature flag atomically. Because `Merge`
+    /// conflicts with all data-modifying operations, a successful commit
+    /// guarantees no concurrent write occurred — no separate validation step
+    /// is needed.
     ///
     /// **No retries are attempted.** Callers should quiesce concurrent writes
-    /// before running this migration. If another write conflicts with either
-    /// commit, this method returns an error and the caller must retry.
+    /// before running this migration. If a conflicting write is detected, this
+    /// method returns an error and the caller must retry.
     ///
     /// This method is idempotent: if the table already uses stable row IDs,
     /// it returns `Ok(())` immediately.
     pub async fn migrate_to_stable_row_ids(&mut self) -> Result<()> {
-        // Fast path: already migrated.
         if self.manifest.uses_stable_row_ids() {
             return Ok(());
         }
 
-        // --- Commit 1: assign row ID sequences to all fragments via Merge ---
-        //
-        // Retries are disabled: callers are expected to quiesce writes before
-        // running this migration. An infinite retry loop risks hanging on a
-        // busy table; failing fast lets the caller decide when to retry.
         let mut fragments = self.manifest.fragments.as_ref().clone();
-        Self::assign_stable_row_ids_for_migration(&mut fragments)?;
+        let next_row_id = Self::assign_stable_row_ids_for_migration(&mut fragments)?;
         let schema = self.manifest.schema.clone();
         let read_version = self.manifest.version;
 
@@ -3155,41 +3131,8 @@ impl Dataset {
             None,
         );
 
-        let ds_after_merge = CommitBuilder::new(Arc::new(self.clone()))
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
             .with_max_retries(0)
-            .execute(transaction)
-            .await?;
-
-        // --- Commit 2: activate the stable row IDs feature flag ---
-        //
-        // Validate that every fragment has row_id_meta. A concurrent append
-        // between the two commits could have added a fragment without one.
-        let fragments = ds_after_merge.manifest.fragments.as_ref();
-        if fragments.iter().any(|frag| frag.row_id_meta.is_none()) {
-            return Err(Error::invalid_input(
-                "Concurrent write added fragment(s) without stable row IDs during migration. \
-                 Please run migrate_to_stable_row_ids again.",
-            ));
-        }
-
-        // Recompute next_row_id from the post-merge manifest so that commit 2
-        // stores the correct value in manifest.next_row_id.
-        let mut fragments_for_nri = fragments.to_vec();
-        let next_row_id = Self::assign_stable_row_ids_for_migration(&mut fragments_for_nri)?;
-
-        let read_version = ds_after_merge.manifest.version;
-        let transaction = Transaction::new(
-            read_version,
-            Operation::UpdateConfig {
-                config_updates: None,
-                table_metadata_updates: None,
-                schema_metadata_updates: None,
-                field_metadata_updates: HashMap::new(),
-            },
-            None,
-        );
-
-        let new_ds = CommitBuilder::new(Arc::new(ds_after_merge))
             .with_stable_row_id_migration_activation(next_row_id)
             .execute(transaction)
             .await?;
