@@ -273,6 +273,7 @@ pub struct DirectoryNamespaceBuilder {
     dir_listing_enabled: bool,
     inline_optimization_enabled: bool,
     table_version_tracking_enabled: bool,
+    async_drop_enabled: bool,
     /// When true, enables migration mode where the namespace checks the manifest first
     /// before falling back to directory listing for root-level tables. When false (default),
     /// root-level tables use directory listing directly without checking the manifest,
@@ -344,6 +345,7 @@ impl DirectoryNamespaceBuilder {
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
             inline_optimization_enabled: true,
             table_version_tracking_enabled: false, // Default to disabled
+            async_drop_enabled: false,
             dir_listing_to_manifest_migration_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
             context_provider: None,
@@ -404,6 +406,12 @@ impl DirectoryNamespaceBuilder {
         self
     }
 
+    /// Enable unique physical generations required by expected-location drop fencing.
+    pub fn async_drop_enabled(mut self, enabled: bool) -> Self {
+        self.async_drop_enabled = enabled;
+        self
+    }
+
     /// Create a DirectoryNamespaceBuilder from properties HashMap.
     ///
     /// This method parses a properties map into builder configuration.
@@ -412,6 +420,7 @@ impl DirectoryNamespaceBuilder {
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
     /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: true)
+    /// - `async_drop_enabled`: Enable unique physical generations for asynchronous drop fencing (optional, default: false)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
@@ -521,6 +530,11 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
 
+        let async_drop_enabled = properties
+            .get("async_drop_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
         // Extract dir_listing_to_manifest_migration_enabled (default: false)
         let dir_listing_to_manifest_migration_enabled = properties
             .get("dir_listing_to_manifest_migration_enabled")
@@ -567,6 +581,7 @@ impl DirectoryNamespaceBuilder {
             dir_listing_enabled,
             inline_optimization_enabled,
             table_version_tracking_enabled,
+            async_drop_enabled,
             dir_listing_to_manifest_migration_enabled,
             credential_vendor_properties,
             context_provider: None,
@@ -754,6 +769,7 @@ impl DirectoryNamespaceBuilder {
                 object_store.clone(),
                 base_path.clone(),
                 self.dir_listing_enabled,
+                self.async_drop_enabled,
                 self.inline_optimization_enabled,
                 self.commit_retries,
             )
@@ -811,6 +827,7 @@ impl DirectoryNamespaceBuilder {
             dir_listing_to_manifest_migration_enabled: self
                 .dir_listing_to_manifest_migration_enabled,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
+            async_drop_enabled: self.async_drop_enabled,
             credential_vendor,
             context_provider: self.context_provider,
             vend_input_storage_options: self.vend_input_storage_options,
@@ -897,6 +914,7 @@ pub struct DirectoryNamespace {
     /// When true, `describe_table` returns `managed_versioning: true` to indicate
     /// commits should go through namespace table version APIs.
     table_version_tracking_enabled: bool,
+    async_drop_enabled: bool,
     /// Credential vendor created once during initialization.
     /// Used to vend temporary credentials for table access.
     credential_vendor: Option<Arc<dyn CredentialVendor>>,
@@ -1032,6 +1050,7 @@ impl DirectoryNamespace {
                     self.object_store.clone(),
                     self.base_path.clone(),
                     self.dir_listing_enabled,
+                    self.async_drop_enabled,
                     self.inline_optimization_enabled,
                     self.commit_retries,
                 )
@@ -1070,6 +1089,7 @@ impl DirectoryNamespace {
                     self.object_store.clone(),
                     self.base_path.clone(),
                     self.dir_listing_enabled,
+                    self.async_drop_enabled,
                     self.inline_optimization_enabled,
                     self.commit_retries,
                 )
@@ -9321,10 +9341,12 @@ mod tests {
         properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
         properties.insert("manifest_enabled".to_string(), "true".to_string());
         properties.insert("dir_listing_enabled".to_string(), "false".to_string());
+        properties.insert("async_drop_enabled".to_string(), "true".to_string());
 
         let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
         assert!(builder.manifest_enabled);
         assert!(!builder.dir_listing_enabled);
+        assert!(builder.async_drop_enabled);
 
         let namespace = builder.build().await.unwrap();
 
@@ -9386,6 +9408,7 @@ mod tests {
         // Both should default to true
         assert!(builder.manifest_enabled);
         assert!(builder.dir_listing_enabled);
+        assert!(!builder.async_drop_enabled);
     }
 
     #[tokio::test]
