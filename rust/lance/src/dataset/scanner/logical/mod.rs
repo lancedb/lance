@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! A logical-plan read path for the scanner.
+//! The read path: a query becomes a DataFusion [`LogicalPlan`], a curated rule set rewrites it,
+//! and an `ExtensionPlanner` lowers it.
 //!
-//! [`Scanner::create_plan`](crate::dataset::Scanner::create_plan) builds physical plans directly.
-//! This module is the alternative: assemble the query as a DataFusion [`LogicalPlan`], run a
-//! curated rule set over it, and lower it with an `ExtensionPlanner`.
+//! [`Scanner::create_plan`](crate::dataset::Scanner::create_plan) is a thin wrapper over
+//! [`create_plan`] here.
 //!
 //! Planning is staged so that the parts which must be synchronous can be:
 //!
@@ -18,8 +18,6 @@
 //!    I/O to obtain. Rewrites that must happen for the plan to be *correct* are `AnalyzerRule`s;
 //!    only rewrites that are optional are `OptimizerRule`s.
 //! 4. **Optimize and lower**, analyzer then logical rules then physical.
-//!
-//! This path is off by default. See [`is_enabled`].
 //!
 //! # The pipeline
 //!
@@ -145,14 +143,6 @@ use self::context::ScanPlanningContext;
 use crate::dataset::Scanner;
 use crate::io::exec::{SimplifyProjection, get_physical_optimizer};
 use crate::{Error, Result};
-
-/// Environment switch for the new path. Off unless explicitly set to `1`.
-///
-/// An env var (rather than a `Scanner` field) keeps this from touching the public builder API
-/// while both paths coexist; the flag and the imperative path go away together.
-pub fn is_enabled() -> bool {
-    std::env::var("LANCE_LOGICAL_SCAN_PLANNER").is_ok_and(|value| value == "1")
-}
 
 /// Plan a scan through the logical path.
 ///

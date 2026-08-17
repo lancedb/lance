@@ -365,8 +365,9 @@ async fn test_sum_single_fragment() {
     let plan = scanner.create_plan().await.unwrap();
     assert_plan_node_equals(
         plan,
-        "AggregateExec: mode=Single, gby=[], aggr=[sum(...)]
-  LanceRead: uri=..., projection=[x], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=false, full_filter=--, refine_filter=--",
+        "AggregateExec: mode=Final, gby=[], aggr=[sum(...)]
+  AggregateExec: mode=Partial, gby=[], aggr=[sum(...)]
+    LanceRead: uri=..., projection=[x], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=false, full_filter=--, refine_filter=--",
     )
     .await
     .unwrap();
@@ -522,8 +523,10 @@ async fn test_group_by_with_count() {
     let plan = scanner.create_plan().await.unwrap();
     assert_plan_node_equals(
         plan,
-        "AggregateExec: mode=Single, gby=[category@0 as category], aggr=[count(...)]
-  LanceRead: uri=..., projection=[category], num_fragments=4, range_before=None, range_after=None, row_id=false, row_addr=false, full_filter=--, refine_filter=--",
+        "AggregateExec: mode=FinalPartitioned, gby=[category@0 as category], aggr=[count(...)]
+  RepartitionExec: partitioning=Hash([category@0], ...), input_partitions=1
+    AggregateExec: mode=Partial, gby=[category@0 as category], aggr=[count(...)]
+      LanceRead: uri=..., projection=[category], num_fragments=4, range_before=None, range_after=None, row_id=false, row_addr=false, full_filter=--, refine_filter=--",
     )
     .await
     .unwrap();
@@ -1207,7 +1210,7 @@ async fn test_scanner_count_rows() {
     // over CountFromMaskExec.
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
   CountFromMask",
     )
     .await
@@ -1238,8 +1241,12 @@ async fn test_scanner_count_rows_with_filter() {
     // COUNT(*) with filter: filter columns are needed, but no data columns for the aggregate
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Single, gby=[], aggr=[count(Int32(1))]
-  LanceRead: uri=..., projection=[x], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=x >= Int64(50), refine_filter=x >= Int64(50)",
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
+  CoalescePartitionsExec
+    AggregateExec: mode=Partial, gby=[], aggr=[count(...)]
+      RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+        ProjectionExec: expr=[]
+          LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=x >= Int64(50), refine_filter=x >= Int64(50)",
     )
     .await
     .unwrap();
@@ -1281,7 +1288,7 @@ async fn test_scanner_count_rows_with_indexed_filter() {
 
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
   CountFromMask
     ScalarIndexQuery: query=[x < 50]@x_idx(BTree)",
     )
@@ -1340,7 +1347,7 @@ async fn test_scanner_count_rows_with_indexed_filter_stable_row_ids() {
 
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
   CountFromMask
     ScalarIndexQuery: query=[x < 100]@x_idx(BTree)",
     )
@@ -1419,7 +1426,7 @@ async fn test_scanner_count_rows_indexed_filter_stable_row_ids_after_compaction(
 
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
   CountFromMask
     ScalarIndexQuery: query=[x < 100]@x_idx(BTree)",
     )
@@ -1493,12 +1500,12 @@ async fn test_scanner_count_rows_with_partial_index_coverage() {
 
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
   CoalescePartitionsExec
     UnionExec
       CountFromMask
         ScalarIndexQuery: query=[x < 1000]@x_idx(BTree)
-      AggregateExec: mode=Partial, gby=[], aggr=[count(Int32(1))]
+      AggregateExec: mode=Partial, gby=[], aggr=[count(...)]
         LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=x < Int64(1000), refine_filter=--",
     )
     .await
@@ -1549,10 +1556,12 @@ async fn test_scanner_count_rows_with_vector_search() {
 
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Single, gby=[], aggr=[count(Int32(1))]
-  SortExec: TopK(fetch=30), ...
-    ANNSubIndex: ...
-      ANNIvfPartition: ...deltas=1",
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
+  AggregateExec: mode=Partial, gby=[], aggr=[count(...)]
+    ProjectionExec: expr=[]
+      SortExec: TopK(fetch=30), ...
+        ANNSubIndex: ...
+          ANNIvfPartition: ...deltas=1",
     )
     .await
     .unwrap();
@@ -1597,8 +1606,12 @@ async fn test_scanner_count_rows_with_fts() {
 
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Single, gby=[], aggr=[count(Int32(1))]
-  MatchQuery: column=text, query=[document]",
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
+  CoalescePartitionsExec
+    AggregateExec: mode=Partial, gby=[], aggr=[count(...)]
+      RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+        ProjectionExec: expr=[]
+          MatchQuery: column=text, query=[document]",
     )
     .await
     .unwrap();

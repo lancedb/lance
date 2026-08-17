@@ -48,19 +48,6 @@ pub(super) async fn logical_plan_for(
     super::super::create_plan(&scan).await
 }
 
-/// As [`logical_plan_for`], but through the imperative path this module replaces.
-///
-/// Only the equivalence check below uses it. It goes away with the imperative path.
-pub(super) async fn imperative_plan_for(
-    dataset: &Dataset,
-    config: impl ScanConfig,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let mut scan = dataset.scan();
-    scan.target_parallelism(1);
-    config(&mut scan)?;
-    scan.create_plan().await
-}
-
 pub(super) async fn assert_logical_plan(
     dataset: &Dataset,
     config: impl ScanConfig,
@@ -68,35 +55,6 @@ pub(super) async fn assert_logical_plan(
 ) -> Result<()> {
     let plan = logical_plan_for(dataset, config).await?;
     assert_plan_node_equals(plan, expected).await
-}
-
-/// A result's rows as a sorted multiset, for comparing two plans that need not agree on order.
-///
-/// Rendered rather than sorted in place because no sort key over the columns is guaranteed to be
-/// total: a list-element full-text search returns one row per matching element, so the same row id
-/// can appear twice with the same score and differ only in a `List` column, which Arrow's lexsort
-/// cannot order. Rendering every column and sorting the strings compares the rows a caller would
-/// actually see, whatever their types.
-pub(super) fn row_multiset(batch: &RecordBatch) -> Result<Vec<String>> {
-    use arrow::util::display::{ArrayFormatter, FormatOptions};
-
-    let formatters = batch
-        .columns()
-        .iter()
-        .map(|column| ArrayFormatter::try_new(column.as_ref(), &FormatOptions::default()))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut rows = (0..batch.num_rows())
-        .map(|row| {
-            formatters
-                .iter()
-                .map(|formatter| formatter.value(row).to_string())
-                .collect::<Vec<_>>()
-                .join(" | ")
-        })
-        .collect::<Vec<_>>();
-    rows.sort();
-    Ok(rows)
 }
 
 pub(super) async fn run(plan: Arc<dyn ExecutionPlan>) -> Result<RecordBatch> {
@@ -197,56 +155,8 @@ pub(super) fn row_ids_of(batch: &RecordBatch) -> Vec<u64> {
 }
 
 /// Run `config`'s scan with `_rowid` appended, so its rows can be named.
-///
-/// Every result oracle below funnels through here, so this is also where the path being replaced is
-/// held to the same answer: the imperative path plans the same query, and the two must return the
-/// same rows in the same order. The oracles state what the answer *is*; this states that nothing
-/// changed on the way to it. Both halves go away together — the oracles stay, the comparison
-/// leaves with the imperative path.
-///
-/// Row order is compared because it is observable: a path that returns the right rows in a
-/// different order has still changed what a caller sees. Reach for [`scan_rows_unordered`] only
-/// where the two paths genuinely have no shared order to agree on.
 pub(super) async fn scan_rows(dataset: &Dataset, config: impl ScanConfig) -> Result<RecordBatch> {
-    scan_rows_compared(dataset, config, false).await
-}
-
-/// As [`scan_rows`], but comparing the two paths' rows as a set.
-///
-/// Only relevance ties need this: the logical path breaks them by row id and the imperative path
-/// does not break them at all, so there is no order for the two to agree on. What that order should
-/// be is asserted directly against the data instead.
-pub(super) async fn scan_rows_unordered(
-    dataset: &Dataset,
-    config: impl ScanConfig,
-) -> Result<RecordBatch> {
-    scan_rows_compared(dataset, config, true).await
-}
-
-async fn scan_rows_compared(
-    dataset: &Dataset,
-    config: impl ScanConfig,
-    as_set: bool,
-) -> Result<RecordBatch> {
-    let config = config_with_row_id(config);
-    let actual = run(logical_plan_for(dataset, &config).await?).await?;
-    let expected = run(imperative_plan_for(dataset, &config).await?).await?;
-
-    assert_eq!(
-        expected.schema(),
-        actual.schema(),
-        "logical path produced a different output schema"
-    );
-    if as_set {
-        assert_eq!(
-            row_multiset(&expected)?,
-            row_multiset(&actual)?,
-            "logical path produced different rows"
-        );
-    } else {
-        assert_eq!(expected, actual, "logical path produced different rows");
-    }
-    Ok(actual)
+    run(logical_plan_for(dataset, config_with_row_id(config)).await?).await
 }
 
 fn config_with_row_id(config: impl ScanConfig) -> impl ScanConfig {
@@ -542,9 +452,7 @@ pub(super) async fn assert_fts_matches(
     matches: impl Fn(i32) -> bool,
 ) -> Result<()> {
     let fixture = Fixture::read(dataset).await?;
-    // Unordered: relevance ties are exactly what the two paths order differently, and
-    // `assert_scores_descending` below is what pins the order that matters.
-    let actual = scan_rows_unordered(dataset, config).await?;
+    let actual = scan_rows(dataset, config).await?;
     let row_ids = row_ids_of(&actual);
 
     assert_scores_descending(&actual);

@@ -2232,8 +2232,9 @@ mod tests {
         crate::utils::test::assert_plan_node_equals(
             plan,
             "ProjectionExec: expr=[id@2 as id, text@3 as text, _score@1 as _score]
-  LanceRead: ..., source=stream(_rowid)
-    MatchQuery: column=text, query=[hello]",
+  SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
+    LanceRead: ..., source=stream(_rowid)
+      MatchQuery: column=text, query=[hello]",
         )
         .await
         .unwrap();

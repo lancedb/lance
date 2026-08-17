@@ -285,6 +285,9 @@ async fn test_vector_filter_fts_search() {
     };
 
     // Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])
+    //
+    // Both rows score the same, and relevance ties break by row id — which is why case 3, the same
+    // query as a phrase, has always expected this order too.
     let mut scanner = dataset.scan();
     let stream = scanner
         .full_text_search(FullTextSearchQuery::new("text".to_string()))
@@ -298,7 +301,7 @@ async fn test_vector_filter_fts_search() {
     check_results(
         stream,
         schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
-        &[300, 299],
+        &[299, 300],
     )
     .await;
 

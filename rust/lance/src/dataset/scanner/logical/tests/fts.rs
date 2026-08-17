@@ -735,27 +735,9 @@ pub(super) async fn hybrid_expectation(
 }
 
 /// Assert a hybrid query returned exactly `expected`, whatever order the two searches leave it in.
-/// Which of a hybrid query's two searches decides the order of its results.
-///
-/// Only the equivalence check reads this: relevance ties are broken by row id here and not at all
-/// on the imperative path, so a relevance-ordered result is compared as a set. Distance-ordered
-/// results are compared in order.
-enum ResultOrder {
-    Distance,
-    Relevance,
-}
-
-async fn assert_hybrid(
-    dataset: &Dataset,
-    config: impl ScanConfig,
-    order: ResultOrder,
-    expected: Vec<i32>,
-) {
+async fn assert_hybrid(dataset: &Dataset, config: impl ScanConfig, expected: Vec<i32>) {
     let fixture = Fixture::read(dataset).await.unwrap();
-    let batch = match order {
-        ResultOrder::Distance => scan_rows(dataset, config).await.unwrap(),
-        ResultOrder::Relevance => scan_rows_unordered(dataset, config).await.unwrap(),
-    };
+    let batch = scan_rows(dataset, config).await.unwrap();
     let mut found = fixture.ids_of(&row_ids_of(&batch));
     found.sort_unstable();
     found.dedup();
@@ -781,7 +763,6 @@ pub(super) async fn test_fts_filter_postfiltering_a_vector_search() {
                 .nearest("vec", &query_vector(), 20)?
                 .filter_query(QueryFilter::Fts(match_query("hello")))
         },
-        ResultOrder::Distance,
         expected,
     )
     .await;
@@ -802,7 +783,6 @@ pub(super) async fn test_fts_filter_prefiltering_a_vector_search() {
                 .nearest("vec", &query_vector(), 20)?
                 .filter_query(QueryFilter::Fts(match_query("hello")))
         },
-        ResultOrder::Distance,
         expected,
     )
     .await;
@@ -825,7 +805,6 @@ pub(super) async fn test_vector_filter_postfiltering_an_fts_search() {
                 .full_text_search(match_query("hello"))?
                 .filter_query(QueryFilter::Vector(vector_filter_query()))
         },
-        ResultOrder::Relevance,
         expected,
     )
     .await;
@@ -848,7 +827,6 @@ pub(super) async fn test_vector_filter_prefiltering_an_fts_search() {
                 .full_text_search(match_query("hello"))?
                 .filter_query(QueryFilter::Vector(vector_filter_query()))
         },
-        ResultOrder::Relevance,
         expected,
     )
     .await;
