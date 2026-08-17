@@ -388,9 +388,14 @@ impl ShardManifestStore {
             if let Some(m) = &current
                 && m.status != ShardStatus::Active
             {
+                let status = match m.status {
+                    ShardStatus::Active => unreachable!(),
+                    ShardStatus::Sealed => "sealed",
+                    ShardStatus::Dropped => "dropped",
+                };
                 return Err(Error::invalid_input(format!(
-                    "shard {} is {:?}; refusing claim (drop fence)",
-                    self.shard_id, m.status
+                    "shard {} is {status}; refusing claim (drop fence)",
+                    self.shard_id
                 )));
             }
 
@@ -766,6 +771,21 @@ mod tests {
         let (next_epoch, reclaimed) = manifest_store.claim_epoch(0).await.unwrap();
         assert!(next_epoch > epoch, "rolled-back shard mints the next epoch");
         assert_eq!(reclaimed.status, ShardStatus::Active);
+
+        let dropped = ShardManifest {
+            version: reclaimed.version + 1,
+            status: ShardStatus::Dropped,
+            ..reclaimed
+        };
+        manifest_store.write(&dropped).await.unwrap();
+        let err = manifest_store.claim_epoch(0).await.unwrap_err();
+        assert!(
+            err.to_string().contains("dropped"),
+            "expected a distinguishable dropped-refusal error, got: {err}"
+        );
+        let after = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(after.writer_epoch, dropped.writer_epoch, "no epoch minted");
+        assert_eq!(after.status, ShardStatus::Dropped);
     }
 
     #[tokio::test]
