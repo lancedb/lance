@@ -210,6 +210,11 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn retry_timeout_for_test(&self) -> Duration {
+        self.retry_timeout
+    }
+
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
         self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
         self

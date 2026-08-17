@@ -328,6 +328,16 @@ pub struct UpdateJob {
 }
 
 impl UpdateJob {
+    fn commit_builder(
+        &self,
+        dataset: Arc<Dataset>,
+        affected_rows: RowAddrTreeMap,
+    ) -> CommitBuilder<'static> {
+        CommitBuilder::new(dataset)
+            .with_affected_rows(affected_rows)
+            .with_retry_timeout(self.retry_timeout)
+    }
+
     pub async fn execute(self) -> Result<UpdateResult> {
         let dataset = self.dataset.clone();
         let config = RetryConfig {
@@ -644,8 +654,8 @@ impl UpdateJob {
                     },
                     dataset.as_ref(),
                 );
-            let new_dataset = CommitBuilder::new(dataset)
-                .with_affected_rows(update_data.affected_rows)
+            let new_dataset = self
+                .commit_builder(dataset, update_data.affected_rows)
                 .execute(transaction)
                 .await?;
             return Ok(UpdateResult {
@@ -703,8 +713,8 @@ impl UpdateJob {
                 dataset.as_ref(),
             );
 
-        let new_dataset = CommitBuilder::new(dataset)
-            .with_affected_rows(update_data.affected_rows)
+        let new_dataset = self
+            .commit_builder(dataset, update_data.affected_rows)
             .execute(transaction)
             .await?;
 
@@ -909,6 +919,25 @@ mod tests {
         assert!(
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_retry_timeout_is_forwarded_to_commit_builder() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy, false).await;
+        let retry_timeout = Duration::from_secs(300);
+        let job = UpdateBuilder::new(dataset.clone())
+            .set("id", "id + 1")
+            .unwrap()
+            .retry_timeout(retry_timeout)
+            .build()
+            .unwrap();
+
+        let commit_builder = job.commit_builder(dataset, RowAddrTreeMap::new());
+        assert_eq!(
+            commit_builder.retry_timeout_for_test(),
+            retry_timeout,
+            "the inner commit retry budget must match the update retry budget"
         );
     }
 
