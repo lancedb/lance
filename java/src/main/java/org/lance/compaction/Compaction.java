@@ -15,6 +15,7 @@ package org.lance.compaction;
 
 import org.lance.Dataset;
 import org.lance.JniLoader;
+import org.lance.LockManager;
 
 import com.google.common.base.Preconditions;
 
@@ -32,21 +33,23 @@ public class Compaction {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(compactionOptions);
 
-    return nativePlanCompaction(
-        dataset,
-        compactionOptions.getTargetRowsPerFragment(),
-        compactionOptions.getMaxRowsPerGroup(),
-        compactionOptions.getMaxBytesPerFile(),
-        compactionOptions.getMaterializeDeletions(),
-        compactionOptions.getMaterializeDeletionsThreshold(),
-        compactionOptions.getNumThreads(),
-        compactionOptions.getBatchSize(),
-        compactionOptions.getDeferIndexRemap(),
-        compactionOptions.getCompactionMode(),
-        compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments(),
-        compactionOptions.getMaxSourceRows(),
-        compactionOptions.getMaxSourceBytes());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativePlanCompaction(
+          dataset,
+          compactionOptions.getTargetRowsPerFragment(),
+          compactionOptions.getMaxRowsPerGroup(),
+          compactionOptions.getMaxBytesPerFile(),
+          compactionOptions.getMaterializeDeletions(),
+          compactionOptions.getMaterializeDeletionsThreshold(),
+          compactionOptions.getNumThreads(),
+          compactionOptions.getBatchSize(),
+          compactionOptions.getDeferIndexRemap(),
+          compactionOptions.getCompactionMode(),
+          compactionOptions.getBinaryCopyReadBatchBytes(),
+          compactionOptions.getMaxSourceFragments(),
+          compactionOptions.getMaxSourceRows(),
+          compactionOptions.getMaxSourceBytes());
+    }
   }
 
   public static CompactionMetrics commitCompaction(
@@ -54,22 +57,24 @@ public class Compaction {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(rewriteResults);
     Preconditions.checkNotNull(compactionOptions);
-    return nativeCommitCompaction(
-        dataset,
-        rewriteResults,
-        compactionOptions.getTargetRowsPerFragment(),
-        compactionOptions.getMaxRowsPerGroup(),
-        compactionOptions.getMaxBytesPerFile(),
-        compactionOptions.getMaterializeDeletions(),
-        compactionOptions.getMaterializeDeletionsThreshold(),
-        compactionOptions.getNumThreads(),
-        compactionOptions.getBatchSize(),
-        compactionOptions.getDeferIndexRemap(),
-        compactionOptions.getCompactionMode(),
-        compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments(),
-        compactionOptions.getMaxSourceRows(),
-        compactionOptions.getMaxSourceBytes());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeCommitCompaction(
+          dataset,
+          rewriteResults,
+          compactionOptions.getTargetRowsPerFragment(),
+          compactionOptions.getMaxRowsPerGroup(),
+          compactionOptions.getMaxBytesPerFile(),
+          compactionOptions.getMaterializeDeletions(),
+          compactionOptions.getMaterializeDeletionsThreshold(),
+          compactionOptions.getNumThreads(),
+          compactionOptions.getBatchSize(),
+          compactionOptions.getDeferIndexRemap(),
+          compactionOptions.getCompactionMode(),
+          compactionOptions.getBinaryCopyReadBatchBytes(),
+          compactionOptions.getMaxSourceFragments(),
+          compactionOptions.getMaxSourceRows(),
+          compactionOptions.getMaxSourceBytes());
+    }
   }
 
   public static native CompactionMetrics nativeCommitCompaction(

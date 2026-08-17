@@ -279,23 +279,25 @@ public class CommitBuilder {
   public Dataset execute(Transaction transaction) {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
     if (dataset != null) {
-      Dataset result =
-          nativeCommitToDataset(
-              dataset,
-              transaction,
-              detached,
-              enableV2ManifestPaths,
-              writeParams,
-              useStableRowIds,
-              storageFormat,
-              maxRetries,
-              skipAutoCleanup,
-              namespaceClient,
-              tableId,
-              namespaceClientManagedVersioning,
-              commitTimeoutNanos);
-      result.setAllocator(dataset.allocator());
-      return result;
+      try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+        Dataset result =
+            nativeCommitToDataset(
+                dataset,
+                transaction,
+                detached,
+                enableV2ManifestPaths,
+                writeParams,
+                useStableRowIds,
+                storageFormat,
+                maxRetries,
+                skipAutoCleanup,
+                namespaceClient,
+                tableId,
+                namespaceClientManagedVersioning,
+                commitTimeoutNanos);
+        result.setAllocator(dataset.allocator());
+        return result;
+      }
     }
     if (uri != null) {
       Dataset result =
