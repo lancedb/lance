@@ -98,7 +98,8 @@ impl<'a> CommitBuilder<'a> {
     /// All data files must use the same storage format as the existing dataset.
     /// If a different format is passed, an error will be returned.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
-        self.storage_format = Some(storage_format.into());
+        self.storage_format = Some(storage_format.resolve());
+
         self
     }
 
@@ -476,13 +477,21 @@ impl<'a> CommitBuilder<'a> {
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                fragment_bitmap,
-                ..dataset.as_ref().clone()
-            }),
+            WriteDestination::Dataset(dataset) => {
+                let base_object_stores = if manifest.base_paths == dataset.manifest.base_paths {
+                    dataset.base_object_stores.clone()
+                } else {
+                    Default::default()
+                };
+                Ok(Dataset {
+                    manifest: Arc::new(manifest),
+                    manifest_location,
+                    session,
+                    fragment_bitmap,
+                    base_object_stores,
+                    ..dataset.as_ref().clone()
+                })
+            }
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
                     object_store.clone(),
@@ -509,6 +518,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
+                    base_object_stores: Default::default(),
                 })
             }
         }
@@ -589,7 +599,8 @@ mod tests {
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) =
-            ConcreteFileVersion::from(LanceFileVersion::Stable).to_data_file_numbers();
+            LanceFileVersion::Stable.resolve().to_data_file_numbers();
+
         Fragment {
             id: 0,
             files: vec![DataFile {

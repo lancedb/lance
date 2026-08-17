@@ -2986,6 +2986,15 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return versions
 
+    def version_refs(self) -> List[VersionRef]:
+        """
+        Return lightweight references to all attached versions in the current branch.
+
+        Unlike :meth:`versions`, this does not read or deserialize every manifest.
+        Use :attr:`latest_version` instead when only the latest version is needed.
+        """
+        return self._ds.version_refs()
+
     @property
     def version(self) -> int:
         """
@@ -3154,7 +3163,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -3213,7 +3222,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Include unverified files that cleanup would remove when this is set.
@@ -3310,12 +3319,17 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_boolean(field_type)
                     and not pa.types.is_string(field_type)
                     and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
                     and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_decimal128(field_type)
+                    and not pa.types.is_decimal256(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
                         f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
+                        ", float, bool, str, large_str, binary, large_binary, "
+                        "decimal, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
                 if not (
@@ -3346,10 +3360,6 @@ class LanceDataset(pa.dataset.Dataset):
                         f" or list of strings, or json, but got {value_type}"
                     )
 
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
@@ -3504,7 +3514,8 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         column : str
             The column to be indexed.  Must be a boolean, integer, float,
-            or string column.
+            string, binary, decimal, fixed-size-binary, or
+            supported temporal column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
@@ -5724,6 +5735,10 @@ class Version(TypedDict):
     metadata: Dict[str, str]
 
 
+class VersionRef(TypedDict):
+    version: int
+
+
 class UpdateResult(TypedDict):
     num_rows_updated: int
 
@@ -6012,6 +6027,11 @@ class LanceOperation:
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        updated_fragment_offsets: dict[int, bytes], optional
+            Physical row offsets that matched the update, keyed by fragment id,
+            each serialized in the portable RoaringBitmap format. Set on
+            ``rewrite_columns`` updates over stable row ids so the commit
+            refreshes row-level version metadata for the matched rows only.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6024,6 +6044,7 @@ class LanceOperation:
             default_factory=list
         )
         update_mode: str = ""
+        updated_fragment_offsets: Optional[Dict[int, bytes]] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -7128,6 +7149,8 @@ class DatasetOptimizer:
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
         max_source_fragments: Optional[int] = None,
+        max_source_rows: Optional[int] = None,
+        max_source_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7159,7 +7182,9 @@ class DatasetOptimizer:
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
         ``lance.compaction.binary_copy_read_batch_bytes``,
-        ``lance.compaction.max_source_fragments``.
+        ``lance.compaction.max_source_fragments``,
+        ``lance.compaction.max_source_rows``,
+        ``lance.compaction.max_source_bytes``.
 
         Parameters
         ----------
@@ -7218,6 +7243,18 @@ class DatasetOptimizer:
             exceed this limit, allowing compaction to proceed incrementally.
             Fragments are processed oldest first. If not specified, uses the
             manifest config value, or applies no limit.
+        max_source_rows: int, optional
+            Maximum number of source rows to compact in a single run. Rows are
+            counted as live rows (physical rows minus soft-deleted rows).
+            Tasks are included until adding the next task would exceed this
+            limit.
+        max_source_bytes: int, optional
+            Maximum number of source bytes to compact in a single run,
+            measured as the total size of the source fragments' data and
+            overlay files. Tasks are included until adding the next task
+            would exceed this limit. Blob v2 payloads live in separate
+            blob files and are not counted, so this is not a cap on total
+            compaction I/O for datasets with blob columns.
 
         Returns
         -------
@@ -7242,6 +7279,8 @@ class DatasetOptimizer:
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
                 max_source_fragments=max_source_fragments,
+                max_source_rows=max_source_rows,
+                max_source_bytes=max_source_bytes,
             ).items()
             if v is not None
         }

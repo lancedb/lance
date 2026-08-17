@@ -16,7 +16,6 @@ rust-version.workspace = true
 object_store = { workspace = true }
 opendal = { workspace = true, optional = true }
 object_store_opendal = { workspace = true, optional = true }
-lance-arrow.workspace = true
 lance-core.workspace = true
 lance-namespace.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
@@ -39,6 +38,7 @@ serde = { workspace = true, features = ["derive"] }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+uuid.workspace = true
 path_abs.workspace = true
 rand.workspace = true
 tempfile.workspace = true

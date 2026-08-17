@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod should_maxscore;
+
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
@@ -24,10 +26,12 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments,
+        WandCursor, WandDocuments, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
+
+use self::should_maxscore::ShouldMaxScoreScorer;
 
 const DEFAULT_BLOCK_SIZE: usize = 128;
 const SCORE_FLOOR_RESOLUTION_BATCH_SIZE: usize = DEFAULT_BLOCK_SIZE;
@@ -196,6 +200,11 @@ pub(super) trait ComposableScorer: Send {
     fn score(&mut self) -> Result<f32>;
     fn advance_shallow(&mut self, target: u64) -> Result<u64>;
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds>;
+    /// Conservative list-wide score upper bound, independent of iterator
+    /// position. `None` keeps the scorer on exact eager composition paths.
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        None
+    }
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()>;
 
     fn matches(&mut self) -> Result<bool> {
@@ -214,6 +223,22 @@ pub(super) trait ComposableScorer: Send {
 }
 
 type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
+
+fn sum_global_score_upper_bounds(children: &[BoxScorer<'_>]) -> Option<f32> {
+    children.iter().try_fold(0.0, |upper, child| {
+        let child_upper = child.global_score_upper_bound()?;
+        if !child_upper.is_finite() || child_upper < 0.0 {
+            return None;
+        }
+        let combined = ScoreBounds { lower: 0.0, upper }
+            .add(ScoreBounds {
+                lower: 0.0,
+                upper: child_upper,
+            })
+            .upper;
+        combined.is_finite().then_some(combined)
+    })
+}
 
 #[derive(Debug, Clone)]
 enum CompoundScorerPlan {
@@ -282,7 +307,11 @@ impl CompoundScorerPlan {
         }
     }
 
-    fn build<'a>(&self, leaves: &mut [Option<BoxScorer<'a>>]) -> Result<BoxScorer<'a>> {
+    fn build<'a>(
+        &self,
+        leaves: &mut [Option<BoxScorer<'a>>],
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxScorer<'a>> {
         match self {
             Self::Leaf { index, boost } => {
                 let leaf = leaves
@@ -300,14 +329,14 @@ impl CompoundScorerPlan {
                 negative,
                 negative_boost,
             } => Ok(Box::new(BoostScorer::try_new(
-                positive.build(leaves)?,
-                negative.build(leaves)?,
+                positive.build(leaves, metrics)?,
+                negative.build(leaves, metrics)?,
                 *negative_boost,
             )?)),
             Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
                 children
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
                 DisjunctionScore::Max,
             )?)),
@@ -315,18 +344,19 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new(
+            } => Ok(Box::new(BooleanScorer::try_new_with_metrics(
                 should
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
                 must.iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
                 must_not
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
+                Some(metrics),
             )?)),
         }
     }
@@ -366,6 +396,10 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
             lower: 0.0,
             upper: self.score_upper_bound(up_to)?,
         })
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        WandCursor::global_score_upper_bound(self)
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
@@ -534,6 +568,14 @@ impl ComposableScorer for MaterializedScorer {
         let end = shallow.start
             + self.rows[shallow.start..shallow.end].partition_point(|row| row.row_id <= up_to);
         self.block_bounds(shallow.start, end)
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        self.rows
+            .iter()
+            .map(|row| row.score)
+            .max_by(f32::total_cmp)
+            .or(Some(0.0))
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
@@ -898,6 +940,10 @@ impl ComposableScorer for EmptyScorer {
         Ok(ScoreBounds::ZERO)
     }
 
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        Some(0.0)
+    }
+
     fn set_min_competitive_score(&mut self, _min_score: f32) -> Result<()> {
         Ok(())
     }
@@ -957,6 +1003,17 @@ impl ComposableScorer for ScaleScorer<'_> {
             .child
             .score_bounds(up_to)?
             .scale_non_negative(self.factor))
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        self.child
+            .global_score_upper_bound()
+            .map(|upper| {
+                ScoreBounds { lower: 0.0, upper }
+                    .scale_non_negative(self.factor)
+                    .upper
+            })
+            .filter(|upper| upper.is_finite() && *upper >= 0.0)
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
@@ -1142,6 +1199,16 @@ impl ComposableScorer for DisjunctionScorer<'_> {
             Ok(ScoreBounds::ZERO)
         } else {
             Ok(bounds)
+        }
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        match self.mode {
+            DisjunctionScore::Sum => sum_global_score_upper_bounds(&self.children),
+            DisjunctionScore::Max => self.children.iter().try_fold(0.0_f32, |upper, child| {
+                let child_upper = child.global_score_upper_bound()?;
+                child_upper.is_finite().then_some(upper.max(child_upper))
+            }),
         }
     }
 
@@ -1390,6 +1457,12 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
         Ok(bounds)
     }
 
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        self.scores_non_negative()
+            .then(|| sum_global_score_upper_bounds(&self.children))
+            .flatten()
+    }
+
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
         if min_score.is_nan() {
             return Err(Error::invalid_input(
@@ -1542,6 +1615,340 @@ impl ComposableScorer for BoostScorer<'_> {
     }
 }
 
+/// Required-plus-optional scorer that only touches the optional side when it
+/// can change competitiveness or an exact score is requested.
+///
+/// The required scorer drives iteration. Once a score floor is available,
+/// block bounds may either skip the whole range or temporarily turn the
+/// optional approximation into a required iterator when the required score
+/// cannot reach the floor on its own.
+#[derive(Clone, Copy)]
+struct ReqOptBounds {
+    up_to: u64,
+    required: ScoreBounds,
+    combined: ScoreBounds,
+}
+
+struct ReqOptScorer<'a> {
+    required: BoxScorer<'a>,
+    optional: BoxScorer<'a>,
+    current: Option<u64>,
+    exhausted: bool,
+    optional_initialized: bool,
+    optional_is_required: bool,
+    optional_checked_doc: Option<u64>,
+    optional_matches: bool,
+    confirmed_doc: Option<u64>,
+    confirmed: bool,
+    min_competitive_score: f32,
+    shallow_bounds: Option<ReqOptBounds>,
+}
+
+impl<'a> ReqOptScorer<'a> {
+    fn new(required: BoxScorer<'a>, optional: BoxScorer<'a>) -> Self {
+        debug_assert!(required.scores_non_negative());
+        debug_assert!(optional.scores_non_negative());
+        Self {
+            required,
+            optional,
+            current: None,
+            exhausted: false,
+            optional_initialized: false,
+            optional_is_required: false,
+            optional_checked_doc: None,
+            optional_matches: false,
+            confirmed_doc: None,
+            confirmed: false,
+            min_competitive_score: f32::NEG_INFINITY,
+            shallow_bounds: None,
+        }
+    }
+
+    fn set_current(&mut self, current: Option<u64>) {
+        if self.current != current {
+            self.optional_checked_doc = None;
+            self.optional_matches = false;
+            self.confirmed_doc = None;
+            self.confirmed = false;
+        }
+        self.current = current;
+        self.optional_is_required = false;
+    }
+
+    fn set_optional_required(&mut self, required: bool) {
+        if self.optional_is_required != required {
+            self.confirmed_doc = None;
+            self.confirmed = false;
+        }
+        self.optional_is_required = required;
+    }
+
+    fn exhaust(&mut self) -> Option<u64> {
+        self.exhausted = true;
+        self.set_current(None);
+        None
+    }
+
+    fn ensure_optional_at_or_after(&mut self, target: u64) -> Result<Option<u64>> {
+        if !self.optional_initialized || self.optional.doc().is_some_and(|doc| doc < target) {
+            self.optional.advance(target)?;
+            self.optional_initialized = true;
+        }
+        Ok(self.optional.doc())
+    }
+
+    fn optional_matches_current(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
+            return Ok(false);
+        };
+        if self.optional_checked_doc == Some(current) {
+            return Ok(self.optional_matches);
+        }
+        self.optional_matches = self.ensure_optional_at_or_after(current)? == Some(current)
+            && self.optional.matches()?;
+        self.optional_checked_doc = Some(current);
+        Ok(self.optional_matches)
+    }
+
+    fn usable_bounds(bounds: ScoreBounds) -> bool {
+        bounds.lower.is_finite() && bounds.upper.is_finite() && bounds.lower <= bounds.upper
+    }
+
+    fn bounds(&mut self, up_to: u64) -> Result<ReqOptBounds> {
+        if let Some(bounds) = self.shallow_bounds
+            && bounds.up_to == up_to
+        {
+            return Ok(bounds);
+        }
+
+        let required = self.required.score_bounds(up_to)?;
+        let optional = if self.optional.doc().is_some_and(|doc| doc <= up_to) {
+            let bounds = self.optional.score_bounds(up_to)?;
+            if Self::usable_bounds(bounds) {
+                bounds.include_zero()
+            } else {
+                ScoreBounds::UNBOUNDED
+            }
+        } else {
+            ScoreBounds::ZERO
+        };
+        let combined = required.add(optional);
+        let bounds = ReqOptBounds {
+            up_to,
+            required,
+            combined,
+        };
+        self.shallow_bounds = Some(bounds);
+        Ok(bounds)
+    }
+
+    fn position(&mut self, mut target: u64) -> Result<Option<u64>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        'search: loop {
+            let bounds = self.shallow_bounds.filter(|bounds| target <= bounds.up_to);
+
+            if self.min_competitive_score.is_finite()
+                && self.min_competitive_score > 0.0
+                && let Some(bounds) = bounds
+                && Self::usable_bounds(bounds.required)
+                && Self::usable_bounds(bounds.combined)
+            {
+                if bounds.combined.upper < self.min_competitive_score {
+                    if bounds.up_to == u64::MAX {
+                        return Ok(self.exhaust());
+                    }
+                    target = bounds.up_to + 1;
+                    self.shallow_bounds = None;
+                    continue;
+                }
+
+                if bounds.required.upper < self.min_competitive_score {
+                    // The optional contribution is necessary throughout this
+                    // cached shallow range. Intersect approximations until
+                    // both sides agree or the range is exhausted.
+                    let Some(mut required_doc) = self.required.advance(target)? else {
+                        return Ok(self.exhaust());
+                    };
+                    if required_doc > bounds.up_to {
+                        target = required_doc;
+                        self.shallow_bounds = None;
+                        continue;
+                    }
+                    self.set_current(Some(required_doc));
+                    self.set_optional_required(true);
+                    loop {
+                        self.set_current(Some(required_doc));
+                        self.set_optional_required(true);
+                        let Some(optional_doc) = self.ensure_optional_at_or_after(required_doc)?
+                        else {
+                            if bounds.up_to == u64::MAX {
+                                return Ok(self.exhaust());
+                            }
+                            target = bounds.up_to + 1;
+                            self.shallow_bounds = None;
+                            continue 'search;
+                        };
+                        if optional_doc > bounds.up_to {
+                            if bounds.up_to == u64::MAX {
+                                return Ok(self.exhaust());
+                            }
+                            target = bounds.up_to + 1;
+                            self.shallow_bounds = None;
+                            continue 'search;
+                        }
+                        if optional_doc == required_doc {
+                            return Ok(self.current);
+                        }
+                        let Some(next_required) = self.required.advance(optional_doc)? else {
+                            return Ok(self.exhaust());
+                        };
+                        if next_required > bounds.up_to {
+                            target = next_required;
+                            self.shallow_bounds = None;
+                            continue 'search;
+                        }
+                        required_doc = next_required;
+                    }
+                }
+            }
+
+            let Some(required_doc) = self.required.advance(target)? else {
+                return Ok(self.exhaust());
+            };
+            self.set_current(Some(required_doc));
+            self.set_optional_required(false);
+            return Ok(self.current);
+        }
+    }
+
+    fn ensure_confirmed(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
+            return Ok(false);
+        };
+        if self.confirmed_doc == Some(current) {
+            return Ok(self.confirmed);
+        }
+        self.confirmed = self.required.matches()?
+            && (!self.optional_is_required || self.optional_matches_current()?);
+        self.confirmed_doc = Some(current);
+        Ok(self.confirmed)
+    }
+}
+
+impl ComposableScorer for ReqOptScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.current
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.required.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        let target = match self.current {
+            None => 0,
+            Some(u64::MAX) => return Ok(self.exhaust()),
+            Some(current) => current + 1,
+        };
+        self.position(target)
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        self.position(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.required.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        if !self.ensure_confirmed()? {
+            return Err(Error::internal(
+                "required-plus-optional FTS score requested for an unconfirmed document",
+            ));
+        }
+        let mut score = self.required.score()?;
+        if self.optional_matches_current()? {
+            score += self.optional.score()?;
+        }
+        checked_score(score, "required-plus-optional FTS scorer")
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let target = self.current.map_or(target, |current| target.max(current));
+        if let Some(bounds) = self.shallow_bounds
+            && target <= bounds.up_to
+        {
+            return Ok(bounds.up_to);
+        }
+        self.shallow_bounds = None;
+        let mut up_to = self.required.advance_shallow(target)?;
+        match self.ensure_optional_at_or_after(target)? {
+            Some(optional_doc) if optional_doc <= target => {
+                up_to = up_to.min(self.optional.advance_shallow(target)?);
+            }
+            Some(optional_doc) => {
+                up_to = up_to.min(optional_doc.saturating_sub(1));
+            }
+            None => {}
+        }
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        Ok(self.bounds(up_to)?.combined)
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        let required = self.required.global_score_upper_bound()?;
+        let optional = self.optional.global_score_upper_bound()?;
+        let combined = ScoreBounds {
+            lower: 0.0,
+            upper: required,
+        }
+        .add(ScoreBounds {
+            lower: 0.0,
+            upper: optional,
+        })
+        .upper;
+        combined.is_finite().then_some(combined)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        if min_score > self.min_competitive_score {
+            self.min_competitive_score = min_score;
+        }
+        Ok(())
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.required
+            .match_cost()
+            .into_iter()
+            .chain(self.optional.match_cost())
+            .reduce(|left, right| left + right)
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        true
+    }
+}
+
 /// Boolean scorer preserving the current membership and score semantics.
 pub(super) struct BooleanScorer<'a> {
     driver: BoxScorer<'a>,
@@ -1552,25 +1959,59 @@ pub(super) struct BooleanScorer<'a> {
 }
 
 impl<'a> BooleanScorer<'a> {
+    #[cfg(test)]
     pub(super) fn try_new(
         should: Vec<BoxScorer<'a>>,
         must: Vec<BoxScorer<'a>>,
         must_not: Vec<BoxScorer<'a>>,
     ) -> Result<Self> {
-        let mut optional = if should.is_empty() {
-            None
-        } else {
-            Some(
+        Self::try_new_with_metrics(should, must, must_not, None)
+    }
+
+    fn try_new_with_metrics(
+        should: Vec<BoxScorer<'a>>,
+        must: Vec<BoxScorer<'a>>,
+        must_not: Vec<BoxScorer<'a>>,
+        metrics: Option<&'a dyn MetricsCollector>,
+    ) -> Result<Self> {
+        let (driver, optional) = if must.is_empty() {
+            if should.is_empty() {
+                return Err(Error::invalid_input(
+                    "boolean query must have at least one should/must query",
+                ));
+            }
+            let driver = if let Some(global_bounds) = ShouldMaxScoreScorer::global_bounds(&should) {
+                Box::new(ShouldMaxScoreScorer::new(should, global_bounds, metrics)) as BoxScorer<'a>
+            } else {
                 Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
-                    as BoxScorer<'a>,
-            )
-        };
-        let driver = if must.is_empty() {
-            optional.take().ok_or_else(|| {
-                Error::invalid_input("boolean query must have at least one should/must query")
-            })?
+                    as BoxScorer<'a>
+            };
+            (driver, None)
         } else {
-            Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>
+            let mut optional = if should.is_empty() {
+                None
+            } else {
+                Some(
+                    Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
+                        as BoxScorer<'a>,
+                )
+            };
+            let required = Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>;
+            let driver = if required.scores_non_negative()
+                && optional
+                    .as_ref()
+                    .is_some_and(|optional| optional.scores_non_negative())
+            {
+                Box::new(ReqOptScorer::new(
+                    required,
+                    optional
+                        .take()
+                        .expect("checked that the optional scorer is present"),
+                )) as BoxScorer<'a>
+            } else {
+                required
+            };
+            (driver, optional)
         };
         let prohibited = if must_not.is_empty() {
             None
@@ -1685,6 +2126,28 @@ impl ComposableScorer for BooleanScorer<'_> {
             bounds = bounds.add(optional.score_bounds(up_to)?.include_zero());
         }
         Ok(bounds)
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        if !self.scores_non_negative() {
+            return None;
+        }
+        let driver = self.driver.global_score_upper_bound()?;
+        let combined = if let Some(optional) = &self.optional {
+            let optional = optional.global_score_upper_bound()?;
+            ScoreBounds {
+                lower: 0.0,
+                upper: driver,
+            }
+            .add(ScoreBounds {
+                lower: 0.0,
+                upper: optional,
+            })
+            .upper
+        } else {
+            driver
+        };
+        (combined.is_finite() && combined >= 0.0).then_some(combined)
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
@@ -2045,7 +2508,7 @@ where
             Some(scorer)
         })
         .collect::<Vec<_>>();
-    let mut scorer = plan.build(&mut leaf_scorers)?;
+    let mut scorer = plan.build(&mut leaf_scorers, metrics)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "compound FTS scorer did not consume every prepared leaf",
@@ -2367,7 +2830,10 @@ async fn compound_search_impl(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
+
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
 
     use super::*;
 
@@ -2380,6 +2846,55 @@ mod tests {
 
     fn materialized(values: &[(u64, f32)]) -> Box<dyn ComposableScorer> {
         Box::new(MaterializedScorer::try_new(rows(values)).unwrap())
+    }
+
+    fn should_maxscore<'a>(
+        children: Vec<BoxScorer<'a>>,
+        metrics: Option<&'a dyn MetricsCollector>,
+    ) -> ShouldMaxScoreScorer<'a> {
+        let global_bounds = ShouldMaxScoreScorer::global_bounds(&children).unwrap();
+        ShouldMaxScoreScorer::new(children, global_bounds, metrics)
+    }
+
+    #[derive(Default)]
+    struct ShouldMetrics {
+        reports: AtomicUsize,
+        skipped_windows: AtomicUsize,
+        bound_recomputations: AtomicUsize,
+        essential_evaluations: AtomicUsize,
+        non_essential_evaluations: AtomicUsize,
+    }
+
+    impl MetricsCollector for ShouldMetrics {
+        fn record_parts_loaded(&self, _num_parts: usize) {}
+
+        fn record_index_loads(&self, _num_loads: usize) {}
+
+        fn record_comparisons(&self, _num_comparisons: usize) {}
+
+        fn record_compound_should_skipped_windows(&self, num_windows: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
+            self.skipped_windows
+                .fetch_add(num_windows, AtomicOrdering::Relaxed);
+        }
+
+        fn record_compound_should_bound_recomputations(&self, num_recomputations: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
+            self.bound_recomputations
+                .fetch_add(num_recomputations, AtomicOrdering::Relaxed);
+        }
+
+        fn record_compound_should_essential_evaluations(&self, num_evaluations: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
+            self.essential_evaluations
+                .fetch_add(num_evaluations, AtomicOrdering::Relaxed);
+        }
+
+        fn record_compound_should_non_essential_evaluations(&self, num_evaluations: usize) {
+            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
+            self.non_essential_evaluations
+                .fetch_add(num_evaluations, AtomicOrdering::Relaxed);
+        }
     }
 
     #[test]
@@ -2532,6 +3047,10 @@ mod tests {
             self.inner.score_bounds(up_to)
         }
 
+        fn global_score_upper_bound(&self) -> Option<f32> {
+            self.inner.global_score_upper_bound()
+        }
+
         fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
             self.inner.set_min_competitive_score(min_score)
         }
@@ -2573,6 +3092,141 @@ mod tests {
         (Box::new(scorer), approximations, confirmations)
     }
 
+    #[derive(Default)]
+    struct ScorerWork {
+        advances: AtomicUsize,
+        confirmations: AtomicUsize,
+        shallow_advances: AtomicUsize,
+        bounds: AtomicUsize,
+    }
+
+    struct InstrumentedScorer<'a> {
+        inner: BoxScorer<'a>,
+        work: Arc<ScorerWork>,
+    }
+
+    impl ComposableScorer for InstrumentedScorer<'_> {
+        fn doc(&self) -> Option<u64> {
+            self.inner.doc()
+        }
+
+        fn document_key(&self) -> Option<u64> {
+            self.inner.document_key()
+        }
+
+        fn next(&mut self) -> Result<Option<u64>> {
+            let doc = self.inner.next()?;
+            if doc.is_some() {
+                self.work.advances.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Ok(doc)
+        }
+
+        fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+            let doc = self.inner.advance(target)?;
+            if doc.is_some() {
+                self.work.advances.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Ok(doc)
+        }
+
+        fn cost(&self) -> usize {
+            self.inner.cost()
+        }
+
+        fn score(&mut self) -> Result<f32> {
+            self.inner.score()
+        }
+
+        fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+            self.work
+                .shallow_advances
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.advance_shallow(target)
+        }
+
+        fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+            self.work.bounds.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.score_bounds(up_to)
+        }
+
+        fn global_score_upper_bound(&self) -> Option<f32> {
+            self.inner.global_score_upper_bound()
+        }
+
+        fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+            self.inner.set_min_competitive_score(min_score)
+        }
+
+        fn matches(&mut self) -> Result<bool> {
+            self.work
+                .confirmations
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.matches()
+        }
+
+        fn match_cost(&self) -> Option<f32> {
+            self.inner.match_cost()
+        }
+
+        fn scores_non_negative(&self) -> bool {
+            self.inner.scores_non_negative()
+        }
+    }
+
+    fn instrumented<'a>(inner: BoxScorer<'a>) -> (BoxScorer<'a>, Arc<ScorerWork>) {
+        let work = Arc::new(ScorerWork::default());
+        (
+            Box::new(InstrumentedScorer {
+                inner,
+                work: work.clone(),
+            }),
+            work,
+        )
+    }
+
+    struct UnboundedScorer {
+        inner: MaterializedScorer,
+    }
+
+    impl ComposableScorer for UnboundedScorer {
+        fn doc(&self) -> Option<u64> {
+            self.inner.doc()
+        }
+
+        fn next(&mut self) -> Result<Option<u64>> {
+            self.inner.next()
+        }
+
+        fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+            self.inner.advance(target)
+        }
+
+        fn cost(&self) -> usize {
+            self.inner.cost()
+        }
+
+        fn score(&mut self) -> Result<f32> {
+            self.inner.score()
+        }
+
+        fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+            self.inner.advance_shallow(target)
+        }
+
+        fn score_bounds(&mut self, _up_to: u64) -> Result<ScoreBounds> {
+            Ok(ScoreBounds::UNBOUNDED)
+        }
+
+        fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+            self.inner.set_min_competitive_score(min_score)
+        }
+
+        fn scores_non_negative(&self) -> bool {
+            true
+        }
+    }
+
     struct CountingScorer {
         inner: MaterializedScorer,
         cost: usize,
@@ -2607,6 +3261,10 @@ mod tests {
 
         fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
             self.inner.score_bounds(up_to)
+        }
+
+        fn global_score_upper_bound(&self) -> Option<f32> {
+            self.inner.global_score_upper_bound()
         }
 
         fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
@@ -2800,5 +3458,489 @@ mod tests {
         .unwrap();
         let results = TopKCollector::new(2).collect(&mut dismax).unwrap();
         assert_eq!(results, rows(&[(1, 4.0), (2, 4.0)]));
+    }
+
+    #[test]
+    fn reqopt_delays_sparse_optional_probes() {
+        let values = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
+        let build = || {
+            let required =
+                Box::new(RequiredConjunctionScorer::try_new(vec![materialized(&values)]).unwrap());
+            let optional = Box::new(
+                DisjunctionScorer::try_new(
+                    vec![materialized(&[(99, 100.0)])],
+                    DisjunctionScore::Sum,
+                )
+                .unwrap(),
+            );
+            let (required, required_work) = instrumented(required);
+            let (optional, optional_work) = instrumented(optional);
+            (required, required_work, optional, optional_work)
+        };
+
+        let (required, _, optional, eager_optional_work) = build();
+        let mut eager = BooleanScorer {
+            driver: required,
+            optional: Some(optional),
+            prohibited: None,
+            current: None,
+            optional_matches: false,
+        };
+        let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
+
+        let (required, required_work, optional, optional_work) = build();
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let results = TopKCollector::new(1).collect(&mut scorer).unwrap();
+
+        assert_eq!(eager_results, rows(&[(99, 101.0)]));
+        assert_eq!(results, rows(&[(99, 101.0)]));
+        let required_advances = required_work.advances.load(AtomicOrdering::Relaxed);
+        let eager_optional_probes = eager_optional_work.advances.load(AtomicOrdering::Relaxed);
+        let optional_probes = optional_work.advances.load(AtomicOrdering::Relaxed);
+        assert_eq!(required_advances, 100);
+        assert_eq!(eager_optional_probes, 100);
+        assert_eq!(optional_probes, 1);
+        assert_eq!(
+            required_work.shallow_advances.load(AtomicOrdering::Relaxed),
+            2
+        );
+        assert_eq!(required_work.bounds.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(
+            required_work.confirmations.load(AtomicOrdering::Relaxed),
+            100
+        );
+        assert_eq!(optional_work.confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert!(
+            optional_probes * 5 <= eager_optional_probes * 4,
+            "lazy required-plus-optional scoring should reduce optional probes by at least 20%: \
+             {optional_probes}/{eager_optional_probes}"
+        );
+    }
+
+    #[test]
+    fn reqopt_temporarily_requires_optional_contribution() {
+        let values = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
+        let (required, required_work) = instrumented(materialized(&values));
+        let (optional, optional_work) = instrumented(materialized(&[(50, 10.0)]));
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(10.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(50, 11.0)]));
+        assert!(required_work.advances.load(AtomicOrdering::Relaxed) < 10);
+        assert_eq!(required_work.confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(optional_work.advances.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(optional_work.confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn boolean_reqopt_keeps_current_confirmation_stable_after_bounds() {
+        let mut scorer = BooleanScorer::try_new(
+            vec![materialized(&[(1, 10.0)])],
+            vec![materialized(&[(0, 1.0), (1, 1.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(5.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(1, 11.0)]));
+    }
+
+    #[test]
+    fn boolean_gates_reqopt_and_signed_boost_uses_exact_fallback() {
+        let supported = BooleanScorer::try_new(
+            vec![materialized(&[(1, 4.0)])],
+            vec![materialized(&[(1, 2.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(supported.optional.is_none());
+
+        let signed_optional = Box::new(
+            BoostScorer::try_new(
+                materialized(&[(1, 4.0), (2, 1.0)]),
+                materialized(&[(1, 1.0), (2, 4.0)]),
+                0.5,
+            )
+            .unwrap(),
+        );
+        let mut fallback = BooleanScorer::try_new(
+            vec![signed_optional],
+            vec![materialized(&[(1, 2.0), (2, 2.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(fallback.optional.is_some());
+        assert_eq!(
+            TopKCollector::new(2).collect(&mut fallback).unwrap(),
+            rows(&[(1, 5.5), (2, 1.0)])
+        );
+    }
+
+    #[test]
+    fn reqopt_uses_exact_iteration_for_unbounded_scorers() {
+        let required = Box::new(UnboundedScorer {
+            inner: MaterializedScorer::try_new(rows(&[(1, 1.0), (2, 1.0)])).unwrap(),
+        });
+        let optional = materialized(&[(2, 10.0)]);
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(5.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(2, 11.0)]));
+    }
+
+    fn pure_should_canary_children() -> (Vec<BoxScorer<'static>>, Vec<Arc<ScorerWork>>) {
+        let mut children = Vec::new();
+        let mut work = Vec::new();
+        let mut push = |child: BoxScorer<'static>| {
+            let (child, child_work) = instrumented(child);
+            children.push(child);
+            work.push(child_work);
+        };
+
+        push(materialized(&[(0, 2.0)]));
+        let dense = (1..=1024).map(|doc| (doc, 0.125)).collect::<Vec<_>>();
+        for _ in 0..8 {
+            push(materialized(&dense));
+        }
+        let sparse = (127..=1023)
+            .step_by(128)
+            .map(|doc| (doc, 1.5))
+            .collect::<Vec<_>>();
+        push(materialized(&sparse));
+        (children, work)
+    }
+
+    fn scorer_advances(work: &[Arc<ScorerWork>]) -> usize {
+        work.iter()
+            .map(|work| work.advances.load(AtomicOrdering::Relaxed))
+            .sum()
+    }
+
+    fn exhaustive_should_top_k(children: &[Vec<(u64, f32)>], limit: usize) -> Vec<ScoredRow> {
+        let mut scores = HashMap::<u64, f32>::new();
+        for child in children {
+            for (doc, score) in child {
+                *scores.entry(*doc).or_default() += *score;
+            }
+        }
+        let mut rows = scores
+            .into_iter()
+            .map(|(doc, score)| ScoredRow::new(doc, score).unwrap())
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by(compare_scored_rows);
+        rows.truncate(limit);
+        rows
+    }
+
+    #[test]
+    fn pure_should_maxscore_reduces_posting_comparisons() {
+        let (children, eager_work) = pure_should_canary_children();
+        let mut eager = DisjunctionScorer::try_new(children, DisjunctionScore::Sum).unwrap();
+        let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
+        let eager_comparisons = scorer_advances(&eager_work);
+
+        let metrics = ShouldMetrics::default();
+        let (children, optimized_work) = pure_should_canary_children();
+        let optimized_results = {
+            let mut optimized = should_maxscore(children, Some(&metrics));
+            TopKCollector::new(1).collect(&mut optimized).unwrap()
+        };
+        let optimized_comparisons = scorer_advances(&optimized_work);
+
+        assert_eq!(eager_results, rows(&[(127, 2.5)]));
+        assert_eq!(optimized_results, eager_results);
+        assert!(eager_comparisons > 0);
+        assert!(
+            optimized_comparisons * 5 <= eager_comparisons * 4,
+            "pure-SHOULD MAXSCORE should reduce posting candidate probes by at least 20%: \
+             optimized={optimized_comparisons} eager={eager_comparisons}"
+        );
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
+        assert!(metrics.skipped_windows.load(AtomicOrdering::Relaxed) > 0);
+        assert!(metrics.bound_recomputations.load(AtomicOrdering::Relaxed) > 0);
+        assert!(metrics.essential_evaluations.load(AtomicOrdering::Relaxed) > 0);
+        assert!(
+            metrics
+                .non_essential_evaluations
+                .load(AtomicOrdering::Relaxed)
+                > 0
+        );
+    }
+
+    #[test]
+    fn pure_should_maxscore_matches_randomized_exhaustive_top_k() {
+        for seed in 0..8 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let children = (0..6)
+                .map(|_| {
+                    (0..256)
+                        .filter_map(|doc| {
+                            if rng.random_bool(0.35) {
+                                let score = rng.random_range(1..=16) as f32 * 0.25;
+                                Some((doc, score))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            for limit in [1, 7, 31, 512] {
+                let expected = exhaustive_should_top_k(&children, limit);
+
+                let mut optimized = should_maxscore(
+                    children.iter().map(|values| materialized(values)).collect(),
+                    None,
+                );
+                let actual = TopKCollector::new(limit).collect(&mut optimized).unwrap();
+                assert_eq!(actual, expected, "seed={seed} limit={limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn pure_should_maxscore_confirms_two_phase_children_before_scoring() {
+        let (phrase, _, confirmations) = two_phase(&[(1, 100.0)], Vec::new(), Some(10.0));
+        let metrics = ShouldMetrics::default();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(10.0);
+        let results = {
+            let mut scorer = should_maxscore(
+                vec![
+                    materialized(&[(0, 10.0)]),
+                    phrase,
+                    materialized(&[(1, 6.0)]),
+                    materialized(&[(1, 5.0)]),
+                ],
+                Some(&metrics),
+            );
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut scorer)
+                .unwrap()
+        };
+
+        assert_eq!(results, rows(&[(1, 11.0)]));
+        assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
+        assert!(
+            metrics
+                .non_essential_evaluations
+                .load(AtomicOrdering::Relaxed)
+                > 0
+        );
+    }
+
+    #[test]
+    fn pure_should_maxscore_preserves_query_score_order_and_terminal_doc() {
+        let mut scorer = should_maxscore(
+            vec![
+                materialized(&[(u64::MAX, 16_777_216.0)]),
+                materialized(&[(u64::MAX, 1.0)]),
+                materialized(&[(u64::MAX, 1.0)]),
+                materialized(&[]),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            TopKCollector::new(1).collect(&mut scorer).unwrap(),
+            rows(&[(u64::MAX, 16_777_216.0)])
+        );
+    }
+
+    #[test]
+    fn pure_should_maxscore_keeps_equal_floor_across_bound_ordering() {
+        let scores = [
+            f32::from_bits(0x4783_798b),
+            f32::from_bits(0x4dd3_8b75),
+            f32::from_bits(0x48e7_7236),
+            f32::from_bits(0x418e_5b26),
+            f32::from_bits(0x4241_b1eb),
+        ];
+        let exact_score = scores
+            .into_iter()
+            .fold(0.0_f32, |total, score| total + score);
+        assert_eq!(exact_score.to_bits(), 0x4dd3_cd8d);
+
+        let mut scorer = should_maxscore(
+            scores
+                .into_iter()
+                .map(|score| materialized(&[(7, score)]))
+                .collect(),
+            None,
+        );
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(exact_score);
+
+        assert_eq!(
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut scorer)
+                .unwrap(),
+            rows(&[(7, exact_score)])
+        );
+    }
+
+    #[test]
+    fn pure_should_maxscore_supports_nested_non_negative_children() {
+        let nested_dismax = Box::new(
+            DisjunctionScorer::try_new(
+                vec![
+                    materialized(&[(0, 1.0), (1, 5.0)]),
+                    materialized(&[(0, 3.0), (2, 4.0)]),
+                ],
+                DisjunctionScore::Max,
+            )
+            .unwrap(),
+        );
+        let nested_boolean = Box::new(
+            BooleanScorer::try_new(
+                Vec::new(),
+                vec![materialized(&[(0, 2.0), (1, 2.0), (2, 2.0)])],
+                vec![materialized(&[(1, 0.0)])],
+            )
+            .unwrap(),
+        );
+        let metrics = ShouldMetrics::default();
+        let results = {
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                vec![
+                    nested_dismax,
+                    nested_boolean,
+                    materialized(&[(0, 0.5), (1, 0.5), (2, 0.5)]),
+                ],
+                Vec::new(),
+                Vec::new(),
+                Some(&metrics),
+            )
+            .unwrap();
+            TopKCollector::new(1).collect(&mut scorer).unwrap()
+        };
+
+        assert_eq!(results, rows(&[(2, 6.5)]));
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
+    }
+
+    #[test]
+    fn pure_should_maxscore_applies_must_not_before_raising_the_floor() {
+        let metrics = ShouldMetrics::default();
+        let results = {
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                vec![
+                    materialized(&[(0, 10.0), (1, 5.0)]),
+                    materialized(&[(0, 1.0), (1, 1.0)]),
+                    materialized(&[(2, 8.0)]),
+                ],
+                Vec::new(),
+                vec![materialized(&[(0, 1.0)])],
+                Some(&metrics),
+            )
+            .unwrap();
+            TopKCollector::new(1).collect(&mut scorer).unwrap()
+        };
+
+        assert_eq!(results, rows(&[(2, 8.0)]));
+        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
+    }
+
+    #[test]
+    fn pure_should_uses_exact_fallback_for_unsupported_shapes() {
+        let signed_metrics = ShouldMetrics::default();
+        let signed_results = {
+            let signed = Box::new(
+                BoostScorer::try_new(
+                    materialized(&[(0, 5.0), (1, 1.0)]),
+                    materialized(&[(0, 2.0), (1, 4.0)]),
+                    1.0,
+                )
+                .unwrap(),
+            );
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                vec![
+                    signed,
+                    materialized(&[(0, 1.0), (1, 1.0)]),
+                    materialized(&[(1, 5.0)]),
+                ],
+                Vec::new(),
+                Vec::new(),
+                Some(&signed_metrics),
+            )
+            .unwrap();
+            TopKCollector::new(2).collect(&mut scorer).unwrap()
+        };
+        assert_eq!(signed_results, rows(&[(0, 4.0), (1, 3.0)]));
+        assert_eq!(signed_metrics.reports.load(AtomicOrdering::Relaxed), 0);
+
+        let unbounded_metrics = ShouldMetrics::default();
+        let unbounded_results = {
+            let unbounded = Box::new(UnboundedScorer {
+                inner: MaterializedScorer::try_new(rows(&[(0, 1.0), (2, 3.0)])).unwrap(),
+            });
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                vec![
+                    unbounded,
+                    materialized(&[(0, 2.0), (1, 2.0)]),
+                    materialized(&[(1, 4.0)]),
+                ],
+                Vec::new(),
+                Vec::new(),
+                Some(&unbounded_metrics),
+            )
+            .unwrap();
+            TopKCollector::new(3).collect(&mut scorer).unwrap()
+        };
+        assert_eq!(unbounded_results, rows(&[(1, 6.0), (0, 3.0), (2, 3.0)]));
+        assert_eq!(unbounded_metrics.reports.load(AtomicOrdering::Relaxed), 0);
+
+        let low_count_metrics = ShouldMetrics::default();
+        {
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                vec![materialized(&[(0, 1.0)]), materialized(&[(1, 2.0)])],
+                Vec::new(),
+                Vec::new(),
+                Some(&low_count_metrics),
+            )
+            .unwrap();
+            assert_eq!(
+                TopKCollector::new(2).collect(&mut scorer).unwrap(),
+                rows(&[(1, 2.0), (0, 1.0)])
+            );
+        }
+        assert_eq!(low_count_metrics.reports.load(AtomicOrdering::Relaxed), 0);
+
+        let overflow_metrics = ShouldMetrics::default();
+        let large_score = f32::MAX / 2.0;
+        {
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                vec![
+                    materialized(&[(0, large_score)]),
+                    materialized(&[(1, large_score)]),
+                    materialized(&[(2, large_score)]),
+                ],
+                Vec::new(),
+                Vec::new(),
+                Some(&overflow_metrics),
+            )
+            .unwrap();
+            assert_eq!(
+                TopKCollector::new(3).collect(&mut scorer).unwrap(),
+                rows(&[(0, large_score), (1, large_score), (2, large_score)])
+            );
+        }
+        assert_eq!(overflow_metrics.reports.load(AtomicOrdering::Relaxed), 0);
     }
 }
