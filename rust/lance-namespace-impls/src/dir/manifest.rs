@@ -3212,7 +3212,9 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 // Delete from manifest first
-                self.delete_from_manifest(&object_id).boxed().await?;
+                self.delete_from_manifest_if_location(&object_id, Some(&info.location))
+                    .boxed()
+                    .await?;
 
                 // Delete physical data directory using the dir_name from manifest
                 let table_path = self.base_path.clone().join(info.location.as_str());
