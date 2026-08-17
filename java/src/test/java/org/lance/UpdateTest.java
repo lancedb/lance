@@ -80,10 +80,17 @@ public class UpdateTest {
 
   @Test
   public void testUpdateAllRows() {
-    UpdateResult result = dataset.update(new UpdateParams(ImmutableMap.of("name", "'updated'")));
+    UpdateResult result =
+        dataset.update(
+            new UpdateParams(ImmutableMap.of("name", "'updated'")).withDataStorageVersion("2.2"));
 
     Assertions.assertEquals(ROW_COUNT, result.getNumRowsUpdated());
     try (Dataset newDataset = result.getDataset()) {
+      Assertions.assertTrue(
+          newDataset.getFragments().stream()
+              .flatMap(fragment -> fragment.metadata().getFiles().stream())
+              .allMatch(
+                  file -> file.getFileMajorVersion() == 2 && file.getFileMinorVersion() == 2));
       List<String> names = readNames(newDataset);
       Assertions.assertEquals(ROW_COUNT, names.size());
       for (String name : names) {

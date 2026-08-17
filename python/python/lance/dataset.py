@@ -525,6 +525,16 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
+    def data_storage_version(self, version: str) -> "MergeInsertBuilder":
+        """Set the exact data storage version for files written by this operation.
+
+        If omitted, the dataset manifest's fallback data storage version is used.
+        Selecting a different V2 version causes the commit to derive mixed
+        data-file-version support from its final manifest. The manifest fallback
+        itself is not changed.
+        """
+        return super(MergeInsertBuilder, self).data_storage_version(version)
+
     def use_index(self, use_index: bool) -> "MergeInsertBuilder":
         """
         Controls whether to use indices for the merge operation.
@@ -2985,6 +2995,7 @@ class LanceDataset(pa.dataset.Dataset):
         where: Optional[str] = None,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
+        data_storage_version: Optional[str] = None,
     ) -> UpdateResult:
         """
         Update column values for rows matching where.
@@ -3003,6 +3014,10 @@ class LanceDataset(pa.dataset.Dataset):
             the operation before giving up. At least one attempt will be made,
             regardless of how long it takes to complete. Subsequent attempts will be
             cancelled once this timeout is reached. Default is 30 seconds.
+        data_storage_version : str, optional
+            Exact data storage version for files written by this operation. If
+            omitted, the manifest fallback is used. This does not change the
+            manifest fallback.
 
         Returns
         -------
@@ -3025,7 +3040,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        return self._ds.update(updates, where, conflict_retries, retry_timeout)
+        return self._ds.update(
+            updates,
+            where,
+            conflict_retries,
+            retry_timeout,
+            data_storage_version,
+        )
 
     def versions(self):
         """

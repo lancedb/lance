@@ -72,7 +72,15 @@ public class MergeInsertTest {
       try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
         MergeInsertResult result =
             dataset.mergeInsert(
-                new MergeInsertParams(Collections.singletonList("id")), sourceStream);
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withDataStorageVersion("2.2"),
+                sourceStream);
+
+        Assertions.assertTrue(
+            result.dataset().getFragments().stream()
+                .flatMap(fragment -> fragment.metadata().getFiles().stream())
+                .anyMatch(
+                    file -> file.getFileMajorVersion() == 2 && file.getFileMinorVersion() == 2));
 
         Assertions.assertEquals(
             "{0=Person 0, 1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4, 7=Source 7, 8=Source 8, 9=Source 9}",

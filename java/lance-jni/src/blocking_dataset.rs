@@ -3343,6 +3343,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let data_storage_version = env
+        .call_method(
+            &java_options,
+            "getDataStorageVersion",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3360,6 +3368,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
+        &data_storage_version,
         config,
     )
 }

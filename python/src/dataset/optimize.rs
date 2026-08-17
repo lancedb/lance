@@ -86,6 +86,12 @@ fn parse_compaction_options(
                 opts.excluded_fragment_ids =
                     value.extract::<Option<Vec<u32>>>()?.unwrap_or_default();
             }
+            "data_storage_version" => {
+                let version: Option<String> = value.extract()?;
+                opts.data_storage_version = version
+                    .map(|version| version.parse().infer_error())
+                    .transpose()?;
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
@@ -391,6 +397,12 @@ impl PyRewriteResult {
     #[getter]
     pub fn read_version(&self) -> u64 {
         self.0.read_version
+    }
+
+    /// str : The exact data storage version used for rewritten files.
+    #[getter]
+    pub fn write_version(&self) -> &str {
+        &self.0.write_version
     }
 
     /// List[lance.fragment.FragmentMetadata] : The metadata for fragments that are being replaced.

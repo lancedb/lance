@@ -423,6 +423,15 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn data_storage_version<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        version: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        slf.builder
+            .data_storage_version(version.parse().infer_error()?);
+        Ok(slf)
+    }
+
     pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
         slf.builder.use_index(use_index);
         Ok(slf)
@@ -1971,13 +1980,14 @@ impl Dataset {
         Ok(dict.into())
     }
 
-    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
+    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None, data_storage_version=None))]
     fn update(
         &mut self,
         updates: &Bound<'_, PyDict>,
         predicate: Option<&str>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
+        data_storage_version: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
@@ -1992,6 +2002,10 @@ impl Dataset {
 
         if let Some(timeout) = retry_timeout {
             builder = builder.retry_timeout(timeout);
+        }
+
+        if let Some(version) = data_storage_version {
+            builder = builder.data_storage_version(version.parse().infer_error()?);
         }
 
         for (key, value) in updates {

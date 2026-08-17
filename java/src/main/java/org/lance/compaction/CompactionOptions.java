@@ -51,6 +51,7 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> maxSourceRows;
   private Optional<Long> maxSourceBytes;
   private List<Long> excludedFragmentIds;
+  private Optional<String> dataStorageVersion;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -66,7 +67,8 @@ public class CompactionOptions implements Serializable {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds) {
+      List<Long> excludedFragmentIds,
+      Optional<String> dataStorageVersion) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -81,6 +83,7 @@ public class CompactionOptions implements Serializable {
     this.maxSourceRows = maxSourceRows;
     this.maxSourceBytes = maxSourceBytes;
     this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
+    this.dataStorageVersion = dataStorageVersion;
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -110,6 +113,10 @@ public class CompactionOptions implements Serializable {
 
   public List<Long> getExcludedFragmentIds() {
     return excludedFragmentIds;
+  }
+
+  public Optional<String> getDataStorageVersion() {
+    return dataStorageVersion;
   }
 
   public Optional<Boolean> getMaterializeDeletions() {
@@ -161,6 +168,7 @@ public class CompactionOptions implements Serializable {
         .add("maxSourceRows", maxSourceRows.orElse(null))
         .add("maxSourceBytes", maxSourceBytes.orElse(null))
         .add("excludedFragmentIds", excludedFragmentIds)
+        .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .toString();
   }
 
@@ -179,6 +187,7 @@ public class CompactionOptions implements Serializable {
     output.writeObject(maxSourceRows.orElse(null));
     output.writeObject(maxSourceBytes.orElse(null));
     output.writeObject(excludedFragmentIds);
+    output.writeObject(dataStorageVersion.orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -205,6 +214,7 @@ public class CompactionOptions implements Serializable {
     this.maxSourceRows = readTrailingLong(input);
     this.maxSourceBytes = readTrailingLong(input);
     this.excludedFragmentIds = readTrailingLongList(input);
+    this.dataStorageVersion = readTrailingString(input);
   }
 
   /**
@@ -238,6 +248,18 @@ public class CompactionOptions implements Serializable {
     }
   }
 
+  private static Optional<String> readTrailingString(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      return Optional.ofNullable((String) input.readObject());
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Optional.empty();
+    }
+  }
+
   /** Builder for CompactionOptions. */
   public static class Builder {
     private Optional<Long> targetRowsPerFragment = Optional.empty();
@@ -254,6 +276,7 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> maxSourceRows = Optional.empty();
     private Optional<Long> maxSourceBytes = Optional.empty();
     private List<Long> excludedFragmentIds = Collections.emptyList();
+    private Optional<String> dataStorageVersion = Optional.empty();
 
     private Builder() {}
 
@@ -345,6 +368,12 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
+    /** Set the exact data storage version for rewritten files. */
+    public Builder withDataStorageVersion(String version) {
+      this.dataStorageVersion = Optional.of(java.util.Objects.requireNonNull(version));
+      return this;
+    }
+
     /**
      * Fragment IDs to exclude from compaction planning. Excluded fragments remain unchanged and act
      * as boundaries, so fragments on opposite sides are not combined into the same task. Duplicate
@@ -393,7 +422,8 @@ public class CompactionOptions implements Serializable {
           maxSourceFragments,
           maxSourceRows,
           maxSourceBytes,
-          excludedFragmentIds);
+          excludedFragmentIds,
+          dataStorageVersion);
     }
   }
 }

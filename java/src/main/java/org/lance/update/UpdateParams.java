@@ -47,6 +47,7 @@ public class UpdateParams {
 
   private final Map<String, String> updates;
   private Optional<String> whereClause = Optional.empty();
+  private Optional<String> dataStorageVersion = Optional.empty();
   private int conflictRetries = DEFAULT_CONFLICT_RETRIES;
   private long retryTimeoutMs = DEFAULT_RETRY_TIMEOUT_MS;
 
@@ -105,6 +106,17 @@ public class UpdateParams {
     return this;
   }
 
+  /**
+   * Set the exact data storage version for files written by this operation.
+   *
+   * <p>If omitted, the manifest fallback is used. When another V2 version produces a mixed
+   * snapshot, the commit derives the required capability without changing the manifest fallback.
+   */
+  public UpdateParams withDataStorageVersion(String version) {
+    this.dataStorageVersion = Optional.of(Preconditions.checkNotNull(version));
+    return this;
+  }
+
   /** Returns an unmodifiable view of the update expressions. */
   public Map<String, String> updates() {
     return Collections.unmodifiableMap(updates);
@@ -122,6 +134,10 @@ public class UpdateParams {
     return retryTimeoutMs;
   }
 
+  public Optional<String> dataStorageVersion() {
+    return dataStorageVersion;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -129,6 +145,7 @@ public class UpdateParams {
         .add("whereClause", whereClause.orElse(null))
         .add("conflictRetries", conflictRetries)
         .add("retryTimeoutMs", retryTimeoutMs)
+        .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .toString();
   }
 }

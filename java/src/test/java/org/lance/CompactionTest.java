@@ -60,6 +60,7 @@ public class CompactionTest {
                 .withNumThreads(1)
                 .withMaxSourceRows(1000)
                 .withMaxSourceBytes(10L * 1024 * 1024)
+                .withDataStorageVersion("2.2")
                 .build();
         CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
 
@@ -69,6 +70,8 @@ public class CompactionTest {
         assertEquals(
             Optional.of(10L * 1024 * 1024),
             compactionPlan.getCompactionOptions().getMaxSourceBytes());
+        assertEquals(
+            Optional.of("2.2"), compactionPlan.getCompactionOptions().getDataStorageVersion());
 
         // will plan to compact two fragments into one.
         assertEquals(1, compactionPlan.getCompactionTasks().size());
@@ -80,6 +83,7 @@ public class CompactionTest {
         // mock network transferring
         task = serializeAndDeserialize(task);
         RewriteResult result = task.execute(dataset);
+        assertEquals(Optional.of("2.2"), result.getWriteVersion());
         CompactionMetrics metrics = result.getMetrics();
         // remove previous fragments and add new single fragment
         assertEquals(2, metrics.getFragmentsRemoved());

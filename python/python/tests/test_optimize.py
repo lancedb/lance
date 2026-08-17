@@ -592,12 +592,22 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     data = pa.table({"a": range(800), "b": range(800)})
 
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=200)
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=200,
+        data_storage_version="2.1",
+    )
     fragments = dataset.get_fragments()
     assert len(fragments) == 4
 
     plan = Compaction.plan(
-        dataset, options=dict(target_rows_per_fragment=400, num_threads=1)
+        dataset,
+        options=dict(
+            target_rows_per_fragment=400,
+            num_threads=1,
+            data_storage_version="2.2",
+        ),
     )
     assert plan.read_version == 1
     assert plan.num_tasks() == 2
@@ -625,6 +635,7 @@ def test_dataset_distributed_optimize(tmp_path: Path):
             target_rows_per_fragment=400,
             excluded_fragment_ids=None,
             num_threads=1,
+            data_storage_version="2.2",
         ),
     )
     assert none_plan == plan
@@ -637,6 +648,7 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert task == plan.tasks[0]
 
     result1 = plan.tasks[0].execute(dataset)
+    assert result1.write_version == "2.2"
     result1.metrics.fragments_removed == 2
     result1.metrics.fragments_added == 1
 
@@ -644,6 +656,7 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     result = pickle.loads(pickled_result)
     assert isinstance(result, RewriteResult)
     assert result == result1
+    assert result.write_version == "2.2"
     assert re.match(
         r"RewriteResult\(read_version=1, new_fragments=\[.+\], old_fragments=\[.+\]\)",
         repr(result),

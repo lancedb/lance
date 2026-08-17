@@ -4015,6 +4015,46 @@ def test_update_with_retry_parameters(tmp_path: Path):
     check_update_stats(update_dict, (10,))
 
 
+def test_update_exact_data_storage_version(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}),
+        tmp_path / "dataset",
+        data_storage_version="2.1",
+    )
+
+    dataset.update({"value": "value + 1"}, data_storage_version="2.2")
+
+    files = [
+        file for fragment in dataset.get_fragments() for file in fragment.metadata.files
+    ]
+    assert {(file.file_major_version, file.file_minor_version) for file in files} == {
+        (2, 2)
+    }
+
+
+def test_merge_insert_exact_data_storage_version(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}),
+        tmp_path / "dataset",
+        data_storage_version="2.1",
+    )
+
+    (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .data_storage_version("2.2")
+        .execute(pa.table({"id": [2, 3], "value": [21, 30]}))
+    )
+
+    versions = {
+        (file.file_major_version, file.file_minor_version)
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    }
+    assert versions == {(2, 1), (2, 2)}
+
+
 def test_scan_with_batch_size(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(10000), "b": range(10000)})
