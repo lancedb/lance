@@ -1631,21 +1631,19 @@ impl ManifestNamespace {
         }
     }
 
-    async fn remove_deregistered_table_marker(&self, location: &str) {
-        let marker_path = match self.deregistered_table_marker_path(location) {
-            Ok(marker_path) => marker_path,
-            Err(error) => {
-                log::warn!("Failed to resolve deregistration marker for '{location}': {error}");
-                return;
-            }
-        };
+    async fn delete_deregistered_table_marker(&self, location: &str) -> Result<()> {
+        let marker_path = self.deregistered_table_marker_path(location)?;
         if let Err(error) = self.object_store.delete(&marker_path).await
             && !error.is_not_found()
         {
-            log::warn!(
-                "Failed to remove deregistration marker at '{}': {error}",
-                marker_path
-            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn remove_deregistered_table_marker(&self, location: &str) {
+        if let Err(error) = self.delete_deregistered_table_marker(location).await {
+            log::warn!("Failed to remove deregistration marker for '{location}': {error}");
         }
     }
 
@@ -3110,6 +3108,7 @@ impl ManifestNamespace {
         if entries.is_empty() {
             return Ok(());
         }
+        Self::ensure_drop_epoch_id_not_user_entries(&entries)?;
 
         self.rewrite_manifest("Failed to overwrite manifest", || {
             UpsertManifestMutation::new(
@@ -3125,6 +3124,7 @@ impl ManifestNamespace {
     }
 
     async fn register_table_in_manifest(&self, entry: ManifestEntry) -> Result<()> {
+        Self::ensure_drop_epoch_id_not_user_entries(std::slice::from_ref(&entry))?;
         let expected_drop_epoch = self.current_drop_epoch().await?;
         self.rewrite_manifest("Failed to register table in manifest", || {
             UpsertManifestMutation::new(
@@ -3144,6 +3144,7 @@ impl ManifestNamespace {
         entry: ManifestEntry,
         expected_location: &str,
     ) -> Result<String> {
+        Self::ensure_drop_epoch_id_not_user_entries(std::slice::from_ref(&entry))?;
         let tombstone_object_id = Self::drop_tombstone_object_id(&entry.object_id);
         self.rewrite_manifest("Failed to replace manifest table location", || {
             ReplaceTableLocationMutation {
@@ -3157,6 +3158,20 @@ impl ManifestNamespace {
         })
         .await?;
         Ok(tombstone_object_id)
+    }
+
+    fn ensure_drop_epoch_id_not_user_entries(entries: &[ManifestEntry]) -> Result<()> {
+        if entries.iter().any(|entry| {
+            entry.object_id == DROP_EPOCH_OBJECT_ID && entry.object_type != ObjectType::DropEpoch
+        }) {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Object id '{DROP_EPOCH_OBJECT_ID}' is reserved for manifest drop fencing"
+                ),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     fn drop_tombstone_object_id(object_id: &str) -> String {
@@ -3198,6 +3213,9 @@ impl ManifestNamespace {
             .into_iter()
             .find(|tombstone| tombstone.tombstone_id == tombstone_id)
             .map(|tombstone| tombstone.location);
+        if let Some(location) = location.as_deref() {
+            self.delete_deregistered_table_marker(location).await?;
+        }
         let tombstone_id = tombstone_id.to_string();
         let deleted = self
             .rewrite_manifest("Failed to complete table drop tombstone", || {
@@ -3207,9 +3225,6 @@ impl ManifestNamespace {
                 }
             })
             .await?;
-        if deleted && let Some(location) = location {
-            self.remove_deregistered_table_marker(&location).await;
-        }
         Ok(deleted)
     }
 
@@ -6226,29 +6241,17 @@ mod tests {
         let legacy =
             create_manifest_namespace_with_retries(legacy_dir.to_str().unwrap(), false, Some(0))
                 .await;
-        legacy
-            .insert_into_manifest_with_metadata(
-                vec![
-                    ManifestEntry {
+        assert!(
+            legacy
+                .insert_into_manifest_with_metadata(
+                    vec![ManifestEntry {
                         object_id: DROP_EPOCH_OBJECT_ID.to_string(),
                         object_type: ObjectType::Table,
                         location: Some("legacy.lance".to_string()),
                         metadata: None,
-                    },
-                    ManifestEntry {
-                        object_id: "table".to_string(),
-                        object_type: ObjectType::Table,
-                        location: Some("generation.lance".to_string()),
-                        metadata: None,
-                    },
-                ],
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            legacy
-                .tombstone_table_in_manifest("table", "generation.lance")
+                    }],
+                    None,
+                )
                 .await
                 .is_err()
         );
