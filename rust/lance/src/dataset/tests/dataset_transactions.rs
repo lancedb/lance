@@ -1204,8 +1204,7 @@ async fn test_merge_rejects_dropped_field_id_reuse() {
     let dataset = dataset_with_dropped_column("memory://", "b").await;
 
     let mut schema = dataset.schema().clone();
-    let mut field =
-        LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
+    let mut field = LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
     field.id = 1;
     schema.fields.push(field);
 

@@ -4795,10 +4795,7 @@ fn schema_fragments_valid(
     schema_fragments_modern_valid(schema, fragments)
 }
 
-pub(crate) fn schema_fragments_modern_valid(
-    _schema: &Schema,
-    fragments: &[Fragment],
-) -> Result<()> {
+pub fn schema_fragments_modern_valid(_schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     // validate that each data file at least contains one field.
     for fragment in fragments {
         for data_file in &fragment.files {
@@ -4816,7 +4813,7 @@ pub(crate) fn schema_fragments_modern_valid(
 /// Check that each fragment contains all fields in the schema.
 /// It is not required that the schema contains all fields in the fragment.
 /// There may be masked fields.
-pub(crate) fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+pub fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     // TODO: add additional validation. Consider consolidating with various
     // validate() methods in the codebase.
     for fragment in fragments {
@@ -5370,7 +5367,7 @@ mod tests {
     fn test_merge_allows_rewritten_fresh_field_id() {
         let schema = one_field_schema();
         let manifest = manifest_with_file_fields(schema.clone(), vec![0]);
-        let mut rewritten_schema = schema.clone();
+        let mut rewritten_schema = schema;
         rewritten_schema.fields[0].id = 1;
         let mut rewritten = manifest.fragments[0].clone();
         rewritten.files[0] = DataFile::new_legacy_from_fields("rewritten.lance", vec![1], None);
@@ -5503,12 +5500,7 @@ mod tests {
         );
 
         let (new_manifest, _) = transaction
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &default_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
@@ -5539,12 +5531,7 @@ mod tests {
         );
 
         let (new_manifest, _) = transaction
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &default_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
@@ -6422,12 +6409,7 @@ mod tests {
             None,
         );
 
-        let result = tx.build_manifest(
-            Some(&manifest),
-            vec![],
-            "txn",
-            &default_build_config(),
-        );
+        let result = tx.build_manifest(Some(&manifest), vec![], "txn", &default_build_config());
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -6484,12 +6466,7 @@ mod tests {
             None,
         );
 
-        let result = tx.build_manifest(
-            Some(&manifest),
-            vec![],
-            "txn",
-            &default_build_config(),
-        );
+        let result = tx.build_manifest(Some(&manifest), vec![], "txn", &default_build_config());
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -6546,13 +6523,8 @@ mod tests {
             None,
         );
 
-        tx.build_manifest(
-            Some(&manifest),
-            vec![],
-            "txn",
-            &default_build_config(),
-        )
-        .expect("bitmap at exact physical_rows boundary should succeed");
+        tx.build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .expect("bitmap at exact physical_rows boundary should succeed");
     }
 
     #[test]
@@ -8072,13 +8044,8 @@ mod tests {
             },
             None,
         );
-        txn.build_manifest(
-            Some(&manifest),
-            vec![],
-            "txn",
-            &default_build_config(),
-        )
-        .map(|(manifest, _)| manifest.fragments[0].clone())
+        txn.build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .map(|(manifest, _)| manifest.fragments[0].clone())
     }
 
     /// Replace field 5 in `fragment` at `read_version`, against a manifest at
@@ -8359,10 +8326,10 @@ mod tests {
 
     mod mem_wal_index_coverage {
         use super::*;
+        use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
         use crate::system_index::mem_wal::{
             CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, MemWalIndexDetails,
         };
-        use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 
         fn user_index(name: &str, uuid: Uuid, frags: &[u32]) -> IndexMetadata {
             IndexMetadata {
