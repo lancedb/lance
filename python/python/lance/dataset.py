@@ -5670,6 +5670,14 @@ class DatasetDelta:
         """
         return self._delta.get_updated_rows()
 
+    def get_deleted_row_ids(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader of the row ids deleted in the range.
+
+        The batches carry a single ``_rowid`` column. Requires stable row ids.
+        """
+        return self._delta.get_deleted_row_ids()
+
 
 class _DatasetDeltaBuilder:
     """Internal builder for :class:`DatasetDelta`.
