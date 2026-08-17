@@ -873,6 +873,13 @@ impl<K: Copy + Ord> TopKCollector<K> {
                     }
                 }
             }
+            let next_min_score = self.competitive_score.get();
+            if next_min_score > min_score {
+                // A scorer may have an unbounded fast path until the heap first
+                // establishes a score floor. Publish that floor before asking
+                // it for another document so it can switch modes immediately.
+                scorer.set_min_competitive_score(next_min_score)?;
+            }
             doc = scorer.next()?;
         }
 
@@ -2087,6 +2094,59 @@ impl<'a> BooleanScorer<'a> {
         Ok(None)
     }
 
+    fn accept_driver_doc_without_score_floor(&mut self) -> Result<bool> {
+        debug_assert!(self.prohibited.is_some());
+        debug_assert_eq!(self.min_competitive_score, f32::NEG_INFINITY);
+        let Some(current) = self.driver.doc() else {
+            return Ok(false);
+        };
+        if !self.driver.matches()? {
+            return Ok(false);
+        }
+
+        // With no finite floor, every finite positive score is competitive.
+        // Probe after positive confirmation and score only documents that are
+        // not prohibited, avoiding wasted scoring when exclusions are dense.
+        self.set_current(Some(current));
+        self.positive_checked_doc = Some(current);
+        self.positive_survivor_doc = Some(current);
+        self.work.positive_survivors += 1;
+        if !self.ensure_not_prohibited()? {
+            return Ok(false);
+        }
+
+        self.optional_matches = if let Some(optional) = &mut self.optional {
+            optional.advance(current)? == Some(current) && optional.matches()?
+        } else {
+            false
+        };
+        let mut score = self.driver.score()?;
+        if self.optional_matches
+            && let Some(optional) = &mut self.optional
+        {
+            score += optional.score()?;
+        }
+        self.positive_score = Some(checked_score(score, "BooleanQuery scorer")?);
+        Ok(true)
+    }
+
+    fn next_accepted_without_score_floor(&mut self, target: Option<u64>) -> Result<Option<u64>> {
+        debug_assert!(self.prohibited.is_some());
+        debug_assert_eq!(self.min_competitive_score, f32::NEG_INFINITY);
+        let mut doc = match target {
+            Some(target) => self.driver.advance(target)?,
+            None => self.driver.next()?,
+        };
+        while doc.is_some() {
+            if self.accept_driver_doc_without_score_floor()? {
+                return Ok(self.current);
+            }
+            doc = self.driver.next()?;
+        }
+        self.set_current(None);
+        Ok(None)
+    }
+
     fn set_current(&mut self, current: Option<u64>) {
         if self.current != current {
             self.optional_matches = false;
@@ -2176,6 +2236,8 @@ impl ComposableScorer for BooleanScorer<'_> {
     fn next(&mut self) -> Result<Option<u64>> {
         if self.prohibited.is_none() {
             self.next_accepted_without_prohibited(None)
+        } else if self.min_competitive_score == f32::NEG_INFINITY {
+            self.next_accepted_without_score_floor(None)
         } else {
             self.position(None)
         }
@@ -2187,6 +2249,8 @@ impl ComposableScorer for BooleanScorer<'_> {
         }
         if self.prohibited.is_none() {
             self.next_accepted_without_prohibited(Some(target))
+        } else if self.min_competitive_score == f32::NEG_INFINITY {
+            self.next_accepted_without_score_floor(Some(target))
         } else {
             self.position(Some(target))
         }
@@ -3732,6 +3796,62 @@ mod tests {
         assert_eq!(scorer.score().unwrap(), 1.0);
         assert_eq!(prohibited_approximations.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(prohibited_confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn boolean_with_unbounded_floor_rejects_prohibited_candidates_before_scoring() {
+        let positive_rows = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
+        let (positive, positive_work) = instrumented(materialized(&positive_rows));
+        let prohibited_rows = (0..100).map(|doc| (doc, 0.0)).collect::<Vec<_>>();
+        let (prohibited, prohibited_approximations, prohibited_confirmations) =
+            two_phase(&prohibited_rows, (0..100).collect(), Some(1.0));
+        let mut scorer =
+            BooleanScorer::try_new(Vec::new(), vec![positive], vec![prohibited]).unwrap();
+
+        assert!(
+            TopKCollector::new(1)
+                .collect(&mut scorer)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(positive_work.scores.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(prohibited_approximations.load(AtomicOrdering::Relaxed), 100);
+        assert_eq!(prohibited_confirmations.load(AtomicOrdering::Relaxed), 100);
+    }
+
+    #[test]
+    fn boolean_switches_to_delayed_probes_after_raising_the_score_floor() {
+        let positive_rows = (0..100)
+            .map(|doc| {
+                let score = match doc {
+                    0 => 50.0,
+                    99 => 50.5,
+                    _ => 0.5,
+                };
+                (doc, score)
+            })
+            .collect::<Vec<_>>();
+        let positive = || materialized(&positive_rows);
+        let prohibited_rows = (0..100).map(|doc| (doc, 0.0)).collect::<Vec<_>>();
+        let (prohibited, prohibited_approximations, prohibited_confirmations) =
+            two_phase(&prohibited_rows, (1..100).collect(), Some(1.0));
+        let metrics = BooleanMetrics::default();
+        let results = {
+            let mut scorer = BooleanScorer::try_new_with_metrics(
+                Vec::new(),
+                vec![positive(), positive()],
+                vec![prohibited],
+                Some(&metrics),
+            )
+            .unwrap();
+            TopKCollector::new(1).collect(&mut scorer).unwrap()
+        };
+
+        assert_eq!(results, rows(&[(0, 100.0)]));
+        assert_eq!(prohibited_approximations.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(prohibited_confirmations.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(metrics.positive_survivors.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(metrics.must_not_probes.load(AtomicOrdering::Relaxed), 2);
     }
 
     #[test]
