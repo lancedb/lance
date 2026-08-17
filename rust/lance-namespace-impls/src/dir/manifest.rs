@@ -358,7 +358,10 @@ enum ConflictResolution<O> {
     /// Creating these object ids with fail-on-conflict semantics. If any of them now
     /// exists in the latest manifest, the create lost the race and must fail with a
     /// concurrent-modification error; otherwise retry the rewrite.
-    FailIfExists(Vec<String>),
+    FailIfExists {
+        object_ids: Vec<String>,
+        locations: Vec<String>,
+    },
     /// Deleting `object_id`. If it is already absent from the latest manifest the delete
     /// has effectively happened, so return `output` as success; otherwise retry.
     SucceedIfAbsent { object_id: String, output: O },
@@ -505,6 +508,21 @@ impl ManifestStreamMutation for UpsertManifestMutation {
             }
         }
 
+        if let Some(location) = row.location.as_deref()
+            && self
+                .expected_locations
+                .values()
+                .any(|expected_location| expected_location == location)
+        {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Location '{}' is also registered to object '{}'",
+                    location, row.object_id
+                ),
+            }
+            .into());
+        }
+
         output.append(
             index_data,
             ManifestOutputRow {
@@ -549,9 +567,14 @@ impl ManifestStreamMutation for UpsertManifestMutation {
         match self.when_matched {
             // Fail-on-conflict create: a concurrent writer may have created one of these
             // ids. Re-applying would still fail, so check directly instead of re-staging.
-            WhenMatched::Fail => ConflictResolution::FailIfExists(
-                self.entries.iter().map(|e| e.object_id.clone()).collect(),
-            ),
+            WhenMatched::Fail => ConflictResolution::FailIfExists {
+                object_ids: self.entries.iter().map(|e| e.object_id.clone()).collect(),
+                locations: self
+                    .entries
+                    .iter()
+                    .filter_map(|e| e.location.clone())
+                    .collect(),
+            },
             // Metadata upsert is last-writer-wins: re-read and re-apply.
             _ => ConflictResolution::Retry,
         }
@@ -591,6 +614,18 @@ impl ManifestStreamMutation for DeleteObjectMutation {
             return Ok(());
         }
 
+        if let Some(expected_location) = self.expected_location.as_deref()
+            && row.location.as_deref() == Some(expected_location)
+        {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Location '{}' is also registered to object '{}'",
+                    expected_location, row.object_id
+                ),
+            }
+            .into());
+        }
+
         output.append(
             index_data,
             ManifestOutputRow {
@@ -620,10 +655,14 @@ impl ManifestStreamMutation for DeleteObjectMutation {
     }
 
     fn conflict_resolution(&self) -> ConflictResolution<Self::Output> {
-        // If a concurrent writer already removed the object, the delete is satisfied.
-        ConflictResolution::SucceedIfAbsent {
-            object_id: self.object_id.clone(),
-            output: (),
+        if self.expected_location.is_some() {
+            ConflictResolution::Retry
+        } else {
+            // If a concurrent writer already removed the object, the delete is satisfied.
+            ConflictResolution::SucceedIfAbsent {
+                object_id: self.object_id.clone(),
+                output: (),
+            }
         }
     }
 }
@@ -1962,13 +2001,30 @@ impl ManifestNamespace {
     ) -> Result<Option<O>> {
         match resolution {
             ConflictResolution::Retry => Ok(None),
-            ConflictResolution::FailIfExists(object_ids) => {
+            ConflictResolution::FailIfExists {
+                object_ids,
+                locations,
+            } => {
                 for object_id in object_ids {
                     if self.manifest_contains_object(object_id).await? {
                         return Err(NamespaceError::ConcurrentModification {
                             message: format!(
                                 "Object '{}' was concurrently created by another operation",
                                 object_id
+                            ),
+                        }
+                        .into());
+                    }
+                }
+                for location in locations {
+                    if self
+                        .object_store
+                        .exists(&self.deregistered_table_marker_path(location))
+                        .await?
+                    {
+                        return Err(NamespaceError::ConcurrentModification {
+                            message: format!(
+                                "Location '{location}' is being physically deleted after deregistration"
                             ),
                         }
                         .into());
@@ -3218,6 +3274,12 @@ impl LanceNamespace for ManifestNamespace {
                     .as_ref()
                     .expect("an overwrite has an existing table")
                     .location;
+                self.object_store
+                    .put(
+                        &self.deregistered_table_marker_path(previous_location),
+                        b"deregistered",
+                    )
+                    .await?;
                 if let Err(error) = self
                     .replace_manifest_table_location(entry, previous_location)
                     .await
@@ -3240,12 +3302,10 @@ impl LanceNamespace for ManifestNamespace {
                     Ok(()) => {}
                     Err(error) if error.is_not_found() => {}
                     Err(error) => {
-                        return Err(lance_core::Error::from(NamespaceError::Internal {
-                            message: format!(
-                                "Failed to delete overwritten table location '{}': {error:?}",
-                                previous_location
-                            ),
-                        }));
+                        log::warn!(
+                            "Failed to delete overwritten table location '{}': {error:?}",
+                            previous_location
+                        );
                     }
                 }
             } else {
@@ -3318,6 +3378,13 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
+                self.object_store
+                    .put(
+                        &self.deregistered_table_marker_path(&info.location),
+                        b"deregistered",
+                    )
+                    .await?;
+
                 // Delete from manifest first
                 self.delete_from_manifest_if_location(&object_id, Some(&info.location))
                     .boxed()
@@ -5010,6 +5077,93 @@ mod tests {
 
         assert!(result.is_ok(), "delete should succeed: {result:?}");
         assert!(!manifest_ns.manifest_contains_object("table").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_expected_location_delete_rejects_alias() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace_with_retries(temp_path, false, Some(0)).await;
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![
+                    ManifestEntry {
+                        object_id: "table".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("shared.lance".to_string()),
+                        metadata: None,
+                    },
+                    ManifestEntry {
+                        object_id: "alias".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("shared.lance".to_string()),
+                        metadata: None,
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = manifest_ns
+            .delete_from_manifest_if_location("table", Some("shared.lance"))
+            .await;
+
+        assert!(result.is_err(), "shared location must not be deregistered");
+        assert!(manifest_ns.manifest_contains_object("table").await.unwrap());
+        assert!(manifest_ns.manifest_contains_object("alias").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_expected_location_replace_rejects_alias() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace_with_retries(temp_path, false, Some(0)).await;
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![
+                    ManifestEntry {
+                        object_id: "table".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("shared.lance".to_string()),
+                        metadata: None,
+                    },
+                    ManifestEntry {
+                        object_id: "alias".to_string(),
+                        object_type: ObjectType::Table,
+                        location: Some("shared.lance".to_string()),
+                        metadata: None,
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = manifest_ns
+            .replace_manifest_table_location(
+                ManifestEntry {
+                    object_id: "table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("replacement.lance".to_string()),
+                    metadata: None,
+                },
+                "shared.lance",
+            )
+            .await;
+
+        assert!(result.is_err(), "shared location must not be replaced");
+        assert_eq!(
+            manifest_ns
+                .query_manifest_for_table("table")
+                .await
+                .unwrap()
+                .unwrap()
+                .location,
+            "shared.lance"
+        );
     }
 
     #[rstest]
